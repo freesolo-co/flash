@@ -7,6 +7,8 @@ is not stubbed globally because client tests use a real loopback server.
 from __future__ import annotations
 
 import contextlib
+import os
+import shlex
 
 import pytest
 
@@ -98,6 +100,207 @@ def pytest_addoption(parser):
             "(default: 300, matching flash's own deploy budget)"
         ),
     )
+
+
+def _temp_root_lever(config) -> str:
+    """How to move pytest's temp root, in the same precedence pytest itself resolves it.
+
+    ``TempPathFactory.getbasetemp`` takes ``--basetemp`` first, then ``PYTEST_DEBUG_TEMPROOT``, and
+    only then falls through to ``tempfile.gettempdir()`` (which is what reads ``TMPDIR``). Telling a
+    developer running with ``--basetemp`` to change ``TMPDIR`` sends them to a knob that has no
+    effect on the path in front of them -- exactly the misdirection this hook exists to end.
+    """
+    if getattr(config.option, "basetemp", None):
+        return "pass a different directory to `--basetemp`"
+    if os.environ.get("PYTEST_DEBUG_TEMPROOT"):
+        return "point `PYTEST_DEBUG_TEMPROOT` elsewhere"
+    return "point `TMPDIR` elsewhere"
+
+
+def _failing_cache_root(text: str):
+    """The env cache root the exception refused, or None if the message does not name one.
+
+    Every branch of ``validate_cache_root_ancestors`` ends with "env cache root <path>" (with an
+    optional "use"/"load environment code from" in between), so the root is always recoverable from
+    the message the test actually failed with -- no re-deriving where the cache should have been.
+
+    The path is terminated by the message's own trailing text, not by whitespace: a temp root under
+    a directory with a space in its name is a perfectly ordinary ``TMPDIR``, and a ``\\S+`` match
+    would stop at that space, hand back a prefix that exists nowhere, and drop the diagnostic on a
+    setup that needs it.
+    """
+    import re
+    from pathlib import Path
+
+    tail = text[text.find("refusing") :] or text
+    match = re.search(r"env cache root (.+?)(?: -- chmod \+t it or move the cache root|\s*$)", tail)
+    return Path(match.group(1)) if match else None
+
+
+def _named_ancestor(text: str):
+    """The ancestor the exception blamed, or None. Pairs with the cache root as the causality test.
+
+    Containment alone does not establish cause: two tests here ``chmod`` a directory UNDER
+    ``tmp_path`` on purpose, so the refused root is inside the temp tree while the ancestor at fault
+    is one the test created. Set ``TMPDIR`` somewhere untrusted as well and the temp root's own bad
+    ancestor exists too -- so a containment-only check blames it and sends the reader to fix a
+    directory that had nothing to do with the failure.
+    """
+    import re
+    from pathlib import Path
+
+    match = re.search(r"env cache root ancestor (.+?) is group/other-writable", text)
+    return Path(match.group(1)) if match else None
+
+
+def _is_within(path, base) -> bool:
+    """True when ``path`` is ``base`` or lives under it, comparing resolved paths."""
+    try:
+        resolved, root = path.resolve(), base.resolve()
+    except OSError:
+        return False
+    return resolved == root or root in resolved.parents
+
+
+def _is_same_path(left, right) -> bool:
+    """True when both name the same directory. Compares raw AND resolved, since the exception and
+    the walk can each have found it by a different route through a symlinked temp root."""
+    try:
+        return left == right or left.resolve() == right.resolve()
+    except OSError:
+        return left == right
+
+
+def _trust_failure_texts(exc) -> list[str]:
+    """Every trust-check message inside ``exc``, outermost first.
+
+    A fixture finalizer that raises alongside another one does not reach the hook as itself:
+    pytest bundles teardown errors into a ``BaseExceptionGroup`` whose ``str()`` is only
+    ``errors while tearing down <Function ...> (2 sub-exceptions)`` -- the trust message is in a
+    member, not the summary. Matching on the top-level text alone therefore drops the diagnostic
+    for exactly the multi-finalizer teardown this hook claims to cover. Recurse; groups nest.
+
+    ALL of them, not the first: two finalizers can each hit the trust check for different reasons,
+    one on a directory the test made unsafe on purpose and one on the temp root's own ancestor.
+    Stopping at the first would let the deliberate failure hide the actionable one, which is the
+    same silence this hook exists to end -- so the caller tests each message and uses any that
+    passes the causality checks.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        return [text for member in exc.exceptions for text in _trust_failure_texts(member)]
+    text = str(exc)
+    return [text] if "env cache root ancestor" in text and "sticky bit" in text else []
+
+
+def _blames_the_temp_root(text: str, base, ancestor) -> bool:
+    """True when THIS refusal is the temp root's fault: refused root inside it, and same ancestor."""
+    failing_root, blamed = _failing_cache_root(text), _named_ancestor(text)
+    if failing_root is None or not _is_within(failing_root, base):
+        return False
+    return blamed is not None and _is_same_path(blamed, ancestor)
+
+
+def _untrusted_tmpdir_ancestor(base):
+    """The first ancestor of ``base`` that the env cache's trust checks will refuse, if any.
+
+    Mirrors the group/other-writable-without-sticky-bit rule in
+    ``flash.envs.cache_security.validate_cache_root_ancestors``, including the chain it walks:
+    raw parents AND resolved ones. A symlinked temp root makes those two different sets, and the
+    exception names whichever one it found -- so walking only the raw chain returns a path that
+    never appears in the message, and the caller's causality check silently drops the diagnostic
+    on exactly the setup that most needs it.
+    """
+    import stat
+
+    chain = (base, *base.parents, base.resolve(), *base.resolve().parents)
+    for ancestor in dict.fromkeys(chain):
+        try:
+            info = ancestor.stat()
+        except OSError:
+            continue
+        if (info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and not (info.st_mode & stat.S_ISVTX):
+            return ancestor, info.st_mode & 0o777
+    return None, None
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Name the temp root on env-cache trust failures, instead of only the code under test.
+
+    ``validate_cache_root_ancestors`` refuses a cache root with a group/other-writable ancestor
+    that has no sticky bit. That check is right, and the tests that trip it are not: they point
+    ``_CACHE_ROOT`` at ``tmp_path``, whose ancestors belong to whatever chose pytest's temp root.
+    Set ``TMPDIR`` to a shared 0775 directory and 13 tests across ``test_env_pull.py`` and
+    ``test_verifiers.py`` go red naming ``cache_security.py`` and a generated cache root -- the
+    code under test and a path the developer never chose -- while never naming the temp root,
+    which is the thing that is actually wrong. Default ``/tmp`` is 1777 and sticky, so CI never
+    sees it.
+
+    Attached to the failing report rather than printed: ``addopts = -q`` suppresses
+    ``pytest_report_header`` and capture swallows a fixture's ``print``, so both go missing in
+    exactly the default run that needs them. A section on the failure is the one place pytest
+    always shows it, and unlike raising in teardown it does not add a second error per test.
+
+    Fires only when the trust check is what rejected the path AND the ancestor it named is the
+    temp root's own, so it explains that failure and never editorializes over an unrelated one.
+    """
+    outcome = yield
+    report = outcome.get_result()
+    # setup and teardown too: an environment resolved in a fixture raises the same exception and
+    # pytest reports it as an ERROR in that phase. those need the explanation exactly as much, and
+    # gating on the call phase silently dropped it for every one of them.
+    if not report.failed:
+        return
+    excinfo = getattr(call, "excinfo", None)
+    if excinfo is None:
+        return
+    texts = _trust_failure_texts(excinfo.value)
+    if not texts:
+        return
+    # a diagnostic must never be able to replace the failure it is explaining. `getbasetemp()`
+    # CREATES the root on first call, so a failure that happened before any `tmp_path` fixture ran
+    # -- a cache under HOME, say -- would create it here during reporting, and an unwritable
+    # `--basetemp` parent would then raise inside the hook and surface as an INTERNALERROR that
+    # buries the original traceback.
+    try:
+        base = item.config._tmp_path_factory.getbasetemp()
+    except Exception:
+        return
+    ancestor, mode = _untrusted_tmpdir_ancestor(base)
+    if ancestor is None:
+        return
+    # the temp root having an unsafe ancestor does not make it the CAUSE. two tests here chmod a
+    # directory under `tmp_path` on purpose to exercise the refusal, and a cache root under HOME can
+    # fail while the temp tree is spotless -- in both cases blaming the temp dir sends the reader to
+    # a knob that changes nothing, which is the same misdirection as saying nothing.
+    #
+    # BOTH halves are required, and neither implies the other:
+    #
+    #   ancestor alone -- with HOME and the temp root as siblings under one 0775 directory, both
+    #   name that directory, so a cache under HOME reads as a temp-dir problem.
+    #   containment alone -- the two tests that `chmod` a directory under `tmp_path` on purpose put
+    #   the refused root inside the temp tree while the ancestor at fault is one they created; if
+    #   TMPDIR is also untrusted, this blames the temp root for a refusal it did not cause.
+    #
+    # requiring the refused root to be under the temp tree AND the blamed ancestor to be the temp
+    # root's own leaves only the case where the temp root is genuinely why the check refused.
+    if not any(_blames_the_temp_root(text, base, ancestor) for text in texts):
+        return
+    # `chmod +t` on the offending ancestor is the only fix that always works. moving the temp root
+    # to a private directory does NOT, if that directory is still under the same bad ancestor --
+    # every parent is checked, so 0700 below a 0775 parent fails identically. say "outside", not
+    # "private".
+    #
+    # shell-quoted: a temp root under a directory with a space is ordinary, and `chmod +t /tmp/team
+    # temp` silently addresses two paths that do not exist. this line is meant to be pasted.
+    quoted = shlex.quote(str(ancestor))
+    detail = (
+        f"pytest's temp root is {base}, and its ancestor {ancestor} is group/other-writable "
+        f"without the sticky bit (mode {mode:04o}), which the env cache trust checks refuse. "
+        f"fix with `chmod +t {quoted}`, or {_temp_root_lever(item.config)} -- one whose whole "
+        f"parent chain is trusted, so not another directory under {ancestor}."
+    )
+    report.sections.append(("the temp dir, not the code under test, caused this", detail))
 
 
 @pytest.fixture(scope="session", autouse=True)
