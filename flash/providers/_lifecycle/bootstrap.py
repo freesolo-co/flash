@@ -1,7 +1,8 @@
 """Bootstrap shared by instance-based providers (e.g. Lambda). Runs inside the worker container.
 
-Stdlib + huggingface_hub only — never import flash here. Reads payload from ``/root/flash/payload.json``.
-Launch scripts must ship ``bootstrap_secrets.py`` (credential redaction) next to this file.
+Stdlib + huggingface_hub only - never import flash here. Reads payload from ``/root/flash/payload.json``.
+Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and ``bootstrap_pip.py``
+next to this file.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 if __package__:
+    from flash.providers._lifecycle import bootstrap_console as _bootstrap_console
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
         _console_progress,
@@ -28,8 +30,9 @@ if __package__:
         _safe_detail,
     )
 else:
-    # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
-    # same directory, and the script directory leads sys.path.
+    # running as a bare script on the box: launch scripts ship every imported sibling into this
+    # directory, which leads sys.path.
+    import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _console_progress,
@@ -38,13 +41,15 @@ else:
         _safe_detail,
     )
 
+_CONSOLE_UPLOAD_CREDITS = _bootstrap_console._CONSOLE_UPLOAD_CREDITS
+_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = _bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+_CONSOLE_UPLOAD_INTERVAL_S = _bootstrap_console._CONSOLE_UPLOAD_INTERVAL_S
+_CONSOLE_UPLOAD_POLL_S = _bootstrap_console._CONSOLE_UPLOAD_POLL_S
+_CONSOLE_UPLOAD_QUIET_POLLS = _bootstrap_console._CONSOLE_UPLOAD_QUIET_POLLS
+_run_console_upload_loop = _bootstrap_console._run_console_upload_loop
+
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
-_CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
-_CONSOLE_UPLOAD_POLL_S = 120.0
-_CONSOLE_UPLOAD_QUIET_POLLS = 4
-_CONSOLE_UPLOAD_CREDITS = 2
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
@@ -267,58 +272,21 @@ def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str 
 def _console_upload_loop(
     payload: dict, console: str, mode: str, interval_s: float, stop_upload
 ) -> None:
-    """Snapshot the console until ``stop_upload`` is set, polling cheaply for a wedge. Polling is
-    free; committing is not (the heartbeat spends 4 of this repo's 5 commits/hour), and the stall
-    classifier kills a wedged run at 1200s/3000s -- long before an hourly snapshot would capture the
-    hang. So commit only on un-uploaded bytes AND either the interval elapsing or sustained silence
-    (``_console_progress`` explains why bytes cannot be the signal). QUIET_POLLS is sized so
-    (it + 1) * poll stays under poll_job's 1200s stall.
-
-    ``armed`` is the wedge latch. A wedge is progress that STOPPED, so it arms only after a
-    heartbeat: startup is quiet by nature and counting it would spend a credit on an empty console.
-    WHICH of `_console_progress`'s two counts drives it switches at the first COMMITTED heartbeat
-    (``ever``), for the reason that function's docstring gives: until one lands, a ``pending``
-    heartbeat is the only evidence the run exists, and counts as progress.
-    It RE-ARMS on progress, because a healthy slow stage -- one transition, then only liveness pings,
-    which ``_console_progress`` subtracts -- reads as silence and buys a snapshot; with a single
-    permanent credit that run could never buy another, so a genuine hang later would wait for the
-    hourly cadence and die at 1200s with no failure-era console, the exact loss this uploader exists
-    to prevent. CREDITS keeps the re-arm honest: a run alternating a heartbeat with silence re-arms
-    every cycle, and uncapped that buys 6/hr against a 5.0/hr budget the heartbeat already spends 4
-    of; they are per RUN, so they never enter the SUSTAINED rate. ``wedged`` excludes an already-due
-    poll, so a credit is spent only when a stall BOUGHT an upload.
-
-    A setup that NEVER reaches a heartbeat stays uncovered on purpose: holding the first-snapshot
-    cadence until progress starts costs a commit in the SUSTAINED rate (5.25/hr against a hard 5.0,
-    measured by ..._keeps_a_slow_starting_run_in_budget), so it is left to the 3000s grace. A FAILED
-    upload advances neither ``sent`` nor the deadline: hf_upload swallows its exception and returns
-    falsy, so resetting ``since`` books a snapshot that reached no repo and puts the retry an
-    interval out, past both teardowns. Staying due retries until one lands."""
-    poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
-    due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
-    sent, size, since, quiet, armed, spent, ever = -1, -1, 0.0, 0.0, False, 0, False
-    while not stop_upload.wait(poll_s):
-        since += poll_s
-        size, staged, beats = _console_progress(console, max(size, 0))
-        ever = ever or bool(staged)
-        progress = staged if ever else beats
-        armed = armed or bool(progress)
-        quiet = 0.0 if progress else quiet + 1
-        due = since >= due_s
-        ok = armed and not due and spent < _CONSOLE_UPLOAD_CREDITS
-        wedged = ok and quiet >= _CONSOLE_UPLOAD_QUIET_POLLS
-        if size == sent or not (due or wedged):
-            continue
+    def upload() -> bool:
         try:
-            up = _upload_console_snapshot(payload, console, mode)
+            return _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
             detail = _safe_detail(exc, secrets=_payload_secrets(payload))
             print(f"console upload warn: {detail}", flush=True)
-            up = False
-        spent += 1 if wedged and up else 0
-        armed = armed and not (wedged and up)
-        if up:
-            sent, since, due_s = size, 0.0, interval_s
+            return False
+
+    _run_console_upload_loop(
+        console,
+        interval_s,
+        stop_upload,
+        progress=_console_progress,
+        upload=upload,
+    )
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:

@@ -130,7 +130,9 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     # the self-contained bootstrap is embedded, with its redaction sibling next to it
     assert "FLASH_BOOTSTRAP_EOF" in script
     assert "FLASH_BOOTSTRAP_SECRETS_EOF" in script
+    assert "FLASH_BOOTSTRAP_CONSOLE_EOF" in script
     assert "/opt/flash/bootstrap_secrets.py" in script
+    assert "/opt/flash/bootstrap_console.py" in script
     assert "metrics.json" in script
     # runs the prebuilt WORKER_IMAGE via Docker with the GPU + the bootstrap as the command
     from flash.providers.runpod.serverless import WORKER_IMAGE
