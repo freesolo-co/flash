@@ -74,7 +74,15 @@ _PDF_SIGNATURE = b"%PDF-"
 # names `Filter` to every reader, and a literal spelling here would leave a chain declared that way
 # invisible -- the stream would then be handed to zlib undecoded, or its unreadable filters missed.
 _FILTER_NAME = b"".join(rb"(?:%c|#%02X|#%02x)" % (letter, letter, letter) for letter in b"Filter")
-_PDF_FILTERS = re.compile(rb"/%s\s*(?:/([\w#]+)|\[([^\]]{0,256})\])" % _FILTER_NAME)
+# A PDF comment runs from `%` to the end of its line and is a legal token separator, so
+# `/Filter%c\n[/ASCII85Decode /FlateDecode]` declares exactly the chain the spaced form does.
+# Accepting whitespace alone left that chain unrecovered: the ASCII85 body went straight to zlib,
+# the decompression error was skipped as "not really a stream", and the key inside published. The
+# encryption-key pattern already treats a comment as a separator; this is the same rule.
+_PDF_SEPARATOR = rb"(?:\s|%[^\r\n]*(?:\r\n|\r|\n))*"
+_PDF_FILTERS = re.compile(
+    rb"/%s%s(?:/([\w#]+)|\[([^\]]{0,256})\])" % (_FILTER_NAME, _PDF_SEPARATOR)
+)
 _PDF_FILTER_NAME = re.compile(rb"/([\w#]+)")
 
 # `#` followed by two hex digits inside a PDF name stands for that byte, so `/Flate#44ecode` and

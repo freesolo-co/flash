@@ -7388,16 +7388,26 @@ def test_a_partial_length_packet_does_not_end_the_openpgp_walk(tmp_path):
         assert credential_in_file(published) == "a private key", name
 
     # ordinary binary must not be refused because a random byte lands in the partial range: the
-    # length is only read that way on the data packets the format allows it on
+    # length is only read that way on the data packets the format allows it on.
+    #
+    # Seeded, and the gate is a RATE rather than zero. A chunk of random bytes refuses at some small
+    # rate whatever this does -- the walk has other ways to run out of sequence -- so demanding zero
+    # made the test fail on its own noise at 64 draws. Measured over 1024 draws: 2-3 refusals with
+    # the tag gate against 10-17 with every tag allowed a partial length, which is the regression
+    # this exists to catch, so the ceiling sits between the two.
+    import random
+
     from flash.env_buffers import _SCAN_CHUNK_BYTES
     from flash.env_openpgp import _openpgp_secret_key_in_sequence
 
+    draws, ceiling = 1024, 6
+    rng = random.Random(20260815)
     refused = sum(
         1
-        for _ in range(64)
-        if _openpgp_secret_key_in_sequence(os.urandom(_SCAN_CHUNK_BYTES), truncated=True) is None
+        for _ in range(draws)
+        if _openpgp_secret_key_in_sequence(rng.randbytes(_SCAN_CHUNK_BYTES), truncated=True) is None
     )
-    assert refused == 0, f"{refused}/64 random chunks refused over a partial length"
+    assert refused <= ceiling, f"{refused}/{draws} random chunks refused over a partial length"
 
 
 def test_a_version_5_session_packet_is_read_with_its_own_layout(tmp_path):
@@ -7548,3 +7558,140 @@ def test_a_pdf_larger_than_the_scan_buffer_is_refused(tmp_path):
     ordinary = tmp_path / "small.pdf"
     ordinary.write_bytes(document(b"harmless text"))
     assert credential_in_file(ordinary) is None
+
+
+def test_a_pdf_filter_declared_across_a_comment_is_still_decoded(tmp_path):
+    """A `%` comment is a token separator, so it may sit between `/Filter` and its value.
+
+    Accepting whitespace alone left `/Filter%c\\n[/ASCII85Decode /FlateDecode]` unrecovered: the
+    chain went unrecognised, the ASCII85 body was handed straight to zlib, the resulting error was
+    read as "not really a stream", and the key inside published. A reader resolves the commented
+    spelling exactly as it resolves the spaced one.
+    """
+    import base64
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    key = b'FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode()
+    stream = base64.a85encode(zlib.compress(key)) + b"~>"
+    for name, separator in (
+        ("spaced.pdf", b" "),
+        ("commented.pdf", b"%a comment before the value\n"),
+    ):
+        published = tmp_path / name
+        published.write_bytes(
+            _flate_pdf(b"/Filter" + separator + b"[/ASCII85Decode /FlateDecode]", stream)
+        )
+        assert credential_in_file(published) == "a Freesolo API key", name
+
+
+def test_a_zip_member_name_is_checked_like_a_tar_member_name(tmp_path):
+    """A zip entry's NAME publishes whatever it spells, exactly as a tar member's does.
+
+    The tar walk checked names and the zip walk did not, so `fslo_<key>.json` inside a zip was read
+    only for its (empty) contents and published with the key in the archive's listing. A name that
+    is itself an encoded container is refused rather than decoded speculatively -- and the raw scan
+    over the archive's own bytes swallowed that refusal, so a member named with base64 of an
+    OpenSSL-encrypted file returned clean while the same string passed to the name scanner refused.
+    """
+    import base64
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    keyed = tmp_path / "keyed.zip"
+    with zipfile.ZipFile(keyed, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"fslo_{_FAKE_KEY_BODY}.json", "{}")
+    assert credential_in_file(keyed) == "a Freesolo API key"
+
+    # a name the scan cannot finish reading is a refusal here too, the same answer the name
+    # scanner already gives for that string on its own
+    unscannable = base64.b64encode(b"Salted__12345678ciphertext").decode()
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(unscannable)
+    hidden = tmp_path / "hidden.zip"
+    with zipfile.ZipFile(hidden, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(unscannable, "{}")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(hidden)
+
+    # ordinary member names must not become refusals or false matches
+    plain = tmp_path / "plain.zip"
+    with zipfile.ZipFile(plain, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("model-00001-of-00002.safetensors", "weights")
+        archive.writestr("configs/train.toml", "[train]\nsteps = 10\n")
+    assert credential_in_file(plain) is None
+
+
+def test_an_openssh_key_with_its_armor_stripped_is_still_a_private_key(tmp_path):
+    """`-----BEGIN OPENSSH PRIVATE KEY-----` wraps base64 of a blob that IS the key.
+
+    Every pattern matched the armor, so the same key with its header removed -- which is what
+    `base64 -d` on the body produces -- matched nothing and published intact. Re-adding the header
+    reconstructs a usable key, so the decoded blob is the whole secret.
+    """
+    import base64
+
+    from flash.env_secrets import credential_in_file
+
+    blob = b"openssh-key-v1\x00" + b"\x00\x00\x00\x04none" * 2 + b"\x00\x00\x00\x00" + b"\x11" * 96
+
+    armored = tmp_path / "id_ed25519"
+    armored.write_bytes(
+        b"-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        + base64.encodebytes(blob)
+        + b"-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    assert credential_in_file(armored) == "a private key block"
+
+    stripped = tmp_path / "id_ed25519.raw"
+    stripped.write_bytes(blob)
+    assert credential_in_file(stripped) == "a private key"
+
+    # the magic alone is not enough: the ciphername length that follows bounds it to a real header,
+    # so prose and binary that happen to carry the string are not refused
+    for ordinary in (b"see openssh-key-v1 format docs\n", b"openssh-key-v1\x00\x00\x01\x00\x00"):
+        prose = tmp_path / f"doc{len(ordinary)}.txt"
+        prose.write_bytes(ordinary)
+        assert credential_in_file(prose) is None, ordinary
+
+
+def test_scanning_a_name_is_charged_to_the_packages_budget(tmp_path):
+    """A name's expansion is bounded by the package's budget, not a fresh one per name.
+
+    A name is a few hundred bytes, which reads like nothing to multiply -- but what it ENCODES is
+    not, and giving each one its own 60-second budget made the package-wide bound advisory: a
+    thousand members each got a full budget, so the limit the package scan enforces was never
+    reached no matter how many expensive names were present.
+    """
+    import time
+
+    from flash.env_secrets import credential_in_name
+
+    # a deadline already in the past leaves no budget, so an expansion cannot be started under it
+    assert credential_in_name(f"fslo_{_FAKE_KEY_BODY}", deadline=time.monotonic() - 1.0) == (
+        "a Freesolo API key"
+    ), "a literal match needs no expansion and must survive an exhausted budget"
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "ordinary.txt").write_bytes(b"nothing here\n")
+    spent: list[float | None] = []
+    import flash.env_secrets as secrets
+
+    original = secrets.credential_in_name
+
+    def record(name, *, deadline=None):
+        spent.append(deadline)
+        return original(name, deadline=deadline)
+
+    secrets.credential_in_name = record
+    try:
+        secrets.reject_credential_bearing_package(package, display={})
+    finally:
+        secrets.credential_in_name = original
+
+    assert spent, "the package walk must scan its member names"
+    assert all(deadline is not None for deadline in spent), "each name must carry a budget"
+    assert len(set(spent)) == 1, "every name in one package shares ONE budget"

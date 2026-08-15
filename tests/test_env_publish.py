@@ -1270,6 +1270,45 @@ def test_publish_refuses_a_credential_supplied_as_the_env_name():
     assert envs.validate_publish_inputs(package_b64=_pkg_b64(_MINIMAL), name="demo")
 
 
+def test_an_unscannable_env_name_is_a_refusal_not_a_server_fault():
+    """A name the scan cannot finish reading is refused, not raised through the route.
+
+    `credential_in_name` decodes what a name encodes, so a name that IS an encoded container raises
+    `_Unscannable` rather than returning a kind. The route catches only `EnvPublishError`, so a
+    36-character caller-supplied name -- base64 of an OpenSSL `Salted__` header -- produced an
+    uncontrolled 500 out of a validation check. Unverifiable is not clean, the same answer the
+    package scan already gives.
+    """
+    unscannable = base64.b64encode(b"Salted__12345678ciphertext").decode()
+
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.validate_publish_inputs(package_b64=_pkg_b64(_MINIMAL), name=unscannable)
+    assert excinfo.value.status == 400
+    assert "cannot be checked for credentials" in str(excinfo.value)
+
+
+def test_a_qualified_env_name_is_normalized_one_segment_at_a_time():
+    """The fold that catches a hidden key must not weld unrelated segments into one.
+
+    Normalization is scanned because it is what gets written, but `publish_slug_for_name` writes a
+    qualified id as three directory segments -- so folding the whole path into one string invented
+    a credential the publish never writes. `acme/fslo_/AbCdEf0123456789` became
+    `acme-fslo_-abcdef0123456789` and was refused as a Freesolo key, while the published path is
+    `acme/fslo_/abcdef0123456789`, in which no key is contiguous.
+    """
+    assert envs.validate_publish_inputs(
+        package_b64=_pkg_b64(_MINIMAL), name="acme/fslo_/AbCdEf0123456789"
+    )
+
+    # the fold still has to catch a key that only normalization makes contiguous, and a key inside
+    # any one segment is still refused -- neither is what the per-segment split gives up.
+    key = "fslo_" + "a1B2c3D4" * 6
+    folded = key.replace("_", "_!", 1).replace("D4", "D4!")
+    for name in (folded, f"acme/proj/{key}", f"acme/{key}"):
+        with pytest.raises(envs.EnvPublishError, match="Freesolo API key"):
+            envs.validate_publish_inputs(package_b64=_pkg_b64(_MINIMAL), name=name)
+
+
 def test_safe_extract_rejects_traversal(tmp_path):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:

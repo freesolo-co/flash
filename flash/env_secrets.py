@@ -822,6 +822,7 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
         depth=depth,
         scan=_scan_member,
         refusal=_Unscannable,
+        named=credential_in_name,
         member_limit=_MAX_ARCHIVE_MEMBERS,
     )
 
@@ -867,7 +868,7 @@ def credential_in_file(path: Path, *, deadline: float | None = None) -> str | No
     return _credential_in_container(path, deadline=deadline, depth=1)
 
 
-def credential_in_name(name: str) -> str | None:
+def credential_in_name(name: str, *, deadline: float | None = None) -> str | None:
     """The kind of credential the path `name` itself carries, or None.
 
     A file whose *name* is the key leaks it through the archive's member list even when its
@@ -878,17 +879,22 @@ def credential_in_name(name: str) -> str | None:
     publish route that check turned a 400 into an uncaught 500, and reached from a tar member name
     it crashed the scan of an archive rather than reporting what was in it.
 
-    A name gets a deadline of its own, which is what enables the container inspection that file
-    contents already get: without one `_decoded_container` returns None, so an encoded container in
-    a name was matched only in its still-compressed form. A 66-character filename holding
+    A name gets a deadline, which is what enables the container inspection that file contents
+    already get: without one `_decoded_container` returns None, so an encoded container in a name
+    was matched only in its still-compressed form. A 66-character filename holding
     `base64(gzip(key))` published clean while decoding and inflating the published path recovered
-    the whole key. The budget is a fresh one rather than the package's, because a name is bounded
-    by the filesystem at a few hundred bytes -- there is no expansion here for a caller to multiply,
-    and sharing the package budget would let a long member list exhaust it on names alone.
+    the whole key.
+
+    `deadline` is the PACKAGE's budget when the caller has one. A name is bounded by the filesystem
+    at a few hundred bytes, which reads like nothing to multiply -- but the expansion behind it is
+    not: a legal 111-character basename encodes a bzip2 stream that inflates to 64 MiB, measured at
+    9.6 seconds for a single name, and a package may carry thousands of them. Charging each one to
+    a fresh 60-second budget made the package-wide bound advisory. A caller with no budget of its
+    own -- the publish route, checking one name -- gets a fresh one.
     """
     return _credential_kind(
         name.encode("utf-8", "surrogatepass"),
-        deadline=time.monotonic() + _MAX_DECOMPRESS_SECONDS,
+        deadline=time.monotonic() + _MAX_DECOMPRESS_SECONDS if deadline is None else deadline,
     )
 
 
@@ -974,7 +980,7 @@ def reject_credential_bearing_package(package_root: Path, *, display: dict[str, 
             try:
                 # the NAME is checked too, directories included: a file called `fslo_<key>.json`
                 # publishes the key in the repository's file tree whatever its contents are.
-                kind = credential_in_name(relative) or (
+                kind = credential_in_name(relative, deadline=deadline) or (
                     credential_in_file(member, deadline=deadline) if member.is_file() else None
                 )
             except _Unscannable as exc:
