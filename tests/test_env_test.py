@@ -593,6 +593,65 @@ def test_env_test_does_not_apply_the_reward_gate_to_an_sft_environment(
     assert "overall: PASS" in captured.out
 
 
+class _ImagePromptEnv(_SingleTurnEnv):
+    def prompt_messages(self, example):
+        return [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": example["input"]}, {"type": "image"}],
+            }
+        ]
+
+
+class _ImageCompletionEnv(_SingleTurnEnv):
+    def sft_completion(self, example):
+        return [{"role": "assistant", "content": [{"type": "image"}]}]
+
+
+def test_env_test_rejects_an_image_environment_for_sft(monkeypatch, tmp_path, capsys):
+    """This command exists so a contract failure costs a local run instead of a submission.
+
+    An image-bearing sft environment is rejected at submit, so `overall: PASS` here would send the
+    user to the one surface guaranteed to turn them away.
+    """
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _ImagePromptEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 1
+    captured = capsys.readouterr()
+    assert "image-bearing SFT is not supported" in captured.err
+    assert "grpo or opd" in captured.err
+    assert "overall: PASS" not in captured.out
+
+
+def test_env_test_rejects_an_image_sft_completion(monkeypatch, tmp_path, capsys):
+    """The completion is checked separately because submit rejects it separately.
+
+    An image in `sft_completion` clears the prompt-side gate, so checking only the prompt would
+    pass the one shape that survives every other offline check and fails after submission.
+    """
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _ImageCompletionEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 1
+    captured = capsys.readouterr()
+    assert "image-bearing SFT completions are not supported" in captured.err
+    assert "overall: PASS" not in captured.out
+
+
+def test_env_test_still_passes_an_image_environment_for_grpo(monkeypatch, tmp_path, capsys):
+    """The limit is sft's, not the model's. grpo and opd tokenize on the worker and are unaffected.
+
+    Without this control the rejection could be widened to every algorithm and the suite would
+    still be green.
+    """
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _ImagePromptEnv())
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 0
+    assert "overall: PASS" in capsys.readouterr().out
+
+
 def test_env_test_keeps_the_reward_gate_when_no_algorithm_is_given(monkeypatch, tmp_path, capsys):
     """An absent algorithm must not be the way to switch a blocking check off.
 

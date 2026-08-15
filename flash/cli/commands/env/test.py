@@ -405,6 +405,34 @@ def _normalize_prompt_images(env, example: dict, messages: list[dict]) -> None:
     normalize_prompt_images(example, messages, getattr(env, "package_root", None))
 
 
+def _image_sft_rejection(env, dataset: list, algorithm: str | None) -> str | None:
+    """Return why this environment cannot train with sft, or None if it can.
+
+    Checks the prompt AND the completion because submit rejects each separately: the prompt through
+    the capability gate, the completion through `_reject_image_completion`. Reporting only the
+    prompt would pass an environment whose images live in `output`, which is the shape that
+    otherwise survives every offline check and fails after the run is submitted.
+    """
+    if (algorithm or _REWARD_DRIVEN_ALGORITHM) != "sft":
+        return None
+    from flash.content.multimodal import IMAGE_SFT_UNSUPPORTED, record_has_images
+
+    build = getattr(env, "prompt_messages", None)
+    for example in dataset:
+        try:
+            messages = build(example) if callable(build) else []
+            if record_has_images(example, messages if isinstance(messages, list) else []):
+                return IMAGE_SFT_UNSUPPORTED
+            completion = env.sft_completion(example)
+            if record_has_images({}, completion if isinstance(completion, list) else []):
+                return "image-bearing SFT completions are not supported"
+        except (Exception, SystemExit):
+            # a prompt or completion that raises is not an image verdict. leave it to the episode
+            # loop below, which reports the real construction error against the failing case.
+            return None
+    return None
+
+
 def _evaluation_response(env, case) -> tuple[str, str]:
     example = _evaluation_example(case)
     # build the prompt even though the replayed response does not need it. `flash env eval` sends
@@ -751,6 +779,13 @@ def cmd_env_test(args) -> int:
 
     if not dataset:
         return _load_failure("dataset is empty")
+
+    # refuse the combination submit refuses. this command exists so a contract failure costs a
+    # local run instead of a rejected submission, and image-bearing sft is rejected at submit --
+    # so passing it here would send the user to the one surface that cannot accept it.
+    unsupported = _image_sft_rejection(env, dataset, getattr(args, "algorithm", None))
+    if unsupported:
+        return _err(unsupported)
 
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
     passed = 0

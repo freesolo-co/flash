@@ -25,10 +25,10 @@ IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
 # the model's real image-expansion token, as opposed to the placeholder above. one definition so
 # the renderer's rejection and the teacher client's drop guard cannot drift apart.
 IMAGE_PAD_TOKEN = "<|image_pad|>"
-# one definition of "image sft is not supported" so the capability gate and the profiler that
-# would otherwise be reached cannot describe the same limit differently. it names the algorithms
-# that DO train on images, because the models themselves are image-capable and the reader's next
-# question is which path to take.
+# the capability gate raises this, and `flash env test` refuses an image-bearing sft environment
+# with it, so the pre-submit check and the submit-time rejection read identically. it names the
+# algorithms that DO train on images, because the models themselves are image-capable and the
+# reader's next question is which path to take.
 IMAGE_SFT_UNSUPPORTED = (
     "image-bearing SFT is not supported. SFT is quoted from a workload profile measured on the "
     "control plane, which cannot tokenize images. Use text-only SFT records, or train on images "

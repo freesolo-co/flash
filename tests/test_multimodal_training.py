@@ -890,17 +890,14 @@ def test_image_sft_rejection_names_the_algorithms_that_do_train_on_images():
 
 
 def test_packaged_image_sft_profiling_reports_the_same_unsupported_message(tmp_path):
-    """One string for one limit, asserted through the path a submission actually takes.
+    """The packaged submit path reaches the capability gate, with no guard of its own.
 
-    The profiler rejects image rows before `validate_multimodal_training` is reached on the packaged
-    path, so both sites are reachable and must not describe the limit differently. Asserting the
-    constant alone would pass even if the profiler stopped using it.
+    Profiling has no image check: it calls `prepare_sft_workload`, which detects the images and
+    calls the gate. Asserting the constant directly would still pass if that call disappeared, so
+    this drives the real entry point a submission uses and reads the message off it.
     """
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.engine.profiling.dataset_profile import (
-        PackagedDatasetUnavailable,
-        profile_packaged_sft_dataset,
-    )
+    from flash.engine.profiling.dataset_profile import profile_packaged_sft_dataset
 
     package, _image = _package(tmp_path)
     (package / "environment.py").write_text("", encoding="utf-8")
@@ -917,7 +914,7 @@ def test_packaged_image_sft_profiling_reports_the_same_unsupported_message(tmp_p
         train=TrainSpec(epochs=1),
     )
 
-    with pytest.raises(PackagedDatasetUnavailable) as excinfo:
+    with pytest.raises(ValueError, match="image-bearing SFT is not supported") as excinfo:
         profile_packaged_sft_dataset(spec, producer_version="1.2.3")
 
     assert str(excinfo.value) == mm.IMAGE_SFT_UNSUPPORTED

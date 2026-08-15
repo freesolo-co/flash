@@ -333,10 +333,9 @@ def profile_packaged_sft_dataset(
         package_root=base_dir,
         contract_text=_contract_text(base_dir, params),
     )
-    from flash.content.multimodal import IMAGE_SFT_UNSUPPORTED, record_has_images
-
-    if any(record_has_images(row, raw_environment.prompt_messages(row)) for row in rows):
-        raise PackagedDatasetUnavailable(IMAGE_SFT_UNSUPPORTED)
+    # no image guard here: prepare_sft_workload runs the same record_has_images detection and
+    # calls the capability gate before it loads a processor, so a second copy would be two owners
+    # for one invariant with nothing forcing them to agree.
     return prepare_sft_workload(
         spec,
         raw_environment,
