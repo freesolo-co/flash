@@ -444,6 +444,29 @@ def _image_sft_rejection(env, dataset: list, algorithm: str | None) -> str | Non
     return None
 
 
+def _warn_low_replay_reward(record: dict, reward: float) -> None:
+    """Surface a replayed gold answer the grader scored at or below zero.
+
+    Advisory, not blocking: two different faults produce this same zero, and naming only the grader
+    sends readers to edit a scorer that is working. The gold completion is the other candidate --
+    `sft_completion` defaults to the row's raw `output` (flash/envs/adapter.py), so a dataset whose
+    `output` is a bare value replays that value verbatim, which a grader requiring a wrapper
+    (`\\boxed{}`, a json object, a tag) is right to score zero.
+    """
+    message = (
+        f"replay gold answer scored low (reward={reward:.6f}); "
+        "check the reward function or the gold completion it scored"
+    )
+    print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+    # printed with repr rather than through `_preview`: the whole point of showing this text is to
+    # expose a formatting defect, and `_preview` collapses whitespace and truncates, so a stray
+    # newline or a `\boxed{}` past the cutoff -- exactly the faults this line exists to reveal --
+    # would be invisible. labelled by what it is (the text the grader received) not "gold answer":
+    # when a multi-turn env overrides the response via `final_response_text`, the scored text is
+    # env-authored and calling it the gold answer sends the reader to edit a row never scored.
+    print(f"  scored text: {_scored_text(record)!r}", file=sys.stderr)
+
+
 def _image_sft_episode_rejection(record: dict, algorithm: str | None) -> str | None:
     """Judge an episode's ALREADY-rendered prompt and gold completion, rendering nothing itself.
 
@@ -826,8 +849,8 @@ def cmd_env_test(args) -> int:
     # refuse the combination submit refuses. this command exists so a contract failure costs a
     # local run instead of a rejected submission, and image-bearing sft is rejected at submit --
     # so passing it here would send the user to the one surface that cannot accept it.
-    unsupported = _image_sft_rejection(env, dataset, getattr(args, "algorithm", None))
-    if unsupported:
+    algorithm = getattr(args, "algorithm", None)
+    if unsupported := _image_sft_rejection(env, dataset, algorithm):
         return _err(unsupported)
 
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
@@ -850,11 +873,10 @@ def cmd_env_test(args) -> int:
         except (Exception, SystemExit) as exc:
             failure = str(exc) or exc.__class__.__name__
 
-        # the preflight scan judged this row on its raw fields only, to avoid rendering it twice.
-        # the prompt it built is available now, so an image the environment constructs rather than
-        # declares is caught here -- still before any episode is reported as passing.
-        unsupported = _image_sft_episode_rejection(record, getattr(args, "algorithm", None))
-        if unsupported:
+        # the preflight judged this row on its raw fields only, to avoid rendering it twice. the
+        # prompt and gold it built are available now, so an image the environment constructs
+        # rather than declares is caught here, before any episode is reported as passing.
+        if unsupported := _image_sft_episode_rejection(record, algorithm):
             return _err(unsupported)
 
         reward = record["reward"]
@@ -886,32 +908,7 @@ def cmd_env_test(args) -> int:
                 if reward == 0.0:
                     replayed_zero.append((example, record["state"]))
             if reward <= 0.0:
-                # two different faults produce this same zero, and naming only the grader sends
-                # readers to edit a scorer that is working. the gold completion is the other
-                # candidate: `sft_completion` defaults to the row's raw `output`
-                # (flash/envs/adapter.py), so a dataset whose `output` is a bare value replays that
-                # value verbatim -- which a grader requiring a wrapper (`\boxed{}`, a json object,
-                # a tag) is right to score zero.
-                message = (
-                    f"replay gold answer scored low (reward={reward:.6f}); "
-                    "check the reward function or the gold completion it scored"
-                )
-                print(
-                    render.warn(message) if render.styled() else f"warning: {message}",
-                    file=sys.stderr,
-                )
-                # printed with repr rather than through `_preview`: the whole point of showing this
-                # text is to expose a formatting defect, and `_preview` collapses whitespace and
-                # truncates, so a stray newline or a `\boxed{}` past the cutoff -- exactly the
-                # faults this line exists to reveal -- would be invisible.
-                # labelled by what it is -- the text the grader received -- not "gold answer": when
-                # a multi-turn env overrides the response via `final_response_text`, the scored text
-                # is env-authored and calling it the gold answer sends the reader to edit a dataset
-                # row that was never scored.
-                print(
-                    f"  scored text: {_scored_text(record)!r}",
-                    file=sys.stderr,
-                )
+                _warn_low_replay_reward(record, reward)
         # outside the replay branch above: an `echo` episode has no gold answer to blame, but its
         # scorer can still crash, and `replayed` is then zero so the grpo gate below is disabled
         # too. reporting nothing there let `flash env test` exit PASS while every score came from a
