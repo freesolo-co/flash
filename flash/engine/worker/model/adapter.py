@@ -90,13 +90,24 @@ def prepare_warmstart_adapter_config(config: dict, model_id: str, adapter_dir: s
     actual = set(config.get("target_parameters") or ())
     missing = sorted(required - actual)
     if not missing:
-        # the targets are declared, but peft still cannot bind verl's synthesized module names --
-        # `experts` resolves to the fused `experts` module it rejects outright. our own exports are
-        # stripped at publish, so this only catches a config that reached us another way; leaving
-        # it would trade this validator's "accepted" for a load failure deeper in verl.
-        if adapter_dir and expected_fused_expert_modules(model_id) & {
-            str(m) for m in (config.get("target_modules") or ())
-        }:
+        synthetic = expected_fused_expert_modules(model_id) & {
+            str(module) for module in (config.get("target_modules") or ())
+        }
+        if not adapter_dir:
+            if synthetic:
+                raise ValueError(
+                    f"warm-start adapter for {model_id} retains unloadable synthetic modules "
+                    f"{sorted(synthetic)} and no adapter directory was provided for repair"
+                )
+            return
+        # declarations are not evidence: peft accepts missing adapter keys and initializes them.
+        # prove the weights before stripping the synthetic names that would otherwise fail loudly.
+        if not adapter_has_fused_expert_tensors(adapter_dir, model_id):
+            raise ValueError(
+                f"warm-start adapter for {model_id} does not contain complete fused expert LoRA "
+                "weights"
+            )
+        if synthetic:
             _rewrite_adapter_config(config, model_id, adapter_dir)
         return
     if actual or not adapter_dir or not adapter_has_fused_expert_tensors(adapter_dir, model_id):

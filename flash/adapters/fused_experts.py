@@ -12,6 +12,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from flash.core.catalog import get_model
+
 _QWEN35_EXPERT_TARGET_PARAMETERS = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
@@ -67,21 +69,17 @@ def has_complete_fused_expert_tensors(keys: Iterable[str], model_id: str) -> boo
     targeted parameters yield a fixed ladder of N wrapper paths, while each trained LoRA wrapper
     contributes both ``lora_A`` and ``lora_B`` tensors.
 
-    Coverage is checked per concrete module instance and per transformer layer. Pooling wrapper
-    paths across the adapter would accept two incomplete layers whose union looks complete. Matching
-    only the owner's final segment would also count an unrelated module such as ``router.experts``.
+    Coverage is checked per concrete module instance and against the model catalog's authoritative
+    transformer-layer count. Deriving expected layers from the artifact itself would accept a
+    truncated file that omitted every LoRA tensor for one layer. Pooling wrapper paths across the
+    adapter would likewise accept two incomplete layers whose union looks complete. Matching only
+    the owner's final segment would also count an unrelated module such as ``router.experts``.
     """
     targets = lora_target_parameters(model_id)
     if not targets:
         return False
     tensor_keys = list(keys)
-    expected_layers = {
-        prefix
-        for key in tensor_keys
-        if ".lora_" in key
-        for prefix in [_layer_prefix(key.partition(".lora_")[0])]
-        if prefix is not None
-    }
+    expected_layer_count = get_model(model_id).num_layers
     required_per_owner: dict[str, int] = {}
     for target in targets:
         if "." in target:
@@ -113,15 +111,19 @@ def has_complete_fused_expert_tensors(keys: Iterable[str], model_id: str) -> boo
         for seen in factors.values():
             if any(seen.get(rung, set()) < {"A", "B"} for rung in ladder):
                 return False
-        if expected_layers:
-            expert_layers = {
-                prefix
-                for instance in factors
-                for prefix in [_layer_prefix(instance)]
-                if prefix is not None
-            }
-            if not expected_layers <= expert_layers:
-                return False
+        expert_layers = {
+            prefix
+            for instance in factors
+            for prefix in [_layer_prefix(instance)]
+            if prefix is not None
+        }
+        layer_roots = {prefix.rsplit(".", 1)[0] for prefix in expert_layers}
+        if len(layer_roots) != 1:
+            return False
+        layer_root = next(iter(layer_roots))
+        expected_layers = {f"{layer_root}.{index}" for index in range(expected_layer_count)}
+        if expert_layers != expected_layers:
+            return False
     return True
 
 

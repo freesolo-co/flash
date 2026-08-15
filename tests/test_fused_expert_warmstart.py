@@ -26,14 +26,13 @@ def _write_expert_adapter(directory, *, config, expert_tensors=True):
     keys = ["base_model.model.layers.0.self_attn.q_proj.lora_A.weight"]
     if expert_tensors:
         # peft names a wrapped nn.parameter after its owning module, never after the parameter, and
-        # nests the second wrapper under `base_layer`. both lora factors are written for each: a
-        # delta is `b @ a`, so a wrapper carrying only `lora_a` never trained.
-        keys += [
-            "base_model.model.layers.0.mlp.experts.lora_A.default.weight",
-            "base_model.model.layers.0.mlp.experts.lora_B.default.weight",
-            "base_model.model.layers.0.mlp.experts.base_layer.lora_A.default.weight",
-            "base_model.model.layers.0.mlp.experts.base_layer.lora_B.default.weight",
-        ]
+        # nests the second wrapper under `base_layer`. both lora factors are written for every one
+        # of the model's authoritative 40 layers: a delta is `b @ a`, so a wrapper carrying only
+        # `lora_a` never trained.
+        keys = []
+        for layer in range(40):
+            owner = f"base_model.model.layers.{layer}.mlp.experts"
+            keys += _wrapper_tensors(owner) + _wrapper_tensors(f"{owner}.base_layer")
     header = {key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]} for key in keys}
     encoded = json.dumps(header).encode("utf-8")
     (directory / "adapter_model.safetensors").write_bytes(
@@ -271,9 +270,14 @@ def test_expert_tensor_coverage_is_counted_per_layer_not_pooled(monkeypatch, tmp
     )
     assert not worker.adapter_has_fused_expert_tensors(str(tmp_path), "Qwen/Qwen3.6-35B-A3B")
 
+    # a self-consistent single-layer artifact is still truncated: the model contract says 40.
+    owner = "base_model.model.layers.0.mlp.experts"
+    _expert_keys(tmp_path, _wrapper_tensors(owner) + _wrapper_tensors(f"{owner}.base_layer"))
+    assert not worker.adapter_has_fused_expert_tensors(str(tmp_path), "Qwen/Qwen3.6-35B-A3B")
+
     # every layer complete is accepted, and one degraded layer is enough to reject.
     complete = []
-    for layer in range(3):
+    for layer in range(40):
         owner = f"base_model.model.layers.{layer}.mlp.experts"
         complete += _wrapper_tensors(owner) + _wrapper_tensors(f"{owner}.base_layer")
     _expert_keys(tmp_path, complete)
@@ -319,6 +323,33 @@ def test_declared_targets_still_get_the_unloadable_module_names_stripped(monkeyp
     assert saved["target_modules"] == ["q_proj"]
     # the rewrite is atomic: no temporary file is left beside the config.
     assert not [name for name in os.listdir(tmp_path) if name.endswith(".tmp")]
+
+
+def test_declared_targets_do_not_bypass_tensor_validation(monkeypatch, tmp_path):
+    """a declaration cannot authorize stripping the module names that make peft fail loudly.
+
+    peft accepts missing adapter keys and initializes them, so repairing a declared config before
+    proving the weights turns a loud load failure into a silently altered warm-start experiment.
+    """
+    import json
+
+    worker = _import_worker(monkeypatch)
+    config = {
+        "peft_type": "LORA",
+        "r": 32,
+        "target_modules": ["q_proj", "experts", "base_layer"],
+        "target_parameters": ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
+    }
+    _write_expert_adapter(tmp_path, config=config)
+    # make the artifact incomplete after writing its complete declaration.
+    _expert_keys(tmp_path, _wrapper_tensors("base_model.model.layers.0.mlp.experts"))
+
+    with pytest.raises(ValueError, match="complete fused expert LoRA weights"):
+        worker.prepare_warmstart_adapter_config(config, "Qwen/Qwen3.6-35B-A3B", str(tmp_path))
+
+    assert config["target_modules"] == ["q_proj", "experts", "base_layer"]
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["target_modules"] == ["q_proj", "experts", "base_layer"]
 
 
 def test_expert_tensor_coverage_matches_the_full_owner_path(monkeypatch, tmp_path):
