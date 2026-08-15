@@ -663,10 +663,20 @@ def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> 
     # ordinary model shard in the package -- measured 216 MB of RSS for a 200 MiB non-PDF. `%PDF-`
     # is head-anchored, which is the same rule `_pdf_stream_payloads` applies before it walks, so
     # reading five bytes first decides it without materializing anything.
+    #
+    # A document that really is a PDF is still bounded. Its grammar is not streamable from here --
+    # the trailer names the encryption dictionary, and an object's filters may sit at any offset --
+    # so deciding it means holding it, and a package may legitimately carry a 256 MiB file. Holding
+    # one whole is a second complete copy while the decoded request and the staged file are both
+    # still live: measured 224 MiB of RSS for a 200 MiB PDF against 26 MiB for the same bytes with
+    # a different first line. Beyond the buffer this scan already allows anywhere else, the honest
+    # answer is the one every other oversized container gets -- undecided, not clean.
     if isinstance(source, Path):
         with source.open("rb") as handle:
             if handle.read(len(_PDF_SIGNATURE)) != _PDF_SIGNATURE:
                 return None
+        if source.stat().st_size > _MAX_NESTED_BUFFER_BYTES:
+            raise _Unscannable("contains a document too large to inspect")
     raw = source.read_bytes() if isinstance(source, Path) else source
     try:
         for plain in _pdf_stream_payloads(raw, _MAX_NESTED_BUFFER_BYTES):

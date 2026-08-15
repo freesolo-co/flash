@@ -6666,27 +6666,37 @@ def test_ordinary_binary_is_not_refused_as_an_unfinishable_openpgp_sequence():
 
     Asserted at the chunk size the scan really reads. A 4 KiB probe still shows a residual from the
     two-byte length form, which can only claim 64 KB and so cannot outrun a megabyte chunk.
+
+    The bodies are drawn from a SEEDED generator, and the rate is asserted with a margin rather than
+    at zero. A megabyte of random bytes lands on a walkable header about twice in a thousand -- a
+    real residual, measured at 0.20% before any of this and 0.23% after -- so 64 unseeded draws fail
+    roughly one run in seven, on a property that has not regressed. Seeding makes the verdict a
+    function of the code alone; the margin is what the assertion is actually about, since the point
+    is that ordinary binary is not refused WHOLESALE, as it was at 18.8%.
     """
-    import os
+    import random
 
     from flash.env_buffers import _SCAN_CHUNK_BYTES
     from flash.env_openpgp import _openpgp_secret_key_in_sequence
 
+    bodies = random.Random(20260815)
+    draws = 256
     refused = sum(
         1
-        for _ in range(64)
-        if _openpgp_secret_key_in_sequence(os.urandom(_SCAN_CHUNK_BYTES), truncated=True) is None
+        for _ in range(draws)
+        if _openpgp_secret_key_in_sequence(bodies.randbytes(_SCAN_CHUNK_BYTES), truncated=True)
+        is None
     )
-    assert refused == 0, f"{refused}/64 random chunks refused as an unfinishable sequence"
+    assert refused <= draws // 64, f"{refused}/{draws} random chunks refused as unfinishable"
 
     # the shape that failed CI, pinned exactly: an old-format one-pass signature tag whose 4-byte
     # length declares a body no scan holds. Undecided here is what refused the publish.
-    implausible = b"\x92" + (1 << 31).to_bytes(4, "big") + os.urandom(4096)
+    implausible = b"\x92" + (1 << 31).to_bytes(4, "big") + bodies.randbytes(4096)
     assert _openpgp_secret_key_in_sequence(implausible, truncated=True) is False
 
     # and a body that IS plausible still reports undecided, which is the property being preserved:
     # the fix must not turn "a real packet I could not finish reading" into a confident clean.
-    spanning = b"\x92" + (1 << 20).to_bytes(4, "big") + os.urandom(4096)
+    spanning = b"\x92" + (1 << 20).to_bytes(4, "big") + bodies.randbytes(4096)
     assert _openpgp_secret_key_in_sequence(spanning, truncated=True) is None
 
 
@@ -7503,3 +7513,38 @@ def test_an_escaped_predictor_key_is_still_a_predictor(tmp_path):
         )
         with pytest.raises(_Unscannable, match="cannot undo"):
             credential_in_file(published)
+
+
+def test_a_pdf_larger_than_the_scan_buffer_is_refused(tmp_path):
+    """A real PDF is held whole, so its size has to be bounded like every other container.
+
+    The signature check in front of it stopped an ordinary shard being materialized, but a file
+    that really begins `%PDF-` still reached an unconditional read: a package may carry a 256 MiB
+    document, and holding one is a second complete copy while the decoded request and the staged
+    file are both still live. Measured 224 MiB of RSS for a 200 MiB PDF against 26 MiB for the same
+    bytes with a different first line.
+
+    The grammar is not streamable from here -- the trailer names the encryption dictionary and an
+    object's filters may sit at any offset -- so the bound refuses rather than parsing incrementally,
+    which is the answer every other oversized container already gets.
+    """
+    from flash.env_secrets import _MAX_NESTED_BUFFER_BYTES, _Unscannable, credential_in_file
+
+    def document(payload: bytes) -> bytes:
+        return (
+            b"%PDF-1.7\n1 0 obj\n<< /Length "
+            + str(len(payload)).encode()
+            + b" >>\nstream\n"
+            + payload
+            + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+        )
+
+    oversized = tmp_path / "big.pdf"
+    oversized.write_bytes(document(b"A" * (_MAX_NESTED_BUFFER_BYTES + 1)))
+    with pytest.raises(_Unscannable, match="too large to inspect"):
+        credential_in_file(oversized)
+
+    # a document inside the bound is still scanned rather than refused over its size
+    ordinary = tmp_path / "small.pdf"
+    ordinary.write_bytes(document(b"harmless text"))
+    assert credential_in_file(ordinary) is None
