@@ -762,23 +762,27 @@ def _build_sft_profile(
 def _horizon_reasoning_fields(
     retained: _RetainedSftRows, horizon: _SftStepHorizon
 ) -> dict[str, int]:
-    """The three reasoning counts, totalled over just the rows the optimizer consumes.
+    """The three reasoning counts, plus the row count they were totalled over.
 
     ``retained.row_reasoning`` is index-aligned with the retained rows, so the horizon's row count
     is also its prefix length. An empty prefix -- a horizon of zero updates -- totals zero and
     stays silent, which is correct: a run that performs no update cannot lose reasoning to one.
+
+    The prefix length travels with the counts as ``reasoning_rows``. Both a bounded and an
+    unbounded profile carry the same horizon inputs, so a reader that re-derived this could not
+    tell which it held.
     """
-    consumed = retained.row_reasoning[
-        : horizon_row_count(
-            len(retained.row_reasoning),
-            examples_per_update=horizon.examples_per_update,
-            updates=horizon.authoritative_steps,
-        )
-    ]
+    rows = horizon_row_count(
+        len(retained.row_reasoning),
+        examples_per_update=horizon.examples_per_update,
+        updates=horizon.authoritative_steps,
+    )
+    consumed = retained.row_reasoning[:rows]
     return {
         "authored_reasoning_turns": sum(row.authored_turns for row in consumed),
         "rendered_reasoning_spans": sum(row.rendered_spans for row in consumed),
         "truncated_reasoning_spans": sum(row.truncated_spans for row in consumed),
+        "reasoning_rows": rows,
     }
 
 

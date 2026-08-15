@@ -384,30 +384,31 @@ def horizon_row_count(row_count: int, *, examples_per_update: int, updates: int)
 
 
 def reasoning_warning_rows(profile: object) -> int:
-    """The horizon-bounded row denominator, from a profile OBJECT or its serialized dict.
+    """The row denominator the reasoning counts were totalled over, from a profile OBJECT or dict.
 
     Both shapes are accepted because the same line is rendered from both: the worker holds the
     profile itself, while the CLI only ever sees the dict that travelled on the quote. Serializing
-    an in-memory profile just to read three integers would also compute a content digest for
-    nothing.
+    an in-memory profile just to read an integer would also compute a content digest for nothing.
 
-    Tolerates a profile from an older producer that predates the horizon fields: a missing or
-    non-integer field falls back to the whole retained count, which is what that producer's
-    unbounded reasoning counts were measured over. Pairing its counts with a bounded denominator
-    would be the mismatch this helper exists to prevent.
+    The producer serializes this alongside the counts rather than leaving it to be re-derived. A
+    reader cannot tell a horizon-bounded count from a whole-dataset one by inspection -- both carry
+    ``examples_per_update`` and ``authoritative_steps`` -- so deriving the denominator from those
+    would pair a binding horizon with counts measured over every retained row and report more
+    authored blocks than the rows it names could hold.
+
+    Falls back to the whole retained count when the field is absent, which is what a producer
+    predating it measured its counts over.
     """
 
     def _int(key: str) -> int | None:
         value = profile.get(key) if isinstance(profile, dict) else getattr(profile, key, None)
         return None if isinstance(value, bool) or not isinstance(value, int) else value
 
+    rows = _int("reasoning_rows")
+    if rows is not None:
+        return rows
     retained = _int("retained_examples")
-    if retained is None:
-        return 0
-    per_update, updates = _int("examples_per_update"), _int("authoritative_steps")
-    if per_update is None or updates is None:
-        return retained
-    return horizon_row_count(retained, examples_per_update=per_update, updates=updates)
+    return 0 if retained is None else retained
 
 
 def rendered_reasoning_loss_warning(

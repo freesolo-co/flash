@@ -33,8 +33,10 @@ ROLLOUT_PROFILE_KINDS = ("grpo", "opd")
 # warning; they are digest-free, but `from_dict` requires an exact field set, so a profile cached
 # under 4 cannot be rebuilt and has to re-profile. 6 adds truncated_reasoning_spans, splitting
 # cap-truncated reasoning out from template-stripped reasoning so the warning names the right
-# remedy; same exact-field-set reason a 5 profile cannot be rebuilt.
-WORKLOAD_PROFILE_SCHEMA_VERSION = 6
+# remedy; same exact-field-set reason a 5 profile cannot be rebuilt. 7 serializes reasoning_rows,
+# the denominator those counts were totalled over: under 6 the counts were whole-dataset, so a
+# reader had to infer the denominator and could pair bounded counts with the wrong row count.
+WORKLOAD_PROFILE_SCHEMA_VERSION = 7
 # 2 lets a gdn hybrid pack when the installed stack proves it can reset example boundaries, where 1
 # always answered exact-unpacked. the same config therefore resolves to a different packing_mode and
 # examples_per_update, so a profile cached under 1 quotes a step count this policy would not: it has
@@ -292,6 +294,11 @@ class SftWorkloadProfile:
     authored_reasoning_turns: int = field(default=0, compare=False)
     rendered_reasoning_spans: int = field(default=0, compare=False)
     truncated_reasoning_spans: int = field(default=0, compare=False)
+    # how many retained rows the three counts above were totalled over. serialized rather than
+    # re-derived because a reader cannot tell a bounded count from a whole-dataset one by looking:
+    # both shapes carry examples_per_update and authoritative_steps, so inferring the denominator
+    # from them would pair a binding horizon with counts that predate the bounding.
+    reasoning_rows: int = field(default=0, compare=False)
     schema_version: int = WORKLOAD_PROFILE_SCHEMA_VERSION
     kind: str = SFT_PROFILE_KIND
     # unix seconds stamped by the control-plane profile producer. 0.0 on worker recomputation.
@@ -335,6 +342,7 @@ class SftWorkloadProfile:
             "authored_reasoning_turns": self.authored_reasoning_turns,
             "rendered_reasoning_spans": self.rendered_reasoning_spans,
             "truncated_reasoning_spans": self.truncated_reasoning_spans,
+            "reasoning_rows": self.reasoning_rows,
         }
         for name, value in counts.items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -371,6 +379,10 @@ class SftWorkloadProfile:
             raise ValueError("untruncated max length cannot be smaller than realized max length")
         if self.truncated_examples > self.retained_examples:
             raise ValueError("truncated examples cannot exceed retained examples")
+        # the reasoning counts are totalled over a prefix of the retained rows, so their denominator
+        # cannot name more rows than were retained.
+        if self.reasoning_rows > self.retained_examples:
+            raise ValueError("reasoning rows cannot exceed retained examples")
         # a truncated row is exactly a row longer than the cap, so the two measurements must agree
         # on whether the cap bound at all.
         if bool(self.truncated_examples) != (self.untruncated_max_length > self.max_length):
@@ -417,6 +429,7 @@ class SftWorkloadProfile:
             "authored_reasoning_turns": int(self.authored_reasoning_turns),
             "rendered_reasoning_spans": int(self.rendered_reasoning_spans),
             "truncated_reasoning_spans": int(self.truncated_reasoning_spans),
+            "reasoning_rows": int(self.reasoning_rows),
             "content_digest": self.content_digest,
         }
 

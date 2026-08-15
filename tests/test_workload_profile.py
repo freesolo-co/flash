@@ -127,6 +127,10 @@ def test_content_digest_covers_every_measured_field() -> None:
     different values because it executes ``environment.py`` while the estimate reads raw records.
     Folding them into the digest would fire the profile-drift warning on a run whose billing
     contract never moved. Nothing is authorized off them: they only choose whether a warning prints.
+
+    ``reasoning_rows`` is the denominator those counts were totalled over, so it belongs on the same
+    side of the digest: it moves exactly when they do, and digesting it would reintroduce the drift
+    warning the counts themselves are kept out to avoid.
     """
     base = _profile()
     provenance = {
@@ -134,6 +138,7 @@ def test_content_digest_covers_every_measured_field() -> None:
         "authored_reasoning_turns",
         "rendered_reasoning_spans",
         "truncated_reasoning_spans",
+        "reasoning_rows",
     }
 
     for name in SftWorkloadProfile.__dataclass_fields__:
