@@ -25,7 +25,8 @@ command.
 
 ```bash
 pip install freesolo-flash          # installs the `flash` CLI (import name is also `flash`)
-flash login --api-key fslo_...       # or: export FREESOLO_API_KEY=fslo_...  (create a key at https://freesolo.co)
+export FREESOLO_API_KEY=fslo_...     # create a key at https://freesolo.co
+flash login                          # validates and stores the key without exposing it in argv
 flash whoami                         # confirm the identity behind your key
 flash projects create "my project"     # prints the canonical project UUID
 flash models list                     # supported base model ids
@@ -544,12 +545,11 @@ current hub — both swallow paths are present in every version Flash supports.)
 
 Two more details that make the difference between a probe and a placebo:
 
-- **Pass the same token the export will use.** Flash resolves the export token as
-  `--api-key` > `HF_TOKEN` in the environment > a local `.env` / `.env.local`, and forwards
-  exactly that value. `huggingface_hub` does none of that — with no `token=` it falls back to
-  your ambient cached login, so the probe can pass on one credential while the export fails
-  on a different one. If you are exporting with `--api-key`, or with a token that lives only
-  in `.env`, pass that literal value here.
+- **Pass the same token the export will use.** Prefer `HF_TOKEN` in the environment or a local
+  `.env` / `.env.local`; `--api-key` still wins when supplied, but exposes the token in process
+  listings. Flash forwards exactly the resolved value. `huggingface_hub` does none of that; with
+  no `token=` it falls back to your ambient cached login, so the probe can pass on one credential
+  while the export fails on a different one. Pass the resolved token explicitly to the probe.
 - **Ask for `private=True`.** The real export creates the repo private and only flips it
   public afterwards if you passed `--public`. A probe that omits this can leave a brand-new
   repo publicly visible until the export catches up, and it fails outright under an org
@@ -683,7 +683,7 @@ spending another GPU run:
 | Wrong identity spends the money                              | Push/train lands in an org you did not expect, or a run id you know is valid comes back "unknown"                                                                                        | `FREESOLO_API_KEY` in the environment silently overrides `flash login`. Run `flash whoami` first. Run visibility is scoped to the key that created the run, so archive result baselines to disk rather than relying on `flash runs list` to find them later.                                                                                                                                                                    |
 | `flash env test` passes but the run trains on the wrong data | Local validation is green; the remote run loads a different split                                                                                                                        | `flash env test` loads `environment.py` with **no** `[environment.params]`, so a params-driven split selection is not exercised. Assert the split inside your own test, or default to the split you actually train on.                                                                                                                                                                                                          |
 | Final checkpoint regresses                                   | Last step is worse than an earlier checkpoint                                                                                                                                            | Run `flash runs checkpoint <run-id>`, deploy a specific step with `flash models deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter.                                                                                                                                                                                                                                     |
-| Export fails before upload                                   | CLI says no HuggingFace token                                                                                                                                                            | Pass `flash models export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`.                                                                                                                                                                                                                                                                          |
+| Export fails before upload                                   | CLI says no HuggingFace token                                                                                                                                                            | Set `HF_TOKEN` in your shell, `.env`, or `.env.local`, then run `flash models export`; avoid `--api-key` because argument values are visible in process listings. Exports are private unless you pass `--public`.                                                                                                                                                                                                               |
 | Exported adapter is a silent no-op locally                   | peft warns about missing adapter keys and local eval matches the bare base model                                                                                                         | The adapter's key namespace does not match the loaded model class. `model.layers.*` keys pair with `AutoModelForCausalLM`; `model.language_model.layers.*` keys pair with `Qwen3_5ForConditionalGeneration` / `Qwen3_5MoeForConditionalGeneration` (via `AutoModelForImageTextToText`). See "Loading an exported adapter locally".                                                                                              |
 | SFT loss improves but quality does not                       | Train loss falls while held-out behavior stalls or degrades                                                                                                                              | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes.                                                                                                                                                                                                                                                                             |
 | Cost surprises                                               | A quick experiment uses more GPU time than intended                                                                                                                                      | Start with `--dry-run` and `--cost`, keep `epochs` and `max_examples` small for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time.                                                                                                                                                                                     |
@@ -1077,7 +1077,7 @@ in a sensible value, so only override with a reason.
 | Knob                           | Convention                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `group_size`                   | Completions sampled per prompt (default 8). More = more signal and more cost; drop to 4 to trim cost. The group needs _within-group variance_ for an advantage to exist.                                                                                                                                                                                                                                          |
-| `max_completion_tokens`        | Completion budget per rollout. Size it to the expected output length; too small silently truncates good answers and poisons the reward, while too large just costs more.                                                                                                                                                                                                                                          |
+| `max_completion_tokens`        | Completion cap for each model turn, not the whole episode. In multi-turn runs every turn gets the full cap again, while the whole transcript (all model turns plus environment replies) must fit inside `max_context_tokens`. Size `max_context_tokens` for the whole episode, not just one turn; an undersized turn cap silently truncates good answers and poisons the reward.                                  |
 | `temperature`                  | Rollout sampling temperature. Keep it near 1.0 for GRPO — too low collapses diversity (and the model can collapse within a few steps); raise it to widen exploration against uniform-reward groups.                                                                                                                                                                                                               |
 | `kl_penalty_coef`              | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move.                                                                                                                                                                                                                                                                      |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
@@ -1085,10 +1085,23 @@ in a sensible value, so only override with a reason.
 | `prompts_per_step`             | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
 | `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
-For thinking models, `max_completion_tokens` is shared between `<think>` reasoning and the final
-answer or action, so undersizing it can truncate the action and teach the model to stop reasoning;
-watch `truncation_rate`, which counts completions not ending in EOS and is not strictly
-`finish_reason=length` when stop sequences or multi-turn rollouts are involved.
+For thinking models, each turn's `max_completion_tokens` is shared between `<think>` reasoning and
+its final answer or action, so undersizing it can truncate the action and teach the model to stop
+reasoning. In multi-turn runs, also size `max_context_tokens` for the accumulated transcript or later
+turns can run out of context. Watch `truncation_rate`, but know what it measures on each algorithm.
+In OPD it counts model turns that did not end in EOS or a configured stop, and OPD additionally
+reports a per-step `discarded_rollouts` count alongside it. In GRPO it comes from verl's
+episode-level clipping, so a single turn hitting the cap does not raise it on its own: that turn
+ends the episode early, which leaves the concatenated response short of the widened capacity verl
+measures against. On multi-turn GRPO, treat a zero rate as "no episode filled its response budget",
+not as "no turn was cut off", and read episode length against the environment's turn limit instead.
+
+Neither metric detects the other way `max_context_tokens` shortens an episode. When an environment
+reply would leave no room to generate, both multi-turn loops stop _before_ dispatching the next
+turn. The last model turn ended normally, so nothing is counted as truncated and the episode simply
+ends early. A run can therefore train on systematically shortened trajectories at
+`truncation_rate = 0`. If episodes are ending sooner than the environment's turn limit, suspect the
+context budget rather than the turn cap.
 
 > **On a derived horizon, `prompts_per_step` buys optimizer steps cheaply.** `prompts_per_step`
 > overrides the tuned prompts-per-step. Total generated tokens are
@@ -1103,8 +1116,11 @@ watch `truncation_rate`, which counts completions not ending in EOS and is not s
 > one; jumping straight to ~80 steps without reading the short run trades one uninformative
 > run for a longer, more expensive one.
 >
-> Two things break the flat-cost approximation, so treat it as a hypothesis to check, not a
-> rule. **`[train] max_steps` overrides the derived horizon**: with it set the step count is
+> Three things break the flat-cost approximation, so treat it as a hypothesis to check, not a
+> rule. **The equation counts one model turn per prompt**: in a multi-turn run every turn gets
+> the full `max_completion_tokens` again, so an episode generates up to that cap times its turn
+> count (bounded by `max_context_tokens`), and the real token bill is a multiple of the estimate.
+> **`[train] max_steps` overrides the derived horizon**: with it set the step count is
 > exactly what you asked for, lowering `prompts_per_step` does not add steps at all, and you
 > simply train on fewer prompts. And per-step cost is not purely token-proportional —
 > GRPO reward waves and OPD teacher calls add latency per step, so multiplying steps can
@@ -1264,6 +1280,15 @@ targeted fix rather than leaning on the reward gate to slowly select against it.
 | Uniform-reward groups                               | every rollout in a group scores the same → no gradient                                   | shape the reward for partial credit; raise `temperature`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Too-hard prompts                                    | the base never succeeds, reward stays at 0                                               | curriculum / easier prompts; warm-start with SFT                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Judge-rewarded degenerate output                    | short, templated answers a judge still rates well                                        | a minimum-substance zero-gate ahead of the judge                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+
+In OPD, a model turn that reaches its cap without EOS or a configured stop is classified as
+truncated, ends the episode, and is dropped before teacher scoring. If every rollout in a step is
+dropped, the step fails with `produced no aligned teacher signal`. Partial dropping is more dangerous:
+it can silently bias training toward shorter episodes, so monitor the per-step `truncation_rate` and
+`discarded_rollouts` metrics rather than relying on the loss alone. Read them as a sampled indicator,
+not a ledger: heartbeats are throttled, so a step that finishes shortly after the previous one does
+not publish its own values, and a nonzero reading means truncation pressure around that point in the
+run rather than an exact count for that step.
 
 ---
 

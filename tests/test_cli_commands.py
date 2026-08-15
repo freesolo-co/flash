@@ -1063,6 +1063,24 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
     assert "bad-key" not in err
 
 
+def test_login_api_key_argument_warns_but_environment_route_does_not(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+
+    assert _run(["login", "--api-key", "fs_secret"]) == 0
+    err = capsys.readouterr().err
+    assert "visible in process listings" in err
+    assert "FREESOLO_API_KEY" in err
+    assert "fs_secret" not in err
+
+    monkeypatch.setenv("FREESOLO_API_KEY", "fs_env_secret")
+    assert _run(["login"]) == 0
+    err = capsys.readouterr().err
+    assert "visible in process listings" not in err
+    assert "fs_env_secret" not in err
+
+
 def test_identity_render_is_ascii_locale_safe(monkeypatch) -> None:
     # Under an ASCII / non-UTF-8 stdout, neither a non-ASCII identity value nor our own
     # punctuation may raise UnicodeEncodeError after a login has already succeeded.
@@ -1305,11 +1323,14 @@ def test_train_live_and_dry_run_send_the_same_sparse_spec(fake_client, tmp_path,
     assert calls[1][4] == calls[0][4]
 
 
-def test_status_runs_and_log_command(fake_client, capsys) -> None:
+def test_status_runs_and_log_command(fake_client, capsys, monkeypatch) -> None:
     assert _run(["runs", "status", "flash-1"]) == 0
     out = capsys.readouterr().out
     assert "done" in out
     assert "cost_usd" in out
+
+    assert _run(["runs", "status", "flash-1", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["run_id"] == "flash-1"
 
     assert _run(["runs", "list"]) == 0
     out = capsys.readouterr().out
@@ -1322,6 +1343,23 @@ def test_status_runs_and_log_command(fake_client, capsys) -> None:
     out = capsys.readouterr().out
     assert "cost_usd" in out
     assert "hello from the worker" not in out
+
+    assert _run(["runs", "status", "flash-1", "--follow", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "done"
+
+    statuses = iter(
+        [
+            {"run_id": "flash-1", "state": "running"},
+            {"run_id": "flash-1", "state": "done"},
+        ]
+    )
+    monkeypatch.setattr(fake_client, "get_run", lambda _run_id: next(statuses))
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    assert _run(["runs", "status", "flash-1", "--follow", "--json"]) == 0
+    assert [json.loads(line)["state"] for line in capsys.readouterr().out.splitlines()] == [
+        "running",
+        "done",
+    ]
 
     assert _run(["runs", "log", "flash-1"]) == 0
     out = capsys.readouterr().out
@@ -1541,6 +1579,7 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
         "frac_reward_zero_std": 0.25,
         "mean_completion_tokens": 48.5,
         "truncation_rate": 0.125,
+        "discarded_rollouts": 1,
         "max_completion_tokens": 256,
     }
     metric_two = {
@@ -1553,6 +1592,7 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
         "frac_reward_zero_std": 0.0,
         "mean_completion_tokens": 51.0,
         "truncation_rate": 0.25,
+        "discarded_rollouts": 2,
         "max_completion_tokens": 256,
     }
 
@@ -1600,11 +1640,11 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
     assert metric_lines == [
         (
             "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
-            "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256"
+            "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 discarded=1 max_comp_tokens=256"
         ),
         (
             "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
-            "comp_len=51 trunc=0.25 max_comp_tokens=256"
+            "comp_len=51 trunc=0.25 discarded=2 max_comp_tokens=256"
         ),
     ]
 
@@ -1702,6 +1742,8 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     deployments_out = capsys.readouterr().out
     assert "flash-1" in deployments_out
     assert "REVISION" in deployments_out
+    assert "OPENAI BASE URL" in deployments_out
+    assert "https://serve.example/v1" in deployments_out
 
     assert _run(["models", "undeploy", "flash-1"]) == 0
     assert ("undeploy", "flash-1") in fake_client.calls
@@ -1726,6 +1768,19 @@ def test_deployments_json_empty_list(fake_client, monkeypatch, capsys) -> None:
     monkeypatch.setattr(fake_client, "deployments", list)
     assert _run(["models", "deployments", "--json"]) == 0
     assert capsys.readouterr().out.strip() == "[]"
+
+
+def test_deployments_without_base_url_renders_placeholder(fake_client, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        fake_client,
+        "deployments",
+        lambda: [{"run_id": "flash-old", "deployment": {"state": "ready"}}],
+    )
+    assert _run(["models", "deployments"]) == 0
+    out = capsys.readouterr().out
+    assert "flash-old" in out
+    assert "OPENAI BASE URL" in out
+    assert "  -" in out
 
 
 def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
@@ -2466,7 +2521,10 @@ def test_submit_payload_carries_authored_pip_and_the_worker_appends_it(
 
 def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeypatch) -> None:
     # The --api-key flag is the destination HF token; checkpoint refs and --public are forwarded.
+    from flash.cli.commands import deploy as cli_deploy
+
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(cli_deploy, "_hf_identity_and_write_access", lambda *_: "me")
     assert (
         _run(
             [
@@ -2485,15 +2543,25 @@ def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeyp
     )
     assert ("export", "flash-1/step-40", "me/adapters", "hf_flag", False) in fake_client.calls
     # The destination repo / url are reported back to the user.
-    out = capsys.readouterr().out
-    assert "me/adapters" in out
+    captured = capsys.readouterr()
+    assert "me/adapters" in captured.out
+    assert "visible in process listings" in captured.err
+    assert "hf_flag" not in captured.err
 
 
-def test_export_reads_hf_token_from_env_and_defaults_private(fake_client, monkeypatch) -> None:
+def test_export_reads_hf_token_from_env_and_defaults_private(
+    fake_client, monkeypatch, capsys
+) -> None:
     # No --api-key: the token resolves from HF_TOKEN, and the repo defaults to private.
+    from flash.cli.commands import deploy as cli_deploy
+
     monkeypatch.setenv("HF_TOKEN", "hf_env")
+    monkeypatch.setattr(cli_deploy, "_hf_identity_and_write_access", lambda *_: "me")
     assert _run(["models", "export", "--adapter-id", "flash-1", "--repository", "me/adapters"]) == 0
     assert ("export", "flash-1", "me/adapters", "hf_env", True) in fake_client.calls
+    err = capsys.readouterr().err
+    assert "visible in process listings" not in err
+    assert "hf_env" not in err
 
 
 def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, tmp_path) -> None:
@@ -2506,6 +2574,682 @@ def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, t
     assert "HuggingFace token" in err
     # The control plane is never contacted when there's no token to send.
     assert not any(call[0] == "export" for call in fake_client.calls)
+
+
+def test_export_rejects_unwritable_namespace_before_control_plane(
+    fake_client, monkeypatch, capsys
+) -> None:
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {"name": "alice", "orgs": [], "auth": {"accessToken": {"role": "write"}}}
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "bob/adapters",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "account alice" in err
+    assert "namespace bob" in err
+    assert "hf_secret" not in err
+    assert not any(call[0] == "export" for call in fake_client.calls)
+
+
+def test_export_allows_an_org_contributor_who_can_write_the_exact_repo(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """The exact-repo permission outranks the coarse org role, so it has to be asked first.
+
+    A `contributor` in `acme` is not `write`/`admin` org-wide, but auth_check says this token can
+    write this very repo. Consulting the role first would refuse an export the Hub allows.
+    """
+    import sys
+    import types
+
+    reached: dict[str, bool] = {"auth_check": False}
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "contributor"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
+            reached["auth_check"] = True
+            return
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    assert reached["auth_check"], "the exact-repo check must run before the org role decides"
+    assert any(call[0] == "export" for call in fake_client.calls)
+    assert "hf_secret" not in capsys.readouterr().err
+
+
+def test_export_allows_an_org_contributor_on_a_hub_too_old_for_the_write_probe(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """`auth_check(..., write=True)` landed in huggingface-hub 1.5, but this package supports >=1.2.
+
+    On 1.2-1.4 there is no exact write probe, so the guard skips it. What follows are CREATION
+    rules, and they must not run for a destination that already exists: an `acme` contributor who
+    can write `acme/model` would be refused on a supported hub version.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "contributor"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        # the pre-1.5 signature: present, but with no `write` parameter to ask for write access.
+        def auth_check(self, repo_id, *, repo_type=None, token=None):
+            return
+
+        def repo_exists(self, repo_id, *, repo_type=None, token=None):
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.4.0"),
+    )
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    assert any(call[0] == "export" for call in fake_client.calls)
+    err = capsys.readouterr().err
+    assert "1.4.0" in err, "the unverified export must say which hub could not check it"
+    assert "hf_secret" not in err
+
+
+def test_export_still_applies_creation_rules_on_an_old_hub_when_the_repo_is_absent(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """The old-hub bypass is scoped to an EXISTING destination.
+
+    A repo that is not there yet is genuinely being created, so the namespace rules still decide.
+    Skipping them here would turn a missing exact probe into a way to create a repo in an org this
+    token has no write access to -- the wrong-namespace export this preflight exists to stop.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "contributor"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        def auth_check(self, repo_id, *, repo_type=None, token=None):
+            return
+
+        def repo_exists(self, repo_id, *, repo_type=None, token=None):
+            return False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.4.0"),
+    )
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    assert not any(call[0] == "export" for call in fake_client.calls)
+    err = capsys.readouterr().err
+    assert "cannot create" in err
+    assert "hf_secret" not in err
+
+
+def test_export_keeps_the_creation_rules_when_existence_is_inconclusive(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """An unanswered existence lookup must not buy a bypass of the namespace rules.
+
+    The old-hub branch skips the creation rules on the grounds that an EXISTING repo is not being
+    created. Extending that to a lookup that merely failed would let any transient Hub error carry
+    an export into a namespace nothing verified -- the wrong-namespace export this preflight exists
+    to stop. Being denied a bypass costs a `contributor` one retry; granting it wrongly is silent.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "contributor"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        # the pre-1.5 signature: no `write` parameter, so there is no exact write probe.
+        def auth_check(self, repo_id, *, repo_type=None, token=None):
+            return
+
+        def repo_exists(self, repo_id, *, repo_type=None, token=None):
+            raise OSError("hub unreachable")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.4.0"),
+    )
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    assert not any(call[0] == "export" for call in fake_client.calls)
+    err = capsys.readouterr().err
+    assert "cannot create" in err
+    assert "hf_secret" not in err
+
+
+def test_export_proceeds_when_the_exact_repo_probe_cannot_reach_the_hub(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A timeout or DNS failure from `auth_check` is not a verdict on the token's permissions.
+
+    Reporting it as "cannot write to <repo>" blames the user's access for a network fault, and the
+    upload runs on the control plane regardless. The whoami path above already degrades this way.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "write"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
+            raise OSError("temporary failure in name resolution")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.27.0"),
+    )
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    assert any(call[0] == "export" for call in fake_client.calls)
+    err = capsys.readouterr().err
+    assert "cannot write to" not in err, "an unreachable Hub must not read as a permission verdict"
+    assert "hf_secret" not in err
+
+
+def test_export_warning_does_not_echo_the_token_from_a_hub_exception(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """The degrade warnings quote the exception, and a local credential rejection quotes the token.
+
+    httpx raises `Illegal header value b'Bearer <token>'` for a token with an internal newline, so
+    interpolating the exception verbatim prints the credential into stderr, logs and bug reports.
+
+    The token here holds a REAL newline and the exception renders the ESCAPED form, which is what
+    httpx actually does -- it builds that message from the header bytes. An earlier version of this
+    test passed a token with no newline against a message containing a literal backslash-n, so the
+    two happened to match and a redaction that only replaced the exact token looked correct.
+    """
+    import sys
+    import types
+
+    token = "hf_secret\nINJECT"
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "write"}],
+                "auth": {"accessToken": {"role": "write"}},
+            }
+
+        def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
+            # the bytes repr of the header, escapes and all, exactly as httpx renders it.
+            raise ValueError(f"Illegal header value {b'Bearer ' + token.encode()!r}")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.27.0"),
+    )
+    _run(
+        [
+            "models",
+            "export",
+            "--adapter-id",
+            "flash-1",
+            "--repository",
+            "acme/model",
+            "--api-key",
+            token,
+        ]
+    )
+    err = capsys.readouterr().err
+    assert "hf_secret" not in err, "the escaped rendering must be redacted too"
+    assert "INJECT" not in err
+    # the exception is still shown: it is the only clue to what actually failed.
+    assert "Illegal header value" in err
+
+
+def test_export_treats_a_rate_limit_or_outage_as_no_answer_but_still_obeys_a_verdict(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """429 and 5xx describe the Hub; 401/403 describe this token. Only the latter may block.
+
+    Rate limiting and outages are transport facts, so refusing the export on them blames the user's
+    access for the Hub being busy. The distinction is the whole reason the check keys on the status
+    rather than on "an exception happened", so both sides of the boundary are pinned here.
+    """
+    import sys
+    import types
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    def run_with(status):
+        class FakeHfApi:
+            def whoami(self, token):
+                return {
+                    "name": "alice",
+                    "orgs": [{"name": "acme", "role": "write"}],
+                    "auth": {"accessToken": {"role": "write"}},
+                }
+
+            def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
+                error = RuntimeError(f"hub said {status}")
+                error.response = Response(status)
+                raise error
+
+        monkeypatch.setitem(
+            sys.modules,
+            "huggingface_hub",
+            types.SimpleNamespace(HfApi=FakeHfApi, __version__="1.27.0"),
+        )
+        fake_client.calls.clear()
+        code = _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        capsys.readouterr()
+        return code
+
+    # 408 and 425 carry a response, so they arrive here with a status rather than through the
+    # statusless path -- but a request timeout and a too-early replay are transport outcomes, not
+    # statements about this token's access.
+    for transient in (408, 425, 429, 500, 503):
+        assert run_with(transient) == 0, f"{transient} is about the Hub, not about this token"
+    for verdict in (401, 403):
+        assert run_with(verdict) == 1, f"{verdict} answers the permission question and must block"
+
+
+def test_export_refuses_a_gated_destination_instead_of_treating_it_as_creatable(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """GatedRepoError subclasses RepositoryNotFoundError, so "gated" must be subtracted from "missing".
+
+    A gated repo exists and this token may not write it. Reading it as absent would hand it to the
+    create-permission paths, which are weaker.
+    """
+    import sys
+    import types
+
+    from huggingface_hub.utils import GatedRepoError
+
+    # a real GatedRepoError, because the point of this test is that the hub makes it a SUBCLASS of
+    # RepositoryNotFoundError. it needs a response carrying `request`/`headers` or its own
+    # constructor raises, and that AttributeError would block for the wrong reason -- passing the
+    # test while never exercising the gated branch at all.
+    response = type(
+        "R",
+        (),
+        {"status_code": 403, "headers": {}, "request": type("Q", (), {"headers": {}})()},
+    )()
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {"name": "alice", "orgs": [], "auth": {"accessToken": {"role": "write"}}}
+
+        def auth_check(self, repo_id, *, repo_type=None, token=None, write=False):
+            raise GatedRepoError("gated", response=response)
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "someone/gated-model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "cannot write" in err
+    assert "hf_secret" not in err
+    assert not any(call[0] == "export" for call in fake_client.calls)
+
+
+def test_export_proceeds_when_the_hub_cannot_be_reached(fake_client, monkeypatch, capsys) -> None:
+    """An unreachable Hub is not a verdict. The copy runs on the control plane, not on this host.
+
+    Blocking here would make a CLI host without Hub egress unable to export at all, while the same
+    command skips the check entirely when huggingface_hub is merely absent.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            raise OSError("[Errno -3] Temporary failure in name resolution")
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "alice/adapters",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    err = capsys.readouterr().err
+    assert "could not reach HuggingFace" in err
+    assert "hf_secret" not in err
+    assert any(call[0] == "export" for call in fake_client.calls)
+
+
+def test_export_still_refuses_a_token_the_hub_rejected(fake_client, monkeypatch, capsys) -> None:
+    """The other half of the same branch: a real answer from the Hub must still block."""
+    import sys
+    import types
+
+    class Rejected(Exception):
+        """A hub error shape carrying a real status: the Hub answered, and the answer was no."""
+
+        def __init__(self) -> None:
+            super().__init__("unauthorized")
+            self.response = type("R", (), {"status_code": 401, "headers": {}})()
+
+    class FakeHfApi:
+        def whoami(self, token):
+            raise Rejected
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "alice/adapters",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "rejected the token" in err
+    assert "hf_secret" not in err
+    assert not any(call[0] == "export" for call in fake_client.calls)
+
+
+def test_export_rejects_fine_grained_scope_for_a_different_namespace(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """A write scope on the token's own repo says nothing about the org it is exporting into.
+
+    alice can write in `acme` by org role, so the namespace gate passes, but her only fine-grained
+    grant covers `alice/*`. Crediting it because it is user-typed would wave through exactly the
+    wrong-namespace export this preflight exists to stop.
+    """
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "write"}],
+                "auth": {
+                    "accessToken": {
+                        "role": "fineGrained",
+                        "fineGrained": {
+                            "global": [],
+                            "scoped": [
+                                {
+                                    "entity": {"name": "alice", "type": "user"},
+                                    "permissions": ["repo.write"],
+                                }
+                            ],
+                        },
+                    }
+                },
+            }
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/secret-model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "acme/secret-model" in err
+    assert "hf_secret" not in err
+    assert not any(call[0] == "export" for call in fake_client.calls)
+
+
+def test_export_accepts_fine_grained_scope_naming_the_destination(
+    fake_client, monkeypatch, capsys
+) -> None:
+    """The same shape, scoped to the destination org, is the case that must still export."""
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {
+                "name": "alice",
+                "orgs": [{"name": "acme", "role": "write"}],
+                "auth": {
+                    "accessToken": {
+                        "role": "fineGrained",
+                        "fineGrained": {
+                            "global": [],
+                            "scoped": [
+                                {
+                                    "entity": {"name": "acme", "type": "org"},
+                                    "permissions": ["repo.write"],
+                                }
+                            ],
+                        },
+                    }
+                },
+            }
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "acme/secret-model",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    assert any(call[0] == "export" for call in fake_client.calls)
+    assert "hf_secret" not in capsys.readouterr().err
+
+
+def test_export_matching_namespace_proceeds_after_preflight(
+    fake_client, monkeypatch, capsys
+) -> None:
+    import sys
+    import types
+
+    class FakeHfApi:
+        def whoami(self, token):
+            return {"name": "alice", "orgs": [], "auth": {"accessToken": {"role": "write"}}}
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeHfApi))
+    assert (
+        _run(
+            [
+                "models",
+                "export",
+                "--adapter-id",
+                "flash-1",
+                "--repository",
+                "alice/adapters",
+                "--api-key",
+                "hf_secret",
+            ]
+        )
+        == 0
+    )
+    assert ("export", "flash-1", "alice/adapters", "hf_secret", True) in fake_client.calls
+    err = capsys.readouterr().err
+    assert "account alice" in err
+    assert "hf_secret" not in err
+
+
+def test_export_without_huggingface_hub_skips_preflight(fake_client, monkeypatch) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def missing_hub(name, *args, **kwargs):
+        if name == "huggingface_hub":
+            raise ModuleNotFoundError(name="huggingface_hub")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_hub)
+    monkeypatch.setenv("HF_TOKEN", "hf_env")
+    assert _run(["models", "export", "--adapter-id", "flash-1", "--repository", "me/adapters"]) == 0
+    assert ("export", "flash-1", "me/adapters", "hf_env", True) in fake_client.calls
 
 
 def test_deploy_enqueues_server_side_verification(fake_client, capsys) -> None:

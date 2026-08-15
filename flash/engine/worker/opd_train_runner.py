@@ -16,8 +16,10 @@ from typing import Any
 
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
-from flash.engine.worker.train.core import step_timing
-from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
+from flash.engine.worker.verl.parallelism import (
+    ULYSSES_SEQUENCE_PARALLEL_SIZE,
+    resolve_reshard_after_forward,
+)
 
 
 @dataclass(frozen=True)
@@ -89,9 +91,6 @@ class _ChildCallbacks:
     on_step: Any
     child_heartbeat: Any
     liveness_fields: Any
-    # timing alone, without the stall-tail fields liveness_fields adds: the checkpoint heartbeat
-    # wants the pace it would otherwise blank, not this stage's liveness diagnostics.
-    step_timing_fields: Any
     progress: dict[str, Any]
     wandb_link: dict[str, str | None]
     child_tail: Any
@@ -534,6 +533,16 @@ def _write_child_shims(
     return entry_path, reward_path
 
 
+def _spec_gpu_type(spec: Any) -> str:
+    """The card class the run landed on, from the spec the caller passed.
+
+    Absent spec or absent gpu table answers "", which the zero-2 gate reads as "unknown hardware"
+    and falls closed to zero-3 on. Guessing a card here would price the gate off hardware the run
+    may not have.
+    """
+    return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
+
+
 def _build_base_config(
     request: _OpdRequest,
     prompt_state: _PromptState,
@@ -561,6 +570,22 @@ def _build_base_config(
         "n_gpus_per_node": runtime.gpu_count,
         # opd shards by DATA -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why.
         "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
+        # zero-2 vs zero-3, decided by the allocator's own fit model so the worker cannot spend
+        # memory the shape was not admitted with. the spec carries the SELECTED class and count
+        # (`_spec_with_gpu`), so this asks about the hardware the run actually landed on.
+        # read it off `request.spec` like every other spec lookup here: the caller may pass a spec
+        # that is NOT the process-global JOB_SPEC (`opd_train.py`: `spec or _w.JOB_SPEC`), and
+        # sizing the gate off different hardware than the run uses is the exact allocator/worker
+        # divergence this gate exists to prevent.
+        "reshard_after_forward": resolve_reshard_after_forward(
+            model_id=request.model_id,
+            algorithm="opd",
+            gpu_type=_spec_gpu_type(getattr(request, "spec", None)),
+            n_gpus=int(runtime.gpu_count),
+            train=getattr(getattr(request, "spec", None), "train", None),
+            thinking=bool(_opd_train._w.THINKING),
+            model_revision=str(getattr(request, "model_revision", "") or ""),
+        ),
         "seed": _opd_train._w.backend_seed(_opd_train._w.SEED),
         "project_name": runtime.project_name,
         "experiment_name": runtime.experiment_name,
@@ -589,26 +614,15 @@ def _build_child_callbacks(
     progress_state: Any,
     bridge: Any,
     resume_step: int,
-    total_steps: int = 0,
 ) -> _ChildCallbacks:
     progress = {
         "step": resume_step,
         "loss": None,
         "truncation_rate": None,
+        "discarded_rollouts": None,
         "truncation_step": None,
     }
     wandb_link: dict[str, str | None] = {}
-    # opd tracked one training-start timestamp and a cumulative wall only, neither readable per
-    # step. this measures the spans between optimizer updates, which is what a projection needs.
-    step_clock = step_timing.StepClock()
-
-    def step_timing_fields() -> dict[str, float | bool]:
-        return step_timing.step_timing_fields(
-            step_clock,
-            current_step=int(progress["step"] or 0),
-            total_steps=total_steps,
-            remaining_wall_seconds=_opd_train._w._remaining_worker_wall_seconds(),
-        )
 
     def on_line(line: str) -> None:
         watcher.raise_if_failed()
@@ -629,41 +643,24 @@ def _build_child_callbacks(
             # when NO step ever produced a distillation loss.
             return
         progress["loss"] = loss
-        progress["truncation_rate"] = progress_state.record_step(step_number, loss, bridge)
+        (
+            progress["truncation_rate"],
+            progress["discarded_rollouts"],
+        ) = progress_state.record_step(step_number, loss, bridge)
         progress["truncation_step"] = step_number
 
     def on_step(step: int) -> None:
         progress["step"] = step
-        step_clock.record(time.monotonic(), step)
         payload = {"step": step}
         if progress["loss"] is not None:
             payload["loss"] = progress["loss"]
         if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
             payload["truncation_rate"] = progress["truncation_rate"]
-        # same as SFT: a heartbeat that blocks the stdout loop defers the next step line's timestamp,
-        # so that span is not a step. measured, not inferred from the return value -- a failed upload
-        # and a 30s wait on the upload lock both block and both report "not committed".
-        started = time.monotonic()
-        _opd_train._w.heartbeat("opd_step", **payload, **step_timing_fields())
-        ended = time.monotonic()
-        step_clock.note_if_blocked(ended - started, ended)
+            payload["discarded_rollouts"] = progress["discarded_rollouts"]
+        _opd_train._w.heartbeat("opd_step", **payload)
 
     def child_heartbeat() -> None:
-        # see liveness_fields below: an upload replaces the published snapshot, so every ping that
-        # can win the shared step slot has to carry the timing or a measured pace disappears.
-        #
-        # and timed like the on_step upload above: this one also runs inside run_verl_training's
-        # reader loop, so blocking here defers the next step line's timestamp. it fires from a
-        # non-step line, so the on_step guard never covers it.
-        started = time.monotonic()
-        _opd_train._w.heartbeat(
-            "opd_step",
-            liveness=True,
-            step=int(progress["step"] or 0),
-            **step_timing_fields(),
-        )
-        ended = time.monotonic()
-        step_clock.note_if_blocked(ended - started, ended)
+        _opd_train._w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
 
     child_tail = _opd_train.ChildOutputTail()
     # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside
@@ -671,21 +668,15 @@ def _build_child_callbacks(
     tail_staleness = _opd_train.ChildTailStaleness()
 
     def liveness_fields() -> dict[str, object]:
-        # this daemon shares the step heartbeat's upload slot, so a tick that wins it must carry the
-        # step timing too, or a published step alternates between having the measurement and not.
-        return {
-            **_opd_train.stall_tail_fields(
-                int(progress["step"] or 0), child_tail, staleness=tail_staleness
-            ),
-            **step_timing_fields(),
-        }
+        return _opd_train.stall_tail_fields(
+            int(progress["step"] or 0), child_tail, staleness=tail_staleness
+        )
 
     return _ChildCallbacks(
         on_line,
         on_step,
         child_heartbeat,
         liveness_fields,
-        step_timing_fields,
         progress,
         wandb_link,
         child_tail,
@@ -703,13 +694,7 @@ def _run_child(
     overrides = _opd_train.build_opd_overrides(config)
     progress_state = _opd_train._OpdProgressState(runtime.resume_state)
     watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state)
-    callbacks = _build_child_callbacks(
-        watcher,
-        progress_state,
-        runtime.bridge,
-        runtime.resume_step,
-        total_steps=workload.update_horizon,
-    )
+    callbacks = _build_child_callbacks(watcher, progress_state, runtime.bridge, runtime.resume_step)
     child_env = _build_child_env(request, prompt_state, workload, runtime, eos_token_ids)
     command = [runtime.python_bin, runtime.entry_path, *overrides]
     gpu_sampler = _opd_train._NvidiaSmiPeakSampler().start()
@@ -717,31 +702,26 @@ def _run_child(
     return_code = 0
     training_completed = runtime.resume_step >= workload.update_horizon
     watcher.start()
-    # also read by the checkpoint heartbeat, which is unthrottled and arms the throttle this stage
-    # shares -- see publishing_step_timing. opened OUTSIDE the try so it spans the watcher drain in
-    # the finally: that drain uploads the final checkpoint, and unregistering first would publish
-    # the run's last save with no pace and arm the throttle behind it.
-    with _opd_train.publishing_step_timing(callbacks.step_timing_fields):
-        try:
-            if runtime.resume_step < workload.update_horizon:
-                progress_state.start_training()
-                with _opd_train.liveness_heartbeat(
-                    "opd_step",
-                    progress=lambda: int(callbacks.progress["step"] or 0),
-                    progress_step=True,
-                    fields=callbacks.liveness_fields,
-                ):
-                    return_code = _opd_train.run_verl_training(
-                        command,
-                        env=child_env,
-                        on_step=callbacks.on_step,
-                        on_line=callbacks.on_line,
-                        heartbeat=callbacks.child_heartbeat,
-                        tail=callbacks.child_tail,
-                    )
-                    training_completed = return_code == 0
-        finally:
-            watcher.stop(require_complete=training_completed)
+    try:
+        if runtime.resume_step < workload.update_horizon:
+            progress_state.start_training()
+            with _opd_train.liveness_heartbeat(
+                "opd_step",
+                progress=lambda: int(callbacks.progress["step"] or 0),
+                progress_step=True,
+                fields=callbacks.liveness_fields,
+            ):
+                return_code = _opd_train.run_verl_training(
+                    command,
+                    env=child_env,
+                    on_step=callbacks.on_step,
+                    on_line=callbacks.on_line,
+                    heartbeat=callbacks.child_heartbeat,
+                    tail=callbacks.child_tail,
+                )
+                training_completed = return_code == 0
+    finally:
+        watcher.stop(require_complete=training_completed)
     peak_gpu_gb = gpu_sampler.stop_gb()
     truncation_window = None
     if return_code != 0:

@@ -31,7 +31,6 @@ import flash.engine.worker as W
 from flash.engine.worker import backend_common, rl_train, sft_train
 from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
-from flash.engine.worker.train.core import step_timing
 from flash.engine.worker.train.rl import shims as verl_shims
 
 
@@ -3281,12 +3280,7 @@ def test_run_rl_train_wires_the_gradient_check_into_the_publish_path():
     assert "_check_grpo_had_a_gradient(" in verdict_source
     assert "resumed=bool(resume_step)," in verdict_source
     assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in verdict_source
-    # the export itself moved into `_publish_final_rl_adapter`, so the ordering is asserted against
-    # that call: it is the only path to the export, and the gradient verdict must still precede it.
-    assert "_export_final_adapter(" in inspect.getsource(rl_train._publish_final_rl_adapter)
-    assert entry_source.index("_validate_rl_child(") < entry_source.index(
-        "_publish_final_rl_adapter("
-    )
+    assert entry_source.index("_validate_rl_child(") < entry_source.index("_export_final_adapter(")
     assert "export_peft_adapter(" in export_source
     # and that the spread series it passes is actually collected from the child's output.
     assert 'parse_verl_metric(line, "critic/advantages/max")' in metrics_source
@@ -4681,6 +4675,27 @@ def test_bridge_score_converts_a_non_finite_episode_to_zero():
         assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
 
 
+def test_per_turn_credit_without_turn_rewards_warns_once_and_keeps_fallback(capsys):
+    env = _BridgeEnv(episode=0.75)
+    bridge = _bridge(env, per_turn_credit=True)
+    for index, session_id in enumerate(("a", "b")):
+        bridge.start({"index": index, "session_id": session_id})
+        bridge.step({"session_id": session_id, "completion_text": "answer"})
+        assert bridge.score({"session_id": session_id, "turn_count": 1}) == {
+            "score": 0.75,
+            "turns": None,
+        }
+
+    out = capsys.readouterr().out
+    warning = "per-turn credit was requested"
+    assert out.count(warning) == 1
+    # the fallback the shim actually applies is per group, not per run
+    # (test_per_turn_credit_shim_leaves_other_groups_on_episode_credit), so a warning claiming the
+    # run switched schemes would misreport which credit assignment trained the model.
+    assert "rollout group" in out
+    assert "this run falls back" not in out
+
+
 def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
     # multi-turn has no per-completion breakdown -- the env scores a whole episode to a scalar --
     # so the transcript IS the only thing this path can publish for `flash runs log`.
@@ -5198,313 +5213,6 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
     assert f"data.max_response_length={inp['max_response_len']}" in rl_train.build_verl_overrides(
         cfg
     )
-
-
-# ---------------------- measured reward latency in train_meta ----------------------
-def _resolved_inputs_for_notes(monkeypatch):
-    """A resolved single-turn input dict, offline.
-
-    Mirrors the resolver fixture above: _resolve_grpo_inputs needs a loaded env, a spec and
-    a tokenizer, none of which exist in a unit test.
-    """
-    from flash.core.spec import JobSpec
-    from flash.engine.worker.runtime.pkg_proxy import W
-
-    class _Env:
-        multi_turn = False
-        is_tool_env = False
-
-        def dataset(self):
-            return [{"index": i} for i in range(33)]
-
-        def prompt_messages(self, ex):
-            return [{"role": "user", "content": f"question {ex['index']}"}]
-
-    class _Tokenizer:
-        pad_token = None
-        eos_token = "<eos>"
-
-        def apply_chat_template(self, messages, **kwargs):
-            return messages[0]["content"]
-
-        def __call__(self, text, **kwargs):
-            return SimpleNamespace(input_ids=[1])
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "grpo",
-            "train": {"prompts_per_step": 16, "epochs": 2},
-        }
-    )
-    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
-    monkeypatch.setattr(W, "SEED", 42, raising=False)
-    monkeypatch.setattr(W, "THINKING", False, raising=False)
-    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    monkeypatch.setattr(W, "grpo_overrides", dict, raising=False)
-    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
-    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
-    monkeypatch.setattr(rl_train, "seed_training_rngs", lambda seed: None)
-    monkeypatch.setattr(rl_train, "model_max_position_embeddings", lambda *a, **k: 40960)
-    return rl_train._resolve_grpo_inputs()
-
-
-def _profile(seconds: float, *, trustworthy: bool = True):
-    """A RewardProfile shaped like the profiler's real output."""
-    from flash.engine.profiling.reward_profile import RewardProfile
-
-    return RewardProfile(
-        seconds_per_completion=seconds,
-        samples=0 if not trustworthy else 3,
-        degenerate=False,
-        failures=0,
-    )
-
-
-def test_train_notes_record_the_measured_grading_latency(monkeypatch):
-    """The measurement has to outlive the log line to be usable by anything downstream.
-
-    A latency that only reaches stdout cannot price a run or place one: the cost model would keep
-    using its single 1.0s average for an env just measured at 0.02s.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=5,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(0.25),
-        step_intervals=[10.0],
-    )
-    assert notes["reward_seconds_per_completion"] == 0.25
-
-
-def test_train_notes_omit_an_untrustworthy_profile(monkeypatch):
-    """A profile that measured nothing must record None, not a number.
-
-    RewardProfile.trustworthy is False when no sample graded successfully; writing its 0.0 into
-    train_meta would read downstream as a genuinely instant grader.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=5,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(0.0, trustworthy=False),
-        step_intervals=[10.0],
-    )
-    assert notes["reward_seconds_per_completion"] is None
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_train_notes_report_idle_fraction_from_the_runs_own_step_wall(monkeypatch):
-    """The idle share is computed from measured wall time, not from the cost model's estimate.
-
-    Deriving it from the modelled step would report the estimator's own opinion back to it, which
-    is exactly the number an operator would want to CHECK against reality.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    # a step wall of 10s, of which grading accounts for 8s -> 80% idle.
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 10,
-    )
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_train_notes_do_not_publish_the_serial_idle_projection_when_batching(monkeypatch):
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(8.0 / completions),
-        step_intervals=[10.0] * 10,
-        reward_bridge_batching=True,
-    )
-
-    assert notes["reward_bridge_batching"] is True
-    assert notes["reward_seconds_per_completion"] == 8.0 / completions
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_idle_fraction_is_none_when_grading_exceeds_the_measured_step(monkeypatch):
-    """Grading that fills the whole step leaves no gpu-bound remainder to divide.
-
-    The profile and the observed wall disagree here (a warm-up latency that no longer holds, or a
-    step wall dominated by something else), and neither can arbitrate, so the honest record is no
-    reading rather than a fabricated 100%.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        # 20s of grading inside a 10s measured step
-        reward_profile=_profile(20.0 / completions),
-        step_intervals=[10.0] * 10,
-    )
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_idle_fraction_ignores_steps_this_worker_did_not_run(monkeypatch):
-    """A resumed run must divide by ITS steps, not by the checkpoint's absolute step number.
-
-    steps_run comes from the checkpoint directory and counts every step the run has ever taken;
-    the wall clock only ever covers this session. A worker resuming at 90 and training to 100
-    walled ten steps, and charging those seconds against a hundred understates each step by 10x --
-    which inflates the idle share toward 100% and would route the run to a co-location tier it
-    cannot sustain. Feeding the measured intervals removes the term entirely.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        # the checkpoint says 100 steps; this worker observed ten, each a real 10s step.
-        steps_run=100,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 10,
-    )
-    # unchanged from the fresh-run case above: resume does not move the reading.
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_idle_fraction_is_unmoved_by_one_slow_step(monkeypatch):
-    """A checkpoint save lands inside a single step interval and must not set the verdict.
-
-    Every save-step gap carries an upload that the other steps never pay. Averaging lets one such
-    step drag the whole reading -- here a 200s outlier among 10s steps would report ~28s/step and
-    flip an 80% idle run to 29%. The median needs MOST steps to be slow before it moves.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 9 + [200.0],
-    )
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_idle_fraction_is_none_when_no_step_was_timed(monkeypatch):
-    """A run that never emitted two step lines has no measured step to divide by.
-
-    One step line yields zero intervals by design (the span before it is engine startup), and a
-    run that died in its first step yields none at all. Both must record no reading rather than
-    fall back to a modelled step, which is the number this metric exists to check.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=1,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(8.0 / completions),
-        step_intervals=[],
-    )
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_step_intervals_exclude_the_span_before_the_first_step():
-    """Engine init, weight load and cudagraph capture precede the first step line.
-
-    That span is setup, paid once, and often larger than a step. Counting it as a step would
-    inflate the step wall and understate the idle share on exactly the short runs where the
-    startup cost dominates. N step lines bound N-1 steps, never N.
-    """
-    assert step_timing.step_intervals([100.0, 110.0, 122.0]) == [10.0, 12.0]
-    # a single step line bounds no whole step: nothing is known about what came before it or after.
-    assert step_timing.step_intervals([100.0]) == []
-    assert step_timing.step_intervals([]) == []
-
-
-def test_post_run_step_intervals_come_from_the_same_clock_the_heartbeat_reads():
-    """One record, so the run's metadata and its live pace cannot disagree about a step.
-
-    ``reward_gpu_idle_fraction`` is derived from these intervals. A second raw list would keep the
-    reprints and blocking-upload spans the clock excludes, so the finished run would report a step
-    cost the operator never saw while it was running.
-    """
-    source = inspect.getsource(rl_train)
-    assert "step_intervals=state.step_clock.intervals()" in source
-    assert "step_line_times" not in source
-
-
-def test_the_profile_hook_returns_its_reading_to_the_caller():
-    """_log_reward_profile must RETURN the profile, not only print it.
-
-    Asserted against the real hook rather than a fixture: the wiring under test is that the run
-    body can capture what the profiler measured.
-    """
-
-    class Env:
-        def sft_completion(self, example):
-            return [{"role": "assistant", "content": "an answer worth grading"}]
-
-    profile = rl_train._log_reward_profile(
-        Env(), lambda index, completion: 1.0, [{"id": i} for i in range(4)], 32
-    )
-    assert profile is not None
-    assert profile.trustworthy
-
-
-def test_the_run_body_passes_the_measured_profile_into_train_meta():
-    """The captured profile must actually reach the notes builder.
-
-    Source-level, because reaching this line in a live run needs a gpu. Without it the hook could
-    return a profile that the run body drops on the floor, and every other test here would still
-    pass while train_meta always recorded None.
-    """
-    reward_src = inspect.getsource(rl_train._start_reward_runtime)
-    entry_src = inspect.getsource(rl_train.run_rl_train)
-    metadata_src = inspect.getsource(rl_train._write_terminal_metadata)
-    assert "_log_reward_profile(" in reward_src, "the hook is never called"
-    assert "reward_profile = " in reward_src, "the hook's reading is discarded"
-    assert "reward_runtime=reward_runtime" in entry_src, "the reading never reaches train_meta"
-    assert "reward_profile=reward_runtime.reward_profile" in metadata_src, (
-        "the reading never reaches train_meta"
-    )
-    assert 'reward_bridge_batching=not inp["multi_turn"]' in metadata_src
-
-
-def test_the_reward_profiler_is_skipped_on_multi_turn():
-    """The profiler times the SINGLE-TURN grading path, which a multi-turn env does not have.
-
-    Source-level for the same reason as above. Running it on a multi-turn env would call
-    env.reward/scores_breakdown on one completion -- a call that env's contract does not define --
-    and record the resulting number as if it described the episode reward path.
-    """
-    src = inspect.getsource(rl_train._start_reward_runtime)
-    profile_call = src[src.index("reward_profile = ") : src.index("multi_turn_bridge = ")]
-    assert 'if inp["multi_turn"]' in profile_call, "the profiler is not gated off multi-turn"
-    assert "None" in profile_call, "multi-turn must record no profile rather than a wrong one"
 
 
 # ---------------- reward observability: the buffer and the heartbeat drain ----------------
@@ -6161,28 +5869,8 @@ def test_the_first_sample_bearing_heartbeat_is_forced():
 def test_the_liveness_fields_hook_carries_reward_observability():
     # the rl_step liveness wrap is what publishes between stdout lines. without the fields hook
     # merging it, samples would only ever reach the wire on the one forced first-metrics heartbeat.
-    # asserted per-fragment rather than against the whole literal: the hook merges several
-    # independent signals now, and pinning its exact text made adding one a test failure without
-    # anything having regressed.
     src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    hook = src[src.index("fields=lambda: {") :]
-    hook = hook[: hook.index("}")]
-    assert '"metrics_last": list(metrics_last)' in hook
-    assert "**_reward_observability()" in hook
-    # the same hook carries step timing, for the same reason: the daemon can win the upload slot,
-    # and a payload without it publishes a step whose measured pace looks lost rather than merely
-    # not re-sent. the reader is shared with publishing_step_timing (which serves the unthrottled
-    # checkpoint ping) rather than each closing over the state separately, so both publish one view.
-    # held on the step state rather than in a local, so the forced first-metrics upload inside the
-    # stdout loop reads the same reader without it being threaded through every call on the way.
-    assert "**state.step_timing_fields()" in hook
-    assert "state.step_timing_fields = _rl_step_timing_publisher(state, expected_steps)" in src
-    # registered through a stand-in rather than directly, because the registration is opened around
-    # the whole try/finally -- the uploader drains in that finally publish the final checkpoint, and
-    # its unthrottled ping reads the registry. `bind` hands the real reader over once the step state
-    # exists, so both publishers still end up on ONE view of the clock.
-    assert "publishing_step_timing(_deferred_timing)" in src
-    assert "_deferred_timing.bind(state.step_timing_fields)" in src
+    assert 'fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()}' in src
 
 
 def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains():
@@ -6204,7 +5892,7 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     # sealed on the new-step branch, and BEFORE the preview reads the published rows so the logged
     # sample and the heartbeat describe the same generation.
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = parsed_step') :]
+    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = int(m.group(1))') :]
     assert 'reward_runtime.observability.close_generation(progress["step"])' in stdout_loop
     assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
         'samp = reward_runtime.observability.latest_for_step(progress["step"])'
@@ -6964,17 +6652,13 @@ def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
     provably finished (fragments print while later ones are still applying, so the first OUTPUT
     line would race the file). a missing marker there means the child trains unpatched."""
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    step_at = stdout_loop.index('progress["step"] = parsed_step')
+    step_at = stdout_loop.index('progress["step"] = int(m.group(1))')
     verify_at = stdout_loop.index("verify_applied_shim_markers(shim_markers, expected_shims)")
     assert step_at < verify_at < stdout_loop.index("close_generation")
     # and the entry point wires the files dict (marker path + expected set) into both the loop
     # and the final verdict.
     entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    # asserted per-kwarg rather than as one contiguous literal: the call takes other keywords too
-    # (the shared step-timing reader among them), and pinning their exact order made ADDING one a
-    # failure here without anything having regressed.
-    assert "_reward_observability=_reward_observability," in entry
-    assert "files=files," in entry
+    assert "_reward_observability=_reward_observability, files=files," in entry
     assert 'rc, state, files["resume_step"], expected_steps, resume_uploader, files=files' in entry
 
 

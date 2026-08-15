@@ -138,6 +138,12 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         f"actor_rollout_ref.actor.optim.lr={_hydra_val(config['learning_rate'])}",
         "actor_rollout_ref.actor.optim.weight_decay=0.0",
         f"actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size={_hydra_val(config['ulysses_sequence_parallel_size'])}",
+        # zero-2 vs zero-3, resolved by the allocator's fit model in the caller. lora makes verl
+        # reuse the actor module for the ref policy (`ref_in_actor`), so there is no second weight
+        # copy and no matching `ref.fsdp_config` key to set.
+        # absent -> True, verl's own default: a config built without the gate must render the
+        # lower-memory strategy, never fall into zero-2 by omission.
+        f"actor_rollout_ref.actor.fsdp_config.reshard_after_forward={_hydra_val(bool(config.get('reshard_after_forward', True)))}",
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the rl driver.
         *trainer_dtype_overrides(),
         "actor_rollout_ref.rollout.name=vllm",

@@ -71,8 +71,11 @@ VERL_VENV_PYTHON = "3.12"
 # to guarantee, but a venv that misses it is left unstamped rather than reused (see below).
 FLA_REQUIREMENT = (
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git"
-    "@f0e213dbd8b5fb90c3c7eca869ac1706d5377139"
+    "@9c8e42e762fce087c27b673af4922795d9edb85e"
 )
+# the flashqla GDN backend lives in a separate wheel that fla 0.5.2 dispatches to; the child's
+# shim binds it on sm90 only (child_io.render_flash_qla_shim).
+FLASH_QLA_REQUIREMENT = "flash-qla==0.1.2"
 CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 
 # the SAME transformers range the main interpreter and Dockerfile.worker's verl-venv layer use.
@@ -106,8 +109,8 @@ VERL_VENV_BUILD_REPAIRS = "libcudart-stub-neutralized-v1"
 # checksum while the mutable release url stays constant must invalidate a venv stamped under the old
 # digest instead of letting it match forever and reuse an install that was never re-verified.
 VERL_VENV_STAMP = (
-    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_INSTALL_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
-    f"{TRANSFORMERS_REQUIREMENT}\n{VERL_VENV_BUILD_REPAIRS}"
+    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_INSTALL_SPEC}\n{FLA_REQUIREMENT}\n{FLASH_QLA_REQUIREMENT}\n"
+    f"{CAUSAL_CONV1D_REQUIREMENT}\n{TRANSFORMERS_REQUIREMENT}\n{VERL_VENV_BUILD_REPAIRS}"
 )
 
 
@@ -962,6 +965,7 @@ from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
 from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     _VERL_METRIC_FIELDS,
     FLASH_CUDART_STUB_MARKER,
+    FLASH_FLASH_QLA_MARKER,
     FLASH_GDN_VARLEN_MARKER,
     FLASH_TF32_MARKER,
     FLASH_WANDB_LINK_MARKER,
@@ -971,6 +975,7 @@ from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     parse_verl_step_metrics,
     parse_wandb_link,
     read_applied_shim_markers,
+    render_flash_qla_shim,
     render_gdn_varlen_shim,
     render_shim_marker_prologue,
     render_tf32_shim,

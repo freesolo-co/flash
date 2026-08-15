@@ -302,6 +302,264 @@ def cmd_deploy(args) -> int:
     return 1 if dep.get("state") == "failed" or waited_but_unservable else 0
 
 
+def _hub_repo_missing_errors() -> tuple[type[BaseException], ...]:
+    """The hub errors that mean "the destination does not exist yet", not "you may not write".
+
+    Imported lazily and tolerantly for the same reason as flash/serve/export.py's `_hub_error_types`:
+    the CLI must stay importable without huggingface_hub. An empty tuple never matches, so a hub too
+    old to export these names fails closed on the strict branch rather than waving an export through.
+    """
+    for module in ("huggingface_hub.errors", "huggingface_hub.utils"):
+        try:
+            return (
+                __import__(module, fromlist=["RepositoryNotFoundError"]).RepositoryNotFoundError,
+            )
+        except (ImportError, AttributeError):
+            continue
+    return ()
+
+
+def _hf_status_code(exc: BaseException) -> int | None:
+    """The HTTP status behind a hub error, or None when the request never got an answer.
+
+    None is the whole point: it separates "the Hub said no" from "the Hub was unreachable", which
+    the preflight must treat differently.
+    """
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hub_repo_gated_errors() -> tuple[type[BaseException], ...]:
+    """Gated-repo errors, which the hub models as a SUBCLASS of "repository not found".
+
+    So they match the missing-repo tuple and have to be subtracted from it. A gated destination
+    exists; it is simply not writable by this token, which is the opposite of creatable.
+    """
+    for module in ("huggingface_hub.errors", "huggingface_hub.utils"):
+        try:
+            return (__import__(module, fromlist=["GatedRepoError"]).GatedRepoError,)
+        except (ImportError, AttributeError):
+            continue
+    return ()
+
+
+def _hf_repo_confirmed_to_exist(api: object, repository: str, token: str) -> bool:
+    """Whether the Hub affirmatively said the destination is already there.
+
+    True only on an affirmative answer. A missing `repo_exists`, an error, or any other non-answer
+    is False, meaning "not confirmed", which leaves the creation rules in charge. That asymmetry is
+    deliberate: bypassing those rules is what lets an export reach a namespace nobody verified, so
+    it must be earned by a real answer rather than granted by the absence of one.
+    """
+    repo_exists = getattr(api, "repo_exists", None)
+    if not callable(repo_exists):
+        return False
+    try:
+        return bool(repo_exists(repository, repo_type="model", token=token))
+    except Exception:
+        return False
+
+
+# sub-500 statuses that describe the request's transport rather than this token's access: request
+# timeout, too-early replay, and rate limiting. 5xx is handled by the range check alongside these.
+_HUB_TRANSIENT_STATUSES = frozenset({408, 425, 429})
+
+
+def _hf_status_is_a_verdict(status: int | None) -> bool:
+    """Whether an HTTP status is the Hub answering the permission question about this token.
+
+    401/403/404 are answers: rejected, forbidden, or no such repo for this token. A missing status
+    (no response at all), 408, 425, 429, and 5xx are not -- they say the Hub was busy, slow or
+    broken, which is a fact about the Hub rather than about the caller's access.
+
+    408 and 425 carry a response, so they reach here rather than the statusless path, but a request
+    timeout and a too-early retry are transport outcomes: nothing about them says this token may not
+    write. Blocking on one would blame the user's permissions for the Hub being slow.
+    """
+    if status is None:
+        return False
+    return status < 500 and status not in _HUB_TRANSIENT_STATUSES
+
+
+def _without_token(text: str, token: str) -> str:
+    """`text` with the token removed, for the warnings that quote a hub exception.
+
+    A local credential rejection quotes what it was handed: httpx raises "Illegal header value
+    b'Bearer <token>'" for a token containing a newline, so interpolating the exception prints the
+    credential to stderr and into any log or pasted bug report. The exception is still worth showing
+    -- it is the only clue to what went wrong -- so redact rather than drop it.
+
+    The escaped renderings have to go too. httpx builds that message from the header BYTES, so a
+    token holding a real newline appears as the two characters `\\` and `n`, which a literal replace
+    of the token never matches -- the redaction silently does nothing in exactly the case it was
+    written for. Each form is removed longest-first so a shorter one cannot bite a piece out of a
+    longer one and leave the rest of the credential in place.
+    """
+    if not token:
+        return text
+    # repr() of the str and of the utf-8 bytes cover the escapings httpx and friends actually emit;
+    # the [1:-1] strips the quotes repr adds so the inner escaped text is what gets matched.
+    forms = {token, repr(token)[1:-1], repr(token.encode())[2:-1]}
+    for form in sorted(forms, key=len, reverse=True):
+        if form:
+            text = text.replace(form, "<redacted>")
+    return text
+
+
+def _hf_hub_version() -> str:
+    """The installed hub version for messages, without importing the package at module scope.
+
+    Falls back to a phrase, not a version-shaped string: this is only reached when the version could
+    not be read, and printing something that looks like a number would name a version nobody has.
+    """
+    try:
+        from huggingface_hub import __version__
+
+        return str(__version__)
+    except Exception:
+        return "(unknown version)"
+
+
+def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
+    """return the token account after verifying the destination namespace when hub is installed."""
+    try:
+        from huggingface_hub import HfApi
+    except ModuleNotFoundError as exc:
+        if exc.name != "huggingface_hub":
+            raise
+        return None
+
+    import inspect
+
+    api = HfApi()
+    try:
+        identity = api.whoami(token=token)
+    except Exception as exc:
+        # a rejected token is the Hub answering, so refuse. a Hub that was unreachable, rate limited
+        # or broken is not an answer: the copy runs on the control plane, not here, so a CLI host
+        # without Hub egress would otherwise be unable to export at all -- while the same command
+        # skips this check entirely when the package is simply absent. degrade to that behaviour
+        # rather than invent a new hard blocker.
+        if not _hf_status_is_a_verdict(_hf_status_code(exc)):
+            print(
+                "warning: could not reach HuggingFace to verify the export namespace "
+                f"({_without_token(str(exc), token)}); proceeding without the check",
+                file=sys.stderr,
+            )
+            return None
+        raise ClientError(
+            "HuggingFace rejected the token before export. Check HF_TOKEN or --api-key and retry."
+        ) from exc
+    account = str(identity.get("name") or identity.get("username") or "").strip()
+    if not account:
+        raise ClientError(
+            "HuggingFace authenticated the token but returned no account name, so Flash could not "
+            "verify the export namespace. Update huggingface-hub or verify the token manually."
+        )
+    print(f"HuggingFace token resolves to account {account}", file=sys.stderr)
+
+    owner = repository.partition("/")[0].strip()
+
+    # the exact repo first: it is the only authoritative answer, and it is the one the export
+    # actually needs. asking the org role first would refuse a `contributor` who can write this
+    # very repo, because a role is a coarser fact than the permission being checked.
+    auth_check = getattr(api, "auth_check", None)
+    exact_probe = callable(auth_check) and "write" in inspect.signature(auth_check).parameters
+    if not exact_probe and _hf_repo_confirmed_to_exist(api, repository, token):
+        # `auth_check(..., write=True)` only exists from huggingface-hub 1.5, and this package still
+        # supports >=1.2, so on 1.2-1.4 there is no exact write probe. the rules below are CREATION
+        # rules and a destination that already exists is not being created, so applying them here
+        # would reject the org `contributor` this ordering was fixed to admit. degrade to a warning,
+        # exactly as this function already does when the Hub is unreachable or the package is absent.
+        # only a CONFIRMED existing repo takes this path. an unanswered lookup keeps the creation
+        # rules, which is what stops an unverified export into someone else's namespace.
+        print(
+            f"warning: huggingface-hub {_hf_hub_version()} cannot check write access to an "
+            f"existing repo; proceeding without verifying {repository}",
+            file=sys.stderr,
+        )
+        return account
+    if exact_probe:
+        try:
+            auth_check(repository, repo_type="model", token=token, write=True)
+            return account
+        except Exception as exc:
+            # a destination that is not there yet cannot be checked directly, so fall through to the
+            # creation rules below. GatedRepoError SUBCLASSES RepositoryNotFoundError, so it must be
+            # excluded first: a gated repo exists and this token may not write it, and reading it as
+            # "absent" would hand it to the weaker create-permission paths.
+            missing = _hub_repo_missing_errors()
+            absent = bool(missing) and isinstance(exc, missing)
+            if absent and isinstance(exc, _hub_repo_gated_errors()):
+                absent = False
+            if not absent and not _hf_status_is_a_verdict(_hf_status_code(exc)):
+                # no verdict about this token: a timeout or DNS failure (no status at all), a 429,
+                # or a 5xx. reporting any of those as "cannot write" blames the user's permissions
+                # for a transport fault, and the upload runs on the control plane anyway. warn and
+                # proceed, exactly as the whoami path above already does for the same class of
+                # failure. 401/403/404 DO answer the question and still fall through to the error.
+                print(
+                    f"warning: could not verify write access to {repository} "
+                    f"({_without_token(str(exc), token)}); proceeding without the check",
+                    file=sys.stderr,
+                )
+                return account
+            if not absent:
+                raise ClientError(
+                    f"HuggingFace token resolves to account {account}, but it cannot write to "
+                    f"{repository}. Grant this token write access to that model repo or set HF_TOKEN "
+                    "to a token that can write there."
+                ) from exc
+
+    # only reached for a destination that does not exist yet, so the question is now whether this
+    # token may CREATE it in that namespace. that is what the org role legitimately answers.
+    org_role = ""
+    for org in identity.get("orgs") or ():
+        if not isinstance(org, dict) or str(org.get("name") or "").casefold() != owner.casefold():
+            continue
+        org_role = str(org.get("role") or org.get("roleInOrg") or "").lower()
+        break
+    if owner.casefold() != account.casefold() and org_role not in {"write", "admin"}:
+        raise ClientError(
+            f"HuggingFace token resolves to account {account}, which cannot create "
+            f"{repository} in the namespace {owner}. Use --repository {account}/<repo>, choose an "
+            "org where this account has write access, or set HF_TOKEN to the intended account."
+        )
+
+    access_token = (identity.get("auth") or {}).get("accessToken") or {}
+    token_role = str(access_token.get("role") or "").lower()
+    if token_role == "write":
+        return account
+    if token_role != "fineGrained".lower():
+        raise ClientError(
+            f"HuggingFace token resolves to account {account}, but Flash could not verify write "
+            f"scope for the new destination {repository}. Use a write token for that namespace, "
+            "or create the repo first so Flash can check its exact write permission."
+        )
+
+    permissions = set(access_token.get("fineGrained", {}).get("global") or ())
+    for scope in access_token.get("fineGrained", {}).get("scoped") or ():
+        if not isinstance(scope, dict):
+            continue
+        entity = scope.get("entity") or {}
+        entity_name = str(entity.get("name") or entity.get("id") or "")
+        # only a scope naming the destination counts. crediting every user-typed scope would accept
+        # a token whose write grant covers some unrelated repo of its own, which is the silent
+        # wrong-namespace export this preflight exists to stop.
+        if entity_name.casefold() in {owner.casefold(), repository.casefold()}:
+            permissions.update(scope.get("permissions") or ())
+    if not ({"repo.write", "repo.content.write"} & permissions):
+        raise ClientError(
+            f"HuggingFace token resolves to account {account}, but its fine-grained scopes do not "
+            f"verify write access for {repository}. Add repository-content write access for that "
+            "namespace or use a write token."
+        )
+    return account
+
+
 def cmd_export(args) -> int:
     from flash.client.runtime_secrets import resolve_hf_token
 
@@ -311,9 +569,16 @@ def cmd_export(args) -> int:
             "no HuggingFace token: pass `--api-key <hf_...>`, or set HF_TOKEN "
             "(export it in your shell or put it in a local .env / .env.local)"
         )
+    if args.api_key:
+        print(
+            "warning: --api-key is visible in process listings; prefer HF_TOKEN or a local "
+            ".env / .env.local",
+            file=sys.stderr,
+        )
+    _hf_identity_and_write_access(args.repository, hf_token)
     client = _commands().client_from_config()
     progress = (
-        f"exporting adapter {args.adapter_id} to {args.repository} — "
+        f"exporting adapter {args.adapter_id} to {args.repository}; "
         "downloading then re-uploading; this can take a minute..."
     )
     print(render.note(progress) if render.styled() else progress, file=sys.stderr)

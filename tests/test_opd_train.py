@@ -2794,22 +2794,24 @@ def _progress_bridge_snapshot(*, samples_seen: int, truncated_rollouts: int):
     )
 
 
-def test_opd_progress_truncation_rate_is_per_step_not_cumulative():
+def test_opd_progress_truncation_metrics_are_per_step_not_cumulative():
     progress = _OpdProgressState()
 
-    first = progress.record_step(
+    first_rate, first_discarded = progress.record_step(
         1,
         0.8,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
-    second = progress.record_step(
+    second_rate, second_discarded = progress.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=3),
     )
 
-    assert first == pytest.approx(0.75)
-    assert second == 0.0
+    assert first_rate == pytest.approx(0.75)
+    assert first_discarded == 3
+    assert second_rate == 0.0
+    assert second_discarded == 0
 
 
 def test_opd_progress_truncation_rate_zero_delta_does_not_reuse_history():
@@ -2820,28 +2822,30 @@ def test_opd_progress_truncation_rate_zero_delta_does_not_reuse_history():
         0.8,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
-    second = progress.record_step(
+    second_rate, second_discarded = progress.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
 
-    assert second == 0.0
+    assert second_rate == 0.0
+    assert second_discarded == 0
 
 
 def test_opd_progress_truncation_rate_handles_zero_rollouts():
     progress = _OpdProgressState()
 
-    rate = progress.record_step(
+    rate, discarded = progress.record_step(
         1,
         0.8,
         _progress_bridge_snapshot(samples_seen=0, truncated_rollouts=0),
     )
 
     assert rate == 0.0
+    assert discarded == 0
 
 
-def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
+def test_opd_progress_step_metrics_stay_out_of_the_persisted_resume_state(tmp_path):
     """checkpoint_state is spread verbatim into opd_state.json, whose schema is fail-closed.
 
     a per-step display value is meaningless on resume and no consumer reads it back: the CLI
@@ -2854,12 +2858,13 @@ def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
     # fail-closed schema, so a partial snapshot would fail before reaching the assertion below.
     full = _resume_accounting(step=1)
     progress = _OpdProgressState()
-    rate = progress.record_step(
+    rate, discarded = progress.record_step(
         1,
         0.8,
         SimpleNamespace(accounting_snapshot=lambda: dict(full)),
     )
     assert rate == pytest.approx(0.375)
+    assert discarded == 3
 
     checkpoint = tmp_path / "checkpoint"
     adapter = tmp_path / "adapter"
@@ -2883,6 +2888,7 @@ def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
 
     state = json.loads((checkpoint / "opd_state.json").read_text())
     assert "truncation_rate" not in state
+    assert "discarded_rollouts" not in state
 
 
 def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
@@ -2892,7 +2898,7 @@ def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
         0.8,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=0),
     )
-    high_rate = high.record_step(
+    high_rate, high_discarded = high.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=12, truncated_rollouts=8),
@@ -2903,13 +2909,16 @@ def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
         0.8,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=4),
     )
-    low_rate = low.record_step(
+    low_rate, low_discarded = low.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=12, truncated_rollouts=2),
     )
 
     assert [high_rate, low_rate] == pytest.approx([1.0, 0.0])
+    # the count is bounded by the step's own sample delta (8 -> 12 is 4 samples), so a split
+    # snapshot reporting 8 truncations cannot attribute more discards than the step drew.
+    assert [high_discarded, low_discarded] == [4, 0]
 
 
 def test_opd_failure_accounting_defaults_optional_no_signal_counter():
@@ -5532,6 +5541,75 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
     assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == str(gpu_count)
 
 
+def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
+    """The gate must size off `request.spec`, never the process-global JOB_SPEC.
+
+    `opd_train` resolves its spec as `spec or _w.JOB_SPEC`, so a caller that passes one gets a run
+    whose hardware is NOT what JOB_SPEC describes. Sizing the gate off the global there would let it
+    enable ZeRO-2 against a card the run never landed on -- the allocator/worker divergence the gate
+    exists to prevent. Pinned with the two disagreeing so reading the wrong one cannot pass.
+    """
+    from flash.engine.worker import opd_train as _opd_train
+    from flash.engine.worker import opd_train_runner as _runner
+
+    # the global says a card with room to spare; the passed spec says a card without it.
+    monkeypatch.setattr(
+        _opd_train._w,
+        "JOB_SPEC",
+        SimpleNamespace(gpu=SimpleNamespace(type="B200"), train=SimpleNamespace()),
+        raising=False,
+    )
+
+    def _build(spec):
+        return _runner._build_base_config(
+            request=SimpleNamespace(
+                multi_turn=False,
+                structured_outputs=None,
+                model_id="Qwen/Qwen3.5-4B",
+                model_revision="",
+                spec=spec,
+                knobs=SimpleNamespace(
+                    max_completion=512,
+                    learning_rate=1e-5,
+                    group_size=2,
+                    kl_coef=0.5,
+                    temperature=1.0,
+                    top_p=1.0,
+                ),
+            ),
+            prompt_state=SimpleNamespace(max_model_len=1536, prompt_budget=1024),
+            workload=SimpleNamespace(
+                prompts_per_step=8,
+                update_horizon=10,
+                local_dir="/w/checkpoints",
+                train_file="/w/train.parquet",
+                val_file="/w/val.parquet",
+                lora_rank=32,
+                lora_alpha=64,
+                target_modules="all-linear",
+                warmstart_adapter=None,
+            ),
+            runtime=SimpleNamespace(
+                model_path="/models/student",
+                gpu_count=2,
+                save_freq=20,
+                project_name="flash",
+                experiment_name="opd-test",
+                reward_path="/w/shim/flash_opd_reward.py",
+                bridge=SimpleNamespace(url="http://127.0.0.1:1234", token="token"),
+            ),
+            eos_token_ids=(151645,),
+        )
+
+    # a spec whose card cannot hold the retained copy must stay on zero-3 even though the global
+    # would have admitted it. reading JOB_SPEC here returns the B200 answer and fails.
+    tight = SimpleNamespace(gpu=SimpleNamespace(type="RTX 4090"), train=SimpleNamespace())
+    assert _build(tight)["reshard_after_forward"] is True
+
+    # and with no spec at all the gate falls closed rather than silently reaching for the global.
+    assert _build(None)["reshard_after_forward"] is True
+
+
 def test_rl_width_never_exceeds_the_sequences_one_step_holds():
     """The launched width must divide prompts * group, or verl aborts at step 0 on a paid box.
 
@@ -6575,7 +6653,12 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
     assert emitted == [
         (
             "opd_step",
-            {"step": 1, "loss": 0.5, "truncation_rate": pytest.approx(0.75)},
+            {
+                "step": 1,
+                "loss": 0.5,
+                "truncation_rate": pytest.approx(0.75),
+                "discarded_rollouts": 3,
+            },
         )
     ]
 
@@ -6604,6 +6687,7 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
     assert emitted[1][0] == "opd_step"
     assert emitted[1][1]["step"] == 2
     assert "truncation_rate" not in emitted[1][1]
+    assert "discarded_rollouts" not in emitted[1][1]
 
 
 def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch):
@@ -6641,6 +6725,7 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
 
     assert [payload["step"] for _, payload in emitted] == [1, 2]
     assert all("truncation_rate" in payload for _, payload in emitted)
+    assert [payload["discarded_rollouts"] for _, payload in emitted] == [3, 0]
 
 
 def test_opd_line_handler_reads_the_loss_through_the_shared_parser():

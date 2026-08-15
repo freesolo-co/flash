@@ -178,6 +178,11 @@ def _plaintext_login_warnings(api_url: str | None, freesolo_url: str | None) -> 
 def cmd_login(args) -> int:
     api_url = args.api_url or load_credentials()[0]
     identity: dict | None = None
+    if args.api_key:
+        print(
+            "warning: --api-key is visible in process listings; prefer FREESOLO_API_KEY",
+            file=sys.stderr,
+        )
     # before any request: the warning is worthless once the key has already gone over the wire.
     # both destinations are checked here rather than at the branch below, because which one receives
     # the key is decided after this point and the caller needs the warning while it can still abort.
@@ -555,6 +560,7 @@ _FOLLOW_METRIC_FIELDS = (
     ("frac_reward_zero_std", "frac_zero_std"),
     ("mean_completion_tokens", "comp_len"),
     ("truncation_rate", "trunc"),
+    ("discarded_rollouts", "discarded"),
     ("max_completion_tokens", "max_comp_tokens"),
 )
 
@@ -637,9 +643,21 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bo
         spinner.clear()
 
 
-def _render_status(status: dict) -> str:
-    """One rendering of a run status: themed panel on a TTY, indented JSON on the machine path."""
-    return render.run_status(status) if render.styled() else json.dumps(status, indent=2)
+def _render_status(status: dict, *, force_json: bool = False, one_line: bool = False) -> str:
+    """One rendering of a run status: themed panel on a TTY, indented JSON on the machine path.
+
+    ``force_json`` is `--json`: the machine rendering even on a TTY, so a script's output does not
+    depend on whether it happens to have one. ``one_line`` keeps each object on a single line for
+    the `--follow` stream, which emits many of them: indented objects would run together into
+    something no line-by-line JSON reader can parse.
+    """
+    if force_json and one_line:
+        return json.dumps(status, separators=(",", ":"))
+    return (
+        render.run_status(status)
+        if render.styled() and not force_json
+        else json.dumps(status, indent=2)
+    )
 
 
 def _print_detached_note(run_id: str) -> None:
@@ -673,13 +691,15 @@ def _follow_run(client: ApiClient, run_id: str) -> int:
     return 0 if state in _OK_STATES else 1
 
 
-def _follow_status(client: ApiClient, run_id: str, interval: float = 2.0) -> int:
+def _follow_status(
+    client: ApiClient, run_id: str, interval: float = 2.0, *, force_json: bool = False
+) -> int:
     """Poll run status until terminal, without replaying worker logs."""
     last_rendered: str | None = None
     try:
         while True:
             status = client.get_run(run_id)
-            rendered = _render_status(status)
+            rendered = _render_status(status, force_json=force_json, one_line=force_json)
             if rendered != last_rendered:
                 print(rendered)
                 last_rendered = rendered
@@ -725,9 +745,10 @@ def cmd_log(args) -> int:
 
 def cmd_status(args) -> int:
     client = client_from_config()
+    force_json = bool(getattr(args, "json", False))
     if getattr(args, "follow", False):
-        return _follow_status(client, args.run_id)
-    print(_render_status(client.get_run(args.run_id)))
+        return _follow_status(client, args.run_id, force_json=force_json)
+    print(_render_status(client.get_run(args.run_id), force_json=force_json))
     return 0
 
 
@@ -844,7 +865,7 @@ def cmd_deployments(args) -> int:
         return 0
     print(
         f"{'RUN ID':<30}  {'STEP':<6}  {'REVISION':<40}  {'STATE':<14}  "
-        f"{'VERIFIED AT':<20}  {'OPENAI MODEL':<30}  DETAIL"
+        f"{'VERIFIED AT':<20}  {'OPENAI MODEL':<30}  {'OPENAI BASE URL':<48}  DETAIL"
     )
     for row in rows:
         deployment = row.get("deployment") or {}
@@ -858,10 +879,11 @@ def cmd_deployments(args) -> int:
         revision = str(deployment.get("adapter_revision") or "-")
         state = str(deployment.get("state") or "-")
         openai_model = str(deployment.get("openai_model") or run_id)
+        openai_base_url = str(deployment.get("openai_base_url") or "-")
         detail = str(deployment.get("error") or deployment.get("detail") or "")[:160]
         print(
             f"{run_id:<30}  {step_text:<6}  {revision:<40}  {state:<14}  "
-            f"{verified_text:<20}  {openai_model:<30}  {detail}"
+            f"{verified_text:<20}  {openai_model:<30}  {openai_base_url:<48}  {detail}"
         )
     return 0
 
