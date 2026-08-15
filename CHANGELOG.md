@@ -61,6 +61,16 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   long-running child invisible to the provider and fails it as `stalled` anyway. Blocking is the
   lesser failure: it blocks only this run, and the provider's 3000s setup grace remains the
   backstop, exactly as it already is for every other setup heartbeat the worker emits this way.
+  The step gate judges the line currently driving it rather than latching open after the first real
+  step, so a checkpoint path or summary carrying `global_step: 500` is refused whether it lands
+  before the first optimizer step or after the thousandth; committing one published a step verl
+  never took, which the CLI displayed and a cancellation was priced from. A resumed attempt reports
+  0 only while its child is still in cold start and the absolute step afterwards: heartbeats
+  overwrite `last_heartbeat` wholesale, so reporting attempt-local throughout made a run resumed at
+  step 120 report 1 after completing 121, regressing the displayed step and billing a cancellation
+  as a single step. The GPU sampler is stopped in the exception-safe path, since a torn-down child
+  now raises: it is a daemon thread that runs until stopped, so it previously outlived a stalled
+  run and kept spawning `nvidia-smi` every 0.5s, once more per stalled attempt on a reusable worker.
   Detection runs entirely on a thread that never uploads --
   it samples the counter and decides on it -- because the heartbeat upload has no timeout, and a
   detector that only advances between uploads can see neither a child going quiet nor one coming
