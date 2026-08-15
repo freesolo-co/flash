@@ -250,6 +250,154 @@ def test_deferred_finders_stack_in_both_orders_and_mark_after_application(
         _clear_deferred_target(target)
 
 
+def test_deferred_loader_supports_an_exec_module_only_loader():
+    applied = []
+
+    class Finder:
+        def uninstall(self):
+            applied.append("uninstalled")
+
+        def apply(self, module):
+            applied.append(module.loaded)
+
+    class ExecOnlyLoader:
+        def exec_module(self, module):
+            module.loaded = "executed"
+
+    loader = runtime._DeferredLoader(Finder(), ExecOnlyLoader())
+    spec = importlib.util.spec_from_loader("flash_exec_only", loader)
+    module = importlib.util.module_from_spec(spec)
+
+    loader.exec_module(module)
+
+    assert module.loaded == "executed"
+    assert applied == ["uninstalled", "executed"]
+
+
+def _install_fake_transformers_packages(monkeypatch, model_type: str):
+    package_names = (
+        "transformers",
+        "transformers.models",
+        f"transformers.models.{model_type}",
+    )
+    for name in package_names:
+        package = types.ModuleType(name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, name, package)
+    utilities = types.ModuleType("transformers.modeling_flash_attention_utils")
+    utilities._is_packed_sequence = lambda _position_ids, _batch: True
+    utilities.prepare_fa_kwargs_from_position_ids = lambda _position_ids: (
+        (("cu-q", "cu-k"), (4, 4))
+    )
+    monkeypatch.setitem(sys.modules, utilities.__name__, utilities)
+
+
+def test_deferred_gdn_and_flashqla_compose_on_the_real_target_import(monkeypatch, tmp_path):
+    model_type = "flash_fake"
+    target = f"transformers.models.{model_type}.modeling_{model_type}"
+    marker_file = str(tmp_path / "markers")
+    seen = {}
+
+    class TextModel:
+        def forward(self, *args, **kwargs):
+            seen.update(kwargs)
+            return "forwarded"
+
+    class Loader:
+        def create_module(self, _spec):
+            return None
+
+        def exec_module(self, module):
+            module.FlashFakeTextModel = TextModel
+            module.chunk_gated_delta_rule = lambda *_args, **_kwargs: "original"
+
+    class Finder:
+        def find_spec(self, fullname, _path=None, _target=None):
+            if fullname == target:
+                return importlib.util.spec_from_loader(fullname, Loader())
+            return None
+
+    _install_fake_transformers_packages(monkeypatch, model_type)
+    monkeypatch.setattr(runtime, "_gdn_seq_idx", lambda _position_ids, _cu: "seq-idx")
+    monkeypatch.setattr(runtime, "_flash_qla_supported", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_flash_qla_impl",
+        lambda: lambda *args, **kwargs: (args, kwargs),
+    )
+    finder = Finder()
+    sys.meta_path.append(finder)
+    _clear_deferred_target(target)
+    try:
+        runtime.install_deferred_gdn(model_type, marker_file)
+        runtime.install_deferred_flash_qla(model_type, marker_file)
+        module = importlib.import_module(target)
+
+        position_ids = types.SimpleNamespace(ndim=2, shape=(1, 4))
+        assert module.FlashFakeTextModel().forward(position_ids=position_ids) == "forwarded"
+        assert seen == {
+            "position_ids": position_ids,
+            "cu_seq_lens_q": "cu-q",
+            "cu_seq_lens_k": "cu-k",
+            "max_length_q": 4,
+            "max_length_k": 4,
+            "seq_idx": "seq-idx",
+        }
+        args, kwargs = module.chunk_gated_delta_rule(
+            1,
+            cu_seqlens_cpu=object(),
+            scale=2,
+        )
+        assert args == (1,)
+        assert kwargs == {"scale": 2}
+        assert Path(marker_file).read_text().splitlines() == ["gdn-varlen", "flashqla-gdn"]
+    finally:
+        _clear_deferred_target(target)
+        sys.meta_path[:] = [entry for entry in sys.meta_path if entry is not finder]
+
+
+@pytest.mark.parametrize(
+    ("supported", "implementation", "warns"),
+    [(False, lambda: "unused", False), (True, None, True)],
+)
+def test_flashqla_unavailable_paths_keep_the_existing_kernel(
+    monkeypatch, capsys, supported, implementation, warns
+):
+    module = types.ModuleType("modeling_flash_fake")
+
+    def original():
+        return "original"
+
+    module.chunk_gated_delta_rule = original
+    monkeypatch.setattr(runtime, "_flash_qla_supported", lambda: supported)
+    monkeypatch.setattr(runtime, "_flash_qla_impl", lambda: implementation)
+
+    assert runtime._patch_flash_qla(module) is False
+    assert module.chunk_gated_delta_rule is original
+    assert ("continuing on fla's own kernel" in capsys.readouterr().err) is warns
+
+
+def test_deferred_gdn_applies_immediately_when_target_is_already_imported(monkeypatch, tmp_path):
+    model_type = "flash_present"
+    target = f"transformers.models.{model_type}.modeling_{model_type}"
+    marker_file = str(tmp_path / "markers")
+
+    class PresentTextModel:
+        def forward(self, *args, **kwargs):
+            return kwargs
+
+    module = types.ModuleType(target)
+    module.PresentTextModel = PresentTextModel
+    _install_fake_transformers_packages(monkeypatch, model_type)
+    monkeypatch.setitem(sys.modules, target, module)
+    monkeypatch.setattr(runtime, "_gdn_seq_idx", lambda _position_ids, _cu: "seq-idx")
+
+    runtime.install_deferred_gdn(model_type, marker_file)
+
+    assert getattr(PresentTextModel.forward, "_flash_gdn_varlen_patched", False)
+    assert Path(marker_file).read_text().splitlines() == ["gdn-varlen"]
+
+
 def test_gdn_flashqla_and_lora_installers_do_not_import_targets_when_armed(tmp_path):
     marker_file = str(tmp_path / "applied_shims.txt")
     targets = (
@@ -289,9 +437,7 @@ def test_required_installer_failure_exits_with_97(monkeypatch, tmp_path):
 
 
 def test_opd_plugin_installs_runtime_before_verl_extensions():
-    source = Path(
-        "/home/azureuser/benchmark/flash-pristine-base/flash/engine/worker/train/opd/child/plugin.py"
-    ).read_text()
+    source = Path(opd_entry.__file__).with_name("plugin.py").read_text()
     bridge_at = source.index("from flash_opd_bridge import")
     runtime_at = source.index("flash_opd_runtime.install(")
     extensions_at = source.rindex("_install_verl_extensions()")
@@ -300,10 +446,10 @@ def test_opd_plugin_installs_runtime_before_verl_extensions():
 
 def test_copied_flat_modules_have_no_importerror_fallback_to_flash():
     roots = (
-        Path("/home/azureuser/benchmark/flash-pristine-base/flash/engine/worker/train/core/child"),
-        Path("/home/azureuser/benchmark/flash-pristine-base/flash/engine/worker/train/sft/child"),
-        Path("/home/azureuser/benchmark/flash-pristine-base/flash/engine/worker/train/rl/child"),
-        Path("/home/azureuser/benchmark/flash-pristine-base/flash/engine/worker/train/opd/child"),
+        Path(runtime.__file__).parent,
+        Path(sft_entry.__file__).parent,
+        Path(grpo_entry.__file__).parent,
+        Path(opd_entry.__file__).parent,
     )
     for root in roots:
         for path in root.glob("*.py"):

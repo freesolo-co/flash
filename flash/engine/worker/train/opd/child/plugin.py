@@ -19,8 +19,8 @@ from typing import Any
 
 from packaging.version import Version
 
-OPD_NO_SIGNAL_ATTEMPTS = 3
 PLUGIN_LOADED_EXTERNALLY = __name__ == "flash_opd_plugin"
+_PLUGIN_CONFIG: dict[str, Any] = {}
 
 if PLUGIN_LOADED_EXTERNALLY:
     from flash_opd_multiturn import build_flash_multi_turn_agent_loop
@@ -193,9 +193,14 @@ def _run_with_no_signal_replacements(
     record_resample,
     record_abandoned,
     *,
-    max_attempts: int = OPD_NO_SIGNAL_ATTEMPTS,
+    max_attempts: int | None = None,
 ):
     """retry an all-no-signal rollout with a fresh bounded dispatch."""
+    if max_attempts is None:
+        try:
+            max_attempts = int(_PLUGIN_CONFIG["no_signal_attempts"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("flash OPD no-signal attempt limit is not configured") from error
     if max_attempts <= 0:
         raise ValueError("flash OPD no-signal attempt limit must be positive")
     for attempt_ordinal in range(max_attempts):
@@ -961,7 +966,8 @@ if PLUGIN_LOADED_EXTERNALLY:
     import flash_opd_runtime
     import flash_verl_runtime
 
-    flash_opd_runtime.install(flash_verl_runtime.load_plugin_config("FLASH_OPD_PLUGIN_CONFIG"))
+    _PLUGIN_CONFIG.update(flash_verl_runtime.load_plugin_config("FLASH_OPD_PLUGIN_CONFIG"))
+    flash_opd_runtime.install(_PLUGIN_CONFIG)
 
 if os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS"):
     _require_structured_runtime_versions()

@@ -37,6 +37,7 @@ from flash.engine.worker.io.heartbeat import (
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.train.core.step_timing import StepTiming
+from flash.engine.worker.train.rl.child.plugin import required_patch_names
 from flash.engine.worker.train.rl.multi_turn import (
     MultiTurnBridge,
     copy_grpo_child_modules,
@@ -45,7 +46,6 @@ from flash.engine.worker.train.rl.multi_turn import (
 )
 from flash.engine.worker.train.rl.reward_module import render_reward_module
 from flash.engine.worker.train.rl.single_turn import score_single_turn, score_single_turn_batch
-from flash.engine.worker.verl.child_io import LORA_ROLLOUT_GUARD_SHIM
 
 
 def _rl_train():
@@ -213,26 +213,7 @@ def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
         "gdn_model_type": gdn_reset_arch,
         "wandb": "wandb" in loggers,
     }
-    expected = []
-    for name, enabled in (
-        ("rank-device-assert", config["dp_cards"] > 1),
-        ("reentrant-checkpointing", config["reentrant_checkpointing"]),
-        (
-            "entropy-quantile",
-            config["entropy_quantile"] is not None and float(config["entropy_quantile"]) < 1.0,
-        ),
-        ("per-turn-credit", config["per_turn_credit"]),
-        ("stop-sequences", bool(config["stop_sequences"])),
-        ("image-pad-ban", config["image_pad_token_id"] is not None),
-        ("structured-outputs", bool(config["structured_outputs"])),
-        ("exact-save-steps", bool(config["save_at_steps"])),
-        ("kl-ref-adapter", config["kl_ref_adapter"]),
-        ("multi-turn-loop", config["multi_turn"]),
-        (LORA_ROLLOUT_GUARD_SHIM, True),
-        ("gdn-varlen", bool(config["gdn_model_type"])),
-    ):
-        if enabled:
-            expected.append(name)
+    expected = required_patch_names(config)
     with open(files["plugin_config_path"], "w", encoding="utf-8") as handle:
         json.dump(config, handle, sort_keys=True, separators=(",", ":"))
     files["expected_shims"] = expected

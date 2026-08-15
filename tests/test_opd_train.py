@@ -48,6 +48,7 @@ from flash.engine.worker.opd_train import (
 from flash.engine.worker.teacher.client import TeacherScore
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
 from flash.engine.worker.train.core.child.runtime import install_checkpoint_handler_filter
+from flash.engine.worker.train.opd.child import plugin as opd_plugin
 from flash.engine.worker.train.opd.child.plugin import (
     FlashTeacherBridgeError,
     _AllNoSignalBatch,
@@ -71,7 +72,17 @@ from flash.engine.worker.train.opd.child.structured import (
     canonical_structured_spec,
 )
 from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
+from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import OPD_RESUME_STATE_VERSION
+
+
+@pytest.fixture(autouse=True)
+def _configure_opd_child_attempt_limit(monkeypatch):
+    monkeypatch.setitem(
+        opd_plugin._PLUGIN_CONFIG,
+        "no_signal_attempts",
+        OPD_NO_SIGNAL_ATTEMPTS,
+    )
 
 
 def _reference_groupwise_reverse_kl(sp_t, groups, kl_coef=1.0):
@@ -442,6 +453,28 @@ def test_all_no_signal_rollout_dispatches_bounded_usable_replacement():
     assert prepared == [True, True]
     assert resamples == [True, True]
     assert abandoned == []
+
+
+def test_changed_plugin_attempt_limit_controls_child_resampling(monkeypatch):
+    attempts = []
+    monkeypatch.setitem(opd_plugin._PLUGIN_CONFIG, "no_signal_attempts", 4)
+
+    def run_attempt(attempt_ordinal):
+        attempts.append(attempt_ordinal)
+        if attempt_ordinal < 3:
+            raise _AllNoSignalBatch(attempt_ordinal)
+        return "usable"
+
+    result = _run_with_no_signal_replacements(
+        run_attempt,
+        lambda _batch: None,
+        lambda: None,
+        lambda: None,
+        lambda: None,
+    )
+
+    assert result == "usable"
+    assert attempts == [0, 1, 2, 3]
 
 
 def test_shifted_group_metadata_uses_verl_prediction_layout():
@@ -6235,6 +6268,7 @@ def test_opd_plugin_config_is_serialized_with_the_child_environment(tmp_path):
     )
     assert json.loads(plugin_config) == {
         "marker_file": str(tmp_path / "applied_shims.txt"),
+        "no_signal_attempts": OPD_NO_SIGNAL_ATTEMPTS,
         "save_at_steps": [3, 7],
         "total_steps": 9,
         "gdn_model_type": "qwen3_5",

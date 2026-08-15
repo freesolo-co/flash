@@ -10,7 +10,6 @@ else:
     from flash.engine.worker.train.core.child import runtime
 
 PLUGIN_LOADED_EXTERNALLY = __name__ == "flash_sft_plugin"
-_LORAPLUS_READY_MARKER = "FLASH_LORAPLUS_READY"
 
 
 def _install_exact_dataloaders() -> None:
@@ -109,7 +108,7 @@ def _install_reentrant_checkpointing() -> None:
     FSDPEngine._build_module = build_reentrant_module
 
 
-def _install_loraplus(ratio: float) -> None:
+def _install_loraplus(ratio: float, ready_marker: str) -> None:
     if ratio <= 1:
         return
     from peft.optimizers import create_loraplus_optimizer
@@ -142,7 +141,7 @@ def _install_loraplus(ratio: float) -> None:
             )
         self._flash_loraplus_applied = True
         print(
-            f"{_LORAPLUS_READY_MARKER} ratio={ratio:g} optimizer={optimizer_cls.__name__}",
+            f"{ready_marker} ratio={ratio:g} optimizer={optimizer_cls.__name__}",
             flush=True,
         )
         return optimizer
@@ -160,7 +159,10 @@ def _install_core(config: dict) -> None:
     )
     if config.get("reentrant_gradient_checkpointing"):
         _install_reentrant_checkpointing()
-    _install_loraplus(float(config.get("loraplus_ratio", 1.0)))
+    _install_loraplus(
+        float(config.get("loraplus_ratio", 1.0)),
+        str(config["loraplus_ready_marker"]),
+    )
 
 
 def install() -> None:

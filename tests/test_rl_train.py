@@ -34,6 +34,7 @@ from flash.engine.worker import backend_common, rl_train, sft_train
 from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.train.core.child import runtime as child_runtime
+from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 from flash.engine.worker.train.rl.child import patches as verl_patches
 from flash.engine.worker.train.rl.child import plugin as grpo_plugin
 
@@ -446,6 +447,218 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
         "verl.experimental.agent_loop.agent_loop",
     ]
     assert not Path(config["marker_file"]).exists()
+
+
+def test_parent_and_child_share_required_patch_registry_and_preserve_zero_entropy(
+    monkeypatch, tmp_path
+):
+    config = {
+        "marker_file": str(tmp_path / "markers"),
+        "dp_cards": 2,
+        "reentrant_checkpointing": False,
+        "multimodal": False,
+        "entropy_quantile": 0.0,
+        "per_turn_credit": False,
+        "stop_sequences": [],
+        "image_pad_token_id": None,
+        "structured_outputs": None,
+        "save_at_steps": [],
+        "total_steps": 10,
+        "kl_ref_adapter": False,
+        "multi_turn": True,
+        "gdn_model_type": "qwen3_5",
+        "wandb": False,
+    }
+    installed = []
+
+    def deferred(name, _marker_file, _target, _installer, *args, **_kwargs):
+        installed.append(name)
+        if name == "entropy-quantile":
+            assert args == (0.0,)
+
+    monkeypatch.setattr(child_runtime, "load_plugin_config_file", lambda _name: config)
+    monkeypatch.setattr(child_runtime, "install_deferred_required", deferred)
+    monkeypatch.setattr(
+        child_runtime,
+        "install_deferred_lora_rollout_guard",
+        lambda _marker_file: installed.append(child_runtime.LORA_ROLLOUT_GUARD_SHIM),
+    )
+    monkeypatch.setattr(
+        child_runtime,
+        "install_deferred_gdn",
+        lambda model_type, _marker_file: installed.append(
+            "gdn-varlen" if model_type == "qwen3_5" else "wrong-gdn"
+        ),
+    )
+
+    grpo_plugin.install()
+
+    expected = grpo_plugin.required_patch_names(config)
+    assert installed == expected
+    assert expected == [
+        "rank-device-assert",
+        "entropy-quantile",
+        "multi-turn-loop",
+        "lora-rollout-guard",
+        "gdn-varlen",
+    ]
+
+
+def _install_entropy_test_modules(monkeypatch, observed):
+    class FakeTensor:
+        def __init__(self, values):
+            self.values = np.asarray(values)
+
+        def bool(self):
+            return FakeTensor(self.values.astype(bool))
+
+        def float(self):
+            return FakeTensor(self.values.astype(float))
+
+        def reshape(self, *shape):
+            return FakeTensor(self.values.reshape(*shape))
+
+        def numel(self):
+            return self.values.size
+
+        def clone(self):
+            return FakeTensor(self.values.copy())
+
+        def tolist(self):
+            return self.values.tolist()
+
+        def __getitem__(self, index):
+            if isinstance(index, FakeTensor):
+                index = index.values
+            return FakeTensor(self.values[index])
+
+        def __mul__(self, other):
+            values = other.values if isinstance(other, FakeTensor) else other
+            return FakeTensor(self.values * values)
+
+        def __ge__(self, other):
+            return FakeTensor(self.values >= other)
+
+        def __and__(self, other):
+            return FakeTensor(self.values & other.values)
+
+    distributed = types.ModuleType("torch.distributed")
+    distributed.is_available = lambda: False
+    distributed.is_initialized = lambda: False
+    distributed.get_world_size = lambda: 1
+    torch = types.ModuleType("torch")
+    torch.__path__ = []
+    torch.distributed = distributed
+    torch.bool = bool
+    torch.tensor = lambda values: FakeTensor(values)
+    torch.zeros_like = lambda tensor, dtype=None: FakeTensor(
+        np.zeros_like(tensor.values, dtype=bool)
+    )
+    torch.quantile = lambda tensor, threshold: float(np.quantile(tensor.values, threshold))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.distributed", distributed)
+    losses = types.ModuleType("verl.workers.utils.losses")
+
+    def get_policy_loss_fn(_loss_mode):
+        def policy_loss(*_args, **kwargs):
+            observed["policy_mask"] = kwargs["response_mask"].clone()
+            return "policy"
+
+        return policy_loss
+
+    def ppo_loss(_config, _model_output, data, _dp_group=None):
+        observed["other_term_mask"] = data["response_mask"].clone()
+        return losses.get_policy_loss_fn("vanilla")(response_mask=data["response_mask"])
+
+    losses.get_policy_loss_fn = get_policy_loss_fn
+    losses.ppo_loss = ppo_loss
+    padding = types.ModuleType("verl.workers.utils.padding")
+    padding.no_padding_2_padding = lambda entropy, _data: entropy
+    utils = types.ModuleType("verl.workers.utils")
+    utils.losses = losses
+    modules = {
+        "verl": types.ModuleType("verl"),
+        "verl.workers": types.ModuleType("verl.workers"),
+        "verl.workers.utils": utils,
+        "verl.workers.utils.losses": losses,
+        "verl.workers.utils.padding": padding,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+    return torch, losses
+
+
+@pytest.mark.parametrize(
+    ("authored_quantile", "expected_threshold"),
+    [(0.2, 0.8), (0.0, 1.0)],
+)
+def test_entropy_installer_masks_only_policy_loss_and_preserves_authored_threshold(
+    monkeypatch, authored_quantile, expected_threshold
+):
+    observed = {}
+    torch, losses = _install_entropy_test_modules(monkeypatch, observed)
+    real_quantile = torch.quantile
+    thresholds = []
+
+    def quantile(values, threshold):
+        thresholds.append(float(threshold))
+        return real_quantile(values, threshold)
+
+    monkeypatch.setattr(torch, "quantile", quantile)
+    verl_patches.install_entropy_quantile(authored_quantile)
+    installed = losses.ppo_loss
+    response_mask = torch.tensor([[True, True, True, True]])
+    entropy = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+
+    assert losses.ppo_loss(None, {"entropy": entropy}, {"response_mask": response_mask}) == "policy"
+    assert thresholds == pytest.approx([expected_threshold])
+    assert observed["policy_mask"].tolist() == [[False, False, False, True]]
+    assert observed["other_term_mask"].tolist() == [[True, True, True, True]]
+    assert response_mask.tolist() == [[True, True, True, True]]
+
+    verl_patches.install_entropy_quantile(authored_quantile)
+    assert losses.ppo_loss is installed
+
+
+def test_exact_save_installer_keeps_authored_and_final_steps_and_is_idempotent(
+    monkeypatch,
+):
+    calls = []
+
+    class RayPPOTrainer:
+        def __init__(self):
+            self.global_steps = 0
+
+        def _save_checkpoint(self):
+            calls.append(self.global_steps)
+            return self.global_steps
+
+    ray_trainer = types.ModuleType("verl.trainer.ppo.ray_trainer")
+    ray_trainer.RayPPOTrainer = RayPPOTrainer
+    ppo = types.ModuleType("verl.trainer.ppo")
+    ppo.ray_trainer = ray_trainer
+    modules = {
+        "verl": types.ModuleType("verl"),
+        "verl.trainer": types.ModuleType("verl.trainer"),
+        "verl.trainer.ppo": ppo,
+        "verl.trainer.ppo.ray_trainer": ray_trainer,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    config = {"save_at_steps": (), "total_steps": 20}
+    assert "exact-save-steps" not in grpo_plugin.required_patch_names(config)
+    verl_patches.install_exact_save_steps((7, 13), 20)
+    installed = RayPPOTrainer._save_checkpoint
+    trainer = RayPPOTrainer()
+    for step in (1, 7, 10, 13, 20):
+        trainer.global_steps = step
+        trainer._save_checkpoint()
+
+    assert calls == [7, 13, 20]
+    verl_patches.install_exact_save_steps((7, 13), 20)
+    assert RayPPOTrainer._save_checkpoint is installed
 
 
 def test_the_deferred_registry_runs_patches_at_the_targets_real_import(tmp_path, monkeypatch):
@@ -2017,18 +2230,30 @@ def test_verl_uses_canonical_heartbeat_stage_contracts():
 
 
 # ------------------------------- reward module render -------------------------------
+def _rendered_reward_namespace(url_env="FLASH_VERL_REWARD_URL"):
+    previous = sys.modules.get("flash_grpo_multiturn")
+    sys.modules["flash_grpo_multiturn"] = grpo_multiturn
+    try:
+        namespace: dict = {}
+        exec(compile(rl_train.render_reward_module(url_env), "<reward>", "exec"), namespace)
+        return namespace
+    finally:
+        if previous is None:
+            sys.modules.pop("flash_grpo_multiturn", None)
+        else:
+            sys.modules["flash_grpo_multiturn"] = previous
+
+
 def test_render_reward_module_is_valid_and_defines_compute_score():
     src = rl_train.render_reward_module()
-    ns: dict = {}
-    exec(compile(src, "<reward>", "exec"), ns)  # compiles + defines, no network call made
+    ns = _rendered_reward_namespace()
     assert callable(ns["compute_score"])
-    # no flash import leaks into the verl-side shim.
-    assert "import flash" not in src
+    assert "from flash_grpo_multiturn import post_json" in src
+    assert "urllib" not in src
 
 
 def test_render_reward_module_missing_index_raises():
-    ns: dict = {}
-    exec(compile(rl_train.render_reward_module(), "<reward>", "exec"), ns)
+    ns = _rendered_reward_namespace()
     with pytest.raises(RuntimeError, match="no example index"):
         ns["compute_score"]("flash_env", "answer", "unused", extra_info={})
 
@@ -2040,12 +2265,9 @@ def test_render_reward_module_missing_index_raises():
 )
 def test_render_reward_module_rejects_invalid_index(monkeypatch, index):
     monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", "http://unused")
-    ns: dict = {}
-    exec(
-        compile(rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"), ns
-    )
+    ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
     monkeypatch.setattr(
-        ns["urllib"].request,
+        grpo_multiturn.urllib.request,
         "urlopen",
         lambda *args, **kwargs: pytest.fail("invalid index must not reach the reward server"),
     )
@@ -2063,13 +2285,7 @@ def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
     )
     try:
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
-        ns: dict = {}
-        exec(
-            compile(
-                rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"
-            ),
-            ns,
-        )
+        ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
         assert (
             ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": index}) == 3.0
         )
@@ -2088,16 +2304,15 @@ def test_a_slow_env_call_is_not_cut_off_by_a_client_deadline(monkeypatch):
         lambda idx, solution: waited.append(idx) or 7.0, example_count=2
     )
     try:
-        ns: dict = {}
-        exec(compile(rl_train.render_reward_module("TEST_URL"), "<reward>", "exec"), ns)
-        real_urlopen = ns["urllib"].request.urlopen
+        ns = _rendered_reward_namespace("TEST_URL")
+        real_urlopen = grpo_multiturn.urllib.request.urlopen
         seen = []
 
         def urlopen_recording_deadline(req, *args, **kwargs):
             seen.append((args, kwargs))
             return real_urlopen(req)
 
-        monkeypatch.setattr(ns["urllib"].request, "urlopen", urlopen_recording_deadline)
+        monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", urlopen_recording_deadline)
         ns["_URL"] = url
         assert ns["compute_score"]("env", "answer", "unused", extra_info={"index": 0}) == 7.0
         assert waited == [0]
@@ -2126,8 +2341,7 @@ def test_concurrent_scorers_are_serialized_for_the_env():
 
     server, url = rl_train.start_reward_server(score, example_count=8)
     try:
-        ns: dict = {}
-        exec(compile(rl_train.render_reward_module("TEST_URL"), "<reward>", "exec"), ns)
+        ns = _rendered_reward_namespace("TEST_URL")
         ns["_URL"] = url
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(
@@ -2585,9 +2799,7 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
     server, url = rl_train.start_reward_server(missing_example, example_count=100)
     try:
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
-        ns: dict = {}
-        src = rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
-        exec(compile(src, "<reward>", "exec"), ns)
+        ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
         with pytest.raises(RuntimeError, match=r"could not serve the request .*IndexError: 99"):
             ns["compute_score"](
                 "flash_env",
@@ -2701,9 +2913,7 @@ def test_the_generated_single_turn_reward_module_surfaces_the_bridges_cause(monk
     server, url = rl_train.start_reward_server(exhausted, example_count=4)
     try:
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
-        ns: dict = {}
-        src = rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
-        exec(compile(src, "<reward>", "exec"), ns)
+        ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
         with pytest.raises(RuntimeError) as exc_info:
             ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": 0})
         message = str(exc_info.value)
@@ -2782,7 +2992,6 @@ def test_the_child_surfaces_the_bridges_error_text_not_just_the_status(
 
 def test_the_child_names_the_status_when_the_body_carries_no_detail(monkeypatch):
     """An undecodable body must still produce a message naming what happened."""
-    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
     def raise_http_error(*_a, **_k):
         raise urllib.error.HTTPError(
@@ -2792,6 +3001,39 @@ def test_the_child_names_the_status_when_the_body_carries_no_detail(monkeypatch)
     monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_http_error)
     with pytest.raises(RuntimeError, match=r"could not serve .*HTTP 503 with no error detail"):
         grpo_multiturn.post_json("http://bridge", "/multiturn/score", {})
+
+
+def test_shared_transport_preserves_reward_specific_network_and_decode_errors(monkeypatch):
+    def raise_url_error(*_args, **_kwargs):
+        raise urllib.error.URLError("bridge down")
+
+    monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_url_error)
+    with pytest.raises(
+        RuntimeError,
+        match=r"flash reward bridge request failed: <urlopen error bridge down>",
+    ):
+        grpo_multiturn.post_json("http://bridge", "/score", {}, error_style="reward")
+
+    class InvalidResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"not-json"
+
+    monkeypatch.setattr(
+        grpo_multiturn.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: InvalidResponse(),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="flash reward bridge returned an invalid response",
+    ):
+        grpo_multiturn.post_json("http://bridge", "/score", {}, error_style="reward")
 
 
 def test_reward_server_scorer_can_capture_samples():
@@ -4549,7 +4791,8 @@ def test_multi_turn_child_modules_are_copied_under_the_names_they_import_each_ot
         # every copy must parse standalone in the child interpreter.
         ast.parse(source)
         imported |= set(re.findall(r"from (flash_[a-z_]+) import", source))
-    # the fallback import targets must be exactly the names copied in.
+    imported |= set(re.findall(r"from (flash_[a-z_]+) import", rl_train.render_reward_module()))
+    # every flat import target, including the generated reward module's transport, must be copied.
     assert imported <= {name.removesuffix(".py") for name in names}
 
 
@@ -6846,6 +7089,7 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
     assert (tmp_path / "flash_grpo_patches.py").is_file()
     assert (tmp_path / "flash_verl_runtime.py").is_file()
     config = json.loads(Path(files["plugin_config_path"]).read_text())
+    assert files["expected_shims"] == grpo_plugin.required_patch_names(config)
     assert config["gdn_model_type"] is None
     assert config["kl_ref_adapter"] is True
 
@@ -6881,10 +7125,12 @@ def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_card
 def test_gdn_model_type_is_serialized_only_after_capability_resolution():
     configure_source = inspect.getsource(rl_train._configure_rl_child)
     config_source = inspect.getsource(rl_train._write_rl_plugin_config)
+    registry_source = inspect.getsource(grpo_plugin.required_patch_specs)
     assert "require_gdn_boundary_resets(caps, gdn_module)" in configure_source
     assert "_write_rl_plugin_config(" in configure_source
-    assert '("gdn-varlen", bool(config["gdn_model_type"]))' in config_source
     assert '"gdn_model_type": gdn_reset_arch' in config_source
+    assert '"gdn-varlen"' in registry_source
+    assert "bool(model_type)" in registry_source
 
 
 def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():

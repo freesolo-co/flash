@@ -551,6 +551,7 @@ def _write_sft_child_shims(
             "marker_file": shim_markers,
             "seed": int(seed),
             "loraplus_ratio": float(_SFT_LORAPLUS_RATIO),
+            "loraplus_ready_marker": _LORAPLUS_READY_MARKER,
             "save_at_steps": list(options.save_at_steps),
             "total_steps": int(model.update_horizon),
             "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),

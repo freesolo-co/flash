@@ -876,7 +876,7 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
 
     sft_plugin._install_seeded_dataloader(43)
     sft_plugin._install_linear_scheduler()
-    sft_plugin._install_loraplus(16)
+    sft_plugin._install_loraplus(16, "CUSTOM_LORAPLUS_READY")
 
     engine = FakeEngine()
     engine.optimizer_config = SimpleNamespace(
@@ -891,10 +891,30 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
         total_training_steps=20,
     )
     assert engine._build_optimizer(SimpleNamespace()) == "lora+"
-    assert _LORAPLUS_READY_MARKER in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "CUSTOM_LORAPLUS_READY ratio=16 optimizer=AdamW" in output
+    assert _LORAPLUS_READY_MARKER not in output
     assert optimizer_calls[0]["optimizer_kwargs"]["eps"] == 1e-8
     assert engine._build_lr_scheduler("optimizer") == "linear"
     assert scheduler_calls == [("optimizer", {"num_warmup_steps": 2, "num_training_steps": 20})]
+
+
+def test_sft_plugin_config_carries_the_canonical_loraplus_marker(tmp_path):
+    from flash.engine.worker import sft_train_runner
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    _, _, raw_config = sft_train_runner._write_sft_child_shims(
+        SimpleNamespace(save_at_steps=(3,)),
+        SimpleNamespace(update_horizon=7, reentrant_gradient_checkpointing=False),
+        shim_dir=str(shim_dir),
+        custom_dataset_path=str(shim_dir / "dataset.py"),
+        seed=42,
+        loggers=[],
+        gdn_reset_arch=None,
+    )
+
+    assert json.loads(raw_config)["loraplus_ready_marker"] == _LORAPLUS_READY_MARKER
 
 
 def _exec_dataloader_shim(monkeypatch):
@@ -1176,8 +1196,8 @@ def test_step_gate_admits_a_line_a_tqdm_bar_was_flushed_in_front_of():
 
 def test_loraplus_installer_has_no_plain_lora_fallback():
     source = inspect.getsource(sft_plugin._install_loraplus)
-    assert "_LORAPLUS_READY_MARKER" in source
-    assert sft_plugin._LORAPLUS_READY_MARKER == _LORAPLUS_READY_MARKER
+    assert "ready_marker" in source
+    assert not hasattr(sft_plugin, "_LORAPLUS_READY_MARKER")
     assert "falling back" not in source
     assert "original_build_optimizer" not in source
     assert "if ratio <= 1" in source

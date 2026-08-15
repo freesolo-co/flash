@@ -74,7 +74,8 @@ class _DeferredLoader:
         self._inner = inner
 
     def create_module(self, spec):
-        return self._inner.create_module(spec)
+        create = getattr(self._inner, "create_module", None)
+        return create(spec) if callable(create) else None
 
     def exec_module(self, module):
         self._inner.exec_module(module)

@@ -32,13 +32,15 @@ def _install_multi_turn() -> None:
     )
 
 
-def install() -> None:
-    config = runtime.load_plugin_config_file("FLASH_GRPO_PLUGIN_CONFIG_PATH")
-    marker_file = str(config["marker_file"])
-    installers = (
+def required_patch_specs(config: dict) -> tuple[tuple, ...]:
+    """describe every fail-closed GRPO patch without importing its target modules."""
+    entropy_quantile = config.get("entropy_quantile")
+    model_type = config.get("gdn_model_type")
+    return (
         (
             "rank-device-assert",
             int(config.get("dp_cards", 1)) > 1,
+            "required",
             "verl.single_controller.base.worker",
             patches.install_rank_device_assert,
             (int(config.get("dp_cards", 1)),),
@@ -47,6 +49,7 @@ def install() -> None:
         (
             "reentrant-checkpointing",
             bool(config.get("reentrant_checkpointing")),
+            "required",
             "verl.workers.engine.fsdp.transformer_impl",
             patches.install_reentrant_checkpointing,
             (),
@@ -54,15 +57,17 @@ def install() -> None:
         ),
         (
             "entropy-quantile",
-            config.get("entropy_quantile") is not None and float(config["entropy_quantile"]) < 1.0,
+            entropy_quantile is not None and float(entropy_quantile) < 1.0,
+            "required",
             "verl.workers.utils.losses",
             patches.install_entropy_quantile,
-            (float(config.get("entropy_quantile") or 1.0),),
+            (float(entropy_quantile) if entropy_quantile is not None else 1.0,),
             {},
         ),
         (
             "per-turn-credit",
             bool(config.get("per_turn_credit")),
+            "required",
             "verl.trainer.ppo.ray_trainer",
             patches.install_per_turn_credit,
             (),
@@ -71,6 +76,7 @@ def install() -> None:
         (
             "stop-sequences",
             bool(config.get("stop_sequences")),
+            "required",
             "verl.experimental.agent_loop.agent_loop",
             patches.install_stop_sequences,
             (tuple(config.get("stop_sequences", ())),),
@@ -79,6 +85,7 @@ def install() -> None:
         (
             "image-pad-ban",
             config.get("image_pad_token_id") is not None,
+            "required",
             "verl.experimental.agent_loop.agent_loop",
             patches.install_image_pad_ban,
             (config.get("image_pad_token_id"),),
@@ -87,6 +94,7 @@ def install() -> None:
         (
             "structured-outputs",
             bool(config.get("structured_outputs")),
+            "required",
             "verl.experimental.agent_loop.agent_loop",
             patches.install_structured_outputs,
             (config.get("structured_outputs"),),
@@ -95,6 +103,7 @@ def install() -> None:
         (
             "exact-save-steps",
             bool(config.get("save_at_steps")),
+            "required",
             "verl.trainer.ppo.ray_trainer",
             patches.install_exact_save_steps,
             (tuple(config.get("save_at_steps", ())), int(config["total_steps"])),
@@ -103,14 +112,45 @@ def install() -> None:
         (
             "kl-ref-adapter",
             bool(config.get("kl_ref_adapter")),
+            "required",
             "verl.workers.engine.fsdp.transformer_impl",
             patches.install_kl_ref_adapter,
             (),
             {},
         ),
+        (
+            "multi-turn-loop",
+            bool(config.get("multi_turn")),
+            "required",
+            "verl.experimental.agent_loop.agent_loop",
+            _install_multi_turn,
+            (),
+            {},
+        ),
+        (runtime.LORA_ROLLOUT_GUARD_SHIM, True, "lora", None, None, (), {}),
+        (
+            "gdn-varlen",
+            bool(model_type),
+            "gdn",
+            None,
+            None,
+            (str(model_type),),
+            {},
+        ),
     )
-    for name, enabled, target, installer, args, kwargs in installers:
-        if enabled:
+
+
+def required_patch_names(config: dict) -> list[str]:
+    return [name for name, enabled, *_rest in required_patch_specs(config) if enabled]
+
+
+def install() -> None:
+    config = runtime.load_plugin_config_file("FLASH_GRPO_PLUGIN_CONFIG_PATH")
+    marker_file = str(config["marker_file"])
+    for name, enabled, kind, target, installer, args, kwargs in required_patch_specs(config):
+        if not enabled:
+            continue
+        if kind == "required":
             runtime.install_deferred_required(
                 name,
                 marker_file,
@@ -119,17 +159,12 @@ def install() -> None:
                 *args,
                 **kwargs,
             )
-    if config.get("multi_turn"):
-        runtime.install_deferred_required(
-            "multi-turn-loop",
-            marker_file,
-            "verl.experimental.agent_loop.agent_loop",
-            _install_multi_turn,
-        )
-    runtime.install_deferred_lora_rollout_guard(marker_file)
-    model_type = config.get("gdn_model_type")
-    if model_type:
-        runtime.install_deferred_gdn(str(model_type), marker_file)
+        elif kind == "lora":
+            runtime.install_deferred_lora_rollout_guard(marker_file)
+        elif kind == "gdn":
+            runtime.install_deferred_gdn(*args, marker_file)
+        else:
+            raise AssertionError(f"unknown GRPO patch kind: {kind}")
     if config.get("wandb"):
         runtime.install_wandb_link_reporting()
 

@@ -22,6 +22,7 @@ from flash.engine.worker.backend_common import (
     trainer_dtype_overrides,
 )
 from flash.engine.worker.sft_train import _build_verl_child_env, _hydra_val
+from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 
 _REQUIRED_OVERRIDE_KEYS = (
     "train_files",
@@ -371,6 +372,7 @@ def _build_opd_plugin_config(
     return json.dumps(
         {
             "marker_file": shim_marker_file(shim_dir),
+            "no_signal_attempts": OPD_NO_SIGNAL_ATTEMPTS,
             "save_at_steps": list(save_at_steps),
             "total_steps": int(total_steps),
             "gdn_model_type": gdn_model_type,
