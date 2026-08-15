@@ -187,27 +187,32 @@ def _raise_verl_failure(
         if classification == "transient":
             raise _w.RetriableInfraError(f"transient no-signal notification failure: {message}")
         raise RuntimeError(f"permanent no-signal notification failure: {message}")
+    # select the most severe direct teacher evidence across score delivery, the bridge, and its ray
+    # actors. the worker reader has already selected the most severe pid-stamped actor record;
+    # letting any transient teacher channel win over a permanent actor record retries the same
+    # deterministic failure on paid GPUs. on equal severity prefer the worker record because it
+    # carries the stage, exception type, and sanitized detail the other summaries lack.
+    teacher_evidence: list[tuple[str, tuple[str, str]]] = []
+    if teacher_worker_failure is not None:
+        teacher_evidence.append(("worker", teacher_worker_failure))
     if score_delivery_failure is not None:
-        classification, message = score_delivery_failure
-        if classification == "transient":
-            raise _w.RetriableInfraError(f"transient teacher score delivery failure: {message}")
-        raise RuntimeError(f"permanent teacher score delivery failure: {message}")
-    # select the most severe direct teacher evidence across the bridge and its ray actors. the
-    # worker reader has already selected the most severe pid-stamped actor record; letting a
-    # transient bridge failure win over a permanent actor record retries the same deterministic
-    # failure on paid GPUs. on equal severity prefer the worker record because it carries the stage,
-    # exception type, and sanitized detail the bridge summary lacks.
-    if teacher_worker_failure is not None and (
-        teacher_failure is None
-        or teacher_worker_failure[0] == "permanent"
-        or teacher_failure[0] == "transient"
-    ):
-        classification, message = teacher_worker_failure
-        if classification == "transient":
-            raise _w.RetriableInfraError(f"transient teacher worker failure: {message}")
-        raise RuntimeError(f"permanent teacher worker failure: {message}")
+        teacher_evidence.append(("score_delivery", score_delivery_failure))
     if teacher_failure is not None:
-        classification, message = teacher_failure
+        teacher_evidence.append(("bridge", teacher_failure))
+    selected = next(
+        (evidence for evidence in teacher_evidence if evidence[1][0] == "permanent"),
+        teacher_evidence[0] if teacher_evidence else None,
+    )
+    if selected is not None:
+        source, (classification, message) = selected
+        if source == "worker":
+            if classification == "transient":
+                raise _w.RetriableInfraError(f"transient teacher worker failure: {message}")
+            raise RuntimeError(f"permanent teacher worker failure: {message}")
+        if source == "score_delivery":
+            if classification == "transient":
+                raise _w.RetriableInfraError(f"transient teacher score delivery failure: {message}")
+            raise RuntimeError(f"permanent teacher score delivery failure: {message}")
         if classification == "transient":
             raise _w.RetriableInfraError(
                 f"transient teacher failure after bounded retries: {message}"

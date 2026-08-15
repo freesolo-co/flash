@@ -6680,13 +6680,14 @@ def test_parent_takes_retriability_from_the_child_record_not_the_exit_status():
     assert "bridge timed out" in str(retriable.value)
 
 
-def test_parent_uses_the_most_severe_bridge_or_worker_failure():
+def test_parent_uses_the_most_severe_teacher_evidence():
     from flash.engine.worker.perf import RetriableInfraError
 
     with pytest.raises(RuntimeError) as worker_fatal:
         _raise_verl_failure(
             87,
             ("transient", "teacher service unavailable"),
+            score_delivery_failure=("transient", "score delivery unknown"),
             teacher_worker_failure=(
                 "permanent",
                 "[stage=template] ValueError: invalid credentials",
@@ -6695,10 +6696,21 @@ def test_parent_uses_the_most_severe_bridge_or_worker_failure():
     assert "invalid credentials" in str(worker_fatal.value)
     assert not isinstance(worker_fatal.value, RetriableInfraError)
 
+    with pytest.raises(RuntimeError) as delivery_fatal:
+        _raise_verl_failure(
+            86,
+            ("transient", "teacher service unavailable"),
+            score_delivery_failure=("permanent", "teacher rejected delivered score"),
+            teacher_worker_failure=("transient", "[stage=generate] TimeoutError: timed out"),
+        )
+    assert "teacher rejected delivered score" in str(delivery_fatal.value)
+    assert not isinstance(delivery_fatal.value, RetriableInfraError)
+
     with pytest.raises(RuntimeError) as bridge_fatal:
         _raise_verl_failure(
             86,
             ("permanent", "teacher rejected credentials"),
+            score_delivery_failure=("transient", "score delivery unknown"),
             teacher_worker_failure=("transient", "[stage=generate] TimeoutError: timed out"),
         )
     assert "teacher rejected credentials" in str(bridge_fatal.value)
