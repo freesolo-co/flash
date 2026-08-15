@@ -82,6 +82,7 @@ class _StepMetricState:
     metrics_last: list[dict] = field(default_factory=list)
     step_timing: StepTiming = field(default_factory=StepTiming)
     sent_first_metrics: bool = False
+    sent_first_timing: bool = False
 
 
 @dataclass
@@ -441,7 +442,6 @@ def _ingest_step_metrics(
     state: _StepMetricState,
     _reward_observability: Callable[[], dict],
 ) -> None:
-    sent_first_metrics = state.sent_first_metrics
     step_metrics = parse_verl_step_metrics(line)
     if step_metrics is not None:
         state.step_timing.record_duration(parse_verl_metric(line, "timing_s/step"))
@@ -452,19 +452,23 @@ def _ingest_step_metrics(
         # the worker's error path reads this global, so a run that dies mid-training
         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
         LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
-        # rl_train_start arms a 900s throttle, so force the first backlog through like
-        # heartbeat.py force_first_samples and retry until committed. later emissions remain
-        # throttled to protect the hf commit cap.
-        if not sent_first_metrics:
-            sent_first_metrics = _w.heartbeat(
+        heartbeat_fields = _reward_observability()
+        has_step_timing = "step_duration_s" in heartbeat_fields
+        # rl_train_start arms a 900s throttle, so force until both the first backlog and the first
+        # usable timing payload commit. later emissions remain throttled to protect the hf commit cap.
+        if not state.sent_first_metrics or (has_step_timing and not state.sent_first_timing):
+            heartbeat_committed = _w.heartbeat(
                 "rl_step",
                 force=True,
                 step=step_metrics["step"],
                 metrics_last=list(state.metrics_last),
-                **_reward_observability(),
+                **heartbeat_fields,
                 gpu=gpu_diagnostics(include_torch=False),
             )
-            state.sent_first_metrics = sent_first_metrics
+            if heartbeat_committed:
+                state.sent_first_metrics = True
+                if has_step_timing:
+                    state.sent_first_timing = True
         # per-step series for train_meta observability parity. these live on the same
         # line as everything else: verl's only console metric sink is LocalLogger,
         # which always prints "step:N - ..." (verl/utils/logger/aggregate_logger.py),

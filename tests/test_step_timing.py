@@ -93,6 +93,86 @@ def test_non_step_and_validation_lines_do_not_consume_warmup() -> None:
     )
 
 
+def test_first_usable_pace_is_forced_after_first_metrics_commit(monkeypatch) -> None:
+    calls = []
+
+    def heartbeat(stage, **fields):
+        calls.append((stage, fields))
+        return True
+
+    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
+    monkeypatch.setattr(rl_train_runner._w, "_remaining_worker_wall_seconds", lambda: 20000.0)
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    inp = {"max_completion": 512, "steps": 190}
+
+    def observability():
+        return {
+            "reward_metrics": {"quality": 0.5},
+            **rl_train_runner._step_timing_fields(inp, state),
+        }
+
+    state.progress["step"] = 1
+    _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
+    state.progress["step"] = 2
+    _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
+    state.progress["step"] = 3
+    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
+
+    assert len(calls) == 2
+    assert calls[0][1]["force"] is True
+    assert "step_duration_s" not in calls[0][1]
+    assert calls[1][1]["force"] is True
+    assert calls[1][1]["step_duration_s"] == 92.0
+    assert calls[1][1]["projected_remaining_s"] == pytest.approx(17296.0)
+    assert state.sent_first_metrics is True
+    assert state.sent_first_timing is True
+
+
+def test_failed_first_timing_commit_retries_on_next_step(monkeypatch) -> None:
+    calls = []
+    outcomes = iter([True, False, True])
+
+    def heartbeat(stage, **fields):
+        calls.append((stage, fields))
+        return next(outcomes)
+
+    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
+    monkeypatch.setattr(rl_train_runner._w, "_remaining_worker_wall_seconds", lambda: 20000.0)
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    inp = {"max_completion": 512, "steps": 190}
+
+    def observability():
+        return {
+            "reward_metrics": {"quality": 0.5},
+            **rl_train_runner._step_timing_fields(inp, state),
+        }
+
+    state.progress["step"] = 1
+    _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
+    assert state.sent_first_metrics is True
+    assert state.sent_first_timing is False
+
+    state.progress["step"] = 2
+    _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
+    assert state.sent_first_metrics is True
+    assert state.sent_first_timing is False
+
+    state.progress["step"] = 3
+    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
+    assert state.sent_first_timing is True
+
+    state.progress["step"] = 4
+    _ingest_step_metrics(_line(4, 94.0), inp, state, observability)
+
+    assert len(calls) == 3
+    assert [fields["step"] for _, fields in calls] == [1, 2, 3]
+    assert "step_duration_s" not in calls[0][1]
+    assert calls[1][1]["step_duration_s"] == 92.0
+    assert calls[2][1]["step_duration_s"] == 92.5
+
+
 def test_forced_first_metrics_retry_carries_pace_once_available(monkeypatch) -> None:
     calls = []
 
@@ -114,8 +194,13 @@ def test_forced_first_metrics_retry_carries_pace_once_available(monkeypatch) -> 
 
     state.progress["step"] = 1
     _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
+    assert state.sent_first_metrics is False
+    assert state.sent_first_timing is False
+
     state.progress["step"] = 2
     _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
+    state.progress["step"] = 3
+    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
 
     assert len(calls) == 2
     assert calls[0][1]["force"] is True
@@ -123,6 +208,8 @@ def test_forced_first_metrics_retry_carries_pace_once_available(monkeypatch) -> 
     assert calls[1][1]["reward_metrics"] == {"quality": 0.5}
     assert calls[1][1]["step_duration_s"] == 92.0
     assert calls[1][1]["projected_remaining_s"] == pytest.approx(17296.0)
+    assert state.sent_first_metrics is True
+    assert state.sent_first_timing is True
 
 
 def test_current_running_rl_attempt_renders_compact_pace_and_one_warning() -> None:

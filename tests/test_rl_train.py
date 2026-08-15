@@ -6070,10 +6070,11 @@ def test_the_first_sample_bearing_heartbeat_is_forced():
     # drops a second payload at an already-committed step. without force, the first heartbeat
     # carrying samples is exactly the one most likely to be suppressed.
     src = inspect.getsource(rl_train._ingest_step_metrics)
-    forced = src[src.index("if not sent_first_metrics:") :]
+    forced = src[src.index("if not state.sent_first_metrics or") :]
     forced = forced[: forced.index("gpu=gpu_diagnostics")]
+    assert "heartbeat_fields = _reward_observability()" in src
     assert "force=True" in forced
-    assert "**_reward_observability()" in forced
+    assert "**heartbeat_fields" in forced
 
 
 def test_the_liveness_fields_hook_carries_reward_observability():
