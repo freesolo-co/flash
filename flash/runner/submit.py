@@ -75,24 +75,33 @@ def prepare_job(
             preflight_train_context_within_serving(spec)
         except ValueError as exc:
             raise ServingPreflightError(str(exc)) from exc
-    if spec.gpu.provider or spec.gpu.type:
-        from flash.providers import PROVIDER_NAMES, available_providers
+    if spec.gpu.provider or spec.gpu.providers or spec.gpu.type:
+        from flash.providers import (
+            PROVIDER_NAMES,
+            available_providers,
+            validated_provider_preferences,
+        )
         from flash.providers.base import providers_for
 
         configured = available_providers()
         provider = spec.gpu.provider.strip().lower()
+        providers = validated_provider_preferences(spec.gpu.providers, allow_empty=True)
+        if provider and providers:
+            raise ValueError("gpu.provider and gpu.providers cannot both be set")
         if provider:
             if provider not in PROVIDER_NAMES:
                 raise ValueError(f"unknown gpu.provider {spec.gpu.provider!r}")
             if provider not in configured:
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
-        elif not any(
+        elif spec.gpu.type and not any(
             name in configured
             for gpu_type in spec.gpu.acceptable_types
             for name in providers_for(gpu_type)
         ):
             # an ordered pin is unplaceable only when NO acceptable class has a configured provider;
-            # rejecting on the head alone would refuse a run whose fallback is perfectly rentable.
+            # rejecting on the head alone would refuse a run whose fallback is perfectly rentable. the
+            # `type` guard keeps a providers-only spec out of here: it pins no class, so there is no
+            # acceptable set to place and the preference stays soft.
             unplaceable = " / ".join(repr(name) for name in spec.gpu.acceptable_types)
             raise ValueError(f"no configured provider can provision gpu.type {unplaceable}")
     info = _runner().resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)

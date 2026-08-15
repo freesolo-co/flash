@@ -172,7 +172,8 @@ def _retry_target(
     # first, so once every candidate's provider has failed that key is True for all of them and the
     # escape degrades to the plain cheapest-first order. the line then reads like recovery while the
     # run loops on the same substrate, which is what made a 46-attempt loop look like progress.
-    # naming it is the difference between "waiting" and "unpin gpu.provider / add another provider".
+    # naming it is the difference between "waiting" and "unpin gpu.provider or keep another provider
+    # configured as a soft fallback".
     retry_failed_providers = (
         ctx.failed_providers
         if first_cache_drop

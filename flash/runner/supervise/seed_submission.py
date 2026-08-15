@@ -411,6 +411,7 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
                 max(0.0, _load_run_deadline_at(ctx.spec.run_id) - _lifecycle.time.time()),
             ),
             provider=getattr(prepared.attempt_spec.gpu, "provider", ""),
+            providers=getattr(prepared.attempt_spec.gpu, "providers", ()),
             # `attempt_spec` is rebuilt from `ctx.spec` every attempt, so this is the AUTHORED pin
             # rather than the class a previous attempt allocated -- which is what lets every retry
             # re-search the whole acceptable set instead of narrowing to whichever class was tried
