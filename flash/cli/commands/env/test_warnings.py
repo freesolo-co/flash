@@ -98,21 +98,26 @@ def _warn_on_unfinished_replay(record: dict) -> None:
     neither is worth misdiagnosing, so the incomplete case names both explanations and puts the
     cheaper one first: extending a dataset row costs less than auditing termination logic.
     """
-    if not record["hit_turn_cap"]:
-        return
-    # reported before the two ambiguous readings below because this one is not a reading at all:
-    # the reference is longer than the cap, so the episode was cut off by the budget and the
-    # environment's termination logic never ran. both numbers are named -- an author cannot act on
+    # checked BEFORE the unfinished gate, not inside it. this is not a reading of an ambiguous
+    # situation -- the reference is longer than the cap, so turns the dataset defines were dropped
+    # and never replayed. that is true whether or not the capped prefix happened to terminate the
+    # episode: an env that declares done on its third turn against a five-turn reference leaves
+    # `hit_turn_cap` false and every other check passing, so gating this on the unfinished path
+    # made those two dropped turns silent. both numbers are named -- an author cannot act on
     # "raise the cap" without knowing the target.
     if record["gold_exceeds_cap"]:
+        # phrased on the DROP, not on "never finished": when the prefix terminated the episode the
+        # environment did finish, and saying otherwise would be false.
         _emit(
-            f"replay gold answer never finished: the gold trajectory is "
-            f"{record['reference_turns']} turn(s) but the episode is capped at "
-            f"{record['turn_cap']}, so only the first {record['turn_cap']} were replayed and the "
-            "environment never got the chance to finish. this is a cap/dataset mismatch, not an "
-            "environment fault: raise the turn cap (`max_turns`, or the row's `max_episode_turns`) "
-            "to at least the length of the gold trajectory, or shorten the row"
+            f"replay gold answer truncated: the gold trajectory is {record['reference_turns']} "
+            f"turn(s) but the episode is capped at {record['turn_cap']}, so only the first "
+            f"{record['turn_cap']} were replayed and the rest were never scored. this is a "
+            "cap/dataset mismatch, not an environment fault: raise the turn cap (`max_turns`, or "
+            "the row's `max_episode_turns`) to at least the length of the gold trajectory, or "
+            "shorten the row"
         )
+        return
+    if not record["hit_turn_cap"]:
         return
     opening = (
         f"replay gold answer never finished: it used all {record['turns']} turn(s) and the "

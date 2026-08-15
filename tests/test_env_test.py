@@ -2427,13 +2427,17 @@ def test_env_test_does_not_call_a_run_measured_nothing_when_turn_rewards_separat
     The blocking gate consults `_separates_on_turn_rewards` for exactly this reason, and the
     advisory warning must too -- a turn vector of (1.0, 0.0) is the signal this training mode
     optimizes, so the run measured plenty.
+
+    Multi-turn on purpose: the vector has to be one the PAID worker would accept, and two rewards
+    only match an episode that emitted two assistant turns.
     """
     env_dir = _environment_dir(tmp_path)
-    env = _SingleTurnEnv(rows=[{"input": "2 + 2?", "output": "4"}], reward=0.0)
+    env = _MultiTurnEnv()
+    monkeypatch.setattr(env, "reward", lambda completion, example, state=None: 0.0)
     monkeypatch.setattr(
         env,
         "rollout_rewards_many",
-        lambda pairs: [RolloutReward(episode=0.0, turns=(1.0, 0.0))],
+        lambda pairs: [RolloutReward(episode=0.0, turns=(1.0, 0.0)) for _ in pairs],
         raising=False,
     )
     _patch_loader(monkeypatch, env)
@@ -2442,6 +2446,41 @@ def test_env_test_does_not_call_a_run_measured_nothing_when_turn_rewards_separat
     captured = capsys.readouterr()
     assert "measured nothing" not in captured.err
     assert "overall: PASS" in captured.out
+
+
+@pytest.mark.parametrize(
+    ("turns", "why"),
+    [
+        ((0.0, 1.0, 0.5), "three rewards for a two-turn episode"),
+        ((float("nan"), 1.0), "a non-finite value"),
+        ((float("inf"), 1.0), "an infinite value"),
+    ],
+)
+def test_env_test_ignores_a_turn_vector_the_paid_worker_would_reject(
+    monkeypatch, tmp_path, capsys, turns, why
+):
+    """Only a vector the WORKER would use is evidence that per-turn credit separates.
+
+    `_validated_reward` (flash/engine/worker/train/rl/scoring.py) discards a vector whose length
+    disagrees with the assistant turns emitted, or that holds a non-finite value, and falls back to
+    the flat episode reward. A run like that trains on all-zero rewards, so reading its vector as
+    separation suppressed both the blocking gate and the warning on a run that measures nothing.
+    """
+    env_dir = _environment_dir(tmp_path)
+    env = _MultiTurnEnv()
+    monkeypatch.setattr(env, "reward", lambda completion, example, state=None: 0.0)
+    monkeypatch.setattr(
+        env,
+        "rollout_rewards_many",
+        lambda pairs: [RolloutReward(episode=0.0, turns=turns) for _ in pairs],
+        raising=False,
+    )
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1, why
+    captured = capsys.readouterr()
+    assert "cannot recognize its own reference answers" in captured.err
+    assert "overall: FAIL" in captured.err
 
 
 def test_env_test_says_replayable_when_the_gold_answer_carries_no_text(

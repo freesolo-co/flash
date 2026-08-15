@@ -399,9 +399,13 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
     # broken. the mismatch is checkable from these two numbers alone, and its remedy is exact --
     # raise the cap or shorten the row -- so it is reported as itself rather than as a guess
     # between two other explanations.
-    record["gold_exceeds_cap"] = (
-        stopped_at_ceiling and policy == "replay" and len(reference_turns) > hard_cap
-    )
+    #
+    # deliberately NOT gated on `stopped_at_ceiling`: the mismatch is a property of the two numbers
+    # alone. an env that happens to declare itself done while the capped PREFIX is being applied
+    # leaves `gold_finished` true and `hit_turn_cap` false, but the trailing gold turns were still
+    # dropped and never replayed -- silently, since every other check passes. whether the prefix
+    # terminated the episode says nothing about whether the row and the cap agree.
+    record["gold_exceeds_cap"] = policy == "replay" and len(reference_turns) > hard_cap
     record["turn_cap"] = hard_cap
     record["reference_turns"] = len(reference_turns)
     record["reward"], record["scorer_error"], record["scored_text"] = _score_with_error(
@@ -490,12 +494,20 @@ def _score_with_error(
     return float(env.reward(completion, example, state)), "", completion
 
 
-def _separates_on_turn_rewards(env, example: dict, state: dict | None) -> bool:
+def _separates_on_turn_rewards(env, example: dict, state: dict | None, turn_count: int) -> bool:
     """Whether per-turn rewards separate an episode whose scalar does not.
 
     ``credit_assignment = "per_turn"`` trains from metadata returned through
     ``rollout_rewards_many`` (flash/envs/adapter.py), not ``env.reward``. Distinct turn values prove
     separation; missing, invalid, or unavailable vectors leave the scalar authoritative.
+
+    A vector is only evidence if the PAID run would actually use it, so the checks here mirror
+    `_validated_reward` (flash/engine/worker/train/rl/scoring.py) exactly: a non-number, a count
+    that disagrees with the assistant turns emitted, or a non-finite value all make the worker
+    discard the vector and fall back to the episode reward. Accepting one this command would not --
+    two rewards for three turns, a NaN -- claimed separation on a run that trains from the flat
+    scalar after all, which then suppressed both the all-zero warning and the blocking gate and let
+    a zero-advantage run print `overall: PASS`. Whatever the worker refuses, this refuses.
     """
     rollout_rewards_many = getattr(env, "rollout_rewards_many", None)
     if not callable(rollout_rewards_many):
@@ -509,7 +521,13 @@ def _separates_on_turn_rewards(env, example: dict, state: dict | None) -> bool:
     turns = getattr(rewards[0], "turns", None)
     if not turns:
         return False
-    return len({float(turn) for turn in turns}) > 1
+    try:
+        coerced = tuple(float(value) for value in turns)
+    except (TypeError, ValueError):
+        return False
+    if len(coerced) != turn_count or not all(math.isfinite(value) for value in coerced):
+        return False
+    return len(set(coerced)) > 1
 
 
 @dataclass
@@ -524,8 +542,12 @@ class _Tally:
 
     # only replay episodes carry a gold answer to score. an echo episode has none, so its reward
     # says nothing about the grader and is counted in neither total.
+    #
+    # a probe subject is `(example, state, turns)`. the turn count rides along because the per-turn
+    # probe has to check a returned vector's length against the assistant turns THAT episode emitted,
+    # exactly as the paid worker does -- see `_separates_on_turn_rewards`.
     replayed: int = 0
-    replayed_zero: list[tuple[dict, dict | None]] = field(default_factory=list)
+    replayed_zero: list[tuple[dict, dict | None, int]] = field(default_factory=list)
     # whether any episode replayed a gold answer at all, including the ones the blocking gate
     # excludes (reasoning markup, an incomplete replay). an all-echo run scored only deliberate
     # junk, for which zero is the CORRECT answer, so the warning must not read that as a broken
@@ -537,7 +559,7 @@ class _Tally:
     gold_without_replayable_text: bool = False
     # the first episode that produced a finite reward, whatever its policy. used only as the subject
     # of the advisory warning's separation probe.
-    scored_episode: tuple[dict, dict | None] | None = None
+    scored_episode: tuple[dict, dict | None, int] | None = None
     # every finite reward whose value says something about the ENVIRONMENT, across all policies and
     # algorithms. the blocking gate counts only the replay episodes it can hold responsible and
     # abstains for a non-grpo algorithm or a junk probe that raised, so a run where nothing scored
@@ -556,7 +578,7 @@ class _Tally:
             # list is the BLOCKING gate's evidence and deliberately excludes a thinking-markup or
             # incomplete replay -- but a per-turn vector on such an episode still proves the grader
             # separates, so the warning needs a subject the gate skips.
-            self.scored_episode = (example, record["state"])
+            self.scored_episode = (example, record["state"], record["turns"])
         # an ECHO episode's reward IS interpretable: zero is the correct score for deliberate junk,
         # and the warning has separate, weaker wording for a run that scored only junk. recorded
         # here because the replay-only bookkeeping below does not apply to it.
@@ -584,7 +606,7 @@ class _Tally:
         # this gate looks for. it is confirmed against a wrong answer once every episode has run,
         # not here: see `_scores_gold_no_better_than_junk`.
         if reward == 0.0:
-            self.replayed_zero.append((example, record["state"]))
+            self.replayed_zero.append((example, record["state"], record["turns"]))
 
 
 def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
