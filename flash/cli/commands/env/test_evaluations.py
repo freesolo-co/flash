@@ -1,8 +1,8 @@
 """Offline contract checks for an environment's evaluation sidecar.
 
-Split from `test.py` to keep that file under the 1000-line gate. This group is cohesive and has one
-entry point, `check_evaluation_suites`: everything else here exists to build one held-out case's
-prompt and replayed response the same way `flash env eval` would.
+Split from `test.py` to keep that file under the 1000-line gate. Single-turn cases validate prompt
+construction and reference replay. Episode cases initialize rollout state and record one synthetic
+model turn to validate state-aware scoring without stepping or scoring the environment.
 """
 
 from __future__ import annotations

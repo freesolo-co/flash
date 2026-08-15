@@ -399,12 +399,18 @@ def test_env_test_episode_suite_does_not_require_sft_gold(
             int(state["response_text"])
             return super().env_reply(messages, state)
 
+        def reward(self, completion, example, state=None):
+            if example["input"] == "held out":
+                raise AssertionError("evaluation case requested environment reward")
+            return super().reward(completion, example, state)
+
     _patch_loader(monkeypatch, _NoEvaluationGoldEnv())
 
     assert cmd_env_test(_args(env_dir)) == 0
     captured = capsys.readouterr()
     assert "evaluation suite episode: 1/1 cases passed contract checks" in captured.out
     assert "evaluation case requested an sft target" not in captured.err
+    assert "evaluation case requested environment reward" not in captured.err
     assert "overall: PASS" in captured.out
 
 
