@@ -17,7 +17,11 @@ from flash.client import ApiError, ClientError
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
-from flash.engine.profiling.workload_profile import unpacked_batch_warning
+from flash.engine.profiling.workload_profile import (
+    reasoning_warning_rows,
+    rendered_reasoning_loss_warning,
+    unpacked_batch_warning,
+)
 from flash.schema import spec_and_train_keys_from_file, train_schema_metadata
 
 
@@ -87,13 +91,9 @@ def _cmd_train_cost_offline(spec) -> int:
         print(render.cost_panel(estimate))
     else:
         print(estimate.breakdown())
-    # derived locally: --cost never reaches the server, so there is no response to read the budget
-    # off. the derivation is pure spec arithmetic, so it agrees with the server's. the warm-start
-    # source context is deliberately NOT passed -- this path cannot read the source run, and naming
-    # a context it did not verify would be a claim rather than a measurement.
-    from flash.engine.plan.prompt_budget import rl_prompt_budget
+    from flash.cli.commands.prompt_budget import warn_cost_prompt_budget
 
-    _print_rl_prompt_budget_warning({"prompt_budget": rl_prompt_budget(spec, derived_by="cli")})
+    warn_cost_prompt_budget(spec)
     return 0
 
 
@@ -197,55 +197,39 @@ def _print_unpacked_batch_warning(status: object, spec) -> None:
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
-def _print_rl_prompt_budget_warning(status: object) -> None:
-    """Warn when a grpo/opd run's prompt budget defaulted off the recipe instead of being chosen.
+def _print_reasoning_loss_warning(status: object) -> None:
+    """Warn that the chat template drops authored reasoning before a training GPU is allocated.
 
-    The server derives the budget at submit and carries it on the response, so the number is known
-    before a training gpu is allocated. The worker's own `dropped N prompts` line lands in the
-    worker log only after allocation, which is too late to change the config for free.
+    Control-plane profiling runs inside the server, so the measurement's own stderr never reaches
+    the submitting client. The counts travel on the quote's profile and the line is rendered here,
+    which is the only place the user can act on it while restructuring is still free.
     """
-    from flash.engine.plan.prompt_budget import rl_prompt_budget_warning
-
-    budget = status.get("prompt_budget") if isinstance(status, dict) else None
-    message = rl_prompt_budget_warning(budget)
+    profile = status.get("workload_profile") if isinstance(status, dict) else None
+    if not isinstance(profile, dict):
+        return
+    authored = profile.get("authored_reasoning_turns")
+    rendered = profile.get("rendered_reasoning_spans")
+    if isinstance(authored, bool) or not isinstance(authored, int):
+        return
+    if isinstance(rendered, bool) or not isinstance(rendered, int):
+        return
+    truncated = profile.get("truncated_reasoning_spans")
+    message = rendered_reasoning_loss_warning(
+        authored_turns=authored,
+        rendered_spans=rendered,
+        # absent on a profile from an older producer, where the two causes were not yet separated.
+        # zero reads as "none were truncated", which is the pre-split behaviour.
+        truncated_spans=truncated
+        if isinstance(truncated, int) and not isinstance(truncated, bool)
+        else 0,
+        # the counts above cover the rows the update horizon reaches, so the denominator has to
+        # cover the same rows. `retained_examples` is the whole retained dataset -- it sizes the
+        # allocation -- and pairing it with bounded counts would understate the survival rate.
+        rows=reasoning_warning_rows(profile),
+    )
     if not message:
         return
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
-
-
-def warmstart_source_context(client, spec) -> int | None:
-    """The warm-start source's authored ``max_context_tokens``, read before the run is submitted.
-
-    The server resolves this too (``runner.preparation._warmstart_source_context``) and puts it on
-    the response, but the response arrives after the run is already provisioning, so a warning that
-    waits for it names a context the user can no longer act on. Pre-submit the reference is still in
-    its public ``<run_id>[/step-N]`` form, so the cli can resolve it over its own authenticated
-    client and warn while the config is still free to change.
-
-    Best-effort for the same reason as the server's copy: a diagnostic must never be the thing that
-    fails a submission, and every way a source can be genuinely unusable is diagnosed with its own
-    message on the submit path. A source we cannot read simply goes unnamed.
-    """
-    from flash.core.catalog import samples_on_policy
-
-    ref = getattr(spec.train, "init_from_adapter", "")
-    if not ref or not samples_on_policy(spec.algorithm):
-        return None
-    from flash.schema import parse_checkpoint_ref
-
-    parsed = parse_checkpoint_ref(ref)
-    if parsed is None:
-        return None
-    try:
-        src = client.get_run(parsed[0])
-    # broad by intent: reporting only, and no diagnostic may be the thing that fails a submit
-    except Exception:
-        return None
-    train = (src or {}).get("spec", {}).get("train", {}) if isinstance(src, dict) else {}
-    context = train.get("max_context_tokens") if isinstance(train, dict) else None
-    if isinstance(context, bool) or not isinstance(context, int) or context <= 0:
-        return None
-    return context
 
 
 def _print_sft_cost(status: dict, spec) -> None:
@@ -273,6 +257,7 @@ def _print_sft_cost(status: dict, spec) -> None:
         file=sys.stderr,
     )
     _print_unpacked_batch_warning(status, spec)
+    _print_reasoning_loss_warning(status)
 
 
 def _legacy_train_key_rejection_detail(

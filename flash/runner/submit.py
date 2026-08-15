@@ -122,12 +122,27 @@ def prepare_job(
     owner_org_id = _runner()._context_org_id(billing_context) or _runner()._context_org_id(
         platform_context
     )
-    public_spec, worker_spec, adapter_identity = _runner()._prepare_init_from_adapter(
-        spec,
-        owner_org_id=owner_org_id,
-        owner_key_id=owner_key_id,
-        token=os.environ.get("HF_TOKEN"),
+    public_spec, worker_spec, adapter_identity, warm_start_context = (
+        _runner()._prepare_init_from_adapter(
+            spec,
+            owner_org_id=owner_org_id,
+            owner_key_id=owner_key_id,
+            token=os.environ.get("HF_TOKEN"),
+        )
     )
+    # these read-only gates belong to preparation: every submit path passes here exactly once, and
+    # callers receive the pinned worker spec before quoting, affordability, persistence, or allocation.
+    worker_spec, environment_ref_deferred = _runner().preflight_validate_environment_ref(
+        worker_spec
+    )
+    from flash.content.multimodal import preflight_validate_image_opd
+    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+
+    preflight_validate_image_opd(
+        worker_spec,
+        scan_packaged_environment=not environment_ref_deferred,
+    )
+    preflight_validate_managed_teacher(worker_spec)
     from flash.cost.spec import estimate_for_spec
 
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
@@ -137,15 +152,7 @@ def prepare_job(
 
     prompt_budget = rl_prompt_budget(
         worker_spec,
-        # the SOURCE lookup reads public_spec, not worker_spec: _prepare_init_from_adapter has
-        # already rewritten worker_spec's init_from_adapter to the internal `<repo>:<phase>/...`
-        # storage locator, and parse_checkpoint_ref only accepts the public `<run_id>[/step-N]`
-        # grammar -- so passing worker_spec here silently resolves nothing and the warning could
-        # never name the context it exists to name. The budget itself still comes off worker_spec,
-        # which is the spec the quote and the run are built from.
-        warm_start_context=_runner()._warmstart_source_context(
-            public_spec, owner_org_id=owner_org_id, owner_key_id=owner_key_id
-        ),
+        warm_start_context=warm_start_context,
     )
     return _runner().PreparedJob(
         public_spec=public_spec,
@@ -247,11 +254,6 @@ def submit_job(
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
-    from flash.content.multimodal import preflight_validate_image_opd
-    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
-
-    preflight_validate_image_opd(worker_spec)
-    preflight_validate_managed_teacher(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     if not dry_run:

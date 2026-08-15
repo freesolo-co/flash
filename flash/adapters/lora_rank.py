@@ -7,11 +7,11 @@ import json
 import math
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
-from flash.core.catalog import serving_context_cap, serving_lora_rank_cap
+from flash.core.catalog import lora_expert_count, serving_context_cap, serving_lora_rank_cap
 
 
 class ServingPreflightError(ValueError):
@@ -277,6 +277,117 @@ def rank_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
     return _max_adapter_value(
         config, scalar="r", pattern="rank_pattern", label="rank", source=source
     )
+
+
+_LORA_A_INFIX = ".lora_A."
+_LORA_B_INFIX = ".lora_B."
+
+
+@dataclass(frozen=True)
+class DeclaredLoraRanks:
+    """The default rank, per-module overrides, and parameter-target module paths in a config."""
+
+    default: int | None = None
+    by_module: Mapping[str, int] = field(default_factory=dict)
+    stacked_rank_modules: tuple[str, ...] = ()
+    stacked_rank_multiplier: int | None = None
+
+    def __bool__(self) -> bool:
+        return self.default is not None or bool(self.by_module)
+
+
+def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
+    """Read the per-module LoRA rank structure out of ``adapter_config.json``."""
+    if not isinstance(config, Mapping):
+        return DeclaredLoraRanks()
+    try:
+        default = _positive_int(config["r"], source="adapter_config.json", field="r")
+    except (KeyError, ValueError):
+        default = None
+
+    by_module: dict[str, int] = {}
+    pattern = config.get("rank_pattern")
+    if isinstance(pattern, Mapping):
+        for module, value in pattern.items():
+            try:
+                by_module[str(module)] = _positive_int(
+                    value, source="adapter_config.json", field="rank_pattern"
+                )
+            except ValueError:
+                continue
+
+    stacked_rank_modules: list[str] = []
+    targets = config.get("target_parameters")
+    if isinstance(targets, list):
+        for target in targets:
+            if not isinstance(target, str):
+                continue
+            module, separator, _ = target.rpartition(".")
+            if separator and module:
+                stacked_rank_modules.append(module)
+
+    base_model = str(config.get("base_model_name_or_path") or "").strip()
+    return DeclaredLoraRanks(
+        default=default,
+        by_module=by_module,
+        stacked_rank_modules=tuple(stacked_rank_modules),
+        stacked_rank_multiplier=lora_expert_count(base_model),
+    )
+
+
+def _rank_for_module(module_path: str, declared: DeclaredLoraRanks) -> int | None:
+    """Resolve a module's rank with PEFT's ordered, anchored ``rank_pattern`` matching."""
+    for module, rank in declared.by_module.items():
+        if not module:
+            continue
+        try:
+            # entries are regexes in PEFT, deliberately not escaped here either
+            if re.match(rf"(.*\.)?({module})$", module_path):
+                return rank
+        except re.error:
+            continue
+    return declared.default
+
+
+def _module_uses_target_parameters(module_path: str, declared: DeclaredLoraRanks) -> bool:
+    """Whether this serialized module came from one of PEFT's targeted parameters."""
+    return any(
+        module_path == module or module_path.endswith(f".{module}")
+        for module in declared.stacked_rank_modules
+    )
+
+
+def lora_tensor_rank_disagrees(key: str, shape: Any, declared: DeclaredLoraRanks) -> bool:
+    """Return whether a 2-D LoRA weight provably contradicts its configured rank.
+
+    Ordinary module weights carry exactly ``r`` on the LoRA axis. A 3-D parameter targeted through
+    PEFT's ``target_parameters`` serializes under its parent module and stacks every model expert on
+    that axis, so only that module may carry exactly ``r * num_experts``. The distinction must be per
+    module because one config may contain ordinary ``target_modules`` and fused parameters together.
+    """
+    if not declared:
+        return False
+    is_a = _LORA_A_INFIX in key
+    is_b = _LORA_B_INFIX in key
+    if is_a == is_b:  # neither, or a key somehow claiming both
+        return False
+    if not isinstance(shape, (list, tuple)) or len(shape) != 2:
+        return False
+    dims = [d for d in shape if isinstance(d, int) and not isinstance(d, bool) and d > 0]
+    if len(dims) != 2:
+        return False
+
+    infix = _LORA_A_INFIX if is_a else _LORA_B_INFIX
+    module_path = key.partition(infix)[0]
+    rank = _rank_for_module(module_path, declared)
+    if rank is None:
+        return False
+    axis = dims[0] if is_a else dims[1]
+    if _module_uses_target_parameters(module_path, declared):
+        multiplier = declared.stacked_rank_multiplier
+        expected = rank * multiplier if multiplier is not None else rank
+        return axis != expected
+    return axis != rank
 
 
 def alpha_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:

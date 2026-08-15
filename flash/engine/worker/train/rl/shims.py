@@ -2,9 +2,322 @@
 
 Renderers return source text because the pinned child cannot import flash. Active shims print a
 marker so the parent can prove each patch executed.
+
+NOTHING HERE MAY IMPORT torch, verl OR vllm AT FRAGMENT SCOPE -- see `_deferred_patch` below.
 """
 
 from __future__ import annotations
+
+from flash.engine.worker.verl.child_io import SHIM_FRAGMENT_FAILED_EXIT_CODE
+
+# Why every fragment below defers its imports into a function body.
+#
+# sitecustomize runs at INTERPRETER STARTUP, and ray starts each actor's interpreter BEFORE it
+# narrows that actor's CUDA_VISIBLE_DEVICES to its own card. `verl/utils/device.py` evaluates
+# `torch.cuda.is_available()` at MODULE scope, and torch's own `is_available` calls
+# `cudaGetDeviceCount`, which initializes the CUDA driver via `cuInit`. So a fragment that imports
+# any verl module at startup builds the CUDA device map against the FULL device list, and a later
+# env-only narrowing cannot rebuild it -- every rank keeps device 0 and nccl aborts init with
+#
+#   Duplicate GPU detected : rank 1 and rank 0 both on CUDA device <pci>
+#
+# ONE finder holding many callbacks, never one finder per fragment. Fragments genuinely share
+# targets -- the stop-sequence and image-pad patches both hook the agent loop -- and a finder that
+# has to delegate around its siblings either recurses forever (each skips only itself, so they call
+# each other) or silently drops a patch (the first match wins and the sibling never fires). Both
+# were reproduced against the per-fragment design this replaced. A registry keyed by module name has
+# neither failure mode: one interception, every callback for that module, in registration order.
+_DEFER_RUNTIME_MARKER = "_flash_defer_registry"
+
+
+def render_deferred_patch_runtime() -> str:
+    """emit the shared deferral registry every ``_deferred_patch`` fragment registers with.
+
+    Rendered ONCE per sitecustomize, above the fragments. Idempotent so a caller that emits it
+    twice cannot discard callbacks already registered by the first copy.
+    """
+    return f'''
+# --- flash: run each verl patch at ITS module's import, not at interpreter startup ---
+# (see train/rl/shims.render_deferred_patch_runtime)
+import sys as _flash_defer_sys
+
+
+def _flash_defer_fail(target, name):
+    """a required patch could not apply: kill the child rather than let it train unpatched.
+
+    ``wrap_shim_fragment``'s try/except cannot cover this. It spans the REGISTRATION, which has
+    already returned by the time the body runs, so a raise here would surface as an ordinary
+    ImportError out of the target's import -- and an importer that catches it and retries gets a
+    clean load: python drops the failed module from sys.modules, this registry has already popped
+    the callback, and the target comes back with NO patch and NO marker. The interpreter then keeps
+    running unpatched until the parent happens to check markers, which for a correctness-critical
+    patch (kl anchoring, save gating, rank/device pinning) means a paid run producing wrong output.
+
+    os._exit is the same escape hatch the wrapper uses: it cannot be swallowed by an except in the
+    importer, by execsitecustomize, or by ray's own import error handling.
+    """
+    import os as _flash_defer_os
+    import traceback as _flash_defer_traceback
+
+    _flash_defer_traceback.print_exc()
+    print(
+        "[flash-verl] required shim fragment " + repr(name) + " failed to apply at the import of "
+        + repr(target) + "; exiting {SHIM_FRAGMENT_FAILED_EXIT_CODE} rather than training unpatched",
+        file=_flash_defer_sys.stderr,
+        flush=True,
+    )
+    _flash_defer_sys.stderr.flush()
+    _flash_defer_os._exit({SHIM_FRAGMENT_FAILED_EXIT_CODE})
+
+
+if not hasattr(_flash_defer_sys, "_flash_defer_registry"):
+
+    class _FlashDeferRegistry:
+        """maps a module name to the patches waiting on it, and installs one meta_path finder."""
+
+        def __init__(self):
+            self._pending = {{}}
+            self._armed = False
+
+        def register(self, target, body):
+            # already imported: nothing left to intercept, so apply now. this keeps the contract
+            # identical whether or not a parent process happened to import the module first.
+            if target in _flash_defer_sys.modules:
+                self._apply(target, body)
+                return
+            self._pending.setdefault(target, []).append(body)
+            if not self._armed:
+                _flash_defer_sys.meta_path.insert(0, self)
+                self._armed = True
+
+        def _apply(self, target, body):
+            # every path that runs a body goes through here, so there is one place a failure can
+            # be handled and no way to add a caller that quietly skips the hard exit.
+            try:
+                body()
+            except BaseException:
+                _flash_defer_fail(target, getattr(body, "_flash_shim_name", "<unknown>"))
+
+        def _run(self, target):
+            # pop first: a body that imports its own target must not re-enter this. popping is safe
+            # only because _apply cannot return after a failure -- see _flash_defer_fail.
+            for body in self._pending.pop(target, []):
+                self._apply(target, body)
+            if not self._pending:
+                self.uninstall()
+
+        def uninstall(self):
+            _flash_defer_sys.meta_path[:] = [
+                f for f in _flash_defer_sys.meta_path if f is not self
+            ]
+            self._armed = False
+
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname not in self._pending:
+                return None
+            # delegate to the finders AFTER this one. that resolves the real spec without importing
+            # anything, so arming touches no cuda; only the loader is wrapped.
+            for finder in [f for f in _flash_defer_sys.meta_path if f is not self]:
+                find = getattr(finder, "find_spec", None)
+                if find is None:
+                    continue
+                spec = find(fullname, path, target)
+                if spec is not None and spec.loader is not None:
+                    spec.loader = _FlashDeferLoader(spec.loader, self, fullname)
+                    return spec
+            return None
+
+    class _FlashDeferLoader:
+        """wrap the real loader so patches land once the module is fully executed.
+
+        ``exec_module`` returning means the module the importer will hand the caller is finished,
+        so this is the first safe moment. Patching from ``find_spec`` instead would run against a
+        half-built module that the real import then replaces.
+        """
+
+        def __init__(self, inner, registry, fullname):
+            self._inner = inner
+            self._registry = registry
+            self._fullname = fullname
+
+        def create_module(self, spec):
+            return self._inner.create_module(spec)
+
+        def exec_module(self, module):
+            self._inner.exec_module(module)
+            self._registry._run(self._fullname)
+
+        def __getattr__(self, name):  # keep the rest of the loader protocol intact
+            return getattr(self._inner, name)
+
+    _flash_defer_sys._flash_defer_registry = _FlashDeferRegistry()
+'''
+
+
+def render_rank_device_assert_shim(n_gpus: int) -> str:
+    """assert every rank opened a DISTINCT physical gpu, before any model is loaded.
+
+    The failure this catches is expensive by construction. A collapsed rank->device map is
+    classified non-retriable and fires only after allocation, image pull, model prefetch and ray
+    startup -- roughly a minute AFTER ``stage=rl_step step=0`` prints, so a status check in that
+    window shows a healthy running run with no error. The abort that eventually arrives names a pci
+    id and no rank mapping, and the surrounding wrapper messages name none of it.
+
+    Checking here converts that into an immediate, self-describing failure with the mapping
+    attached. It is deliberately cheap: torch already knows the ordinal, and the uuid comes from the
+    device properties torch has loaded anyway, so there is no extra probe and nothing to time out.
+
+    Single-card runs are skipped -- one rank cannot collide with itself, and the collective path
+    that fails is never entered.
+
+    Fails CLOSED. If two ranks share a device, every later symptom (nccl abort, an OOM at half the
+    expected capacity, or a run that silently trains on one card) is worse than refusing here.
+    """
+    if int(n_gpus) < 2:
+        return ""
+    return _deferred_patch(
+        "rankdevice",
+        "verl.single_controller.base.worker",
+        f'''
+import os as _flash_rank_os
+
+import torch as _flash_rank_torch
+from verl.single_controller.base import worker as _flash_rank_worker
+
+_FLASH_EXPECTED_RANKS = {int(n_gpus)}
+_flash_rank_original_init = _flash_rank_worker.Worker.__init__
+
+
+def _flash_rank_device_identity():
+    """(ordinal, uuid) for the device THIS rank would train on, or None if it cannot be read."""
+    if not _flash_rank_torch.cuda.is_available():
+        return None
+    ordinal = _flash_rank_torch.cuda.current_device()
+    try:
+        # the uuid is what makes this a real check: two ranks that both report ordinal 0 may still
+        # be two different physical cards (each with its own CUDA_VISIBLE_DEVICES), while two ranks
+        # on ONE card share a uuid no matter what ordinals they report.
+        uuid = str(getattr(_flash_rank_torch.cuda.get_device_properties(ordinal), "uuid", "") or "")
+    except Exception:
+        uuid = ""
+    return ordinal, uuid
+
+
+def _flash_rank_check(self):
+    identity = _flash_rank_device_identity()
+    if identity is None:
+        return
+    ordinal, uuid = identity
+    # prefer the rank the worker itself resolved. verl assigns self._rank from os.environ["RANK"]
+    # in the same __init__ this wrapper runs after, so the two agree today -- but reading the worker
+    # means this cannot silently collapse every actor onto one rank if that ever stops being true.
+    # the env fallback deliberately has NO default: a default of zero would make every claim line
+    # say rank 0, one uuid would map to one rank, and the collision would be hidden by the check.
+    rank = getattr(self, "_rank", None)
+    if rank is None:
+        rank = getattr(self, "rank", None)
+    rank = int(rank) if rank is not None else int(_flash_rank_os.environ["RANK"])
+    local_rank = int(_flash_rank_os.environ.get("LOCAL_RANK", "0"))
+    visible = _flash_rank_os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+    print(
+        "[rl-verl] rank-device binding rank=" + repr(rank)
+        + " local_rank=" + repr(local_rank)
+        + " cuda_ordinal=" + repr(ordinal)
+        + " visible_devices=" + repr(visible)
+        + " uuid=" + repr(uuid or "<unavailable>"),
+        flush=True,
+    )
+    if not uuid:
+        # without a uuid there is nothing to compare, and inventing a pass would defeat the check.
+        # the line above still records the binding for a post-mortem.
+        return
+    # rendezvous through a file rather than a collective: this runs BEFORE the process group
+    # exists, which is the whole point -- nccl's own duplicate-device check is what we are trying
+    # to beat to the failure. the directory is per-run and the writes are O_APPEND single lines.
+    claims_path = _flash_rank_os.environ.get("FLASH_RANK_DEVICE_CLAIMS", "")
+    if not claims_path:
+        return
+    with open(claims_path, "a") as handle:
+        handle.write(repr(rank) + " " + uuid + "\\n")
+    claims = {{}}
+    with open(claims_path) as handle:
+        for line in handle:
+            parts = line.split()
+            if len(parts) == 2:
+                claims.setdefault(parts[1], set()).add(int(parts[0]))
+    collided = {{u: sorted(r) for u, r in claims.items() if len(r) > 1}}
+    if collided:
+        raise RuntimeError(
+            "flash: ranks were bound to the SAME physical gpu before training started -- "
+            + repr(collided)
+            + " (uuid -> ranks). this rank: rank=" + repr(rank)
+            + " local_rank=" + repr(local_rank)
+            + " cuda_ordinal=" + repr(ordinal)
+            + " CUDA_VISIBLE_DEVICES=" + repr(visible)
+            + ". expected " + repr(_FLASH_EXPECTED_RANKS) + " ranks on distinct cards; nccl would "
+            "abort a minute later with 'Duplicate GPU detected' and no rank mapping."
+        )
+
+
+def _flash_rank_init(self, *args, **kwargs):
+    result = _flash_rank_original_init(self, *args, **kwargs)
+    # AFTER verl's own __init__: that is what applies ray's CUDA_VISIBLE_DEVICES narrowing and the
+    # set_device call, so checking before it would measure the unpinned state and always pass.
+    _flash_rank_check(self)
+    return result
+
+
+if not getattr(_flash_rank_worker.Worker.__init__, "_flash_rank_checked", False):
+    _flash_rank_init._flash_rank_checked = True
+    _flash_rank_worker.Worker.__init__ = _flash_rank_init
+''',
+        "rank-device-assert",
+    )
+
+
+def _deferred_patch(tag: str, target: str, body: str, marker: str) -> str:
+    """Run ``body`` when ``target`` finishes importing, rather than at sitecustomize time.
+
+    ``target`` is the module the fragment actually patches, so the body runs at the first moment
+    that module exists and still before verl uses it. Hooking the exact module rather than the
+    ``verl`` package matters: the body imports heavy submodules, and doing that while the parent
+    package is itself mid-execution would run against a half-initialized ``verl``.
+
+    ``body`` may import torch/verl/vllm freely -- by the time it runs, ray has narrowed this actor
+    to its own card, so the CUDA context it builds is the right one.
+
+    ``tag`` uniquifies the closure this emits. Fragments are concatenated into ONE sitecustomize at
+    module scope, so a shared function name would let the last fragment silently replace an earlier
+    one's body.
+
+    ``marker`` is the fragment's name, recorded from INSIDE the body once the patch has landed.
+    Deferral moves the work off sitecustomize time, so ``wrap_shim_fragment``'s own
+    ``_flash_record_applied_shim`` call no longer sits after the patch -- it sits after the
+    REGISTRATION, and would prove only that a callback was queued. The parent's
+    ``verify_applied_shim_markers`` would then accept a child whose patch never ran, which is
+    exactly the train-unpatched hole the wrapper exists to close. Recording here keeps one marker
+    meaning one thing: this patch is installed.
+
+    Fail-closed in both directions: an exception in the body propagates out of the child's own
+    import of ``target`` (killing the run), and a body that never runs records no marker (failing
+    the parent's check).
+
+    Requires ``render_deferred_patch_runtime()`` earlier in the same sitecustomize.
+    """
+    import textwrap
+
+    applied = f"{textwrap.dedent(body).strip()}\n_flash_record_applied_shim({marker!r})"
+    return f"""
+def _flash_deferred_body_{tag}():
+{textwrap.indent(applied, "    ")}
+
+
+# the registry reads this to name the fragment in its hard-exit message; without it a failed patch
+# reports only the module it was hooking, which is shared by several fragments.
+_flash_deferred_body_{tag}._flash_shim_name = {marker!r}
+_flash_defer_sys._flash_defer_registry.register({target!r}, _flash_deferred_body_{tag})
+"""
+
 
 _ENTROPY_QUANTILE_MARKER = "[flash-verl] top-entropy token masking active"
 _STOP_SEQUENCES_MARKER = "[flash-verl] rollout stop strings active"
@@ -25,7 +338,10 @@ def render_kl_ref_adapter_shim(warmstart: bool) -> str:
     """
     if not warmstart:
         return ""
-    return f'''
+    return _deferred_patch(
+        "klref",
+        "verl.workers.engine.fsdp.transformer_impl",
+        f'''
 from contextlib import contextmanager as _flash_ref_contextmanager
 
 import torch.nn as _flash_ref_nn
@@ -100,7 +416,9 @@ def _flash_ref_disable_adapter(self):
 
 _flash_ref_impl.FSDPEngine._build_lora_module = _flash_ref_build_lora_module
 _flash_ref_impl.FSDPEngine.disable_adapter = _flash_ref_disable_adapter
-'''
+''',
+        "kl-ref-adapter",
+    )
 
 
 def render_structured_outputs_shim(structured_outputs: dict | None) -> str:
@@ -112,7 +430,10 @@ def render_structured_outputs_shim(structured_outputs: dict | None) -> str:
     """
     if not structured_outputs:
         return ""
-    return f'''
+    return _deferred_patch(
+        "structuredoutputs",
+        "verl.experimental.agent_loop",
+        f'''
 from verl.experimental.agent_loop import agent_loop as _flash_so_agent_loop
 from vllm.sampling_params import StructuredOutputsParams as _FlashStructuredOutputsParams
 
@@ -146,7 +467,9 @@ if not getattr(
     _flash_patch_structured_outputs()
     _flash_so_agent_loop.AgentLoopWorker._run_agent_loop._flash_so_patched = True
     print({_STRUCTURED_OUTPUTS_MARKER!r} + " " + repr(_flash_structured_outputs), flush=True)
-'''
+''',
+        "structured-outputs",
+    )
 
 
 def render_exact_save_steps_shim(save_at_steps: tuple[int, ...], total_steps: int) -> str:
@@ -158,7 +481,10 @@ def render_exact_save_steps_shim(save_at_steps: tuple[int, ...], total_steps: in
     """
     if not save_at_steps:
         return ""
-    return f'''
+    return _deferred_patch(
+        "exactsave",
+        "verl.trainer.ppo.ray_trainer",
+        f'''
 from verl.trainer.ppo import ray_trainer as _flash_save_ray_trainer
 
 _flash_required_save_steps = frozenset({tuple(sorted(save_at_steps))!r})
@@ -191,7 +517,9 @@ if not getattr(
         + " final=" + repr(_flash_total_steps),
         flush=True,
     )
-'''
+''',
+        "exact-save-steps",
+    )
 
 
 def render_stop_sequences_shim(stop_sequences: tuple[str, ...]) -> str:
@@ -203,7 +531,10 @@ def render_stop_sequences_shim(stop_sequences: tuple[str, ...]) -> str:
     """
     if not stop_sequences:
         return ""
-    return f'''
+    return _deferred_patch(
+        "stopsequences",
+        "verl.experimental.agent_loop",
+        f'''
 from verl.experimental.agent_loop import agent_loop as _flash_agent_loop
 
 _flash_stop_sequences = {list(stop_sequences)!r}
@@ -233,7 +564,9 @@ if not getattr(_flash_agent_loop.AgentLoopWorker._run_agent_loop, "_flash_stop_p
     _flash_patch_run_agent_loop()
     _flash_agent_loop.AgentLoopWorker._run_agent_loop._flash_stop_patched = True
     print({_STOP_SEQUENCES_MARKER!r} + " " + repr(_flash_stop_sequences), flush=True)
-'''
+''',
+        "stop-sequences",
+    )
 
 
 def render_image_pad_ban_shim(image_pad_token_id: int | None) -> str:
@@ -244,7 +577,10 @@ def render_image_pad_ban_shim(image_pad_token_id: int | None) -> str:
     """
     if image_pad_token_id is None:
         return ""
-    return f"""
+    return _deferred_patch(
+        "imagepadban",
+        "verl.experimental.agent_loop",
+        f"""
 from verl.experimental.agent_loop import agent_loop as _flash_image_agent_loop
 
 _flash_image_pad_token_id = {int(image_pad_token_id)!r}
@@ -271,7 +607,9 @@ if not getattr(
     _flash_patch_image_pad_ban()
     _flash_image_agent_loop.AgentLoopWorker._run_agent_loop._flash_image_pad_patched = True
     print({_IMAGE_PAD_BAN_MARKER!r} + " " + repr(_flash_image_pad_token_id), flush=True)
-"""
+""",
+        "image-pad-ban",
+    )
 
 
 def render_per_turn_credit_shim(per_turn_credit: bool) -> str:
@@ -283,12 +621,19 @@ def render_per_turn_credit_shim(per_turn_credit: bool) -> str:
     """
     if not per_turn_credit:
         return ""
-    return '''
+    return _deferred_patch(
+        "perturncredit",
+        "verl.trainer.ppo.ray_trainer",
+        '''
 import torch as _flash_pt_torch
 from verl.trainer.ppo import ray_trainer as _flash_pt_ray_trainer
 
 _flash_pt_original_compute_advantage = _flash_pt_ray_trainer.compute_advantage
-_flash_pt_logged = False
+# a one-slot list rather than a bare flag with `global`: this fragment is rendered INSIDE a deferred
+# body (see _deferred_patch), where `global` would bind a module-level name that nothing defines and
+# raise NameError on the first advantage call. mutating a closed-over container works identically at
+# module scope and inside the body.
+_flash_pt_logged = [False]
 
 
 def _flash_pt_rows(non_tensor_batch, batch_size):
@@ -351,7 +696,6 @@ def _flash_pt_per_turn_advantages(rows, index, episode_advantages):
 
 
 def _flash_pt_compute_advantage(data, *args, **kwargs):
-    global _flash_pt_logged
     data = _flash_pt_original_compute_advantage(data, *args, **kwargs)
     episode = data.batch.get("advantages")
     if episode is None or episode.dim() != 2:
@@ -382,14 +726,16 @@ def _flash_pt_compute_advantage(data, *args, **kwargs):
     data.batch["advantages"] = advantages
     # returns feeds the critic, which grpo does not use; stock grpo sets it to the same tensor.
     data.batch["returns"] = advantages
-    if not _flash_pt_logged:
+    if not _flash_pt_logged[0]:
         print("[rl-verl] multi-turn per-turn group-relative credit is active", flush=True)
-        _flash_pt_logged = True
+        _flash_pt_logged[0] = True
     return data
 
 
 _flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage
-'''
+''',
+        "per-turn-credit",
+    )
 
 
 def render_reentrant_checkpointing_shim(reentrant: bool, *, multimodal: bool = False) -> str:
@@ -443,7 +789,10 @@ def _flash_install_vision_input_grads(module):
         if multimodal
         else ""
     )
-    return f"""
+    return _deferred_patch(
+        "reentrant",
+        "verl.workers.engine.fsdp.transformer_impl",
+        f"""
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine as _FlashReentrantEngine
 
 _flash_reentrant_original_build_module = _FlashReentrantEngine._build_module
@@ -467,7 +816,9 @@ def _flash_reentrant_build_module(self):
 
 
 _FlashReentrantEngine._build_module = _flash_reentrant_build_module
-"""
+""",
+        "reentrant-checkpointing",
+    )
 
 
 def render_entropy_quantile_shim(entropy_quantile: float | None) -> str:
@@ -480,7 +831,10 @@ def render_entropy_quantile_shim(entropy_quantile: float | None) -> str:
     if entropy_quantile is None or float(entropy_quantile) >= 1.0:
         return ""
     threshold = 1.0 - float(entropy_quantile)
-    return f'''
+    return _deferred_patch(
+        "entropyquantile",
+        "verl.workers.utils.losses",
+        f'''
 import threading as _flash_threading
 
 import torch as _flash_torch
@@ -568,7 +922,9 @@ if not getattr(_flash_original_ppo_loss, "_flash_entropy_masked", False):
     _flash_losses.get_policy_loss_fn = _flash_masked_policy_loss_fn
     _flash_losses.ppo_loss = _flash_entropy_masked_ppo_loss
     print({_ENTROPY_QUANTILE_MARKER!r} + " quantile={entropy_quantile:g}", flush=True)
-'''
+''',
+        "entropy-quantile",
+    )
 
 
 def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
@@ -618,6 +974,20 @@ def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
         "        with urllib.request.urlopen(req) as r:\n"
         "            payload = json.loads(r.read().decode())\n"
         "            return float(payload['score'])\n"
+        # handle http errors before url errors so the bridge's specific failure detail is preserved
+        # instead of being reduced to a generic status message that names no cause.
+        "    except urllib.error.HTTPError as exc:\n"
+        "        detail = ''\n"
+        "        try:\n"
+        "            detail = str(json.loads(exc.read().decode())['error'])\n"
+        "        except Exception:\n"
+        "            detail = ''\n"
+        "        fault = 'could not serve' if exc.code >= 500 else 'rejected'\n"
+        "        if detail:\n"
+        "            raise RuntimeError('flash reward bridge %s the request (HTTP %s): %s'\n"
+        "                               % (fault, exc.code, detail)) from exc\n"
+        "        raise RuntimeError('flash reward bridge %s the request: HTTP %s with no error detail'\n"
+        "                           % (fault, exc.code)) from exc\n"
         "    except urllib.error.URLError as exc:\n"
         "        raise RuntimeError('flash reward bridge request failed: %s' % exc) from exc\n"
         "    except Exception as exc:\n"
