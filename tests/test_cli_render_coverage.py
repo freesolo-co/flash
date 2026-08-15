@@ -292,6 +292,25 @@ def test_deployments_table_formats_verified_at_as_utc(styled_plain) -> None:
     assert "1700000000" not in out
 
 
+def test_deployments_table_surfaces_base_url_and_handles_missing_value(styled_plain) -> None:
+    out = render.deployments_table(
+        [
+            {
+                "run_id": "r1",
+                "deployment": {
+                    "state": "ready",
+                    "openai_base_url": "https://serve.example/v1",
+                },
+            },
+            {"run_id": "r2", "deployment": {"state": "ready"}},
+        ]
+    )
+    assert "OPENAI BASE URL" in out
+    assert "https://serve.example/v1" in out
+    assert "r2" in out
+    assert "-" in out
+
+
 def test_run_status_shows_realized_cost_and_artifacts(styled_plain) -> None:
     obj = {
         "run_id": "flash-1",

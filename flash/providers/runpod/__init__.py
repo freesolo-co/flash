@@ -98,7 +98,7 @@ class RunpodProvider:
         log: Any = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        from flash.core.spec import require_matching_seed
+        from flash.core.spec import gpu_count_of, require_matching_seed
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.jobs import (
             make_hf_failure_detail_reader,
@@ -147,7 +147,12 @@ class RunpodProvider:
             # the persisted scarcity flag controls stall grace, not capacity wording. recovery
             # rebuilds the unpinned allocation with a fresh candidate set, so claiming no escalation
             # remains would be false.
-            **stall_kwargs(on_last_gpu=on_last_gpu),
+            #
+            # the card count comes from the spec rather than the handle's `allocated_gpu_count`:
+            # attach polls the persisted EFFECTIVE worker spec, which submission already stamped
+            # with the count allocation resolved, and the attach context pops that handle key off
+            # before the handle reaches here. same number, but sourced where it is always present.
+            **stall_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
         )
 
     def cancel(self, handle: JobHandle) -> None:
