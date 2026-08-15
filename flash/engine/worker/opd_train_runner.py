@@ -157,8 +157,12 @@ def _prepare_prompts(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     thinking_prefill = _opd_train._thinking_prefill_text(tokenizer)
-    requested_len = request.knobs.max_length or (
-        _opd_train.RECIPE.opd.max_prompt_len + request.knobs.max_completion
+    from flash.engine.plan.vram import opd_rollout_seq_len
+
+    requested_len = opd_rollout_seq_len(
+        request.knobs.max_length,
+        request.knobs.max_completion,
+        bool(_opd_train._w.THINKING),
     )
     # clamp to the architecture BEFORE deriving the prompt budget, so every downstream length agrees.
     # clamping only the engine would admit prompts sized against the unclamped budget and then fail

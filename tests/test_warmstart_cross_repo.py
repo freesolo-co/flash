@@ -223,7 +223,9 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
             "digest", "config", "adapter_model.safetensors", "weight:1"
         ),
     )
-    public_spec, worker_spec, identity = R._prepare_init_from_adapter(child, token="token")
+    public_spec, worker_spec, identity, source_context = R._prepare_init_from_adapter(
+        child, token="token"
+    )
 
     assert calls == [("owner/source-runs:sft/source-run", "token", _REVISION)]
     assert public_spec.train.init_from_adapter == "source-run"
@@ -237,6 +239,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
         "weight_filename": "adapter_model.safetensors",
         "weight_identity": "weight:1",
     }
+    assert source_context is None
 
 
 def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
@@ -409,7 +412,7 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
     """The inherited pin must be on the spec BEFORE `resolve_model` sizes the run.
 
     Sizing reads the revision: `resolve_model` re-derives params/vocab from the pinned commit and
-    raises `min_disk_gb` to `params_b * 2 + 64`, which for half of today's catalog exceeds the
+    raises `min_disk_gb` to `ceil(2 * params_b) + 64`, which for half of today's catalog exceeds the
     catalog default (Qwen3.5-4B: 0 -> 73). Inheriting inside `_prepare_init_from_adapter`, which
     runs after `resolve_model`, `_with_model_disk`, and `_assign_weight_cache_volume`, provisions
     the child as if unpinned while training it pinned, and skips the geometry validation the pin
@@ -622,7 +625,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
             "run_id": "source-run",
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "sft",
-            "train": {"hf_repo": "owner/source-runs"},
+            "train": {"hf_repo": "owner/source-runs", "max_context_tokens": 8192},
         }
     )
     source_status = provisioned_status(R, source, state="done")
@@ -639,8 +642,13 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
         }
     )
     estimated_specs = []
+    source_reads = []
 
-    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    def get_source(run_id):
+        source_reads.append(run_id)
+        return source_status
+
+    monkeypatch.setattr(R, "get_status", get_source)
     monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
     monkeypatch.setattr(
         checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
@@ -683,6 +691,8 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     )
     assert estimated_specs == [prepared.worker_spec]
     assert prepared.estimated_cost_usd == 12.5
+    assert prepared.prompt_budget["warm_start_context"] == 8192
+    assert source_reads == ["source-run", "source-run"]
 
 
 def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path):
