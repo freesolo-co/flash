@@ -8047,3 +8047,209 @@ def test_an_age_encrypted_file_is_refused_like_every_other_ciphertext(tmp_path):
     prose = tmp_path / "notes.md"
     prose.write_bytes(b"We encrypt these with age-encryption.org/v1 before sharing.\n")
     assert credential_in_file(prose) is None
+
+
+def test_an_ar_trailer_too_short_for_a_header_is_refused(tmp_path):
+    """The ar walk's end condition could not tell "finished" from "gave up".
+
+    Fewer bytes left than a 60-byte header ended the walk as if the archive were complete, so a
+    remainder that is not a member -- a bare compressed record appended after one -- was neither
+    parsed nor reported. A 29-byte zlib record holding a key published clean while the same record
+    standing alone was refused.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    record = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+    assert len(record) < 60  # the fixture only works if it fits inside a header's width
+
+    control = tmp_path / "record.zlib"
+    control.write_bytes(record)
+    assert credential_in_file(control) == "a Freesolo API key"  # the control the ar must not lose
+
+    header = b"empty.txt".ljust(16) + b"0".ljust(12) + b"0".ljust(6) + b"0".ljust(6)
+    header += b"100644".ljust(8) + b"0".ljust(10) + b"`\n"
+    short = tmp_path / "short.a"
+    short.write_bytes(b"!<arch>\n" + header + record)
+    with pytest.raises(_Unscannable, match="cannot read"):
+        credential_in_file(short)
+
+    # an archive ending exactly on a member boundary is still clean, so this did not refuse every ar
+    plain = tmp_path / "plain.a"
+    plain.write_bytes(b"!<arch>\n" + header)
+    assert credential_in_file(plain) is None
+
+
+def test_a_codec_error_in_one_member_does_not_abandon_the_archive(tmp_path):
+    """`zlib.error` and `LZMAError` inherit straight from `Exception`, so nothing caught them.
+
+    An uncaught codec error escaped the member loop entirely and the dispatcher read it as "not a
+    zip after all", moving on to the next handler. A corrupt FIRST member therefore hid a perfectly
+    readable second member holding the key.
+    """
+    import struct
+    import zipfile
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    buffered = io.BytesIO()
+    with zipfile.ZipFile(buffered, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("a_corrupt.bin", os.urandom(4000))
+        archive.writestr("b_key.txt", f"fslo_{_FAKE_KEY_BODY}".encode())
+    raw = bytearray(buffered.getvalue())
+
+    # damage the FIRST member's deflate stream deep enough that it is rejected rather than truncated
+    signature = raw.find(b"PK\x03\x04")
+    names = struct.unpack_from("<H", raw, signature + 26)[0]
+    extra = struct.unpack_from("<H", raw, signature + 28)[0]
+    payload = signature + 30 + names + extra
+    for index in range(payload + 3, payload + 60):
+        raw[index] ^= 0xFF
+
+    corrupt = tmp_path / "corrupt.zip"
+    corrupt.write_bytes(bytes(raw))
+    # the fixture really does raise the error that used to escape, rather than a caught one
+    with zipfile.ZipFile(io.BytesIO(bytes(raw))) as archive, pytest.raises(zlib.error):
+        archive.read("a_corrupt.bin")
+    assert credential_in_file(corrupt) == "a Freesolo API key"
+
+
+def test_a_zip_appended_to_another_zip_is_still_walked(tmp_path):
+    """`zipfile` reads the LAST end-of-central-directory record, so the first archive vanishes.
+
+    `cat a.zip b.zip` leaves the whole of `a.zip` as a prefix `namelist()` never reports, and a key
+    DEFLATED inside it is not in the concatenation's raw bytes either -- so both passes returned
+    clean on a file every unzip recovers the key from.
+    """
+    import zipfile
+
+    from flash.env_secrets import credential_in_file
+
+    first = io.BytesIO()
+    with zipfile.ZipFile(first, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        archive.writestr("key.txt", f"fslo_{_FAKE_KEY_BODY}\n" * 40)
+    second = io.BytesIO()
+    with zipfile.ZipFile(second, "w") as archive:
+        archive.writestr("readme.txt", b"hello\n")
+
+    hidden = first.getvalue()
+    assert f"fslo_{_FAKE_KEY_BODY}".encode() not in hidden  # compression hides it from the raw pass
+
+    control = tmp_path / "first.zip"
+    control.write_bytes(hidden)
+    assert credential_in_file(control) == "a Freesolo API key"  # the control the pair must match
+
+    joined = tmp_path / "joined.zip"
+    joined.write_bytes(hidden + second.getvalue())
+    assert credential_in_file(joined) == "a Freesolo API key"
+
+    # an ordinary single zip has no prefix at all and is unaffected
+    plain = tmp_path / "plain.zip"
+    plain.write_bytes(second.getvalue())
+    assert credential_in_file(plain) is None
+
+
+def test_an_octal_escape_is_resolved_like_the_hex_ones(tmp_path):
+    """Python resolves `\\105` to `E` exactly as it resolves `\\x45`.
+
+    Only the hex and unicode spellings were rejoined, so a key body carrying one octal escape
+    evaluated to the complete credential at runtime while the raw bytes a pattern reads were split
+    by the escape and matched nothing.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY[:2] + "\\105" + _FAKE_KEY_BODY[3:]
+    escaped = tmp_path / "sidecar.py"
+    escaped.write_text(f'KEY = "fslo_{body}"\n')
+    assert eval(f'"fslo_{body}"')[7] == "E"  # the fixture must really decode to the key
+    assert credential_in_file(escaped) == "a Freesolo API key"
+
+    # a short octal escape is left alone, so an ordinary regex string is not rewritten
+    ordinary = tmp_path / "pattern.py"
+    ordinary.write_text('SPLIT = "\\1 and \\2"\n')
+    assert credential_in_file(ordinary) is None
+
+
+def test_a_comment_between_adjacent_literals_is_still_a_seam(tmp_path):
+    """Inside parentheses the tokenizer discards a trailing comment exactly as it does whitespace.
+
+    `('fslo_AbCd'  # prefix\\n 'Ef...')` is one string at runtime, so the seam had to close for the
+    same reason the plain adjacent pair does -- and the comment text between the quotes kept it
+    open.
+    """
+    from flash.env_secrets import credential_in_file
+
+    split = tmp_path / "helper.py"
+    split.write_text(
+        f"KEY = ('fslo_{_FAKE_KEY_BODY[:8]}'  # the issuer prefix\n       '{_FAKE_KEY_BODY[8:]}')\n"
+    )
+    assert credential_in_file(split) == "a Freesolo API key"
+
+    # two list elements separated by a comment are still two values, not one
+    listed = tmp_path / "names.py"
+    listed.write_text('NAMES = ["alpha",  # first\n         "beta"]\n')
+    assert credential_in_file(listed) is None
+
+
+def test_jwk_halves_in_sibling_objects_are_not_one_key(tmp_path):
+    """Records split at depth ZERO, so two sibling objects shared one record.
+
+    `{"public":{"kty":"RSA"},"artifact":{"d":"..."}}` holds a public key and an unrelated
+    high-entropy value under a private member name, in different objects -- and pairing them
+    refused a legitimate publish. The entropy test cannot separate the two, because a build id
+    scores exactly as random as a key body.
+    """
+    from flash.env_secrets import credential_in_file
+
+    payload = "abcdefghijklmnopqrstuvwxyz012345"
+
+    siblings = tmp_path / "manifest.json"
+    siblings.write_text(f'{{"public":{{"kty":"RSA"}},"artifact":{{"d":"{payload}"}}}}\n')
+    assert credential_in_file(siblings) is None
+
+    reversed_order = tmp_path / "reversed.json"
+    reversed_order.write_text(f'{{"artifact":{{"d":"{payload}"}},"public":{{"kty":"RSA"}}}}\n')
+    assert credential_in_file(reversed_order) is None
+
+    # every shape that IS one key still pairs, including across nested metadata and one level down
+    for name, text in {
+        "flat.json": f'{{"kty":"RSA","d":"{payload}"}}',
+        "swapped.json": f'{{"d":"{payload}","kty":"RSA"}}',
+        "nested.json": f'{{"kty":"RSA","meta":{{"x":1}},"d":"{payload}"}}',
+        "wrapped.json": f'{{"keys":[{{"kty":"RSA","d":"{payload}"}}]}}',
+        "descended.json": f'{{"kty":"RSA","sub":{{"d":"{payload}"}}}}',
+    }.items():
+        real = tmp_path / name
+        real.write_text(text + "\n")
+        assert credential_in_file(real) == "a private key", name
+
+
+def test_prose_naming_the_pgp_armor_is_not_ciphertext(tmp_path):
+    """The armor LINE alone refused the document most likely to quote it.
+
+    A README saying "look for a block starting with -----BEGIN PGP MESSAGE-----" carries no
+    ciphertext, and refusing it named a remedy -- decrypt and remove the message -- for a file that
+    has none.
+    """
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    prose = tmp_path / "README.md"
+    prose.write_text("Look for a block starting with -----BEGIN PGP MESSAGE----- in the archive.\n")
+    assert credential_in_file(prose) is None
+
+    # a header with no body at all is not a message either
+    empty = tmp_path / "empty.asc"
+    empty.write_text("-----BEGIN PGP MESSAGE-----\n-----END PGP MESSAGE-----\n")
+    assert credential_in_file(empty) is None
+
+    # a real armored message is still refused, so the narrowing kept the true positive
+    real = tmp_path / "secret.asc"
+    real.write_text(
+        "-----BEGIN PGP MESSAGE-----\n\n"
+        "hQEMAwm7ZLQ8Kd1kAQf/abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH\n"
+        "=abcd\n-----END PGP MESSAGE-----\n"
+    )
+    with pytest.raises(_Unscannable, match="encrypted OpenPGP"):
+        credential_in_file(real)

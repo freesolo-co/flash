@@ -11,6 +11,7 @@ one way -- nothing here imports the scanning -- so these can be tested on bytes 
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 
 _MAX_OPENPGP_MARKERS = 8
@@ -85,6 +86,19 @@ _PACKET_PAST_BUFFER = -1
 
 _OPENPGP_MESSAGE_ARMOR = b"-----BEGIN PGP MESSAGE-----"
 
+# The armor line followed by an actual armored BODY. RFC 4880 §6.2 puts optional headers, then a
+# blank line, then base64 -- so a real message always has a run of base64 behind the line, while a
+# README saying "look for a block starting with -----BEGIN PGP MESSAGE-----" has prose or nothing.
+# The line alone refused documentation that merely names it, which is a false alarm on exactly the
+# file most likely to mention it.
+#
+# One base64 line of 32 characters is the bar. The shortest real message is a session-key packet
+# and a data packet, hundreds of bytes of base64 across several lines, so this cannot exclude a
+# genuine one -- and prose does not carry a 32-character base64 run on the line after the marker.
+_OPENPGP_ARMORED_BODY = re.compile(
+    rb"-----BEGIN PGP MESSAGE-----[^\n]*\n(?:[!-9;-~][^\n]*\n)*\s*\n?[A-Za-z0-9+/]{32}"
+)
+
 # How much of a stream `_looks_like_textual` reads. A multi-byte UTF-8 character straddling the cut
 # would decode-fail on the truncation rather than on the content, so the sample is taken at a
 # 4 KiB boundary and the decode error is tolerated as "not text" -- which is the safe direction:
@@ -97,10 +111,16 @@ def _has_openpgp_message_armor(window: bytes) -> bool:
     Searched at any offset rather than anchored: armor is text, so it is ordinarily embedded -- a
     key pasted into a YAML block or appended to a config sits well past byte zero.
 
-    No false-positive budget is spent on this. The line is 27 fixed bytes ending in five dashes; it
-    does not occur in prose that is not quoting an actual message.
+    The BODY is required, not just the line. The line alone read as ciphertext in a README that
+    merely names it -- "look for a block starting with -----BEGIN PGP MESSAGE-----" -- which is a
+    false refusal on the document most likely to mention it, and on a file holding no ciphertext at
+    all. A real message always has base64 behind the line, so requiring that costs a genuine one
+    nothing.
+
+    The substring test runs first because it is a memchr scan and the pattern is not: almost every
+    window has no armor line at all and pays only the fast test.
     """
-    return _OPENPGP_MESSAGE_ARMOR in window
+    return _OPENPGP_MESSAGE_ARMOR in window and _OPENPGP_ARMORED_BODY.search(window) is not None
 
 
 def _is_openpgp_encrypted(head: bytes) -> bool | None:

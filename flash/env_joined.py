@@ -40,7 +40,16 @@ import re
 # is consumed with the seam, which is what a parser does with it. Bounded to the two-character
 # combinations the language defines, so an ordinary identifier ending in a quote cannot be eaten:
 # `x = foo["a"]["b"]` has no whitespace-only seam between its quotes and is unaffected either way.
-_ADJACENT_LITERALS = re.compile(rb"(?<!\\)[\"'][ \t]*(?:\r?\n[ \t]*)?(?i:[bruf]{0,2})[\"']")
+#
+# A `#` COMMENT may sit in the seam too. Inside parentheses Python spans the concatenation across
+# lines, and a comment before the newline is discarded by the tokenizer exactly as whitespace is:
+# `('fslo_AbCd'  # prefix\n 'Ef0123456789')` evaluates to the whole key while the raw bytes are
+# split by the comment text. Allowed only immediately before the single permitted newline, which is
+# where a comment can legally end a line -- so the separator is still "nothing that survives
+# parsing", and a `", "` between two list elements is as excluded as it was.
+_ADJACENT_LITERALS = re.compile(
+    rb"(?<!\\)[\"'][ \t]*(?:#[^\n]*)?(?:\r?\n[ \t]*)?(?i:[bruf]{0,2})[\"']"
+)
 
 # A backslash immediately before a newline, which POSIX sh, make, C and YAML all remove to rejoin
 # the line. An EVEN number of preceding backslashes means the backslash is itself escaped and the
@@ -70,7 +79,21 @@ _CONTINUATIONS = (b"\\\n", b"\\\r\n")
 # of them can invent a character outside what these patterns already match.
 _JSON_ESCAPE = re.compile(rb"\\(?:u00|U000000|x)([0-7][0-9A-Fa-f])")
 
-# What those escapes look like as plain substrings, for the guard in `_rejoined`.
+# The OCTAL spelling of the same character, which Python resolves in an ordinary string literal:
+# `"fslo_a1\1052c3D4..."` evaluates to the complete key while the raw bytes a pattern reads are
+# split by the escape. Exactly three octal digits, bounded to `[0-1][0-7][0-7]` so the value stays
+# in the same 0x00-0x7F ASCII range as the hex forms above and cannot invent a character outside
+# what these patterns already match.
+#
+# Three digits rather than one or two, deliberately. Python accepts `\1` and `\12` as well, but a
+# lone `\0`-`\7` is one character of ordinary text away from any regex-quoted string and rewriting
+# it would corrupt far more than it recovers -- while a key body written with a SHORT octal escape
+# still leaves a long unbroken run on one side for the ordinary pass to match.
+_OCTAL_ESCAPE = re.compile(rb"\\([0-1][0-7][0-7])")
+
+# What those escapes look like as plain substrings, for the guard in `_rejoined`. The octal form
+# has no distinctive prefix -- a backslash alone is its marker -- so it is guarded by the same
+# `\\` test rather than a letter.
 _ESCAPE_MARKERS = (b"\\u", b"\\U", b"\\x")
 
 
@@ -95,4 +118,8 @@ def _rejoined(data: bytes) -> bytes:
     # substitution pass over every byte.
     if any(marker in joined for marker in _ESCAPE_MARKERS):
         joined = _JSON_ESCAPE.sub(lambda point: bytes.fromhex(point.group(1).decode()), joined)
+    # Guarded by a bare backslash rather than a two-byte marker, since that is all an octal escape
+    # has. Still a memchr-speed test, and still absent from most files.
+    if b"\\" in joined:
+        joined = _OCTAL_ESCAPE.sub(lambda point: bytes([int(point.group(1), 8)]), joined)
     return joined

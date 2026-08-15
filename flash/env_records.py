@@ -103,8 +103,11 @@ class _RecordSplitter:
         # point inside it can be tested for a split escape pair.
         self._string_from = -1
 
-    def ends(self, data: bytes, *, overlap: int = 0) -> list[int]:
-        """The offsets in `data` just past each top-level record boundary.
+    def ends(self, data: bytes, *, overlap: int = 0) -> list[tuple[int, int]]:
+        """Each offset in `data` just past a closing brace, with the depth left behind it.
+
+        Depth 0 is a top-level record boundary; a deeper one closes a nested object, which the
+        pairing uses to drop halves that belong to a subtree it has left.
 
         `overlap` is how many trailing bytes of `data` the next call will re-read. The state is
         rewound to that point on entry, so the shared bytes are tokenized twice but counted once.
@@ -144,7 +147,7 @@ class _RecordSplitter:
                 return []
             at = tail.end()
             self.in_string = False
-        found: list[int] = []
+        found: list[tuple[int, int]] = []
         pattern = _JSON_RECORD_SPLIT if b"{" in data or b"}" in data else _STRING_ONLY
         # The full tokenizer is skipped when the window holds no brace at all, but its quotes are
         # still scanned: one left open here is what the next window resumes inside.
@@ -156,12 +159,24 @@ class _RecordSplitter:
                 self._string_from = token.start() + 1
             elif token.group(2):
                 self.depth += 1
+                # An OPENING brace is reported too, with the depth it opens into. Without it a
+                # fragment spans several depths at once and cannot be credited to one object: in
+                # `{"kty":"RSA","meta":{"x":1}` the `kty` is on the outer object while the brace
+                # ending the fragment closes the inner one, and in `{"public":{"kty":"RSA"}` the
+                # `kty` is on the INNER object -- the two fragments are otherwise identical in
+                # shape. Splitting at every brace gives each piece exactly one depth.
+                found.append((token.end(), self.depth))
             else:
                 # Never below zero: a stray `}` in prose would otherwise leave the depth negative
                 # and every later `{` would close a record early, splitting a real key in two.
                 self.depth = max(0, self.depth - 1)
-                if not self.depth:
-                    found.append(token.end())
+                # EVERY close is reported, with the depth left behind it, not just the ones that
+                # return to zero. A top-level boundary (depth 0) ends a record; a deeper one ends a
+                # SUBTREE, which is what tells the pairing that a half seen inside it is now out of
+                # scope. Reporting only the record boundaries let two sibling objects share one
+                # record, so `{"public":{"kty":"RSA"},"artifact":{"d":"..."}}` paired halves that
+                # belong to different keys and refused a legitimate publish.
+                found.append((token.end(), self.depth))
         self._settle(data, resume_at)
         return found
 
@@ -231,24 +246,53 @@ class _RecordHalves:
 
     def __init__(self, detector: _TwoMarkers) -> None:
         self.detector = detector
-        self.context = False
-        self.payload: re.Match[bytes] | None = None
+        # Halves are held per DEPTH, not once for the whole record. A half seen at depth 2 belongs
+        # to the object that is open there, and closing that object drops it -- which is what stops
+        # two SIBLING objects, both inside one record, from lending each other their halves.
+        self.context: set[int] = set()
+        self.payload: dict[int, re.Match[bytes]] = {}
+        self.depth = 0
 
-    def paired(self, data: bytes, ends: list[int]) -> re.Match[bytes] | None:
-        """The payload match of the first record in `data` holding BOTH halves, or None."""
+    def paired(self, data: bytes, ends: list[tuple[int, int]]) -> re.Match[bytes] | None:
+        """The payload match of the first OBJECT in `data` holding both halves, or None."""
         start = 0
-        for boundary in ends:
-            if found := self._absorb(data[start:boundary]):
+        for boundary, depth in ends:
+            # `ends` reports every brace, so a fragment lies wholly at one depth -- the one in
+            # force before the brace that ends it. Its halves belong to the object open there.
+            if found := self._absorb(data[start:boundary], self.depth):
                 return found
-            self.context = False
-            self.payload = None
+            if depth < self.depth:
+                # A CLOSING brace: everything seen strictly deeper goes out of scope with the
+                # object it closed. Depth 0 clears everything, which is the top-level record
+                # boundary the JSONL case relies on. An opening brace only descends and drops
+                # nothing, since the object being entered is a child of what is already in scope.
+                self.context = {at for at in self.context if at <= depth}
+                self.payload = {at: hit for at, hit in self.payload.items() if at <= depth}
+            self.depth = depth
             start = boundary
-        return self._absorb(data[start:])
+        return self._absorb(data[start:], self.depth)
 
-    def _absorb(self, record: bytes) -> re.Match[bytes] | None:
-        """Fold one record fragment into the halves seen so far, returning a completed pair."""
+    def _absorb(self, record: bytes, depth: int) -> re.Match[bytes] | None:
+        """Fold one fragment into the halves seen so far, returning a completed pair.
+
+        `depth` is the nesting level the fragment's own content sits at. A pair completes when the
+        payload is at or below the object carrying the context marker -- so a key written
+        `{"kty":"RSA","sub":{"d":"..."}}` still pairs, since an enclosing object is an ancestor of
+        the one holding `d`. Two SIBLINGS share no ancestor below their parent, so neither can lend
+        the other its half.
+        """
         if not record:
             return None
-        self.context = self.context or bool(self.detector.context.search(record))
-        self.payload = self.payload or self.detector.payload_match(record)
-        return self.payload if self.context and self.payload else None
+        if self.detector.context.search(record):
+            self.context.add(depth)
+        if depth not in self.payload and (hit := self.detector.payload_match(record)):
+            self.payload[depth] = hit
+        if not self.context or not self.payload:
+            return None
+        # The shallowest context marker has the widest scope, and a payload at or below it is
+        # inside the object that marker describes.
+        context_at = min(self.context)
+        for at in sorted(self.payload):
+            if at >= context_at:
+                return self.payload[at]
+        return None

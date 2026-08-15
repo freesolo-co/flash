@@ -15,14 +15,16 @@ archive structure, and what a member's bytes MEAN stays with the caller.
 from __future__ import annotations
 
 import io
+import lzma
 import tarfile
 import time
 import zipfile
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import IO
 
-from flash.env_formats import _zip_member_count
+from flash.env_formats import _read_at, _zip_member_count
 
 # What "this member cannot be read" looks like, across both formats and every codec underneath them.
 #
@@ -41,6 +43,13 @@ _UNREADABLE_MEMBER = (
     # half-written shard in a dataset directory is ordinary, and crashing on it would be a worse
     # bug than the hole being closed.
     tarfile.TarError,
+    # The two codec errors that also inherit straight from `Exception`. A member whose deflate or
+    # xz stream is damaged deep enough raises one of these, and uncaught it escaped the member loop
+    # entirely: the dispatcher read that as "not a zip after all" and moved on, so a corrupt FIRST
+    # member hid a perfectly readable second member holding the key. Recorded like every other
+    # unreadable member instead, which refuses rather than approves.
+    zlib.error,
+    lzma.LZMAError,
 )
 
 # What the caller hands in: a scanner for one member's bytes, and the refusal it raises. Taking them
@@ -128,8 +137,35 @@ def credential_in_zip(
                 # other unreadable member reaches the same conclusion for the same reason.
                 unreadable = unreadable or "an archive member this check cannot read"
                 continue  # the rest of the archive still gets scanned
+        # Anything BEFORE the first member is a prefix `zipfile` never enumerates. It reads the
+        # LAST end-of-central-directory record, so a second zip appended to a first makes the whole
+        # first archive an invisible prefix -- `namelist()` returns only the second zip's members
+        # and a key deflated inside the first published intact, since compression also keeps it out
+        # of the raw byte pass. `cat a.zip b.zip` is the one-line recipe.
+        #
+        # The prefix is handed back to the scanner rather than parsed here: it may be another zip,
+        # a tar, a compressed stream, or an SFX stub that is genuinely just an executable. Bounded
+        # by the lowest local-header offset, so this reads what the archive itself says precedes
+        # its first member, and an ordinary zip has no prefix at all and pays nothing.
+        prefix = min((info.header_offset for info in archive.infolist()), default=0)
+    # A refusal the MEMBERS produced is reported first. The prefix is bytes this archive says it
+    # does not own, so a vaguer complaint about them must not displace the specific answer the walk
+    # already has -- an encrypted member inside a zip that itself sits inside a tar has a non-zero
+    # offset, and letting the prefix scan speak first replaced "an encrypted archive member" with
+    # the generic message and named the wrong remedy.
     if unreadable:
         raise refusal(f"contains {unreadable}")
+    if prefix > 0:
+        head = source[:prefix] if isinstance(source, bytes) else _read_at(source, 0, prefix)
+        if head:
+            try:
+                if kind := scan(io.BytesIO(head), deadline, depth):
+                    return kind
+            except _UNREADABLE_MEMBER:
+                # Only the ordinary unreadable cases are swallowed. A refusal the scanner itself
+                # raises is not caught here at all: it carries its own specific message and
+                # propagates, which is what a prefix holding real ciphertext should do.
+                raise refusal("contains an archive member this check cannot read") from None
     return None
 
 
@@ -256,6 +292,13 @@ def credential_in_ar(
     at = len(_AR_MAGIC)
     for _ in range(member_limit):
         if at + _AR_HEADER > len(data):
+            # Fewer bytes left than a header. Exactly zero is the archive's clean end; anything
+            # else is a remainder the walk cannot parse and therefore has not read -- and unread is
+            # not clean. A 29-byte zlib record after a zero-length member fits in that gap, and
+            # returning None here published the key it inflates to while the same record standing
+            # alone was refused.
+            if at != len(data):
+                unreadable = unreadable or "an archive member this check cannot read"
             break
         header = data[at : at + _AR_HEADER]
         try:
