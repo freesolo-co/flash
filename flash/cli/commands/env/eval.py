@@ -17,7 +17,8 @@ from flash.cli.commands.env.eval_args import (
     positive_int,
 )
 from flash.cli.commands.env.push import _err
-from flash.cli.commands.env.test import _env_params, _evaluation_example
+from flash.cli.commands.env.test import _env_params
+from flash.cli.commands.env.test_evaluations import _evaluation_example
 from flash.cli.ui import render
 from flash.envs.evaluations import (
     EvalCase,
