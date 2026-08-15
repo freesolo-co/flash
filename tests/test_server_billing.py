@@ -418,9 +418,34 @@ def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
     assert "insufficient" not in res.text
 
 
+def test_transient_environment_resolve_is_attempted_once_per_request(api, monkeypatch):
+    """the request-side preflight owns one bounded attempt before deferring a transient failure."""
+    import flash.envs.loader as env_loader
+    from flash.envs.identity import GitHubUnavailableError
+
+    calls = []
+
+    def _transient(_parsed, *_args, **_kwargs):
+        calls.append(1)
+        raise GitHubUnavailableError("GitHub server error (503, transient)")
+
+    monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _transient)
+
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["state"] == "dry_run"
+    assert calls == [1], f"environment ref was resolved {len(calls)} times"
+
+
 def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):
-    # a non-402 billing error (backend unreachable / 5xx) must NOT block training; the completion
-    # charge is the backstop. The run is still accepted and recorded.
+    # a non-402 billing error (backend unreachable / 5xx) must not block training; the completion
+    # charge is the backstop. the run is still accepted and recorded.
     import flash.server.billing.charges as billing_mod
 
     def _unreachable(**k):

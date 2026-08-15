@@ -56,7 +56,7 @@ def test_urlopen_raises_typed_error_on_rate_limit_403(monkeypatch):
 
 
 def test_urlopen_non_rate_limit_403_stays_plain_runtime_error(monkeypatch):
-    # A 403 that is NOT a rate limit (auth failure, repo not found) must stay a plain RuntimeError
+    # a 403 that is not a rate limit (auth failure, repo not found) must stay a plain runtimeerror
     # (non-retriable) so the run fails fast instead of looping on a fresh worker forever.
     from flash.envs.loader import GitHubRateLimitError, _urlopen
 
@@ -69,6 +69,33 @@ def test_urlopen_non_rate_limit_403_stays_plain_runtime_error(monkeypatch):
     with pytest.raises(RuntimeError) as exc:
         _urlopen(urllib.request.Request("https://api.github.com/x"))
     assert not isinstance(exc.value, GitHubRateLimitError)
+
+
+@pytest.mark.parametrize("code", [404, 422])
+def test_urlopen_raises_permanent_error_on_settled_github_answer(monkeypatch, code):
+    from flash.envs.loader import GitHubPermanentError, _urlopen
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(code, '{"message": "Not Found"}')),
+    )
+
+    with pytest.raises(GitHubPermanentError, match=rf"\({code}\)"):
+        _urlopen(urllib.request.Request("https://api.github.com/x"), max_rate_limit_retries=0)
+
+
+def test_urlopen_raises_unavailable_error_on_server_failure(monkeypatch):
+    from flash.envs.loader import GitHubUnavailableError, _urlopen
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(503, "service unavailable")),
+    )
+
+    with pytest.raises(GitHubUnavailableError, match="503"):
+        _urlopen(urllib.request.Request("https://api.github.com/x"), max_rate_limit_retries=0)
 
 
 def test_urlopen_success_returns_bytes(monkeypatch):

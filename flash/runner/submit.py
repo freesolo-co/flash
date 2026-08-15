@@ -128,6 +128,14 @@ def prepare_job(
         owner_key_id=owner_key_id,
         token=os.environ.get("HF_TOKEN"),
     )
+    # these read-only gates belong to preparation: every submit path passes here exactly once, and
+    # callers receive the pinned worker spec before quoting, affordability, persistence, or allocation.
+    worker_spec = _runner().preflight_validate_environment_ref(worker_spec)
+    from flash.content.multimodal import preflight_validate_image_opd
+    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+
+    preflight_validate_image_opd(worker_spec)
+    preflight_validate_managed_teacher(worker_spec)
     from flash.cost.spec import estimate_for_spec
 
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
@@ -230,22 +238,6 @@ def submit_job(
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
-    from flash.content.multimodal import preflight_validate_image_opd
-    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
-
-    # ahead of allocation and inside dry-run: an environment repo GitHub permanently rejects is the
-    # submitter's typo, and the plane already holds the 404 that proves it. FIRST of the three:
-    # the opd image preflight below resolves the same ref to read its dataset, so leaving this
-    # second would surface an unresolvable environment as a raw GitHub error from whichever
-    # preflight happened to touch it first, instead of the named refusal.
-    #
-    # keeps the pin it resolved. the http route hoists this same gate ahead of affordability and
-    # hands the pinned spec back in `prepared_job`, in which case `resolved_sha` is already set and
-    # this returns without a request; a direct caller resolves here instead. either way the pin is
-    # made once, which is the point of `_assign_resolved_env_sha` further down.
-    worker_spec = _runner().preflight_validate_environment_ref(worker_spec)
-    preflight_validate_image_opd(worker_spec)
-    preflight_validate_managed_teacher(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     if not dry_run:

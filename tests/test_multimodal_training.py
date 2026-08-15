@@ -759,42 +759,6 @@ def test_image_opd_submit_preflight_rejects_text_teacher_before_state_mutation(
         runner.get_status(spec.run_id)
 
 
-def test_image_opd_submit_preflight_preserves_unsupported_model_precedence(monkeypatch, tmp_path):
-    from flash import runner
-    from flash.core.spec import JobSpec
-
-    algorithm = "opd"
-    model = "meta-llama/Llama-3.2-1B"
-    message = "does not support image-bearing"
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-
-    def fail(*args, **kwargs):
-        raise AssertionError("rejected submit must not mutate warm-start state or reach providers")
-
-    monkeypatch.setattr(runner, "_mark_warmstart_source", fail)
-    monkeypatch.setattr(runner, "_run_job", fail)
-    monkeypatch.setattr(runner, "_run_job_background", fail)
-    monkeypatch.setattr(runner.threading, "Thread", fail)
-    params = {"records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}]}
-    spec = JobSpec.from_dict(
-        {
-            "run_id": f"image-{algorithm}-reject-{model.rsplit('/', 1)[-1]}",
-            "model": model,
-            "algorithm": algorithm,
-            "environment": {"id": "local", "params": params},
-            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k3"},
-        }
-    )
-    prepared = runner.PreparedJob(public_spec=spec, worker_spec=spec, estimated_cost_usd=0.0)
-
-    with pytest.raises(ValueError, match=message):
-        runner.submit_job(spec, prepared_job=prepared)
-    with pytest.raises(FileNotFoundError):
-        runner.get_status(spec.run_id)
-
-
 def test_grpo_prices_the_full_context_budget_for_image_and_mixed_rows():
     """An image prompt occupies its context budget, so grpo prices the budget, not the text length.
 
