@@ -274,9 +274,10 @@ def _console_upload_loop(job: dict, console: str, mode: str, interval: float, st
     poll = min(_CONSOLE_UPLOAD_POLL_S, interval)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval)
     sent, size, since, quiet, armed, spent, ever = -1, -1, 0.0, 0.0, False, 0, False
+    progress_state = {"offset": 0, "partial": b"", "dropping": False}
     while not stop.wait(poll):
         since += poll
-        size, staged, beats = _console_progress(console, max(size, 0))
+        size, staged, beats = _console_progress(console, progress_state)
         if staged and not ever and since < due_s:
             due_s = interval
         ever |= bool(staged)

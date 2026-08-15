@@ -1169,20 +1169,22 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
     # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
     assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
-    # parse only producer-prefixed json and inspect top-level flags. nested user/model text carrying
-    # marker-shaped fragments must stay inert.
-    assert 're.findall(rb"(?m)^HEARTBEAT ({.*})$", buf)' in body
-    assert "json.loads(x)" in body
-    assert 'not x.get("liveness")' in body
-    # parse only whole lines. the offset remains before a partial heartbeat until its json completes.
-    assert 'cut = buf.rfind(b"\\n") + 1' in body
-    # one parse yields both counts. top-level pending/throttled markers are uncommitted but remain
-    # available for pre-first-commit arming.
-    assert 'not {"pending", "throttled"} & set(x)' in body
+    # the shipped parser advances through bounded chunks, retains only a bounded partial line, and
+    # drops overlong lines through their newline. eof stays separate from the parser offset so growth
+    # in an unterminated line still makes a snapshot eligible.
+    assert "chunk = handle.read(1_048_576)" in body
+    assert 'state["offset"] = offset + len(chunk)' in body
+    assert "state.update(partial=partial, dropping=dropping)" in body
+    assert "return eof, committed, beats" in body
+    # each complete heartbeat is decoded independently and only top-level markers classify it.
+    assert 'line.startswith(b"HEARTBEAT ")' in body
+    assert 'json.loads(line[len(b"HEARTBEAT ") :])' in body
+    assert 'not payload.get("liveness")' in body
+    assert 'not {"pending", "throttled"} & set(payload)' in body
     assert "if staged and not committed and since < due_s:" in body
     assert f"due_s = {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
     assert "committed = committed or bool(staged)" in body
-    assert "progress = staged if committed else len(beats)" in body
+    assert "progress = staged if committed else beats" in body
     assert "armed = armed or bool(progress)" in body
     assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
     # a counting rule cannot go negative now that it counts whole matching lines instead of
@@ -1246,15 +1248,17 @@ def _drive_serverless_upload_loop(statuses: list[str], *, succeed=True) -> list[
     import inspect
     import json
     import os
-    import re
     import textwrap
 
     from flash.providers.runpod.serverless import endpoints
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_loop"
-    )
+    nodes = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name in {"_console_progress", "_upload_loop"}
+    ]
+    nodes.sort(key=lambda n: n.lineno)
     mode = f"test_{os.getpid()}_{time.time_ns()}"
     console = f"/tmp/console_{mode}.txt"
     state = {"poll": 0}
@@ -1277,11 +1281,12 @@ def _drive_serverless_upload_loop(statuses: list[str], *, succeed=True) -> list[
                         "throttled": 'model text: "throttled":',
                     }
                 ]
-            line = (
-                f"HEARTBEAT {json.dumps(payload)}\n"
-                if status != "none"
-                else f"worker chatter {state['poll']}\n"
-            )
+            if status == "none":
+                line = f"worker chatter {state['poll']}\n"
+            elif status == "partial":
+                line = "x" * 100
+            else:
+                line = f"HEARTBEAT {json.dumps(payload)}\n"
             with open(console, "a") as f:
                 f.write(line)
             return False
@@ -1294,19 +1299,39 @@ def _drive_serverless_upload_loop(statuses: list[str], *, succeed=True) -> list[
         "console": console,
         "mode": mode,
         "json": json,
-        "re": re,
+        "os": os,
         "stop_upload": _Stop(),
         "_upload_console": _upload,
     }
     try:
         with open(console, "w"):
             pass
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<handler>", "exec"), namespace)
         namespace["_upload_loop"]()
         return uploads
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.remove(console)
+
+
+def _source_shipped_console_progress():
+    import ast
+    import inspect
+    import json
+    import os
+    import textwrap
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_console_progress"
+    )
+    namespace = {"json": json, "os": os}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    return namespace["_console_progress"]
 
 
 def test_instance_and_source_shipped_console_upload_loops_stay_in_parity(monkeypatch):
@@ -1317,10 +1342,13 @@ def test_instance_and_source_shipped_console_upload_loops_stay_in_parity(monkeyp
         (["committed"] + ["none"] * 6, True),
         (["throttled"] * 14 + ["none"] * 6, True),
         (["none"] * 7, lambda attempt: attempt > 1),
+        (["partial"] * 36, True),
     ]
     for statuses, succeed in cases:
         staged = [int(status in {"committed", "nested"}) for status in statuses]
-        beats = [int(status != "none") for status in statuses]
+        beats = [
+            int(status in {"committed", "nested", "pending", "throttled"}) for status in statuses
+        ]
         sizes = [1000 * (n + 1) for n in range(len(statuses))]
         _waits, instance_uploads = _drive_instance_upload_loop(
             monkeypatch,
@@ -1752,18 +1780,25 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
         payload = {"stage": "train", "ts": 1.0, "run_id": "r", "mode": "train", **kw}
         return f"HEARTBEAT {json.dumps(payload)}\n".encode()
 
+    def _state(offset: int = 0) -> dict:
+        return {"offset": offset, "partial": b"", "dropping": False}
+
+    def _scan(path, state=None):
+        return _instance_bootstrap._console_progress(str(path), state or _state())
+
     console = tmp_path / "console_train.txt"
     progress = _hb(step=7)
     pings = _hb(liveness=True) + b"ray warning: worker is idle\n"
     console.write_bytes(progress + pings)
 
-    size, beats, _any = _instance_bootstrap._console_progress(str(console), 0)
+    console_state = _state()
+    size, beats, _any = _scan(console, console_state)
     assert (size, beats) == (len(progress) + len(pings), 1)
 
     # the wedge: heartbeats keep arriving, but every one is a liveness ping.
     with open(console, "ab") as f:
         f.write(pings * 3)
-    size2, beats2, _any2 = _instance_bootstrap._console_progress(str(console), size)
+    size2, beats2, _any2 = _scan(console, console_state)
     assert beats2 == 0, "liveness pings after the last real heartbeat must not read as progress"
     assert size2 == size + len(pings) * 3
 
@@ -1777,7 +1812,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     cut = ping.index(b'"liveness":') - 5  # past "stage", before "liveness"
     assert b'"stage":' not in ping[cut:]
     assert b'"liveness":' in ping[cut:]
-    assert _instance_bootstrap._console_progress(str(solo), cut) == (len(ping), 0, 0)
+    assert _scan(solo, _state(cut)) == (len(ping), 0, 0)
 
     # an UNCOMMITTED heartbeat (upload attempted, did not land) is excluded for the same reason
     # as a liveness ping: the provider's stall clock reads heartbeat.json from HF, so one that
@@ -1786,21 +1821,21 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     # exists to take gets scheduled after the teardown has already killed the box.
     pend = tmp_path / "console_pending.txt"
     pend.write_bytes(_hb(step=8, pending=True) * 2)
-    assert _instance_bootstrap._console_progress(str(pend), 0)[1] == 0
+    assert _scan(pend)[1] == 0
     # but it DOES count toward arming, the third value: the line exists because a heartbeat was
     # produced, so the training loop was reached. If arming used the progress count instead, a run
     # whose heartbeat uploads all fail would never arm and could never buy a wedge snapshot -- the
     # next scheduled one is an interval out, past the setup teardown, so the console is lost.
-    assert _instance_bootstrap._console_progress(str(pend), 0)[2] == 2
+    assert _scan(pend)[2] == 2
 
     # local cadence suppression is uncommitted too, but remains available to arm pre-commit liveness.
     throttled = tmp_path / "console_throttled.txt"
     throttled.write_bytes(_hb(step=9, throttled=True) * 2)
-    assert _instance_bootstrap._console_progress(str(throttled), 0)[1:] == (0, 2)
+    assert _scan(throttled)[1:] == (0, 2)
 
     mixed = tmp_path / "console_mixed.txt"
     mixed.write_bytes(_hb(step=10) + _hb(step=11, pending=True) + _hb(step=12, throttled=True))
-    assert _instance_bootstrap._console_progress(str(mixed), 0)[1:] == (1, 3)
+    assert _scan(mixed)[1:] == (1, 3)
 
     nested = tmp_path / "console_nested_markers.txt"
     nested.write_bytes(
@@ -1815,13 +1850,13 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
             ],
         )
     )
-    assert _instance_bootstrap._console_progress(str(nested), 0)[1:] == (1, 1)
+    assert _scan(nested)[1:] == (1, 1)
 
     # a liveness ping arms nothing: it prints from a daemon whether or not the training loop is
     # alive, so unlike a pending heartbeat it is not evidence the run ever reached the loop.
     lv_only = tmp_path / "console_liveness_only.txt"
     lv_only.write_bytes(_hb(liveness=True) * 3)
-    assert _instance_bootstrap._console_progress(str(lv_only), 0)[1:] == (0, 0)
+    assert _scan(lv_only)[1:] == (0, 0)
 
     # a THIRD-PARTY line carrying "stage" is not a heartbeat and must not read as progress. ray,
     # verl and any library are free to emit structured json, and a wedged worker keeps emitting it
@@ -1829,7 +1864,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     # `HEARTBEAT ` prefix names the producer instead of inferring it from a shared key.
     foreign = tmp_path / "console_foreign.txt"
     foreign.write_bytes(b'(raylet) {"ts":"t","level":"WARN","stage":"rollout","msg":"idle"}\n' * 5)
-    assert _instance_bootstrap._console_progress(str(foreign), 0)[1] == 0
+    assert _scan(foreign)[1] == 0
 
     # a line split by the poll boundary is counted EXACTLY ONCE, in whichever chunk carries its
     # `HEARTBEAT` prefix. The old subtraction could see the tail half alone, count its "stage" and
@@ -1838,13 +1873,15 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     split = tmp_path / "console_split_beat.txt"
     beat = _hb(step=11)
     split.write_bytes(beat[:20])
-    head_size, head_beats, _ = _instance_bootstrap._console_progress(str(split), 0)
+    split_state = _state()
+    head_size, head_beats, _ = _scan(split, split_state)
     with open(split, "ab") as f:
         f.write(beat[20:])
-    tail_size, tail_beats, _ = _instance_bootstrap._console_progress(str(split), head_size)
+    tail_size, tail_beats, _ = _scan(split, split_state)
+    assert head_size == 20, "eof advances even while the valid heartbeat remains partial"
     assert head_beats + tail_beats == 1, "a split heartbeat is counted once, not zero or twice"
     assert tail_size == len(beat)
-    assert _instance_bootstrap._console_progress(str(split), tail_size)[1] == 0, "no recount"
+    assert _scan(split, split_state)[1] == 0, "no recount"
 
     # and the tail half of a split LIVENESS ping is never counted: the old rule saw its "stage"
     # without the "liveness" that disqualified it, so a wedge read as progress forever.
@@ -1852,21 +1889,153 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     ping = _hb(step=12, liveness=True)
     cut = ping.index(b'"liveness":') - 5
     lv_split.write_bytes(ping[:cut])
-    lv_head = _instance_bootstrap._console_progress(str(lv_split), 0)
+    lv_state = _state()
+    lv_head = _scan(lv_split, lv_state)
     with open(lv_split, "ab") as f:
         f.write(ping[cut:])
-    lv_tail = _instance_bootstrap._console_progress(str(lv_split), lv_head[0])
+    lv_tail = _scan(lv_split, lv_state)
     assert lv_head[1] + lv_tail[1] == 0, "a split liveness ping must never read as progress"
 
-    # the offset itself stops at the last NEWLINE, not at EOF. Returning EOF strands the partial
-    # line behind the offset: its completing bytes arrive on the next poll without the `HEARTBEAT `
-    # prefix that identifies them, so a real heartbeat is dropped and a healthy run reads as wedged.
+    # eof and parser progress are distinct: the complete heartbeat is counted now, while the partial
+    # next line is retained in bounded state and its bytes still advance the upload watermark.
     part = tmp_path / "console_partial.txt"
     whole = _hb(step=3)
-    part.write_bytes(whole + _hb(step=4)[:20])
-    assert _instance_bootstrap._console_progress(str(part), 0) == (len(whole), 1, 1)
+    partial = _hb(step=4)[:20]
+    part.write_bytes(whole + partial)
+    part_state = _state()
+    assert _scan(part, part_state) == (len(whole) + len(partial), 1, 1)
+    assert part_state["offset"] == len(whole) + len(partial)
+    assert part_state["partial"] == partial
 
-    assert _instance_bootstrap._console_progress(str(tmp_path / "absent.txt"), 0) == (-1, 0, 0)
+    assert _scan(tmp_path / "absent.txt") == (-1, 0, 0)
+
+
+def test_console_progress_skips_malformed_lines_independently(tmp_path):
+    import json
+
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    def _hb(step: int) -> bytes:
+        return f"HEARTBEAT {json.dumps({'stage': 'train', 'step': step})}\n".encode()
+
+    console = tmp_path / "console_malformed.txt"
+    valid_one = _hb(1)
+    valid_two = _hb(2)
+    malformed = b"HEARTBEAT {not json}\n"
+    console.write_bytes(malformed + valid_one + malformed + valid_two)
+    state = {"offset": 0, "partial": b"", "dropping": False}
+
+    assert _instance_bootstrap._console_progress(str(console), state) == (
+        console.stat().st_size,
+        2,
+        2,
+    )
+    assert state["offset"] == console.stat().st_size
+
+
+def test_console_progress_bounds_repeated_reads_of_an_unterminated_line(tmp_path):
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers._lifecycle import bootstrap_secrets
+
+    read_limit = bootstrap_secrets._CONSOLE_PROGRESS_READ_LIMIT
+    console = tmp_path / "console_unterminated.txt"
+    console.write_bytes(b"x" * (2 * read_limit + 123))
+    state = {"offset": 0, "partial": b"", "dropping": False}
+
+    first = _instance_bootstrap._console_progress(str(console), state)
+    assert first == (console.stat().st_size, 0, 0)
+    assert state == {"offset": read_limit, "partial": b"", "dropping": True}
+
+    second = _instance_bootstrap._console_progress(str(console), state)
+    assert second == (console.stat().st_size, 0, 0)
+    assert state["offset"] == 2 * read_limit
+    assert state["partial"] == b""
+    assert state["dropping"] is True
+
+    _instance_bootstrap._console_progress(str(console), state)
+    assert state["offset"] == console.stat().st_size
+    assert state["partial"] == b""
+
+
+def test_console_progress_recovers_after_an_overlong_line_newline(tmp_path):
+    import json
+
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers._lifecycle import bootstrap_secrets
+
+    console = tmp_path / "console_overlong.txt"
+    console.write_bytes(b"x" * (bootstrap_secrets._CONSOLE_PROGRESS_LINE_LIMIT + 1))
+    state = {"offset": 0, "partial": b"", "dropping": False}
+    assert _instance_bootstrap._console_progress(str(console), state)[1:] == (0, 0)
+    assert state["dropping"] is True
+    assert state["partial"] == b""
+
+    valid = f"HEARTBEAT {json.dumps({'stage': 'train', 'step': 3})}\n".encode()
+    with open(console, "ab") as handle:
+        handle.write(b"\n" + valid)
+
+    assert _instance_bootstrap._console_progress(str(console), state)[1:] == (1, 1)
+    assert state["dropping"] is False
+
+
+def test_console_progress_instance_and_source_shipped_parser_stay_in_parity(tmp_path):
+    import json
+
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    source_progress = _source_shipped_console_progress()
+    console = tmp_path / "console_parser_parity.txt"
+    valid = f"HEARTBEAT {json.dumps({'stage': 'train', 'step': 1})}\n".encode()
+    pending = f"HEARTBEAT {json.dumps({'stage': 'train', 'step': 2, 'pending': True})}\n".encode()
+    writes = [
+        b"HEARTBEAT {not json}\n" + valid[:17],
+        valid[17:] + b"HEARTBEAT {not json}\n" + pending,
+        b"x" * 64_001,
+        b"\n" + valid,
+    ]
+    instance_state = {"offset": 0, "partial": b"", "dropping": False}
+    source_state = {"offset": 0, "partial": b"", "dropping": False}
+    console.write_bytes(b"")
+
+    for chunk in writes:
+        with open(console, "ab") as handle:
+            handle.write(chunk)
+        assert _instance_bootstrap._console_progress(
+            str(console), instance_state
+        ) == source_progress(str(console), source_state)
+        assert instance_state == source_state
+
+
+def test_instance_console_upload_loop_uses_eof_growth_for_unterminated_output(
+    tmp_path, monkeypatch
+):
+    import os
+
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    console = tmp_path / "console_growing_partial.txt"
+    console.write_bytes(b"")
+    uploads: list[int] = []
+
+    class _Stop:
+        polls = 0
+
+        def wait(self, _seconds: float) -> bool:
+            if self.polls >= 5:
+                return True
+            self.polls += 1
+            with open(console, "ab") as handle:
+                handle.write(b"x" * 100)
+            return False
+
+    def _upload(_payload, path, _mode):
+        uploads.append(os.path.getsize(path))
+        return True
+
+    monkeypatch.setattr(_instance_bootstrap, "_upload_console_snapshot", _upload)
+    _instance_bootstrap._console_upload_loop({}, str(console), "train", 240.0, _Stop())
+
+    assert uploads == [200, 400]
 
 
 def test_instance_console_upload_loop_arms_on_a_heartbeat_whose_upload_failed(monkeypatch):

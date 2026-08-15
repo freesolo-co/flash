@@ -23,6 +23,8 @@ _SECRET_RE = re.compile(
 # component lines are registered as needles too; the floor keeps a common fragment such as ``}``
 # from erasing innocent output. Mirrors flash._internal.diagnostics.
 _MIN_SECRET_COMPONENT = 8
+_CONSOLE_PROGRESS_READ_LIMIT = 1_048_576
+_CONSOLE_PROGRESS_LINE_LIMIT = 64_000
 
 
 def _bounded_pattern(needle: str) -> str:
@@ -179,50 +181,46 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
     return tail[cut + 1 :] if cut >= 0 else ""
 
 
-def _console_progress(p, at):
-    """``(size, progress heartbeats, any heartbeats)`` after ``offset``; size -1 if unreadable.
+def _console_progress(path, state):
+    """return ``(eof size, committed beats, any beats)`` from one bounded incremental scan.
 
-    The two counts answer different questions and must not be collapsed. The first is the COMMITTED
-    count: a heartbeat that reached HF, the only thing the provider's stall clock advances on. The
-    second additionally counts ``pending`` and ``throttled`` ones produced only for the console.
-    Which count drives the uploader's wedge timer switches at the first COMMITTED heartbeat. After
-    one, only committed ones may count: the stall clock is anchored to it and already counting down
-    to a teardown, so treating a later uncommitted line as progress would push the wedge snapshot past
-    the box's own death. Before one there is no such clock to contradict -- teardown is the fixed
-    setup grace -- and a run before its first upload can emit only uncommitted console lines,
-    indistinguishable on the committed count from a worker that never reached the training loop. It
-    would never arm, buy no wedge snapshot, and reach only the hourly cadence at 4200s: past the
-    3000s grace, with the console covering the hang lost entirely. Bytes cannot tell a
-    wedge from a noisy one: a stuck worker keeps printing Ray warnings, so the size grows every poll
-    and a size-only rule never fires. The stall classifier advances only on a progress heartbeat,
-    echoed here as ``HEARTBEAT {...}``, so counting those tracks the signal that decides teardown.
-    Only a line that IS one counts, hence the ``HEARTBEAT `` anchor rather than a bare ``"stage":``
-    scan: any third-party line carrying that key -- structured json from ray, verl or a library --
-    would otherwise read as progress, and a wedged worker keeps printing those, so the wedge would
-    never be detected at all. Liveness pings are excluded: EVERY payload carries ``"stage"`` and
-    those print every 30s from a daemon, so counting them reads a worker wedged inside a liveness
-    block as busy forever -- ``poll`` refuses to advance on them for the same reason, and this must
-    agree or the run dies with no console. ``pending`` and ``throttled`` heartbeats are excluded too:
-    neither reached HF, so the provider's stall clock is still anchored to the older committed one.
-    Counting them would reset this timer against a teardown already counting down. A match spans
-    a WHOLE line and the offset stops at the last newline, not at EOF, so a line split across two
-    polls is judged exactly once, on the poll completing it. Both halves must be inert alone or the
-    split decides the run: the head carries the prefix but not yet the ``"liveness"`` disqualifying
-    it, so counting it there reads a wedge as progress -- the exact bug, arriving through the fix --
-    while a tail measured from EOF would have lost its prefix and dropped a real heartbeat, faking a
-    wedge the other way. Stopping at the newline also keeps ``offset`` on a line start, which is
-    what lets ``^`` mean what it says; re-reading one partial line is the whole cost. Only bytes
-    past ``offset`` are read, so a scan costs one poll's output."""
+    ``state`` owns the parser offset, a bounded partial line, and whether an overlong line is being
+    dropped. the returned size is the actual eof watermark, independent of parser progress, so an
+    unterminated line still makes a later snapshot eligible. complete heartbeat lines are decoded
+    independently; malformed and overlong lines are inert without hiding later valid lines.
+    """
+    offset = int(state.get("offset", 0))
+    partial, dropping = state.get("partial", b""), bool(state.get("dropping", False))
     try:
-        with open(p, "rb") as f:
-            f.seek(at)
-            b = f.read()
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            eof = handle.tell()
+            if eof < offset:
+                offset, partial, dropping = 0, b"", False
+            handle.seek(offset)
+            chunk = handle.read(_CONSOLE_PROGRESS_READ_LIMIT)
     except OSError:
         return -1, 0, 0
-    n = b.rfind(b"\n") + 1
-    try:
-        h = [json.loads(x) for x in re.findall(rb"(?m)^HEARTBEAT ({.*})$", b[:n])]
-    except ValueError:
-        h = []
-    h = [x for x in h if not x.get("liveness")]
-    return at + n, sum(not {"pending", "throttled"} & set(x) for x in h), len(h)
+    state["offset"] = offset + len(chunk)
+    lines = (partial + chunk).split(b"\n")
+    partial = lines.pop()
+    if dropping:
+        if not lines:
+            state.update(partial=b"", dropping=True)
+            return eof, 0, 0
+        dropping, lines = False, lines[1:]
+    if len(partial) > _CONSOLE_PROGRESS_LINE_LIMIT:
+        partial, dropping = b"", True
+    committed = beats = 0
+    for line in lines:
+        if len(line) > _CONSOLE_PROGRESS_LINE_LIMIT or not line.startswith(b"HEARTBEAT "):
+            continue
+        try:
+            payload = json.loads(line[len(b"HEARTBEAT ") :])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and not payload.get("liveness"):
+            beats += 1
+            committed += not {"pending", "throttled"} & set(payload)
+    state.update(partial=partial, dropping=dropping)
+    return eof, committed, beats

@@ -535,16 +535,10 @@ def _train_body(input_data: dict) -> dict:
                 return False
             if final:
                 console_teardown.set()
-            # per-caller scratch: sharing one .tail splices an unsynchronized final snapshot
             tail = console + (".final.tail" if final else ".tail")
 
             def _wait_s() -> float:
-                """Lock wait, clamped to what is left of the run wall deadline. The watchdog
-                hard-exits AT the deadline, so a terminal upload still blocked on the lock is killed
-                mid-acquire and the commit that could have landed in the window that remained never
-                runs; the reserve keeps room for it. Each retry re-reads the clock, so the tries
-                shrink rather than each being clamped and still summing past it. Zero polls without
-                waiting: acquire rejects a negative, and a blown deadline must still try."""
+                """clamp retries to the wall deadline while preserving terminal upload time."""
                 try:
                     return min(120.0, max(0.0, _require_deadline_allowance() - 30.0))
                 except (TimeoutError, RuntimeError):
@@ -559,12 +553,8 @@ def _train_body(input_data: dict) -> dict:
             finally:
                 if held:
                     console_upload_lock.release()
-            # `not held`: the commit above raced a holder still inside upload_file, whose older bytes
-            # can land after it. acquiring is proof that finished, so one more commit wins. the wait
-            # is BOUNDED, never a retry loop: a permanently wedged holder never frees and this must
-            # still return. split into tries so a holder needing longer than one timeout is still
-            # caught -- an HF upload recovering after ~240s otherwise lands last and restores the
-            # pre-failure console. past the bound it is treated as wedged and the raw commit stands.
+            # if the lock was held, bounded retries wait for the older upload before one final commit.
+            # a permanently wedged holder never frees, so the unsynchronized terminal commit stands.
             for _ in range(3) if final and not held else ():
                 if console_upload_lock.acquire(timeout=_wait_s()):
                     try:
@@ -582,31 +572,25 @@ def _train_body(input_data: dict) -> dict:
                 spec = json.loads(input_data["job_spec_json"])
                 phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
                 prefix = f"{phase_ns}/{spec['run_id']}"
-                # Keep the newest bytes only; the uploaded tail's end is never truncated.
                 tail_bytes = 64_000
                 with open(console, "rb") as f:
                     f.seek(0, os.SEEK_END)
                     start = max(0, f.tell() - tail_bytes)
-                    # over-read one byte so a boundary landing exactly after a newline is
-                    # recognized as starting a COMPLETE line rather than assumed partial.
+                    # over-read one byte to distinguish a complete boundary from a partial line.
                     f.seek(max(0, start - 1))
                     raw = f.read()
                 if start == 0:
                     tail = raw.decode("utf-8", "replace")
                 else:
                     tail = raw[1:].decode("utf-8", "replace")
-                    # a truncated first line is dropped before sanitizing: a boundary landing inside
-                    # a one-line credential leaves a fragment full-value redaction no longer matches.
-                    # duplicated, not imported: only this function's SOURCE ships to the worker.
-                    # bootstrap_secrets._read_console_tail is canonical.
+                    # drop a truncated first line before sanitizing; the canonical twin is
+                    # bootstrap_secrets._read_console_tail.
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
                 with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
-                # re-checked after staging: teardown can begin mid-flight, and committing then would
-                # overwrite the terminal console with older bytes.
                 if not final and console_teardown.is_set():
                     print(f"console upload dropped for {mode}; superseded by the terminal snapshot")
                     return False
@@ -621,6 +605,43 @@ def _train_body(input_data: dict) -> dict:
                 print("console upload warn:", _safe_detail(e, env))
                 return False
 
+        def _console_progress(path: str, state: dict) -> tuple[int, int, int]:
+            offset = int(state.get("offset", 0))
+            partial, dropping = state.get("partial", b""), bool(state.get("dropping", False))
+            try:
+                with open(path, "rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    eof = handle.tell()
+                    if eof < offset:
+                        offset, partial, dropping = 0, b"", False
+                    handle.seek(offset)
+                    chunk = handle.read(1_048_576)
+            except OSError:
+                return -1, 0, 0
+            state["offset"] = offset + len(chunk)
+            lines = (partial + chunk).split(b"\n")
+            partial = lines.pop()
+            if dropping:
+                if not lines:
+                    state.update(partial=b"", dropping=True)
+                    return eof, 0, 0
+                dropping, lines = False, lines[1:]
+            if len(partial) > 64_000:
+                partial, dropping = b"", True
+            committed = beats = 0
+            for line in lines:
+                if len(line) > 64_000 or not line.startswith(b"HEARTBEAT "):
+                    continue
+                try:
+                    payload = json.loads(line[len(b"HEARTBEAT ") :])
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(payload, dict) and not payload.get("liveness"):
+                    beats += 1
+                    committed += not {"pending", "throttled"} & set(payload)
+            state.update(partial=partial, dropping=dropping)
+            return eof, committed, beats
+
         def run_mode(mode: str, check: bool) -> int:
             """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
             console = f"/tmp/console_{mode}.txt"
@@ -629,28 +650,14 @@ def _train_body(input_data: dict) -> dict:
             def _upload_loop() -> None:
                 due_s, since, quiet_polls = 600.0, 0.0, 0
                 uploaded_size, size, quiet_spent, armed, committed = -1, -1, 0, False, False
+                progress_state = {"offset": 0, "partial": b"", "dropping": False}
                 while not stop_upload.wait(120.0):
                     since += 120.0
-                    try:
-                        at = max(size, 0)
-                        with open(console, "rb") as hf:
-                            hf.seek(at)
-                            buf = hf.read()
-                    except OSError:
-                        buf, at = b"", -1
-                    cut = buf.rfind(b"\n") + 1  # whole lines only; the offset stays a line start
-                    buf, size = buf[:cut], at + cut
-                    try:
-                        beats = [json.loads(x) for x in re.findall(rb"(?m)^HEARTBEAT ({.*})$", buf)]
-                    except ValueError:
-                        beats = []
-                    beats = [x for x in beats if not x.get("liveness")]
-                    staged = sum(not {"pending", "throttled"} & set(x) for x in beats)
+                    size, staged, beats = _console_progress(console, progress_state)
                     if staged and not committed and since < due_s:
                         due_s = 3600.0
                     committed = committed or bool(staged)
-                    # re-arm on progress; before the first commit, uncommitted beats count too.
-                    progress = staged if committed else len(beats)
+                    progress = staged if committed else beats
                     armed = armed or bool(progress)
                     quiet_polls = 0 if progress else quiet_polls + 1
                     due = since >= due_s
@@ -661,8 +668,7 @@ def _train_body(input_data: dict) -> dict:
                     uploaded_size = size if ok else uploaded_size
                     quiet_spent += 1 if wedged and ok else 0
                     armed = armed and not (wedged and ok)
-                    # only a LANDED upload advances the deadline: resetting on a swallowed failure
-                    # puts the retry an interval out, past the stall teardown.
+                    # only a landed upload advances the deadline.
                     if ok:
                         since, due_s = 0.0, 3600.0
 
@@ -681,10 +687,8 @@ def _train_body(input_data: dict) -> dict:
                 uploader.start()
                 try:
                     for line in proc.stdout:
-                        # the handler's own stdout is captured by runpod and surfaced in provider
-                        # status, where only this process knows the run's worker-env secret values,
-                        # so each echoed child line is sanitized here at the source. the console
-                        # file keeps the raw line; its upload path sanitizes the selected tail.
+                        # sanitize child output before runpod captures it; the console file remains
+                        # raw until its bounded upload path sanitizes the selected tail.
                         print(_safe_detail(line, env, 100_000), end="")
                         cf.write(line)
                     proc.wait()
