@@ -1077,7 +1077,7 @@ in a sensible value, so only override with a reason.
 | Knob                           | Convention                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `group_size`                   | Completions sampled per prompt (default 8). More = more signal and more cost; drop to 4 to trim cost. The group needs _within-group variance_ for an advantage to exist.                                                                                                                                                                                                                                          |
-| `max_completion_tokens`        | Completion budget per rollout. Size it to the expected output length; too small silently truncates good answers and poisons the reward, while too large just costs more.                                                                                                                                                                                                                                          |
+| `max_completion_tokens`        | Completion cap for each model turn, not the whole episode. In multi-turn runs every turn gets the full cap again, while the whole transcript (all model turns plus environment replies) must fit inside `max_context_tokens`. Size `max_context_tokens` for the whole episode, not just one turn; an undersized turn cap silently truncates good answers and poisons the reward.                                  |
 | `temperature`                  | Rollout sampling temperature. Keep it near 1.0 for GRPO — too low collapses diversity (and the model can collapse within a few steps); raise it to widen exploration against uniform-reward groups.                                                                                                                                                                                                               |
 | `kl_penalty_coef`              | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move.                                                                                                                                                                                                                                                                      |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
@@ -1085,10 +1085,23 @@ in a sensible value, so only override with a reason.
 | `prompts_per_step`             | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
 | `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
-For thinking models, `max_completion_tokens` is shared between `<think>` reasoning and the final
-answer or action, so undersizing it can truncate the action and teach the model to stop reasoning;
-watch `truncation_rate`, which counts completions not ending in EOS and is not strictly
-`finish_reason=length` when stop sequences or multi-turn rollouts are involved.
+For thinking models, each turn's `max_completion_tokens` is shared between `<think>` reasoning and
+its final answer or action, so undersizing it can truncate the action and teach the model to stop
+reasoning. In multi-turn runs, also size `max_context_tokens` for the accumulated transcript or later
+turns can run out of context. Watch `truncation_rate`, but know what it measures on each algorithm.
+In OPD it counts model turns that did not end in EOS or a configured stop, and OPD additionally
+reports a per-step `discarded_rollouts` count alongside it. In GRPO it comes from verl's
+episode-level clipping, so a single turn hitting the cap does not raise it on its own: that turn
+ends the episode early, which leaves the concatenated response short of the widened capacity verl
+measures against. On multi-turn GRPO, treat a zero rate as "no episode filled its response budget",
+not as "no turn was cut off", and read episode length against the environment's turn limit instead.
+
+Neither metric detects the other way `max_context_tokens` shortens an episode. When an environment
+reply would leave no room to generate, both multi-turn loops stop _before_ dispatching the next
+turn. The last model turn ended normally, so nothing is counted as truncated and the episode simply
+ends early. A run can therefore train on systematically shortened trajectories at
+`truncation_rate = 0`. If episodes are ending sooner than the environment's turn limit, suspect the
+context budget rather than the turn cap.
 
 > **On a derived horizon, `prompts_per_step` buys optimizer steps cheaply.** `prompts_per_step`
 > overrides the tuned prompts-per-step. Total generated tokens are
@@ -1103,8 +1116,11 @@ watch `truncation_rate`, which counts completions not ending in EOS and is not s
 > one; jumping straight to ~80 steps without reading the short run trades one uninformative
 > run for a longer, more expensive one.
 >
-> Two things break the flat-cost approximation, so treat it as a hypothesis to check, not a
-> rule. **`[train] max_steps` overrides the derived horizon**: with it set the step count is
+> Three things break the flat-cost approximation, so treat it as a hypothesis to check, not a
+> rule. **The equation counts one model turn per prompt**: in a multi-turn run every turn gets
+> the full `max_completion_tokens` again, so an episode generates up to that cap times its turn
+> count (bounded by `max_context_tokens`), and the real token bill is a multiple of the estimate.
+> **`[train] max_steps` overrides the derived horizon**: with it set the step count is
 > exactly what you asked for, lowering `prompts_per_step` does not add steps at all, and you
 > simply train on fewer prompts. And per-step cost is not purely token-proportional —
 > GRPO reward waves and OPD teacher calls add latency per step, so multiplying steps can
@@ -1264,6 +1280,15 @@ targeted fix rather than leaning on the reward gate to slowly select against it.
 | Uniform-reward groups                               | every rollout in a group scores the same → no gradient                                   | shape the reward for partial credit; raise `temperature`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Too-hard prompts                                    | the base never succeeds, reward stays at 0                                               | curriculum / easier prompts; warm-start with SFT                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Judge-rewarded degenerate output                    | short, templated answers a judge still rates well                                        | a minimum-substance zero-gate ahead of the judge                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+
+In OPD, a model turn that reaches its cap without EOS or a configured stop is classified as
+truncated, ends the episode, and is dropped before teacher scoring. If every rollout in a step is
+dropped, the step fails with `produced no aligned teacher signal`. Partial dropping is more dangerous:
+it can silently bias training toward shorter episodes, so monitor the per-step `truncation_rate` and
+`discarded_rollouts` metrics rather than relying on the loss alone. Read them as a sampled indicator,
+not a ledger: heartbeats are throttled, so a step that finishes shortly after the previous one does
+not publish its own values, and a nonzero reading means truncation pressure around that point in the
+run rather than an exact count for that step.
 
 ---
 
