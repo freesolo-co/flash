@@ -23,6 +23,7 @@ from flash.engine.worker.backend_common import (
 )
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.verl.checkpoints import MergeDiskExhaustedError, MergeDiskHeadroomError
 
 
 def _sft_train():
@@ -113,6 +114,8 @@ class _VerlCheckpointWatcher:
         self._thread.start()
 
     def raise_if_failed(self) -> None:
+        if isinstance(self._error, (MergeDiskHeadroomError, MergeDiskExhaustedError)):
+            raise self._error
         if self._error is not None:
             raise RuntimeError("verl checkpoint watcher failed") from self._error
 
@@ -140,6 +143,20 @@ class _VerlCheckpointWatcher:
 
     def _should_publish(self, step: int) -> bool:
         return not self.required_steps or step in self.required_steps
+
+    def _publishable(self, pending: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        """coalesce only an optional multi-checkpoint backlog to its newest save."""
+        if self.required_steps or len(pending) <= 1:
+            return pending
+        superseded = pending[:-1]
+        self.processed_steps.update(step for step, _ in superseded)
+        print(
+            f"[ckpt] publishing step {pending[-1][0]} and skipping superseded periodic "
+            f"checkpoint(s) {', '.join(str(step) for step, _ in superseded)}: the publisher is "
+            "behind training, and each export writes a full model copy to the same disk",
+            flush=True,
+        )
+        return pending[-1:]
 
     def _staged_source(self, step: int, checkpoint_dir: str) -> str:
         """hardlink a completed checkpoint before verl retention can prune it.
@@ -220,7 +237,7 @@ class _VerlCheckpointWatcher:
     def _run(self) -> None:
         try:
             while True:
-                for step, checkpoint_dir in self._pending():
+                for step, checkpoint_dir in self._publishable(self._pending()):
                     self._publish(step, checkpoint_dir)
                 # re-read rather than reusing the sweep above: verl advances the tracker right up to
                 # the moment the child exits, so a step can become visible during that sweep.
