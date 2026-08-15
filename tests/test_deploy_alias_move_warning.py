@@ -98,17 +98,80 @@ def test_deploying_final_over_a_checkpoint_warns_in_the_other_direction() -> Non
     assert "deploying final" in warning
 
 
+def test_a_displaced_final_adapter_is_reachable_by_revision_not_a_step_selector() -> None:
+    """`step-N` cannot address the displaced final adapter: there is no `/final` selector.
+
+    `_parse_chat_target` accepts a bare run id, `RUN/step-N`, or a full immutable revision. Once
+    the alias moves, `step-N` names the INCOMING checkpoint and the bare id is the thing that just
+    changed -- so the generic "compare with step-N" advice reaches everything except the model the
+    user just lost. Its immutable revision is the one selector that still resolves.
+    """
+    current = {
+        "run_id": "flash-1",
+        "state": "ready",
+        "checkpoint_step": None,
+        "adapter_revision": "flash-1@abc123",
+    }
+
+    warning = _alias_move_warning(_Client(current), "flash-1", 50) or ""
+
+    assert "flash-1@abc123" in warning
+    assert "no `/final` selector" in warning
+
+
+def test_a_displaced_final_adapter_without_a_revision_says_where_to_find_one() -> None:
+    """An older plane can answer without `adapter_revision`; never print an empty selector."""
+    warning = _alias_move_warning(_Client(_ready(None)), "flash-1", 50) or ""
+
+    assert "no `/final` selector" in warning
+    assert "models deployments" in warning
+    assert "``" not in warning
+
+
+def test_a_displaced_checkpoint_needs_no_revision_hint() -> None:
+    """`step-100` still addresses a displaced CHECKPOINT, so the extra hint would be noise."""
+    warning = _alias_move_warning(_Client(_ready(100)), "flash-1", 50) or ""
+
+    assert "/final" not in warning
+
+
 def test_a_run_with_no_deployment_is_not_a_replacement() -> None:
     """A first deploy displaces nothing, so it must stay silent."""
     assert _alias_move_warning(_Client(None), "flash-1", 50) is None
 
 
-@pytest.mark.parametrize("state", ["queued", "failed", "reconciling", "revocation_failed"])
+@pytest.mark.parametrize("state", ["queued", "failed", "reconciling"])
 def test_only_a_servable_revision_can_be_displaced(state: str) -> None:
     """Nothing is serving off the alias yet, so moving it costs nobody their model."""
     current = {"run_id": "flash-1", "state": state, "checkpoint_step": 100}
 
     assert _alias_move_warning(_Client(current), "flash-1", 50) is None
+
+
+def test_a_failed_revocation_leaves_the_alias_ambiguous_not_idle() -> None:
+    """`revocation_failed` is backend cleanup that did NOT finish, so the alias may still resolve.
+
+    Local authority is revoked, but the target the backend serves is exactly what could not be
+    confirmed -- and `_validate_deploy_request` rejects only the busy set, so a deploy proceeds
+    from here and can replace a target that is still live. Reading it as "not serving" suppressed
+    the warning in a case where the alias is already ambiguous.
+    """
+    current = {"run_id": "flash-1", "state": "revocation_failed", "checkpoint_step": 100}
+
+    warning = _alias_move_warning(_Client(current), "flash-1", 50) or ""
+
+    assert "revocation did not complete" in warning
+    assert "cannot be determined from here" in warning
+    # the same reason the unsettled arm names no checkpoint: this record's step describes the
+    # deployment whose revocation failed, not a confirmed live alias target.
+    assert "step-100" not in warning
+
+
+def test_a_failed_revocation_warns_even_on_the_same_step() -> None:
+    """The step comparison cannot clear it: what the alias holds is the unknown."""
+    current = {"run_id": "flash-1", "state": "revocation_failed", "checkpoint_step": 50}
+
+    assert _alias_move_warning(_Client(current), "flash-1", 50) is not None
 
 
 def _unsettled(step):

@@ -42,6 +42,10 @@ _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 # plane introduces are both non-busy and non-servable, so `--wait` must fail closed on them
 # rather than let `deploy --wait && evaluate` proceed against nothing.
 _DEPLOYMENT_READY_STATES = frozenset({"ready", "deployed"})
+# an undeploy whose backend cleanup failed (flash/runner/supervise/transitions.py). local serving
+# authority is revoked, but the alias may still resolve to the old target -- neither servable nor
+# safely assumed idle.
+_REVOCATION_FAILED_STATE = "revocation_failed"
 _DEPLOY_POLL_SECONDS = 5.0
 # `--wait 0` still owes the caller its one read, and a read needs a positive timeout. keep that
 # bound short enough that "check once, do not block" stays true against a stalled plane: a longer
@@ -281,7 +285,13 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
     # (flash/server/routes/serving.py). reading it as "not serving" suppressed the warning in
     # the very case the alias is most likely to move out from under someone.
     unknown_activation = current.get("activation_outcome_unknown") is True
-    if str(current.get("state") or "") not in _DEPLOYMENT_READY_STATES and not unknown_activation:
+    # `revocation_failed` is an undeploy whose BACKEND cleanup failed: local authority is revoked
+    # but the alias may still resolve to the old target, and `_validate_deploy_request` rejects
+    # only the busy set, so a deploy proceeds from here. reading it as "not serving" suppressed
+    # the warning in the case where cleanup already left the alias ambiguous.
+    revocation_failed = str(current.get("state") or "") == _REVOCATION_FAILED_STATE
+    ambiguous = unknown_activation or revocation_failed
+    if str(current.get("state") or "") not in _DEPLOYMENT_READY_STATES and not ambiguous:
         # nothing is being served off the alias yet, so nothing is lost by moving it.
         return None
     cli = _commands().CLI_NAME
@@ -289,6 +299,16 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
         f"so every client using bare `{base_run_id}` changes model. address a specific "
         f"checkpoint with `{cli} models chat {base_run_id}/step-N` to compare them."
     )
+    if revocation_failed:
+        # same reason as the unknown-activation arm: this record's `checkpoint_step` describes the
+        # deployment whose revocation failed, and whether the backend still answers on the alias
+        # is exactly what could not be determined. hedge rather than name a checkpoint.
+        return (
+            f"{base_run_id} has a deployment whose revocation did not complete, so whether it "
+            f"still serves off that shared model id cannot be determined from here; deploying "
+            f"{_served_step_label(requested_step)} may move it, "
+            f"{tail} run `{cli} models deployments` to see the current state first."
+        )
     if unknown_activation:
         # this record's `checkpoint_step` names the INCOMING attempt, not what the alias holds:
         # the plane resolves the live target from `adapter_alias_target` / `previous_deployment`,
@@ -314,10 +334,27 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
         return None
     if served_step == requested_step:
         return None
+    reach_displaced = ""
+    if served_step is None:
+        # the displaced checkpoint is the FINAL adapter, and `_parse_chat_target` accepts only a
+        # bare run id, `RUN/step-N`, or a full immutable revision -- there is no `/final`
+        # selector. once the alias moves, `step-N` addresses the incoming checkpoint and the bare
+        # id is the thing that just changed, so the generic advice cannot reach the final adapter
+        # at all. its immutable revision can, and the record being displaced carries one.
+        revision = str(current.get("adapter_revision") or "").strip()
+        reach_displaced = (
+            f" the displaced final adapter has no `/final` selector; reach it by its immutable "
+            f"revision `{revision}`."
+            if revision
+            else (
+                " the displaced final adapter has no `/final` selector; reach it by its immutable "
+                f"revision, which `{cli} models deployments` prints."
+            )
+        )
     return (
         f"{base_run_id} currently serves {_served_step_label(served_step)}; deploying "
         f"{_served_step_label(requested_step)} moves that shared model id onto the new "
-        f"checkpoint, {tail}"
+        f"checkpoint, {tail}{reach_displaced}"
     )
 
 
