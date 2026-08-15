@@ -51,12 +51,12 @@ _MAX_ARCHIVE_MEMBERS = 100_000
 _COMPRESSED_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00")
 
 # a legacy lzma-alone stream has a 13-byte structural header rather than fixed magic: one properties
-# byte, a little-endian dictionary size, and an uncompressed size. The dictionary encodings below
-# are the canonical sizes emitted by lzma encoders, which keeps the weak signature from probing
-# ordinary binaries while still covering custom lc/lp/pb combinations.
+# byte, a little-endian dictionary size, and an uncompressed size. The dictionary field is not a
+# canonical-size marker: liblzma accepts every 32-bit value and rounds values below its internal
+# minimum up, so restricting it to powers of two or three times one rejected a stream with 4,095
+# there even though the same decoder recovered its key. The properties remain structural, and the
+# caller still requires the candidate to produce decompressed output before recognising it.
 _LZMA_ALONE_HEADER_BYTES = 13
-_LZMA_ALONE_MIN_DICTIONARY = 1 << 12
-_LZMA_ALONE_MAX_DICTIONARY = 3 << 29
 
 # Containers this scan can RECOGNISE but not expand, because the stdlib has no decompressor for
 # them. A `.jsonl.zst` -- the ordinary way a dataset shard ships -- holds its credential nowhere a
@@ -164,10 +164,8 @@ _OVERLAY_PROBE_BYTES = 1 << 16
 # chance occurrences of the gzip magic across 400 MiB of random bytes, of which 0 inflated.
 _MAX_OVERLAY_CANDIDATES = 4096
 
-# How much of a candidate's probe identifies it for the repeat check above. Long enough that two
-# different streams do not collide -- a gzip header alone is 10 bytes and a real payload's deflate
-# bits follow immediately -- and short enough that the key costs a slice rather than a hash of the
-# whole 64 KiB probe.
+# how much of a candidate's probe buckets it for the exact repeat check below. This prefix is only a
+# cheap lookup key: candidates in one bucket are compared over the whole probe before one is skipped.
 _OVERLAY_PROBE_KEY_BYTES = 64
 
 # The "gave up with candidates unprobed" answer, distinct from both an offset and from None. A
@@ -210,7 +208,7 @@ def _after_skippable_frames(head: bytes) -> tuple[bytes, bool]:
 
 
 def _looks_like_lzma_alone(head: bytes) -> bool:
-    """Whether `head` has the conservative structural header of an lzma-alone stream."""
+    """Whether `head` has the structural properties of an lzma-alone stream."""
     if len(head) < _LZMA_ALONE_HEADER_BYTES:
         return False
     properties = head[0]
@@ -218,13 +216,7 @@ def _looks_like_lzma_alone(head: bytes) -> bool:
         return False
     lc = properties % 9
     lp = (properties // 9) % 5
-    if lc + lp > 4:
-        return False
-    dictionary = int.from_bytes(head[1:5], "little")
-    if not _LZMA_ALONE_MIN_DICTIONARY <= dictionary <= _LZMA_ALONE_MAX_DICTIONARY:
-        return False
-    unit = dictionary // 3 if dictionary % 3 == 0 else dictionary
-    return unit & (unit - 1) == 0
+    return lc + lp <= 4
 
 
 def _looks_compressed(head: bytes) -> bool:
@@ -346,8 +338,9 @@ def _decompresses(probe: bytes) -> bool:
     gzip, xz and lzma-alone are deliberately NOT given the same treatment. They emit output within
     the probe, so "no output yet" really is a rejection for them. Accepting `needs_input` instead
     measured 97 false acceptances in 2,000 random gzip-magic bodies. For lzma-alone, requiring output
-    after a valid 0x5d/8 MiB/unknown-size header measured 0 acceptances across 2,000 random 64 KiB
-    bodies. That proof matters because its header is structural rather than fixed magic.
+    after widening the dictionary field measured 0 acceptances in each of three 2,000-probe sets:
+    random bodies behind structurally valid headers, fully random bodies, and bodies beginning with
+    0x5d. That proof matters because its header is structural rather than fixed magic.
     """
     try:
         if probe.startswith(b"\x1f\x8b\x08"):
@@ -408,31 +401,23 @@ def _overlay_offset(source: Path | bytes) -> int | None:
 
     Every candidate in a window is probed before the bound is consulted, so the limit bites on the
     number of WINDOWS walked rather than on a decoy count an attacker sets. Cutting a window's list
-    short instead would hand back the bypass the third answer exists to close: the file chooses how
-    many failing magics precede the real stream, so a cap applied mid-window is a cap the file
-    positions its payload behind.
+    short instead would put a real payload behind a cap the file controls. A file of 4,146 distinct
+    decoys before a payload still has that payload examined in the same bounded window.
 
-    What the file cannot be allowed to choose is the COST of that walk. Two things made it
-    expensive, and both are the same bytes being handled repeatedly rather than a real search:
+    What the file cannot be allowed to choose is repeated decompression of the same bytes. A 1 MiB
+    file of adjacent gzip magics contains 349,522 candidates but only 22 distinct probe prefixes; at
+    56 microseconds per decode, probing every repeat took 18 seconds. The probe comes from the window
+    already in hand, and candidates sharing `_OVERLAY_PROBE_KEY_BYTES` enter an exact repeat check.
 
-      * every probe reopened the file and re-read `_OVERLAY_PROBE_BYTES`. On a 1 MiB file of
-        adjacent gzip magics that was 349,522 opens re-reading 21 GB. The probe now comes from the
-        window already in hand, and only a candidate whose stream runs past the window's end falls
-        back to a read.
-      * every probe then ran a decompressor over 64 KiB, at 56 microseconds each -- 18 seconds for
-        one megabyte of upload. Overlapping magics produce the SAME probe bytes over and over, so
-        the decode is repeated rather than distinguishing anything: those 349,522 candidates are 22
-        distinct probes. Deduplicating on the probe's head collapses them to 22 decodes.
+    The prefix is not proof of equality. A corrupted bzip2 stream and a valid copy agreed for 64
+    bytes, diverged at byte 70, and the old cache skipped the valid copy -- the key behind it published
+    while the valid stream alone was reported. A full-probe comparison now skips only identical
+    decompressor input; one mismatch disables deduplication for that bucket rather than guessing that
+    later candidates are repeats.
 
-    Deduplication cannot hide a payload, which is why it is safe where a cap is not: two candidates
-    with identical leading bytes decode identically, so skipping the second skips a repeat of an
-    answer already obtained. A file of 4,146 DISTINCT decoys in front of a real payload -- the
-    shape an attacker actually needs, since a repeat buys nothing -- stays 4,147 separate probes and
-    the payload is still found.
-
-    A probe is a decompressor rejecting a few bytes -- measured 20 chance gzip magics across
-    400 MiB of random data, none of which inflated -- so the cap is far above what any real file
-    reaches and a genuine payload is still found.
+    A probe is a decompressor rejecting a few bytes -- measured 20 chance gzip magics across 400 MiB
+    of random data, none of which inflated -- so the cap is far above what any real file reaches and
+    a genuine payload is still found.
 
     Offset 0 is excluded deliberately: a stream that begins the file is not an overlay and the
     ordinary openers already read it.
@@ -442,15 +427,19 @@ def _overlay_offset(source: Path | bytes) -> int | None:
         found = sorted(
             at for magic in _OVERLAY_MAGIC for at in _offsets_of(window, magic) if base + at > 0
         )
-        seen: set[bytes] = set()
+        seen: dict[bytes, int | None] = {}
         for at in found:
             probe = _probe_bytes(source, window, base, at)
-            # Keyed on the head rather than the whole probe, so the key costs a slice instead of a
-            # 64 KiB hash. Two streams agreeing over this much and diverging later would both have
-            # to be real streams, and the first is returned in that case anyway.
-            if (key := probe[:_OVERLAY_PROBE_KEY_BYTES]) in seen:
-                continue
-            seen.add(key)
+            key = probe[:_OVERLAY_PROBE_KEY_BYTES]
+            if key in seen:
+                representative = seen[key]
+                if representative is not None:
+                    prior = _probe_bytes(source, window, base, representative)
+                    if probe == prior:
+                        continue
+                    seen[key] = None
+            else:
+                seen[key] = at
             if _decompresses(probe):
                 return base + at
         probed += len(found)

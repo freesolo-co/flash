@@ -8673,3 +8673,197 @@ def test_a_version_one_key_store_of_certificates_is_publishable(tmp_path):
     holding = tmp_path / "v1key.jks"
     holding.write_bytes(bytes(keyed))
     assert credential_in_file(holding) == "a key store"
+
+
+def test_a_noncanonical_lzma_dictionary_size_is_still_expanded(tmp_path):
+    """The decoder accepts any dictionary size, not only the ones an encoder usually writes.
+
+    Recognition was restricted to powers of two and `3 * 2^n` to hold the false-positive rate down,
+    which is narrower than the format: a stream whose field says 4095 decompresses perfectly and
+    returned clean, so rewriting one header field published the key.
+    """
+    import lzma
+    import struct
+
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    canonical = lzma.compress(key, format=lzma.FORMAT_ALONE)
+
+    control = tmp_path / "canonical.lzma"
+    control.write_bytes(canonical)
+    assert credential_in_file(control) == "a Freesolo API key"  # the control the pair must match
+
+    # the properties byte, then a 4-byte little-endian dictionary size, then the uncompressed size
+    odd = bytearray(canonical)
+    odd[1:5] = struct.pack("<I", 4095)
+    assert key in lzma.decompress(bytes(odd), format=lzma.FORMAT_ALONE)  # any reader recovers it
+
+    rewritten = tmp_path / "odd.lzma"
+    rewritten.write_bytes(bytes(odd))
+    assert credential_in_file(rewritten) == "a Freesolo API key"
+
+
+def test_a_named_unicode_escape_is_resolved_like_the_others(tmp_path):
+    """Python resolves `\\N{LATIN CAPITAL LETTER E}` to `E` exactly as it resolves `\\x45`.
+
+    The hex, unicode and octal spellings were rejoined but the named one was not, so a key body
+    carrying a single `\\N{...}` evaluated to the whole credential at runtime while the raw bytes a
+    pattern reads were split by the escape and matched nothing.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY
+    plain = tmp_path / "plain.py"
+    plain.write_text(f"API_KEY = 'fslo_{body}'\n")
+    assert credential_in_file(plain) == "a Freesolo API key"  # the control the pair must match
+
+    # the escape sits early, so the run left behind it is too short to match on its own
+    escaped = f"{body[:10]}\\N{{LATIN CAPITAL LETTER B}}{body[11:]}"
+    assert body[10] == "B"  # the escape stands in for exactly this character
+    split = tmp_path / "split.py"
+    split.write_text(f"API_KEY = 'fslo_{escaped}'\n")
+    assert f"fslo_{body}".encode() not in split.read_bytes()  # not literally present
+    assert credential_in_file(split) == "a Freesolo API key"
+
+    # a name that resolves to nothing ASCII is left alone rather than guessed at
+    unknown = tmp_path / "unknown.py"
+    unknown.write_text("LABEL = '\\N{NO SUCH CHARACTER NAME}'\n")
+    assert credential_in_file(unknown) is None
+
+
+def test_a_comment_before_a_pdf_predictor_value_is_still_a_predictor(tmp_path):
+    """A `%` comment may sit between `/Predictor` and its number, as anywhere else in a PDF.
+
+    The predictor pattern accepted only whitespace, so `/Predictor%c\\n12` declared nothing: the
+    stream was inflated and its PNG row differences scanned as content, while a conforming decode
+    reconstructs the key. The spaced spelling was refused correctly.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    columns = 8
+    raw = f"fslo_{_FAKE_KEY_BODY}".encode()
+    rows = [raw[at : at + columns].ljust(columns, b"\0") for at in range(0, len(raw), columns)]
+    encoded = bytearray()
+    previous = bytes(columns)
+    for row in rows:
+        encoded += b"\x02"  # the PNG `Up` predictor tag
+        encoded += bytes((row[at] - previous[at]) % 256 for at in range(columns))
+        previous = row
+    stream = zlib.compress(bytes(encoded))
+    assert raw not in zlib.decompress(stream)  # inflation alone does not reveal it
+
+    def _document(parms: bytes) -> bytes:
+        body = b"%PDF-1.4\n1 0 obj\n<< /Length " + str(len(stream)).encode()
+        body += b" /Filter /FlateDecode" + parms + b" >>\nstream\n"
+        body += stream + b"\nendstream\nendobj\n"
+        return body + b"trailer\n<< /Root 1 0 R >>\n%%EOF\n"
+
+    spaced = tmp_path / "spaced.pdf"
+    spaced.write_bytes(_document(b" /DecodeParms << /Predictor 12 /Columns 8 >>"))
+    with pytest.raises(_Unscannable, match="filter this cannot undo"):
+        credential_in_file(spaced)
+
+    commented = tmp_path / "commented.pdf"
+    commented.write_bytes(_document(b" /DecodeParms << /Predictor%comment\n12 /Columns 8 >>"))
+    with pytest.raises(_Unscannable, match="filter this cannot undo"):
+        credential_in_file(commented)
+
+
+def test_a_gzip_whose_extra_field_fills_the_probe_is_still_probed(tmp_path):
+    """A gzip header carries optional fields, and a large one runs past the overlay probe.
+
+    The probe reads a bounded prefix and calls "no output yet" a rejection, so a stream whose extra
+    field ends at the boundary was dismissed before the deflate bits were ever in view -- the same
+    payload standing alone was expanded and reported. Reproduced with the header CRC both present
+    and absent, so the boundary is what matters rather than those two bytes.
+    """
+    import gzip
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+
+    def _stream(header_crc: bool) -> bytes:
+        deflater = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+        payload = deflater.compress(key) + deflater.flush()
+        flags = 0x04 | (0x02 if header_crc else 0)
+        head = bytes([0x1F, 0x8B, 0x08, flags, 0, 0, 0, 0, 0, 0xFF])
+        head += (65523).to_bytes(2, "little") + b"\x00" * 65523
+        if header_crc:
+            head += (zlib.crc32(head) & 0xFFFF).to_bytes(2, "little")
+        return (
+            head + payload + zlib.crc32(key).to_bytes(4, "little") + len(key).to_bytes(4, "little")
+        )
+
+    stub = b"#!/bin/sh\necho hi\nexit 0\n"
+    for header_crc in (True, False):
+        stream = _stream(header_crc)
+        assert key in gzip.decompress(stream)  # a valid stream either way
+
+        alone = tmp_path / f"alone-{header_crc}.gz"
+        alone.write_bytes(stream)
+        assert credential_in_file(alone) == "a Freesolo API key"  # the control it must match
+
+        behind = tmp_path / f"behind-{header_crc}.run"
+        behind.write_bytes(stub + stream)
+        assert credential_in_file(behind) == "a Freesolo API key"
+
+
+def test_a_broken_overlay_candidate_does_not_hide_a_valid_one(tmp_path):
+    """Candidates were deduplicated on a 64-byte prefix, which two streams can share.
+
+    A corrupted stream whose first difference is at offset 70 made the valid stream behind it look
+    like one already tried, so it was skipped and the key it holds published -- while that same
+    valid stream behind the same stub was reported.
+    """
+    import bz2
+
+    from flash.env_secrets import credential_in_file
+
+    payload = f"fslo_{_FAKE_KEY_BODY}".encode() + b"\n" + b"filler to lengthen the stream " * 20
+    valid = bz2.compress(payload)
+    assert len(valid) > 80  # long enough for two candidates to share a 64-byte prefix
+
+    stub = b"#!/bin/sh\necho hi\nexit 0\n"
+    control = tmp_path / "valid.run"
+    control.write_bytes(stub + valid)
+    assert credential_in_file(control) == "a Freesolo API key"  # the control the pair must match
+
+    broken = bytearray(valid)
+    broken[70] ^= 0xFF  # diverges only after the shared prefix
+    assert bytes(broken[:64]) == valid[:64]
+
+    paired = tmp_path / "paired.run"
+    paired.write_bytes(stub + bytes(broken) + b"\n" + valid)
+    assert credential_in_file(paired) == "a Freesolo API key"
+
+
+def test_an_archive_name_scan_inherits_the_package_deadline(tmp_path):
+    """`credential_in_name` opens a fresh budget when it is handed no deadline.
+
+    The walkers passed the bare function, so a name scanned late in an archive could spend nearly a
+    second full budget after the package one had almost run out -- the archive checks the outer
+    deadline before the callback, not inside it, so the bound it exists to enforce was doubled.
+    """
+    import functools
+    import inspect
+
+    from flash import env_secrets
+
+    for walker in (
+        env_secrets._credential_in_zip,
+        env_secrets._credential_in_tar,
+        env_secrets._credential_in_ar,
+    ):
+        source = inspect.getsource(walker)
+        assert "named=functools.partial(" in source, f"{walker.__name__} passes an unbound namer"
+        assert "deadline=deadline" in source
+
+    # the bound callable really does carry the deadline through to the scan
+    bound = functools.partial(env_secrets.credential_in_name, deadline=1e18)
+    assert bound.keywords["deadline"] == 1e18
+    assert bound(f"cache-fslo_{_FAKE_KEY_BODY}.json") == "a Freesolo API key"
