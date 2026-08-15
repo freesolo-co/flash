@@ -858,6 +858,57 @@ def test_the_drain_always_ends_so_a_fast_run_is_never_silenced():
     assert len(clock.intervals()) == 255, len(clock.intervals())
 
 
+def test_a_backlog_larger_than_the_drain_bound_is_still_not_timed_as_steps():
+    """The bound must not cut a drain short and admit the rest of the burst at pipe speed.
+
+    A 30s wait on the HF upload lock, on a run whose steps take 0.4s, queues ~75 step lines -- more
+    than the 64-line bound. Ending the drain on that count let the remaining arrivals through as
+    ordinary intervals, and once they outnumbered the clean ones they took the median: 0.001s
+    published against a true 0.4s. That is the same 100x under-report the drain exists to prevent,
+    reintroduced by its own terminator, and it under-reports in the direction that matters -- the
+    ETA and the wall warning both read far too optimistic.
+
+    The bound itself is still required, but only where no pace has been measured yet (see
+    ``test_the_drain_always_ends_so_a_fast_run_is_never_silenced``): the gap test needs a measured
+    pace to size itself against, and a block before the first interval has none.
+    """
+    real_step, pipe = 0.4, 0.001
+
+    def run(queued: int) -> step_timing.StepClock:
+        clock = step_timing.StepClock()
+        timeline, t, step = [], 0.0, 1
+        for _ in range(20):
+            timeline.append((t, step, 0.001))
+            t += real_step
+            step += 1
+        # the 30s upload lock, declared by measurement the way the trainers do it.
+        timeline.append((t, step, 30.0))
+        t += 30.0
+        step += 1
+        # everything the child completed while the reader was blocked, read back at pipe speed.
+        for _ in range(queued):
+            timeline.append((t, step, 0.001))
+            t += pipe
+            step += 1
+        for _ in range(20):
+            timeline.append((t, step, 0.001))
+            t += real_step
+            step += 1
+        _replay(clock, timeline)
+        return clock
+
+    # a backlog smaller than the bound was always handled; the regression is above it.
+    for queued in (10, 64, 75, 200, 2000):
+        clock = run(queued)
+        assert clock.step_seconds() == pytest.approx(real_step, abs=0.02), (
+            f"{queued} queued lines published {clock.step_seconds()}s against a true {real_step}s"
+        )
+        # and none of the burst survived as an interval, rather than merely being outvoted.
+        assert not [gap for gap in clock.intervals() if gap < real_step / 2], (
+            f"{queued} queued lines left pipe-speed intervals in the window"
+        )
+
+
 def test_a_thin_margin_is_not_reported_as_a_certain_cutoff():
     """The 90% trigger covers two situations, and only one of them is a cutoff.
 

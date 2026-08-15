@@ -79,9 +79,10 @@ class StepClock:
     # this is ~2x the window a projection actually needs.
     _RETAINED_STEP_LINES = 256
 
-    # how many post-block lines may be discarded as buffered before the clock starts measuring
-    # again regardless. a bound rather than a rule: it guarantees the drain always ends, so a run
-    # whose real steps are faster than the drain floor cannot be silenced for the rest of its life.
+    # the drain terminator for the one case the arrival-gap test cannot decide: a block declared
+    # before any step has been measured, where there is no pace to size the gap against. once a pace
+    # exists the gap ends the drain instead and this does not apply -- see _draining, where capping a
+    # measurable drain was itself what let a long backlog take the median.
     _MAX_DRAINED_LINES = 64
 
     def __init__(self) -> None:
@@ -203,14 +204,25 @@ class StepClock:
         outnumbering the real lines the published pace collapsed to 0.10s against a true 92s.
 
         A burst is identified by its arrival gap, not by counting lines: the whole point is that the
-        reader was not waiting, so an inter-arrival below the same threshold that declared the block
-        is a line that was already sitting in the pipe. The first line whose gap exceeds it is one
-        the reader genuinely waited for, which ends the drain -- so a block that buffered nothing
-        costs a single line rather than a fixed quota.
+        reader was not waiting, so an inter-arrival below the drain floor is a line that was already
+        sitting in the pipe. The first line whose gap exceeds it is one the reader genuinely waited
+        for, which ends the drain -- so a block that buffered nothing costs a single line rather than
+        a fixed quota.
 
-        ``_MAX_DRAINED_LINES`` bounds it so the drain always ends. Without it a run whose real steps
-        are faster than the threshold would look like an unending burst and publish nothing at all
-        for the rest of its life, which is a worse failure than a slightly skewed median.
+        The floor is the measured pace when there is one, not a fixed 1s. A fixed floor cannot tell a
+        0.4s real step from a 0.001s pipe arrival -- both are "below threshold" -- so on a fast run
+        every genuine wait read as more backlog and only the line COUNT could end the drain. Half the
+        measured pace separates them by two orders of magnitude, and it is self-scaling: a 92s run
+        and a 0.4s run get the same test.
+
+        ``_MAX_DRAINED_LINES`` then bounds only the case the gap test cannot decide -- a block that
+        lands before any step has been measured, where there is no pace to compare a gap against.
+        With a pace in hand the cap must NOT fire: a 30s upload lock on a 0.4s run queues ~75 lines,
+        and cutting the drain at 64 admitted the rest of the burst at pipe speed. Once those
+        outnumbered the clean intervals they took the median and the published pace collapsed to
+        0.001s against a true 0.4s -- the same failure the drain exists to prevent, reintroduced by
+        its own bound. Ending on the gap instead keeps the guarantee (a genuine wait always arrives,
+        and its gap always clears half the pace) without capping how much backlog may be discarded.
         """
         if not self._draining_backlog:
             return False
@@ -222,11 +234,19 @@ class StepClock:
             # (it opens the new segment) and the question is deferred to the line after it.
             self._drained = 1
             return False
-        if float(now) - previous >= _BLOCKING_CALL_THRESHOLD_S:
+        measured = steady_state_step_seconds(self.intervals())
+        floor = (
+            _BLOCKING_CALL_THRESHOLD_S
+            if measured is None
+            else min(_BLOCKING_CALL_THRESHOLD_S, measured / 2)
+        )
+        if float(now) - previous >= floor:
             # the reader waited for this one, so the backlog is gone and normal timing resumes.
             self._draining_backlog = False
             return False
-        if self._drained >= self._MAX_DRAINED_LINES:
+        if measured is None and self._drained >= self._MAX_DRAINED_LINES:
+            # no pace was ever measured, so no gap test can end this drain -- the count is the only
+            # terminator left, and a bounded skew beats publishing nothing for the rest of the run.
             self._draining_backlog = False
             return False
         if self._drained == 1:
