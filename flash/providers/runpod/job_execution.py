@@ -549,6 +549,12 @@ def _classify_queue_state(
                 # when THIS probe was stamped, so health-timer eligibility is measured from the
                 # real cadence rather than assumed from the post-request clock above.
                 probe_at=state.last_health_probe,
+                # the clock the expired() calls below are handed. A slow health request leaves it
+                # behind the stamp above, and only it decides whether they fire on THIS pass.
+                classifier_now=now,
+                # probes land on polling iterations, not on the gate constant, so the real cadence
+                # depends on the interval this run was launched with.
+                interval_s=context.interval_s,
             )
             budget = f"; {note}" if note else ""
             context.say(f"queued; workers: {workers}{budget}")

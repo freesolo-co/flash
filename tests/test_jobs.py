@@ -854,11 +854,11 @@ def test_an_unarmed_health_timer_never_displaces_the_capacity_deadline():
     # but the handicap is a cadence, NOT a veto: an unarmed timer whose grace is genuinely shorter
     # still fires first and is still the honest number to report. Dropping unarmed timers outright
     # would hide the 240s unhealthy grace behind a 900s capacity one.
-    from flash.providers.runpod.jobs import HEALTH_PROBE_CADENCE_S
+    from flash.providers.runpod.jobs import HEALTH_PROBE_GATE_S
 
     shorter = _note(0.0, unhealthy=True, unhealthy_since=None, unhealthy_grace_s=240.0)
     assert "unhealthy grace" in shorter, shorter
-    assert HEALTH_PROBE_CADENCE_S == 90.0
+    assert HEALTH_PROBE_GATE_S == 90.0
 
 
 def test_an_armed_health_timer_is_charged_the_probe_gap_it_must_wait_for():
@@ -927,12 +927,22 @@ def test_a_timer_armed_on_this_probe_is_not_charged_the_arming_delay_twice():
     # already running from now; it only cannot ALSO expire on that pass. Charging it a further
     # cadence on top modelled the default 240s unhealthy grace as firing at 360s when it really
     # fires at 270s, and so reported the 300s capacity grace -- a deadline the run never reaches.
-    from flash.providers.runpod.jobs import HEALTH_PROBE_CADENCE_S, _health_deadline_in
+    from flash.providers.runpod.jobs import HEALTH_PROBE_GATE_S, _health_deadline_in
 
-    assert HEALTH_PROBE_CADENCE_S == 90.0
-    # 240s of grace armed at this probe: probes land at +90, +180, +270, and only the last is past
-    # the deadline. Three cadences, not four.
-    assert _health_deadline_in(240.0, armed=False, now=0.0, probe_at=0.0) == 270.0
+    assert HEALTH_PROBE_GATE_S == 90.0
+    # 240s of grace armed at this probe, at a cadence of 90: probes land at +90, +180, +270, and
+    # only the last is past the deadline. Three cadences, not four.
+    assert (
+        _health_deadline_in(
+            240.0,
+            armed=False,
+            now=0.0,
+            probe_at=0.0,
+            cadence=90.0,
+            classifier_remaining=240.0,
+        )
+        == 270.0
+    )
 
     # which is what makes the note pick the deadline that actually fires, at the production pairing
     # of a 240s unhealthy grace against a 300s capacity grace.
@@ -946,6 +956,88 @@ def test_a_timer_armed_on_this_probe_is_not_charged_the_arming_delay_twice():
         queue_grace_s=300.0,
     )
     assert "unhealthy grace" in fires_first, fires_first
+
+
+def test_probe_cadence_follows_the_poll_interval_not_the_gate_constant():
+    # _classify_queue_state can only probe ON a polling iteration, and its gate rejects equality
+    # (`now - last_health_probe <= 90` returns early). So the real spacing is the first whole number
+    # of intervals STRICTLY past 90s, not 90s itself. Treating the gate as the cadence predicts
+    # health checks earlier than they can happen: at interval_s=60 probes are 120s apart, so a 240s
+    # unhealthy grace armed at 120s cannot fire until the 480s poll -- a 430s capacity grace gets
+    # there first, while assuming 90s put the health check at 390s and reported unhealthy.
+    from flash.providers.runpod.jobs import HEALTH_PROBE_GATE_S, _health_probe_cadence
+
+    assert HEALTH_PROBE_GATE_S == 90.0
+    assert _health_probe_cadence(10.0) == 100.0  # the poll_job default: 10 polls, not 9
+    assert _health_probe_cadence(60.0) == 120.0
+    assert _health_probe_cadence(90.0) == 180.0  # equality is rejected, so one poll is not enough
+    assert _health_probe_cadence(45.0) == 135.0
+    assert _health_probe_cadence(0.0) == HEALTH_PROBE_GATE_S  # degenerate: the tightest bound
+
+    slow_polling = _note(
+        120.0,
+        interval_s=60.0,
+        probe_at=120.0,
+        unhealthy=True,
+        unhealthy_since=None,  # armed by the expired() call below this note
+        unhealthy_grace_s=240.0,  # cannot fire before the 480s poll
+        queued_since=0.0,
+        queue_grace_s=430.0,  # fires at 430s, checked every poll
+    )
+    assert "capacity grace" in slow_polling, slow_polling
+    assert "unhealthy" not in slow_polling, slow_polling
+
+    # the same pairing at the default interval really does put unhealthy first (cadence 100, so it
+    # fires at 300s), which is what makes this a cadence question rather than a fixed preference.
+    fast_polling = _note(
+        120.0,
+        interval_s=10.0,
+        probe_at=120.0,
+        unhealthy=True,
+        unhealthy_since=None,
+        unhealthy_grace_s=240.0,
+        queued_since=0.0,
+        queue_grace_s=430.0,
+    )
+    assert "unhealthy grace" in fast_polling, fast_polling
+
+
+def test_a_health_timer_within_grace_at_the_classifier_clock_is_not_reported_as_due():
+    # Two clocks, and they are not interchangeable. The expired() calls below the note are handed
+    # the PRE-request clock, so that clock alone decides whether they fire on this pass; the note is
+    # stamped after the request. When a slow request carries the wall clock past both an armed
+    # grace and the no-progress limit, ranking the health candidate as immediately due names a timer
+    # that cannot fire -- while _classify_stall reads the fresh clock and returns `stalled` next.
+    slow_request = _note(
+        250.0,  # post-request: 250s elapsed against a 240s grace, so it LOOKS due
+        classifier_now=230.0,  # pre-request: only 230s, still inside the grace
+        probe_at=230.0,
+        unhealthy=True,
+        unhealthy_since=0.0,
+        unhealthy_grace_s=240.0,
+        queued_since=0.0,
+        queue_grace_s=100_000.0,
+        stall_since=0.0,
+        stall_limit_s=200.0,  # spent at the fresh clock: this is what actually fires
+    )
+    assert "no-progress limit" in slow_request, slow_request
+    assert "unhealthy" not in slow_request, slow_request
+
+    # but a timer genuinely spent at the CLASSIFIER clock does fire on this pass, and is still the
+    # honest thing to report -- the fix is about which clock, not about suppressing health timers.
+    really_due = _note(
+        250.0,
+        classifier_now=250.0,
+        probe_at=250.0,
+        unhealthy=True,
+        unhealthy_since=0.0,
+        unhealthy_grace_s=240.0,
+        queued_since=0.0,
+        queue_grace_s=100_000.0,
+        stall_since=0.0,
+        stall_limit_s=3000.0,
+    )
+    assert "unhealthy grace" in really_due, really_due
 
 
 def test_a_deadline_already_declined_this_iteration_does_not_outrank_the_next_check():
