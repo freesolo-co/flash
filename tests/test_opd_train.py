@@ -7172,3 +7172,21 @@ def test_opd_stops_an_unguarded_child_at_its_first_step_not_after_the_whole_run(
 
     with pytest.raises(RuntimeError, match=r"never proved.*lora-rollout-guard"):
         callbacks.on_line("step:1 - actor/distillation/loss:0.5")
+
+
+def test_opd_names_the_failed_fragment_when_the_child_exits_fail_closed():
+    """wrapping a fragment made exit 97 reachable from opd, so opd has to explain it.
+
+    the wrapped guard hard-exits the child rather than train unpatched. without this branch the
+    run surfaces as a bare "exited with status 97", which reads as an unclassified crash and
+    invites a retry that fails identically on the same interpreter.
+    """
+    from flash.engine.worker import backend_common
+
+    with pytest.raises(
+        RuntimeError, match="required flash runtime patch failed to apply"
+    ) as excinfo:
+        _raise_verl_failure(backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, None)
+
+    # permanent: retrying re-runs the same incompatible verl/transformers stack.
+    assert not isinstance(excinfo.value, opd_train._w.RetriableInfraError)
