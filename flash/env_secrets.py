@@ -334,6 +334,20 @@ def _decoded_container(deadline: float | None, depth: int) -> _Inspector | None:
     return inspect
 
 
+def _scan_stream_head(chunk: bytes, upcoming: bytes) -> tuple[str | None, bool, bool]:
+    """Inspect the first chunk's anchored formats and classify its container syntax."""
+    container_head = _looks_like_container_head(chunk)
+    source_container = _looks_like_source_container(chunk)
+    if kind := _openpgp_kind(chunk, truncated=bool(upcoming)):
+        return kind, container_head, source_container
+    head, truncated = _after_skippable_frames(chunk[:_SKIPPABLE_SCAN_BYTES])
+    if truncated:
+        raise _Unscannable("begins with a frame prelude too long to read past")
+    if fmt := _unexpandable_format(head, anchored=True):
+        raise _Unscannable(_uninspectable_reason(fmt))
+    return None, container_head, source_container
+
+
 def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int = 0) -> str | None:
     """The kind of credential anywhere in `handle`, or None.
 
@@ -342,8 +356,7 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
     count would mean a key placed after the cutoff publishes, which is the bug rather than the
     protection.
 
-    `deadline` bounds expansion time when the bytes come from an archive. Exceeding it raises
-    `_Unscannable` rather than returning None, so the caller refuses the publish.
+    `deadline` bounds expansion time and refuses rather than returning a clean verdict.
 
     A stream that is ITSELF a container is expanded in turn. Nested containers are buffered to be
     reopened, so one too large to hold in memory also raises: leaving it to the scan of its literal
@@ -384,22 +397,9 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
             if not walking_store:
                 store_head = bytearray()
         if not carry:
-            container_head = _looks_like_container_head(chunk)
-            source_container = _looks_like_source_container(chunk)
-            if kind := _openpgp_kind(chunk, truncated=bool(upcoming)):
+            kind, container_head, source_container = _scan_stream_head(chunk, upcoming)
+            if kind:
                 return kind
-            # zstd and LZ4 both allow a metadata envelope before the real frame. What matters here
-            # is only whether that prelude could be READ to its end: a frame declaring a payload
-            # longer than the bytes available leaves the format undecided, and undecided is not
-            # clean. The signature search itself runs below over the whole window, so the walked
-            # bytes are not needed -- only the verdict on whether the walk ran out.
-            head, truncated = _after_skippable_frames(chunk[:_SKIPPABLE_SCAN_BYTES])
-            if truncated:
-                raise _Unscannable("begins with a frame prelude too long to read past")
-            # Anchored: every format is decisive about what a stream BEGINS with, including the
-            # short zstd and LZ4 magics that are not searched for at arbitrary offsets below.
-            if fmt := _unexpandable_format(head, anchored=True):
-                raise _Unscannable(_uninspectable_reason(fmt))
         if depth:
             overlay_probe = overlay_tail + chunk
             overlay_found = overlay_found or _overlay_offset(overlay_probe) is not None
