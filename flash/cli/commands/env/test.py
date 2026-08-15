@@ -409,41 +409,6 @@ def _normalize_prompt_images(env, example: dict, messages: list[dict]) -> None:
     normalize_prompt_images(example, messages, getattr(env, "package_root", None))
 
 
-def _image_sft_rejection(env, dataset: list, algorithm: str | None) -> str | None:
-    """Return why this environment cannot train with sft, or None if it can.
-
-    Checks the prompt AND the completion because submit rejects each separately: the prompt through
-    the capability gate, the completion through `_reject_image_completion`. Reporting only the
-    prompt would pass an environment whose images live in `output`, which is the shape that
-    otherwise survives every offline check and fails after the run is submitted.
-
-    Rows the episode loop is about to drive are judged on their raw fields alone. Rendering them
-    here too would call user hooks twice per row, and a stateful or one-shot hook renders
-    differently the second time -- so the verdict could describe a rendering the reported episode
-    never ran. Later rows are never driven, so rendering them costs nothing that would otherwise
-    happen and is the only way to see an image they build rather than declare.
-    """
-    if (algorithm or _REWARD_DRIVEN_ALGORITHM) != "sft":
-        return None
-    from flash.content.multimodal import IMAGE_SFT_UNSUPPORTED, record_has_images
-
-    build = getattr(env, "prompt_messages", None)
-    completion_of = getattr(env, "sft_completion", None)
-    driven = min(_DEFAULT_EPISODES, len(dataset))
-    for index, example in enumerate(dataset):
-        # a hook that raises is not an image verdict -- the episode loop reports the real
-        # construction error against the failing case. keep scanning rather than returning: the
-        # loop only drives the first few rows, so abandoning the scan here would let an image row
-        # further down the dataset reach `overall: PASS`.
-        rendered = [] if index < driven else _hook_messages(build, example)
-        if record_has_images(example, rendered):
-            return IMAGE_SFT_UNSUPPORTED
-        completion = [] if index < driven else _hook_messages(completion_of, example)
-        if record_has_images({}, completion):
-            return "image-bearing SFT completions are not supported"
-    return None
-
-
 def _warn_low_replay_reward(record: dict, reward: float) -> None:
     """Surface a replayed gold answer the grader scored at or below zero.
 
@@ -467,36 +432,29 @@ def _warn_low_replay_reward(record: dict, reward: float) -> None:
     print(f"  scored text: {_scored_text(record)!r}", file=sys.stderr)
 
 
-def _image_sft_episode_rejection(record: dict, algorithm: str | None) -> str | None:
-    """Judge an episode's ALREADY-rendered prompt and gold completion, rendering nothing itself.
+def _image_sft_episode_rejection(example: dict, record: dict, algorithm: str | None) -> str | None:
+    """Reject an image-bearing sft episode, judging only what this episode already produced.
 
-    The preflight scan reads only raw fields for the rows this loop drives, so an image the
-    environment builds in `prompt_messages` or `sft_completion` rather than declaring on the record
-    is caught here instead -- off the renders the episode already performed, so a stateful hook is
-    still called exactly once per row.
+    Scoped to the sampled episodes on purpose. Scanning the rest of the dataset would call user
+    hooks that can carry state -- advancing it before episode 1 is driven, so the reported episodes
+    would not be the ones a plain run produces -- and would ignore `train.max_examples`, which
+    truncates the rows submit-time profiling ever sees (`dataset_profile.py`) and which this
+    command has no run config to read. Both would fail environments a real sft run accepts.
+
+    Reads the raw record for a declared image and the rendered messages for a constructed one, so
+    neither shape needs a second render.
     """
     if (algorithm or _REWARD_DRIVEN_ALGORITHM) != "sft":
         return None
     from flash.content.multimodal import IMAGE_SFT_UNSUPPORTED, record_has_images
 
     prompt = record.get("prompt")
-    if record_has_images({}, prompt if isinstance(prompt, list) else []):
+    if record_has_images(example, prompt if isinstance(prompt, list) else []):
         return IMAGE_SFT_UNSUPPORTED
     completion = record.get("reference_messages")
     if record_has_images({}, completion if isinstance(completion, list) else []):
         return "image-bearing SFT completions are not supported"
     return None
-
-
-def _hook_messages(hook, example: dict) -> list:
-    """Call an environment message hook, treating any failure as "nothing to inspect"."""
-    if not callable(hook):
-        return []
-    try:
-        messages = hook(example)
-    except (Exception, SystemExit):
-        return []
-    return messages if isinstance(messages, list) else []
 
 
 def _evaluation_response(env, case) -> tuple[str, str]:
@@ -846,13 +804,7 @@ def cmd_env_test(args) -> int:
     if not dataset:
         return _load_failure("dataset is empty")
 
-    # refuse the combination submit refuses. this command exists so a contract failure costs a
-    # local run instead of a rejected submission, and image-bearing sft is rejected at submit --
-    # so passing it here would send the user to the one surface that cannot accept it.
     algorithm = getattr(args, "algorithm", None)
-    if unsupported := _image_sft_rejection(env, dataset, algorithm):
-        return _err(unsupported)
-
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
     passed = 0
     # only replay episodes carry a gold answer to score. an echo episode has none, so its reward
@@ -876,7 +828,7 @@ def cmd_env_test(args) -> int:
         # the preflight judged this row on its raw fields only, to avoid rendering it twice. the
         # prompt and gold it built are available now, so an image the environment constructs
         # rather than declares is caught here, before any episode is reported as passing.
-        if unsupported := _image_sft_episode_rejection(record, algorithm):
+        if unsupported := _image_sft_episode_rejection(example, record, algorithm):
             return _err(unsupported)
 
         reward = record["reward"]

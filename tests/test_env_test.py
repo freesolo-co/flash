@@ -687,8 +687,8 @@ def test_env_test_renders_a_driven_row_once_for_sft(monkeypatch, tmp_path, capsy
     assert env.prompt_calls == 1
 
 
-class _LateImageEnv(_SingleTurnEnv):
-    """Text rows, then a row whose prompt raises, then an image row."""
+class _TailImageEnv(_SingleTurnEnv):
+    """Text rows in the sampled prefix, image rows only in the untouched tail."""
 
     def __init__(self):
         super().__init__(
@@ -696,31 +696,31 @@ class _LateImageEnv(_SingleTurnEnv):
                 {"input": "a", "output": "1"},
                 {"input": "b", "output": "2"},
                 {"input": "c", "output": "3"},
-                {"input": "boom", "output": "4"},
-                {"input": "d", "output": "5", "image": "dataset/red.png"},
+                {"input": "d", "output": "4", "image": "dataset/red.png"},
             ]
         )
+        self.rendered: list[str] = []
 
     def prompt_messages(self, example):
-        if example["input"] == "boom":
-            raise ValueError("prompt construction exploded")
+        self.rendered.append(example["input"])
         return super().prompt_messages(example)
 
 
-def test_env_test_finds_an_image_row_past_a_row_whose_prompt_raises(monkeypatch, tmp_path, capsys):
-    """A raising hook is not an image verdict, and must not end the scan.
+def test_env_test_ignores_image_rows_outside_the_sampled_episodes(monkeypatch, tmp_path, capsys):
+    """`train.max_examples` can cap an sft run before the image rows, and that run is valid.
 
-    The episode loop drives only the first few rows, so abandoning the scan at the first broken
-    row would let an image row further down the dataset reach `overall: PASS` -- the exact silent
-    approval this check exists to prevent.
+    Profiling truncates the dataset before it detects images, and this command has no run config
+    to read that bound from -- so judging the tail would fail an environment whose capped sft
+    prefix is text-only and whose image rows exist for a grpo or opd run. The tail is also never
+    rendered, which keeps a stateful hook from advancing before the episodes are driven.
     """
     env_dir = _environment_dir(tmp_path)
-    _patch_loader(monkeypatch, _LateImageEnv())
+    env = _TailImageEnv()
+    _patch_loader(monkeypatch, env)
 
-    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 1
-    captured = capsys.readouterr()
-    assert "image-bearing SFT is not supported" in captured.err
-    assert "overall: PASS" not in captured.out
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    assert "overall: PASS" in capsys.readouterr().out
+    assert env.rendered == ["a", "b", "c"]
 
 
 def test_env_test_still_passes_an_image_environment_for_grpo(monkeypatch, tmp_path, capsys):
