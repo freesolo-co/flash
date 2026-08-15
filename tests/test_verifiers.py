@@ -1982,6 +1982,70 @@ def test_step_episode_receives_the_raw_turn_not_the_scored_one(monkeypatch):
     )
 
 
+class _BlockReplyMultiTurnEnv(_EnvironmentMultiTurn):
+    """Multi-turn env whose step_episode replies in openai-style text BLOCKS rather than a string."""
+
+    def __init__(self):
+        self.scored: list[object] = []
+
+    def start_episode(self, example, prompt_text):
+        return [{"role": "user", "content": "go"}]
+
+    def step_episode(self, example, messages, assistant_response):
+        return _EnvironmentStepResult(
+            done=False,
+            messages=(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first "},
+                        {"type": "text", "text": "second"},
+                    ],
+                },
+            ),
+            final_response_text=None,
+        )
+
+    def score_episodes(self, example, episodes):
+        self.scored.extend(episodes)
+        return [_RewardResult(score=1.0, success=True) for _ in episodes]
+
+
+def test_a_block_reply_reaches_the_scorer_as_the_text_the_model_saw(monkeypatch):
+    """The turn handed to a turn-aware scorer must be the text the next model turn conditioned on.
+
+    The multi-turn child joins text blocks through message_content_text before the reply enters the
+    transcript, so the model reads "first second". Recording the turn with a bare str() stored the
+    python repr "[{'type': 'text', ...}]" instead, and score_episodes then graded a transcript that
+    never existed. The two views have to agree.
+    """
+    sdk_env = _BlockReplyMultiTurnEnv()
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+    state = env.new_rollout_state(example)
+    env.record_model_turn(state, "a turn")
+    env.env_reply(state["messages"], state)
+
+    # record_model_turn appends the assistant turn first, so the env's reply is the last one.
+    recorded = [turn.content for turn in state["turns"]]
+    assert recorded[-1] == "first second", f"the scorer would grade {recorded[-1]!r}"
+    assert "'type'" not in recorded[-1], "a block-list repr reached the scored transcript"
+
+
+def test_a_plain_string_reply_is_still_recorded_unchanged(monkeypatch):
+    """The block fix must not alter the shape every existing multi-turn env already returns."""
+    sdk_env = _SteppingMultiTurnEnv()
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+
+    example = {"id": "a", "input": "2+2?", "output": "4"}
+    state = env.new_rollout_state(example)
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env.env_reply(state["messages"], state)
+
+    assert [turn.content for turn in state["turns"]][-1] == "next"
+
+
 def test_stepping_the_env_leaves_the_scored_text_stripped(monkeypatch):
     """Fixing step_episode must not un-fix grading: the scorer still sees answer-only text."""
     sdk_env = _SteppingMultiTurnEnv()

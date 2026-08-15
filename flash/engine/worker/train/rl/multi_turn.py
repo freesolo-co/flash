@@ -258,8 +258,16 @@ class MultiTurnBridge:
                 return {"terminal": True, "messages": []}
             replies = self._env.env_reply(list(state.get("messages") or ()), state)
             terminal = bool(self._env.rollout_done(state, self._max_turns))
+        if terminal:
+            # nothing here is ever shown to the model: the child breaks on `terminal` BEFORE it
+            # reads `messages`. env_reply has already recorded these replies into the state that
+            # score_episodes reads, so the episode is scored on them either way. validating them
+            # for transcript representability would turn a completed episode whose env signed off
+            # with an image or a tool payload into a 400 with no reward -- refusing a turn the
+            # model was never going to see.
+            return {"terminal": True, "messages": []}
         return {
-            "terminal": terminal,
+            "terminal": False,
             "messages": [_env_reply_message(message) for message in replies],
         }
 

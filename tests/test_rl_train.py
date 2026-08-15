@@ -4768,6 +4768,57 @@ def test_bridge_step_stops_before_asking_a_finished_env_for_a_reply():
     }
 
 
+class _SignOffEnv(_BridgeEnv):
+    """an env whose ``env_reply`` ENDS the episode, the way the adapter's does when ``step_episode``
+    returns ``done=True``: ``rollout_done`` is false at the bridge's check BEFORE the reply and true
+    at the one after. that ordering is what puts a final sign-off message on the terminal path;
+    a plain ``done_after=1`` stops at the earlier check and never calls ``env_reply`` at all."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._signed_off = False
+        self.last_state: dict = {}
+
+    def env_reply(self, messages, state):
+        self._signed_off = True
+        self.last_state = state
+        return super().env_reply(messages, state)
+
+    def rollout_done(self, state, max_turns):
+        return self._signed_off or super().rollout_done(state, max_turns)
+
+
+def test_bridge_step_does_not_validate_a_terminal_reply_the_child_never_reads():
+    # an env that signs off with a final image (or any non-text block) alongside done=True used to
+    # take the reply-block guard and 400 the episode -- losing a completed rollout's reward over a
+    # message that was never going to be shown to the model. the child breaks on `terminal` BEFORE
+    # it reads `messages`, and env_reply has already recorded the reply into the scored state.
+    env = _SignOffEnv(
+        done_after=9,
+        replies=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}],
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    out = bridge.step({"session_id": "a", "completion_text": "first"})
+    assert out == {"terminal": True, "messages": []}
+    # the sign-off still reached the state the reward path reads; it was skipped, not dropped.
+    # _BridgeEnv.env_reply extends the same `state["messages"]` the adapter's does.
+    assert env.replies[0] in env.last_state["messages"]
+
+
+def test_bridge_step_still_refuses_a_non_terminal_image_reply():
+    # the terminal exemption above must not weaken the live path: a mid-episode image still cannot
+    # reach the engine, so it stays a loud failure rather than a silently dropped turn.
+    env = _BridgeEnv(
+        done_after=9,
+        replies=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}],
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="image block"):
+        bridge.step({"session_id": "a", "completion_text": "first"})
+
+
 def test_bridge_step_on_an_unknown_session_raises_rather_than_scoring_a_blank_episode():
     with pytest.raises(KeyError, match="unknown multi-turn session"):
         _bridge(_BridgeEnv()).step({"session_id": "ghost", "completion_text": "x"})
