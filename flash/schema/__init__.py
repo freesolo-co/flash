@@ -22,7 +22,7 @@ from flash.core.spec import (
     parse_seed,
     require_project_id,
 )
-from flash.providers import PROVIDER_NAMES
+from flash.providers import PROVIDER_NAMES, validated_provider_preferences
 from flash.providers.base import (
     GPU_INFO,
     UnsupportedGpuError,
@@ -430,7 +430,7 @@ def _validate_gpu_section(
     algorithm: str,
     train_raw: dict[str, Any],
     thinking: bool,
-) -> tuple[str, str, dict[str, int]]:
+) -> tuple[str, str, tuple[str, ...], dict[str, int]]:
     """Validate the gpu section."""
     gpu_raw = raw.get("gpu")
     if gpu_raw is None:
@@ -457,6 +457,14 @@ def _validate_gpu_section(
         raise ConfigError(
             f"gpu.provider must be one of {', '.join(PROVIDER_NAMES)}; got {provider_raw!r}"
         )
+    try:
+        gpu_providers = validated_provider_preferences(
+            gpu_raw.get("providers", ()), allow_empty="providers" not in gpu_raw
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
+    if gpu_provider and gpu_providers:
+        raise ConfigError("gpu.provider and gpu.providers cannot both be set")
 
     gpu_type_raw = gpu_raw.get("type", "")
     if not isinstance(gpu_type_raw, str):
@@ -474,6 +482,9 @@ def _validate_gpu_section(
             raise ConfigError(
                 f"gpu.provider {gpu_provider!r} cannot provision gpu.type {gpu_type!r}"
             )
+        # a preference is not a pin. providers that cannot provision this class simply contribute no
+        # candidate, and unnamed configured providers remain eligible, so only the fleet-wide submit
+        # check rejects a type that no configured provider can provision.
 
     requested_gpu_count = authored_gpu_ceiling(gpu_type, gpu_count)
     preflight_gpu_count = provisional_gpu_count(
@@ -513,7 +524,7 @@ def _validate_gpu_section(
         )
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
-    return gpu_type, gpu_provider, gpu_options
+    return gpu_type, gpu_provider, gpu_providers, gpu_options
 
 
 def _validate_algorithm_model_consistency(
@@ -575,7 +586,7 @@ def spec_from_dict(
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
     env_raw, environment_pip, environment_secrets = _validate_environment_section(raw)
     train_raw = _validate_train_section(raw, algorithm)
-    gpu_type, gpu_provider, gpu_options = _validate_gpu_section(
+    gpu_type, gpu_provider, gpu_providers, gpu_options = _validate_gpu_section(
         raw,
         model=model,
         model_revision=model_revision,
@@ -636,6 +647,7 @@ def spec_from_dict(
         gpu=GpuSpec(
             type=gpu_type,
             provider=gpu_provider,
+            providers=gpu_providers,
             **gpu_options,
         ),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
@@ -797,6 +809,12 @@ _ALGO_VALIDATORS = {
 
 
 def _validate_spec(spec: JobSpec) -> None:
+    if spec.gpu.provider and spec.gpu.providers:
+        raise ConfigError("gpu.provider and gpu.providers cannot both be set")
+    try:
+        validated_provider_preferences(spec.gpu.providers, allow_empty=True)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
     if spec.gpu.type:
         try:
             canonical_gpu(spec.gpu.type)

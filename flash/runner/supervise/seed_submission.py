@@ -401,6 +401,7 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
                 max(0.0, _load_run_deadline_at(ctx.spec.run_id) - _lifecycle.time.time()),
             ),
             provider=getattr(prepared.attempt_spec.gpu, "provider", ""),
+            providers=getattr(prepared.attempt_spec.gpu, "providers", ()),
             gpu_type=getattr(prepared.attempt_spec.gpu, "type", ""),
             model_revision=prepared.attempt_spec.model_revision,
             # an authored gpu.count is a hard ceiling. the digest-stable integer 1 on an unpinned
@@ -826,7 +827,8 @@ def _retry_target(
     # first, so once every candidate's provider has failed that key is True for all of them and the
     # escape degrades to the plain cheapest-first order. the line then reads like recovery while the
     # run loops on the same substrate, which is what made a 46-attempt loop look like progress.
-    # naming it is the difference between "waiting" and "unpin gpu.provider / add another provider".
+    # naming it is the difference between "waiting" and "unpin gpu.provider or keep another provider
+    # configured as a soft fallback".
     retry_failed_providers = (
         ctx.failed_providers
         if first_cache_drop
