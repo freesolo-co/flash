@@ -39,9 +39,7 @@ def _previous_ready_deployment(deployment: dict) -> dict | None:
     return None
 
 
-def _confirmed_active_failed_deployment(
-    deployment: object, *, run_id: str | None = None
-) -> dict | None:
+def _confirmed_active_failed_deployment(deployment: object, *, run_id: str) -> dict | None:
     if not isinstance(deployment, dict):
         return None
     revision = deployment.get("adapter_revision")
@@ -50,13 +48,13 @@ def _confirmed_active_failed_deployment(
         deployment.get("state") == "failed"
         and deployment.get("alias_activation_confirmed") is True
         and parsed is not None
-        and (run_id is None or parsed[0] == run_id)
+        and parsed[0] == run_id
     ):
         return dict(deployment)
     return None
 
 
-def _deployment_predecessor(deployment: dict, *, run_id: str | None = None) -> dict | None:
+def _deployment_predecessor(deployment: dict, *, run_id: str) -> dict | None:
     ready = _previous_ready_deployment(deployment)
     if ready is not None:
         return ready

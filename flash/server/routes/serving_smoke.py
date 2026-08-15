@@ -340,6 +340,52 @@ def _smoke_request_settings(spec: JobSpec) -> tuple[dict | None, int, list[str] 
     return constraint, max_tokens, stop_sequences or None
 
 
+def _bounded_smoke_chat(
+    *,
+    serving_model: str,
+    thinking: bool,
+    expected_checkpoint: str,
+    expected_adapter_revision: str,
+    max_tokens: int,
+    stop_sequences: list[str] | None,
+    deadline: float,
+    budget_s: float,
+    error_context: str | None = None,
+) -> dict:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _smoke_timeout_error(budget_s)
+        try:
+
+            def _chat_call(timeout_s: float = remaining):
+                return _app.serve_chat(
+                    run_id=serving_model,
+                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    thinking=thinking,
+                    expected_checkpoint=expected_checkpoint,
+                    expected_adapter_revision=expected_adapter_revision,
+                    timeout_s=timeout_s,
+                    retry_unavailable=True,
+                    stop=stop_sequences,
+                )
+
+            return _bounded_call(_chat_call, deadline=deadline, budget_s=budget_s)
+        except RetryableServingUnavailable as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _smoke_timeout_error(budget_s) from exc
+            time.sleep(min(exc.retry_after_seconds, remaining))
+        except ServingError:
+            raise
+        except Exception as exc:
+            if error_context is None:
+                raise
+            raise ServingError(f"{error_context}: {exc}") from exc
+
+
 def _run_deployment_smoke(
     run_id: str,
     spec: JobSpec,
@@ -351,37 +397,16 @@ def _run_deployment_smoke(
     started = time.monotonic()
     deadline = started + budget_s
     constraint, max_tokens, stop_sequences = _smoke_request_settings(spec)
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise _smoke_timeout_error(budget_s)
-        try:
-
-            def _smoke_call(timeout_s: float = remaining):
-                return _app.serve_chat(
-                    run_id=serving_model,
-                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
-                    temperature=0.0,
-                    max_tokens=max_tokens,
-                    thinking=spec.thinking,
-                    expected_checkpoint=expected_checkpoint,
-                    timeout_s=timeout_s,
-                    retry_unavailable=True,
-                    stop=stop_sequences,
-                )
-
-            result = _bounded_call(
-                _smoke_call,
-                deadline=deadline,
-                budget_s=budget_s,
-            )
-        except RetryableServingUnavailable as exc:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _smoke_timeout_error(budget_s) from exc
-            time.sleep(min(exc.retry_after_seconds, remaining))
-            continue
-        break
+    result = _bounded_smoke_chat(
+        serving_model=serving_model,
+        thinking=spec.thinking,
+        expected_checkpoint=expected_checkpoint,
+        expected_adapter_revision=serving_model,
+        max_tokens=max_tokens,
+        stop_sequences=stop_sequences,
+        deadline=deadline,
+        budget_s=budget_s,
+    )
     content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
     # truncation is a thinking-budget failure whether or not a grammar is configured: serving
     # returns the reasoning in reasoning_content, so a run cut off mid-thought still arrives with a
@@ -441,39 +466,17 @@ def _verify_alias_thinking(
     started = time.monotonic()
     deadline = started + budget_s
     _, max_tokens, stop_sequences = _smoke_request_settings(spec)
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise _smoke_timeout_error(budget_s)
-        try:
-
-            def _alias_call(timeout_s: float = remaining):
-                return _app.serve_chat(
-                    run_id=run_id,
-                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
-                    temperature=0.0,
-                    max_tokens=max_tokens,
-                    thinking=True,
-                    expected_checkpoint=expected_checkpoint,
-                    timeout_s=timeout_s,
-                    retry_unavailable=True,
-                    stop=stop_sequences,
-                )
-
-            result = _bounded_call(_alias_call, deadline=deadline, budget_s=budget_s)
-        except RetryableServingUnavailable as exc:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _smoke_timeout_error(budget_s) from exc
-            time.sleep(min(exc.retry_after_seconds, remaining))
-            continue
-        except ServingError:
-            raise
-        except Exception as exc:
-            raise ServingError(
-                f"alias thinking verification could not reach {run_id}: {exc}"
-            ) from exc
-        break
+    result = _bounded_smoke_chat(
+        serving_model=run_id,
+        thinking=True,
+        expected_checkpoint=expected_checkpoint,
+        expected_adapter_revision=adapter_revision,
+        max_tokens=max_tokens,
+        stop_sequences=stop_sequences,
+        deadline=deadline,
+        budget_s=budget_s,
+        error_context=f"alias thinking verification could not reach {run_id}",
+    )
 
     _smoke_provenance(result, adapter_revision, expected_checkpoint)
     _alias_reasoning_content(result, run_id, adapter_revision)

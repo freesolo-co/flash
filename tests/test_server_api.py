@@ -5532,6 +5532,29 @@ def test_deploy_persists_ordinary_post_activation_probe_failures(api, monkeypatc
     assert runner.read_verified_adapter_revisions(run_id) == frozenset()
 
 
+def test_post_activation_failure_persistence_error_records_divergence(monkeypatch, capsys):
+    from flash.serve.deploy import ServingError
+    from flash.server.routes import serving_completion
+
+    revision = "run-1@final." + "a" * 40
+    monkeypatch.setattr(
+        serving_completion._app,
+        "get_status",
+        lambda _run_id: (_ for _ in ()).throw(RuntimeError("status unavailable")),
+    )
+
+    serving_completion._record_post_activation_failure(
+        "run-1",
+        ServingError("alias verification failed"),
+        {"adapter_revision": revision, "requested_at": 1.0},
+    )
+
+    output = capsys.readouterr().out
+    assert "deployment_record_diverged" in output
+    assert revision in output
+    assert "status unavailable" in output
+
+
 def test_deploy_records_alias_thinking_on_a_healthy_thinking_deployment(api, monkeypatch):
     """The healthy path still commits ready and exposes the resolved state on the record."""
     import flash.runner as runner
@@ -5579,6 +5602,63 @@ def test_deploy_records_alias_thinking_on_a_healthy_thinking_deployment(api, mon
     assert resp.json()["state"] == "ready"
     assert resp.json()["alias_thinking_tag"] is True
     assert runner.read_verified_adapter_revisions(run_id) == frozenset({revision})
+
+
+def test_ready_commit_status_read_failure_records_divergence(api, monkeypatch, capsys):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+    from flash.server.routes import serving_completion
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, run_id)
+        return Deployment(
+            run_id=run_id,
+            model=SPEC["model"],
+            adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            openai_base_url="https://serve.example/v1",
+            adapter_revision=revision,
+        )
+
+    commit_attempted = [False]
+    status_read_failed = [False]
+    real_get_status = app_mod.get_status
+
+    def fail_commit(*_args, **_kwargs):
+        commit_attempted[0] = True
+        raise RuntimeError("ready commit failed")
+
+    def fail_first_recovery_read(target_run_id):
+        if commit_attempted[0] and not status_read_failed[0]:
+            status_read_failed[0] = True
+            raise RuntimeError("status unavailable")
+        return real_get_status(target_run_id)
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod, "serve_chat", lambda **_kwargs: _smoke_chat_result(revision, run_id)
+    )
+    monkeypatch.setattr(serving_completion, "_commit_ready_deployment", fail_commit)
+    monkeypatch.setattr(app_mod, "get_status", fail_first_recovery_read)
+
+    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    assert status_read_failed == [True]
+    output = capsys.readouterr().out
+    assert "deployment_record_diverged" in output
+    assert "status unavailable" in output
 
 
 def test_commit_miss_with_same_attempt_retries_and_persists_ready(api, monkeypatch):
@@ -5691,50 +5771,6 @@ def test_commit_miss_superseded_records_divergence_without_alias_revert(api, mon
     # the newer actor's record is preserved: undeploy wrote "undeployed" and it stays
     deployment = runner.get_status(run_id).deployment
     assert deployment["state"] == "undeployed"
-
-
-def test_post_activation_serialization_failure_persists_known_active_failure(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-
-    key = _login()
-    run_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    status = runner.get_status(run_id)
-    status.state = "done"
-    runner._save_status(status)
-    revision = f"{run_id}@final." + "a" * 40
-
-    class BrokenDeployment:
-        def to_dict(self):
-            raise RuntimeError("serialization failed after activation")
-
-    def fake_deploy(**kwargs):
-        kwargs["before_activate"](revision, run_id)
-        return BrokenDeployment()
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
-    monkeypatch.setattr(
-        app_mod, "serve_chat", lambda **kwargs: _smoke_chat_result(revision, run_id)
-    )
-
-    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["state"] == "failed"
-    assert body["adapter_revision"] == revision
-    assert body["alias_activation_confirmed"] is True
-    assert body["error"] == "serialization failed after activation"
-    persisted = runner.get_status(run_id).deployment
-    assert persisted["state"] == "failed"
-    assert persisted["adapter_revision"] == revision
-    assert persisted["alias_activation_confirmed"] is True
-    assert persisted["error"] == "serialization failed after activation"
-    assert "activation_outcome_unknown" not in persisted
-    assert "previous_deployment" not in persisted
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
 
 
 def test_create_rejects_retired_gpu_class(api):

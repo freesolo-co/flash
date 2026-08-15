@@ -237,7 +237,6 @@ def _finish_deployment_unlocked(
     *,
     run_id: str,
     spec_dict: dict,
-    checkpoint_step: int | None,
     is_checkpoint: bool,
     deploy_kwargs: dict,
     deployment: dict,
@@ -252,13 +251,15 @@ def _finish_deployment_unlocked(
         return
     current = dict(deployment)
     smoke_result: dict = {}
+    activation_target: tuple[str, str] | None = None
 
     def _assert_activation_fence() -> None:
         _assert_deployment_activation_fence(run_id, deployment, is_checkpoint, prev_state)
 
     def _before_activate(adapter_revision: str, checkpoint: str) -> None:
-        nonlocal current
+        nonlocal activation_target, current
         _assert_activation_fence()
+        activation_target = (adapter_revision, checkpoint)
         current = _deployment_state(
             {**current, "adapter_revision": adapter_revision},
             "smoke_testing",
@@ -312,16 +313,15 @@ def _finish_deployment_unlocked(
         _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
         return
 
-    try:
-        activated_current = {**current, **dep.to_dict()}
-    except Exception as exc:
-        _record_post_activation_failure(run_id, exc, current)
-        return
+    activated_current = {**current, **dep.to_dict()}
     activated_current.pop("activation_outcome_unknown", None)
     try:
-        _verify_activated_alias_thinking(
-            run_id, spec, dep, smoke_result, checkpoint_step=checkpoint_step
-        )
+        if spec.thinking and smoke_result.get("thinking_tag"):
+            if activation_target is None:
+                raise ServingError(
+                    "deploy_adapter returned without reporting its activation target"
+                )
+            _verify_activated_alias_thinking(run_id, spec, activation_target, smoke_result)
     except Exception as exc:
         _record_post_activation_failure(run_id, exc, activated_current)
         return
@@ -344,14 +344,14 @@ def _finish_deployment_unlocked(
                 run_id, current, verification_generation, is_checkpoint, deployment
             )
     except Exception as exc:
-        latest = _app.get_status(run_id)
-        latest_deployment = latest.deployment or {}
-        if (
-            latest_deployment.get("adapter_revision") == current.get("adapter_revision")
-            and latest_deployment.get("state") in _DEPLOYMENT_READY_STATES
-        ):
-            return
         try:
+            latest = _app.get_status(run_id)
+            latest_deployment = latest.deployment or {}
+            if (
+                latest_deployment.get("adapter_revision") == current.get("adapter_revision")
+                and latest_deployment.get("state") in _DEPLOYMENT_READY_STATES
+            ):
+                return
             if not _commit_ready_deployment(
                 run_id, current, verification_generation, is_checkpoint, prev_state
             ):
@@ -381,20 +381,26 @@ def _record_post_activation_failure(run_id: str, exc: Exception, current: dict) 
         detail="alias activated but post-activation verification failed; redeploy to retry",
         **fields,
     )
-    previous = _app.get_status(run_id)
-    marked = _serving.mark_deployment_failed(run_id, failed)
-    _serving._report_persisted_transition(
-        previous, marked, persisted=_deployment_failure_persisted(marked, failed)
-    )
+    try:
+        previous = _app.get_status(run_id)
+        marked = _serving.mark_deployment_failed(run_id, failed)
+        _serving._report_persisted_transition(
+            previous, marked, persisted=_deployment_failure_persisted(marked, failed)
+        )
+    except Exception as persistence_exc:
+        divergence = (
+            "deployment_record_diverged: serving alias was activated for "
+            f"{failed.get('adapter_revision')} but failure-state recovery did not complete after "
+            f"{exc!r}: {persistence_exc!r}"
+        )
+        print(f"deploy[{run_id}]: {divergence}", flush=True)
 
 
 def _verify_activated_alias_thinking(
     run_id: str,
     spec: JobSpec,
-    dep,
+    activation_target: tuple[str, str],
     smoke_result: dict,
-    *,
-    checkpoint_step: int | None = None,
 ) -> None:
     """Prove the freshly activated alias kept the reasoning channel the revision smoked with.
 
@@ -407,12 +413,7 @@ def _verify_activated_alias_thinking(
     pinned revision produced no reasoning either, the smoke has already judged that (it raises for a
     catalog model), and the difference this check exists to catch is not present.
     """
-    if not spec.thinking or not smoke_result.get("thinking_tag"):
-        return
-    # read off the deployment only once the gate above has passed: a non-thinking run must reach
-    # none of this, so the attribute is never required of a deployment that will not be checked.
-    revision = str(getattr(dep, "adapter_revision", "") or "")
-    expected_checkpoint = run_id if checkpoint_step is None else f"{run_id}/step-{checkpoint_step}"
+    revision, expected_checkpoint = activation_target
     smoke_result.update(
         _serving._verify_alias_thinking(
             run_id,

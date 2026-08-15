@@ -56,7 +56,7 @@ from flash.server.platform.internal_client import run_org_id
 
 router = APIRouter()
 
-_DEPLOYMENT_STALE_SECONDS = 30 * 60
+_DEPLOYMENT_STALE_SECONDS = 40 * 60
 
 
 def _deployment_state(deployment: dict, state: str, **fields) -> dict:
@@ -376,7 +376,7 @@ def deploy(
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
         _require_deploy_org(run_id, deploy_org_id)
-        previous_deployment = _deployment_predecessor(current_deployment)
+        previous_deployment = None
         expected_adapter_revision = None
         if not dry_run:
             try:
@@ -439,7 +439,6 @@ def deploy(
         job_kwargs = {
             "run_id": run_id,
             "spec_dict": status.spec,
-            "checkpoint_step": checkpoint_step,
             "is_checkpoint": is_checkpoint,
             "deploy_kwargs": deploy_kwargs,
             "deployment": dep_dict,

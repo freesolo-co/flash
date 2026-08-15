@@ -68,14 +68,15 @@ READBACK_MAX_DELAY_SECONDS = 2.0
 # with margin. the floor is doubled to 10 and the per-B term covers a bigger base on top.
 #
 # the cap is the real constraint, and readiness is only one leg of the attempt. the same deploy also
-# spends time BEFORE this wait (resolving the hub revision, downloading the adapter config to read
-# its rank, the capability check, registration) and AFTER it (`_SMOKE_BUDGET_SECONDS` = 600s of
-# smoke, then activation). the whole attempt must finish inside BOTH `_DEPLOYMENT_STALE_SECONDS`
-# (1800s, when the plane declares an in-flight attempt abandoned) and the CLI's 1800s default
-# `--wait`, or a deploy that is still progressing is reaped or reported as failed.
+# spends time before this wait (resolving the hub revision, downloading the adapter config to read
+# its rank, the capability check, registration) and after it (600s of immutable smoke, activation,
+# then 600s of alias smoke). the whole attempt must finish inside both
+# `_DEPLOYMENT_STALE_SECONDS` (2400s, when the plane declares an in-flight attempt abandoned) and
+# the CLI's 2400s default `--wait`, or a deploy that is still progressing is reaped or reported as
+# failed.
 #
-# so the cap leaves real slack rather than just clearing smoke: 900 + 600 = 1500, keeping 300s for
-# the surrounding hub reads, registration, activation, and poll latency, none of which share a
+# so the cap leaves real slack rather than just clearing smoke: 900 + 600 + 600 = 2100, keeping 300s
+# for the surrounding hub reads, registration, activation, and poll latency, none of which share a
 # wall-clock bound with this one.
 #
 # a longer budget costs little: an adapter serving REJECTS raises as soon as the revision reports
@@ -819,6 +820,7 @@ def _retryable_smoke_unavailable(
     response: httpx.Response,
     *,
     requested_model: str,
+    expected_adapter_revision: str,
 ) -> RetryableServingUnavailable | None:
     if response.status_code != 503:
         return None
@@ -835,7 +837,7 @@ def _retryable_smoke_unavailable(
         or error.get("retryable") is not True
         or code not in _RETRYABLE_SMOKE_503_CODES
         or error.get("requested_model") != requested_model
-        or error.get("adapter_revision") != requested_model
+        or error.get("adapter_revision") != expected_adapter_revision
     ):
         return None
     raw_delay = response.headers.get("Retry-After") or error.get("retry_after_seconds")
@@ -855,6 +857,7 @@ def chat(
     max_tokens: int = 512,
     thinking: bool = False,
     expected_checkpoint: str | None = None,
+    expected_adapter_revision: str | None = None,
     timeout_s: float | None = None,
     retry_unavailable: bool = False,
     stop: list[str] | None = None,
@@ -888,7 +891,11 @@ def chat(
     with client_context as client:
         resp = client.post(f"{base}/chat/completions", json=body, headers=headers, timeout=timeout)
         if retry_unavailable:
-            retryable_error = _retryable_smoke_unavailable(resp, requested_model=run_id)
+            retryable_error = _retryable_smoke_unavailable(
+                resp,
+                requested_model=run_id,
+                expected_adapter_revision=expected_adapter_revision or run_id,
+            )
             if retryable_error is not None:
                 raise retryable_error
         resp.raise_for_status()

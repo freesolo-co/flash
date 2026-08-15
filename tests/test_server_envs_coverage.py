@@ -1563,6 +1563,7 @@ def test_alias_thinking_verification_targets_the_mutable_alias(monkeypatch):
     assert calls[0]["thinking"] is True
     assert 0 < calls[0]["timeout_s"] <= 600.0
     assert calls[0]["expected_checkpoint"] == "run-1"
+    assert calls[0]["expected_adapter_revision"] == _SMOKE_REVISION
     assert calls[0]["retry_unavailable"] is True
     assert out["alias_thinking_tag"] is True
     assert out["alias_thinking_latency_s"] >= 0.0
@@ -1806,47 +1807,21 @@ def test_pinned_revision_smoke_alone_would_not_catch_a_silent_alias(monkeypatch)
         serving._verify_alias_thinking("run-1", spec, _SMOKE_REVISION, "run-1")
 
 
-def _fake_deployment():
-    """A deployment stub WITHOUT `adapter_revision`, matching the fakes the deploy tests use.
-
-    Deliberately bare: the skip path must not read anything off the deployment, so requiring the
-    attribute here would break every existing test whose fake predates this check.
-    """
-    return types.SimpleNamespace()
-
-
-def test_alias_thinking_verification_is_skipped_for_a_nonthinking_run(monkeypatch):
-    """A run with no reasoning channel must not pay for the check or gain a new failure mode."""
+def test_activated_alias_verification_uses_the_captured_activation_pair(monkeypatch):
     calls = []
-    monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
-        lambda **kwargs: calls.append(kwargs) or _smoke_response("The answer is 4"),
-    )
-    smoke_result = {"thinking_tag": False}
+    spec = _smoke_spec(thinking=True)
+    activation_target = (_SMOKE_REVISION, "run-1/custom-checkpoint")
+
+    def fake_verify(*args):
+        calls.append(args)
+        return {"alias_thinking_tag": True}
+
+    monkeypatch.setattr(serving, "_verify_alias_thinking", fake_verify)
+    smoke_result = {"thinking_tag": True}
+
     serving_completion._verify_activated_alias_thinking(
-        "run-1", _smoke_spec(thinking=False), _fake_deployment(), smoke_result
+        "run-1", spec, activation_target, smoke_result
     )
 
-    assert calls == []
-    assert "alias_thinking_tag" not in smoke_result
-
-
-def test_alias_thinking_verification_is_skipped_when_the_revision_never_thought(monkeypatch):
-    """Only a difference between revision and alias is the regression this check exists for.
-
-    An uncataloged model whose template omits the tag reaches here with `thinking_tag` false and
-    has already been judged by the smoke, so asking the alias could only fail it a second time for
-    a condition that is not alias reconciliation.
-    """
-    calls = []
-    monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
-        lambda **kwargs: calls.append(kwargs) or _smoke_response("The answer is 4"),
-    )
-    serving_completion._verify_activated_alias_thinking(
-        "run-1", _smoke_spec(thinking=True), _fake_deployment(), {"thinking_tag": False}
-    )
-
-    assert calls == []
+    assert calls == [("run-1", spec, _SMOKE_REVISION, "run-1/custom-checkpoint")]
+    assert smoke_result["alias_thinking_tag"] is True
