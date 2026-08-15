@@ -528,10 +528,11 @@ def _train_body(input_data: dict) -> dict:
 
             The terminal snapshot must be the LAST writer: every caller commits to the same repo
             path, so an older periodic one landing after it restores a pre-failure console over the
-            bytes that explain the failure. ``final`` therefore never yields (upload_file takes no
-            timeout, so a wedged holder would suppress it forever), periodic callers drop their
-            commit once ``console_teardown`` is set, and a terminal upload forced through without the
-            lock re-commits once it frees. Each rule is pinned by a test_serverless_*console* case.
+            bytes that explain the failure. ``final`` therefore never yields INDEFINITELY (upload_file
+            takes no timeout, so a wedged holder would suppress it forever) nor past the run wall
+            deadline, periodic callers drop their commit once ``console_teardown`` is set, and a
+            terminal upload forced through without the lock re-commits once it frees. Each rule has a
+            test_serverless_*console* case.
 
             Returns whether the tail landed: errors are swallowed, not raised, so a caller tracking
             what is stored cannot read a normal return as success and skip the retry it earned."""
@@ -542,7 +543,20 @@ def _train_body(input_data: dict) -> dict:
                 console_teardown.set()
             # per-caller scratch: sharing one .tail splices an unsynchronized final snapshot
             tail = console + (".final.tail" if final else ".tail")
-            held = console_upload_lock.acquire(timeout=120.0)
+
+            def _wait_s() -> float:
+                """Lock wait, clamped to what is left of the run wall deadline. The watchdog
+                hard-exits AT the deadline, so a terminal upload still blocked on the lock is killed
+                mid-acquire and the unsynchronized commit that could have landed in the window that
+                remained never runs; the reserve keeps room for it. Each retry re-reads the clock, so
+                the tries shrink rather than each being clamped and still summing past it. Zero polls
+                without waiting: acquire rejects a negative, and a blown deadline must still try."""
+                try:
+                    return min(120.0, max(0.0, _require_deadline_allowance() - 30.0))
+                except (TimeoutError, RuntimeError):
+                    return 0.0
+
+            held = console_upload_lock.acquire(timeout=_wait_s())
             try:
                 if not final and (console_teardown.is_set() or not held):
                     print(f"console upload skipped for {mode}; the terminal snapshot supersedes it")
@@ -554,12 +568,12 @@ def _train_body(input_data: dict) -> dict:
             # `not held`: the commit above raced a holder still inside upload_file, whose older bytes
             # can land after it. acquiring is proof that finished, so one more commit wins. the wait
             # is BOUNDED, never a retry loop: a permanently wedged holder never frees and this must
-            # still return. it is split into tries so a holder that needs longer than one timeout is
+            # still return. it is split into tries so a holder needing longer than one timeout is
             # still caught -- an HF upload recovering after ~240s otherwise lands last and restores
-            # the pre-failure console. the total is what the terminal path can afford to wait; a
-            # holder still running past it is treated as wedged and the unsynchronized commit stands.
+            # the pre-failure console. a holder past the bound is treated as wedged and the
+            # unsynchronized commit stands.
             for _ in range(3) if final and not held else ():
-                if console_upload_lock.acquire(timeout=120.0):
+                if console_upload_lock.acquire(timeout=_wait_s()):
                     try:
                         ok = _upload_console_locked(mode, console, tail, True) or ok
                     finally:

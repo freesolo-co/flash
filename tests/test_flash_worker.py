@@ -1625,6 +1625,8 @@ def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots()
         "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
         "console_upload_lock": threading.Lock(),
         "console_teardown": threading.Event(),  # not set: teardown has not begun
+        # far from the wall deadline, so the lock wait clamp is not what this test exercises.
+        "_require_deadline_allowance": lambda: 86_400.0,
         "_upload_console_locked": _upload_console_locked,
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
@@ -1697,6 +1699,8 @@ def test_serverless_terminal_console_upload_recommits_after_a_slow_holder_finish
         "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
         "console_upload_lock": lock,
         "console_teardown": threading.Event(),
+        # far from the wall deadline, so the lock wait clamp is not what this test exercises.
+        "_require_deadline_allowance": lambda: 86_400.0,
         "_upload_console_locked": _locked,
         "print": lambda *_a, **_k: None,
     }
@@ -1755,6 +1759,8 @@ def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
         "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
         "console_upload_lock": _NeverFree(),
         "console_teardown": threading.Event(),
+        # far from the wall deadline, so the per-try 120s bound is what this test measures.
+        "_require_deadline_allowance": lambda: 86_400.0,
         "_upload_console_locked": lambda mode, _c, _t, _f: uploaded.append(mode) or True,
         "print": lambda *_a, **_k: None,
     }
@@ -1773,6 +1779,95 @@ def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
     assert timeouts
     assert all(0 < t <= 120.0 for t in timeouts)
     assert sum(timeouts) <= 600.0, f"the terminal path can wait at most 600s in total: {timeouts}"
+
+
+def test_serverless_terminal_console_upload_never_waits_past_the_run_wall_deadline():
+    """The lock wait must be clamped to the time left before the watchdog hard-exits.
+
+    ``_train_body`` arms ``threading.Timer(remaining, _deadline_exit)``, and ``_deadline_exit``
+    calls ``os._exit(124)``. A fixed 120s acquire therefore does not merely wait too long: a worker
+    with less than that left is KILLED mid-acquire, so the unsynchronized commit that could have
+    finished inside the window that remained never runs at all, and the terminal snapshot -- the
+    only record of why the run failed -- is lost. That is the same loss the whole terminal path
+    exists to prevent, arriving through the fix for it.
+
+    The clock advances by each wait, exactly as a real blocking acquire consumes wall time, so this
+    also pins the TOTAL: every retry re-reads the deadline, so the tries shrink to zero instead of
+    each being individually clamped and still summing past it.
+    """
+    import ast
+    import inspect
+    import textwrap
+    import threading
+    import types
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
+    )
+
+    class _NeverFree:
+        """A wedged holder; every acquire burns its full timeout, as a real one would."""
+
+        def __init__(self, clock: dict, asked: list[float]) -> None:
+            self.clock = clock
+            self.asked = asked
+
+        def acquire(self, timeout: float) -> bool:
+            self.asked.append(timeout)
+            self.clock["t"] += timeout
+            return False
+
+        def release(self) -> None:
+            raise AssertionError("released a lock that was never acquired")
+
+    def _run(allowance, clock: dict, asked: list[float]) -> tuple[bool, list[str]]:
+        """Exec the shipped closure against one deadline model. Args are passed, not closed
+        over, so each case binds its OWN state rather than the last loop iteration's."""
+        uploaded: list[str] = []
+        namespace: dict = {
+            "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
+            "console_upload_lock": _NeverFree(clock, asked),
+            "console_teardown": threading.Event(),
+            "_upload_console_locked": lambda m, _c, _t, _f, _u=uploaded: _u.append(m) or True,
+            "print": lambda *_a, **_k: None,
+            "_require_deadline_allowance": allowance,
+        }
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+        return namespace["_upload_console"]("train", final=True), uploaded
+
+    for remaining in (5.0, 45.0, 200.0, 600.0):
+        clock: dict = {"t": 0.0}
+        asked: list[float] = []
+        # re-read per call, like the real one: it closes over time.time(). bound as defaults so
+        # this case's own clock is captured.
+        ok, uploaded = _run(lambda _r=remaining, _c=clock: _r - _c["t"], clock, asked)
+
+        assert ok is True
+        # the commit still happens -- clamping must not turn into skipping.
+        assert uploaded == ["train"], f"terminal snapshot lost with {remaining}s left: {uploaded}"
+        # nothing waited past the deadline, so the watchdog never fires mid-acquire.
+        assert clock["t"] < remaining, (
+            f"waited {clock['t']}s of {remaining}s remaining; the watchdog would have killed the "
+            f"worker mid-acquire: {asked}"
+        )
+        # acquire() rejects a negative timeout, so the clamp must floor at zero rather than pass
+        # the negative straight through and raise out of the terminal path.
+        assert all(t >= 0 for t in asked), asked
+
+    # a deadline already blown must still poll and commit, not raise out of the terminal path.
+    def _blown() -> float:
+        raise TimeoutError("run wall deadline exceeded")
+
+    asked_blown: list[float] = []
+    ok, committed = _run(_blown, {"t": 0.0}, asked_blown)
+
+    assert ok is True
+    assert committed == ["train"], "a run past its deadline must still attempt the last snapshot"
+    assert asked_blown
+    assert all(t == 0 for t in asked_blown), asked_blown
 
 
 def test_serverless_terminal_console_upload_recommits_after_two_timeouts(monkeypatch):
@@ -1831,6 +1926,8 @@ def test_serverless_terminal_console_upload_recommits_after_two_timeouts(monkeyp
             "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
             "console_upload_lock": _VerySlowHolder(frees_on, order),
             "console_teardown": threading.Event(),
+            # far from the wall deadline, so the clamp never shortens these tries.
+            "_require_deadline_allowance": lambda: 86_400.0,
             "_upload_console_locked": _commit(order),
             "print": lambda *_a, **_k: None,
         }
@@ -1874,6 +1971,8 @@ def test_serverless_periodic_console_upload_defers_once_teardown_begins():
         "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
         "console_upload_lock": threading.Lock(),  # free: only the teardown flag may defer
         "console_teardown": console_teardown,
+        # far from the wall deadline, so the lock wait clamp is not what this test exercises.
+        "_require_deadline_allowance": lambda: 86_400.0,
         "_upload_console_locked": lambda mode, _c, _t, _f: uploaded.append(mode) or True,
         "print": lambda *_a, **_k: None,
     }
