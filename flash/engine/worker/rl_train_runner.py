@@ -49,11 +49,13 @@ from flash.engine.worker.train.rl.multi_turn import (
     start_reward_server,
 )
 from flash.engine.worker.train.rl.shims import (
+    render_deferred_patch_runtime,
     render_entropy_quantile_shim,
     render_exact_save_steps_shim,
     render_image_pad_ban_shim,
     render_kl_ref_adapter_shim,
     render_per_turn_credit_shim,
+    render_rank_device_assert_shim,
     render_reentrant_checkpointing_shim,
     render_reward_module,
     render_stop_sequences_shim,
@@ -213,6 +215,12 @@ def _prepare_rl_files(inp, prompts):
     shim_markers = shim_marker_file(shim_dir)
     if os.path.exists(shim_markers):
         os.remove(shim_markers)
+    # where each rank records the gpu uuid it opened, so a collision is caught before nccl init.
+    # removed for the same reason as the marker file: a stale one from a prior attempt would show
+    # ranks claiming devices this attempt never touched, and read as a collision that is not there.
+    rank_device_claims = os.path.join(shim_dir, "rank_device_claims.txt")
+    if os.path.exists(rank_device_claims):
+        os.remove(rank_device_claims)
     return {
         "rollout_examples": rollout_examples,
         "message_prompts": message_prompts,
@@ -225,6 +233,7 @@ def _prepare_rl_files(inp, prompts):
         "shim_dir": shim_dir,
         "shim_py": os.path.join(shim_dir, "sitecustomize.py"),
         "shim_markers": shim_markers,
+        "rank_device_claims": rank_device_claims,
     }
 
 
@@ -239,6 +248,9 @@ def _write_rl_shim(inp, files) -> list[str]:
     # loaded. each feature renderer returns "" when its feature is off; the tf32 fragment is
     # unconditional, so this source is never empty.
     required_fragments = [
+        # first, so a collapsed rank->device map is reported before any other patch runs and long
+        # before the model load that currently hides it. inert at one card.
+        ("rank-device-assert", render_rank_device_assert_shim(int(inp["dp_cards"]))),
         (
             "reentrant-checkpointing",
             render_reentrant_checkpointing_shim(
@@ -273,7 +285,20 @@ def _write_rl_shim(inp, files) -> list[str]:
             # into this process there is nothing left to fix.
             render_tilelang_cudart_shim(),
             render_shim_marker_prologue(files["shim_markers"]),
-            *(wrap_shim_fragment(name, source) for name, source in required_fragments),
+            # above every wrapped fragment: each one registers with this registry rather than
+            # importing verl at startup, which is what keeps ray free to pin each rank to its own
+            # card (see train/rl/shims.render_deferred_patch_runtime). unwrapped -- it only defines
+            # the registry and touches no cuda, so there is no patch here that could fail open.
+            render_deferred_patch_runtime(),
+            # every fragment above defers its patch to the import of the module it targets, so this
+            # wrapper now spans only the registration. a marker written here would prove a callback
+            # was queued, not that the patch ran, and the parent's verify_applied_shim_markers would
+            # pass for a child training unpatched. each deferred body records its own name once the
+            # patch is actually installed.
+            *(
+                wrap_shim_fragment(name, source, record_immediately=False)
+                for name, source in required_fragments
+            ),
             # unconditional: every flash rollout is a lora rollout, and a base-model fallback is
             # indistinguishable from a working run in the metrics.
             render_lora_rollout_guard_fragment(),
@@ -444,6 +469,10 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
         shim_dir=files["shim_dir"], wandb_enabled="wandb" in loggers
     )
     env_for_verl["FLASH_VERL_REWARD_URL"] = reward_url
+    # where each rank records the gpu it opened. ray fans this env to every actor, which is what
+    # makes the file a rendezvous point: the check needs to compare ranks that have no process
+    # group yet (see render_rank_device_assert_shim).
+    env_for_verl["FLASH_RANK_DEVICE_CLAIMS"] = files["rank_device_claims"]
     # the model is prefetched above; keep the subprocess off hf's rate-limited api.
     env_for_verl["HF_HUB_OFFLINE"] = "1"
     env_for_verl["TRANSFORMERS_OFFLINE"] = "1"
