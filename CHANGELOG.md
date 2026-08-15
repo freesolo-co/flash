@@ -52,9 +52,13 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     what a real rollout group would pay.
     The end-of-run advantage-spread guard catches that only after the GPUs are paid for. An
     all-`echo` run is reported differently and more weakly, because zero is the _correct_ score for
-    the deliberate junk echo replays - what is wrong there is that no _replayable_ gold answer was
-    ever scored, which includes a real gold completion whose turns carry no text (image-only
-    content, a native tool-call turn). It stays silent when the grader was proven to separate - a
+    the deliberate junk echo replays - what is wrong there is that no gold text was ever scored,
+    which includes a real gold completion whose payload sits outside `content`: a native tool call
+    keeps its arguments in `tool_calls` and leaves `content` null. That row is a correct SFT target,
+    so it gets the opposite remedy - the warning says explicitly not to add assistant text to
+    satisfy the check, and to exercise the reward function against a sampled rollout instead, rather
+    than sending the author to corrupt a working target. It stays silent when the grader was proven
+    to separate - a
     centered scale paying gold 0.0 and junk -1.0, or a per-turn vector that separates while the
     scalar is only a placeholder - since both have a real gradient and calling them unmeasured
     would be false. Both probes behind that judgement are spent only where their answer can change
@@ -69,10 +73,16 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
     deferred final `env_reply`, so an environment that solves its task on the last allowed turn is
     not misreported. A gold answer shorter than the episode is judged at the moment it ran out
     rather than at the end: the junk the driver pads with cannot advance the environment, so the
-    final state says nothing about the reference either way. That keeps both halves honest - a
+    final state says nothing about the reference either way. Both halves stay reportable - a
     five-move solution against a twelve-turn cap on an unsolvable board (the field case, since real
-    datasets carry minimal solutions) is still reported, while a short gold answer on a working
-    environment is not blamed for the padding that followed it. The ceiling compared against is the
+    datasets carry minimal solutions) is still reported, and so is a short gold answer on a working
+    environment, because at that sampling point the two are indistinguishable: both are not-done,
+    one because it never can be and one because a real rollout would simply have continued. Rather
+    than resolve that ambiguity silently in either direction, the warning states it - a reference
+    that ran out before the cap names both explanations and puts the cheaper one first, since
+    extending a dataset row costs less than auditing termination logic that works. Only a reference
+    that covered every turn and still never finished leaves the environment as the sole
+    explanation. The ceiling compared against is the
     _effective_ one: a row setting `max_episode_turns` below the dataset-wide `max_turns` is stopped
     by its own budget, which `rollout_done` gives precedence, so measuring exhaustion against
     `max_turns` alone silenced this warning for exactly the rows whose budget is tightest.
