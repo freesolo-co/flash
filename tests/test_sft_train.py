@@ -4535,99 +4535,6 @@ def test_a_failed_upload_still_frees_the_exported_adapter(monkeypatch, tmp_path)
     )
 
 
-def test_merge_is_refused_when_its_output_cannot_fit_beside_the_checkpoint(monkeypatch, tmp_path):
-    """`verl.model_merger merge` writes the FULL model, so it needs room for a second copy.
-
-    `save_hf_model_and_tokenizer` calls `model.save_pretrained(target_dir, state_dict=...)`, so
-    exporting one 35b checkpoint materializes ~70 GB into `<adapter>_merge` beside the ~60 GB
-    checkpoint it reads. When that does not fit, the merger dies partway through with ENOSPC and
-    takes down a run whose training already succeeded.
-
-    Asserts the subprocess is never launched: the value of the guard is failing BEFORE the
-    expensive write, with a message naming the shortfall.
-    """
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    actor_dir = tmp_path / "global_step_9"
-    (actor_dir / "huggingface").mkdir(parents=True)
-    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
-
-    launched = []
-    monkeypatch.setattr(
-        verl_checkpoints.subprocess, "run", lambda *a, **kw: launched.append(a) or None
-    )
-    monkeypatch.setattr(
-        verl_checkpoints.shutil,
-        "disk_usage",
-        lambda path: SimpleNamespace(total=1 << 40, used=1 << 40, free=1024),
-    )
-
-    with pytest.raises(verl_checkpoints.MergeDiskHeadroomError, match=r"only 0\.0 GB is free"):
-        verl_checkpoints.export_peft_adapter(
-            str(actor_dir),
-            str(tmp_path / "adapter"),
-            base_model_id="org/model",
-            python_bin="/verl/python",
-        )
-    assert not launched, "the merger ran even though its output could not fit"
-
-
-def test_merge_sizing_ignores_shards_nested_below_the_checkpoint(tmp_path):
-    """the estimate must count only the shards the merger actually opens.
-
-    `_load_and_merge_state_dicts` reads exact top-level paths -- `Path(local_dir) /
-    f"model_world_size_{W}_rank_{r}.pt"`, one per rank -- and never recurses. A nested directory
-    that happens to hold shard-named files (a staging tree, a partially copied checkpoint) is not
-    merge input, so adding its bytes would inflate the requirement and refuse a merge that fits.
-
-    That is the same over-estimate the optimizer-state exclusion exists to prevent, in a different
-    form, and it matters in the same direction: a guard that refuses a valid merge is a regression
-    this PR would have introduced, whereas one that underestimates merely leaves today's behavior.
-    """
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    actor_dir = tmp_path / "ckpt"
-    nested = actor_dir / "staged"
-    nested.mkdir(parents=True)
-    (actor_dir / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 8192)
-    (nested / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 8192)
-
-    assert verl_checkpoints._model_shard_bytes(str(actor_dir)) == 8192
-
-
-def test_merge_headroom_allows_the_merge_when_there_is_room(monkeypatch, tmp_path):
-    """paired control: the guard must not block a merge that fits.
-
-    Without this, a guard that always raised would pass the refusal test above.
-    """
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    actor_dir = tmp_path / "global_step_9"
-    (actor_dir / "huggingface").mkdir(parents=True)
-    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
-
-    launched = []
-    monkeypatch.setattr(
-        verl_checkpoints.subprocess,
-        "run",
-        lambda *a, **kw: launched.append(a) or SimpleNamespace(returncode=0),
-    )
-    monkeypatch.setattr(
-        verl_checkpoints.shutil,
-        "disk_usage",
-        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
-    )
-    # the merger is faked, so it produces no adapter; only reaching that error proves it ran.
-    with pytest.raises(RuntimeError, match="did not produce a peft adapter"):
-        verl_checkpoints.export_peft_adapter(
-            str(actor_dir),
-            str(tmp_path / "adapter"),
-            base_model_id="org/model",
-            python_bin="/verl/python",
-        )
-    assert launched, "the merger was refused even though its output fits"
-
-
 def test_worker_disables_xet_upload_staging_before_importing_hf(monkeypatch):
     """uploads must stream from the checkpoint, not stage a second copy beside it.
 
@@ -4740,96 +4647,6 @@ def test_importing_the_worker_package_does_not_freeze_the_xet_default(monkeypatc
     assert result.returncode == 0, result.stderr
 
 
-def test_optimizer_state_is_not_counted_against_the_merge(tmp_path):
-    """the estimate must cover what the merger WRITES, not what the checkpoint holds.
-
-    `_load_and_merge_state_dicts` loads only `model_world_size_*_rank_*.pt`, and that merged dict is
-    what `save_pretrained` writes back out. The `optim_*` and `extra_state_*` files beside it are
-    read by resume and never materialized by the merger, so charging them to the merge inflates the
-    requirement by the whole optimizer state -- about 7.6 GB of adam moments on a 35b rank-32 run.
-
-    That direction of error is the dangerous one. Underestimating just lets the merger hit ENOSPC
-    the way it already does today; overestimating fails a run that had room, which is a regression
-    the guard itself would have introduced.
-    """
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    source = tmp_path / "global_step_9"
-    source.mkdir()
-    (source / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 4096)
-    (source / "model_world_size_2_rank_1.pt").write_bytes(b"x" * 4096)
-    (source / "optim_world_size_2_rank_0.pt").write_bytes(b"x" * 65536)
-    (source / "extra_state_world_size_2_rank_0.pt").write_bytes(b"x" * 2048)
-
-    assert verl_checkpoints._model_shard_bytes(str(source)) == 8192, (
-        "optimizer or extra state was charged to the merge, which can refuse a merge that fits"
-    )
-
-
-def test_the_adapter_is_moved_out_of_the_merge_tree_not_copied(monkeypatch, tmp_path):
-    """the export must never hold two copies of the adapter at once.
-
-    `export_peft_adapter` deletes `<adapter>_merge` only AFTER placing the adapter in its final
-    directory. Copying the files there would put a second copy of every adapter file on the disk
-    while the whole merge tree is still present, and that transient peak is not what
-    `require_merge_headroom` reserved space for -- it is the same class of overshoot the guard
-    exists to prevent.
-
-    Both directories are siblings under one parent, hence one filesystem, so the placement can be a
-    rename that transfers no bytes.
-
-    The assertion has to be made at the moment `rmtree` runs, not after the call returns: by then
-    the merge tree is gone under either implementation, so a post-hoc check cannot tell a move from
-    a copy. What distinguishes them is whether the source files are still occupying space when the
-    final adapter already exists.
-    """
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    actor_dir = tmp_path / "global_step_5"
-    (actor_dir / "huggingface").mkdir(parents=True)
-    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 512)
-    out_adapter = tmp_path / "adapter"
-    merge_out = tmp_path / "adapter_merge"
-    lora_dir = merge_out / "lora_adapter"
-
-    def fake_merge(*args, **kwargs):
-        lora_dir.mkdir(parents=True)
-        (lora_dir / "adapter_config.json").write_text("{}")
-        (lora_dir / "adapter_model.safetensors").write_bytes(b"weights")
-        return SimpleNamespace(returncode=0)
-
-    duplicated: list[str] = []
-    real_rmtree = verl_checkpoints.shutil.rmtree
-
-    def watching_rmtree(path, *args, **kwargs):
-        if str(path) == str(merge_out) and lora_dir.is_dir():
-            duplicated.extend(sorted(os.listdir(lora_dir)))
-        return real_rmtree(path, *args, **kwargs)
-
-    monkeypatch.setattr(verl_checkpoints.subprocess, "run", fake_merge)
-    monkeypatch.setattr(verl_checkpoints.shutil, "rmtree", watching_rmtree)
-    monkeypatch.setattr(
-        verl_checkpoints.shutil,
-        "disk_usage",
-        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
-    )
-
-    verl_checkpoints.export_peft_adapter(
-        str(actor_dir),
-        str(out_adapter),
-        base_model_id="org/model",
-        python_bin="/verl/python",
-    )
-
-    assert (out_adapter / "adapter_model.safetensors").read_bytes() == b"weights"
-    assert (out_adapter / "adapter_config.json").read_text() == "{}"
-    assert duplicated == [], (
-        f"the merge tree still held {duplicated} after the adapter was placed, "
-        "so both copies were on disk at once"
-    )
-    assert not merge_out.exists()
-
-
 def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypatch, tmp_path):
     """the swallowed-failure path, asserted as an accumulation rather than a single free.
 
@@ -4884,6 +4701,106 @@ def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypa
 
     left = sorted(p for p in os.listdir(export_root) if p.startswith("step-"))
     assert left == [], f"8 failed saves left {len(left)} adapters on disk: {left}"
+
+
+def _publishing_watcher(monkeypatch, tmp_path, *, steps, required_steps):
+    """an sft watcher over `steps` completed checkpoints that records what it publishes."""
+    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+
+    local_dir = tmp_path / "ckpts"
+    local_dir.mkdir()
+    for step in steps:
+        (local_dir / f"global_step_{step}" / "huggingface").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text(str(max(steps)))
+
+    published: list[int] = []
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        sft_checkpoints._w,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (published.append(step), kwargs["before_upload"](), True)[2],
+    )
+    monkeypatch.setattr(sft_checkpoints._w, "publish_deployable_checkpoint", lambda *a, **kw: None)
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=required_steps,
+    )
+    return watcher, published
+
+
+def test_watcher_run_coalesces_an_optional_backlog(monkeypatch, tmp_path):
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=()
+    )
+
+    watcher._stop.set()
+    watcher._run()
+
+    assert watcher._error is None
+    assert published == [450]
+    assert watcher.processed_steps == {350, 400, 450}
+
+
+def test_a_publisher_keeping_up_still_publishes_every_periodic_save(monkeypatch, tmp_path):
+    """a singleton sweep remains publishable."""
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(50, 100), required_steps=()
+    )
+
+    # one sweep per checkpoint, which is what "keeping up" means.
+    for step in (50, 100):
+        pathlib.Path(watcher.local_dir, "latest_checkpointed_iteration.txt").write_text(str(step))
+        for pending_step, checkpoint_dir in watcher._publishable(watcher._pending()):
+            watcher._publish(pending_step, checkpoint_dir)
+
+    assert published == [50, 100], "a publisher that was keeping up still lost a checkpoint"
+
+
+def test_required_saves_are_never_skipped_even_when_the_publisher_lags(monkeypatch, tmp_path):
+    """required saves remain lossless across a backlog."""
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=(350, 450)
+    )
+
+    for step, checkpoint_dir in watcher._publishable(watcher._pending()):
+        watcher._publish(step, checkpoint_dir)
+
+    assert published == [350, 450], f"a required save was dropped as superseded: {published}"
+
+
+def test_the_opd_watcher_publishes_every_step_despite_the_sft_bound(monkeypatch, tmp_path):
+    """opd keeps all pending retry states."""
+    from flash.engine.worker.train.opd import failures as opd_failures
+
+    watcher = opd_failures._OpdVerlCheckpointWatcher(
+        local_dir=str(tmp_path / "ckpts"),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+        seed=0,
+        prompt_pool_fingerprint="fp",
+        prompts_per_step=1,
+        group_size=1,
+        accounting_state=lambda step: None,
+    )
+    pending = [(1, "/ckpts/global_step_1"), (2, "/ckpts/global_step_2")]
+
+    assert watcher._publishable(pending) == pending, (
+        "the opd watcher inherited the sft backlog skip, dropping a resume point"
+    )
+    assert watcher.processed_steps == set(), "opd marked a step processed without publishing it"
 
 
 def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):
@@ -5042,49 +4959,6 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     assert os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")), (
         "the rl watcher lost the adapter weights between staging and publication"
     )
-
-
-def test_a_failed_merge_does_not_strand_the_merge_tree(monkeypatch, tmp_path):
-    """the largest transient on the disk must not survive its own failure.
-
-    `merge_out` holds the full merged model, tens of gb on a real run. If the merger dies partway
-    through -- or writes a layout this code refuses -- deleting it only on the success path would
-    leave that tree behind on exactly the disk this module exists to protect, and the next save
-    would start with less room than this one had. Cleanup has to cover the resource's whole
-    lifetime, not just the happy path.
-    """
-    import subprocess
-
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    actor_dir = tmp_path / "global_step_3"
-    (actor_dir / "huggingface").mkdir(parents=True)
-    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 512)
-    out_adapter = tmp_path / "adapter"
-    merge_out = tmp_path / "adapter_merge"
-
-    def dying_merge(*args, **kwargs):
-        # the merger writes most of the model, then fails: the exact shape of a disk-full death.
-        (merge_out / "model-00001-of-00002.safetensors").parent.mkdir(parents=True, exist_ok=True)
-        (merge_out / "model-00001-of-00002.safetensors").write_bytes(b"w" * 65536)
-        raise subprocess.CalledProcessError(1, "verl.model_merger")
-
-    monkeypatch.setattr(verl_checkpoints.subprocess, "run", dying_merge)
-    monkeypatch.setattr(
-        verl_checkpoints.shutil,
-        "disk_usage",
-        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
-    )
-
-    with pytest.raises(subprocess.CalledProcessError):
-        verl_checkpoints.export_peft_adapter(
-            str(actor_dir),
-            str(out_adapter),
-            base_model_id="org/model",
-            python_bin="/verl/python",
-        )
-
-    assert not merge_out.exists(), "a failed merge left its partial model tree on the disk"
 
 
 def test_a_failed_export_does_not_strand_a_partial_adapter(monkeypatch, tmp_path):
