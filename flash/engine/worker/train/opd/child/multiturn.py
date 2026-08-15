@@ -9,7 +9,7 @@ import time
 from typing import Any
 from uuid import uuid4
 
-try:  # inside the verl child, copied in beside this file
+if __name__ == "flash_opd_multiturn":
     from flash_multiturn_glue import (
         EnvGlueTokenizer,
         dedup_seam_terminator,
@@ -20,7 +20,7 @@ try:  # inside the verl child, copied in beside this file
         validate_glue_template,
         validate_transcript_messages,
     )
-except ImportError:  # in-tree (parent process, tests, lint)
+else:
     from flash.engine.worker.train.core.child.glue import (
         EnvGlueTokenizer,
         dedup_seam_terminator,

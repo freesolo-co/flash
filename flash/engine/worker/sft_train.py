@@ -321,11 +321,6 @@ def _resolve_sft_fused_ce_backend(caps):
     return fused_ce_backend(caps)
 
 
-def _append_exact_sft_dataloader_shim(shim_source: str) -> str:
-    shim_source += render_exact_sft_dataloader_shim()
-    return shim_source
-
-
 def _sft_profile_max_length(profile) -> int:
     max_length = profile.max_length
     return max_length  # noqa: RET504
@@ -355,10 +350,7 @@ from flash.engine.worker.backend_common import (  # noqa: E402,F401
     parse_verl_metric,
     parse_wandb_link,
     probe_verl_capabilities,
-    render_flash_qla_shim,
-    render_gdn_varlen_shim,
-    render_shim_marker_prologue,
-    render_wandb_link_shim,
+    render_sitecustomize_bootstrap,
     require_gdn_boundary_resets,
     resolve_verl_loggers,
     resolve_verl_python,
@@ -368,7 +360,6 @@ from flash.engine.worker.backend_common import (  # noqa: E402,F401
     strict_gdn_probe_module,
     verify_applied_shim_markers,
     verl_step_number,
-    wrap_shim_fragment,
 )
 from flash.engine.worker.entry.sft import _model_arch_dims, sft_under_ran  # noqa: E402,F401
 from flash.engine.worker.io.heartbeat import liveness_heartbeat  # noqa: E402
@@ -387,12 +378,9 @@ from flash.engine.worker.train.sft.config import (  # noqa: E402,F401
     _hydra_val,
     _optimizer_override_config,
     _render_sft_dataset_module,
-    _render_sft_sitecustomize,
     _sft_parquet_features,
     _write_sft_parquet,
     build_sft_overrides,
-    render_exact_sft_dataloader_shim,
-    render_loraplus_shim,
 )
 
 # isort: split
