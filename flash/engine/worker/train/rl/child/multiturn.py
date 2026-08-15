@@ -17,7 +17,7 @@ import urllib.request
 from typing import Any
 from uuid import uuid4
 
-try:  # inside the verl child, copied in beside this file
+if __name__ == "flash_grpo_multiturn":
     from flash_multiturn_glue import (
         EnvGlueTokenizer,
         dedup_seam_terminator,
@@ -27,7 +27,7 @@ try:  # inside the verl child, copied in beside this file
         turn_is_unusable,
         validate_transcript_messages,
     )
-except ImportError:  # in-tree (tests, lint)
+else:
     from flash.engine.worker.train.core.child.glue import (
         EnvGlueTokenizer,
         dedup_seam_terminator,

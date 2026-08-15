@@ -11,7 +11,6 @@ import asyncio
 import functools
 import hashlib
 import importlib.metadata
-import importlib.util
 import json
 import os
 from collections.abc import Callable
@@ -20,12 +19,13 @@ from typing import Any
 
 from packaging.version import Version
 
-from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
+OPD_NO_SIGNAL_ATTEMPTS = 3
+PLUGIN_LOADED_EXTERNALLY = __name__ == "flash_opd_plugin"
 
-try:
+if PLUGIN_LOADED_EXTERNALLY:
     from flash_opd_multiturn import build_flash_multi_turn_agent_loop
     from flash_opd_structured import StructuredOutputReplay, canonical_structured_spec
-except ImportError:
+else:
     from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
     from flash.engine.worker.train.opd.child.structured import (
         StructuredOutputReplay,
@@ -909,7 +909,7 @@ def main() -> None:
 # path reading an unbound global. the child then dies with `NameError: _post_json`, and since the
 # loss decorator has already registered by that point the retry reports "flash_groupwise_reverse_kl
 # is already registered" instead, which points at the wrong problem entirely.
-try:
+if PLUGIN_LOADED_EXTERNALLY:
     from flash_opd_bridge import (
         FlashTeacherBridgeError,
         _coordinate_first_mutation_notice,
@@ -932,7 +932,7 @@ try:
         _write_resample_failure_fallback,
         _write_score_delivery_failure_fallback,
     )
-except ImportError:
+else:
     from flash.engine.worker.train.opd.child.bridge import (  # noqa: F401
         FlashTeacherBridgeError,
         _coordinate_first_mutation_notice,
@@ -957,8 +957,14 @@ except ImportError:
     )
 
 
+if PLUGIN_LOADED_EXTERNALLY:
+    import flash_opd_runtime
+    import flash_verl_runtime
+
+    flash_opd_runtime.install(flash_verl_runtime.load_plugin_config("FLASH_OPD_PLUGIN_CONFIG"))
+
 if os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS"):
     _require_structured_runtime_versions()
 
-if importlib.util.find_spec("verl") is not None:
+if PLUGIN_LOADED_EXTERNALLY:
     _install_verl_extensions()
