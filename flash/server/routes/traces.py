@@ -9,7 +9,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import anyio
 import httpx
@@ -122,12 +122,36 @@ def _safe_provider_response_headers(
             # a malformed authority (`http://[broken`) makes urljoin raise. this helper runs after
             # the paid upstream call but before the trace is recorded, so letting it propagate cost
             # the caller its trace AND, on the streaming path, skipped the generator that closes the
-            # upstream response. a location that cannot be resolved is relayed unresolved instead.
+            # upstream response. a location that cannot be resolved is dropped rather than relayed.
             try:
-                safe[name] = urljoin(upstream_url, value)
+                resolved = urljoin(upstream_url, value)
             except ValueError:
-                safe[name] = value
+                continue
+            # only a location on the provider's own origin is relayed. the caller is documented to
+            # send its provider credential in `X-Freesolo-Provider-Key`, and a redirect-following
+            # client resends custom headers across origins -- redirect libraries know to strip
+            # `Authorization`, not this one -- so a provider redirect pointing elsewhere would hand
+            # that credential to the redirect target.
+            if _same_origin(resolved, upstream_url):
+                safe[name] = resolved
     return safe
+
+
+def _same_origin(candidate: str, upstream_url: str) -> bool:
+    """Whether `candidate` addresses the same scheme, host and port as the upstream call.
+
+    A downgrade from `https` to `http` is a different origin here even though the host matches: it
+    would put the relayed credential on the wire in clear text.
+    """
+    try:
+        target = urlsplit(candidate)
+        upstream = urlsplit(upstream_url)
+    except ValueError:
+        return False
+    return (
+        target.scheme.casefold() == upstream.scheme.casefold()
+        and target.netloc.casefold() == upstream.netloc.casefold()
+    )
 
 
 def _usage_tokens(payload: Any) -> tuple[int | None, int | None]:

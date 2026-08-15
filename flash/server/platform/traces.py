@@ -641,5 +641,12 @@ def _bounded_identifier(value: str | None) -> str | None:
 
     These sit outside the payload bounds and are stored even for a failed call, so an unbounded
     value is database growth an authenticated caller controls directly.
+
+    The value is also made encodable. JSON admits a lone surrogate, so `{"model": "\\ud800"}` parses
+    into a `str` that utf-8 cannot encode, and sqlite raises `UnicodeEncodeError` when it binds the
+    column -- reported as a persistence failure that DROPPED the trace, including the traces
+    recording a useful upstream error. Payload strings already pass through the same helper.
     """
-    return None if value is None else _truncate(str(value), _MAX_IDENTIFIER_LENGTH)
+    if value is None:
+        return None
+    return _truncate(_utf8_safe_text(str(value)), _MAX_IDENTIFIER_LENGTH)

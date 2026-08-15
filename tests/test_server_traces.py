@@ -2175,7 +2175,7 @@ async def test_streaming_upstream_error_records_raw_json(tmp_path, monkeypatch) 
     ("location", "expected"),
     [
         ("/v1/retry", "https://api.openai.com/v1/retry"),
-        ("https://provider.example/retry", "https://provider.example/retry"),
+        ("https://api.openai.com/v1/retry", "https://api.openai.com/v1/retry"),
     ],
     ids=["relative", "absolute"],
 )
@@ -2263,7 +2263,10 @@ def test_a_redirect_is_recorded_but_not_exported_as_a_training_target(
 
     assert response.status_code == 307
     assert response.content == redirect_body
-    assert response.headers["location"] == "https://provider.example/login"
+    # the location names a different origin from the upstream call, so it is not relayed -- see
+    # `test_a_redirect_off_the_provider_origin_is_not_relayed`. the body and status still reach the
+    # caller, which is what this test is about.
+    assert "location" not in response.headers
     assert "set-cookie" not in response.headers
     raw = _raw(trace_api)
     span = raw["records"][0]["spans"][0]
@@ -4554,7 +4557,8 @@ def test_malformed_redirect_location_does_not_abandon_the_trace() -> None:
     """`urljoin` raises on a malformed IPv6 authority, and this helper runs after the paid call.
 
     Letting it propagate cost the caller its trace and, on the streaming path, skipped the generator
-    that closes the upstream response and client.
+    that closes the upstream response and client. It is dropped rather than relayed unresolved: a
+    location that cannot be parsed cannot be shown to be on the provider's origin.
     """
     safe = traces._safe_provider_response_headers(
         {"location": "http://[broken"},
@@ -4562,7 +4566,7 @@ def test_malformed_redirect_location_does_not_abandon_the_trace() -> None:
         upstream_url="https://api.openai.com/v1/chat/completions",
     )
 
-    assert safe["location"] == "http://[broken"
+    assert "location" not in safe
     resolved = traces._safe_provider_response_headers(
         {"location": "/v2/chat"},
         status_code=302,
@@ -6619,7 +6623,10 @@ def test_a_streamed_redirect_stays_raw_even_when_recording_fails(trace_api, monk
 
     assert response.status_code == 307
     assert response.headers["content-type"].startswith("text/html")
-    assert response.headers["location"] == "https://provider.example/login"
+    # off-origin location, so it is not relayed -- see
+    # `test_a_redirect_off_the_provider_origin_is_not_relayed`. the raw body is what this test is
+    # about, and it must still arrive uncorrupted.
+    assert "location" not in response.headers
     assert "set-cookie" not in response.headers
     assert response.content == redirect_body
     assert b"freesolo-record-failed" not in response.content
@@ -10933,3 +10940,110 @@ def test_an_ordinary_schema_is_kept_whole_and_not_reported() -> None:
 
     assert len(sanitized["tools"][0]["function"]["parameters"]["$defs"]) == 25
     assert flag.hit is False
+
+
+_UPSTREAM_URL = "https://api.openai.com/v1/chat/completions"
+
+
+def _relayed_location(location: str, *, status: int = 302) -> str | None:
+    return traces._safe_provider_response_headers(
+        {"location": location}, status_code=status, upstream_url=_UPSTREAM_URL
+    ).get("location")
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://evil.example.com/collect",
+        "//evil.example.com/collect",
+        "http://api.openai.com/v1/chat",
+        "https://api.openai.com:8443/v1/chat",
+        "https://api.openai.com@evil.example.com/collect",
+    ],
+    ids=["cross-origin", "protocol-relative", "scheme-downgrade", "other-port", "userinfo-host"],
+)
+def test_a_redirect_off_the_provider_origin_is_not_relayed(location: str) -> None:
+    """The caller is documented to send its provider credential in `X-Freesolo-Provider-Key`.
+
+    Redirect-following clients strip `Authorization` across origins but do not know to strip a
+    custom header, so relaying an off-origin `Location` would hand that credential to whatever the
+    redirect names. A scheme downgrade counts as off-origin too: the host matches, but it would put
+    the same credential on the wire in clear text. Such a redirect also bypasses recording, leaving
+    only the 3xx stored while the completion happens outside the proxy.
+    """
+
+    assert _relayed_location(location) is None
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("https://api.openai.com/v2/chat", "https://api.openai.com/v2/chat"),
+        ("/v2/chat", "https://api.openai.com/v2/chat"),
+        ("completions2", "https://api.openai.com/v1/chat/completions2"),
+        ("https://API.OpenAI.com/v2/chat", "https://API.OpenAI.com/v2/chat"),
+    ],
+    ids=["absolute", "rooted", "sibling", "host-case"],
+)
+def test_a_redirect_within_the_provider_origin_is_still_relayed(
+    location: str, expected: str
+) -> None:
+    """The restriction is on origin, not on redirects: a provider moving its own endpoint still
+    reaches the caller, and a relative target still resolves against the upstream URL. Host
+    comparison is case-insensitive, as DNS is."""
+
+    assert _relayed_location(location) == expected
+
+
+def test_a_redirect_status_is_still_required_for_any_location() -> None:
+    assert _relayed_location("https://api.openai.com/v2/chat", status=200) is None
+
+
+def test_the_origin_check_does_not_disturb_other_relayed_headers() -> None:
+    safe = traces._safe_provider_response_headers(
+        {"retry-after": "3", "x-ratelimit-remaining": "9", "set-cookie": "a=b"},
+        status_code=302,
+        upstream_url=_UPSTREAM_URL,
+    )
+
+    assert safe["retry-after"] == "3"
+    assert safe["x-ratelimit-remaining"] == "9"
+    assert "set-cookie" not in safe
+
+
+def test_an_unencodable_identifier_is_normalized_rather_than_dropping_the_trace() -> None:
+    """JSON admits a lone surrogate, so `{"model": "\\ud800"}` parses into a `str` that utf-8
+    cannot encode. sqlite raises `UnicodeEncodeError` binding that column, which surfaced as a
+    persistence failure that DROPPED the whole trace -- including traces recording a useful
+    upstream error. Payload strings already pass through this normalization."""
+
+    lone_surrogate = "\ud800"
+
+    bounded = platform_traces._bounded_identifier(lone_surrogate)
+
+    assert bounded is not None
+    assert bounded != lone_surrogate
+    bounded.encode("utf-8")
+    connection = sqlite3.connect(":memory:")
+    connection.execute("create table t (model text)")
+    connection.execute("insert into t values (?)", (bounded,))
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["gpt-test", "\U0001f600", "modelo-espanol", None],
+    ids=["plain", "astral-pair", "accented", "absent"],
+)
+def test_an_encodable_identifier_is_stored_as_itself(value: str | None) -> None:
+    """A surrogate PAIR is a legal astral character, not a defect, and must survive unchanged."""
+
+    assert platform_traces._bounded_identifier(value) == value
+
+
+def test_the_identifier_length_bound_still_applies() -> None:
+    oversized = "m" * (platform_traces._MAX_IDENTIFIER_LENGTH + 500)
+
+    bounded = platform_traces._bounded_identifier(oversized)
+
+    assert bounded is not None
+    assert len(bounded) <= platform_traces._MAX_IDENTIFIER_LENGTH
