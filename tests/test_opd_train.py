@@ -5425,6 +5425,91 @@ def _config(**overrides):
     return config
 
 
+def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
+    from flash.engine.worker import opd_train_runner as runner
+
+    knobs = SimpleNamespace(
+        save_at_steps=save_at_steps,
+        save_every=save_every,
+        group_size=2,
+        stop_sequences=(),
+    )
+    request = SimpleNamespace(
+        knobs=knobs,
+        model_id="Qwen/Qwen3.5-4B",
+        model_revision="revision",
+        spec=SimpleNamespace(
+            gpu=SimpleNamespace(count=1),
+            wandb=SimpleNamespace(project=None),
+        ),
+        structured_outputs=None,
+        env=None,
+        multi_turn=False,
+        max_turns=0,
+    )
+    prompt_state = SimpleNamespace(
+        prompts=[],
+        tokenizer=object(),
+        teacher=object(),
+        thinking_prefill="",
+    )
+    workload = SimpleNamespace(
+        prompts_per_step=64,
+        update_horizon=horizon,
+        local_dir="/checkpoints",
+        prompt_pool_fingerprint="fingerprint",
+    )
+    monkeypatch.setattr(runner._opd_train, "_cached_model_path", lambda *_args: "/model")
+    monkeypatch.setattr(runner._opd_train, "resolve_verl_loggers", lambda _caps: ["console"])
+    monkeypatch.setattr(runner._opd_train._w, "wandb_run_name", lambda: "opd-test")
+    monkeypatch.setattr(runner, "_write_child_shims", lambda *_args: ("entry.py", "reward.py"))
+    monkeypatch.setattr(
+        runner._opd_train, "_restore_verl_resume", lambda *_args, **_kwargs: (0, None)
+    )
+
+    class Bridge:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(runner._opd_train, "_TeacherAlignmentBridge", Bridge)
+    return runner._materialize_child_files(
+        request,
+        prompt_state,
+        workload,
+        "/python",
+        {},
+        None,
+        (),
+    ).save_freq
+
+
+def test_opd_save_freq_clamps_to_a_short_derived_horizon(monkeypatch):
+    from flash.engine.plan.steps import on_policy_steps
+
+    horizon = on_policy_steps(epochs=1, prompt_count=800, prompts_per_step=64)
+    assert horizon == 13
+    save_freq = _materialized_opd_save_freq(
+        monkeypatch, save_at_steps=(), save_every=20, horizon=horizon
+    )
+    assert save_freq == 13
+    assert horizon % save_freq == 0
+
+
+def test_opd_save_freq_preserves_long_run_interval_and_exact_step_gcd(monkeypatch):
+    assert (
+        _materialized_opd_save_freq(monkeypatch, save_at_steps=(), save_every=15, horizon=100) == 15
+    )
+    assert (
+        _materialized_opd_save_freq(
+            monkeypatch, save_at_steps=(10, 25, 100), save_every=15, horizon=100
+        )
+        == 5
+    )
+
+
 def test_sitecustomize_saves_only_exact_required_steps(monkeypatch):
     saved = []
 
