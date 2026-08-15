@@ -1338,9 +1338,9 @@ def _save_steps_inputs(monkeypatch, *, save_at_steps=None, save_every=None, max_
 
 
 def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
-    # verl only saves when global_step % save_freq == 0, so it cannot hit an arbitrary set directly.
-    # the gcd is the largest interval every required step divides, so verl writes a superset of the
-    # checkpoints and the uploader publishes deployables at exactly the requested ones.
+    # periodic saves land only when global_step % save_freq == 0, so they cannot hit an arbitrary set
+    # directly. the gcd is the largest interval every required step divides, so verl writes a superset
+    # of the checkpoints and the uploader publishes deployables at exactly the requested ones.
     inp = _save_steps_inputs(monkeypatch, save_at_steps=(10, 25, 100))
     assert inp["save_freq"] == 5
     assert inp["save_at_steps"] == (10, 25, 100)
@@ -1349,10 +1349,22 @@ def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
 
 
 def test_save_freq_falls_back_to_save_every_without_exact_steps(monkeypatch):
-    # no exact steps: periodic saves are preserved on the customer's own interval.
+    # a long run preserves the customer's interval, so the clamp never increases normal frequency.
     inp = _save_steps_inputs(monkeypatch, save_every=15)
+    assert inp["steps"] == 100
     assert inp["save_freq"] == 15
     assert inp["save_at_steps"] == ()
+
+
+def test_short_derived_horizon_clamps_save_freq_to_the_final_step(monkeypatch):
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(example_count=800),
+        train={"max_examples": 800, "epochs": 1, "prompts_per_step": 64},
+    )
+    assert inp["steps"] == 13
+    assert inp["save_freq"] == 13
+    assert inp["steps"] % inp["save_freq"] == 0
 
 
 def test_save_steps_reach_the_horizon_they_were_validated_against(monkeypatch):
@@ -4043,7 +4055,7 @@ def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
 # each test pins one rejection message so deleting a guard cannot pass via another raise.
 
 
-def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
+def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None, example_count=8):
     """a minimal single-turn text env, optionally flipped to a shape verl grpo handles differently.
 
     ``image_uri`` must be a source the normalizer accepts offline (a data uri): a remote https url
@@ -4060,7 +4072,7 @@ def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
             self.max_turns = 3 if multi_turn else 0
 
         def dataset(self):
-            return [{"index": i} for i in range(8)]
+            return [{"index": i} for i in range(example_count)]
 
         # the four calls the multi-turn bridge drives an env through. defined unconditionally so a
         # test can delete one and assert the capability gate catches it.
@@ -6090,7 +6102,7 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     # sealed on the new-step branch, and BEFORE the preview reads the published rows so the logged
     # sample and the heartbeat describe the same generation.
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = int(m.group(1))') :]
+    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = step_number') :]
     assert 'reward_runtime.observability.close_generation(progress["step"])' in stdout_loop
     assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
         'samp = reward_runtime.observability.latest_for_step(progress["step"])'
@@ -6822,6 +6834,9 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
         "stop-sequences",
         "exact-save-steps",
         "kl-ref-adapter",
+        # unconditional: every flash rollout is a lora rollout, so there is no configuration in
+        # which a base-model fallback is the intended behavior.
+        "lora-rollout-guard",
     ]
     source = Path(files["shim_py"]).read_text()
     # the wrap indents whole fragments into try blocks; a syntax slip would turn the child's
@@ -6829,6 +6844,9 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
     compile(source, "sitecustomize.py", "exec")
     for name in expected:
         assert f"_flash_record_applied_shim({name!r})" in source
+    # the canonical fragment records once through its deferred hook, never at wrapper startup.
+    assert source.count("_flash_record_applied_shim('lora-rollout-guard')") == 1
+    assert "_flash_lora_rollout_guard_applied()" in source
     assert "per-turn-credit" not in source
     # tf32 stays first and unwrapped: it swallows its own failures by design and a later fragment
     # that raised must not be able to cost the run its tensor-core throughput.
@@ -6850,7 +6868,7 @@ def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
     provably finished (fragments print while later ones are still applying, so the first OUTPUT
     line would race the file). a missing marker there means the child trains unpatched."""
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    step_at = stdout_loop.index('progress["step"] = int(m.group(1))')
+    step_at = stdout_loop.index("step_number = verl_step_number(line)")
     verify_at = stdout_loop.index("verify_applied_shim_markers(shim_markers, expected_shims)")
     assert step_at < verify_at < stdout_loop.index("close_generation")
     # and the entry point wires the files dict (marker path + expected set) into both the loop
