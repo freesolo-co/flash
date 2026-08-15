@@ -977,6 +977,81 @@ def test_the_rl_projection_reads_the_step_from_the_shared_gate():
     assert contaminated["wall_deadline_at_risk"] is True  # the false warning
 
 
+def test_a_validation_pass_is_not_charged_to_the_step_that_follows_it():
+    """verl reprints the current step for a validation pass, and that line carries no train metric.
+
+    `parse_verl_step_metrics` returns None for it BY DESIGN: it holds only val-* fields and must not
+    displace the step's training row. RL timed its clock off that parse, so the one line the clock's
+    reprint rule exists to catch never reached the clock -- and the validation pass stayed inside the
+    next optimizer interval, published as what a step costs. SFT and OPD never had this: they are
+    dispatched from `verl_step_number` by run_verl_training, which is the same gate this now uses.
+    """
+    import ast
+    from pathlib import Path
+
+    import flash
+    from flash.engine.worker.verl.child_io import parse_verl_step_metrics, verl_step_number
+
+    train = "step:{n} - critic/rewards/mean:0.4 actor/grad_norm:1.1"
+    validation = "step:{n} - val-core/openai/gsm8k/reward/mean@1:0.73"
+
+    # the premise: the validation line IS a step boundary but carries no renderable row.
+    assert verl_step_number(validation.format(n=5)) == 5
+    assert parse_verl_step_metrics(validation.format(n=5)) is None
+    assert parse_verl_step_metrics(train.format(n=5)) is not None
+
+    # step 5 completes at t=100, its validation pass runs for 60s, step 6 costs the same 100s as
+    # every other step. the interval that must be published is 100, not the 160 that swallows it.
+    timeline = [(0.0, train.format(n=4)), (100.0, train.format(n=5))]
+    timeline += [(160.0, validation.format(n=5)), (260.0, train.format(n=6))]
+
+    def replay(*, gate_on_metrics: bool) -> list[float]:
+        clock = step_timing.StepClock()
+        for arrival, line in timeline:
+            if gate_on_metrics:
+                # the old wiring: only a line that parses a metrics row reaches the clock.
+                metrics = parse_verl_step_metrics(line)
+                if metrics is not None:
+                    clock.record(arrival, metrics.get("step"))
+            else:
+                step = verl_step_number(line)
+                if step is not None:
+                    clock.record(arrival, step)
+        return clock.intervals()
+
+    assert replay(gate_on_metrics=False) == [100.0, 100.0]
+    # and the wiring this replaces really did charge the validation pass to the next step.
+    assert replay(gate_on_metrics=True) == [100.0, 160.0]
+
+    # the production path uses the gate. asserted on the source because driving _execute_rl_child
+    # needs a live verl child: the clock call must sit under the `verl_step_number` branch, and
+    # `_ingest_step_metrics` -- which is reached only when a metrics row parses -- must not time.
+    worker = Path(flash.__file__).parent / "engine" / "worker"
+    tree = ast.parse((worker / "rl_train_runner.py").read_text())
+    ingest = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_ingest_step_metrics"
+    )
+    assert "step_clock.record" not in ast.unparse(ingest), (
+        "the RL clock is gated on the metrics parse again, so a validation reprint is invisible "
+        "to it and the next interval absorbs the whole validation pass"
+    )
+    child = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_execute_rl_child"
+    )
+    timed_under_the_gate = [
+        node
+        for node in ast.walk(child)
+        if isinstance(node, ast.If)
+        and "parsed_step is not None" in ast.unparse(node.test)
+        and "step_clock.record" in ast.unparse(node)
+    ]
+    assert timed_under_the_gate, "the RL clock is no longer driven by the shared step gate"
+
+
 def test_the_child_stream_heartbeat_is_timed_like_the_step_one():
     """Both uploads run inside run_verl_training's reader loop, so both defer the next timestamp.
 

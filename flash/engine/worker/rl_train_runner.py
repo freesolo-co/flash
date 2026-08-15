@@ -507,7 +507,6 @@ def _ingest_step_metrics(
     sent_first_metrics = state.sent_first_metrics
     step_metrics = parse_verl_step_metrics(line)
     if step_metrics is not None:
-        state.step_clock.record(time.monotonic(), step_metrics.get("step"))
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]
@@ -600,6 +599,15 @@ def _execute_rl_child(
             parsed_step = verl_step_number(line)
             if parsed_step is not None:
                 progress["step"] = parsed_step
+                # timed off the SHARED gate, like SFT's and OPD's on_step, rather than off the
+                # metrics parse below. verl tags a validation pass with the step it just finished,
+                # and `parse_verl_step_metrics` returns None for that line by design -- it carries
+                # only val-* fields and must not displace the step's training row. Gating the clock
+                # on it too meant the reprint the clock exists to exclude never reached the clock on
+                # RL: the validation pass stayed inside the next optimizer interval and was
+                # published as what a step costs. That is the same class of error as counting
+                # warmup, and `record` already holds the rule -- it just has to see the line.
+                state.step_clock.record(time.monotonic(), parsed_step)
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
                 # flash patch at all, so fail now rather than after the whole run is paid for. not
