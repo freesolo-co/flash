@@ -29,6 +29,25 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- A wedged training run now fails in minutes with a named cause instead of holding a paid GPU
+  until the provider's generic no-progress timer fires. The worker already counted heartbeat
+  ticks with no new child output and published `child_tail_silent_ticks`, but nothing consumed
+  it, and the signal could not have worked if it had: a wedged child is not silent (a verl
+  TransferQueue timer reprints one frozen line every ~5 minutes), so the counter reset forever and
+  never climbed past single digits on runs that were already dead. Repeated identical lines no
+  longer count as output, silence is measured on every step rather than only before the first,
+  and the sample is taken on a thread that never uploads so a stuck HF commit cannot freeze the
+  verdict. Healthy quiet is protected on both training paths: OPD resets on each completed teacher
+  interaction, GRPO on parent-side reward grading, and both report a call still in flight so one
+  long batched scoring call cannot read as a wedge.
+
+- The root cause of the OPD wedge itself: a rollout that hard-exits inside a Ray agent-loop actor
+  wrote neither the `finished` nor the `failure` marker its prompt needed, so the trainer's
+  replay-buffer `sample()` polled a `running` status no living worker could ever clear. The
+  rollout now records the failure before exiting, the wait is bounded by an actor-liveness probe
+  and a no-progress deadline, and the dying actor leaves a durable record so the run reports which
+  teacher or template failure killed it rather than a bare non-zero exit.
+
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
   `flash`. On a host where `runpod-flash` owns the `flash` script, the printed
