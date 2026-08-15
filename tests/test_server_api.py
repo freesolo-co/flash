@@ -8359,7 +8359,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "algorithm": "grpo",
         "environment": {"path": "/legacy/local/env"},
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": ["not-a-gpu", "RTX 5090"]},
+        "gpu": {"type": "RTX 5090"},
         "run_id": "bad-1",
     }
     # Run #2: a valid no-handle spec — must still be recovered (resubmitted) despite run #1.
@@ -8395,17 +8395,12 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     # registered its uniquely-named RunPod endpoint before crashing, which the no-op RunPod
     # `sweep_orphans` won't reap. recover_runs must instead derive the endpoint name from the
     # RAW persisted status (gpu.type + run_id, no spec parse) and `terminate_endpoint` it.
-    attempted = []
     terminated = []
-
-    def fake_terminate(gpu_type, run_id=None):
-        attempted.append((gpu_type, run_id))
-        if gpu_type == "not-a-gpu":
-            raise ValueError("malformed gpu")
-        terminated.append((gpu_type, run_id))
-        return []
-
-    monkeypatch.setattr(runpod_train, "terminate_endpoint", fake_terminate)
+    monkeypatch.setattr(
+        runpod_train,
+        "terminate_endpoint",
+        lambda gpu_type, run_id=None: terminated.append((gpu_type, run_id)) or [],
+    )
 
     # The orphan sweep must still run after the loop. recover_runs resolves it via a
     # function-local `from flash.providers import configured_providers`, so patch the
@@ -8456,9 +8451,9 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     # endpoint must still be torn down -- derived from the RAW persisted gpu.type + run_id,
     # not from a JobSpec -- so a crash that registered an endpoint before persisting a handle
     # can't leak it (RunPod's `sweep_orphans` is a no-op and would never catch it).
-    assert attempted == [("not-a-gpu", "bad-1"), ("RTX 5090", "bad-1")]
     assert ("RTX 5090", "bad-1") in terminated, (
-        "a malformed GPU entry must not prevent cleanup from reaching a valid fallback endpoint"
+        "a malformed-spec run's endpoint must be GC'd by reconstructed name (raw gpu.type + "
+        "run_id), since its spec can't be parsed and the RunPod orphan sweep is a no-op"
     )
 
 

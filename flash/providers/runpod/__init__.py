@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 from flash.providers._lifecycle.deadline import deadline_kwargs
@@ -14,6 +15,16 @@ from flash.providers.base import (
     Provider,
     rentable_gpu_counts,
 )
+
+
+def terminate_persisted_endpoints(spec: Any, run_id: str) -> None:
+    """Best-effort teardown for every GPU class named by a raw persisted spec."""
+    from flash.core.spec import persisted_gpu_types
+    from flash.providers.runpod.serverless import terminate_endpoint
+
+    for gpu_type in persisted_gpu_types(spec):
+        with contextlib.suppress(Exception):
+            terminate_endpoint(gpu_type, run_id)
 
 
 class RunpodProvider:
@@ -190,7 +201,7 @@ class RunpodProvider:
         from flash.providers.runpod.serverless import terminate_endpoint
 
         # every acceptable class, not just the head: allocation ranks a multi-class pin on cost and
-        # may rent a fallback, whose endpoint name is derived from THAT class. matching is by name,
+        # may rent a fallback, whose endpoint name is derived from that class. matching is by name,
         # so naming a class this run never rented is a no-op.
         for gpu_type in spec.gpu.acceptable_types:
             terminate_endpoint(gpu_type, spec.run_id)

@@ -234,6 +234,10 @@ class CapacityLookupError(RuntimeError):
     """
 
 
+class CapacityUnavailableError(CapacityLookupError):
+    """A live provider answered successfully but currently offers no fitting capacity."""
+
+
 class UnreconciledCreateError(RuntimeError):
     """An ambiguous non-idempotent create could not be reconciled.
 
@@ -846,10 +850,6 @@ class AllocationConstraints:
 
     disk_gb: float = 0.0
     max_wall_seconds: float = 0.0
-    # One class to narrow the market query to, or empty for an unrestricted search. Set only when
-    # exactly one class is acceptable: a provider treats it as "nothing else can win", which is
-    # false for a multi-class pin. The allocator's own filter in `_gather_candidates` is what
-    # enforces the acceptable set — this field is only a query hint.
     gpu_type: str = ""
     # Whole-run fit floor before the allocator reduces it to a per-card market query. Capacity-aware
     # providers use this to distinguish a missing rentable shape from a sold-out one.

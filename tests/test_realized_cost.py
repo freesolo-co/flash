@@ -149,6 +149,28 @@ def test_reconcile_run_reports_and_persists(monkeypatch):
     assert updates["reconciled_at"] == now
 
 
+def test_reconcile_run_reports_the_selected_fallback_without_allocated_gpu(monkeypatch):
+    status = _status(
+        run_id="r-fallback",
+        spec={"gpu": {"type": ["RTX 5090", "A100 PCIe"]}},
+        effective_preparation={"worker_spec": {"gpu": {"type": "A100 PCIe"}}},
+        remote={"provider": "runpod", "endpoint_id": "ep-fallback"},
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "realized_cost_for_remote",
+        lambda remote, **kw: realized.RealizedCost(
+            provider="runpod", realized_usd=1.0, by_resource={"gpu": 1.0}
+        ),
+    )
+    posted: dict = {}
+    monkeypatch.setattr(reconcile, "_report", lambda body: posted.update(body) or True)
+    monkeypatch.setattr(runner, "record_realized_cost", lambda *args, **kwargs: None)
+
+    assert reconcile.reconcile_run(status, now=1_000_000.0) is True
+    assert posted["gpu"] == "A100 PCIe"
+
+
 def test_instance_realized_cost_bills_launch_to_run_end_not_padded_end():
     """Instance providers bill flat $/hr over launch->run_end; the settle-padded billing `end`
     (used only for RunPod's invoice query) must NOT inflate their wall."""

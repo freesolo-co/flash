@@ -119,12 +119,7 @@ def _validated_gpu_type(value: Any, *, field_name: str) -> str:
 
 
 def _validated_gpu_type_fallbacks(value: Any, *, head: str) -> tuple[str, ...]:
-    """Canonicalize the alternatives after `gpu.type`, preserving authored order.
-
-    Duplicates are dropped rather than rejected: the same class named twice asks for nothing the
-    first entry did not already ask for, and allocation walks a set. The FIRST occurrence is kept,
-    so the authored order is stable for the callers that need one class to name.
-    """
+    """Canonicalize and deduplicate fallback classes in authored order."""
     if value is None:
         return ()
     if isinstance(value, str) or not isinstance(value, (list, tuple)):
@@ -141,14 +136,7 @@ def _validated_gpu_type_fallbacks(value: Any, *, head: str) -> tuple[str, ...]:
 
 
 def _parse_persisted_gpu_types(gpu: dict) -> tuple[str, tuple[str, ...]]:
-    """Read a persisted `[gpu]` mapping into the concrete head plus its ordered alternatives.
-
-    `type` arrives in EITHER spelling here, and both have to work. This is the reader of
-    ``to_dict()``, which re-folds an ordered pin back into the authored list so a resubmitted payload
-    round-trips; it is also the reader of a persisted ``status.spec``, which the runner reloads on
-    roughly twenty paths. Accepting only the split form would crash every ordered run on its first
-    status reload, and accepting only the list form would break the split.
-    """
+    """Read either public list form or internal head-plus-fallback form."""
     gpu_type_raw = gpu.get("type", "")
     extra_types: tuple = ()
     if isinstance(gpu_type_raw, (list, tuple)):
@@ -156,50 +144,51 @@ def _parse_persisted_gpu_types(gpu: dict) -> tuple[str, tuple[str, ...]]:
         if not authored:
             raise ValueError("gpu.type list must name at least one gpu")
         gpu_type_raw, extra_types = authored[0], tuple(authored[1:])
-        if gpu.get("type_fallbacks"):
+        if "type_fallbacks" in gpu:
             raise ValueError("gpu.type list and gpu.type_fallbacks cannot both be set")
     if not isinstance(gpu_type_raw, str):
         raise TypeError("gpu.type must be a string")
     gpu_type = (
         _validated_gpu_type(gpu_type_raw, field_name="gpu.type") if gpu_type_raw.strip() else ""
     )
-    # every entry is canonicalized and validated exactly like the head: a persisted record is re-read
-    # here on every recovery hop, and an unvalidated fallback would only fail once allocation
-    # reached it.
     return gpu_type, _validated_gpu_type_fallbacks(
         extra_types or gpu.get("type_fallbacks", ()), head=gpu_type
     )
 
 
-def persisted_gpu_types(spec: dict[str, Any] | None) -> tuple[str, ...]:
-    """Every GPU class a persisted spec finds acceptable, in authored order, without parsing it.
-
-    For the callers that CANNOT go through ``JobSpec.from_dict``, because they run when the record
-    may already be unparseable: endpoint teardown after a parse failure, the idle reaper walking
-    every stored run, billing on a stale record. ``to_dict()`` writes an ordered pin as
-    ``gpu.type = ["A100 PCIe", "A100 SXM"]``, and handing that list to ``canonical_gpu`` raises
-    ``AttributeError: 'list' object has no attribute 'strip'``. Those sites suppress exceptions to
-    protect their caller, so the failure is silent and a paid endpoint is never torn down.
-
-    Total over malformed input: a raise here would reintroduce that silent skip.
-    """
-    gpu = (spec or {}).get("gpu")
+def persisted_gpu_types(spec: Any) -> tuple[str, ...]:
+    """Read acceptable GPU classes from a raw persisted spec without raising."""
+    if not isinstance(spec, dict):
+        return ()
+    gpu = spec.get("gpu")
     raw = gpu.get("type") if isinstance(gpu, dict) else None
     if isinstance(raw, str):
-        raw = [raw]
+        raw = (raw,)
     elif not isinstance(raw, (list, tuple)):
         return ()
     return tuple(dict.fromkeys(entry for entry in raw if isinstance(entry, str) and entry))
 
 
-def persisted_gpu_head(spec: dict[str, Any] | None) -> str:
-    """First acceptable class for scalar reporting before allocation records the winner.
-
-    Exact for scalar pins. Ordered pins are cost-ranked, so callers must prefer
-    ``remote.allocated_gpu`` and use this only while no allocated class exists.
-    """
+def persisted_gpu_head(spec: Any) -> str:
+    """First acceptable class from a raw persisted spec, or an empty string."""
     types = persisted_gpu_types(spec)
     return types[0] if types else ""
+
+
+def attributed_gpu_type(status: Any) -> str:
+    """GPU class actually selected for a raw run status, or its authored head."""
+
+    def field(name: str) -> Any:
+        return status.get(name) if isinstance(status, dict) else getattr(status, name, None)
+
+    remote = field("remote")
+    allocated = remote.get("allocated_gpu") if isinstance(remote, dict) else None
+    if isinstance(allocated, str) and allocated:
+        return allocated
+    preparation = field("effective_preparation")
+    worker_spec = preparation.get("worker_spec") if isinstance(preparation, dict) else None
+    selected = persisted_gpu_head(worker_spec)
+    return selected or persisted_gpu_head(field("spec"))
 
 
 def _opt_int(value: Any) -> int | None:
@@ -463,9 +452,7 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
-    # empty selects managed auto-allocation; a set value restricts allocation to `acceptable_types`
-    # (this class plus `type_fallbacks`), which compete on cost rather than authored order. a lone
-    # `type` is therefore a hard pin to exactly that class, unchanged.
+    # empty selects managed allocation; acceptable types compete on cost.
     type: str = ""
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
@@ -478,9 +465,7 @@ class GpuSpec:
     # number of cards of `type` a single training worker occupies (1..8). count > 1 provisions a
     # multi-gpu pod; the training loop shards across them in the sft/opd multi-gpu paths.
     count: int = 1
-    # the authored alternatives AFTER `type`, when `[gpu] type` was written as an ordered list.
-    # `type` stays a single concrete class because every worker, provider submit path, and endpoint
-    # name reads it as one; only allocation looks at the wider set. empty for a scalar pin.
+    # authored alternatives after the concrete head class.
     type_fallbacks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -507,12 +492,7 @@ class GpuSpec:
 
     @property
     def acceptable_types(self) -> tuple[str, ...]:
-        """Classes allocation may rent, in authored order; empty means auto-allocate.
-
-        The single source of "what did the author pin", so a caller never has to remember to union
-        `type` with `type_fallbacks` and accidentally narrow the list back to its head. Order does
-        not rank the classes -- they compete on cost -- it only fixes which one gets named first.
-        """
+        """Classes allocation may rent, in authored order."""
         return (self.type, *self.type_fallbacks) if self.type else ()
 
 
@@ -701,9 +681,7 @@ class JobSpec:
         gpu = data["gpu"]
         for managed in MANAGED_GPU_KEYS:
             gpu.pop(managed, None)
-        # an ordered pin round-trips in the AUTHORED spelling -- `type` is the list, and the derived
-        # head/fallbacks split does not appear. the public parser owns that split and rejects
-        # `type_fallbacks` as unauthorable, so emitting it would fail the resubmit round trip.
+        # restore the public list spelling for an ordered pin.
         fallbacks = gpu.pop("type_fallbacks", ())
         if fallbacks:
             gpu["type"] = [gpu["type"], *fallbacks]
@@ -724,10 +702,7 @@ class JobSpec:
         # without serializing it into an explicit empty preference, which every parser rejects.
         if not data["gpu"].get("providers"):
             data["gpu"].pop("providers", None)
-        # same rule for the fallbacks, and it is also what keeps a pre-upgrade preparation digest
-        # valid: those snapshots were hashed before this key existed, so emitting an empty one for
-        # every single-class pin would fail integrity validation on the first recovery after the
-        # upgrade. an ordered pin is non-empty and stays bound, so tampering is still caught.
+        # omit an empty field to preserve existing preparation digests.
         if not data["gpu"].get("type_fallbacks"):
             data["gpu"].pop("type_fallbacks", None)
         return data
@@ -788,9 +763,7 @@ class JobSpec:
 
             if provider and provider not in PROVIDER_NAMES:
                 raise ValueError(f"unknown gpu.provider {provider!r}")
-            # every acceptable class has to be provisionable by the pinned provider, not just the
-            # head: a fallback the provider cannot carry is dead weight that would silently narrow
-            # the list back to one class at allocation time.
+            # a hard provider pin must carry every acceptable class.
             for candidate in (gpu_type, *gpu_type_fallbacks):
                 if candidate and provider and provider not in providers_for(candidate):
                     raise ValueError(

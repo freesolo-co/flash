@@ -1075,12 +1075,6 @@ def test_record_training_run_posts_to_backend(monkeypatch):
 
 
 def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
-    """An ordered pin may rent a fallback, so the registry must read `allocated_gpu` first.
-
-    The allocator ranks the acceptable classes on cost-per-step, not authored order, so the head is
-    a preference and not a prediction. Reporting it once a different class is running misattributes
-    every status report for that run.
-    """
     from flash.runner import RunStatus
     from flash.server.domain import run_registry
 
@@ -1112,20 +1106,19 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
     }
     context = {"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"}
 
-    # allocation has landed on the SECOND acceptable class: that is what must be reported.
+    # terminal persistence clears the remote, so the effective worker spec retains the selected class.
     run_registry.record_training_run(
         status=RunStatus(
             run_id="flash-1",
-            state="running",
+            state="cancelled",
             spec=spec,
-            remote={"allocated_gpu": "A100 SXM"},
+            effective_preparation={"worker_spec": {"gpu": {"type": "A100 SXM"}}},
             platform_context=context,
         )
     )
     assert json.loads(seen["body"])["gpuType"] == "A100 SXM"
 
-    # before allocation stamps one, the authored head is the only thing available -- and the list
-    # spelling must not degrade to a null, which is what drops GPU attribution on queued reports.
+    # before allocation, the authored head remains the best available attribution.
     run_registry.record_training_run(
         status=RunStatus(
             run_id="flash-1",

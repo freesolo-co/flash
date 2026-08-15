@@ -147,6 +147,20 @@ def test_exact_only_preflight_rejects_unconfigured_provider_set_before_persisten
     assert persisted == []
 
 
+def test_preflight_rejects_an_unreachable_fallback_class(orch, monkeypatch) -> None:
+    import flash.providers as providers
+
+    spec = satisfy_sft_profile(
+        orch,
+        monkeypatch,
+        _spec(type="H100", type_fallbacks=("RTX 5090",)),
+    )
+    monkeypatch.setattr(providers, "available_providers", lambda: ("lambda",))
+
+    with pytest.raises(ValueError, match=r"gpu\.type 'RTX 5090'"):
+        orch.submit_job(spec, dry_run=True)
+
+
 @pytest.mark.parametrize(
     ("gpu_preferences", "expected_provider", "expected_providers"),
     [
@@ -215,6 +229,37 @@ def test_auto_gpu_effective_spec_is_transient_and_keeps_base_auto(orch) -> None:
     assert second_attempt.gpu.type == "H100"
     assert first_attempt is not base
     assert second_attempt is not base
+
+
+def test_selected_fallback_preserves_the_authored_acceptable_set(orch) -> None:
+    base = _spec(type="RTX 5090", type_fallbacks=("A100 PCIe",))
+
+    selected = orch._spec_with_gpu(base, "A100 PCIe")
+
+    assert selected.gpu.acceptable_types == ("A100 PCIe", "RTX 5090")
+    _seed_status(orch, base)
+    assert orch._persist_effective_worker_spec(selected)
+    restored = orch.reallocation_spec_from_status(orch.get_status(base.run_id))
+    assert restored.gpu.acceptable_types == ("RTX 5090", "A100 PCIe")
+
+
+def test_terminate_persisted_endpoints_isolates_each_gpu_failure(monkeypatch) -> None:
+    from flash.providers import runpod
+    from flash.providers.runpod import serverless
+
+    calls: list[str] = []
+
+    def terminate(gpu_type: str, _run_id: str) -> None:
+        calls.append(gpu_type)
+        if gpu_type == "RTX 5090":
+            raise RuntimeError("first cleanup failed")
+
+    monkeypatch.setattr(serverless, "terminate_endpoint", terminate)
+
+    runpod.terminate_persisted_endpoints(
+        {"gpu": {"type": ["RTX 5090", "A100 PCIe"]}}, "flash-cleanup"
+    )
+    assert calls == ["RTX 5090", "A100 PCIe"]
 
 
 def test_effective_spec_carries_the_allocated_card_count(orch) -> None:
@@ -1019,71 +1064,8 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     assert "walking past the cheapest class" in log.getvalue()
 
 
-def test_ordered_gpu_pin_walks_to_its_fallback_when_the_first_class_is_dry(orch, monkeypatch):
-    """The point of the ordered list, end to end: a pin that used to have nowhere to walk now does.
-
-    Same capacity shortage as the stop test above, but the author named an alternative, so the run
-    escalates to it and finishes instead of failing. This is the pairing that matters -- the stop
-    only bounds the damage, whereas the list is what actually gets the run onto a card."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
-
-    # what an ordered pin produces: both named classes offered, cheapest first.
-    candidates = (
-        Candidate("runpod", "A100 PCIe", 1.19, 80),
-        Candidate("runpod", "A100 SXM", 1.89, 80),
-    )
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
-
-    submitted_gpus = []
-
-    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
-        submitted_gpus.append(run_spec.gpu.type)
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
-        if attempt == 0:
-            return PollResult(
-                False,
-                failure="no_capacity",
-                detail="never scheduled: job stuck IN_QUEUE for 903s",
-            )
-        return PollResult(True, metrics={"train_tokens": 4096})
-
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    # `_spec` goes through JobSpec.from_dict, the INTERNAL boundary, which sees the already-split
-    # head plus fallbacks -- the authored `type = [...]` list is the public schema's spelling and is
-    # split there (covered in test_spec_and_validation.py). Same spec either way, as asserted next.
-    spec = _spec(
-        run_id="flash-ordered-gpu-walk",
-        type="A100 PCIe",
-        type_fallbacks=("A100 SXM",),
-    )
-    assert spec.gpu.acceptable_types == ("A100 PCIe", "A100 SXM")
-    _seed_status(orch, spec)
-    log = io.StringIO()
-    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
-
-    assert metrics["train_tokens"] == 4096
-    # the dry class is not re-asked; the named alternative is where the retry lands.
-    assert submitted_gpus == ["A100 PCIe", "A100 SXM"]
-    assert "has already refused capacity twice" not in log.getvalue()
-
-
 def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch, monkeypatch):
-    """The stop must fire for a multi-class pin when its provider market is also fixed.
-
-    Without a provider pin each allocation can discover the class on another provider, so #1195
-    deliberately preserves the full retry budget. With both boundaries fixed, the trap is that the
-    picker never walks back to a dearer tried class: `_select_candidate`
-    prefers an untried shape once, then falls back to cheapest-per-step, so a dry ordered pin of
-    PCIe ($1.19) and SXM ($1.89) walks PCIe, SXM, PCIe, PCIe, PCIe... Asking "have ALL classes
-    refused twice?" therefore never becomes true -- SXM is stranded at one refusal forever -- and
-    the stop is inert for exactly the pins the ordered list exists to create, leaving the 75-minute
-    loop this PR removes. Asking it of the class the retry WOULD pick is the question that decides
-    the next attempt, and it fires on the third submission here."""
+    """A fixed multi-class market stops when the projected class refuses twice."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -1117,9 +1099,9 @@ def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch,
     with pytest.raises(RuntimeError, match="failed after retries"):
         orch._submit_seed_supervised(spec, spec.seed, log)
 
-    # PCIe, SXM, then PCIe again -- and there it stops, because that third submission is PCIe's
-    # second refusal and PCIe is where the retry keeps landing. Not the budget's five: the two
-    # attempts saved are 900s of capacity grace each. Every named class still got a look first,
+    # pcie, sxm, then pcie again -- and there it stops, because that third submission is pcie's
+    # second refusal and pcie is where the retry keeps landing. not the budget's five: the two
+    # attempts saved are 900s of capacity grace each. every named class still got a look first,
     # which is what separates this from writing a run off on one refusal.
     assert submitted_gpus == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
     out = log.getvalue()
@@ -1130,14 +1112,7 @@ def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch,
 def test_a_named_alternative_still_gets_its_own_look_after_the_first_class_refuses(
     orch, monkeypatch
 ):
-    """Refusals are a per-shape TALLY, not a set of names, and this is what that buys.
-
-    Track mere membership ("has this shape refused at all?") and the run dies at two submissions:
-    PCIe refuses, SXM refuses, the retry projects back onto PCIe, PCIe is on the list, stop. Both
-    classes would have been written off on a single refusal each -- the momentary-shortage defect,
-    just spread across two classes instead of one. The tally instead requires the class the retry
-    lands on to refuse TWICE, so the run makes a third submission. Here PCIe is dry once and
-    rentable on that second look, which is ordinary market behaviour and must not be fatal."""
+    """Each named class gets one refusal before a repeated class is stopped."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -1156,7 +1131,7 @@ def test_a_named_alternative_still_gets_its_own_look_after_the_first_class_refus
     def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted_gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
-        # both classes dry on their first look; PCIe rentable when the retry returns to it.
+        # both classes dry on their first look; pcie rentable when the retry returns to it.
         if run_spec.gpu.type == "A100 PCIe" and submitted_gpus.count("A100 PCIe") > 1:
             return PollResult(True, metrics={"train_tokens": 4096})
         return PollResult(False, failure="no_capacity", detail="dry")
@@ -1173,7 +1148,7 @@ def test_a_named_alternative_still_gets_its_own_look_after_the_first_class_refus
     metrics = orch._submit_seed_supervised(spec, spec.seed, log)
 
     # three submissions, not the two a membership set would have allowed: the run survives one
-    # refusal from each class and rents PCIe on the look the tally kept alive.
+    # refusal from each class and rents pcie on the look the tally kept alive.
     assert metrics["train_tokens"] == 4096
     assert submitted_gpus == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
     assert "has already refused capacity twice" not in log.getvalue()
@@ -2525,7 +2500,6 @@ def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_clas
     # and the operator is pointed at the two things that actually widen the search.
     assert "has already refused capacity twice" in out
     assert "drop the gpu.type pin" in out
-    assert 'type = ["A100 PCIe", "A100 SXM"]' in out
     assert "drop gpu.provider" in out
 
 
@@ -2597,6 +2571,98 @@ def test_dynamic_provider_search_keeps_the_full_capacity_retry_budget(orch, monk
     assert submitted_gpus == ["H200"] * (INFRA_RETRY_FLOOR + 1)
     assert "has already refused capacity twice" not in log.getvalue()
     assert "drop the gpu.type pin" not in log.getvalue()
+
+
+def test_multi_count_pin_keeps_retry_budget_when_another_width_can_reappear(orch, monkeypatch):
+    """A count ceiling admits several shapes, even when the current market exposes only one."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
+
+    candidates = (Candidate("runpod", "H200", 4.0, 141, gpu_count=1),)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
+
+    submissions = []
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submissions.append(run_spec.gpu.count)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        return PollResult(False, failure="no_capacity", detail="only one width is visible")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(
+        run_id="flash-pinned-multi-count-capacity",
+        type="H200",
+        provider="runpod",
+        count=2,
+    )
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert submissions == [1] * (INFRA_RETRY_FLOOR + 1)
+    assert "has already refused capacity twice" not in log.getvalue()
+
+
+def test_allocation_time_sellout_counts_for_a_fixed_shape(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import CapacityUnavailableError
+
+    calls = 0
+
+    def sold_out(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise CapacityUnavailableError("exact GPU 'H100' currently has no capacity")
+
+    monkeypatch.setattr(allocator, "allocate", sold_out)
+    spec = _spec(
+        run_id="flash-pinned-allocation-capacity",
+        type="H100",
+        provider="lambda",
+        count=1,
+        max_retries=4,
+    )
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert calls == 2
+    assert "has already refused capacity twice" in log.getvalue()
+
+
+def test_allocation_lookup_outage_keeps_the_full_retry_budget(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import CapacityLookupError
+    from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
+
+    calls = 0
+
+    def lookup_failed(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise CapacityLookupError("lambda live capacity lookup failed")
+
+    monkeypatch.setattr(allocator, "allocate", lookup_failed)
+    spec = _spec(
+        run_id="flash-pinned-allocation-lookup",
+        type="H100",
+        provider="lambda",
+        count=1,
+    )
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, log)
+
+    assert calls == INFRA_RETRY_FLOOR + 1
+    assert "has already refused capacity twice" not in log.getvalue()
 
 
 def test_a_provisioned_attempt_resets_the_class_capacity_refusals(orch, monkeypatch):

@@ -264,12 +264,7 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
 
 
 def test_cancel_tears_down_every_acceptable_class_of_an_ordered_pin(tmp_path, monkeypatch):
-    """The endpoint name is RECONSTRUCTED from the GPU class, not read back from the handle.
-
-    Allocation ranks a multi-class pin on cost, so the class actually rented may not be the head --
-    and naming only the head leaves the rented endpoint running and billing. Terminating by name is
-    best-effort, so a class this run never rented simply matches nothing.
-    """
+    """Cancellation tears down every endpoint name an ordered pin could select."""
     import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -294,6 +289,31 @@ def test_cancel_tears_down_every_acceptable_class_of_an_ordered_pin(tmp_path, mo
 
     assert orch.cancel_run(spec.run_id).state == "cancelled"
     assert terminated == ["A100 PCIe", "A100 SXM"]
+
+
+def test_terminal_charge_uses_the_selected_fallback_after_remote_cleanup(monkeypatch):
+    from flash.runner import RunStatus
+    from flash.server.billing import charges
+
+    captured: dict[str, object] = {}
+
+    def post_billing(*, token, path, body):
+        captured.update(token=token, path=path, body=body)
+        return {"ok": True}
+
+    monkeypatch.setattr(charges, "_post_billing", post_billing)
+    status = RunStatus(
+        run_id="flash-billed-fallback",
+        state="cancelled",
+        spec={"algorithm": "sft", "model": "m", "gpu": {"type": ["RTX 5090", "A100 PCIe"]}},
+        effective_preparation={"worker_spec": {"gpu": {"type": "A100 PCIe"}}},
+        billing_context={"org_id": "org-1"},
+        cost_usd=1.25,
+    )
+
+    charges.charge_completed_run(internal_key="internal", status=status)
+
+    assert captured["body"]["gpu"] == "A100 PCIe"
 
 
 def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):

@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from flash.core.spec import JobSpec, persisted_gpu_types
+from flash.core.spec import JobSpec
 from flash.providers._lifecycle.deadline import deadline_kwargs
 from flash.providers._lifecycle.poll import _attempt_int
 
@@ -554,15 +554,9 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     if not resource_deleted:
         _record_cleanup_remote(run_id, persisted_remote)
     _compare_and_fail_remote(run_id, persisted_remote, detail)
-    # every acceptable class, not just the head: allocation may have rented a fallback, and the
-    # endpoint name is reconstructed from the class rather than read back, so naming only the head
-    # leaves a fallback endpoint running. isolate each name so one malformed entry cannot prevent
-    # cleanup of the remaining valid classes.
-    for gpu_type in persisted_gpu_types(status.spec):
-        with contextlib.suppress(Exception):
-            from flash.providers.runpod.serverless import terminate_endpoint
+    from flash.providers.runpod import terminate_persisted_endpoints
 
-            terminate_endpoint(gpu_type, run_id)
+    terminate_persisted_endpoints(status.spec, run_id)
     print(f"attach: {run_id} {detail}", file=log)
     return get_status(run_id)
 

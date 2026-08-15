@@ -43,17 +43,28 @@ def _every_shape_tried(
 _REFUSALS_BEFORE_GIVING_UP = 2
 
 
+def _capacity_refusal_key(
+    ctx: _SubmitContext, outcome: _AttemptOutcome
+) -> tuple[str, str, int] | None:
+    """Shape that refused capacity, including a fixed shape rejected during allocation."""
+    if outcome.chosen is not None:
+        return _lifecycle._shape_key(outcome.chosen)
+    if not ctx.spec.gpu.type or not ctx.spec.gpu.provider or ctx.spec.gpu.count != 1:
+        return None
+    return (ctx.spec.gpu.provider, ctx.spec.gpu.type, 1)
+
+
 # what the log says INSTEAD of naming a retry target, when the run stops on exhausted capacity.
 #
 # claims only what the stop establishes: that the class this retry would land on has refused twice.
-# NOT "every class refused twice" (over an ordered pin the walk is A, B, A) and not "every fitting
-# class was tried" (`_select_candidate` sorts on failed provider before untried, so an untried class
-# on a failed provider loses to a tried one on a healthy provider). the remedies cover the rest.
+# NOT "every class refused twice" (with several fitting classes the walk is A, B, A) and not "every
+# fitting class was tried" (`_select_candidate` sorts on failed provider before untried, so an
+# untried class on a failed provider loses to a tried one on a healthy provider). the remedies
+# cover the rest.
 _EXHAUSTED_CAPACITY_ACTION = (
     "not retrying: the GPU class this retry would return to has already refused capacity twice, "
     "and no better class is left to fail over to, so re-queueing would fail the same way. Widen "
-    'the search -- drop the gpu.type pin, name alternatives (type = ["A100 PCIe", "A100 SXM"]), '
-    "or drop gpu.provider"
+    "the search -- drop the gpu.type pin, or drop gpu.provider"
 )
 
 
@@ -65,10 +76,10 @@ def _capacity_exhausted(
 ) -> bool:
     """Whether a retry would re-ask a question the class it lands on has ALREADY refused twice.
 
-    A ``no_capacity`` verdict settles the same question only when both class and provider are pinned.
-    Without a provider pin the next allocation rebuilds the live market and may discover that class
-    on Lambda or Vast even when RunPod refused it twice. A hard class-plus-provider pin has nowhere
-    new to ask, which is what turned an unavailable shape into a 75-minute serial retry loop.
+    A ``no_capacity`` verdict settles the same question only when class, provider, and one-card shape
+    are fixed. Without a provider pin the next allocation can discover the class on a returning
+    market; with a wider card-count ceiling, a currently absent width can reappear. Only the fixed
+    one-card class-plus-provider question is safe to stop asking after its second refusal.
 
     The bar is a SECOND refusal, since ``no_capacity`` also covers a transient search flake and a
     market that was dry a minute ago routinely frees a card. Counted PER SHAPE rather than as a set
@@ -89,15 +100,20 @@ def _capacity_exhausted(
         or first_cache_drop
         or not ctx.spec.gpu.type
         or not ctx.spec.gpu.provider
+        or ctx.spec.gpu.count != 1
     ):
         return False
-    if outcome.chosen is None:
+    refused_key = _capacity_refusal_key(ctx, outcome)
+    if refused_key is None:
         return False
     # the tally as it will stand once this failure is recorded, so the shape that just refused is
     # counted in its own verdict rather than judged on the state before it spoke.
     refusals = dict(ctx.capacity_refusals)
-    chosen_key = _lifecycle._shape_key(outcome.chosen)
-    refusals[chosen_key] = refusals.get(chosen_key, 0) + 1
+    refusals[refused_key] = refusals.get(refused_key, 0) + 1
+    # an allocation-time sellout has no candidate snapshot, but a one-card class-plus-provider pin
+    # still identifies the exact question the next allocation will ask again.
+    if outcome.chosen is None:
+        return refusals[refused_key] >= _REFUSALS_BEFORE_GIVING_UP
     # the same projection the log line reads, so the decision and its explanation cannot disagree.
     projected = _lifecycle._projected_retry_class(
         outcome.candidates,

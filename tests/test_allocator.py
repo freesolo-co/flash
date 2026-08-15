@@ -357,18 +357,13 @@ def test_allocate_gpu_type_fallbacks_widen_the_search_without_dictating_the_winn
         gpu_type_fallbacks=("A100 PCIe",),
     )
 
-    # only the named classes survive; RTX 4090 is offered and fitting but was not asked for.
+    # only the named classes survive; rtx 4090 is offered and fitting but was not asked for.
     assert {candidate.gpu for candidate in allocation.candidates} == {"H100", "A100 PCIe"}
-    # and the cheaper of the two wins despite H100 being named first.
+    # and the cheaper of the two wins despite h100 being named first.
     assert allocation.gpu == "A100 PCIe"
 
 
-def test_allocate_drops_an_unsatisfiable_fallback_but_still_fails_on_the_authored_class(
-    monkeypatch,
-):
-    """Naming alternatives says "any of these will do", so one that cannot be satisfied is dropped
-    rather than failing the run. When NONE can be, the first class's error is the one raised: it is
-    what the author asked for, so its remedy is the one worth acting on."""
+def test_allocate_rejects_an_unsatisfiable_fallback(monkeypatch):
     from flash.providers import allocator, get_provider
     from flash.providers.base import Candidate, UnsupportedGpuError
 
@@ -380,25 +375,42 @@ def test_allocate_drops_an_unsatisfiable_fallback_but_still_fails_on_the_authore
         lambda need, constraints: [Candidate("runpod", "H100", 3.29, 80)],
     )
 
-    # RTX 4090 cannot hold an 80 GB run, so it is dropped and the H100 still allocates.
-    allocation = allocator.allocate(
-        "Qwen/Qwen3.5-9B",
-        "grpo",
-        gpu_type="H100",
-        gpu_type_fallbacks=("RTX 4090",),
-        max_gpu_count=1,
-    )
-    assert allocation.gpu == "H100"
-
-    # with every class unsatisfiable the run is unplaceable, and the message names the authored one.
     with pytest.raises(UnsupportedGpuError, match=r"RTX 4090.*requires at least 80 GB"):
         allocator.allocate(
             "Qwen/Qwen3.5-9B",
             "grpo",
-            gpu_type="RTX 4090",
-            gpu_type_fallbacks=("RTX 5090",),
+            gpu_type="H100",
+            gpu_type_fallbacks=("RTX 4090",),
             max_gpu_count=1,
         )
+
+
+def test_allocate_ordered_lambda_pin_classifies_impossible_shapes_as_unsupported(monkeypatch):
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import Candidate, UnsupportedGpuError
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda",))
+
+    def only_b200(_need, constraints):
+        if constraints.gpu_type:
+            raise UnsupportedGpuError(
+                f"lambda does not offer a rentable {constraints.gpu_type} shape up to 4 cards"
+            )
+        return [Candidate("lambda", "B200", 5.00, 180, gpu_count=4)]
+
+    monkeypatch.setattr(get_provider("lambda"), "live_candidates", only_b200)
+
+    for fallbacks in ((), ("H100",)):
+        with pytest.raises(UnsupportedGpuError, match="lambda does not offer"):
+            allocator.allocate(
+                "Qwen/Qwen3.5-0.8B",
+                "grpo",
+                provider="lambda",
+                gpu_type="A10",
+                gpu_type_fallbacks=fallbacks,
+                max_gpu_count=4,
+            )
 
 
 def test_allocate_gpu_type_enforces_vram_and_provider_support(monkeypatch):

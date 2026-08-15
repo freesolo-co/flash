@@ -109,12 +109,7 @@ def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
         if not include_terminal and status.state in TERMINAL_STATES:
             continue
         _add((status.remote or {}).get("endpoint_name"))
-        # every acceptable class, not just the head: allocation ranks an ordered pin on
-        # cost-per-step and may rent a fallback, and this index is what bounds the reaper's scope --
-        # `_sweep_idle_flash_endpoints` SKIPS any endpoint it cannot name here. Indexing the head
-        # alone would leave a fallback endpoint orphaned before its handle is persisted permanently
-        # unsweepable, holding worker quota. The extra names are harmless in both directions: an
-        # endpoint that was never created simply matches nothing.
+        # index every acceptable class so fallback endpoints remain in the reaper's scope.
         for gpu in persisted_gpu_types(status.spec):
             with contextlib.suppress(Exception):
                 _add(endpoint_name(canonical_gpu(gpu), _run_suffix(status.run_id)))

@@ -21,11 +21,13 @@ from flash.providers.base import (
     AllocationConstraints,
     Candidate,
     CapacityLookupError,
+    CapacityUnavailableError,
     UnsupportedGpuError,
     _run_cost_key,
     authored_gpu_ceiling,
     canonical_gpu,
     combined_vram_gb,
+    largest_rentable_count,
     providers_for,
     rentable_gpu_counts,
     run_config_for_ranking,
@@ -40,12 +42,6 @@ from flash.providers.fit_errors import (
     vram_fit_error_message,
     widenable_gpu_names,
 )
-
-# re-exported: every caller reaches for the cap through the allocator, and the certification it
-# performs is an allocation decision. the definition lives in a sibling only for file size.
-from flash.providers.geometry import geometry_safe_gpu_cap
-
-__all__ = ["allocate", "geometry_safe_gpu_cap", "required_vram_gb", "vram_headroom"]
 
 logger = get_logger(__name__)
 
@@ -292,33 +288,132 @@ def _sizing_int(train, name: str, default: int) -> int:
     return number if number > 0 else default
 
 
-def _structurally_fits(available, need: int, cap: int, executed_width, exact: str = "") -> bool:
-    """Whether any provider OFFERS a class that could hold the run, ignoring current stock.
+def _structurally_fits(available, need: int, cap: int, executed_width, acceptable=()) -> bool:
+    """Whether an acceptable provider class could hold the run, ignoring current stock.
 
-    Separates "sold out right now" (retryable) from "no such shape exists" (terminal). Reads each
-    provider's advertised class list, never live capacity, so it stays truthful during the very
-    outage it is called to interpret.
-
-    ``exact`` narrows the scan to a pinned class, since a pin cannot be satisfied by some other class
-    being offered -- the same rule ``_structural_gpu_names`` applies. Empty for an unpinned search,
-    where any offered class counts.
-
-    Credits ``_executed_width`` rather than the rented count: a width the run will not launch on is
-    not a shape waiting to come back in stock, so sharing the filter's own rule is what makes "no
-    candidate fit" and "no shape could fit" answer the same question.
+    Reads advertised classes so capacity outages cannot affect the answer, and applies the executed
+    width because a shape the run will not launch on is terminal rather than sold out.
     """
+    allowed = set(acceptable)
     for name in available:
         try:
             classes = get_provider(name).gpu_classes()
         except Exception:  # a provider that cannot even list classes proves nothing either way
             continue
         for gpu_class in classes:
-            if exact and gpu_class.name != exact:
+            if allowed and gpu_class.name not in allowed:
                 continue
             for count in rentable_gpu_counts(cap):
                 if combined_vram_gb(gpu_class.vram_gb, executed_width(count)) >= need:
                     return True
     return False
+
+
+# Widest count safe to rent when a model's true head geometry could not be certified. Named because
+# the guard that skips certification (`cap > _UNCERTIFIED_CAP`) is only correct while it matches the
+# ceiling certification would otherwise apply: raise one without the other and a run either takes a
+# hub round trip that cannot widen it, or skips the round trip that would have. ALLOC-004 tracks
+# validating arbitrary off-catalog head geometry at every width.
+_UNCERTIFIED_CAP = 4
+
+
+def geometry_safe_gpu_cap(
+    model_id: str, max_gpu_count: int, *, model_revision: str = "", certify: bool = False
+) -> int:
+    """Rentable ceiling whose head divisibility is known before paid allocation.
+
+    The width becomes vLLM's ``tensor_model_parallel_size`` for the rollout engine (grpo
+    ``train/rl/verl_config.py``, opd ``train/opd/overrides.py``), and vLLM requires
+    ``num_attention_heads % tp_size == 0`` -- it raises at engine init otherwise -- so a catalog row
+    is only safe at the counts that divide its OWN head count. Curated membership is not uniform
+    geometry: catalog head counts are 8, 8, 16, 16, 24, and 16, so trusting membership alone
+    accepted an 8-card width for the 27B (24 heads) that the engine rejects at init, after the box
+    was already rented.
+
+    This cap OUTLIVED ulysses. It was written when the width was also
+    ``ulysses_sequence_parallel_size``; sequence parallelism is now pinned off on all three
+    algorithms (it corrupts GatedDeltaNet state), but rollout tensor parallelism still consumes the
+    same width, so the same divisibility gate is still what stands between a rented box and a
+    post-payment engine failure.
+
+    Scope, stated precisely: this certifies QUERY-head divisibility only. vLLM also constrains kv
+    heads and the GDN linear dimensions under tensor parallelism, and Flash records both
+    (``num_key_value_heads``, ``linear_num_value_heads``) without gating on them. Every current row
+    divides 1/2/4/8 on all three axes, so nothing is mis-admitted today. Widening the check to those
+    two axes is a separate invariant and deliberately not in this change.
+
+    The head count is READ from the row (``num_attention_heads``), never derived: ``hidden_size //
+    head_dim`` is a different number on four of the six rows -- see ``_query_attention_heads``.
+
+    A revision whose geometry cannot be certified keeps the pre-existing four-card ceiling rather
+    than renting 8 cards verl may reject at startup, but that ceiling only NARROWS the divisor
+    search; it is not a substitute for it. A ceiling is a bound, not a divisibility proof -- 4
+    divides 24 but not 20 -- so the heads are checked either way.
+
+    A pin is not by itself unknown geometry. SFT reaches allocation with a revision ALWAYS resolved
+    to a sha (``runner.submit.prepare_job`` -> ``_resolve_model_revision`` with ``required=True``),
+    so treating "pinned" as "uncertifiable" capped every SFT run in the catalog at four cards and
+    made ``--gpus 8`` unreachable for the algorithm that always pins -- including for a run that
+    only fits at eight. The pinned commit's own ``config.json`` is what settles it: read the head
+    count from that commit (validated against the catalog row, fail-closed, so a drifted pin is
+    rejected rather than widened) and cap on the real number. An unreadable pin certifies nothing:
+    it keeps the four-card ceiling AND falls back to the row's own head count for the divisor
+    search, so it can only ever be narrower than the same run unpinned, never wider.
+
+    ``certify`` is what permits the hub round trip, and ONLY the submission path passes it. Reading a
+    pinned commit's config is network i/o, so a transient hub failure returns the uncertified
+    four-card ceiling. On the submit path that is a safe conservative answer the allocator can still
+    act on. On an OFFLINE path it is not: `spec_from_dict` feeds this cap to `provisional_gpu`, whose
+    job is to REJECT an unplaceable run, so a blip would narrow a 35B that genuinely needs eight
+    cards down to four and reject it as unplaceable during config parsing that is otherwise entirely
+    offline -- turning a transient network error into a terminal, and wrong, user-facing rejection.
+    The cost quote has the same shape (`_offline_gpu_shape` is documented as structural and must not
+    consume live failures). Both keep the default and stay offline; certification belongs where a
+    healthy retry and a real allocation decision live.
+    """
+    from flash.core.catalog import MODELS
+
+    cap = largest_rentable_count(max_gpu_count)
+    info = MODELS.get(model_id)
+    heads = _query_attention_heads(info) if info is not None else 0
+    if info is None:
+        # nothing to certify a width against, and nothing to cross-check a pin's own config with.
+        cap = min(cap, _UNCERTIFIED_CAP)
+    elif certify and model_revision and cap > _UNCERTIFIED_CAP:
+        # the weights the worker really loads are the pinned commit's, so its config -- not the
+        # row's default-revision geometry -- is what may widen this run. only worth a hub round trip
+        # when there is something to widen TO: at or below the uncertified cap, certification
+        # cannot raise the ceiling.
+        from flash.engine.plan.vram import certified_attention_heads
+
+        certified = certified_attention_heads(model_id, model_revision)
+        if certified > 0:
+            heads = certified
+        else:
+            # uncertified: fall back to the ceiling, but keep checking the ROW's heads below. the
+            # ceiling narrows the divisor search, it does not replace it, so a row whose heads do
+            # not divide it is still narrowed further instead of rented at a width verl rejects.
+            cap = min(cap, _UNCERTIFIED_CAP)
+    if heads <= 0:
+        # geometry we cannot read is geometry we cannot certify, so a catalog row that records no
+        # head count is treated exactly like an uncertifiable revision rather than trusted for 8.
+        return min(cap, _UNCERTIFIED_CAP)
+    for count in rentable_gpu_counts(cap):
+        if heads % count == 0:
+            return count
+    return 1
+
+
+def _query_attention_heads(info) -> int:
+    """Query-attention head count for a catalog row, or 0 when the row does not record one.
+
+    Read, never derived. ``hidden_size // head_dim`` looks like the head count and is not: these
+    checkpoints decouple ``head_dim`` from that ratio, so the quotient is wrong for four of the six
+    catalog rows (3.5-4B is 16 heads, not 2560/256 = 10; 0.8B is 8, not 4; 3.6-27B is 24, not 20;
+    35B-A3B is 16, not 8). A cap computed from the quotient divides the wrong number -- it happened
+    to stay conservative on today's catalog, but nothing makes that hold for the next row added.
+    """
+    return int(getattr(info, "num_attention_heads", 0) or 0)
 
 
 def _resolve_exact_gpu(
@@ -467,47 +562,33 @@ def _narrow_to_pinned_gpus(
     unpinned: tuple[str, ...] | None,
     executed_width,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
-    """Resolve an authored pin and narrow the search to its satisfiable classes and providers."""
+    """Validate every acceptable class and narrow the provider search."""
     cap = geometry_safe_gpu_cap(
         model_id, max_gpu_count, model_revision=model_revision, certify=True
     )
     widest_cap = geometry_safe_gpu_cap(
         model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
     )
-    acceptable: list[str] = []
-    reachable: set[str] = set()
-    first_failure: UnsupportedGpuError | None = None
-    for candidate in (gpu_type, *gpu_type_fallbacks):
-        try:
-            exact, providers = _resolve_exact_gpu(
-                candidate,
-                need=need,
-                cap=cap,
-                max_gpu_count=max_gpu_count,
-                provider=provider,
-                available=available,
-                widest_cap=widest_cap,
-                unpinned=unpinned,
-                executed_width=executed_width,
-                algorithm=algorithm,
-            )
-        except UnsupportedGpuError as exc:
-            if first_failure is None:
-                first_failure = exc
-            continue
-        acceptable.append(exact)
-        reachable.update(providers)
-    if not acceptable:
-        if first_failure is not None:
-            raise first_failure
-        raise UnsupportedGpuError("no acceptable GPU class was named")
-
-    # preserve the caller's provider order after narrowing; it is also the ranking tiebreak order.
+    resolved = [
+        _resolve_exact_gpu(
+            candidate,
+            need=need,
+            cap=cap,
+            max_gpu_count=max_gpu_count,
+            provider=provider,
+            available=available,
+            widest_cap=widest_cap,
+            unpinned=unpinned,
+            executed_width=executed_width,
+            algorithm=algorithm,
+        )
+        for candidate in (gpu_type, *gpu_type_fallbacks)
+    ]
+    acceptable = tuple(exact for exact, _providers in resolved)
+    reachable = {name for _exact, providers in resolved for name in providers}
     available = tuple(name for name in available if name in reachable)
     exact = acceptable[0] if len(acceptable) == 1 else ""
-    if not available:
-        raise UnsupportedGpuError(f"exact GPU {acceptable[0]!r} has no configured active provider")
-    return exact, tuple(acceptable), available
+    return exact, acceptable, available
 
 
 def _structural_gpu_names(available: tuple[str, ...], exact: str) -> tuple[str, ...]:
@@ -609,42 +690,40 @@ def _gather_candidates(
     Returns ``(candidates, lookup_failed, structurally_unsupported)``. The two failure records are
     what let an empty result be told apart from a genuine no-fit.
 
-    ``acceptable`` is the authored class set (empty for an unpinned search). This filter is the
-    authoritative one: a provider may narrow its own market query from the constraints as an
-    optimization, but only what survives here reaches ranking, so a provider that ignores the hint
-    still cannot widen the pin.
+    ``acceptable`` is the authoritative class filter; empty means unpinned.
     """
     allowed = set(acceptable)
+    queries = tuple(replace(constraints, gpu_type=gpu) for gpu in acceptable) or (constraints,)
     candidates: list[Candidate] = []
     lookup_failed = False
     structurally_unsupported: dict[str, UnsupportedGpuError] = {}
-    # runpod prices off a static table (no live lookup), so it never blips; lambda/vast query live
-    # capacity and can. a per-provider blip degrades to the others (we just skip it), but we remember it
-    # so an empty result can be told apart from a genuine no-fit below.
-    # runpod uses the same loop but does not raise CapacityLookupError.
     for name in available:
-        try:
-            found = get_provider(name).live_candidates(per_card_need, constraints)
-            candidates += [
-                candidate
-                for candidate in found
-                if candidate.provider == name and (not allowed or candidate.gpu in allowed)
-            ]
-        except UnsupportedGpuError as exc:
-            # A count-specific SKU miss is provider-local during an automatic search. Lambda may not
-            # sell 8x H100 while RunPod or Vast does; aborting here discards candidates already found
-            # elsewhere. An explicitly selected provider still fails immediately with its precise
-            # structural reason.
+        unsupported: list[UnsupportedGpuError] = []
+        for query in queries:
+            try:
+                found = get_provider(name).live_candidates(per_card_need, query)
+                candidates += [
+                    candidate
+                    for candidate in found
+                    if candidate.provider == name and (not allowed or candidate.gpu in allowed)
+                ]
+            except UnsupportedGpuError as exc:
+                unsupported.append(exc)
+            except CapacityLookupError as exc:
+                lookup_failed = True
+                logger.warning(
+                    "%s capacity lookup failed (%s); allocating without it", name, exc.__cause__
+                )
+        if len(unsupported) == len(queries):
             if provider:
-                raise
-            structurally_unsupported[name] = exc
-            logger.info("%s cannot offer this shape (%s); trying other providers", name, exc)
-        except CapacityLookupError as exc:
-            lookup_failed = True
-            logger.warning(
-                "%s capacity lookup failed (%s); allocating without it", name, exc.__cause__
+                raise unsupported[0]
+            structurally_unsupported[name] = unsupported[0]
+            logger.info(
+                "%s cannot offer any acceptable shape (%s); trying other providers",
+                name,
+                unsupported[0],
             )
-    return candidates, lookup_failed, structurally_unsupported
+    return list(dict.fromkeys(candidates)), lookup_failed, structurally_unsupported
 
 
 def _raise_no_candidate_error(
@@ -653,6 +732,7 @@ def _raise_no_candidate_error(
     need: float,
     cap: int,
     exact: str,
+    acceptable: tuple[str, ...],
     supported_available: tuple[str, ...],
     structurally_unsupported: dict[str, UnsupportedGpuError],
     lookup_failed: bool,
@@ -672,7 +752,7 @@ def _raise_no_candidate_error(
     # THE precondition for every retryable answer below: a shape the run could execute on is
     # advertised somewhere, so "come back later" is a coherent thing to say. Evaluated once -- three
     # copies of this question is what let the sft width clamp reach one branch and not the others.
-    could_fit = _structurally_fits(supported_available, need, cap, executed_width, exact)
+    could_fit = _structurally_fits(supported_available, need, cap, executed_width, acceptable)
     if lookup_failed and could_fit:
         # No candidate fit, but a live capacity lookup blipped and was the only possible source of one
         # -> retryable, NOT terminal: a Vast/Lambda-only run must ride out a market/API outage on its
@@ -692,7 +772,7 @@ def _raise_no_candidate_error(
     )
     if exact:
         if live_only and could_fit:
-            raise CapacityLookupError(
+            raise CapacityUnavailableError(
                 f"exact GPU {exact!r} is structurally supported but currently has no capacity on "
                 f"{', '.join(supported_available)}"
             )
@@ -704,7 +784,7 @@ def _raise_no_candidate_error(
     # without that guard a genuinely oversized run would retry until its infra budget ran out
     # instead of failing immediately with the reason.
     if live_only and could_fit:
-        raise CapacityLookupError(
+        raise CapacityUnavailableError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) right now: a fitting class is "
             f"structurally offered on {', '.join(supported_available)} but has no capacity — "
             f"retry may find it"
@@ -737,10 +817,7 @@ def allocate(
     ``max_gpu_count=None`` auto-sizes to the smallest geometry-safe ceiling that can fit. an integer
     is an authored hard ceiling; fitting shapes up to that ceiling still compete on dollars per step.
 
-    ``gpu_type`` plus ``gpu_type_fallbacks`` is the authored acceptable SET, in authored order.
-    Restricting the search to several classes rather than one is what gives a pinned run somewhere to
-    fail over when its first class is out of capacity. Ranking among the survivors is unchanged --
-    still cheapest-per-step -- so the order narrows the search without influencing the winner.
+    ``gpu_type`` and its fallbacks restrict the search without changing cheapest-cost ranking.
     """
     # the same profile knobs ranking prices on: VRAM must be sized for the work that will RUN, not
     # the authored request. an exact-unpacked run executes batch 1 at the measured length, so sizing
@@ -841,6 +918,7 @@ def allocate(
             need=need,
             cap=cap,
             exact=exact,
+            acceptable=acceptable,
             supported_available=supported_available,
             structurally_unsupported=structurally_unsupported,
             lookup_failed=lookup_failed,

@@ -60,16 +60,7 @@ def test_protected_names_cover_live_runs_only(monkeypatch):
 
 
 def test_ordered_gpu_pin_is_protected_before_its_handle_is_persisted(monkeypatch):
-    """An ordered pin persists `gpu.type` as a LIST, and the reaper reads raw status.
-
-    The spec-derived name exists precisely to cover the submit-to-handle-persist window. Passing the
-    raw list to `canonical_gpu` raises `AttributeError: 'list' object has no attribute 'strip'`, and
-    the call sits under `contextlib.suppress`, so the run silently contributes NO name at all: with
-    no `remote.endpoint_name` either, its live endpoint is outside the protected set and reapable
-    while the run is still provisioning.
-
-    EVERY acceptable class is named, not just the head: the allocator ranks an ordered pin on
-    cost-per-step, so a fallback can be the class actually rented."""
+    """Every acceptable class is protected before the handle is persisted."""
     rows = [{"run_id": "flash-ordered"}]
     statuses = {
         "flash-ordered": RunStatus(
@@ -89,13 +80,7 @@ def test_ordered_gpu_pin_is_protected_before_its_handle_is_persisted(monkeypatch
 
 
 def test_an_orphaned_fallback_endpoint_stays_in_the_reapers_scope(monkeypatch):
-    """The reaper SKIPS any endpoint absent from its known set, so a missed name is a permanent leak.
-
-    Unlike the protected set, where a missing name costs protection, a missing name here costs
-    reachability: `_sweep_idle_flash_endpoints` does `if known is not None and canon not in known:
-    continue`. An ordered pin whose fallback was rented and orphaned before its handle persisted
-    would never be nameable, and would hold worker quota indefinitely. A terminal run is used
-    because that is when the endpoint is genuinely orphaned rather than merely unprotected."""
+    """A terminal fallback endpoint remains within the reaper's known scope."""
     rows = [{"run_id": "flash-orphan"}]
     statuses = {
         "flash-orphan": RunStatus(

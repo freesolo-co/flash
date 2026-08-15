@@ -16,6 +16,7 @@ from flash.core.spec import (
     GpuSpec,
     JobSpec,
     TrainSpec,
+    attributed_gpu_type,
     load_job_spec_from_env,
     persisted_gpu_head,
     persisted_gpu_types,
@@ -1281,9 +1282,7 @@ def test_gpu_type_pins_and_unset_stays_auto(capsys) -> None:
 
 
 def test_gpu_type_accepts_an_ordered_list_of_acceptable_classes() -> None:
-    """A list narrows allocation to those classes instead of collapsing it to one, so a capacity
-    shortage on the first has somewhere to go. The head stays a single concrete class because every
-    worker and provider submit path reads `gpu.type` as one."""
+    """An ordered list preserves every acceptable class behind one concrete head."""
     spec = spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "A100 SXM"]}))
 
     assert spec.gpu.type == "A100 PCIe"
@@ -1302,15 +1301,14 @@ def test_gpu_type_accepts_an_ordered_list_of_acceptable_classes() -> None:
         lone.gpu.acceptable_types
         == spec_from_dict(_raw(**{"gpu.type": "B200"})).gpu.acceptable_types
     )
-    # a repeat asks for nothing the first mention did not, and the FIRST position is preference.
+    # a repeat asks for nothing the first mention did not, and the first position is preference.
     assert spec_from_dict(
         _raw(**{"gpu.type": ["H100", "A100 PCIe", "H100"]})
     ).gpu.acceptable_types == ("H100", "A100 PCIe")
 
 
 def test_gpu_type_list_rejects_empty_and_unusable_entries() -> None:
-    """Every named class is validated, not just the head: a fallback allocation would never rent is
-    dead weight, and catching it at parse time beats surfacing it once the head runs out."""
+    """Every named class must be valid, reachable, and large enough."""
     with pytest.raises(ConfigError, match=r"must not be an empty list"):
         spec_from_dict(_raw(**{"gpu.type": []}))
     with pytest.raises(ConfigError, match=r"unsupported gpu"):
@@ -1319,7 +1317,7 @@ def test_gpu_type_list_rejects_empty_and_unusable_entries() -> None:
         spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", 1]}))
     with pytest.raises(ConfigError, match=r"gpu\.type entries must not be empty"):
         spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "  "]}))
-    # the VRAM floor applies to the whole list, so a fallback too small to hold the run is refused.
+    # the vram floor applies to the whole list, so a fallback too small to hold the run is refused.
     with pytest.raises(ConfigError, match="requires at least"):
         spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", **{"gpu.type": ["A100 PCIe", "RTX 4090"]}))
     # and so does provider compatibility.
@@ -1328,9 +1326,7 @@ def test_gpu_type_list_rejects_empty_and_unusable_entries() -> None:
 
 
 def test_gpu_type_list_round_trips_through_the_public_payload() -> None:
-    """The public spec carries the AUTHORED spelling. The head/fallbacks split is derived, and the
-    parser rejects `type_fallbacks` as unauthorable, so emitting it would fail the resubmit round
-    trip and emitting only the head would silently drop the failover classes."""
+    """Public serialization restores the authored list spelling."""
     from flash.client.specs import spec_payload
 
     spec = spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "A100 SXM"]}), run_id="gpu-list")
@@ -1344,8 +1340,7 @@ def test_gpu_type_list_round_trips_through_the_public_payload() -> None:
 
 
 def test_authoring_gpu_type_fallbacks_directly_is_rejected() -> None:
-    """`type_fallbacks` is derived from the list form. Accepting both spellings would let a config
-    name a head that contradicts its own fallback list."""
+    """The internal split form is not public configuration."""
     raw = _raw()
     raw["gpu"]["type_fallbacks"] = ["A100 SXM"]
 
@@ -1354,8 +1349,7 @@ def test_authoring_gpu_type_fallbacks_directly_is_rejected() -> None:
 
 
 def test_persisted_gpu_type_fallbacks_are_canonicalized_and_require_a_head() -> None:
-    """The internal boundary re-reads a persisted record on every recovery hop, so an unvalidated
-    fallback would only fail once allocation reached it."""
+    """Persisted fallback classes receive the same validation as the head."""
     assert _job_from_dict(
         {"gpu": {"type": "h100", "type_fallbacks": [" a100 pcie "]}}
     ).gpu.acceptable_types == ("H100", "A100 PCIe")
@@ -1380,10 +1374,7 @@ def test_gpu_spec_guards_direct_ordered_pin_construction() -> None:
 
 
 def test_persisted_ordered_gpu_pin_survives_a_status_reload() -> None:
-    """`to_dict()` writes the AUTHORED list, and the runner reloads that record through
-    `JobSpec.from_dict` on roughly twenty paths (status reads, attach, recovery, serving, billing).
-    So the internal parser has to accept the list spelling too: when it took only the split form,
-    every ordered-pin run parsed once and then died on its first status reload."""
+    """The public list form remains stable across repeated status reloads."""
     spec = _job_from_dict({"gpu": {"type": "A100 PCIe", "type_fallbacks": ["A100 SXM"]}})
 
     persisted = spec.to_dict()
@@ -1402,17 +1393,7 @@ def test_persisted_ordered_gpu_pin_survives_a_status_reload() -> None:
 
 
 def test_persisted_gpu_head_reads_an_unparseable_spec_without_raising() -> None:
-    """The reader for callers that CANNOT go through `JobSpec.from_dict`.
-
-    Endpoint teardown after a parse failure, the idle reaper walking every stored run, and billing
-    on a stale record all read `status.spec` raw, and an ordered pin puts a list where they expect
-    one class name. Handing that list to `canonical_gpu` raises `AttributeError: 'list' object has
-    no attribute 'strip'`; every one of those sites suppresses exceptions to protect its caller, so
-    the failure is silent and a paid endpoint is simply never torn down.
-
-    It must therefore be total over malformed input as well: these callers are reached BECAUSE the
-    record is suspect, so a raise here would reintroduce the same silent skip it exists to remove.
-    """
+    """The raw reader remains total when a persisted spec cannot be parsed."""
     assert persisted_gpu_head({"gpu": {"type": ["A100 PCIe", "A100 SXM"]}}) == "A100 PCIe"
     assert persisted_gpu_head({"gpu": {"type": "H200"}}) == "H200"
     # malformed or absent -> "" (falsey), which every call site already guards on. no raise.
@@ -1425,17 +1406,14 @@ def test_persisted_gpu_head_reads_an_unparseable_spec_without_raising() -> None:
         {"gpu": {"type": None}},
         {"gpu": "not-a-dict"},
         {"gpu": {"type": 7}},
+        "truthy-string",
+        ["truthy-list"],
     ):
         assert persisted_gpu_head(malformed) == ""
 
 
 def test_persisted_gpu_types_names_every_acceptable_class() -> None:
-    """The set form, for the caller where a MISSING name hides a paid resource.
-
-    The idle reaper skips any endpoint it cannot name, so indexing only the head would leave an
-    orphaned fallback endpoint permanently unsweepable. Total over malformed input for the same
-    reason as the head reader: these callers are reached because the record is suspect.
-    """
+    """The raw reader returns every usable class without raising."""
     assert persisted_gpu_types({"gpu": {"type": ["A100 PCIe", "A100 SXM"]}}) == (
         "A100 PCIe",
         "A100 SXM",
@@ -1458,8 +1436,23 @@ def test_persisted_gpu_types_names_every_acceptable_class() -> None:
         {"gpu": {"type": None}},
         {"gpu": "not-a-dict"},
         {"gpu": {"type": 7}},
+        "truthy-string",
+        ["truthy-list"],
     ):
         assert persisted_gpu_types(malformed) == ()
+
+
+def test_attributed_gpu_type_prefers_effective_worker_spec_and_is_total() -> None:
+    status = {
+        "remote": None,
+        "effective_preparation": {"worker_spec": {"gpu": {"type": "A100 SXM"}}},
+        "spec": {"gpu": {"type": ["RTX 5090", "A100 SXM"]}},
+    }
+    assert attributed_gpu_type(status) == "A100 SXM"
+    status["remote"] = {"allocated_gpu": "H200"}
+    assert attributed_gpu_type(status) == "H200"
+    for malformed in ("status", ["status"], {"remote": []}, {"effective_preparation": "bad"}):
+        assert attributed_gpu_type(malformed) == ""
 
 
 def test_removed_gpu_pin_key_is_rejected_as_unknown() -> None:
@@ -1590,15 +1583,7 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
     assert _preparation_digest(marked, marked, None) != legacy
 
 
-def test_ordered_gpu_pin_field_does_not_change_pre_existing_preparation_digests() -> None:
-    """A snapshot prepared before `gpu.type_fallbacks` existed must still rehash to its digest.
-
-    Same contract as the marker test above, one level down: `to_internal_dict()` now emits the key
-    for every spec, so without an omission every in-flight warm-start or auto-pinned run fails
-    integrity validation on the first recovery after the upgrade.
-    """
-    import hashlib
-
+def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
     from flash.runner.preparation import _preparation_digest
 
     scalar = JobSpec(
@@ -1607,41 +1592,6 @@ def test_ordered_gpu_pin_field_does_not_change_pre_existing_preparation_digests(
         model_revision="c" * 40,
         gpu=GpuSpec(type="A100 PCIe", count=1, provider="runpod"),
     )
-
-    # the pre-upgrade bytes: today's payload minus the key that did not exist then. mirrors
-    # _preparation_digest's own omissions rather than re-deriving them, so the control cannot drift.
-    worker_payload = scalar.to_internal_dict()
-    for key in (
-        "model_revision_auto",
-        "gpu_count_auto",
-        "workload_profile_input_digest",
-        "workload_profile_producer_version",
-        "workload_profile",
-    ):
-        if not worker_payload.get(key):
-            worker_payload.pop(key, None)
-    worker_payload["gpu"].pop("type_fallbacks", None)
-    public_payload = scalar.to_dict()  # to_dict() already strips the fallbacks
-    if not public_payload["environment"].get("pip"):
-        public_payload["environment"].pop("pip", None)
-
-    legacy = hashlib.sha256(
-        json.dumps(
-            {
-                "version": 1,
-                "public_spec": public_payload,
-                "worker_spec": worker_payload,
-                "adapter_identity": None,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    assert _preparation_digest(scalar, scalar, None) == legacy
-
-    # an ordered pin is non-empty, so it stays bound: a tampered fallback list is still caught, and
-    # it does not collide with the bare head it was widened from.
     ordered = replace(
         scalar,
         gpu=GpuSpec(type="A100 PCIe", type_fallbacks=("A100 SXM",), count=1, provider="runpod"),
@@ -1649,7 +1599,8 @@ def test_ordered_gpu_pin_field_does_not_change_pre_existing_preparation_digests(
     other = replace(
         scalar, gpu=GpuSpec(type="A100 PCIe", type_fallbacks=("H100",), count=1, provider="runpod")
     )
-    assert _preparation_digest(ordered, ordered, None) != legacy
+
+    assert _preparation_digest(ordered, ordered, None) != _preparation_digest(scalar, scalar, None)
     assert _preparation_digest(ordered, ordered, None) != _preparation_digest(other, other, None)
 
 

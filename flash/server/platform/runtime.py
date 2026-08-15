@@ -12,7 +12,7 @@ import os
 import threading
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
-from flash.core.spec import JobSpec, persisted_gpu_types
+from flash.core.spec import JobSpec
 from flash.runner import adapter_prefix, get_status, runs_file_path
 from flash.server.platform import db
 
@@ -710,13 +710,9 @@ def _classify_recoverable_runs(
                 # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
                 # persisted status without parsing the spec. Terminate by that reconstructed
                 # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
-                # every acceptable class: allocation may have rented a fallback. isolate each name
-                # so one malformed entry cannot prevent cleanup of the remaining valid classes.
-                for gpu_type in persisted_gpu_types(status.spec):
-                    with contextlib.suppress(Exception):
-                        from flash.providers.runpod.serverless import terminate_endpoint
+                from flash.providers.runpod import terminate_persisted_endpoints
 
-                        terminate_endpoint(gpu_type, status.run_id)
+                terminate_persisted_endpoints(status.spec, status.run_id)
                 continue
             # reap run-scoped resources from the parseable public spec before touching the private
             # warm-start snapshot. source drift or snapshot tampering must not strand an endpoint.
