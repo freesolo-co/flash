@@ -329,6 +329,15 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
             f"{tail} run `{cli} models deployments` to see the current state first."
         )
     raw_step = current.get("checkpoint_step")
+    # `int()` does not just reject what it cannot read -- it silently COERCES. `true` becomes 1,
+    # `false` becomes 0, and `1.5` truncates to 1, none of them raising. a step this client cannot
+    # read as an exact whole number is an unreadable record, not checkpoint 1: reading it as a
+    # number either suppresses the warning (deploying step-1 against a `true`) or names a
+    # checkpoint that was never live. bool is checked first because it is a subclass of int.
+    if isinstance(raw_step, bool):
+        return None
+    if isinstance(raw_step, float) and not raw_step.is_integer():
+        return None
     try:
         served_step = None if raw_step is None else int(raw_step)
     except (TypeError, ValueError, OverflowError):

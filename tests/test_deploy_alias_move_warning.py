@@ -445,6 +445,38 @@ def test_a_non_finite_step_is_reachable_from_a_real_response_body() -> None:
     assert _alias_move_warning(_Client({**decoded, "run_id": "flash-1"}), "flash-1", 50) is None
 
 
+@pytest.mark.parametrize("lossy_step", [True, False, 1.5, 0.5, -2.5])
+def test_a_lossy_checkpoint_step_is_unreadable_rather_than_coerced(lossy_step) -> None:
+    """`int()` does not only reject: it silently coerces, and both outcomes are wrong.
+
+    `json.loads` produces `True` from `true` and `1.5` from a fractional number, and `int()`
+    answers 1 for both without raising -- so the earlier exception guard never sees them. Read as
+    a number, `true` suppresses the warning entirely when deploying step-1, and any other target
+    gets told step-1 is live when nothing of the sort is. Neither is a checkpoint, so the record
+    is unreadable.
+    """
+    current = {"run_id": "flash-1", "state": "ready", "checkpoint_step": lossy_step}
+
+    # step 1 is the value int() coerces to, so it is the target that would be silenced.
+    assert _alias_move_warning(_Client(current), "flash-1", 1) is None
+    # and any other target is the one that would be told step-1 is live.
+    assert _alias_move_warning(_Client(current), "flash-1", 50) is None
+
+
+@pytest.mark.parametrize("whole_step", [100.0, 0.0])
+def test_a_whole_float_step_is_still_read_as_that_checkpoint(whole_step) -> None:
+    """Rejecting lossy conversions must not reject a lossless one.
+
+    A plane that JSON-encodes the step as `100.0` loses nothing by converting; only a fractional
+    value does. Rejecting every float would turn a readable record into a silent no-warning.
+    """
+    current = {"run_id": "flash-1", "state": "ready", "checkpoint_step": whole_step}
+
+    assert _alias_move_warning(_Client(current), "flash-1", int(whole_step)) is None
+    warning = _alias_move_warning(_Client(current), "flash-1", 50) or ""
+    assert f"serves step-{int(whole_step)}" in warning
+
+
 def test_a_numeric_string_step_is_still_compared_as_a_number() -> None:
     """Normalizing must not turn `"100"` into a spurious warning against step 100."""
     current = {"run_id": "flash-1", "state": "ready", "checkpoint_step": "100"}
