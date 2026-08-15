@@ -483,18 +483,13 @@ def _build_flash_teacher_extensions():
 
 
 def _exit_process_for_multiturn(exit_code: int) -> None:
-    """Exit adapter for the multi-turn loop, which supplies an exit code and nothing else.
+    """Exit after the multi-turn loop has written its detailed failure record.
 
-    The loop has already collapsed the error to one of the two teacher exit codes by the time it
-    calls this, so recover the classification from the code rather than plumbing the exception
-    through a second parameter that every other caller would have to supply.
+    Both `_opd_run` and its outer catch-all record the stage, exception type, and sanitized detail
+    before calling this adapter. Writing here too would atomically replace that record with a generic
+    exit-code message under the same pid-and-classification filename.
     """
-    classification = "transient" if exit_code == _TRANSIENT_TEACHER_EXIT else "permanent"
-    _exit_teacher_worker(
-        exit_code,
-        classification,
-        f"multi-turn OPD rollout failed with teacher exit code {exit_code}",
-    )
+    os._exit(exit_code)
 
 
 def _build_flash_ppo_trainer(PPOTrainer, tq, KVBatchMeta):

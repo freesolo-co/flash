@@ -4604,8 +4604,8 @@ def test_multiturn_catch_all_writes_stage_type_and_message_before_exit(
     monkeypatch, tmp_path, stage, failure_path
 ):
     from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.child import plugin as child_plugin
     from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
-    from flash.engine.worker.train.opd.child.plugin import _write_child_failure_fallback
 
     child_failure_path = str(tmp_path / "child-failure")
     bridge_token = "bridge-secret-token"
@@ -4627,6 +4627,12 @@ def test_multiturn_catch_all_writes_stage_type_and_message_before_exit(
 
     def child_exit(code):
         raise ChildExit(code)
+
+    monkeypatch.setattr(child_plugin.os, "_exit", child_exit)
+    marked = set()
+
+    async def mark_failed(kwargs):
+        marked.add(kwargs["uid"])
 
     def post_json(_url, _token, path, _payload):
         if path == failure_path:
@@ -4661,9 +4667,10 @@ def test_multiturn_catch_all_writes_stage_type_and_message_before_exit(
         agent_loop_output=SimpleNamespace,
         post_json=post_json,
         score_failure_handler=lambda error: (_ for _ in ()).throw(error),
-        child_failure_handler=_write_child_failure_fallback,
+        child_failure_handler=child_plugin._write_child_failure_fallback,
         deterministic_seed=lambda *_args, **_kwargs: 1,
-        process_exit=child_exit,
+        process_exit=child_plugin._exit_process_for_multiturn,
+        mark_prompt_failed=mark_failed,
     )
     loop_type._run_turns = AgentLoopBase._run_turns
 
@@ -4674,12 +4681,14 @@ def test_multiturn_catch_all_writes_stage_type_and_message_before_exit(
             global_steps=1,
             index=0,
             session_id=0,
+            uid="prompt-1",
         )
 
     with pytest.raises(ChildExit) as exit_error:
         asyncio.run(run_loop())
 
     assert exit_error.value.code == 86
+    assert marked == {"prompt-1"}
     fallback = _read_classified_failure_fallback(child_failure_path)
     assert fallback == (
         "permanent",
@@ -4716,6 +4725,10 @@ def test_child_failure_record_survives_cancellation_during_the_close_request(mon
 
     close_started = threading.Event()
     exits = []
+    marked = set()
+
+    async def mark_failed(kwargs):
+        marked.add(kwargs["uid"])
 
     def post_json(_url, _token, path, _payload):
         if path == "/multiturn/start":
@@ -4749,6 +4762,7 @@ def test_child_failure_record_survives_cancellation_during_the_close_request(mon
         child_failure_handler=_write_child_failure_fallback,
         deterministic_seed=lambda *_args, **_kwargs: 1,
         process_exit=exits.append,
+        mark_prompt_failed=mark_failed,
     )
     loop_type._run_turns = AgentLoopBase._run_turns
 
@@ -4760,6 +4774,7 @@ def test_child_failure_record_survives_cancellation_during_the_close_request(mon
                 global_steps=1,
                 index=0,
                 session_id=0,
+                uid="prompt-cancelled",
             )
         )
         await asyncio.get_running_loop().run_in_executor(None, close_started.wait, 5.0)
@@ -4769,8 +4784,9 @@ def test_child_failure_record_survives_cancellation_during_the_close_request(mon
 
     asyncio.run(run_loop())
 
-    # the exit never runs on this path -- that is the point: the record is the only survivor.
+    # the exit never runs on this path -- the durable record and marker are the only survivors.
     assert exits == []
+    assert marked == {"prompt-cancelled"}
     assert _read_classified_failure_fallback(child_failure_path) == (
         "permanent",
         (
@@ -6634,6 +6650,31 @@ def test_parent_takes_retriability_from_the_child_record_not_the_exit_status():
             teacher_worker_failure=("transient", "[stage=generate] TimeoutError: bridge timed out"),
         )
     assert "bridge timed out" in str(retriable.value)
+
+
+def test_parent_uses_the_most_severe_bridge_or_worker_failure():
+    from flash.engine.worker.perf import RetriableInfraError
+
+    with pytest.raises(RuntimeError) as worker_fatal:
+        _raise_verl_failure(
+            87,
+            ("transient", "teacher service unavailable"),
+            teacher_worker_failure=(
+                "permanent",
+                "[stage=template] ValueError: invalid credentials",
+            ),
+        )
+    assert "invalid credentials" in str(worker_fatal.value)
+    assert not isinstance(worker_fatal.value, RetriableInfraError)
+
+    with pytest.raises(RuntimeError) as bridge_fatal:
+        _raise_verl_failure(
+            86,
+            ("permanent", "teacher rejected credentials"),
+            teacher_worker_failure=("transient", "[stage=generate] TimeoutError: timed out"),
+        )
+    assert "teacher rejected credentials" in str(bridge_fatal.value)
+    assert not isinstance(bridge_fatal.value, RetriableInfraError)
 
 
 def _config(**overrides):
@@ -8739,20 +8780,24 @@ def test_teacher_worker_exit_still_exits_when_the_record_cannot_be_written(monke
     assert exits == [87]
 
 
-def test_multiturn_exit_adapter_maps_the_code_to_its_classification(tmp_path, monkeypatch):
-    import flash.engine.worker.train.opd.child.bridge as bridge
+def test_multiturn_exit_adapter_preserves_the_detailed_record(tmp_path, monkeypatch):
     import flash.engine.worker.train.opd.child.plugin as plugin
 
     base = tmp_path / "teacher-worker-failure"
     monkeypatch.setenv("FLASH_OPD_TEACHER_WORKER_FAILURE_PATH", str(base))
-    monkeypatch.setattr(bridge.os, "_exit", lambda code: None)
+    plugin._write_child_failure_fallback(
+        "transient", "generate", TimeoutError("teacher scoring timed out")
+    )
+    exits = []
+    monkeypatch.setattr(plugin.os, "_exit", exits.append)
 
     plugin._exit_process_for_multiturn(87)
 
-    classification, _message = opd_train._read_classified_failure_fallback(str(base))
-    # 87 is the retriable code: misclassifying it as permanent would turn a retriable blip into a
-    # terminal run failure.
-    assert classification == "transient"
+    assert exits == [87]
+    assert opd_train._read_classified_failure_fallback(str(base)) == (
+        "transient",
+        "[stage=generate] TimeoutError: teacher scoring timed out",
+    )
 
 
 def test_verl_failure_names_the_teacher_worker_when_the_child_code_cannot():

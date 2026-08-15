@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -186,6 +187,7 @@ async def _opd_run(
     transient_teacher_exit: int,
     exit_process,
     child_failure_handler,
+    mark_prompt_failed,
     **kwargs,
 ):
     failure_stage = "template"
@@ -267,6 +269,10 @@ async def _opd_run(
             failure_stage,
             failure_error,
         )
+        # the same production path must clear the transfer-queue marker before cleanup can block or
+        # be cancelled; the outer wrapper never sees ordinary errors because this function catches
+        # them and invokes the hard-exit adapter itself.
+        await mark_prompt_failed(kwargs)
     finally:
         if start_attempted:
             with contextlib.suppress(Exception):
@@ -509,6 +515,12 @@ def build_flash_multi_turn_agent_loop(
         async def run(self, sampling_params: dict[str, Any], **kwargs):
             try:
                 return await self._run(sampling_params, **kwargs)
+            except asyncio.CancelledError:
+                # cancellation is a BaseException and bypasses the ordinary catch-all. the actor
+                # task can still disappear with a live `running` marker, so clear it before the
+                # cancellation escapes; any detailed record written before cleanup remains intact.
+                await mark_failed(kwargs)
+                raise
             except Exception as error:
                 classification = (
                     "transient"
@@ -546,6 +558,7 @@ def build_flash_multi_turn_agent_loop(
                 transient_teacher_exit=transient_teacher_exit,
                 exit_process=exit_process,
                 child_failure_handler=child_failure_handler,
+                mark_prompt_failed=mark_failed,
                 **kwargs,
             )
 

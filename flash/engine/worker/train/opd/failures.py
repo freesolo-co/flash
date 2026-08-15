@@ -191,6 +191,20 @@ def _raise_verl_failure(
         if classification == "transient":
             raise _w.RetriableInfraError(f"transient teacher score delivery failure: {message}")
         raise RuntimeError(f"permanent teacher score delivery failure: {message}")
+    # select the most severe direct teacher evidence across the bridge and its ray actors. the
+    # worker reader has already selected the most severe pid-stamped actor record; letting a
+    # transient bridge failure win over a permanent actor record retries the same deterministic
+    # failure on paid GPUs. on equal severity prefer the worker record because it carries the stage,
+    # exception type, and sanitized detail the bridge summary lacks.
+    if teacher_worker_failure is not None and (
+        teacher_failure is None
+        or teacher_worker_failure[0] == "permanent"
+        or teacher_failure[0] == "transient"
+    ):
+        classification, message = teacher_worker_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(f"transient teacher worker failure: {message}")
+        raise RuntimeError(f"permanent teacher worker failure: {message}")
     if teacher_failure is not None:
         classification, message = teacher_failure
         if classification == "transient":
@@ -198,27 +212,9 @@ def _raise_verl_failure(
                 f"transient teacher failure after bounded retries: {message}"
             )
         raise RuntimeError(f"permanent teacher failure: {message}")
-    # the record decides, not the exit status. every actor writes its own pid-stamped record but
-    # only one reaches os._exit first, and the reader deliberately returns the most SEVERE record
-    # across all of them. taking the headline from the record and the retry decision from the exit
-    # code splits them: a permanent auth failure recorded by one actor, reported under the
-    # transient exit another actor happened to win with, is retried on paid GPUs until the attempt
-    # budget runs out -- every attempt failing on the same bad credential.
-    #
-    # it also outranks the truncation heuristic below, which is an inference drawn from an EARLIER
-    # no-signal batch: a child that recorded a failure and exited with a generic status would be
-    # reported as a fatal completion-cap error, telling the user to raise max_completion_tokens.
-    #
-    # this is why the record is consulted BEFORE the two exit-code branches below rather than after
-    # them: those branches name a classification without carrying the recorded detail, so reaching
-    # them first would discard both the message and the record's own verdict on retriability.
-    if teacher_worker_failure is not None:
-        classification, message = teacher_worker_failure
-        # "worker", not "bridge": the record is written by a dying ray agent-loop ACTOR, and saying
-        # so is what tells the reader the child driver is not the process that failed.
-        if classification == "transient":
-            raise _w.RetriableInfraError(f"transient teacher worker failure: {message}")
-        raise RuntimeError(f"permanent teacher worker failure: {message}")
+    # the worker record also outranks bare child exit codes and the truncation heuristic below.
+    # those branches carry no recorded detail, and the heuristic is only an inference drawn from an
+    # earlier no-signal batch; either one would discard the actor record's own classification.
     # these fire only when the *child driver* exits with a teacher code and left no record. when the
     # teacher path runs inside a ray agent-loop actor -- which is the normal case -- os._exit kills
     # the actor and the driver exits some other way, so these codes never arrive and the fallback
