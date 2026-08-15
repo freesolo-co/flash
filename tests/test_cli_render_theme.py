@@ -81,6 +81,10 @@ def test_styled_path_is_themed_but_lossless(monkeypatch, fake_client, capsys) ->
     assert "cost_usd" in out
     assert '"state": "done"' in out
 
+    assert cli.main(["runs", "status", "flash-1", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["state"] == "done"
+
 
 def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
     # Provider metadata may exist in API payloads for lifecycle/accounting, but human CLI summaries
@@ -347,6 +351,9 @@ def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setattr(runtime_secrets, "resolve_hf_token", lambda *a, **k: "hf_x")
+    monkeypatch.setattr(
+        "flash.cli.commands.deploy._hf_identity_and_write_access", lambda *_: "acme"
+    )
     monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _ExportClient())
 
     # default export (no --public) is private; the card must say so, not "public"

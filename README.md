@@ -44,7 +44,7 @@ path is self-hostable end to end — see **[SELF_HOSTING.md](SELF_HOSTING.md)**.
 
 ## Using the hosted service
 
-`flash login` is not interactive — pass the key explicitly or export `FREESOLO_API_KEY` first:
+`flash login` is not interactive. Export `FREESOLO_API_KEY` first so the key does not appear in process listings:
 
 ```bash
 pip install freesolo-flash
@@ -97,6 +97,7 @@ then pass `RUN_ID/step-N` as the adapter id. To copy a finished adapter into you
 HuggingFace repo:
 
 ```bash
+export HF_TOKEN=hf_...
 flash models export --adapter-id RUN_ID --repository your-org/your-repo
 ```
 

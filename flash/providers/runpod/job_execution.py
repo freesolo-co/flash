@@ -34,6 +34,13 @@ from flash.providers.runpod.serverless import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+# Job statuses that PROVE RunPod took the job out of the queue and therefore granted it a worker.
+# Kept as an allowlist because the complement (`!= "IN_QUEUE"`) also matches None and any status
+# this code does not recognise, which would let one flaky reading stand in as proof of a grant.
+_GRANT_PROVING_STATUSES = frozenset(
+    {"IN_PROGRESS", "COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}
+)
+
 
 @dataclass
 class _DeployContext:
@@ -322,6 +329,10 @@ class _PollState:
     throttled_timer: Any
     queued_timer: Any
     worker_coming_up_at: float | None
+    # latched once RunPod has ever granted a worker. `worker_coming_up_at` is a TTL'd sighting and
+    # so goes false again on any health gap; this never does. The queued-wait stall exemption keys
+    # on it so a flapping health read cannot keep rearming the cold-start budget.
+    ever_saw_worker: bool
 
 
 def _wall_deadline_result(context: _PollContext) -> PollResult | None:
@@ -494,6 +505,7 @@ def _classify_queue_state(
         coming_up = _worker_is_coming_up(_probe_worker_coming_up_at(context, now), now)
         if coming_up:
             state.worker_coming_up_at = now
+            state.ever_saw_worker = True
     if state.queued_timer.expired(
         status == "IN_QUEUE" and not coming_up, now, context.queue_grace_s
     ):
@@ -531,6 +543,14 @@ def _classify_queue_state(
         # flag: a probe that starts failing must not leave a stale true suppressing the
         # capacity timer forever, so it expires after WORKER_COMING_UP_TTL_S.
         state.worker_coming_up_at = now if (usable or recovering) else None
+        if usable or recovering or workers.get("unhealthy"):
+            # an unhealthy worker is an ALLOCATED box whose image failed to start, so it proves the
+            # grant just as much as a healthy one -- `preload_runpod._has_worker` counts it for the
+            # same reason. it deliberately does not feed `worker_coming_up_at` above: that
+            # suppresses the capacity timer for a worker that is coming up, which an unhealthy one
+            # is not. this only records that capacity was never the problem, so health flickering
+            # between unhealthy and empty cannot make a broken box look like starvation.
+            state.ever_saw_worker = True
         if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
             # name the budget this wait is spending, so a queued line separates "still inside its
             # grace" from "wedged". A worker that is coming up suppresses only the capacity and
@@ -611,15 +631,29 @@ def _update_heartbeat(context: _PollContext, state: _PollState) -> None:
     if new_key == state.last_hb_key:
         return
     state.last_hb_key = new_key
+    hb_attempt = _attempt_int(new_key[3])
+    if hb_attempt != context.current_attempt:
+        # non-current heartbeat: ignore so stale progress never tightens the stall window, and so a
+        # previous attempt's worker -- which ran on an allocation this attempt no longer holds --
+        # never stands as proof that THIS attempt was granted one.
+        return
+    # a heartbeat for THIS attempt was written by a worker that ran, so it proves a grant on its own.
+    # that matters on the reattach path: recovery starts with `ever_saw_worker` false and, if the job
+    # was already requeued before attaching, never gets to observe the earlier IN_PROGRESS. with
+    # health also unreadable the job would look never-granted, stay exempt from the stall check, and
+    # finally be reported `no_capacity` despite having demonstrably run.
+    #
+    # deliberately ABOVE the `stage is None` return: that return drops liveness pings, which are most
+    # of what setup publishes (`sft_model_load`, `*_data_loading`, `*_configuring`). A ping proves a
+    # worker ran just as well as a staged heartbeat -- it must not advance the stall clock, which is
+    # why it still returns below, but it is evidence of a grant, and only the grant question is
+    # settled here.
+    state.ever_saw_worker = True
     if stage is None:
         return
     hb_ts = new_key[2]
     hb_step = new_key[1]
-    hb_attempt = _attempt_int(new_key[3])
     is_training_hb = is_training_heartbeat(stage, hb_step)
-    if hb_attempt != context.current_attempt:
-        # non-current heartbeat: ignore so stale progress never tightens the stall window.
-        return
     if hb_attempt > state.last_hb_attempt:
         # fresh attempt: reset ts baseline and re-derive seen_training_hb so cold-start grace rearms.
         state.last_hb_attempt = hb_attempt
@@ -638,13 +672,47 @@ def _update_heartbeat(context: _PollContext, state: _PollState) -> None:
 def _classify_stall(context: _PollContext, state: _PollState, status: Any) -> PollResult | None:
     in_setup = context.heartbeat_reader is not None and not state.seen_training_hb
     stall_limit = context.setup_grace_s if in_setup else context.stall_after_s
-    if _jobs.time.time() - state.last_progress <= stall_limit:
+    # a job still IN_QUEUE with no worker granted is not stalled: nothing is running that could
+    # make progress, and _classify_queue_state above already owns this wait on the capacity grace
+    # (returning `no_capacity`, the failure the supervisor routes on). The two limits are
+    # independent, so a capacity grace scaled past the stall limit -- a 4-card shape waits 3600s
+    # against a 3000s setup grace -- would otherwise be cut short HERE by a timer measuring the
+    # absence of a worker that was never granted, mislabelled "stalled", and re-requesting the same
+    # class exactly as before. Defer to the capacity timer for this state instead of racing it.
+    #
+    # Only for the no-worker case: once health shows one coming up, the queue timer is suppressed
+    # and the setup grace legitimately governs the cold start, unscaled, as it always did.
+    now = _jobs.time.time()
+    if (
+        status == "IN_QUEUE"
+        and not state.ever_saw_worker
+        and not _worker_is_coming_up(state.worker_coming_up_at, now)
+    ):
+        # The wait is exempt, so the clock this function measures has to be exempt with it: it
+        # anchors on the last status CHANGE, which for a job queued from the start is the moment it
+        # entered the queue. Leaving it there would bank the whole queued wait against the cold
+        # start, so a worker granted late -- after 3000s of queueing, but inside a 4-card's 3600s
+        # capacity grace -- would be declared stalled on its very first poll, having been given no
+        # time to boot at all. Roll the anchor forward while the exemption holds so the grant
+        # starts the cold-start budget from zero, exactly as an immediate grant does.
+        #
+        # Strictly PRE-grant, hence `ever_saw_worker` gating the branch itself rather than just the
+        # re-anchor. `worker_coming_up_at` is a TTL'd sighting that goes false again on any health
+        # gap, so exempting on it alone means a worker granted and then lost -- health reporting it
+        # once, then empty -- keeps skipping the stall check forever. The queue timer (rearmed by
+        # the same gap) then runs to the scaled capacity grace and reports `no_capacity` for a GPU
+        # that WAS granted, which is both the wrong limit and the wrong label: it can trip the
+        # supervisor's weight-cache drop on a run that never had a capacity problem. Past the first
+        # grant every observation belongs to the setup timer.
+        state.last_progress = now
+        return None
+    if now - state.last_progress <= stall_limit:
         return None
     phase = "setup (pre-training)" if in_setup else "training"
     return PollResult(
         False,
         failure="stalled",
-        detail=f"no worker progress for {int(_jobs.time.time() - state.last_progress)}s "
+        detail=f"no worker progress for {int(now - state.last_progress)}s "
         f"during {phase} (job status {status}, limit {int(stall_limit)}s)",
     )
 
@@ -726,6 +794,7 @@ def poll_job(
         # while a worker is initializing or usable; carry that observation forward so the capacity
         # timer gets it too, and a heavy image can never self-report as no_capacity.
         worker_coming_up_at=None,
+        ever_saw_worker=False,
     )
     while True:
         terminal = _wall_deadline_result(context)
@@ -737,6 +806,19 @@ def poll_job(
         if provider_status is None:
             continue
         status = provider_status.get("status")
+        if status in _GRANT_PROVING_STATUSES:
+            # leaving the queue proves RunPod granted a worker, whatever health says. the two
+            # health-derived latch sites go quiet when the health endpoint is unreachable (both
+            # swallow their errors), and RunPod can requeue a job that already ran -- which would
+            # otherwise leave the requeued job looking never-granted, exempt from the setup-stall
+            # check forever.
+            #
+            # an allowlist, never `!= "IN_QUEUE"`: that shape also matches None and any unrecognized
+            # string, so a single flaky job_status response would permanently "prove" a grant, drop
+            # the queued-wait exemption, and let a genuine capacity wait die as `stalled` -- losing
+            # the weight-cache fallback that only `no_capacity` triggers. `preload_runpod.py` hit
+            # this first and its comment warns against exactly this pattern.
+            state.ever_saw_worker = True
         if status != state.last_status:
             say(f"job {handle.job_id}: {status}")
             state.last_status = status

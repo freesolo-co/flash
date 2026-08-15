@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
+from flash.core.spec import gpu_count_of
 from flash.providers._lifecycle.deadline import (
     deadline_kwargs,
     require_create_allowance,
@@ -65,6 +66,7 @@ __all__ = [
     "apply_disk_gb",
     "build_function_input",
     "capacity_escalation_note",
+    "capacity_grace_multiplier",
     "decode_output",
     "deploy_train_endpoint",
     "grow_weight_cache_volumes",
@@ -85,6 +87,28 @@ __all__ = [
 # giving up. purely a timing knob -- it says nothing about whether a retry follows, because
 # on_last_gpu (runner/lifecycle.py) is also true when the infra retry budget is exhausted.
 LAST_GPU_CAPACITY_GRACE_S = 900.0
+
+# multi-card shapes are rarer than single cards, so a grace sized for 1x expires on a 4x wait that
+# was merely slow rather than starved. expiring it does not find capacity faster: the supervisor
+# tears the endpoint down and re-requests THE SAME class (`_select_candidate` re-picks the only
+# fitting shape once nothing is untried), so the run pays a fresh cold start to rejoin the same
+# queue it just left. observed: 3-5 attempts and ~55 min of queueing per arm before a single
+# optimizer step, with the multi-GPU arms churning most. scale the wait with the card count
+# instead, so scarcity is waited out on one queue position rather than re-requested.
+CAPACITY_GRACE_PER_GPU_CAP = 4
+
+
+def capacity_grace_multiplier(gpu_count: int) -> int:
+    """Scarcity multiplier on the capacity grace for a ``gpu_count``-card shape.
+
+    Linear in the card count and capped: a 4x shape waits 4x as long as a 1x one, and anything
+    wider than the cap waits the cap rather than growing without bound. Single-card runs multiply
+    by 1, so their timing is exactly what it was.
+    """
+    if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
+        return 1
+    return min(gpu_count, CAPACITY_GRACE_PER_GPU_CAP)
+
 
 # how long ONE "a worker is coming up" health reading keeps suppressing the capacity timer. probes
 # run every 90s, so this absorbs a couple of missed or failed probes and no more: if health stops
@@ -107,9 +131,12 @@ PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
 TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
 
 
-def stall_kwargs(on_last_gpu: bool = False) -> dict:
-    """poll_job stall-window kwargs. queue/throttled grace is ~5 min normally, ~15 min on last GPU (nowhere left to walk)."""
-    grace = LAST_GPU_CAPACITY_GRACE_S if on_last_gpu else 300.0
+def stall_kwargs(on_last_gpu: bool = False, gpu_count: int = 1) -> dict:
+    """poll_job stall-window kwargs. queue/throttled grace is ~5 min normally, ~15 min on last GPU
+    (nowhere left to walk), then scaled by the card count because multi-card shapes are scarcer."""
+    grace = (LAST_GPU_CAPACITY_GRACE_S if on_last_gpu else 300.0) * capacity_grace_multiplier(
+        gpu_count
+    )
     return {
         "stall_after_s": 1500.0,
         "setup_grace_s": 3000.0,
@@ -740,7 +767,9 @@ def submit_run(
         current_attempt=attempt_id,
         **deadline_kwargs(poll_job, deadline_at),
         on_last_gpu=on_last_gpu,
-        **stall_kwargs(on_last_gpu=on_last_gpu),
+        # the count actually rented for this attempt, which allocation may have resolved to fewer
+        # cards than the spec's ceiling named -- so read the effective spec, not the run's request.
+        **stall_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
     )
 
 
