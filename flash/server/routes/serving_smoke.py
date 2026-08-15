@@ -23,7 +23,7 @@ from referencing.exceptions import Unresolvable
 from flash.adapters.lora_rank import serving_completion_token_capacity
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.core.spec import JobSpec
-from flash.serve.deploy import RetryableServingUnavailable, ServingError
+from flash.serve.deploy import AliasThinkingSilent, RetryableServingUnavailable, ServingError
 from flash.serve.preflight import (
     SERVING_PROMPT_TOKEN_ALLOWANCE,
     ExternalSchemaReference,
@@ -319,6 +319,73 @@ def _validate_structured_smoke(
         raise ServingError(f"configured structured-output regex is invalid: {exc}") from exc
 
 
+def _smoke_request_settings(spec: JobSpec) -> tuple[dict | None, int, list[str] | None]:
+    train = getattr(spec, "train", None)
+    constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
+    max_tokens = 256
+    # thinking spends tokens before content regardless of grammar, so 256 can truncate the think
+    # block and reject a healthy deployment. the resolver widens it to what the run reasons within,
+    # bounded by a smoke-specific ceiling. a grammar lifts that ceiling because the smoke generates
+    # under the adapter's serving default and its shortest legal answer may be longer.
+    if spec.thinking:
+        max_tokens = max(
+            256, resolve_smoke_completion_tokens(spec, constrained=constraint is not None)
+        )
+        serving_capacity = serving_completion_token_capacity(
+            spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
+        )
+        if serving_capacity is not None:
+            max_tokens = min(max_tokens, serving_capacity)
+    stop_sequences = [str(value) for value in (getattr(train, "stop_sequences", ()) or ())]
+    return constraint, max_tokens, stop_sequences or None
+
+
+def _bounded_smoke_chat(
+    *,
+    serving_model: str,
+    thinking: bool,
+    expected_checkpoint: str,
+    expected_adapter_revision: str,
+    max_tokens: int,
+    stop_sequences: list[str] | None,
+    deadline: float,
+    budget_s: float,
+    error_context: str | None = None,
+) -> dict:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _smoke_timeout_error(budget_s)
+        try:
+
+            def _chat_call(timeout_s: float = remaining):
+                return _app.serve_chat(
+                    run_id=serving_model,
+                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    thinking=thinking,
+                    expected_checkpoint=expected_checkpoint,
+                    expected_adapter_revision=expected_adapter_revision,
+                    timeout_s=timeout_s,
+                    retry_unavailable=True,
+                    stop=stop_sequences,
+                )
+
+            return _bounded_call(_chat_call, deadline=deadline, budget_s=budget_s)
+        except RetryableServingUnavailable as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _smoke_timeout_error(budget_s) from exc
+            time.sleep(min(exc.retry_after_seconds, remaining))
+        except ServingError:
+            raise
+        except Exception as exc:
+            if error_context is None:
+                raise
+            raise ServingError(f"{error_context}: {exc}") from exc
+
+
 def _run_deployment_smoke(
     run_id: str,
     spec: JobSpec,
@@ -329,60 +396,17 @@ def _run_deployment_smoke(
 ) -> dict:
     started = time.monotonic()
     deadline = started + budget_s
-    train = getattr(spec, "train", None)
-    constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
-    max_tokens = 256
-    # thinking spends tokens before content regardless of grammar, so 256 can truncate the think
-    # block and reject a healthy deployment. the resolver widens it to what the run reasons within,
-    # bounded by a smoke-specific ceiling -- this budget is spent from the same wall clock that must
-    # also cold-start the base model and load the adapter, so it cannot track the training context.
-    # a grammar lifts that ceiling: it is the adapter's serving default, so the smoke generates under
-    # it, and the shortest string it admits may be longer than the ceiling allows.
-    if spec.thinking:
-        max_tokens = max(
-            256, resolve_smoke_completion_tokens(spec, constrained=constraint is not None)
-        )
-        serving_capacity = serving_completion_token_capacity(
-            spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
-        )
-        if serving_capacity is not None:
-            max_tokens = min(max_tokens, serving_capacity)
-    # a run trained with stop_sequences terminates on its delimiter and need never emit EOS. without
-    # forwarding them the smoke generates past the answer to max_tokens, comes back
-    # finish_reason="length", and the truncation guard below rejects a checkpoint that answered
-    # correctly.
-    stop_sequences = [str(value) for value in (getattr(train, "stop_sequences", ()) or ())]
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise _smoke_timeout_error(budget_s)
-        try:
-
-            def _smoke_call(timeout_s: float = remaining):
-                return _app.serve_chat(
-                    run_id=serving_model,
-                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
-                    temperature=0.0,
-                    max_tokens=max_tokens,
-                    thinking=spec.thinking,
-                    expected_checkpoint=expected_checkpoint,
-                    timeout_s=timeout_s,
-                    retry_unavailable=True,
-                    stop=stop_sequences or None,
-                )
-
-            result = _bounded_call(
-                _smoke_call,
-                deadline=deadline,
-                budget_s=budget_s,
-            )
-        except RetryableServingUnavailable as exc:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _smoke_timeout_error(budget_s) from exc
-            time.sleep(min(exc.retry_after_seconds, remaining))
-            continue
-        break
+    constraint, max_tokens, stop_sequences = _smoke_request_settings(spec)
+    result = _bounded_smoke_chat(
+        serving_model=serving_model,
+        thinking=spec.thinking,
+        expected_checkpoint=expected_checkpoint,
+        expected_adapter_revision=serving_model,
+        max_tokens=max_tokens,
+        stop_sequences=stop_sequences,
+        deadline=deadline,
+        budget_s=budget_s,
+    )
     content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
     # truncation is a thinking-budget failure whether or not a grammar is configured: serving
     # returns the reasoning in reasoning_content, so a run cut off mid-thought still arrives with a
@@ -406,4 +430,60 @@ def _run_deployment_smoke(
         "verify_finish_reason": finish,
         "thinking_tag": "<think>" in content or "</think>" in content,
         "verify_sample": answer[:160],
+    }
+
+
+def _alias_reasoning_content(result: dict, run_id: str, adapter_revision: str) -> str:
+    choices = result.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    message = choice.get("message") if isinstance(choice, dict) else None
+    if not isinstance(message, dict):
+        raise ServingError("alias thinking verification returned a malformed chat message")
+    if "reasoning_content" not in message:
+        raise AliasThinkingSilent(
+            run_id,
+            adapter_revision,
+            detail=(
+                "the alias returned no direct reasoning_content field while the immutable revision "
+                "smoked with reasoning enabled"
+            ),
+        )
+    reasoning = message.get("reasoning_content")
+    if not isinstance(reasoning, str):
+        raise ServingError("alias thinking verification returned non-string reasoning_content")
+    return reasoning
+
+
+def _verify_alias_thinking(
+    run_id: str,
+    spec: JobSpec,
+    adapter_revision: str,
+    expected_checkpoint: str,
+    *,
+    budget_s: float = _SMOKE_BUDGET_SECONDS,
+) -> dict:
+    """Confirm the freshly activated alias serves the activated revision with reasoning metadata."""
+    started = time.monotonic()
+    deadline = started + budget_s
+    _, max_tokens, stop_sequences = _smoke_request_settings(spec)
+    result = _bounded_smoke_chat(
+        serving_model=run_id,
+        thinking=True,
+        expected_checkpoint=expected_checkpoint,
+        expected_adapter_revision=adapter_revision,
+        max_tokens=max_tokens,
+        stop_sequences=stop_sequences,
+        deadline=deadline,
+        budget_s=budget_s,
+        error_context=f"alias thinking verification could not reach {run_id}",
+    )
+
+    _smoke_provenance(result, adapter_revision, expected_checkpoint)
+    _alias_reasoning_content(result, run_id, adapter_revision)
+    if time.monotonic() > deadline:
+        raise _smoke_timeout_error(budget_s)
+    return {
+        "alias_thinking_tag": True,
+        "alias_thinking_verified_at": time.time(),
+        "alias_thinking_latency_s": time.monotonic() - started,
     }

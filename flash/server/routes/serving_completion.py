@@ -18,7 +18,12 @@ from flash.runner import (
     mark_checkpoint_deployed,
     verified_adapter_revision_generation,
 )
-from flash.serve.deploy import ActivationOutcomeUnknown, AdapterConfigMissing, ServingError
+from flash.serve.deploy import (
+    ActivationOutcomeUnknown,
+    AdapterConfigMissing,
+    AliasThinkingSilent,
+    ServingError,
+)
 from flash.server import app as _app
 from flash.server.platform import db
 
@@ -77,9 +82,14 @@ def recover_deployments() -> int:
                 detail = "deployment retired: its algorithm was removed; submit a new run to deploy"
             else:
                 continue
+            recovered_state = (
+                "reconciling"
+                if state == "reconciling" and deployment.get("activation_outcome_unknown") is True
+                else "failed"
+            )
             failed = _deployment_state(
                 deployment,
-                "failed",
+                recovered_state,
                 error=error,
                 detail=detail,
                 recovered_at=time.time(),
@@ -232,7 +242,6 @@ def _finish_deployment_unlocked(
     *,
     run_id: str,
     spec_dict: dict,
-    checkpoint_step: int | None,
     is_checkpoint: bool,
     deploy_kwargs: dict,
     deployment: dict,
@@ -247,16 +256,15 @@ def _finish_deployment_unlocked(
         return
     current = dict(deployment)
     smoke_result: dict = {}
-    activated = False
+    activation_target: tuple[str, str] | None = None
 
     def _assert_activation_fence() -> None:
         _assert_deployment_activation_fence(run_id, deployment, is_checkpoint, prev_state)
 
     def _before_activate(adapter_revision: str, checkpoint: str) -> None:
-        nonlocal current
+        nonlocal activation_target, current
         _assert_activation_fence()
-        # smoke is unconditional for real deployments: alias activation only ever follows a
-        # verified generation against the immutable revision.
+        activation_target = (adapter_revision, checkpoint)
         current = _deployment_state(
             {**current, "adapter_revision": adapter_revision},
             "smoke_testing",
@@ -292,67 +300,133 @@ def _finish_deployment_unlocked(
 
     try:
         dep = _app.deploy_adapter(**deploy_kwargs, before_activate=_before_activate)
-        activated = True
-        current = {**current, **dep.to_dict()}
-        current.pop("activation_outcome_unknown", None)
-        current["verify"] = True
-        current = _deployment_state(
+    except ActivationOutcomeUnknown as exc:
+        reconciling = _deployment_state(
             current,
-            "ready",
-            detail="immutable revision verified and alias activated",
-            **smoke_result,
+            "reconciling",
+            error=str(exc),
+            detail="alias activation outcome is unknown; authoritative reconciliation required",
+            activation_outcome_unknown=True,
         )
-        verification_generation = current.get("verification_generation")
-        current = _public_deployment(current)
+        previous = _app.get_status(run_id)
+        marked = _serving.mark_deployment_failed(run_id, reconciling)
+        _serving._report_persisted_transition(
+            previous, marked, persisted=marked.deployment == reconciling
+        )
+        return
+    except Exception as exc:
+        _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
+        return
 
-        def _commit_ready() -> bool:
-            return _commit_ready_deployment(
-                run_id, current, verification_generation, is_checkpoint, prev_state
-            )
+    activated_current = {**current, **dep.to_dict()}
+    activated_current.pop("activation_outcome_unknown", None)
+    try:
+        if spec.thinking and smoke_result.get("thinking_tag"):
+            if activation_target is None:
+                raise ServingError(
+                    "deploy_adapter returned without reporting its activation target"
+                )
+            _verify_activated_alias_thinking(run_id, spec, activation_target, smoke_result)
+    except Exception as exc:
+        _record_post_activation_failure(run_id, exc, activated_current)
+        return
 
-        def _reconcile_commit_miss() -> None:
+    current = dict(activated_current)
+    current["verify"] = True
+    current = _deployment_state(
+        current,
+        "ready",
+        detail="immutable revision verified and alias activated",
+        **smoke_result,
+    )
+    verification_generation = current.get("verification_generation")
+    current = _public_deployment(current)
+    try:
+        if not _commit_ready_deployment(
+            run_id, current, verification_generation, is_checkpoint, prev_state
+        ):
             _reconcile_ready_commit_miss(
                 run_id, current, verification_generation, is_checkpoint, deployment
             )
-
-        if not _commit_ready():
-            _reconcile_commit_miss()
-            return
     except Exception as exc:
-        if isinstance(exc, ActivationOutcomeUnknown):
-            reconciling = _deployment_state(
-                current,
-                "reconciling",
-                error=str(exc),
-                detail="alias activation outcome is unknown; authoritative reconciliation required",
-                activation_outcome_unknown=True,
-            )
-            previous = _app.get_status(run_id)
-            marked = _serving.mark_deployment_failed(run_id, reconciling)
-            _serving._report_persisted_transition(
-                previous, marked, persisted=marked.deployment == reconciling
-            )
-            return
-        if activated:
-            try:
-                latest = _app.get_status(run_id)
-                latest_deployment = latest.deployment or {}
-                if (
-                    latest_deployment.get("adapter_revision") == current.get("adapter_revision")
-                    and latest_deployment.get("state") in _DEPLOYMENT_READY_STATES
-                ):
-                    return
-                if not _commit_ready():
-                    _reconcile_commit_miss()
-            except Exception as recovery_exc:
-                divergence = (
-                    "deployment_record_diverged: serving alias was activated for "
-                    f"{current.get('adapter_revision')} but ready-state recovery failed after "
-                    f"{exc!r}: {recovery_exc!r}"
+        try:
+            latest = _app.get_status(run_id)
+            latest_deployment = latest.deployment or {}
+            if (
+                latest_deployment.get("adapter_revision") == current.get("adapter_revision")
+                and latest_deployment.get("state") in _DEPLOYMENT_READY_STATES
+            ):
+                return
+            if not _commit_ready_deployment(
+                run_id, current, verification_generation, is_checkpoint, prev_state
+            ):
+                _reconcile_ready_commit_miss(
+                    run_id, current, verification_generation, is_checkpoint, deployment
                 )
-                print(f"deploy[{run_id}]: {divergence}", flush=True)
-            return
-        _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
+        except Exception as recovery_exc:
+            divergence = (
+                "deployment_record_diverged: serving alias was activated for "
+                f"{current.get('adapter_revision')} but ready-state recovery failed after "
+                f"{exc!r}: {recovery_exc!r}"
+            )
+            print(f"deploy[{run_id}]: {divergence}", flush=True)
+
+
+def _record_post_activation_failure(run_id: str, exc: Exception, current: dict) -> None:
+    failed_source = dict(current)
+    failed_source.pop("activation_outcome_unknown", None)
+    failed_source.pop("previous_deployment", None)
+    fields = {"alias_activation_confirmed": True}
+    if isinstance(exc, AliasThinkingSilent):
+        fields["alias_thinking_tag"] = False
+    failed = _deployment_state(
+        failed_source,
+        "failed",
+        error=str(exc),
+        detail="alias activated but post-activation verification failed; redeploy to retry",
+        **fields,
+    )
+    try:
+        previous = _app.get_status(run_id)
+        marked = _serving.mark_deployment_failed(run_id, failed)
+        _serving._report_persisted_transition(
+            previous, marked, persisted=_deployment_failure_persisted(marked, failed)
+        )
+    except Exception as persistence_exc:
+        divergence = (
+            "deployment_record_diverged: serving alias was activated for "
+            f"{failed.get('adapter_revision')} but failure-state recovery did not complete after "
+            f"{exc!r}: {persistence_exc!r}"
+        )
+        print(f"deploy[{run_id}]: {divergence}", flush=True)
+
+
+def _verify_activated_alias_thinking(
+    run_id: str,
+    spec: JobSpec,
+    activation_target: tuple[str, str],
+    smoke_result: dict,
+) -> None:
+    """Prove the freshly activated alias kept the reasoning channel the revision smoked with.
+
+    Raises `ServingError` when it did not, which reaches the caller's failure path with the alias
+    already live. That is the correct direction: the alias serves a real adapter and answers
+    normally, so tearing it down would replace a degraded deployment with none, but committing
+    `ready` would state that a thinking deployment thinks when it demonstrably does not.
+
+    Gated on the smoke's own `thinking_tag` so this only ever fires on a genuine regression: if the
+    pinned revision produced no reasoning either, the smoke has already judged that (it raises for a
+    catalog model), and the difference this check exists to catch is not present.
+    """
+    revision, expected_checkpoint = activation_target
+    smoke_result.update(
+        _serving._verify_alias_thinking(
+            run_id,
+            spec,
+            revision,
+            expected_checkpoint,
+        )
+    )
 
 
 def _record_deployment_failure(

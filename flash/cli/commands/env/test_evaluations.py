@@ -1,12 +1,13 @@
 """Offline contract checks for an environment's evaluation sidecar.
 
-Split from `test.py` to keep that file under the 1000-line gate. This group is cohesive and has one
-entry point, `check_evaluation_suites`: everything else here exists to build one held-out case's
-prompt and replayed response the same way `flash env eval` would.
+Split from `test.py` to keep that file under the 1000-line gate. Single-turn cases validate prompt
+construction and reference replay. Episode cases validate initial rollout and prompt construction,
+then bind the scorer signature without executing it against unfinished state.
 """
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 from flash.cli.commands.env.push import _err
@@ -76,7 +77,41 @@ def _evaluation_response(env, case) -> tuple[str, str]:
     return policy, response
 
 
+def _check_episode_evaluation_prompt(env, case) -> None:
+    """Validate the held-out case's initial rollout state and prompt without advancing it."""
+    # imported here rather than at module scope: `test.py` imports this module.
+    from flash.cli.commands.env.test import _new_multi_turn_replay_state, _new_record
+
+    _new_multi_turn_replay_state(env, _evaluation_example(case), _new_record())
+
+
+def _validate_episode_scorer_signature(scorer, case, state_style: str | None) -> None:
+    """Bind the online scorer call shape without executing it against unfinished state."""
+    if not callable(scorer):
+        raise TypeError("evaluation suite score must be callable")
+    try:
+        signature = inspect.signature(scorer)
+    except (TypeError, ValueError):
+        # some builtins and extension callables expose no signature, so keep the permissive runtime
+        # behavior without calling them during an offline check.
+        return
+
+    response = "response"
+    state = {}
+    if state_style is None:
+        signature.bind(case, response)
+    elif state_style == "keyword":
+        signature.bind(case, response, state=state)
+    else:
+        signature.bind(case, response, state)
+
+
 def _check_evaluation_suites(entrypoint: Path, env) -> bool:
+    from flash.cli.commands.env.episode import (
+        _grades_episodes,
+        _state_argument,
+        _warn_if_episode_state_is_hidden,
+    )
     from flash.envs.evaluations import (
         _DEFAULT_EVALUATIONS_PATH,
         EvalSuiteReport,
@@ -107,9 +142,28 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
                     f"evaluation suite {suite.name} failed contract checks: suite produced no cases"
                 )
                 continue
+            episode_suite = _grades_episodes(suite)
+            if episode_suite and not getattr(env, "multi_turn", False):
+                raise TypeError(
+                    "suite sets grades_episodes = True, but this environment is single-turn "
+                    "and has no episode to play"
+                )
+            scorer = getattr(suite, "score", None)
+            if episode_suite:
+                state_style = _state_argument(scorer)
+                _warn_if_episode_state_is_hidden(suite, state_style)
+                for case in cases:
+                    _check_episode_evaluation_prompt(env, case)
+                _validate_episode_scorer_signature(scorer, cases[0], state_style)
+                print(
+                    f"evaluation suite {suite.name}: {len(cases)}/{len(cases)} cases "
+                    "passed contract checks"
+                )
+                continue
+
             for index, case in enumerate(cases, start=1):
                 _policy, response = _evaluation_response(env, case)
-                scored = suite.score(case, response)
+                scored = scorer(case, response)
                 result = normalize_eval_result(
                     case,
                     response,

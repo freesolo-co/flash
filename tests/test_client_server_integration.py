@@ -237,6 +237,11 @@ def test_dry_run_create_previews_on_the_server(make_client) -> None:
     # Persisted like any run — retrievable and listed — but no GPU was ever allocated.
     assert client.get_run(run_id)["state"] == "dry_run"
     assert run_id in [r["run_id"] for r in client.list_runs()]
+    # the derived prompt budget travels with the preview and remains visible through runs status.
+    budget = created["prompt_budget"]
+    assert budget["context_source"] == "recipe_default"
+    assert budget["prompt_budget"] == budget["engine_len"] - budget["max_completion"]
+    assert client.get_run(run_id)["prompt_budget"] == budget
 
 
 def test_logs_offset_paging_roundtrip(make_client) -> None:

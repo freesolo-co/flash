@@ -127,11 +127,13 @@ def prepare_job(
     owner_org_id = _runner()._context_org_id(billing_context) or _runner()._context_org_id(
         platform_context
     )
-    public_spec, worker_spec, adapter_identity = _runner()._prepare_init_from_adapter(
-        spec,
-        owner_org_id=owner_org_id,
-        owner_key_id=owner_key_id,
-        token=os.environ.get("HF_TOKEN"),
+    public_spec, worker_spec, adapter_identity, warm_start_context = (
+        _runner()._prepare_init_from_adapter(
+            spec,
+            owner_org_id=owner_org_id,
+            owner_key_id=owner_key_id,
+            token=os.environ.get("HF_TOKEN"),
+        )
     )
     # these read-only gates belong to preparation: every submit path passes here exactly once, and
     # callers receive the pinned worker spec before quoting, affordability, persistence, or allocation.
@@ -149,11 +151,20 @@ def prepare_job(
     from flash.cost.spec import estimate_for_spec
 
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
+    # derive the rl prompt budget from the same resolved spec the quote is built from, so the
+    # reported budget describes the run that was actually priced and submitted.
+    from flash.engine.plan.prompt_budget import rl_prompt_budget
+
+    prompt_budget = rl_prompt_budget(
+        worker_spec,
+        warm_start_context=warm_start_context,
+    )
     return _runner().PreparedJob(
         public_spec=public_spec,
         worker_spec=worker_spec,
         estimated_cost_usd=estimated_cost_usd,
         adapter_identity=adapter_identity,
+        prompt_budget=prompt_budget,
     )
 
 
@@ -267,6 +278,7 @@ def submit_job(
         platform_context=platform_context,
         workload_profile_input_digest=worker_spec.workload_profile_input_digest or None,
         workload_profile=worker_spec.workload_profile or None,
+        prompt_budget=prepared.prompt_budget,
         effective_preparation={
             "worker_spec": worker_spec.to_internal_dict(),
             "workload_profile": worker_spec.workload_profile or None,
