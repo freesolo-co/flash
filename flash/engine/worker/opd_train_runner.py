@@ -447,16 +447,12 @@ def _materialize_child_files(
         int(getattr(request.spec.gpu, "count", 1) or 1),
         workload.prompts_per_step * knobs.group_size,
     )
-    save_freq = (
-        math.gcd(*knobs.save_at_steps)
-        if knobs.save_at_steps
-        else max(1, min(knobs.save_every, workload.update_horizon))
-    )
+    default_save_freq = max(1, min(knobs.save_every, workload.update_horizon))
+    save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else default_save_freq
     # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
     loggers = _opd_train.resolve_verl_loggers(caps)
-    project_name = (
-        request.spec.wandb.project if request.spec and request.spec.wandb else None
-    ) or "flash"
+    wandb = request.spec.wandb if request.spec else None
+    project_name = wandb.project if wandb and wandb.project else "flash"
     experiment_name = _opd_train._w.wandb_run_name()
     entry_path, reward_path = _write_child_shims(
         request,
