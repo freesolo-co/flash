@@ -135,6 +135,11 @@ class FreesoloEnvironment(BaseEnvironment):
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None
+        # id(row) -> that row's one TaskExample, filled by dataset() as it builds the rows. see
+        # _task_example for why every hook that touches a row must be handed the same object.
+        # written once, before any rollout can run, so concurrent GRPO grading only ever reads it.
+        # keyed on id() and kept exactly as long as _dataset_cache, whose rows own those ids.
+        self._row_tasks: dict[int, Any] = {}
         # whether this run samples <think> blocks. the worker sets it from the JobSpec once the
         # env is loaded; off by default so a CLI-side load (flash env test) grades raw text, which
         # is what an echo/replay harness feeds it.
@@ -169,6 +174,34 @@ class FreesoloEnvironment(BaseEnvironment):
         return cap
 
     def _task_example(self, example: dict):
+        """The ONE ``TaskExample`` for this dataset row, reused by every hook that touches it.
+
+        The SDK hands the env a task object and nothing else: ``score_responses(example, texts)``
+        has no prompt parameter, so the task is the only channel from ``start_episode`` to
+        ``score_response``. Building a fresh one per call cut that channel for single-turn envs --
+        an env that CHOSE something per episode (the image it rendered, a sampled distractor set,
+        a randomized target) conditioned generation on one task object and was then graded against
+        a different one, so the grader could not identify what the model had actually been shown.
+        Silently wrong rewards, which GRPO then optimizes.
+
+        Whether that broke was luck, not design: ``task_example_from_record`` passes a record's
+        ``metadata`` dict through BY REFERENCE but substitutes a fresh ``{}`` when the record has
+        none, so an env stashing its choice in ``example.metadata`` survived only for rows whose
+        source data happened to carry a metadata field. One task per row makes it uniform.
+
+        This is the contract the multi-turn path already has -- ``new_rollout_state`` builds the
+        task once and ``_score_episode`` grades with that same ``state["task"]``. Single-turn now
+        matches it rather than being the odd one out.
+
+        The tasks are built by :meth:`dataset` alongside the rows themselves, keyed by row
+        IDENTITY, so this is a lookup rather than a cache: there is no fill, no eviction and no
+        lock, and a row can never be graded through a task built for a different one. Anything
+        that is not a dataset row -- an eval case, a bare ``{"output": ...}`` -- has no episode to
+        preserve and gets a per-call task, exactly as before.
+        """
+        task = self._row_tasks.get(id(example))
+        if task is not None:
+            return task
         return self._task_example_from_record(self._canonical_record(example))
 
     def _with_system_prompt(self, messages: list[dict]) -> list[dict]:
@@ -260,6 +293,7 @@ class FreesoloEnvironment(BaseEnvironment):
                     f"not the packaged file {self._source} ({file_rows} rows)"
                 )
         records = []
+        row_tasks: dict[int, Any] = {}
         for example in examples:
             raw = dict(getattr(example, "record", {}) or {})
             if _CANONICAL_INPUT_KEY not in raw and getattr(example, "input", None) is not None:
@@ -274,7 +308,14 @@ class FreesoloEnvironment(BaseEnvironment):
                 raw["id"] = example_id
             record = self._canonical_record(raw)
             records.append(record)
+            # build this row's ONE task here, next to the row itself: every later hook --
+            # start_episode, sft_completion, scoring -- looks it up instead of minting its own.
+            # see _task_example.
+            row_tasks[id(record)] = self._task_example_from_record(record)
+        # assigned together: the rows own the ids the task map is keyed on, so neither may be
+        # visible without the other.
         self._dataset_cache = records
+        self._row_tasks = row_tasks
         return records
 
     def prompt_messages(self, example: dict) -> list[dict]:

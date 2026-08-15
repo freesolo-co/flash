@@ -288,6 +288,9 @@ class StarterMultiTurnEnv(EnvironmentMultiTurn):
     ) -> EnvironmentStepResult:
         # Advance the world after one assistant action. Return done=True to end the
         # episode, or append an observation message and keep going.
+        # `messages` already ends with this action: messages[-1]["content"] is
+        # `assistant_response`. If you rebuild state by replaying the transcript, replay
+        # `messages[:-1]` and apply `assistant_response` once, or you apply it twice.
         try:
             guess = int(assistant_response.strip().split()[0])
         except (ValueError, IndexError):
