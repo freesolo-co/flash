@@ -21,7 +21,10 @@ from http.server import BaseHTTPRequestHandler
 
 from flash.engine.worker.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.score_batcher import ScoreBatcher
-from flash.engine.worker.train.core.child.glue import validate_transcript_messages
+from flash.engine.worker.train.core.child.glue import (
+    ENVIRONMENT_REPLY_SOURCE,
+    validate_transcript_messages,
+)
 from flash.engine.worker.train.rl.scoring import RolloutScoreRequest, score_rollouts
 
 # how many concurrently-finished episodes the multi-turn bridge scores in ONE env call. a whole
@@ -215,7 +218,9 @@ class MultiTurnBridge:
             return {"terminal": True, "messages": []}
         return {
             "terminal": False,
-            "messages": validate_transcript_messages(list(replies), source="environment reply"),
+            "messages": validate_transcript_messages(
+                list(replies), source=ENVIRONMENT_REPLY_SOURCE
+            ),
         }
 
     def _score_batch(self, requests: list) -> list:

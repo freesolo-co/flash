@@ -2014,6 +2014,40 @@ def test_an_image_bearing_env_reply_reaches_the_scorer_as_blocks_not_as_a_repr(m
     )
 
 
+def test_a_reused_env_block_list_does_not_rewrite_already_recorded_turns(monkeypatch):
+    """A recorded turn is a permanent record, so it cannot alias a list the env keeps mutating.
+
+    An env that renders into ONE list (a board redrawn each step) hands back the same object every
+    turn. ``dict(message)`` is a shallow copy, so without an explicit copy the turn recorded on step
+    1 and the turn recorded on step 2 are the same list -- and the scorer reads the final image as
+    the entire trajectory. ``str()`` used to make these turns immune by accident; keeping the blocks
+    means owning the copy.
+    """
+    reused = [{"type": "text", "text": "board v1"}]
+
+    class _MutatingReplyEnv(_SteppingMultiTurnEnv):
+        def step_episode(self, example, messages, assistant_response):
+            return _EnvironmentStepResult(
+                done=False,
+                messages=({"role": "user", "content": reused},),
+                final_response_text=None,
+            )
+
+    env = _thinking_env(monkeypatch, _MutatingReplyEnv(), prompt_opens_thinking=False)
+    state = env.new_rollout_state({"id": "a", "input": "2+2?", "output": "4"})
+    env.record_model_turn(state, _THINK_COMPLETION)
+    env.env_reply(state["messages"], state)
+
+    # the env redraws its board in place before the next step, the way a stateful renderer does.
+    reused[0]["text"] = "board v2"
+
+    recorded = [turn.content for turn in state["turns"] if isinstance(turn.content, list)]
+    assert recorded, "the block-bearing turn was not recorded"
+    assert recorded[0] == [{"type": "text", "text": "board v1"}], (
+        f"a later env mutation rewrote an already-recorded turn: {recorded[0]!r}"
+    )
+
+
 def test_stepping_the_env_leaves_the_scored_text_stripped(monkeypatch):
     """Fixing step_episode must not un-fix grading: the scorer still sees answer-only text."""
     sdk_env = _SteppingMultiTurnEnv()

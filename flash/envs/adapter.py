@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -645,7 +646,16 @@ class FreesoloEnvironment(BaseEnvironment):
                     # not str(): EnvironmentTurn.content is ChatContent, so a block list is a shape
                     # the scorer can already read. coercing it here would hand score_episodes the
                     # python repr of the blocks instead of the blocks themselves.
-                    content=content if isinstance(content, (list, tuple)) else str(content),
+                    #
+                    # deepcopy because this turn is a permanent RECORD while the same list stays in
+                    # state["messages"] and goes back to step_episode next turn. an env that renders
+                    # into one reused list (a board redrawn each step) would otherwise rewrite every
+                    # turn already recorded, and the scorer would read the final image as the whole
+                    # trajectory. `str()` used to make these turns immune by accident; keeping the
+                    # blocks means owning the copy.
+                    content=deepcopy(content)
+                    if isinstance(content, (list, tuple))
+                    else str(content),
                 )
             )
         return replies
