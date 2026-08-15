@@ -17,6 +17,7 @@ import time
 import traceback
 
 from flash._internal.diagnostics import sanitize_diagnostic
+from flash.adapters.fused_experts import expected_fused_expert_modules, lora_target_parameters
 from flash.core.spec import FIXED_SEED, load_job_spec_from_env
 from flash.engine.result.accounting import RunMetrics
 from flash.engine.worker.backend_common import collect_ray_failure_logs
@@ -56,9 +57,9 @@ from flash.engine.worker.io.wandb_log import (
 )
 from flash.engine.worker.model.adapter import (
     _download_adapter,
-    lora_target_parameters,
+    adapter_has_fused_expert_tensors,
     make_lora,
-    validate_lora_target_parameters,
+    prepare_warmstart_adapter_config,
 )
 from flash.engine.worker.model.decoding import (
     graded_text,
@@ -466,10 +467,12 @@ __all__ = [
     "_memory_mode",
     "_remove_fla_from_disk",
     "_restrict_fla_gdn_autotune_on_blackwell",
+    "adapter_has_fused_expert_tensors",
     "backend_seed",
     "build_grpo_prompt_dataset",
     # gpu/backend setup
     "error_artifact_name",
+    "expected_fused_expert_modules",
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "graded_text",
@@ -489,6 +492,7 @@ __all__ = [
     "make_lora",
     "model_revision_kwargs",
     "prefetch_model",
+    "prepare_warmstart_adapter_config",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
     "publish_opd_optimizer_start_marker",
@@ -503,7 +507,6 @@ __all__ = [
     "think_token_count",
     "thinking_text",
     "upload_resume_checkpoint",
-    "validate_lora_target_parameters",
     "wait_for_gpu",
     "wandb_run_name",
     "write_base_model_provenance",

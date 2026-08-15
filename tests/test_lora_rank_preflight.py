@@ -348,14 +348,12 @@ def test_submit_rejects_a_warmstart_source_that_never_trained_the_fused_experts(
         )
 
 
-def test_submit_and_worker_agree_on_which_sources_are_recoverable():
-    """the preflight must not pass a source the worker will kill after renting the gpus.
+def test_submit_rejects_a_partial_declaration_before_the_worker():
+    """a partial target list is definitely invalid and must fail before hardware allocation.
 
-    the recoverable case is target_parameters EMPTY plus the flattened-module fingerprint. a
-    PARTIAL list alongside that fingerprint is not recoverable: the worker's recovery only runs
-    when the field is empty, so accepting it at submit would defer the same rejection to
-    ``stage=rl_adapter_loading`` on allocated hardware -- the exact cost regression this preflight
-    exists to prevent.
+    verl drops ``target_parameters`` wholesale, so a partial list alongside the flattened-module
+    fingerprint is not a legacy export shape. the worker rejects it too; accepting it at submit
+    would merely defer the same error to ``stage=rl_adapter_loading`` on allocated hardware.
     """
     import flash.engine.worker.model.adapter as adapter_mod
     from flash.runner.preparation import _require_warmstart_expert_targets
@@ -371,4 +369,37 @@ def test_submit_and_worker_agree_on_which_sources_are_recoverable():
 
     # and the worker rejects the same config, which is why submit must not have accepted it.
     with pytest.raises(ValueError, match="omits required expert targets"):
-        adapter_mod.validate_lora_target_parameters(dict(partial_with_fingerprint), moe, None)
+        adapter_mod.prepare_warmstart_adapter_config(dict(partial_with_fingerprint), moe, None)
+
+
+@pytest.mark.parametrize("synthetic", ["experts", "base_layer"])
+def test_submit_requires_the_complete_legacy_fingerprint(synthetic):
+    """HALF the fingerprint means a TRUNCATED adapter, which the worker will reject.
+
+    verl derives ``target_modules`` from tensor names, so an adapter that trained both fused
+    parameters yields both synthetic names while one that trained a single parameter yields only
+    one. accepting either name on its own therefore admits exactly the truncated adapter the
+    worker's wrapper count rejects -- after the gpus are rented, which is the cost regression this
+    preflight exists to prevent.
+    """
+    from flash.runner.preparation import _require_warmstart_expert_targets
+
+    with pytest.raises(ValueError, match="fused routed experts"):
+        _require_warmstart_expert_targets(
+            {"target_parameters": None, "target_modules": ["q_proj", synthetic]},
+            "Qwen/Qwen3.6-35B-A3B",
+        )
+
+
+def test_the_legacy_fingerprint_has_exactly_one_definition():
+    """the exporter, the preflight and the worker must not re-derive this set independently.
+
+    they need it for three different reasons (strip it, recognize it, agree with both), so three
+    local derivations are how they drift apart -- which is what let the preflight accept half a
+    fingerprint the worker rejected.
+    """
+    from flash.adapters.fused_experts import expected_fused_expert_modules
+
+    assert expected_fused_expert_modules("Qwen/Qwen3.6-35B-A3B") == {"experts", "base_layer"}
+    assert expected_fused_expert_modules("Qwen/Qwen3.5-9B") == set()
+    assert expected_fused_expert_modules(None) == set()

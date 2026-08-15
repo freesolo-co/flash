@@ -6,6 +6,12 @@ import json
 import os
 import shutil
 
+from flash.adapters.fused_experts import (
+    expected_fused_expert_modules,
+    has_complete_fused_expert_tensors,
+    lora_target_parameters,
+    restore_fused_expert_targets,
+)
 from flash.adapters.lora_rank import resolve_adapter_ref
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.worker.io.hf import (
@@ -22,72 +28,43 @@ from flash.engine.worker.runtime.pkg_proxy import W as _w
 
 _ADAPTER_DOWNLOAD_RETRIES = 4
 _ADAPTER_DOWNLOAD_BACKOFF_S = 5.0
-_QWEN35_EXPERT_TARGET_PARAMETERS = (
-    "mlp.experts.gate_up_proj",
-    "mlp.experts.down_proj",
-)
-
-
-def lora_target_parameters(model_id: str | None) -> list[str] | None:
-    """return direct parameter targets required by the model's fused expert layout."""
-    if model_id == "Qwen/Qwen3.6-35B-A3B":
-        return list(_QWEN35_EXPERT_TARGET_PARAMETERS)
-    return None
 
 
 def adapter_has_fused_expert_tensors(adapter_dir: str | None, model_id: str) -> bool:
-    """did this adapter train ALL of the model's fused routed experts?
-
-    the weights, not the config, are the ground truth: peft wraps each targeted `nn.Parameter` in a
-    `ParamWrapper` whose lora tensors sit under the OWNING MODULE's path. the targeted parameter's
-    own name -- `gate_up_proj` / `down_proj` -- never appears in a tensor key, so a wrapper cannot
-    be matched to the specific parameter it adapts.
-
-    what it can be matched to is how MANY wrappers exist. peft nests them: wrapping a second
-    parameter on an already-wrapped module puts the new wrapper outside the first, so N parameters
-    targeted on one module yield N distinct lora paths (`...mlp.experts.lora_A`, then
-    `...mlp.experts.base_layer.lora_A`). counting distinct paths under an owner therefore counts
-    the parameters trained on it.
-
-    requiring the full count is what makes the recovery safe. "any expert tensor" would accept a
-    truncated adapter that trained only one of the two, and the caller would then write the
-    complete target list into its config -- at which point peft freshly initializes the parameter
-    that never trained, silently, instead of the load failing. a partial adapter must be rejected.
-    """
-    targets = lora_target_parameters(model_id)
-    if not targets or not adapter_dir:
+    """Return whether the downloaded adapter has complete fused-expert tensor coverage."""
+    if not adapter_dir:
         return False
     try:
         keys = _read_adapter_tensor_keys(adapter_dir) or []
     except Exception:
         return False
-    # how many parameters each owning module ("mlp.experts.*" -> "experts") must account for.
-    required_per_owner: dict[str, int] = {}
-    for target in targets:
-        if "." in target:
-            owner = target.split(".")[-2]
-            required_per_owner[owner] = required_per_owner.get(owner, 0) + 1
-    if not required_per_owner:
-        return False
-    for owner, needed in required_per_owner.items():
-        # the wrapper's identity is its path from the owner down ("experts", "experts.base_layer"),
-        # which is shared across layers, so the distinct set is the per-module wrapper count.
-        wrappers = set()
-        for key in keys:
-            if ".lora_" not in key:
-                continue
-            segments = key.split(".lora_")[0].split(".")
-            if owner in segments:
-                wrappers.add(".".join(segments[segments.index(owner) :]))
-        if len(wrappers) < needed:
-            return False
-    return True
+    return has_complete_fused_expert_tensors(keys, model_id)
 
 
-def validate_lora_target_parameters(
-    config: dict, model_id: str, adapter_dir: str | None = None
-) -> None:
-    """fail closed when a warm-start adapter omits required fused expert parameters.
+def _rewrite_adapter_config(config: dict, model_id: str, adapter_dir: str) -> None:
+    """apply the fused-expert repair to the caller's dict AND to the file peft will read.
+
+    verl gets the adapter DIRECTORY (`model.lora_adapter_path`) and reloads it itself through
+    `PeftModel.from_pretrained`, so an in-memory-only repair leaves the bytes peft actually reads
+    unchanged and the load fails on the config this call just accepted.
+
+    written through a temporary file and replaced atomically: a truncating in-place rewrite that is
+    interrupted leaves an adapter directory with a corrupt `adapter_config.json`, which is a worse
+    state than either the original or the repaired one.
+    """
+    restore_fused_expert_targets(config, model_id)
+    config_path = os.path.join(str(adapter_dir), "adapter_config.json")
+    with open(config_path, encoding="utf-8") as config_file:
+        on_disk = json.load(config_file)
+    restore_fused_expert_targets(on_disk, model_id)
+    tmp_path = f"{config_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as config_file:
+        json.dump(on_disk, config_file, indent=2)
+    os.replace(tmp_path, config_path)
+
+
+def prepare_warmstart_adapter_config(config: dict, model_id: str, adapter_dir: str | None) -> None:
+    """Validate and, when proven safe, repair the warm-start adapter config.
 
     `target_parameters` is the only thing that adapts a fused routed-expert `nn.Parameter`, so an
     adapter that lacks it really is unusable for warm start. but the saved config is not a reliable
@@ -113,23 +90,23 @@ def validate_lora_target_parameters(
     actual = set(config.get("target_parameters") or ())
     missing = sorted(required - actual)
     if not missing:
+        # the targets are declared, but peft still cannot bind verl's synthesized module names --
+        # `experts` resolves to the fused `experts` module it rejects outright. our own exports are
+        # stripped at publish, so this only catches a config that reached us another way; leaving
+        # it would trade this validator's "accepted" for a load failure deeper in verl.
+        if adapter_dir and expected_fused_expert_modules(model_id) & {
+            str(m) for m in (config.get("target_modules") or ())
+        }:
+            _rewrite_adapter_config(config, model_id, adapter_dir)
         return
-    if actual or not adapter_has_fused_expert_tensors(adapter_dir, model_id):
+    if actual or not adapter_dir or not adapter_has_fused_expert_tensors(adapter_dir, model_id):
         raise ValueError(
             f"warm-start adapter for {model_id} omits required expert targets {missing}; "
             "retrain the source adapter with the current Flash version"
         )
     # config dropped the field, weights prove the experts were trained: recover in the caller's
     # dict and in the file, so both this run's reader and verl's own load see the real targeting.
-    from flash.engine.worker.verl.checkpoints import restore_fused_expert_targets
-
-    restore_fused_expert_targets(config, model_id)
-    config_path = os.path.join(str(adapter_dir), "adapter_config.json")
-    with open(config_path, encoding="utf-8") as config_file:
-        on_disk = json.load(config_file)
-    restore_fused_expert_targets(on_disk, model_id)
-    with open(config_path, "w", encoding="utf-8") as config_file:
-        json.dump(on_disk, config_file, indent=2)
+    _rewrite_adapter_config(config, model_id, adapter_dir)
     print(
         f"[init-adapter] recovered fused expert targets {sorted(required)} from adapter weights; "
         "the source config predates the export fix"

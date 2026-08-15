@@ -15,7 +15,12 @@ import re
 import shutil
 import subprocess
 
-from flash.engine.worker.model.adapter import lora_target_parameters
+from flash.adapters.fused_experts import (
+    has_complete_fused_expert_tensors,
+    lora_target_parameters,
+    restore_fused_expert_targets,
+)
+from flash.engine.worker.model.lora import _read_adapter_tensor_keys
 
 
 class MergeDiskHeadroomError(RuntimeError):
@@ -341,39 +346,6 @@ def export_peft_adapter(
         shutil.rmtree(merge_out, ignore_errors=True)
 
 
-def restore_fused_expert_targets(cfg: dict, model_id: str) -> None:
-    """put a fused-moe adapter's `target_parameters` back into the config verl wrote, in place.
-
-    verl's exporter builds `adapter_config.json` from rank, alpha and `target_modules` only
-    (`verl/model_merger/base_model_merger.py`: `peft_dict = {"r", "lora_alpha", "target_modules"}`),
-    so `target_parameters` -- the only thing that adapts a fused routed-expert `nn.Parameter` -- is
-    dropped on every save. it also derives `target_modules` from tensor names as
-    `key.split(".")[-3]`, which for peft's `ParamWrapper` tensors
-    (`...mlp.experts.lora_A.default.weight`, `...mlp.experts.base_layer.lora_A.default.weight`)
-    yields the bare strings `experts` and `base_layer`.
-
-    both halves have to be undone here or the exported adapter cannot be loaded back at all:
-    `experts` resolves to the fused `Experts` module, which peft rejects ("Target module Experts()
-    is not supported"), so restoring `target_parameters` alone would still fail. that load is not
-    hypothetical -- verl warm-starts through `PeftModel.from_pretrained` on this exact directory
-    (`verl/workers/engine/fsdp/transformer_impl.py:_build_lora_module`).
-
-    only the names verl synthesized from the fused-expert tensors are removed; every real module
-    peft targeted keeps its entry, so a non-moe adapter is untouched.
-    """
-    target_parameters = lora_target_parameters(model_id)
-    if not target_parameters:
-        return
-    cfg["target_parameters"] = list(target_parameters)
-    # the leaf of each targeted parameter ("mlp.experts.gate_up_proj" -> "experts") plus peft's
-    # inner "base_layer" wrapper: exactly the synthetic names, matched from the config rather than
-    # hardcoded so a model with a different fused layout stays correct.
-    synthetic = {p.split(".")[-2] for p in target_parameters if "." in p} | {"base_layer"}
-    modules = cfg.get("target_modules")
-    if isinstance(modules, list):
-        cfg["target_modules"] = sorted({str(m) for m in modules} - synthetic)
-
-
 def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision: str = "") -> None:
     """stamp the saved adapter's immutable base identity into adapter_config.json.
 
@@ -398,6 +370,13 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
         raise RuntimeError("adapter base revision does not match the validated target commit")
     cfg["base_model_name_or_path"] = model_id
     cfg["revision"] = model_revision or None
+    if lora_target_parameters(model_id):
+        keys = _read_adapter_tensor_keys(adapter_dir) or []
+        if not has_complete_fused_expert_tensors(keys, model_id):
+            raise RuntimeError(
+                f"exported adapter for {model_id} does not contain complete fused expert LoRA "
+                "weights; refusing to stamp it as warm-start compatible"
+            )
     restore_fused_expert_targets(cfg, model_id)
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)

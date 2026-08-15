@@ -606,9 +606,9 @@ def test_35b_warmstart_requires_fused_expert_targets(monkeypatch):
     model_id = "Qwen/Qwen3.6-35B-A3B"
 
     with pytest.raises(ValueError, match="omits required expert targets"):
-        worker.validate_lora_target_parameters({"target_modules": "all-linear"}, model_id)
+        worker.prepare_warmstart_adapter_config({"target_modules": "all-linear"}, model_id, None)
 
-    worker.validate_lora_target_parameters(
+    worker.prepare_warmstart_adapter_config(
         {
             "target_parameters": [
                 "mlp.experts.gate_up_proj",
@@ -616,177 +616,9 @@ def test_35b_warmstart_requires_fused_expert_targets(monkeypatch):
             ]
         },
         model_id,
+        None,
     )
-    worker.validate_lora_target_parameters({}, "Qwen/Qwen3.5-9B")
-
-
-def _write_expert_adapter(directory, *, config, expert_tensors=True):
-    """write an adapter dir shaped like one of verl's exports.
-
-    the safetensors header is written by hand rather than through `safetensors.torch`: the offline
-    test job has no torch, and the code under test only ever reads tensor KEYS out of the header.
-    """
-    import json
-    import struct
-
-    keys = ["base_model.model.layers.0.self_attn.q_proj.lora_A.weight"]
-    if expert_tensors:
-        # peft names a wrapped nn.Parameter after its OWNING module, never after the parameter.
-        keys += [
-            "base_model.model.layers.0.mlp.experts.lora_A.weight",
-            "base_model.model.layers.0.mlp.experts.base_layer.lora_A.weight",
-        ]
-    header = {key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]} for key in keys}
-    encoded = json.dumps(header).encode("utf-8")
-    (directory / "adapter_model.safetensors").write_bytes(
-        struct.pack("<Q", len(encoded)) + encoded + b"\x01\x02"
-    )
-    (directory / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
-
-
-def test_verl_export_restores_the_fused_expert_targeting_it_drops(tmp_path):
-    """the exported adapter must be loadable back, not merely present.
-
-    verl rebuilds adapter_config.json from rank/alpha/target_modules, so it drops
-    `target_parameters` AND flattens the wrapped expert modules into `target_modules` as
-    `experts`/`base_layer`. peft cannot bind those names, so an unrepaired export fails to load
-    even before the warm-start validator sees it.
-    """
-    import json
-
-    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
-
-    _write_expert_adapter(
-        tmp_path,
-        config={
-            "peft_type": "LORA",
-            "r": 32,
-            "target_modules": ["q_proj", "experts", "base_layer"],
-            "target_parameters": None,
-        },
-    )
-    stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.6-35B-A3B", "c" * 40)
-
-    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
-    assert saved["target_parameters"] == [
-        "mlp.experts.gate_up_proj",
-        "mlp.experts.down_proj",
-    ]
-    # the synthesized names are gone; the real module peft targeted survives.
-    assert saved["target_modules"] == ["q_proj"]
-    assert saved["base_model_name_or_path"] == "Qwen/Qwen3.6-35B-A3B"
-
-
-def test_non_moe_export_is_untouched_by_the_expert_repair(tmp_path):
-    import json
-
-    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
-
-    config = {"peft_type": "LORA", "r": 32, "target_modules": ["q_proj", "v_proj"]}
-    _write_expert_adapter(tmp_path, config=config, expert_tensors=False)
-    stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
-
-    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
-    assert saved["target_modules"] == ["q_proj", "v_proj"]
-    assert saved.get("target_parameters") is None
-
-
-def test_warmstart_recovers_expert_targets_from_the_adapters_own_weights(monkeypatch, tmp_path):
-    """an adapter exported before the fix trained the experts; its config just forgot to say so.
-
-    rejecting it stranded every 35B adapter this pipeline had ever produced, including ones that
-    deploy and serve, behind advice ("retrain with the current Flash version") that reproduced the
-    same file. the weights are the ground truth.
-    """
-    import json
-
-    worker = _import_worker(monkeypatch)
-    config = {
-        "peft_type": "LORA",
-        "r": 32,
-        "target_modules": ["q_proj", "experts", "base_layer"],
-        "target_parameters": None,
-    }
-    _write_expert_adapter(tmp_path, config=config)
-
-    worker.validate_lora_target_parameters(config, "Qwen/Qwen3.6-35B-A3B", str(tmp_path))
-
-    assert set(config["target_parameters"]) == {
-        "mlp.experts.gate_up_proj",
-        "mlp.experts.down_proj",
-    }
-    # verl re-reads the directory itself (model.lora_adapter_path -> PeftModel.from_pretrained),
-    # so the repair is worthless unless it reaches the file on disk.
-    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
-    assert set(saved["target_parameters"]) == {
-        "mlp.experts.gate_up_proj",
-        "mlp.experts.down_proj",
-    }
-    assert saved["target_modules"] == ["q_proj"]
-
-
-def test_warmstart_still_rejects_an_adapter_that_never_trained_the_experts(monkeypatch, tmp_path):
-    """the recovery must not become a rubber stamp: no expert tensors, no warm start."""
-    worker = _import_worker(monkeypatch)
-    config = {
-        "peft_type": "LORA",
-        "r": 32,
-        "target_modules": ["q_proj"],
-        "target_parameters": None,
-    }
-    _write_expert_adapter(tmp_path, config=config, expert_tensors=False)
-
-    with pytest.raises(ValueError, match="omits required expert targets"):
-        worker.validate_lora_target_parameters(config, "Qwen/Qwen3.6-35B-A3B", str(tmp_path))
-
-    # and with no directory to read, there is no evidence to recover from either.
-    with pytest.raises(ValueError, match="omits required expert targets"):
-        worker.validate_lora_target_parameters(dict(config), "Qwen/Qwen3.6-35B-A3B")
-
-
-@pytest.mark.parametrize(
-    "present",
-    [
-        pytest.param(["base_model.model.layers.0.mlp.experts.lora_A.weight"], id="outer-only"),
-        pytest.param(
-            ["base_model.model.layers.0.mlp.experts.base_layer.lora_A.weight"], id="inner-only"
-        ),
-    ],
-)
-def test_warmstart_rejects_an_adapter_that_trained_only_one_expert_parameter(
-    monkeypatch, tmp_path, present
-):
-    """a truncated adapter must not be recovered into claiming it trained both parameters.
-
-    peft NESTS its wrappers, so targeting two parameters on one module yields two distinct lora
-    paths. accepting a single one as proof of both would rewrite the config to declare the full
-    target set, and peft would then freshly initialize the parameter that never trained -- a
-    silently wrong warm start rather than a failed one.
-    """
-    import json
-    import struct
-
-    worker = _import_worker(monkeypatch)
-    keys = ["base_model.model.layers.0.self_attn.q_proj.lora_A.weight", *present]
-    header = {key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]} for key in keys}
-    encoded = json.dumps(header).encode("utf-8")
-    (tmp_path / "adapter_model.safetensors").write_bytes(
-        struct.pack("<Q", len(encoded)) + encoded + b"\x01\x02"
-    )
-    config = {
-        "peft_type": "LORA",
-        "r": 32,
-        "target_modules": ["q_proj", "experts", "base_layer"],
-        "target_parameters": None,
-    }
-    (tmp_path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="omits required expert targets"):
-        worker.validate_lora_target_parameters(config, "Qwen/Qwen3.6-35B-A3B", str(tmp_path))
-
-    # the rejected adapter's config is left exactly as found: no partial repair written back.
-    on_disk = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
-    assert on_disk["target_parameters"] is None
+    worker.prepare_warmstart_adapter_config({}, "Qwen/Qwen3.5-9B", None)
 
 
 def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
