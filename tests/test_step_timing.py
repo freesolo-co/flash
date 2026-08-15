@@ -1140,7 +1140,11 @@ def test_a_call_that_blocks_for_several_steps_is_caught_on_a_sub_second_run():
         _replay(clock, timeline)
         return clock
 
-    for clean_first in (1, 2, 3, 10):
+    # 0 is the PRODUCTION shape and the one this originally missed: RL's forced first-metrics
+    # upload fires on the first step line, so no interval exists yet when the block is measured.
+    # A pace-relative rule is unreachable there, and starting this loop at 1 hid that entirely --
+    # the call is judged at the NEXT step line instead, against the span it landed in.
+    for clean_first in (0, 1, 2, 3, 10):
         clock = run(clean_first)
         assert clock.step_seconds() == pytest.approx(real, abs=0.02), (
             f"{clean_first} clean steps before the block published {clock.step_seconds()}s "
@@ -1149,6 +1153,14 @@ def test_a_call_that_blocks_for_several_steps_is_caught_on_a_sub_second_run():
         assert not [gap for gap in clock.intervals() if gap < real / 2], (
             f"{clean_first} clean steps before the block left pipe-speed intervals in the window"
         )
+
+    # deferring an unjudged call must not turn ordinary overhead into a block once the first span
+    # finally measures it: a 1ms call inside a 0.4s step is not a stall, and splitting there would
+    # cost an interval on every run whose first heartbeat is merely slow-ish.
+    fast = step_timing.StepClock()
+    _replay(fast, [(i * 0.4, i, 0.001) for i in range(6)])
+    assert fast.step_seconds() == pytest.approx(0.4, abs=0.001)
+    assert not fast._segments, "1ms of call overhead broke a 0.4s span"
 
     # and the floor must not become so tight that ordinary call overhead splits a normal run.
     ordinary = step_timing.StepClock()

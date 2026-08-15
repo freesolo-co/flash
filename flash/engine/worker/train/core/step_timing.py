@@ -98,6 +98,9 @@ class StepClock:
         self._draining_backlog = False
         self._drained = 0
         self._last_arrival: float | None = None
+        # blocking time inside the current span that could not be judged when it happened, because
+        # no pace was measured yet. resolved at the next step line (see _resolve_unjudged_block).
+        self._unjudged_block_s = 0.0
 
     def note_blocking_work(self) -> None:
         """Declare that the caller is about to block, so the span in progress is not a step.
@@ -146,17 +149,42 @@ class StepClock:
         outvote it.
 
         Half the measured pace is the same floor the drain uses, so both halves of this mechanism
-        answer "did the reader wait" the same way. Falling back to the fixed threshold before any
-        pace exists keeps ordinary call overhead from splitting a segment on a run that has not yet
-        shown what a step costs.
+        answer "did the reader wait" the same way.
+
+        Before any pace exists the question cannot be answered HERE, and that is precisely the case
+        that matters: RL's forced first-metrics upload fires on the FIRST step line, so
+        ``intervals()`` is empty at the only moment it is asked. Falling back to the fixed 1s let a
+        0.9s upload on a 0.1s run slip under -- ~9 lines queued, the drain was never armed, and the
+        median collapsed to 0.001s against a true 0.1s.
+
+        So a sub-threshold call is not discarded, it is DEFERRED: the elapsed time is held and
+        judged at the next step line, where the span it landed in is finally known (see
+        ``_resolve_unjudged_block``). Deferring rather than guessing is what keeps ordinary call
+        overhead from splitting a segment on a run that has not yet shown what a step costs.
         """
         measured = steady_state_step_seconds(self.intervals())
-        threshold = (
-            _BLOCKING_CALL_THRESHOLD_S
-            if measured is None
-            else min(_BLOCKING_CALL_THRESHOLD_S, measured / 2)
-        )
-        if elapsed_s >= threshold:
+        if measured is not None:
+            if elapsed_s >= min(_BLOCKING_CALL_THRESHOLD_S, measured / 2):
+                self.note_blocking_work()
+            return
+        if elapsed_s >= _BLOCKING_CALL_THRESHOLD_S:
+            self.note_blocking_work()
+        elif elapsed_s > 0:
+            # no pace yet: hold it for the next step line to judge against the span it lands in.
+            self._unjudged_block_s += float(elapsed_s)
+
+    def _resolve_unjudged_block(self, span_s: float) -> None:
+        """Judge a deferred block now that the span containing it is known.
+
+        The span from the previous step line to this one is the first evidence of what a step costs
+        on this run. A call that occupied half of it stalled the reader whatever its absolute
+        duration -- the same test the measured-pace path applies, using the first sample instead of
+        a median. Nothing is retroactively unpublished: the block is declared before this line is
+        recorded, so the span it contaminated is closed rather than measured, exactly as it would
+        have been had the pace been known in time.
+        """
+        pending, self._unjudged_block_s = self._unjudged_block_s, 0.0
+        if pending > 0 and span_s > 0 and pending >= span_s / 2:
             self.note_blocking_work()
 
     def record(self, now: float, step: int | None = None) -> None:
@@ -190,6 +218,11 @@ class StepClock:
         """
         if self._draining(now):
             return
+        if self._unjudged_block_s and self._times:
+            # a block held from before any pace existed. the span it landed in ends HERE, so it can
+            # finally be judged -- and it must happen before this line is recorded, so a confirmed
+            # block closes the contaminated span instead of extending it.
+            self._resolve_unjudged_block(float(now) - self._times[-1])
         if step is not None:
             if self._last_step is not None and int(step) == self._last_step:
                 # the span up to here is not a step, but this timestamp is where the next one starts.
