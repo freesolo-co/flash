@@ -400,6 +400,32 @@ def test_short_write_marker_survives_the_merger_subprocess_boundary(
     assert cause.output == "unexpected pos 221967808 vs 221967696"
 
 
+def test_direct_disk_marker_replaces_an_earlier_short_write_marker(
+    monkeypatch, actor_dir, tmp_path
+):
+    from flash.engine.worker import backend_common
+    from flash.engine.worker.verl import checkpoints
+
+    def supervise(cmd, *, env, on_line, errors):
+        on_line("unexpected pos 221967808 vs 221967696\n")
+        on_line("Disk quota exceeded (os error 122)\n")
+        return 7
+
+    monkeypatch.setattr(backend_common, "_run_streaming_verl_subprocess", supervise)
+    monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(1 << 40))
+
+    with pytest.raises(checkpoints.MergeDiskExhaustedError) as caught:
+        checkpoints.export_peft_adapter(
+            str(actor_dir),
+            str(tmp_path / "adapter"),
+            base_model_id="org/model",
+            python_bin="/verl/python",
+        )
+    cause = caught.value.__cause__
+    assert isinstance(cause, subprocess.CalledProcessError)
+    assert cause.output == "Disk quota exceeded (os error 122)"
+
+
 def test_merger_preserves_cancellation_identity(monkeypatch):
     from flash.engine.worker import backend_common
     from flash.engine.worker.verl import checkpoints
