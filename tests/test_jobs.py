@@ -643,6 +643,8 @@ def _queued_forever(monkeypatch, health, *, step=20.0, queue_grace_s=900.0, log=
 
 
 def test_empty_workers_log_elapsed_capacity_grace_before_no_capacity(monkeypatch):
+    from itertools import pairwise
+
     logs = io.StringIO()
     res = _queued_forever(
         monkeypatch,
@@ -651,12 +653,17 @@ def test_empty_workers_log_elapsed_capacity_grace_before_no_capacity(monkeypatch
         log=logs,
     )
 
+    assert not res.ok
     assert res.failure == "no_capacity"
+    assert "no RunPod capacity" in res.detail
     capacity_lines = [line for line in logs.getvalue().splitlines() if "capacity grace" in line]
-    assert capacity_lines
-    match = re.search(r"; waited (\d+)s of 700s capacity grace$", capacity_lines[0])
-    assert match
-    assert int(match.group(1)) >= 0
+    elapsed_values = []
+    for line in capacity_lines:
+        match = re.search(r"; waited (\d+)s of 700s capacity grace$", line)
+        assert match
+        elapsed_values.append(int(match.group(1)))
+    assert len(elapsed_values) >= 2
+    assert all(later > earlier for earlier, later in pairwise(elapsed_values))
 
 
 def test_four_card_last_gpu_log_names_only_scaled_capacity_grace(monkeypatch):
@@ -699,6 +706,43 @@ def test_allocated_worker_log_suppresses_capacity_grace(monkeypatch, workers):
     assert res.failure == "stalled"
     queued_lines = [line for line in logs.getvalue().splitlines() if "queued; workers:" in line]
     assert queued_lines
+    assert all("capacity grace" not in line for line in queued_lines)
+
+
+def test_unhealthy_worker_log_suppresses_capacity_grace(monkeypatch):
+    logs = io.StringIO()
+    res = _queued_forever(
+        monkeypatch,
+        lambda eid, _fp, **_kw: {"workers": {"unhealthy": 1}},
+        log=logs,
+    )
+
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "worker stuck unhealthy" in res.detail
+    queued_lines = [line for line in logs.getvalue().splitlines() if "queued; workers:" in line]
+    assert queued_lines
+    assert all("capacity grace" not in line for line in queued_lines)
+
+
+@pytest.mark.parametrize("granted_workers", [{"initializing": 1}, {"ready": 1}])
+def test_empty_health_after_worker_grant_suppresses_capacity_grace(monkeypatch, granted_workers):
+    logs = io.StringIO()
+    probes = {"count": 0}
+
+    def health(eid, _fp, **_kw):
+        probes["count"] += 1
+        return {"workers": granted_workers if probes["count"] == 1 else {}}
+
+    res = _queued_forever(monkeypatch, health, queue_grace_s=5000.0, log=logs)
+
+    assert probes["count"] >= 2
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "setup (pre-training)" in res.detail
+    queued_lines = [line for line in logs.getvalue().splitlines() if "queued; workers:" in line]
+    assert queued_lines
+    assert any("workers: {}" in line for line in queued_lines)
     assert all("capacity grace" not in line for line in queued_lines)
 
 

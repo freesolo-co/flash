@@ -514,7 +514,12 @@ def _classify_queue_state(
             state.ever_saw_worker = True
         if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
             message = f"queued; workers: {workers}"
-            if not usable and not recovering and state.queued_timer.since is not None:
+            if (
+                not usable
+                and not recovering
+                and not state.ever_saw_worker
+                and state.queued_timer.since is not None
+            ):
                 elapsed_s = max(0, int(now - state.queued_timer.since))
                 message += f"; waited {elapsed_s}s of {int(context.queue_grace_s)}s capacity grace"
             context.say(message)
