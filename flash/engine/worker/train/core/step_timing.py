@@ -44,11 +44,16 @@ import statistics
 # block -- a failed upload, or a 30s wait on the upload lock -- are orders of magnitude above this.
 _BLOCKING_CALL_THRESHOLD_S = 1.0
 
-# how much slower than the observed pipe speed an arrival must be to count as one the reader waited
-# for, when no step pace has been measured yet. pipe reads and real steps sit orders of magnitude
-# apart (~0.001s against 0.1s and up), so a wide multiple separates them without needing to know the
-# run's scale, and it stays below the absolute floor that applies once a pace exists.
+# how much slower than a pipe read an arrival must be to count as one the reader waited for. pipe
+# reads and real steps sit orders of magnitude apart (~0.001s against 0.1s and up), so a wide
+# multiple separates them without needing to know the run's scale.
 _PIPE_GAP_MULTIPLE = 20.0
+
+# how much longer than the blocking call the next arrival may be and still be treated as output the
+# call held back. a line buffered during a call is already sitting in the pipe when the call returns,
+# so it is read essentially at that instant; a line the reader genuinely waited for arrives later on
+# the run's own schedule. the slack is small because those two are what must be told apart.
+_BLOCK_ARRIVAL_SLACK = 1.05
 
 
 def step_intervals(step_line_times: list[float]) -> list[float]:
@@ -185,15 +190,24 @@ class StepClock:
     def _resolve_unjudged_block(self, span_s: float) -> None:
         """Judge a deferred block now that the span containing it is known.
 
-        The span from the previous step line to this one is the first evidence of what a step costs
-        on this run. A call that occupied half of it stalled the reader whatever its absolute
-        duration -- the same test the measured-pace path applies, using the first sample instead of
-        a median. Nothing is retroactively unpublished: the block is declared before this line is
-        recorded, so the span it contaminated is closed rather than measured, exactly as it would
-        have been had the pace been known in time.
+        The question is whether the call held this line BACK, and the span it landed in answers it.
+        A line buffered during the call is already sitting in the pipe when the call returns, so it
+        is read at essentially that instant: its span is bounded by the call. A line the reader
+        genuinely waited for arrives later, on the run's own schedule, and the span runs past the
+        call by however long the step still had to go.
+
+        Occupying half the span is NOT that test. A 0.09s call inside a 0.1s step clears it while
+        buffering nothing -- the next line still arrived on time -- and declaring a block there
+        armed a drain that then discarded every genuine arrival: 40 real steps thrown away and no
+        pace published at all, because with no measured pace the drain's own floor could not
+        recognise a 0.1s wait either. Overlapping a step is ordinary; delaying one is the defect.
+
+        Nothing is retroactively unpublished: the block is declared before this line is recorded, so
+        a span that really was contaminated is closed rather than measured, exactly as it would have
+        been had the pace been known in time.
         """
         pending, self._unjudged_block_s = self._unjudged_block_s, 0.0
-        if pending > 0 and span_s > 0 and pending >= span_s / 2:
+        if pending > 0 and span_s > 0 and span_s <= pending * _BLOCK_ARRIVAL_SLACK:
             self.note_blocking_work()
 
     def record(self, now: float, step: int | None = None) -> None:
@@ -327,6 +341,24 @@ class StepClock:
             # the fastest confirmed arrival is the cleanest read of the pipe speed: a queued line
             # delayed by scheduler noise only ever reads slower than the pipe, never faster.
             self._drain_pipe_s = gap
+        if (
+            measured is not None
+            and self._drain_pipe_s * _PIPE_GAP_MULTIPLE >= floor
+            and self._drained >= self._MAX_DRAINED_LINES
+        ):
+            # these arrivals are not pipe-fast: the fastest one in this whole drain is within an
+            # order of magnitude of the floor itself, so they look like real steps sitting under a
+            # stale bar rather than buffered output. a real backlog is FINITE, so one that long
+            # without a single genuinely fast read means the PACE is wrong, not that more output is
+            # queued -- a run settling at 0.4s after a block taken at a 1.0s pace discarded 200 real
+            # steps while still publishing 1.0s, with the ETA and wall warning overstated to match.
+            #
+            # the distinguishability guard is what keeps this from reintroducing the collapse the
+            # bound itself once caused: a genuine 30s lock on a 0.4s run drains at 0.001s, which is
+            # far below the floor, so its 75 queued lines are still discarded in full rather than
+            # cut off at 64 and admitted as ordinary intervals.
+            self._draining_backlog = False
+            return False
         if (
             measured is None
             and self._drain_pipe_s * _PIPE_GAP_MULTIPLE >= _BLOCKING_CALL_THRESHOLD_S

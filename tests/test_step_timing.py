@@ -7,6 +7,7 @@ actually needed 4.9h. Every test here exists to keep the published number on the
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -483,10 +484,29 @@ def test_a_finished_run_shows_no_projection():
 
 
 def test_a_junk_duration_is_ignored_rather_than_rendered():
-    """The field crosses a network boundary from the worker, so the panel cannot assume it is sane."""
-    for bad in (0, -5, "fast", None, True, float("inf"), float("nan")):
+    """The field crosses a network boundary from the worker, so the panel cannot assume it is sane.
+
+    The oversized integer is not the same case as ``inf``. json keeps an arbitrarily long literal as
+    a python int of that exact value, so it passes an ``isinstance(value, (int, float))`` check and
+    then raises ``OverflowError`` inside ``float()`` rather than saturating -- crashing the whole
+    status view over one junk field, which is the opposite of what a validating helper is for.
+    """
+    oversized = json.loads("1" + "0" * 400)
+    assert isinstance(oversized, int), "json must hand this back as an int for the case to apply"
+    for bad in (0, -5, "fast", None, True, float("inf"), float("nan"), oversized, -oversized):
         heartbeat = {"stage": "rl_step", "step": 3, "ts": time.time(), "step_duration_s": bad}
         assert step_timing_pairs(heartbeat, running=True) == [], bad
+
+    # the projection field goes through the same helper and crashed the same way.
+    projected = {
+        "stage": "rl_step",
+        "step": 3,
+        "ts": time.time(),
+        "step_duration_s": 92.0,
+        "progress": 0.5,
+        "projected_remaining_s": oversized,
+    }
+    assert dict(step_timing_pairs(projected, running=True)) == {"pace": "92s/step"}
 
 
 def test_a_superseded_attempts_pace_is_not_shown_as_this_runs():
@@ -1223,6 +1243,88 @@ def test_a_deferred_block_is_judged_before_the_drain_reads_its_own_line():
 
     # the drain must still END on a run this shape, not silence it for the rest of its life.
     assert not run(9)._draining_backlog, "the drain never terminated"
+
+
+def test_a_call_that_overlaps_a_step_without_delaying_it_is_not_a_block():
+    """Occupying part of a step is ordinary; holding the next line back is the defect.
+
+    A 90ms call inside a 100ms step buffers NOTHING -- it returns before the step finishes, so the
+    next line still arrives on its own schedule. Judging the deferred call by whether it filled half
+    the span declared a block anyway (0.09 >= 0.1/2), and arming the drain there was ruinous: with
+    no measured pace the drain could not recognise a genuine 100ms wait either, so it discarded 40
+    real steps and the run published NO pace and NO ETA at all.
+
+    The distinguishing evidence is where the next line lands. A buffered line is already in the pipe
+    when the call returns and is read at essentially that instant, so its span is bounded by the
+    call; a line the reader waited for arrives later, on the run's own schedule.
+    """
+    real = 0.1
+
+    def run(call_s: float) -> step_timing.StepClock:
+        clock = step_timing.StepClock()
+        t, step = 0.0, 0
+        clock.record(t, step)
+        step += 1
+        clock.note_if_blocked(call_s)
+        # the call returned before the step did, so nothing queued: real steps, on schedule.
+        for _ in range(40):
+            t += real
+            clock.record(t, step)
+            step += 1
+        return clock
+
+    # a call that ends within the slack of the next arrival is genuinely ambiguous -- a line
+    # buffered at 0.099s and one waited for until 0.100s are the same observation -- so the range
+    # tested here stops short of it and the clock keeps treating that as a block.
+    for call_s in (0.05, 0.06, 0.09):
+        clock = run(call_s)
+        assert clock.step_seconds() == pytest.approx(real, abs=0.001), (
+            f"a {call_s}s call that buffered nothing published {clock.step_seconds()}s"
+        )
+        assert not clock._draining_backlog, f"a {call_s}s call armed a drain it should not have"
+        assert len(clock.intervals()) == 40, (
+            f"a {call_s}s call cost {40 - len(clock.intervals())} real steps"
+        )
+
+    # and a call that genuinely DID hold the line back is still caught: the next arrival lands at
+    # the moment the call returns, which is what being buffered looks like.
+    delayed = step_timing.StepClock()
+    delayed.record(0.0, 0)
+    delayed.note_if_blocked(0.9)
+    delayed.record(0.9, 1)
+    assert delayed._draining_backlog, "a call that delayed the next line must still arm the drain"
+
+
+def test_the_drain_ends_when_the_run_accelerates_past_its_own_floor():
+    """The floor comes from the RETAINED pace, which is history the run may have moved on from.
+
+    After a genuine block on a run pacing at 1.0s, if steps then settle at 0.4s, every real arrival
+    sits under the 0.5s floor and reads as backlog. The drain then never ended: it discarded 200
+    real steps while continuing to publish the stale 1.0s pace, so the ETA and the wall-limit
+    warning stayed overstated for the rest of the run -- the mirror of the collapse the drain exists
+    to prevent, and in the direction that argues for cutting a run that would have fit.
+
+    A real backlog is finite, so a drain this long is evidence the pace itself is wrong rather than
+    evidence of more buffered output.
+    """
+    clock = step_timing.StepClock()
+    t, step = 0.0, 0
+    for _ in range(20):
+        clock.record(t, step)
+        step += 1
+        t += 1.0
+    assert clock.step_seconds() == 1.0, "precondition: the retained pace is 1.0s"
+
+    clock.note_blocking_work()
+    for _ in range(200):
+        t += 0.4
+        clock.record(t, step)
+        step += 1
+
+    assert not clock._draining_backlog, "the drain never ended on an accelerating run"
+    assert clock.step_seconds() == pytest.approx(0.4, abs=0.01), (
+        f"the run settled at 0.4s but the clock still publishes {clock.step_seconds()}s"
+    )
 
 
 def test_the_forced_first_metrics_upload_carries_the_pace_when_it_retries():

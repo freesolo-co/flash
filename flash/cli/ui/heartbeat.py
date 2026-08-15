@@ -262,7 +262,14 @@ def _finite_positive(value: object) -> float | None:
     """A strictly positive finite float, or None -- the worker's field may be absent or junk."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        # json keeps an arbitrarily large literal as an int, where float() raises rather than
+        # returning inf. this helper's whole job is to answer "usable number or not", so a value
+        # too large to convert is junk like any other -- and letting it raise crashed the whole
+        # status view instead of dropping one row.
+        return None
     if number <= 0 or number != number or number in (float("inf"), float("-inf")):
         return None
     return number
