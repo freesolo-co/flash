@@ -552,6 +552,7 @@ def test_train_body_imports_every_name_it_uses():
     imports are out of scope, so every stdlib/3p name it references must be
     imported inside the function body (else NameError before training)."""
     import ast
+    import builtins
     import inspect
 
     from flash.providers.runpod import serverless as train
@@ -569,6 +570,54 @@ def test_train_body_imports_every_name_it_uses():
     for name in ("contextlib", "json", "os", "subprocess", "sys", "threading"):
         assert name in imported, f"_train_body uses {name!r} without a local import"
     assert "_CONSOLE_UPLOAD_INTERVAL_S" not in inspect.getsource(train._train_body)
+
+    # a nested helper may only close over names bound in an ENCLOSING scope. reaching for one bound
+    # in a sibling function is a NameError at runtime, and unit tests that exec the helper against a
+    # hand-built namespace supply the name themselves, so they pass while the worker would die.
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+    def _walk_scope(scope):
+        """Nodes belonging to ``scope`` itself, NOT to functions nested inside it.
+
+        ast.walk would descend into them, so a name bound only in a SIBLING helper would count as
+        bound here -- exactly the mistake this check exists to catch, silently passing.
+        """
+        stack = list(ast.iter_child_nodes(scope))
+        while stack:
+            node = stack.pop()
+            yield node
+            if not isinstance(node, scopes):
+                stack.extend(ast.iter_child_nodes(node))
+
+    def _bound(scope) -> set[str]:
+        names = {a.arg for a in ast.walk(scope.args) if isinstance(a, ast.arg)}
+        for node in _walk_scope(scope):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                names.add(node.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                names |= {alias.asname or alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                names.add(node.name)  # `except X as e` binds e for the handler's body
+            elif isinstance(node, ast.Global):
+                names |= set(node.names)
+        return names
+
+    builtin_names = set(dir(builtins))
+
+    def _check(scope, visible: set[str]) -> None:
+        inner = visible | _bound(scope)
+        for node in _walk_scope(scope):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                assert node.id in inner or node.id in builtin_names, (
+                    f"{getattr(scope, 'name', '<lambda>')} reads {node.id!r}, "
+                    "bound in no enclosing scope"
+                )
+            elif isinstance(node, scopes):
+                _check(node, inner)
+
+    _check(fn, set())
 
 
 def test_train_body_has_no_prime_install_path():
@@ -1346,7 +1395,7 @@ def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots()
     tails: list[str] = []
     started = threading.Event()
 
-    def _upload_console_locked(_mode: str, _console: str, tail_path: str) -> bool:
+    def _upload_console_locked(_mode: str, _console: str, tail_path: str, _final: bool) -> bool:
         started.set()
         order.append(f"begin:{tail_path}")
         tails.append(tail_path)
@@ -1357,6 +1406,7 @@ def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots()
     namespace: dict = {
         "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
         "console_upload_lock": threading.Lock(),
+        "console_teardown": threading.Event(),  # not set: teardown has not begun
         "_upload_console_locked": _upload_console_locked,
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
@@ -1392,6 +1442,7 @@ def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
     import ast
     import inspect
     import textwrap
+    import threading
     import types
 
     from flash.providers.runpod.serverless import endpoints
@@ -1416,7 +1467,8 @@ def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
     namespace: dict = {
         "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
         "console_upload_lock": _NeverFree(),
-        "_upload_console_locked": lambda mode, _console, _tail: uploaded.append(mode) or True,
+        "console_teardown": threading.Event(),
+        "_upload_console_locked": lambda mode, _c, _t, _f: uploaded.append(mode) or True,
         "print": lambda *_a, **_k: None,
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
@@ -1428,6 +1480,119 @@ def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
     # bounded wait, so a wedged holder delays the terminal upload rather than suppressing it.
     assert timeouts
     assert all(0 < t <= 120.0 for t in timeouts)
+
+
+def test_serverless_periodic_console_upload_defers_once_teardown_begins():
+    """A periodic snapshot must not commit after the terminal one is under way.
+
+    ``final=True`` deliberately does not wait for the lock, so the two can run concurrently and the
+    periodic upload -- captured BEFORE the failure -- could land last and overwrite the terminal
+    console with pre-failure bytes, losing the diagnostic. The terminal call sets
+    ``console_teardown``, so a periodic snapshot that sees it drops its commit rather than racing.
+    """
+    import ast
+    import inspect
+    import textwrap
+    import threading
+    import types
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
+    )
+    uploaded: list[str] = []
+    console_teardown = threading.Event()
+    console_teardown.set()  # a terminal snapshot has begun
+
+    namespace: dict = {
+        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
+        "console_upload_lock": threading.Lock(),  # free: only the teardown flag may defer
+        "console_teardown": console_teardown,
+        "_upload_console_locked": lambda mode, _c, _t, _f: uploaded.append(mode) or True,
+        "print": lambda *_a, **_k: None,
+    }
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    upload_console = namespace["_upload_console"]
+
+    assert upload_console("train") is False, "a periodic snapshot must defer once teardown began"
+    assert uploaded == []
+    # the terminal snapshot is exactly the one teardown is running, so it must still commit.
+    assert upload_console("train", final=True) is True
+    assert uploaded == ["train"]
+
+
+def test_serverless_periodic_console_upload_drops_a_commit_started_before_teardown(
+    tmp_path, monkeypatch
+):
+    """Teardown can begin while a periodic snapshot is already staging its tail.
+
+    The pre-acquire gate cannot catch that one: it passed before teardown started. Without a
+    re-check immediately before the commit, the in-flight periodic upload lands AFTER the terminal
+    one and overwrites the failure console with bytes read before the failure -- the exact loss the
+    terminal upload exists to prevent. This drives the real ``_upload_console_locked``, since the
+    re-check lives there rather than in the caller.
+    """
+    import ast
+    import inspect
+    import json
+    import os
+    import textwrap
+    import threading
+
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    node = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_upload_console_locked"
+    )
+    console = tmp_path / "console_train.txt"
+    console.write_text("line one\nline two\n")
+    commits: list[str] = []
+    console_teardown = threading.Event()
+    console_teardown.set()  # teardown began while this snapshot was staging its tail
+
+    class _Api:
+        def __init__(self, token=None):
+            pass
+
+        def upload_file(self, *, path_in_repo: str, **_kw) -> None:
+            commits.append(path_in_repo)
+
+    # the function imports HfApi from huggingface_hub itself, so a namespace entry is ignored and
+    # the real client would make a LIVE network call. patch where it is looked up.
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
+
+    warnings: list[str] = []
+    namespace: dict = {
+        "os": os,
+        "json": json,
+        "input_data": {
+            "job_spec_json": json.dumps({"algorithm": "opd", "run_id": "r1"}),
+            "hf_repo": "org/repo",
+        },
+        "env": {},
+        "console_teardown": console_teardown,
+        "_require_deadline_allowance": lambda: None,
+        "_safe_detail": lambda text, _env, _limit=0: text,
+        "print": lambda *args, **_kw: warnings.append(" ".join(str(a) for a in args)),
+    }
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    upload_locked = namespace["_upload_console_locked"]
+
+    tail = str(tmp_path / "console_train.txt.tail")
+    assert upload_locked("train", str(console), tail, False) is False
+    assert commits == [], "a periodic upload must not commit once teardown has begun"
+    # the terminal snapshot still commits: it IS the teardown upload.
+    assert upload_locked("train", str(console), tail + ".final", True) is True
+    assert commits == ["opd/r1/console_train.txt"]
+    # a False from a swallowed error would satisfy the first assertion for the wrong reason.
+    assert not [w for w in warnings if "warn" in w], warnings
 
 
 def test_instance_console_upload_loop_never_waits_longer_than_the_interval():

@@ -511,39 +511,45 @@ def _train_body(input_data: dict) -> dict:
         )
 
         console_upload_lock = threading.Lock()
+        # set once a terminal snapshot begins. run_mode's stop_upload is per-call and scoped inside
+        # it, so these uploaders cannot see it; this is the flag they check.
+        console_teardown = threading.Event()
 
         def _upload_console(mode: str, final: bool = False) -> bool:
             """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
-            console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
-            from both the subprocess-failure path and the missing-metrics crash path: a worker killed
-            without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
-            ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
-            crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque.
+            console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe from
+            both the subprocess-failure and missing-metrics crash paths: a worker killed without a
+            Python exception (OOM/SIGKILL, segfault, silent early exit) writes NO
+            ``error_<mode>.txt``, so the console is then the only root-cause record — and a crash
+            that exits 0 would otherwise skip the upload, leaving the failure opaque.
 
             Serialized against itself: the periodic uploader is a daemon thread joined with a
-            timeout, so a slow snapshot can still run when the final one begins, and whichever
-            commits last wins. ``final`` never yields: upload_file takes no timeout, so a wedged
-            periodic snapshot holds the lock forever, and skipping the terminal upload there leaves
-            pre-failure bytes as the only console on the repo.
+            timeout, so a slow snapshot can still run when the final one begins. ``final`` never
+            yields -- upload_file takes no timeout, so a wedged periodic snapshot holds the lock
+            forever and skipping the terminal upload leaves pre-failure bytes as the only console.
+            A periodic snapshot that sees ``console_teardown`` therefore drops its commit rather
+            than racing: captured BEFORE the terminal one, landing last, it would erase it.
 
             Returns whether the tail landed: errors are swallowed, not raised, so a caller tracking
             what is stored cannot read a normal return as success and skip the retry it earned."""
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
                 return False
+            if final:
+                console_teardown.set()
             held = console_upload_lock.acquire(timeout=120.0)
             try:
-                if not held and not final:
-                    print(f"console upload skipped for {mode}; a snapshot is still in flight")
+                if not final and (console_teardown.is_set() or not held):
+                    print(f"console upload skipped for {mode}; the terminal snapshot supersedes it")
                     return False
                 # per-caller scratch: sharing one .tail splices an unsynchronized final snapshot
                 suffix = ".final.tail" if final else ".tail"
-                return _upload_console_locked(mode, console, console + suffix)
+                return _upload_console_locked(mode, console, console + suffix, final)
             finally:
                 if held:
                     console_upload_lock.release()
 
-        def _upload_console_locked(mode: str, console: str, tail_path: str) -> bool:
+        def _upload_console_locked(mode: str, console: str, tail_path: str, final: bool) -> bool:
             try:
                 from huggingface_hub import HfApi
 
@@ -564,23 +570,22 @@ def _train_body(input_data: dict) -> dict:
                     tail = raw.decode("utf-8", "replace")
                 else:
                     tail = raw[1:].decode("utf-8", "replace")
-                    # the byte boundary can land inside a one-line credential, and a partial
-                    # value no longer matches full-value redaction, so a truncated first line is
-                    # dropped before sanitizing. a line the boundary did not split is kept: it
-                    # may hold the root-cause exception.
-                    # a tail that is ONE unterminated line is dropped whole. that loses the only
-                    # diagnostic on a crash whose evidence is a single huge line, but any bound
-                    # that would let it through is measured against the credentials this process
-                    # KNOWS, and the value at risk is the one it does not: a capability minted at
-                    # runtime contributes no needle, so a margin sized from an unrelated configured
-                    # secret leaves a long fragment of it behind. an empty tail never leaked.
-                    # mirrors bootstrap_secrets._read_console_tail.
+                    # a truncated first line is dropped before sanitizing: a boundary landing
+                    # inside a one-line credential leaves a fragment that full-value redaction no
+                    # longer matches. duplicated rather than imported because only this function's
+                    # SOURCE ships to the worker; bootstrap_secrets._read_console_tail is the
+                    # canonical copy and carries the full reasoning.
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
                 with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
+                # re-checked after staging: teardown can begin mid-flight, and committing then
+                # would overwrite the terminal console with older bytes.
+                if not final and console_teardown.is_set():
+                    print(f"console upload dropped for {mode}; superseded by the terminal snapshot")
+                    return False
                 HfApi(token=env.get("HF_TOKEN")).upload_file(
                     path_or_fileobj=tail_path,
                     path_in_repo=f"{prefix}/console_{mode}.txt",
