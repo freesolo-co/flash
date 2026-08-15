@@ -232,6 +232,10 @@ def _has_schema_context(value: Any, *, declaration_host: bool = True) -> bool:
     "THIRDPARTY"}}}}` claimed the schema exemption. `password` was then read as a property
     DEFINITION rather than a credential field, and its unknown `value` keyword was kept verbatim.
 
+    The request root is one of those places. It opens the host vocabulary for the keys BELOW it,
+    but a chat-completions envelope is not itself a declaration, so the same payload spelled at the
+    top level -- `$id` beside `model` and `messages` -- leaked the same credential.
+
     The SHAPE tests below still apply, because they are what recognizes a schema that declares no
     identity at all -- the ordinary case for a `parameters` block -- and they demand that every
     property value be an unambiguous schema definition, which the payload above fails.

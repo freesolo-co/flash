@@ -532,14 +532,17 @@ def _redact_secret_fields(
         return "[redacted]"
     if isinstance(value, dict):
         # an `$id`/`$schema` MEMBER only declares a schema where a declaration can live: beneath a
-        # recognized host, an inherited wrapper, or at the payload root. anywhere else it is an
-        # ordinary string, and honouring it let nested request data claim the schema exemption and
-        # keep a credential beside a secret-named property verbatim. the SHAPE tests are unaffected,
-        # so a `parameters` block that declares no identity is still recognized as before.
+        # recognized host or an inherited wrapper. anywhere else it is an ordinary string, and
+        # honouring it let request data claim the schema exemption and keep a credential beside a
+        # secret-named property verbatim. the payload root is NOT such a place: it opens the host
+        # VOCABULARY below, but a chat-completions envelope is not itself a declaration, so a body
+        # that merely spells `$id` beside `model` and `messages` claimed the exemption for
+        # everything under it. the SHAPE tests are unaffected, so a `parameters` block that declares
+        # no identity is still recognized as before.
         schema_context = (
             schema_context
             or schema_wrapper
-            or _has_schema_context(value, declaration_host=schema_host or payload_root)
+            or _has_schema_context(value, declaration_host=schema_host)
         )
         # an embedded resource may select its own dialect, so this is read per node rather than
         # once for the payload, and the reading in force here is what the children inherit.

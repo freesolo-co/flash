@@ -12116,3 +12116,67 @@ def test_a_schema_shaped_node_is_still_recognized_without_an_identifier() -> Non
         )
         is False
     )
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        {"$id": "note"},
+        {"$schema": "https://json-schema.org/draft/2020-12/schema"},
+    ],
+)
+def test_the_request_root_cannot_declare_itself_a_schema(identifier: dict[str, str]) -> None:
+    """The chat-completions envelope is not a declaration host. The root opens the host VOCABULARY
+    -- `tools`, `response_format` and the rest -- but is not itself a place a declaration can live,
+    so an identifier beside ordinary request fields is a string like any other. Honouring it let a
+    request whose top level spells `$id` claim the schema exemption for its whole body, and
+    `password` was then read as a property DEFINITION rather than a credential field: its unknown
+    `value` keyword was kept verbatim, so a third-party credential the caller never registered
+    reached the raw export.
+    """
+    payload = {
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        **identifier,
+        "properties": {"password": {"type": "string", "value": "THIRDPARTY"}},
+    }
+
+    stored = traces._sanitize_for_trace(payload, ())
+
+    assert "THIRDPARTY" not in json.dumps(stored)
+    assert stored["properties"]["password"] == "[redacted]"
+
+
+def test_the_root_still_opens_the_schema_host_vocabulary() -> None:
+    """Control for the fix above: only the IDENTIFIER branch stops reading the root as a
+    declaration. A real host named at the root still opens the exemption for its subtree, so a
+    declared schema keeps an ordinary property's annotations while a credential property's literal
+    is redacted.
+    """
+    parameters = {
+        "$id": "https://example.test/tool",
+        "type": "object",
+        "properties": {
+            "city": {"type": "string", "vendorKeyword": True, "default": "Boston"},
+            "password": {"type": "string", "vendorKeyword": True, "default": "SECRET"},
+        },
+    }
+    payload = {"tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}]}
+
+    stored = traces._sanitize_for_trace(payload, ())["tools"][0]["function"]["parameters"]
+
+    assert stored["properties"]["city"]["default"] == "Boston"
+    assert stored["properties"]["password"]["default"] == "[redacted]"
+
+
+def test_a_root_identifier_does_not_blank_ordinary_schema_annotations() -> None:
+    """The fix withholds an EXEMPTION rather than adding redaction, so content that was already
+    kept is untouched: a root identifier beside an ordinary definition leaves that definition's
+    annotations exactly as they were.
+    """
+    payload = {"$id": "note", "$defs": {"city": {"type": "string", "default": "Boston"}}}
+
+    stored = traces._sanitize_for_trace(payload, ())
+
+    assert stored["$defs"]["city"]["default"] == "Boston"
+    assert stored["$id"] == "note"
