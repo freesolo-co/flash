@@ -708,7 +708,8 @@ def env_setup(paths: list[str], project_id: str, *, can_publish: bool = True) ->
         # running FLASH_STANDALONE=1, and setup classifies on the API URL, which cannot see it.
         next_step = arrow(
             "publish it: push to a git repo, then set [environment] id = "
-            "github:OWNER/REPO@main:environment.py (needs FLASH_STANDALONE=1 on the plane)"
+            "github:OWNER/REPO@REF:environment.py (REF is the repo's actual default branch) "
+            "(needs FLASH_STANDALONE=1 on the plane)"
         )
     return _safe(f"{head}\n{tree}\n\n{next_step}")
 
