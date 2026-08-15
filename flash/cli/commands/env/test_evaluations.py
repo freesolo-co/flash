@@ -78,7 +78,7 @@ def _evaluation_response(env, case) -> tuple[str, str]:
 
 def _episode_evaluation_response(env, case) -> tuple[str, dict]:
     """Replay one held-out episode without re-running the environment's reward."""
-    # imported here rather than at module scope: `test.py` imports THIS module.
+    # imported here rather than at module scope: `test.py` imports this module.
     from flash.cli.commands.env.test import _drive_multi_turn, _new_record
 
     record = _new_record()

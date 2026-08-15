@@ -36,7 +36,13 @@ def _grades_episodes(suite) -> bool:
     Keying off the environment scored the wrong turn there and turned a well-formed first action
     into an error, so the suite has to say so itself.
     """
-    return bool(getattr(suite, "grades_episodes", False))
+    value = getattr(suite, "grades_episodes", False)
+    if not isinstance(value, bool):
+        name = getattr(suite, "name", "evaluation")
+        raise TypeError(
+            f"suite {name!r} grades_episodes must be a bool, got {type(value).__name__}"
+        )
+    return value
 
 
 def _drive_episode(client, target: str, environment, case: EvalCase, args) -> dict | str:
@@ -184,32 +190,30 @@ def _state_argument(score) -> str | None:
     except (TypeError, ValueError):
         # builtins and C callables expose no signature; treat them as the published contract.
         return None
-    named_state = next((p for p in parameters if p.name == "state"), None)
-    if named_state is not None and named_state.kind in (
-        inspect.Parameter.KEYWORD_ONLY,
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-    ):
-        # by keyword even where positional would also bind: it cannot land on the wrong parameter.
-        return "keyword"
     positional = [
         parameter
         for parameter in parameters
         if parameter.kind
         in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     ]
-    if len(positional) >= 3 and positional[2].name == "episode":
-        # preserve the previously shipped transcript-aware scorer shape without treating an
-        # unrelated third option such as `threshold=0.5` as episode state.
-        return "positional"
+    named_state = next((parameter for parameter in parameters if parameter.name == "state"), None)
+    if named_state is not None:
+        if named_state.kind is inspect.Parameter.POSITIONAL_ONLY:
+            return "positional" if positional.index(named_state) == 2 else None
+        if named_state.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            # by keyword even where positional would also bind: it cannot land on the wrong parameter.
+            return "keyword"
     # checked before `*args`, since a scorer with both can take `state=` but one with only
     # `*args` cannot.
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters):
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
         return "keyword"
-    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
-        return "positional"
-    # a positional-only parameter is supported only when it explicitly names the episode state.
-    if named_state is not None and named_state.kind is inspect.Parameter.POSITIONAL_ONLY:
-        return "positional"
+    if any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
+        # state is the third call argument, so *args receives it only when no regular option occupies
+        # that position.
+        return "positional" if len(positional) == 2 else None
     return None
 
 

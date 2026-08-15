@@ -332,8 +332,8 @@ def test_env_test_validates_episode_suite_with_finished_state(monkeypatch, tmp_p
         "            {'role': 'assistant', 'content': 'first'},\n"
         "            {'role': 'assistant', 'content': 'second'},\n"
         "        ])]\n"
-        "    def score(self, case, response, episode):\n"
-        "        turns = [m['content'] for m in episode['messages'] if m['role'] == 'assistant']\n"
+        "    def score(self, case, response, state):\n"
+        "        turns = [m['content'] for m in state['messages'] if m['role'] == 'assistant']\n"
         "        return response == 'second' and turns == ['first', 'second']\n"
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
