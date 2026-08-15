@@ -325,10 +325,8 @@ def test_heartbeat_console_marks_only_an_attempted_upload_that_failed(monkeypatc
     failed heartbeat resets that timer while the stall clock keeps counting from the older
     committed one -- and the wedge snapshot gets scheduled past the teardown it exists to beat.
 
-    The exemption is as load-bearing as the mark. A THROTTLED heartbeat is uncommitted too, but
-    marking it would fire the wedge path on every healthy run: the step stages coalesce at
-    _HB_MIN_INTERVAL_S (900s), nearly double the uploader's 480s quiet threshold. Both directions
-    are asserted here because a fix for either one alone reads as correct in isolation.
+    A throttled heartbeat is uncommitted too, but it needs a distinct marker: it did not fail an
+    upload, yet it also cannot reset the wedge clock as if the provider observed this payload.
     """
     import json
 
@@ -353,14 +351,14 @@ def test_heartbeat_console_marks_only_an_attempted_upload_that_failed(monkeypatc
     ne.heartbeat("rl_step", step=2)
     assert _console(-1)["pending"] is True
 
-    # THROTTLED, not failed: uncommitted, but the last commit is recent BY CONSTRUCTION, so this
-    # is real progress the provider's clock already has. Marking it is the false-wedge bug.
+    # throttled, not failed: the record remains visible but cannot claim hf committed this payload.
     monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: True)
     ne._HB_LAST_UPLOAD = time.time()
     ne.heartbeat("rl_step", liveness=True, step=3)
     throttled = _console(-1)
     assert "pending" not in throttled, "a throttled heartbeat is not a failed one"
+    assert throttled["throttled"] is True
     assert throttled["step"] == 3, "the throttled heartbeat still reaches the console"
 
 

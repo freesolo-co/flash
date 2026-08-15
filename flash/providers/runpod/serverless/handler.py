@@ -581,13 +581,15 @@ def _train_body(input_data: dict) -> dict:
                         buf, size = buf[:cut], cursor + cut
                     pat = rb'(?m)^HEARTBEAT (?!.*"liveness":).*$'
                     beats = re.findall(pat, buf)
-                    staged = sum(b'"pending":' not in b for b in beats)
+                    staged = sum(
+                        b'"pending":' not in line and b'"throttled":' not in line for line in beats
+                    )
                     had_committed = committed
                     committed = committed or bool(staged)
                     if committed and not had_committed and uploaded_size >= 0:
                         due_s = 3600.0
                     # a wedge is progress that stopped: re-arm on it, spend only on a stall that
-                    # bought an upload. two credits per run. pending counts until the first commit.
+                    # bought an upload. two credits per run. uncommitted beats only arm the loop.
                     progress = staged if committed else len(beats)
                     armed = armed or bool(progress)
                     quiet_polls = 0 if progress else quiet_polls + 1

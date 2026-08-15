@@ -22,7 +22,7 @@ _SECRET_RE = re.compile(
 # component lines are registered as needles too; the floor keeps a common fragment such as ``}``
 # from erasing innocent output. Mirrors flash._internal.diagnostics.
 _MIN_SECRET_COMPONENT = 8
-_CONSOLE_PROGRESS_SCAN_BYTES = 1_048_576
+_CONSOLE_SCAN_BYTES = 1_048_576
 
 
 def _bounded_pattern(needle: str) -> str:
@@ -193,7 +193,7 @@ def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
                 f.seek(offset - 1)
                 line_start = f.read(1) == b"\n"
             f.seek(offset)
-            buf = f.read(_CONSOLE_PROGRESS_SCAN_BYTES)
+            buf = f.read(_CONSOLE_SCAN_BYTES)
     except OSError:
         return -1, 0, 0
 
@@ -206,7 +206,8 @@ def _console_progress(console: str, offset: int) -> tuple[int, int, int]:
         buf = buf[first_newline + 1 :]
 
     cut = buf.rfind(b"\n") + 1
-    if not cut and len(buf) == _CONSOLE_PROGRESS_SCAN_BYTES:
+    if not cut and len(buf) == _CONSOLE_SCAN_BYTES:
         return cursor + len(buf), 0, 0
     hb = re.findall(rb'(?m)^HEARTBEAT (?!.*"liveness":).*$', buf[:cut])
-    return cursor + cut, sum(b'"pending":' not in b for b in hb), len(hb)
+    committed = sum(b'"pending":' not in line and b'"throttled":' not in line for line in hb)
+    return cursor + cut, committed, len(hb)

@@ -139,19 +139,11 @@ def _console_heartbeat_snapshot(
     upload_due: bool = False,
     provisional_claim: int = 0,
 ) -> str:
-    """The heartbeat line echoed to the console. ``pending`` marks one whose upload did not land.
+    """Render one bounded console record with explicit HF commit state.
 
-    The console uploader keys its wedge timer on these lines, but the provider's stall clock reads
-    only what reached HF. A heartbeat that never landed there but looked like progress here would
-    reset that timer against a stall clock still anchored to the older committed one, so the wedge
-    snapshot could be scheduled after teardown had already killed the box.
-
-    Only an upload that was ATTEMPTED and failed is marked. A THROTTLED heartbeat is uncommitted
-    too, and marking it would be the more damaging bug in the opposite direction: the step stages
-    coalesce at ``_HB_MIN_INTERVAL_S`` (900s), far past the uploader's quiet threshold, so every
-    healthy run would read as wedged between commits. The throttle is only safe because the last
-    commit is recent by construction, which is exactly what a failed upload cannot promise. The
-    flag is additive, so a committed heartbeat is byte-identical to before.
+    ``pending`` means an attempted or provisional upload did not settle. ``throttled`` means no
+    upload was attempted. Neither may reset the console wedge clock as if the provider had observed
+    it, but both still prove the worker reached the progress loop and can arm diagnostics.
     """
     console_payload = dict(payload)
     metrics_last = console_payload.pop("metrics_last", None)
@@ -165,6 +157,8 @@ def _console_heartbeat_snapshot(
             claim_uncommitted = provisional_claim > _HB_COMMITTED_CLAIM_SEQ
         if upload_due or claim_uncommitted:
             console_payload["pending"] = True
+        else:
+            console_payload["throttled"] = True
     return json.dumps(console_payload)
 
 

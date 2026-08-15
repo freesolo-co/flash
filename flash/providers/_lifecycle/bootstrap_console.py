@@ -25,8 +25,8 @@ def _run_console_upload_loop(
     kills a wedged run at 1200s/3000s, before an hourly snapshot can preserve its diagnostics.
 
     ``armed`` means real progress was observed and then stopped. Before the first committed
-    heartbeat, a pending heartbeat may arm the loop because it is the only proof setup reached the
-    worker. After one commit, only committed heartbeats count because the provider's stall clock is
+    heartbeat, an uncommitted heartbeat may arm the loop because it is the only proof setup reached
+    the worker. After one commit, only committed heartbeats count because the provider's stall clock is
     anchored to what reached the artifact repo. Progress re-arms the latch; the per-run credit cap
     prevents a flapping run from turning the poll cadence into the commit cadence.
 

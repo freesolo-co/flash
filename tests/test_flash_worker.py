@@ -1190,7 +1190,7 @@ def test_first_console_snapshot_precedes_the_stall_teardown():
     # the committed count it never arms, buys no wedge snapshot, and the next scheduled upload is
     # an interval out, past the setup teardown. After a commit exists the provider's stall clock is
     # anchored and counting down, so only committed ones may count.
-    assert "staged = sum(b'\"pending\":' not in b for b in beats)" in body
+    assert "b'\"throttled\":' not in line" in body
     assert "committed = committed or bool(staged)" in body
     assert "progress = staged if committed else len(beats)" in body
     assert "armed = armed or bool(progress)" in body
@@ -1652,8 +1652,8 @@ def test_shipped_upload_loop_decides_exactly_like_the_canonical_one(tmp_path):
     string intact and silently gives the two providers different wedge behavior.
 
     So both real implementations are executed against identical console streams and their upload
-    counts compared. The streams mix committed, pending and liveness heartbeats with plain noise,
-    because those are exactly the inputs the two must agree on: only committed heartbeats count once
+    counts compared. The streams mix committed, pending, throttled and liveness heartbeats with
+    plain noise, because those are exactly the inputs the two must agree on: only committed beats count once
     one has landed, liveness never counts, and noise grows the file without being progress.
     """
     import ast
@@ -1675,6 +1675,7 @@ def test_shipped_upload_loop_decides_exactly_like_the_canonical_one(tmp_path):
     lines = {
         "commit": b'HEARTBEAT {"stage":"step","step":1}\n',
         "pending": b'HEARTBEAT {"stage":"step","pending":true}\n',
+        "throttled": b'HEARTBEAT {"stage":"step","throttled":true}\n',
         "liveness": b'HEARTBEAT {"stage":"step","liveness":true}\n',
         "noise": b"(raylet) still waiting for resources\n",
         "silent": b"",
@@ -1808,6 +1809,10 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     # next scheduled one is an interval out, past the setup teardown, so the console is lost.
     assert _instance_bootstrap._console_progress(str(pend), 0)[2] == 2
 
+    throttled = tmp_path / "console_throttled.txt"
+    throttled.write_bytes(_hb(step=9, throttled=True))
+    assert _instance_bootstrap._console_progress(str(throttled), 0)[1:] == (0, 1)
+
     # a liveness ping arms nothing: it prints from a daemon whether or not the training loop is
     # alive, so unlike a pending heartbeat it is not evidence the run ever reached the loop.
     lv_only = tmp_path / "console_liveness_only.txt"
@@ -1861,7 +1866,7 @@ def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
     # through capped chunks, recognizes that it is mid-line, then resumes at the next complete record.
     from flash.providers._lifecycle import bootstrap_secrets
 
-    cap = bootstrap_secrets._CONSOLE_PROGRESS_SCAN_BYTES
+    cap = bootstrap_secrets._CONSOLE_SCAN_BYTES
     huge = tmp_path / "console_huge_line.txt"
     huge.write_bytes(b"x" * (2 * cap + 17) + b"\n" + _hb(step=99))
     cursor = 0
@@ -1939,6 +1944,34 @@ def test_instance_console_upload_loop_arms_on_a_heartbeat_whose_upload_failed(mo
     assert sorted({n * poll_s for n in uploads3} - scheduled_at), (
         "a run that stopped committing must still buy a wedge snapshot"
     )
+
+
+def test_throttled_heartbeat_cannot_push_snapshot_past_stall_teardown(monkeypatch):
+    """Console-only progress must preserve the provider's older committed deadline."""
+    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+
+    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
+    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    stall_s = 1200.0
+    cycles = 14
+    # one committed heartbeat arms the loop. the first scheduled snapshot lands at 600s, then no
+    # bytes change until a throttled heartbeat appears at 960s. it never reached hf, so treating it
+    # as committed resets the quiet clock and delays the next snapshot to 1440s, after teardown.
+    sizes = [1000] * 7 + [2000] + [2000] * (cycles - 8)
+    staged = [1] + [0] * (cycles - 1)
+    beats = [1] + [0] * 6 + [1] + [0] * (cycles - 8)
+    _waits, uploads = _drive_instance_upload_loop(
+        monkeypatch,
+        sizes,
+        cycles=cycles,
+        staged=staged,
+        beats=beats,
+    )
+
+    at_s = [attempt * poll_s for attempt in uploads]
+    assert at_s[0] == first_s
+    assert at_s[1] == 8 * poll_s
+    assert at_s[1] < stall_s
 
 
 def test_instance_console_upload_loop_retries_when_an_upload_fails(monkeypatch):
