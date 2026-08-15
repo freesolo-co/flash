@@ -3667,6 +3667,59 @@ def test_recover_deployments_recovers_busy_states_on_startup_regardless_of_age(
     ]
 
 
+def test_restart_recovery_preserves_unknown_activation_for_authoritative_readback(api, monkeypatch):
+    import flash.runner as runner
+    from flash.server.routes import serving
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    previous_revision = f"{run_id}@final." + "a" * 40
+    attempted_revision = f"{run_id}@final." + "b" * 40
+    previous = {
+        "run_id": run_id,
+        "state": "failed",
+        "adapter_revision": previous_revision,
+        "alias_activation_confirmed": True,
+        "requested_at": 1.0,
+    }
+    status.deployment = {
+        "run_id": run_id,
+        "state": "reconciling",
+        "adapter_revision": attempted_revision,
+        "activation_outcome_unknown": True,
+        "previous_deployment": previous,
+        "requested_at": 2.0,
+    }
+    runner._save_status(status)
+
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": run_id}])
+    monkeypatch.setattr(serving, "_report_persisted_transition", lambda *_args, **_kwargs: None)
+
+    assert serving.recover_deployments() == 1
+    recovered = runner.get_status(run_id).deployment
+    assert recovered["state"] == "reconciling"
+    assert recovered["activation_outcome_unknown"] is True
+    assert recovered["previous_deployment"] == previous
+
+    readbacks = []
+
+    def read_alias(target_run_id):
+        readbacks.append(target_run_id)
+        return attempted_revision
+
+    monkeypatch.setattr(serving._app, "adapter_alias_target", read_alias)
+    target, predecessor = serving._activation_predecessor(run_id, recovered)
+
+    assert readbacks == [run_id]
+    assert target == attempted_revision
+    assert predecessor["adapter_revision"] == attempted_revision
+    assert predecessor["state"] == "reconciling"
+
+
 def test_deployment_job_is_started_before_waiters_can_observe_it(monkeypatch):
     import flash.server.app as app_mod
 

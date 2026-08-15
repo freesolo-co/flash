@@ -82,9 +82,14 @@ def recover_deployments() -> int:
                 detail = "deployment retired: its algorithm was removed; submit a new run to deploy"
             else:
                 continue
+            recovered_state = (
+                "reconciling"
+                if state == "reconciling" and deployment.get("activation_outcome_unknown") is True
+                else "failed"
+            )
             failed = _deployment_state(
                 deployment,
-                "failed",
+                recovered_state,
                 error=error,
                 detail=detail,
                 recovered_at=time.time(),
