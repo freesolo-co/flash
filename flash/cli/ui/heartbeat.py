@@ -275,7 +275,21 @@ def _finite_positive(value: object) -> float | None:
     return number
 
 
-def step_timing_pairs(heartbeat: dict, *, running: bool) -> list[tuple[str, str]]:
+def _snapshot_is_stale(heartbeat_age_seconds: float | None) -> bool:
+    """True when a stored countdown is old enough to no longer describe now.
+
+    Same threshold the panel already uses to flag a quiet heartbeat, so the pace row and the age row
+    agree about when a snapshot stopped being current instead of each drawing its own line.
+    """
+    return heartbeat_age_seconds is not None and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S
+
+
+def step_timing_pairs(
+    heartbeat: dict,
+    *,
+    running: bool,
+    heartbeat_age_seconds: float | None = None,
+) -> list[tuple[str, str]]:
     """Rows for measured per-step cost and what it projects, when the worker has measured one.
 
     Absent until a whole step has been timed, which is deliberate and is the entire point: the first
@@ -295,13 +309,24 @@ def step_timing_pairs(heartbeat: dict, *, running: bool) -> list[tuple[str, str]
     row = f"{_humanize_step_cost(per_step)}/step"
     remaining = _finite_positive(heartbeat.get("projected_remaining_s"))
     if remaining is not None:
-        row += f" · ~{_humanize_duration(remaining)} left at this rate"
+        # the projection is a SNAPSHOT taken when the worker published, and mid-training uploads are
+        # held for up to 900s. rendering a stored "~10m left" as current still reads ~10m eight
+        # minutes later, which is the one direction that matters: it understates how far along the
+        # run is and invites cancelling something that is nearly done. the pace itself does not go
+        # stale the same way -- it is a rate, not a countdown -- so only the countdown is qualified.
+        as_of = " when last reported" if _snapshot_is_stale(heartbeat_age_seconds) else ""
+        row += f" · ~{_humanize_duration(remaining)} left at this rate{as_of}"
     pairs = [("pace", row)]
     if heartbeat.get("wall_deadline_at_risk"):
         wall = _finite_positive(heartbeat.get("remaining_wall_s"))
         # the wall is named only when the worker sent it, so the warning never cites a number the
         # panel cannot show. without it the warning still stands on the projection alone.
-        against = f" against {_humanize_duration(wall)} of wall time left" if wall else ""
+        # both sides of this comparison were measured at the same instant on the worker, so the
+        # verdict stays valid as it ages -- but the wall figure it QUOTES is a countdown like the
+        # projection, and naming it as current would overstate the remaining allowance by however
+        # long the upload was held.
+        as_of = " when last reported" if _snapshot_is_stale(heartbeat_age_seconds) else ""
+        against = f" against {_humanize_duration(wall)} of wall time left{as_of}" if wall else ""
         # the worker warns from 90% of the allowance, so the flag covers two different situations
         # and they deserve different words. a projection that still FITS is a headroom warning: the
         # final checkpoint upload runs after the last step and can take minutes on a large model,
@@ -479,7 +504,11 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     # measured on a worker that no longer exists, and the replacement may be on different hardware
     # entirely, so presenting it as this run's pace would be a confident wrong number.
     if from_current_attempt:
-        pairs += step_timing_pairs(hb, running=running)
+        pairs += step_timing_pairs(
+            hb,
+            running=running,
+            heartbeat_age_seconds=heartbeat_age_seconds,
+        )
     age = _humanize_age_seconds(heartbeat_age_seconds)
     if age:
         # the progress row already explains this silence, and does it more precisely. show one or

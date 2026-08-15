@@ -483,6 +483,35 @@ def test_a_finished_run_shows_no_projection():
     assert step_timing_pairs(heartbeat, running=False) == []
 
 
+def test_a_stale_projection_is_labelled_rather_than_read_as_current():
+    """The countdown is a snapshot, and mid-training uploads are held for up to 900s.
+
+    Rendering a stored "~10m left" unqualified still reads ~10m eight minutes later. That errs in
+    the direction that costs money: it understates how far along the run is, which argues for
+    cancelling something nearly finished. The pace itself is a RATE and does not decay the same way,
+    so only the countdown is qualified.
+    """
+    beat = {"step_duration_s": 92.0, "projected_remaining_s": 600.0}
+
+    fresh = dict(step_timing_pairs(beat, running=True, heartbeat_age_seconds=30.0))["pace"]
+    assert "~10m left at this rate" in fresh
+    assert "when last reported" not in fresh, "a fresh snapshot must not be hedged"
+
+    stale = dict(step_timing_pairs(beat, running=True, heartbeat_age_seconds=480.0))["pace"]
+    assert "~10m left at this rate when last reported" in stale
+
+    # the pace is present either way: this qualifies the countdown, it does not withhold it.
+    assert "92s/step" in fresh
+    assert "92s/step" in stale
+
+    # the wall warning quotes a countdown too, so the same qualification applies to it.
+    at_risk = {**beat, "wall_deadline_at_risk": True, "remaining_wall_s": 300.0}
+    warning = dict(step_timing_pairs(at_risk, running=True, heartbeat_age_seconds=480.0))[
+        "wall limit"
+    ]
+    assert "5m of wall time left when last reported" in warning
+
+
 def test_a_junk_duration_is_ignored_rather_than_rendered():
     """The field crosses a network boundary from the worker, so the panel cannot assume it is sane.
 
@@ -1293,6 +1322,59 @@ def test_a_call_that_overlaps_a_step_without_delaying_it_is_not_a_block():
     delayed.note_if_blocked(0.9)
     delayed.record(0.9, 1)
     assert delayed._draining_backlog, "a call that delayed the next line must still arm the drain"
+
+
+def test_a_call_before_the_first_step_line_is_not_charged_to_a_later_step():
+    """SFT and OPD fire this callback on startup output, long before any optimizer line.
+
+    ``run_verl_training`` initializes ``last_hb`` to zero, so the first child-stream line -- an
+    initialization message, not a step -- runs the heartbeat. A 0.9s upload there finishes DURING
+    warmup, which is already excluded whole and which no interval can contain.
+
+    Deferring it anyway meant the value sat unjudged until a span existed to compare it against, and
+    that span belonged to a step which had not started when the call ran. On a 0.1s workload the
+    comparison then declared a block, arming the no-pace drain: 39 genuine steps discarded and no
+    pace published at all, from an upload that had already finished before the first step began.
+    """
+    clock = step_timing.StepClock()
+    clock.note_if_blocked(0.9)
+    assert clock._unjudged_block_s == 0.0, "a pre-baseline call must not be carried forward"
+
+    for step in range(40):
+        clock.record(step * 0.1, step)
+
+    assert clock.step_seconds() == pytest.approx(0.1, abs=0.001), clock.step_seconds()
+    assert not clock._draining_backlog, "a finished pre-baseline call armed a drain"
+    assert len(clock.intervals()) == 39
+
+
+def test_a_long_call_that_delayed_nothing_keeps_the_interval_it_did_not_touch():
+    """Length alone does not prove a call blocked the reader; the next arrival does.
+
+    A 2s upload that returns mid-step on a 92s/step run delayed no output at all, but the absolute
+    1s threshold declared it a block on sight. That costs a segment, and on a two-step run the
+    segment IS the only measurable interval, so the run published no pace and no ETA -- for a call
+    that occupied 2% of one step.
+
+    The deferred path already judges by whether the next line was held back, and this simply stops
+    exempting long calls from that judgement.
+    """
+    for steps in (2, 3, 4):
+        clock = step_timing.StepClock()
+        clock.record(0.0, 0)
+        clock.note_if_blocked(2.0)
+        for i in range(1, steps):
+            clock.record(i * 92.0, i)
+        assert clock.step_seconds() == 92.0, f"{steps} steps published {clock.step_seconds()}"
+        assert len(clock.intervals()) == steps - 1, f"{steps} steps lost an interval"
+
+    # a long call that DID hold the line back is still caught: the next arrival lands the instant
+    # the call returns, which is what a buffered line looks like.
+    blocked = step_timing.StepClock()
+    blocked.record(0.0, 0)
+    blocked.note_if_blocked(30.0)
+    blocked.record(30.0, 1)
+    assert blocked._draining_backlog, "a 30s lock that buffered output must still arm the drain"
 
 
 def test_the_drain_ends_when_the_run_accelerates_past_its_own_floor():

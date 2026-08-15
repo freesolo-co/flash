@@ -181,10 +181,20 @@ class StepClock:
             if elapsed_s >= min(_BLOCKING_CALL_THRESHOLD_S, measured / 2):
                 self.note_blocking_work()
             return
-        if elapsed_s >= _BLOCKING_CALL_THRESHOLD_S:
-            self.note_blocking_work()
-        elif elapsed_s > 0:
+        if not self._times:
+            # nothing has been timed yet, so this call sits in the warmup that precedes the first
+            # step line -- which is already excluded whole, and no interval can contain it. SFT and
+            # OPD drive this callback from the child stream with last_hb=0, so it fires on startup
+            # output long before any optimizer line; deferring there let a 0.9s upload that had
+            # ALREADY FINISHED be charged to the second step's span, arming a drain that discarded
+            # 39 genuine steps and published no pace at all. holding it would also be judging it
+            # against a span it never touched.
+            return
+        if elapsed_s > 0:
             # no pace yet: hold it for the next step line to judge against the span it lands in.
+            # length alone does not decide it, however long the call was -- a 2s upload that returns
+            # mid-step on a 92s run delayed nothing, and charging it a segment cost the only
+            # interval a short run had. the next arrival is the evidence either way.
             self._unjudged_block_s += float(elapsed_s)
 
     def _resolve_unjudged_block(self, span_s: float) -> None:
