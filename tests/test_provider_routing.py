@@ -147,7 +147,16 @@ def test_exact_only_preflight_rejects_unconfigured_provider_set_before_persisten
     assert persisted == []
 
 
-def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
+@pytest.mark.parametrize(
+    ("gpu_preferences", "expected_provider", "expected_providers"),
+    [
+        ({"provider": "runpod"}, "runpod", ()),
+        ({"providers": ("runpod", "vast")}, "", ("runpod", "vast")),
+    ],
+)
+def test_runpod_allocation_routes_to_runpod_submit(
+    orch, monkeypatch, gpu_preferences, expected_provider, expected_providers
+):
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import jobs as rp_jobs
@@ -176,7 +185,7 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    spec = _spec(provider="runpod", type="RTX 4090")
+    spec = _spec(type="RTX 4090", **gpu_preferences)
     _seed_status(orch, spec)
     metrics = orch._submit_seed_supervised(
         spec,
@@ -187,7 +196,8 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
     assert metrics["train_tokens"] == 4096
     assert captured["gpu_type"] == "RTX 4090"
     assert captured["runtime_secrets"] == {"WANDB_API_KEY": "user-wb"}
-    assert captured["allocate_kwargs"]["provider"] == "runpod"
+    assert captured["allocate_kwargs"]["provider"] == expected_provider
+    assert captured["allocate_kwargs"]["providers"] == expected_providers
     assert captured["allocate_kwargs"]["gpu_type"] == "RTX 4090"
     remote = orch.get_status(spec.run_id).remote
     assert remote["provider"] == "runpod"
@@ -1235,6 +1245,22 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
         {("runpod", "H100", 1), ("lambda", "H100", 1)},
     )
     assert (chosen.provider, chosen.gpu) == ("runpod", "RTX Pro 6000")
+
+
+def test_select_candidate_escapes_a_failed_preferred_provider():
+    from flash.providers.base import Candidate
+    from flash.runner.supervise.lifecycle import _select_candidate
+
+    # the allocator placed the preferred provider first even though vast was cheaper. retry must
+    # still demote the failed provider before preserving that incoming preference-ranked order.
+    ranked = (
+        Candidate("runpod", "H100", 3.00, 80),
+        Candidate("vast", "H100", 0.50, 80),
+    )
+
+    chosen = _select_candidate(ranked, {"runpod"}, {("runpod", "H100", 1)})
+
+    assert chosen is ranked[1]
 
 
 def test_select_candidate_keeps_the_allocators_per_step_ranking():
