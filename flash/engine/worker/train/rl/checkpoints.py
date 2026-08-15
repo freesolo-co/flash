@@ -23,7 +23,11 @@ from flash.engine.worker.backend_common import (
 )
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
+from flash.engine.worker.verl.checkpoints import (
+    MergeDiskExhaustedError,
+    MergeDiskHeadroomError,
+    resume_checkpoint_is_loadable,
+)
 
 
 def _rl_train():
@@ -121,6 +125,8 @@ class _VerlResumeUploader:
         called only after training finished cleanly: on a crash or cancel the missing steps are a
         symptom of the real failure, and raising here would mask it.
         """
+        if isinstance(self._error, (MergeDiskHeadroomError, MergeDiskExhaustedError)):
+            raise self._error
         if self._error is not None:
             raise RuntimeError("verl resume uploader failed") from self._error
         missing = sorted(self.required_steps - self.published_steps)

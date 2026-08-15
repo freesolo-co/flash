@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 from dataclasses import dataclass, field
+from math import ceil
 
 from tests._helpers.profile import satisfy_sft_profile
 
@@ -61,25 +62,98 @@ def test_oversized_catalog_models_carry_disk_floors():
     assert MODELS["Qwen/Qwen3.6-35B-A3B"].min_disk_gb == 200
 
 
-def test_submit_raises_disk_to_model_min(monkeypatch):
-    """submit_job (dry-run) bumps gpu.disk_gb to a catalog model's min_disk_gb."""
+def test_every_catalog_algorithm_gets_the_full_bf16_merge_floor():
+    from flash.core.catalog import MODELS, resolve_model
+
+    for model in MODELS.values():
+        expected = max(model.min_disk_gb, ceil(model.params_b * 2) + 64)
+        for algorithm in model.algos:
+            assert resolve_model(model.id, algorithm).min_disk_gb == expected
+
+
+def test_public_model_rows_report_the_derived_merge_floor():
+    from flash.core.catalog import MODELS, public_model_rows
+
+    rows = {row["id"]: row for row in public_model_rows()}
+    for model in MODELS.values():
+        expected = max(model.min_disk_gb, ceil(model.params_b * 2) + 64)
+        assert rows[model.id]["min_disk_gb"] == expected
+
+
+def test_fractional_parameter_merge_floor_rounds_up(monkeypatch):
+    from flash.core.catalog import MODELS, ModelInfo, resolve_model
+
+    model = ModelInfo(
+        id="test/fractional-disk",
+        display_name="fractional",
+        params="0.9B",
+        params_b=0.9,
+        algos=("sft",),
+        min_vram_gb=1,
+    )
+    monkeypatch.setitem(MODELS, model.id, model)
+
+    assert resolve_model(model.id, "sft").min_disk_gb == 66
+
+
+def test_moe_merge_floor_uses_total_parameters(monkeypatch):
+    from flash.core.catalog import MODELS, ModelInfo, resolve_model
+
+    model = ModelInfo(
+        id="test/moe-disk",
+        display_name="moe",
+        params="35B total / 3B active",
+        params_b=35.0,
+        active_params_b=3.0,
+        algos=("sft", "grpo", "opd"),
+        min_vram_gb=1,
+    )
+    monkeypatch.setitem(MODELS, model.id, model)
+
+    assert resolve_model(model.id, "opd").min_disk_gb == 134
+
+
+def test_revision_geometry_is_applied_before_the_disk_floor(monkeypatch):
+    from flash.core.catalog import MODELS, ModelInfo, resolve_model
+    from flash.engine.plan import vram
+
+    model = ModelInfo(
+        id="test/revision-disk",
+        display_name="revision",
+        params="4B",
+        params_b=4.0,
+        algos=("sft",),
+        min_vram_gb=1,
+    )
+    monkeypatch.setitem(MODELS, model.id, model)
+    monkeypatch.setattr(
+        vram,
+        "_validated_revision_geometry",
+        lambda model_id, revision, info: (50.0, 123456),
+    )
+
+    resolved = resolve_model(model.id, "sft", "commit")
+    assert resolved.params_b == 50.0
+    assert resolved.min_disk_gb == 164
+
+
+def test_submit_applies_derived_model_disk_floor(monkeypatch):
+    """submit_job sends the resolved full-bf16 merge floor to the worker."""
     from flash import runner
     from flash.core.catalog import MODELS, ModelInfo
     from flash.core.spec import JobSpec
 
-    monkeypatch.setitem(
-        MODELS,
-        "test/big-disk",
-        ModelInfo(
-            id="test/big-disk",
-            display_name="x",
-            params="4B",
-            params_b=4.0,
-            algos=("sft",),
-            min_vram_gb=32,
-            min_disk_gb=160,
-        ),
+    model = ModelInfo(
+        id="test/big-disk",
+        display_name="x",
+        params="8B",
+        params_b=8.0,
+        algos=("sft",),
+        min_vram_gb=32,
+        min_disk_gb=0,
     )
+    monkeypatch.setitem(MODELS, model.id, model)
+    expected_floor = ceil(model.params_b * 2) + 64
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = JobSpec.from_dict(
@@ -92,12 +166,12 @@ def test_submit_raises_disk_to_model_min(monkeypatch):
             }
         )
         # sft submission is profile-gated, and this synthetic catalog model has no hub revision to
-        # resolve. Disk sizing is what is under test, so seed the profile instead.
+        # resolve. disk sizing is what is under test, so seed the profile instead.
         satisfy_sft_profile(runner, monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
         # disk_gb is platform-managed: stripped from the public status.spec, read the sizing the
         # worker executes from the effective-preparation worker spec.
-        assert status.effective_preparation["worker_spec"]["gpu"]["disk_gb"] == 160
+        assert status.effective_preparation["worker_spec"]["gpu"]["disk_gb"] == expected_floor
         # explicit larger user value wins
         spec_big = JobSpec.from_dict(
             {
