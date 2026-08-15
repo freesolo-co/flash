@@ -730,11 +730,19 @@ def poll_job(
         # download on real runs, and no heartbeat can change "RunPod never gave us a GPU". Blocking
         # on network I/O there would delay the escalation to the next GPU class for a line that is
         # never printed on this path -- _classify_queue_state returns no_capacity before it.
-        if not _queue_deadline_already_spent(context, state, status, now):
+        deferred_heartbeat = _queue_deadline_already_spent(context, state, status, now)
+        if not deferred_heartbeat:
             _update_heartbeat(context, state)
         terminal = _classify_queue_state(context, state, status, now)
         if terminal is not None:
             return terminal
+        if deferred_heartbeat:
+            # the boundary probe found a worker coming up and overturned the presumed no_capacity
+            # verdict, so this job is alive and _classify_stall is the very next check. Deferring the
+            # read to the next poll would let a stall limit that is also spent fire on a job whose
+            # fresh heartbeat is already readable -- killing a live run to save a read we now have to
+            # do anyway. The skip above is only ever a shortcut past a verdict that stands.
+            _update_heartbeat(context, state)
         terminal = _classify_stall(context, state, status)
         if terminal is not None:
             return terminal

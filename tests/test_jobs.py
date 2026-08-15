@@ -891,18 +891,18 @@ def test_health_eligibility_is_measured_from_the_probe_not_the_formatting_clock(
     # out than it really is: after a 150s retried request the next probe is already due, so a 240s
     # unhealthy grace can still fire before a 300s capacity grace with 150s left. Adding a flat 90s
     # from the post-request clock hid that and selected capacity.
-    # The probe ran 45s ago, so the next one is due in 45s and an unhealthy timer with 45s of raw
-    # grace left fires then. Capacity has 60s left and is checked every poll, so unhealthy really is
-    # first. Assuming a full cadence from the formatting clock puts unhealthy at 90s instead and
-    # wrongly reports capacity -- the deadline the operator would NOT hit.
+    # The probe ran 40s ago, so the next one is due in 50s -- past the 45s of raw grace left, which
+    # is the first probe that can fire the timer. Capacity has 65s left and is checked every poll,
+    # so unhealthy really is first. Assuming a full cadence from the formatting clock puts unhealthy
+    # at 90s instead and wrongly reports capacity -- the deadline the operator would NOT hit.
     slow_probe = _note(
         195.0,
-        probe_at=150.0,  # 45s ago: next probe due in 45s
+        probe_at=155.0,  # 40s ago: next probe due in 50s
         unhealthy=True,
         unhealthy_since=0.0,
-        unhealthy_grace_s=240.0,  # 45s of raw grace left
+        unhealthy_grace_s=240.0,  # 45s of raw grace left, so that probe fires it
         queued_since=0.0,
-        queue_grace_s=255.0,  # 60s left, checked every poll
+        queue_grace_s=260.0,  # 65s left, checked every poll
     )
     assert "unhealthy grace" in slow_probe, slow_probe
 
@@ -919,6 +919,67 @@ def test_health_eligibility_is_measured_from_the_probe_not_the_formatting_clock(
         queue_grace_s=270.0,
     )
     assert "capacity grace" in fresh_probe, fresh_probe
+
+
+def test_a_timer_armed_on_this_probe_is_not_charged_the_arming_delay_twice():
+    # `GraceTimer.expired` ARMS on the call that first sees the state ("first poll the state held ->
+    # arm") -- the same call that runs a few lines after this note. So an unarmed timer's grace is
+    # already running from now; it only cannot ALSO expire on that pass. Charging it a further
+    # cadence on top modelled the default 240s unhealthy grace as firing at 360s when it really
+    # fires at 270s, and so reported the 300s capacity grace -- a deadline the run never reaches.
+    from flash.providers.runpod.jobs import HEALTH_PROBE_CADENCE_S, _health_deadline_in
+
+    assert HEALTH_PROBE_CADENCE_S == 90.0
+    # 240s of grace armed at this probe: probes land at +90, +180, +270, and only the last is past
+    # the deadline. Three cadences, not four.
+    assert _health_deadline_in(240.0, armed=False, now=0.0, probe_at=0.0) == 270.0
+
+    # which is what makes the note pick the deadline that actually fires, at the production pairing
+    # of a 240s unhealthy grace against a 300s capacity grace.
+    fires_first = _note(
+        0.0,
+        probe_at=0.0,
+        unhealthy=True,
+        unhealthy_since=None,  # armed by the expired() call below this note
+        unhealthy_grace_s=240.0,
+        queued_since=0.0,
+        queue_grace_s=300.0,
+    )
+    assert "unhealthy grace" in fires_first, fires_first
+
+
+def test_a_deadline_already_declined_this_iteration_does_not_outrank_the_next_check():
+    # A slow health request can push several deadlines past due at once. Capacity and the run wall
+    # were checked BEFORE the request, with the older clock, and did not fire; _classify_stall is the
+    # next check to run and uses the current clock. So when the request crosses both, `stalled` is
+    # what the operator will actually see, and ranking the most-overdue candidate first would name a
+    # deadline this iteration has already declined to act on.
+    crossed = _note(
+        1000.0,
+        queued_since=0.0,
+        queue_grace_s=300.0,  # spent by a wide margin, but checked before the request
+        stall_since=0.0,
+        stall_limit_s=900.0,  # spent by less, but _classify_stall runs next
+    )
+    assert "no-progress limit" in crossed, crossed
+    assert "capacity" not in crossed, crossed
+
+    wall_crossed = _note(
+        1000.0,
+        absolute_deadline=500.0,  # long past, but checked at the top of the iteration
+        stall_since=0.0,
+        stall_limit_s=900.0,
+        queue_grace_s=100_000.0,
+    )
+    assert "no-progress limit" in wall_crossed, wall_crossed
+    assert "wall" not in wall_crossed, wall_crossed
+
+    # ordering only decides between deadlines that are ALREADY SPENT. One still counting down is
+    # ranked on its real remaining time, so a live capacity grace still wins over a distant stall.
+    live = _note(
+        800.0, queued_since=0.0, queue_grace_s=900.0, stall_since=0.0, stall_limit_s=3000.0
+    )
+    assert "capacity grace" in live, live
 
 
 def test_a_spent_capacity_deadline_is_not_delayed_by_a_blocking_heartbeat_read(monkeypatch):
@@ -968,6 +1029,88 @@ def test_a_spent_capacity_deadline_is_not_delayed_by_a_blocking_heartbeat_read(m
     # no_capacity regardless, so the read is pure latency in front of a GPU-class escalation.
     spent = [a for a in ages if a is not None and a > 300.0]
     assert not spent, ages
+
+
+def test_a_boundary_rescue_reads_the_heartbeat_before_the_stall_check(monkeypatch):
+    # Skipping the heartbeat read is only ever a shortcut past a verdict that STANDS. At the grace
+    # boundary the classifier re-probes health, and a worker found coming up overturns the presumed
+    # no_capacity verdict -- the job is alive. _classify_stall is then the very next check, so a
+    # fresh heartbeat that became readable this iteration has to be consumed first: deferring it to
+    # the next poll fails a live run as `stalled` to save a read that then happens anyway.
+    import io
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    # no worker on any SCHEDULED probe, so the capacity timer runs out. The last read is the extra
+    # one _classify_queue_state takes at the grace boundary itself, and only that one finds a worker
+    # initializing -- which overturns the presumed no_capacity verdict and keeps the run alive.
+    scheduled_probes_before_boundary = 3
+    probes = itertools.count()
+
+    def health(_eid, _fp, **_kw):
+        if next(probes) < scheduled_probes_before_boundary:
+            return {"workers": {}}
+        return {"workers": {"initializing": 1}}
+
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # slow enough that the capacity grace is reached first: the stall limit below must still be
+    # ahead of us at the boundary, or the rescue this test is about never gets a chance to matter.
+    clock = itertools.count(start=0, step=20.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+
+    # record whether the heartbeat was read on the iteration whose capacity verdict was overturned,
+    # and whether the stall classifier ran after it. That ordering IS the finding: a rescued job
+    # goes straight into _classify_stall, so a heartbeat deferred to the next poll arrives too late.
+    from flash.providers.runpod import job_execution
+
+    events: list[str] = []
+    real_update = job_execution._update_heartbeat
+    real_classify_queue = job_execution._classify_queue_state
+    real_classify_stall = job_execution._classify_stall
+
+    def _spy_update(context, state):
+        events.append("heartbeat")
+        return real_update(context, state)
+
+    def _spy_queue(context, state, status, now):
+        spent = job_execution._queue_deadline_already_spent(context, state, status, now)
+        verdict = real_classify_queue(context, state, status, now)
+        if spent and verdict is None:
+            events.append("rescued")
+        return verdict
+
+    def _spy_stall(context, state, status):
+        events.append("stall-check")
+        return real_classify_stall(context, state, status)
+
+    monkeypatch.setattr(job_execution, "_update_heartbeat", _spy_update)
+    monkeypatch.setattr(job_execution, "_classify_queue_state", _spy_queue)
+    monkeypatch.setattr(job_execution, "_classify_stall", _spy_stall)
+
+    jobs.poll_job(
+        _runpod_handle(jobs),
+        log=io.StringIO(),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        stall_after_s=500.0,
+        setup_grace_s=500.0,
+        queue_grace_s=300.0,
+        on_last_gpu=False,
+    )
+    assert "rescued" in events, (
+        f"the boundary rescue never happened, so this proves nothing: {events}"
+    )
+    rescue = events.index("rescued")
+    after = events[rescue + 1 :]
+    assert after, f"nothing ran after the rescue, so the ordering is untested: {events}"
+    assert after[0] == "heartbeat", (
+        "the rescued iteration went into _classify_stall without reading the heartbeat, so a "
+        f"heartbeat that became visible here cannot save the run: {events}"
+    )
 
 
 def test_a_recovering_worker_still_reports_the_budgets_that_do_apply():

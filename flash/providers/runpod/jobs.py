@@ -333,24 +333,24 @@ def _health_deadline_in(
     than it really is and could hide a health grace that fires first. A request that outran a whole
     cadence leaves the next probe due immediately.
 
-    The timers are checked a few lines after this note in the same pass, so a grace already spent
-    fires now (0). An unarmed timer is one further cadence out: the poll that arms it cannot also
-    expire it.
+    The checks that can fire this timer, as offsets from `now`: the `expired()` call a few lines
+    below this note in the SAME pass, then one per health probe. An unarmed timer is not charged an
+    extra cadence -- `GraceTimer.expired` arms `since = now` on that same call ("first poll the state
+    held -> arm"), so its grace starts running now; it simply cannot also EXPIRE on the pass that
+    arms it, which is what dropping that first check from its candidate list expresses.
+
+    `expired()` fires on `now - since > grace`, strictly, so a probe landing exactly ON the deadline
+    does not fire it and the one after does.
     """
-    remaining = max(raw_remaining, 0.0)
-    if remaining <= 0.0 and armed:
-        return 0.0
     # when the next probe is due, relative to `now`; never negative, and 0 when already due.
     next_probe_in = 0.0 if probe_at is None else max(probe_at + HEALTH_PROBE_CADENCE_S - now, 0.0)
-    # the first probe boundary at or beyond the grace's own deadline
-    if remaining > next_probe_in:
-        extra = math.ceil((remaining - next_probe_in) / HEALTH_PROBE_CADENCE_S)
-        eligible_in = next_probe_in + extra * HEALTH_PROBE_CADENCE_S
-    else:
-        eligible_in = next_probe_in
-    if not armed:
-        eligible_in += HEALTH_PROBE_CADENCE_S
-    return eligible_in
+    if armed and raw_remaining < 0.0:
+        return 0.0  # the call below this note fires it
+    if next_probe_in > raw_remaining:
+        return next_probe_in
+    # the first probe strictly beyond the grace's own deadline
+    extra = math.floor((raw_remaining - next_probe_in) / HEALTH_PROBE_CADENCE_S) + 1
+    return next_probe_in + extra * HEALTH_PROBE_CADENCE_S
 
 
 def queue_wait_note(
@@ -388,12 +388,22 @@ def queue_wait_note(
 
     The no-progress limit always applies, so there is always at least one deadline to report.
     """
-    # (remaining, waited, budget, label, clause). The health timers cannot fire at their raw
-    # deadline: _classify_queue_state only re-checks them on the ~90s probe cadence, while capacity,
-    # no-progress and the wall deadline are checked every poll. So a health timer actually expires at
-    # its NEXT eligible probe, and an unarmed one needs one further probe to arm at all. Charging
-    # that lateness is what makes "nearest" honest -- an unhealthy timer with 10s of raw grace left
-    # does not beat a capacity timer with 20s, because capacity fires inside the probe gap.
+    # (fires_in, check_order, waited, budget, label, clause). The health timers cannot fire at their
+    # raw deadline: _classify_queue_state only re-checks them on the ~90s probe cadence, while
+    # capacity, no-progress and the wall deadline are checked every poll. So a health timer actually
+    # expires at its NEXT eligible probe. Charging that lateness is what makes "nearest" honest -- an
+    # unhealthy timer with 10s of raw grace left does not beat a capacity timer with 20s, because
+    # capacity fires inside the probe gap.
+    #
+    # `check_order` breaks ties in the order the remaining checks of THIS iteration actually run,
+    # counted from this line: the health timers a few lines below, then _classify_stall, then the
+    # next iteration's wall check and the capacity timer inside the next _classify_queue_state.
+    # It decides between deadlines that are ALREADY SPENT, where raw overdue-ness says nothing about
+    # which one bites: capacity and the wall were checked before this note and did not fire, so if a
+    # slow health request pushed both them and the no-progress limit past due, _classify_stall is the
+    # next check to run and `stalled` is what the operator will see. Ranking "most overdue" first
+    # would name a deadline this iteration has already declined to act on.
+    health_order, stall_order, wall_order, capacity_order = 0, 1, 2, 3
     candidates = []
     if unhealthy:
         waited = 0.0 if unhealthy_since is None else now - unhealthy_since
@@ -403,7 +413,7 @@ def queue_wait_note(
             now=now,
             probe_at=probe_at,
         )
-        candidates.append((remaining, waited, unhealthy_grace_s, "unhealthy", ""))
+        candidates.append((remaining, health_order, waited, unhealthy_grace_s, "unhealthy", ""))
     if throttled:
         waited = 0.0 if throttled_since is None else now - throttled_since
         remaining = _health_deadline_in(
@@ -412,7 +422,7 @@ def queue_wait_note(
             now=now,
             probe_at=probe_at,
         )
-        candidates.append((remaining, waited, throttled_grace_s, "throttled", ""))
+        candidates.append((remaining, health_order, waited, throttled_grace_s, "throttled", ""))
     # the caller only asks for a note when it has just confirmed no usable or recovering worker, so
     # the capacity timer is either running or about to re-arm on the next poll. a cleared `since`
     # therefore means zero elapsed, not "not applicable": _classify_queue_state clears it via the
@@ -433,20 +443,41 @@ def queue_wait_note(
             if on_last_gpu
             else ""
         )
-        candidates.append((queue_grace_s - waited, waited, queue_grace_s, "capacity", clause))
+        # clamped, like every candidate below: a deadline already past fires at 0, and how far past
+        # it is says nothing about which one bites -- capacity was checked BEFORE this note with the
+        # pre-request clock and declined to fire, so on a slow health request it queues behind the
+        # checks that have not run yet. `check_order` is what resolves that, not overdue-ness.
+        candidates.append(
+            (
+                max(queue_grace_s - waited, 0.0),
+                capacity_order,
+                waited,
+                queue_grace_s,
+                "capacity",
+                clause,
+            )
+        )
     # the no-progress limit, checked one call after the queue classifier in the same iteration.
     # setup_grace_s normally dwarfs the queue graces, but poll_job accepts both independently, so a
     # short stall_after_s can be the real deadline while the capacity grace is still wide open.
     stall_waited = now - stall_since
     candidates.append(
-        (stall_limit_s - stall_waited, stall_waited, stall_limit_s, "no-progress", "")
+        (
+            max(stall_limit_s - stall_waited, 0.0),
+            stall_order,
+            stall_waited,
+            stall_limit_s,
+            "no-progress",
+            "",
+        )
     )
     if absolute_deadline is not None:
         # the run-global wall clock, which poll_job checks before every status read. on a late
         # retry or reattachment it can be shorter than any grace, and it is not a grace at all --
         # nothing "arms" it -- so it is reported as the remaining budget rather than time served.
-        candidates.append((absolute_deadline - now, 0.0, absolute_deadline - now, "run wall", ""))
-    _, waited, budget, label, clause = min(candidates, key=lambda c: c[0])
+        wall_left = absolute_deadline - now
+        candidates.append((max(wall_left, 0.0), wall_order, 0.0, wall_left, "run wall", ""))
+    _, _, waited, budget, label, clause = min(candidates, key=lambda c: (c[0], c[1]))
     if label == "run wall":
         return f"{int(max(budget, 0.0))}s left of the run wall deadline"
     unit = "limit" if label == "no-progress" else "grace"
