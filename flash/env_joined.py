@@ -49,7 +49,7 @@ import unicodedata
 # where a comment can legally end a line -- so the separator is still "nothing that survives
 # parsing", and a `", "` between two list elements is as excluded as it was.
 _ADJACENT_LITERALS = re.compile(
-    rb"(?<!\\)[\"'][ \t]*(?:#[^\n]*)?(?:\r?\n[ \t]*)?(?i:[bruf]{0,2})[\"']"
+    rb"(?<!\\)[\"'][ \t]*(?:(?:#[^\n]*)?\r?\n[ \t]*)?(?i:[bruf]{0,2})[\"']"
 )
 
 # A backslash immediately before a newline, which POSIX sh, make, C and YAML all remove to rejoin
@@ -103,6 +103,11 @@ _NAMED_ESCAPE = re.compile(rb"\\N\{([^{}\r\n]+)\}")
 # `\\` test rather than a letter.
 _ESCAPE_MARKERS = (b"\\u", b"\\U", b"\\x", b"\\N{")
 
+# a shell assignment word begins at a command-word boundary and carries one identifier before `=`.
+# restricting quote removal to this context joins `KEY=fslo_ab"cd"` without welding quotes in prose,
+# python statements, or adjacent top-level lines that the runtime never combines.
+_SHELL_ASSIGNMENT = re.compile(rb"(?<![^\s;|&()])[A-Za-z_][A-Za-z0-9_]*=")
+
 
 def _named_ascii(match: re.Match[bytes]) -> bytes:
     """The ASCII text named by a Python `\\N{...}` escape, or the original escape unchanged."""
@@ -111,6 +116,104 @@ def _named_ascii(match: re.Match[bytes]) -> bytes:
         return resolved.encode("ascii")
     except (KeyError, UnicodeDecodeError, UnicodeEncodeError):
         return match.group(0)
+
+
+def _seam_depths(data: bytes, starts: set[int]) -> dict[int, int]:
+    """The bracket depth at each candidate literal seam, ignoring strings and comments."""
+    depths: dict[int, int] = {}
+    depth = 0
+    quote: int | None = None
+    triple = False
+    comment = False
+    at = 0
+    while at < len(data):
+        if at in starts:
+            depths[at] = depth
+        byte = data[at]
+        if comment:
+            if byte in (10, 13):
+                comment = False
+            at += 1
+            continue
+        if quote is not None:
+            if triple and data[at : at + 3] == bytes([quote]) * 3:
+                quote, triple, at = None, False, at + 3
+                continue
+            if not triple and byte == quote:
+                quote = None
+                at += 1
+                continue
+            # a backslash protects the next quote from ending the literal. skipping the pair also
+            # keeps brackets inside an escape from changing the surrounding expression's depth.
+            at += 2 if byte == 92 and at + 1 < len(data) else 1
+            continue
+        if byte == 35:
+            comment = True
+        elif byte in (34, 39):
+            quote = byte
+            triple = data[at : at + 3] == bytes([byte]) * 3
+            if triple:
+                at += 3
+                continue
+        elif byte in (40, 91, 123):
+            depth += 1
+        elif byte in (41, 93, 125):
+            depth = max(0, depth - 1)
+        at += 1
+    return depths
+
+
+def _join_adjacent_literals(data: bytes) -> bytes:
+    """Close same-line seams and newline seams inside implicit continuation brackets."""
+    matches = list(_ADJACENT_LITERALS.finditer(data))
+    if not matches:
+        return data
+    depths = _seam_depths(data, {match.start() for match in matches})
+    out = bytearray()
+    at = 0
+    for match in matches:
+        out += data[at : match.start()]
+        seam = match.group(0)
+        if b"\n" in seam and depths.get(match.start(), 0) == 0:
+            out += seam
+        at = match.end()
+    out += data[at:]
+    return bytes(out)
+
+
+def _join_shell_assignments(data: bytes) -> bytes:
+    """Remove balanced quote boundaries inside shell assignment words only."""
+    out = bytearray()
+    copied = 0
+    search_at = 0
+    while match := _SHELL_ASSIGNMENT.search(data, search_at):
+        at = match.end()
+        quote: int | None = None
+        value = bytearray()
+        changed = False
+        while at < len(data):
+            byte = data[at]
+            if quote is None and byte in b" \t\r\n\v\f":
+                break
+            if byte == 92 and at + 1 < len(data):
+                value += data[at : at + 2]
+                at += 2
+                continue
+            if byte in (34, 39) and (quote is None or quote == byte):
+                quote = byte if quote is None else None
+                changed = True
+                at += 1
+                continue
+            value.append(byte)
+            at += 1
+        if changed and quote is None:
+            out += data[copied : match.end()] + value
+            copied = at
+        search_at = max(at, match.end())
+    if copied == 0:
+        return data
+    out += data[copied:]
+    return bytes(out)
 
 
 def _rejoined(data: bytes) -> bytes:
@@ -126,9 +229,11 @@ def _rejoined(data: bytes) -> bytes:
     deadline. A backslash before a newline is absent from almost every file, and `bytes.__contains__`
     settles it at memchr speed.
     """
-    joined = _ADJACENT_LITERALS.sub(b"", data)
-    if any(marker in data for marker in _CONTINUATIONS):
+    joined = data
+    if any(marker in joined for marker in _CONTINUATIONS):
         joined = _CONTINUED_LINE.sub(rb"\1", joined)
+    joined = _join_adjacent_literals(joined)
+    joined = _join_shell_assignments(joined)
     # Guarded by the same substring test as the continuation, for the same reason: `\u` is absent
     # from almost every file, and settling that at memchr speed keeps the ordinary scan free of a
     # substitution pass over every byte.

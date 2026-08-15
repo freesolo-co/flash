@@ -297,6 +297,8 @@ def credential_in_tar(
 # bytes of mtime, 6 each of uid and gid, 8 of mode, 10 of size, then the two-byte magic that ends
 # it. Members are padded to an even offset.
 _AR_MAGIC = b"!<arch>\n"
+_AR_THIN_MAGIC = b"!<thin>\n"
+_AR_MAGICS = (_AR_MAGIC, _AR_THIN_MAGIC)
 _AR_HEADER = 60
 _AR_SIZE_FIELD = slice(48, 58)
 _AR_NAME_FIELD = slice(0, 16)
@@ -331,7 +333,8 @@ def credential_in_ar(
     # same reason the zlib probe reads a bounded prefix rather than the member.
     if isinstance(source, Path):
         with source.open("rb") as head:
-            if head.read(len(_AR_MAGIC)) != _AR_MAGIC:
+            magic = head.read(len(_AR_MAGIC))
+            if magic not in _AR_MAGICS:
                 return None
         # the ar walk needs random access to member bodies, so it holds the archive once recognised.
         # a 200 MiB archive previously drove peak rss up by 448 MiB before any nested-buffer bound
@@ -341,11 +344,13 @@ def credential_in_ar(
         data = source.read_bytes()
     else:
         data = source
-        if not data.startswith(_AR_MAGIC):
+        magic = next((candidate for candidate in _AR_MAGICS if data.startswith(candidate)), b"")
+        if not magic:
             return None
+    thin = magic == _AR_THIN_MAGIC
     unreadable = ""
     gnu_names: bytes | None = None
-    at = len(_AR_MAGIC)
+    at = len(magic)
     for _ in range(member_limit):
         if at + _AR_HEADER > len(data):
             # Fewer bytes left than a header. Exactly zero is the archive's clean end; anything
@@ -375,8 +380,13 @@ def credential_in_ar(
         # long-name schemes so neither representation becomes a gap.
         if kind := named(raw_name.rstrip("/")):
             return kind
-        body = data[at + _AR_HEADER : at + _AR_HEADER + size]
-        if len(body) < size:
+        # thin ar keeps only its metadata tables in the archive. ordinary member sizes describe files
+        # outside it, so stepping by those sizes skips past every later header and leaves their names
+        # unread. the exact 64-bit thin magic makes this branch cost nothing on other content.
+        embedded = not thin or raw_name in ("/", "//", "/SYM64/")
+        stored_size = size if embedded else 0
+        body = data[at + _AR_HEADER : at + _AR_HEADER + stored_size]
+        if len(body) < stored_size:
             unreadable = unreadable or "an archive member this check cannot read"
             break
         payload = body
@@ -409,12 +419,13 @@ def credential_in_ar(
                     resolved_name = gnu_names[offset:end].rstrip(b"/").decode("ascii", "replace")
         if resolved_name and (kind := named(resolved_name)):
             return kind
-        try:
-            if kind := scan(io.BytesIO(payload), deadline, depth):
-                return kind
-        except _UNREADABLE_MEMBER:
-            unreadable = unreadable or "an archive member this check cannot read"
-        at += _AR_HEADER + size + (size % 2)
+        if not thin:
+            try:
+                if kind := scan(io.BytesIO(payload), deadline, depth):
+                    return kind
+            except _UNREADABLE_MEMBER:
+                unreadable = unreadable or "an archive member this check cannot read"
+        at += _AR_HEADER + stored_size + (stored_size % 2)
     else:
         # Reaching the bound is allowed when that member ended the archive. Only bytes still left
         # prove there is a member beyond the configured limit; the old unconditional `else` refused
@@ -424,3 +435,79 @@ def credential_in_ar(
     if unreadable:
         raise refusal(f"contains {unreadable}")
     return None
+
+
+_CPIO_NEWC_MAGIC = b"070701"
+_CPIO_HEADER = 110
+_CPIO_HEX_FIELDS = 13
+_CPIO_FILESIZE = 6
+_CPIO_NAMESIZE = 11
+
+
+def credential_in_cpio(
+    source: Path | bytes,
+    *,
+    deadline: float,
+    depth: int,
+    scan: Scanner,
+    refusal: type[Exception],
+    named: Namer,
+    member_limit: int,
+    size_limit: int | None = None,
+) -> str | None:
+    """The kind of credential in a structurally valid newc cpio archive, or None."""
+    if isinstance(source, Path):
+        with source.open("rb") as head:
+            probe = head.read(_CPIO_HEADER)
+        if not probe.startswith(_CPIO_NEWC_MAGIC):
+            return None
+        if size_limit is not None and source.stat().st_size > size_limit:
+            raise refusal("contains an archive too large to inspect")
+        data = source.read_bytes()
+    else:
+        data = source
+        probe = data[:_CPIO_HEADER]
+        if not probe.startswith(_CPIO_NEWC_MAGIC):
+            return None
+    fields = probe[len(_CPIO_NEWC_MAGIC) : _CPIO_HEADER]
+    # the magic alone is printable text. requiring all 104 field bytes to be ascii hex makes a random
+    # acceptance about 10^-126, so ordinary csv and model data never pay a member walk by chance.
+    if len(fields) != _CPIO_HEX_FIELDS * 8 or any(
+        byte not in b"0123456789abcdefABCDEF" for byte in fields
+    ):
+        return None
+    at = 0
+    for _ in range(member_limit):
+        if time.monotonic() > deadline:
+            raise refusal("takes too long to decompress")
+        if at + _CPIO_HEADER > len(data):
+            raise refusal("contains an archive member this check cannot read")
+        header = data[at : at + _CPIO_HEADER]
+        if header[:6] != _CPIO_NEWC_MAGIC:
+            raise refusal("contains an archive member this check cannot read")
+        encoded = header[6:]
+        if any(byte not in b"0123456789abcdefABCDEF" for byte in encoded):
+            raise refusal("contains an archive member this check cannot read")
+        values = [int(encoded[index : index + 8], 16) for index in range(0, len(encoded), 8)]
+        size, name_size = values[_CPIO_FILESIZE], values[_CPIO_NAMESIZE]
+        name_at = at + _CPIO_HEADER
+        name_end = name_at + name_size
+        if name_size < 1 or name_end > len(data) or data[name_end - 1] != 0:
+            raise refusal("contains an archive member this check cannot read")
+        name = data[name_at : name_end - 1].decode("utf-8", "replace")
+        if kind := named(name):
+            return kind
+        body_at = (name_end + 3) & ~3
+        body_end = body_at + size
+        if body_end > len(data):
+            raise refusal("contains an archive member this check cannot read")
+        next_at = (body_end + 3) & ~3
+        if name == "TRAILER!!!":
+            tail = data[next_at:].lstrip(b"\0")
+            if tail and (kind := scan(io.BytesIO(tail), deadline, depth)):
+                return kind
+            return None
+        if kind := scan(io.BytesIO(data[body_at:body_end]), deadline, depth):
+            return kind
+        at = next_at
+    raise refusal("contains an archive with too many members to inspect")

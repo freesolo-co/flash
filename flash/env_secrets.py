@@ -25,7 +25,6 @@ import gzip
 import io
 import lzma
 import os
-import re
 import tarfile
 import time
 import zipfile
@@ -33,7 +32,12 @@ import zlib
 from pathlib import Path
 from typing import IO, NoReturn
 
-from flash.env_archive import credential_in_ar, credential_in_tar, credential_in_zip
+from flash.env_archive import (
+    credential_in_ar,
+    credential_in_cpio,
+    credential_in_tar,
+    credential_in_zip,
+)
 from flash.env_base64 import _Inspector, _match_base64, _RunTooLongToExpand
 from flash.env_buffers import (
     _SCAN_CHUNK_BYTES,
@@ -47,8 +51,11 @@ from flash.env_buffers import (
 from flash.env_deflate import (
     _PDF_SIGNATURE,
     _EncryptedDocument,
+    _gzip_original_name,
+    _GzipHeaderTooLarge,
     _pdf_stream_payloads,
     _raw_deflate_from,
+    _scan_framed_stream,
     _TooManyStreams,
     _UnreachedStream,
     _UnreadableFilterChain,
@@ -78,15 +85,9 @@ from flash.env_joined import _rejoined
 # every test still reads all three from here.
 from flash.env_keystores import _keystore_undecided, _openpgp_kind, _Unscannable
 from flash.env_openpgp import _MAX_OPENPGP_MARKERS, _has_openpgp_message_armor
-from flash.env_patterns import (
-    _ASSIGNED_PATTERNS,
-    _LITERAL_PATTERNS,
-    _MAX_BODY,
-    _TOKEN_PATTERNS,
-    _match,
-    _unfinished_private_key_armor,
-)
+from flash.env_patterns import _MAX_BODY, _match, _unfinished_private_key_armor
 from flash.env_policy import _unexpandable_format, _uninspectable_reason
+from flash.env_redact import redacted_name
 
 # Carried between chunks so a credential straddling a chunk boundary is still matched. Derived from
 # `_MAX_BODY` rather than written as a bare number, so the two cannot drift apart: the overlap must
@@ -557,7 +558,7 @@ def _credential_in_overlay(source: Path | bytes, *, deadline: float, depth: int)
         return None
     if not payload:
         raise _Unscannable("contains an appended archive too large to inspect")
-    return _credential_in_container(payload, deadline=deadline, depth=depth + 1)
+    return _credential_in_container(payload, deadline=deadline, depth=depth)
 
 
 def _credential_in_raw_deflate(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
@@ -644,6 +645,15 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
         next((magic for magic in (b"BZh", b"\xfd7zXZ\x00") if head.startswith(magic)), b""),
         gzip.open,
     )
+    if head.startswith(b"\x1f\x8b\x08"):
+        try:
+            original_name = _gzip_original_name(source)
+        except _GzipHeaderTooLarge:
+            raise _Unscannable("contains a gzip header too large to inspect") from None
+        if original_name and (
+            kind := credential_in_name(original_name.decode("latin-1"), deadline=deadline)
+        ):
+            return kind
     # A raw zlib stream (RFC 1950) is deflate with a 2-byte header instead of gzip's 10, so none of
     # the openers above read it. `decompressobj` with the zlib window size does, and it is the same
     # deflate underneath -- which is why the stream can be expanded rather than merely refused.
@@ -722,10 +732,30 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
                 raise _Unscannable("contains a compressed stream too large to inspect")
         else:
             raise _Unscannable("contains more compressed records than this check can inspect")
+    framed = (
+        "bz2"
+        if head.startswith(b"BZh")
+        else "xz"
+        if head.startswith(b"\xfd7zXZ\x00")
+        else "lzma-alone"
+        if _looks_like_lzma_alone(head)
+        else None
+    )
+    if framed:
+        kind, trailing = _scan_framed_stream(
+            source,
+            format=framed,
+            deadline=deadline,
+            depth=depth,
+            scan=_scan_member,
+            trailing_limit=_MAX_NESTED_BUFFER_BYTES,
+        )
+        if trailing is None:
+            raise _Unscannable("contains trailing data too large to inspect")
+        if kind or not trailing:
+            return kind
+        return _credential_in_container(trailing, deadline=deadline, depth=depth)
     stream_source = source if isinstance(source, Path) else io.BytesIO(source)
-    if _looks_like_lzma_alone(head):
-        with lzma.open(stream_source, "rb", format=lzma.FORMAT_ALONE) as stream:
-            return _scan_stream(stream, deadline=deadline, depth=depth)
     with opener(stream_source, "rb") as stream:
         try:
             return _scan_stream(stream, deadline=deadline, depth=depth)
@@ -772,17 +802,25 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
 
 
 def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
-    """The kind of credential in any readable member of an ar archive, or None."""
+    """The kind of credential in any readable member of an ar or newc cpio archive."""
     if isinstance(source, bytes):
-        head = source[:8]
+        head = source[:110]
     else:
         with source.open("rb") as handle:
-            head = handle.read(8)
-    # Settlement means the handler actually walked an ar. Without this decline, every non-ar file
-    # returned None here and incorrectly suppressed a later PDF or tar refusal as already verified.
-    if head != b"!<arch>\n":
-        raise zipfile.BadZipFile("not an ar archive")
-    return credential_in_ar(
+            head = handle.read(110)
+    # settlement means this handler actually walked an archive. without this decline, every other
+    # file returned none here and incorrectly suppressed a later pdf or tar refusal as verified.
+    if head.startswith((b"!<arch>\n", b"!<thin>\n")):
+        walker = credential_in_ar
+    elif (
+        len(head) == 110
+        and head.startswith(b"070701")
+        and all(byte in b"0123456789abcdefABCDEF" for byte in head[6:])
+    ):
+        walker = credential_in_cpio
+    else:
+        raise zipfile.BadZipFile("not an ar or cpio archive")
+    return walker(
         source,
         deadline=deadline,
         depth=depth,
@@ -865,52 +903,14 @@ def credential_in_name(name: str, *, deadline: float | None = None) -> str | Non
     )
 
 
-def _redacted(name: str) -> str:
-    """`name` with any credential body masked, safe to print.
-
-    The refusal names the member so the author can find it, and when the credential is IN that name
-    printing it verbatim re-leaks the key into a terminal and whatever collects its output -- the
-    one thing the rest of this module is careful never to do. The issuer prefix and the surrounding
-    path survive, which is all that is needed to locate the file.
-    """
-
-    def _mask(match: re.Match[bytes]) -> bytes:
-        body = next((index for index, group in enumerate(match.groups(), 1) if group), None)
-        if body is None:
-            return match.group(0)
-        return match.group(0)[: match.start(body) - match.start()] + b"***"
-
-    # `surrogatepass` for the same reason as `credential_in_name`: `surrogateescape` cannot encode
-    # a lone surrogate, and this runs while REPORTING a refusal, so the crash would replace the
-    # message naming the credential.
-    masked = name.encode("utf-8", "surrogatepass")
-    for _kind, pattern in _TOKEN_PATTERNS + _ASSIGNED_PATTERNS:
-        masked = pattern.sub(_mask, masked)
-    # A name detected only through base64, or as a whole key structure, has no plaintext body to
-    # mask, so masking cannot help: printing any of it prints the key. A compact private JWK fits
-    # in a 129-character filename, and every pattern above left it untouched, so the refusal
-    # printed the complete Ed25519 scalar to the terminal and any collected logs. Withhold the
-    # name and give the author the directory instead, which is enough to find a file they just
-    # tried to publish.
-    #
-    # The REJOINED form is tested too, because that is the spelling the detection used. A name
-    # whose key is split by an escape or an adjacent-literal seam -- `fslo_AbCd\x45f0123456789`,
-    # `'fslo_AbCd' 'Ef0123456789'` -- matches no pattern as written, so every substitution above
-    # left it untouched and the refusal printed the complete reversible spelling of the key into the
-    # terminal and any collected logs. Masking cannot fix that: the seam sits inside the body, so
-    # there is no contiguous run to substitute. Withholding is the same answer the base64 case gets.
-    if (
-        any(pattern.search(masked) for _kind, pattern in _LITERAL_PATTERNS)
-        or _match_base64(masked)
-        or _credential_kind(_rejoined(masked)) is not None
-    ):
-        parent = name.rsplit("/", 1)[0] if "/" in name else ""
-        return (
-            f"{parent}/<a file whose name encodes a credential>"
-            if parent
-            else ("<a file whose name encodes a credential>")
-        )
-    return masked.decode("utf-8", "replace")
+def _redacted(name: str, *, deadline: float | None = None) -> str:
+    """`name` masked or withheld by the container-aware display helper."""
+    return redacted_name(
+        name,
+        credential_check=credential_in_name,
+        deadline=deadline,
+        refusals=(_Unscannable, _RunTooLongToExpand),
+    )
 
 
 def reject_credential_bearing_package(package_root: Path, *, display: dict[str, str]) -> None:
@@ -943,7 +943,7 @@ def reject_credential_bearing_package(package_root: Path, *, display: dict[str, 
         failed = Path(str(error.filename or package_root))
         relative = failed.relative_to(package_root).as_posix() if failed != package_root else "."
         raise ValueError(
-            f"{_redacted(display.get(relative, relative))} could not be read to check it for "
+            f"{_redacted(display.get(relative, relative), deadline=deadline)} could not be read to check it for "
             "credentials, so publishing it would commit unscanned content to a shared environment "
             "repository. Fix the permissions on it before publishing."
         ) from None
@@ -954,7 +954,7 @@ def reject_credential_bearing_package(package_root: Path, *, display: dict[str, 
         for name in sorted(dirs) + sorted(files):
             member = Path(root) / name
             relative = member.relative_to(package_root).as_posix()
-            shown = _redacted(display.get(relative, relative))
+            shown = _redacted(display.get(relative, relative), deadline=deadline)
             try:
                 # the NAME is checked too, directories included: a file called `fslo_<key>.json`
                 # publishes the key in the repository's file tree whatever its contents are.

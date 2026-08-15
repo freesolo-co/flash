@@ -121,7 +121,14 @@ def _looks_like_container(data: bytes) -> bool:
         or _looks_like_tar(data)
         # ar has no nested predicate elsewhere: a top-level archive was walked by its handler, while
         # the same bytes inside a zip were treated as final content and hid a compressed key member.
-        or data.startswith(b"!<arch>\n")
+        or data.startswith((b"!<arch>\n", b"!<thin>\n"))
+        # newc cpio is printable at its magic, so the 104 declared field bytes must all be hex before
+        # recursion is charged. random input passes that combined structure about once in 10^126.
+        or (
+            len(data) >= 110
+            and data.startswith(b"070701")
+            and all(byte in b"0123456789abcdefABCDEF" for byte in data[6:110])
+        )
         or zipfile.is_zipfile(io.BytesIO(data))
         # A self-extracting SHELL archive, whose stub is a script rather than an executable: none of
         # the tests above sees past it, since each asks what the file BEGINS with and it begins with

@@ -8901,3 +8901,215 @@ def test_recognising_lzma_alone_does_not_probe_a_third_of_a_spreadsheet(tmp_path
         if _looks_like_lzma_alone(_header(properties, 1 << 23, declared))
     )
     assert accepted == 0, "arbitrary size fields still pass, so the probe cost returns"
+
+
+def test_redaction_withholds_a_name_whose_decoded_container_holds_a_credential():
+    """Redaction must inspect the encoded container that made the name unsafe.
+
+    The name scanner inflated base64 of gzip and found the key, but `_redacted` decoded only one
+    base64 layer. Its refusal then printed the reversible filename verbatim to terminals, HTTP
+    responses, and logs, recreating the leak while reporting it.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import _redacted, credential_in_name
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    encoded = base64.urlsafe_b64encode(gzip.compress(key, mtime=0)).decode().rstrip("=")
+    assert credential_in_name(encoded) == "a Freesolo API key"
+
+    shown = _redacted(encoded)
+    assert encoded not in shown
+    assert "encodes a credential" in shown
+
+
+def test_top_level_literals_on_consecutive_lines_are_not_joined(tmp_path):
+    """A newline joins literals only when syntax supplies an implicit continuation.
+
+    Python treats two quoted top-level lines as separate statements. Welding them invented a key
+    that never exists at runtime, while the same pair inside parentheses is one real string and must
+    remain covered.
+    """
+    from flash.env_secrets import credential_in_file
+
+    first, rest = f"fslo_{_FAKE_KEY_BODY[:10]}", _FAKE_KEY_BODY[10:]
+    bracketed = tmp_path / "bracketed.py"
+    bracketed.write_text(f'KEY = ("{first}"\n       "{rest}")\n')
+    assert credential_in_file(bracketed) == "a Freesolo API key"
+
+    separate = tmp_path / "separate.py"
+    separate.write_text(f'x = "{first}"\n"{rest}"\n')
+    assert credential_in_file(separate) is None
+
+
+def test_a_gnu_thin_ar_scans_its_resolved_member_names(tmp_path):
+    """Thin ar omits member bodies but still publishes every resolved name in its listing.
+
+    Treating only `!<arch>` as ar skipped `!<thin>` entirely, so a GNU long name encoding a gzipped
+    key returned clean even though scanning the same published name directly reports the key.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import credential_in_file, credential_in_name
+
+    encoded = (
+        base64.urlsafe_b64encode(gzip.compress(f"fslo_{_FAKE_KEY_BODY}".encode(), mtime=0))
+        .decode()
+        .rstrip("=")
+    )
+    assert credential_in_name(encoded) == "a Freesolo API key"
+
+    def header(name: str, size: int) -> bytes:
+        return (
+            name.ljust(16).encode()[:16]
+            + b"0".ljust(12)
+            + b"0".ljust(6)
+            + b"0".ljust(6)
+            + b"100644".ljust(8)
+            + str(size).ljust(10).encode()[:10]
+            + b"`\n"
+        )
+
+    names = (encoded + "/\n").encode()
+    archive = b"!<thin>\n" + header("//", len(names)) + names
+    archive += b"\n" if len(names) % 2 else b""
+    archive += header("/0", 9)
+    thin = tmp_path / "members.a"
+    thin.write_bytes(archive)
+    assert credential_in_file(thin) == "a Freesolo API key"
+
+
+def test_a_newc_cpio_member_is_scanned_as_its_own_file(tmp_path):
+    """A cpio member can hold compressed content absent from the archive's literal byte scan.
+
+    The newc format was not recognized, so a zlib member containing a key published clean. Its magic
+    plus thirteen fixed-width hexadecimal fields is structural enough to walk without charging
+    random data for speculative decompression.
+    """
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    packed = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+    control = tmp_path / "payload.zz"
+    control.write_bytes(packed)
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    archive = bytearray()
+
+    def add(name: str, body: bytes, inode: int) -> None:
+        fields = (inode, 0o100644, 0, 0, 1, 0, len(body), 0, 0, 0, 0, len(name) + 1, 0)
+        archive.extend(b"070701" + b"".join(f"{value:08x}".encode() for value in fields))
+        archive.extend(name.encode() + b"\0")
+        archive.extend(b"\0" * (-len(archive) % 4))
+        archive.extend(body)
+        archive.extend(b"\0" * (-len(archive) % 4))
+
+    add("payload.zz", packed, 1)
+    add("TRAILER!!!", b"", 2)
+    published = tmp_path / "package.cpio"
+    published.write_bytes(bytes(archive))
+    assert credential_in_file(published) == "a Freesolo API key"
+
+
+def test_a_gzip_original_filename_is_scanned_before_its_payload(tmp_path):
+    """The gzip FNAME field is published metadata and can itself encode opaque credential content.
+
+    Only the plaintext body was scanned, so a harmless stream whose original filename was base64 of
+    an OpenSSL envelope returned clean. The same filename passed directly to the name scanner is an
+    intended opaque-content refusal.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext").decode().rstrip("=")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(encoded)
+
+    plain = gzip.compress(b"harmless plaintext\n", mtime=0)
+    named = (
+        plain[:3] + bytes([plain[3] | 0x08]) + plain[4:10] + encoded.encode() + b"\0" + plain[10:]
+    )
+    published = tmp_path / "named.gz"
+    published.write_bytes(named)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
+def test_shell_assignment_words_join_quoted_and_unquoted_segments(tmp_path):
+    """POSIX shell concatenates every quoted and unquoted segment in one assignment word.
+
+    Removing quote-to-quote seams alone missed both boundary directions, even though the shell exports
+    the same complete key as the ordinary fully quoted control. Restricting the join to `NAME=` words
+    avoids joining arbitrary prose or separate source statements.
+    """
+    from flash.env_secrets import credential_in_file
+
+    whole = tmp_path / "whole.sh"
+    whole.write_text(f'API_KEY="fslo_{_FAKE_KEY_BODY}"\n')
+    assert credential_in_file(whole) == "a Freesolo API key"
+
+    first, rest = _FAKE_KEY_BODY[:10], _FAKE_KEY_BODY[10:]
+    for name, source in (
+        ("suffix.sh", f'API_KEY=fslo_{first}"{rest}"\n'),
+        ("prefix.sh", f'API_KEY="fslo_{first}"{rest}\n'),
+    ):
+        script = tmp_path / name
+        script.write_text(source)
+        assert credential_in_file(script) == "a Freesolo API key", name
+
+
+def test_an_overlay_payload_uses_the_same_depth_as_its_standalone_stream(tmp_path):
+    """A self-extracting stub is not another compressed layer.
+
+    Charging depth once for the text stub and again for its payload reduced the documented nesting
+    allowance: four harmless gzip layers were clean alone but refused when the identical bytes sat
+    behind a shell preamble.
+    """
+    import gzip
+
+    from flash.env_secrets import credential_in_file
+
+    payload = b"harmless plaintext\n"
+    for _ in range(4):
+        payload = gzip.compress(payload, mtime=0)
+    standalone = tmp_path / "nested.gz"
+    standalone.write_bytes(payload)
+    assert credential_in_file(standalone) is None
+
+    overlay = tmp_path / "nested.run"
+    overlay.write_bytes(b"#!/bin/sh\nexit 0\n" + payload)
+    assert credential_in_file(overlay) is None
+
+
+def test_trailing_streams_after_bzip2_xz_and_lzma_alone_are_scanned(tmp_path):
+    """The first framed stream ending does not make a nonmatching suffix disappear.
+
+    The high-level bzip2 and lzma readers returned the first plaintext and silently ignored a trailing
+    zlib record. That record alone reports the key, so each wrapper must preserve its consumed
+    boundary and dispatch the remainder through the scanner.
+    """
+    import bz2
+    import lzma
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    trailing = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+    control = tmp_path / "trailing.z"
+    control.write_bytes(trailing)
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    wrapped = (
+        ("payload.bz2", bz2.compress(b"harmless")),
+        ("payload.xz", lzma.compress(b"harmless", format=lzma.FORMAT_XZ)),
+        ("payload.lzma", lzma.compress(b"harmless", format=lzma.FORMAT_ALONE)),
+    )
+    for name, first in wrapped:
+        published = tmp_path / name
+        published.write_bytes(first + trailing)
+        assert credential_in_file(published) == "a Freesolo API key", name

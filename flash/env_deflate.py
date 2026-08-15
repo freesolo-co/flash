@@ -12,10 +12,15 @@ about bytes and formats, nothing about files, packages or the scan.
 from __future__ import annotations
 
 import base64
+import bz2
+import io
 import itertools
+import lzma
 import re
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import IO
 
 # Where a PDF keeps its compressed content, and how many of those streams are expanded. The
 # `/FlateDecode` filter names the encoding, and the `stream` keyword with its mandatory newline
@@ -226,8 +231,8 @@ class _TooManyStreams(Exception):
 _LATIN1_TEXT = frozenset(range(0x20, 0x7F)) | frozenset(range(0xA0, 0x100))
 
 
-def _gzip_header_unfinished(probe: bytes) -> bool:
-    """Whether a gzip header consumes the probe before enough payload is visible to judge it.
+def _gzip_header_parts(probe: bytes) -> tuple[bytes | None, bool]:
+    """The gzip original name and whether its header consumes the available probe.
 
     RFC 1952 puts a fixed 10-byte header first, then four optional fields the flag byte announces: an
     extra field of up to 65,535 bytes, a NUL-terminated name, a NUL-terminated comment, and a 2-byte
@@ -245,23 +250,25 @@ def _gzip_header_unfinished(probe: bytes) -> bool:
     block. A 65,523-byte FEXTRA left only one byte in the probe; with or without FHCRC, the valid
     stream behind a shell stub was dismissed while its standalone copy exposed the key.
 
-    True means only "payload not yet judgeable". It is not a claim that the stream is real, so a
-    candidate reaching it is expanded and judged there rather than accepted here.
+    The boolean means only "payload not yet judgeable". It is not a claim that the stream is real,
+    so a candidate reaching it is expanded and judged there rather than accepted here. The name is
+    returned exactly as the header stores it, so published metadata goes through the name scanner too.
     """
     if len(probe) < 12 or not probe.startswith(b"\x1f\x8b\x08"):
-        return False
+        return None, False
     flags = probe[3]
     # The two reserved bits must be clear: no real header sets them, and requiring that is most of
     # what keeps a chance magic from looking like a header at all.
     if flags & 0b11100000:
-        return False
+        return None, False
     at = 10
+    name: bytes | None = None
     # The extra field declares a LENGTH, so it is decided by arithmetic. A chance length is small
     # and lands well inside the probe, which is not the condition this exists for.
     if flags & 0b100:
         at = 12 + int.from_bytes(probe[10:12], "little")
         if at >= len(probe):
-            return True
+            return name, True
     # FNAME and FCOMMENT are NUL-terminated and unbounded, so a legal one longer than the probe
     # reaches the end with no terminator -- the same "payload not reached yet" the extra field
     # reports by arithmetic. Excluding them meant a valid stream with an 80 KiB name inflated to
@@ -278,15 +285,108 @@ def _gzip_header_unfinished(probe: bytes) -> bool:
     for present in (0b1000, 0b10000):
         if flags & present:
             if at >= len(probe):
-                return True
+                return name, True
             end = probe.find(b"\0", at)
             if end < 0:
                 unterminated = probe[at:]
-                return all(byte in _LATIN1_TEXT for byte in unterminated)
+                return name, all(byte in _LATIN1_TEXT for byte in unterminated)
+            if present == 0b1000:
+                name = probe[at:end]
             at = end + 1
     if flags & 0b10:
         at += 2
-    return len(probe) - at < 2
+    return name, len(probe) - at < 2
+
+
+def _gzip_header_unfinished(probe: bytes) -> bool:
+    """Whether a gzip header consumes the probe before two payload bytes are visible."""
+    return _gzip_header_parts(probe)[1]
+
+
+class _GzipHeaderTooLarge(Exception):
+    """A gzip header exceeds the bounded metadata window and cannot be approved as scanned."""
+
+
+_GZIP_HEADER_READ_BYTES = 64 << 10
+
+
+def _gzip_original_name(source: Path | bytes, limit: int = 4 << 20) -> bytes | None:
+    """The exact original filename in a gzip header, or None when it has none."""
+    source_size = len(source) if isinstance(source, bytes) else source.stat().st_size
+    wanted = min(_GZIP_HEADER_READ_BYTES, limit)
+    while wanted:
+        if isinstance(source, bytes):
+            probe = source[:wanted]
+        else:
+            with source.open("rb") as handle:
+                probe = handle.read(wanted)
+        name, unfinished = _gzip_header_parts(probe)
+        if not unfinished:
+            return name
+        if len(probe) >= source_size:
+            return None
+        if wanted >= limit:
+            raise _GzipHeaderTooLarge
+        wanted = min(limit, wanted * 2)
+    return None
+
+
+class _SingleCompressedReader:
+    """A bounded-output reader for one bzip2 or lzma stream that preserves its suffix."""
+
+    def __init__(self, handle: IO[bytes], decoder: bz2.BZ2Decompressor | lzma.LZMADecompressor):
+        self._handle = handle
+        self._decoder = decoder
+        self._unused = b""
+
+    def read(self, size: int = -1) -> bytes:
+        if size <= 0:
+            return b""
+        out = bytearray()
+        while len(out) < size and not self._decoder.eof:
+            block = b"" if not self._decoder.needs_input else self._handle.read(1 << 20)
+            if not block and self._decoder.needs_input:
+                raise EOFError("compressed stream ended before its end marker")
+            out += self._decoder.decompress(block, size - len(out))
+        if self._decoder.eof:
+            self._unused = self._decoder.unused_data
+        return bytes(out)
+
+    def trailing(self, limit: int) -> bytes | None:
+        """Bytes after the first stream, or None when buffering them would exceed `limit`."""
+        if len(self._unused) > limit:
+            return None
+        rest = self._handle.read(limit + 1 - len(self._unused))
+        trailing = self._unused + rest
+        return None if len(trailing) > limit else trailing
+
+
+_StreamScanner = Callable[[IO[bytes], float, int], str | None]
+
+
+def _scan_framed_stream(
+    source: Path | bytes,
+    *,
+    format: str,
+    deadline: float,
+    depth: int,
+    scan: _StreamScanner,
+    trailing_limit: int,
+) -> tuple[str | None, bytes | None]:
+    """Scan one bzip2/xz/lzma-alone stream and return its unconsumed suffix."""
+    handle = source.open("rb") if isinstance(source, Path) else io.BytesIO(source)
+    try:
+        if format == "bz2":
+            decoder: bz2.BZ2Decompressor | lzma.LZMADecompressor = bz2.BZ2Decompressor()
+        else:
+            lzma_format = lzma.FORMAT_ALONE if format == "lzma-alone" else lzma.FORMAT_XZ
+            decoder = lzma.LZMADecompressor(format=lzma_format)
+        stream = _SingleCompressedReader(handle, decoder)
+        if kind := scan(stream, deadline, depth):
+            return kind, b""
+        return None, stream.trailing(trailing_limit)
+    finally:
+        handle.close()
 
 
 def _raw_deflate_payload(data: bytes, budget: int) -> bytes | None:

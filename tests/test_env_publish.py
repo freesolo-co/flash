@@ -1287,6 +1287,21 @@ def test_an_unscannable_env_name_is_a_refusal_not_a_server_fault():
     assert "cannot be checked for credentials" in str(excinfo.value)
 
 
+def test_an_oversized_env_name_is_rejected_before_encoded_content_scanning():
+    """A caller-controlled base64 run must not escape as the scanner's internal size exception.
+
+    `credential_in_name` refuses to expand a run beyond 4 MiB, but the route translated only the
+    archive scanner's refusal. An overlong name therefore produced a 500 instead of an ordinary
+    validation response, even though no publishable environment name needs millions of characters.
+    """
+    package = _pkg_b64(_MINIMAL)
+    assert envs.validate_publish_inputs(package_b64=package, name="demo")
+
+    with pytest.raises(envs.EnvPublishError, match="name is too long") as excinfo:
+        envs.validate_publish_inputs(package_b64=package, name="A" * ((4 << 20) + 1))
+    assert excinfo.value.status == 400
+
+
 def test_a_qualified_env_name_is_normalized_one_segment_at_a_time():
     """The fold that catches a hidden key must not weld unrelated segments into one.
 

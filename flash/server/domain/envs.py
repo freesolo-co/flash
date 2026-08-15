@@ -36,6 +36,7 @@ _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_DOWNLOAD_BYTES = _MAX_UNCOMPRESSED_BYTES
 _MAX_MEMBERS = ARCHIVE_MEMBER_LIMIT
 _MAX_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
+_MAX_ENV_NAME_CHARS = 1024
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
@@ -454,6 +455,8 @@ def validate_publish_inputs(*, package_b64: object, name: object) -> bytes:
         raise EnvPublishError("env package must be a base64 string")
     if not name:
         raise EnvPublishError("missing env name")
+    if len(name) > _MAX_ENV_NAME_CHARS:
+        raise EnvPublishError(f"env name is too long (limit {_MAX_ENV_NAME_CHARS} characters)")
     _reject_credential_name(name)
     max_encoded = ((_MAX_UPLOAD_BYTES + 2) // 3) * 4 + 3
     if len(package_b64) > max_encoded:
