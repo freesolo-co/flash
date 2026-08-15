@@ -11,7 +11,6 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 import flash.runner as _runner
-from flash.content.multimodal import preflight_validate_image_opd
 from flash.runner import (
     DeploymentRevocationError,
     DeploymentStatePersistenceError,
@@ -22,10 +21,7 @@ from flash.runner import (
 from flash.schema import train_schema_metadata
 from flash.serve.preflight import ServingPreflightError
 from flash.server import app as _app
-from flash.server.domain.teacher_broker import (
-    TeacherBrokerConfigurationError,
-    preflight_validate_managed_teacher,
-)
+from flash.server.domain.teacher_broker import TeacherBrokerConfigurationError
 from flash.server.platform import db
 from flash.server.platform.deps import (
     _parse_spec,
@@ -243,20 +239,6 @@ def _record_environment_use(
         )
 
 
-def _preflight_validate_spec(worker_spec) -> None:
-    """Run the read-only spec gates before the submission is charged against affordability.
-
-    submit_job runs these same gates, but it runs them after this point, so an unsupported spec
-    would be told "insufficient balance" (402) for a run it can never launch at any balance --
-    sending the user to top up instead of to the real defect. The managed-teacher gate belongs
-    with them for the same reason: running it only before allocation meant an opd run the plane
-    cannot serve was quoted, recorded, and charged first, then failed seconds later with the
-    reason discarded.
-    """
-    preflight_validate_image_opd(worker_spec)
-    preflight_validate_managed_teacher(worker_spec)
-
-
 def _submit_failure_http_error(exc: Exception) -> HTTPException:
     """Classify a failed submission as the submitter's fault or the plane's.
 
@@ -405,9 +387,8 @@ def create_run(
                 ),
             ) from exc
         run_id = prepared.public_spec.run_id
-        # validate the spec BEFORE charging affordability against it. these gates are pure and
-        # raise ValueError, which the handler below turns into the 400 submit_job would produce.
-        _preflight_validate_spec(prepared.worker_spec)
+        # prepare_job has completed every read-only gate before affordability and retained any
+        # resolved environment sha on the worker spec passed to submit_job below.
         # run the affordability check for dry runs too. it is verify-only (moves no money), so a
         # `--dry-run` that passes now also proves the org can cover the estimate, instead of the run
         # being validated here and rejected 402 only on real submission.
