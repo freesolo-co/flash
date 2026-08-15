@@ -309,6 +309,11 @@ def credential_in_tar(
                     # same target passed directly to the name scanner was refused.
                     if info.linkname and (kind := named(info.linkname)):
                         return kind
+                    # ustar publishes owner and group names in the header too. they are exact metadata
+                    # values like the member and link names, not speculative bytes from the raw pass.
+                    for owner in (info.uname, info.gname):
+                        if owner and (kind := named(owner)):
+                            return kind
                     if not info.isfile():
                         continue
                     try:
@@ -374,6 +379,24 @@ _AR_MAGICS = (_AR_MAGIC, _AR_THIN_MAGIC)
 _AR_HEADER = 60
 _AR_SIZE_FIELD = slice(48, 58)
 _AR_NAME_FIELD = slice(0, 16)
+
+
+def _ar_symbol_names(body: bytes, width: int) -> Iterator[bytes]:
+    """the exact symbol strings in a gnu ar index whose integer fields use `width` bytes."""
+    if len(body) < width:
+        raise ValueError
+    count = int.from_bytes(body[:width], "big")
+    names_at = width * (count + 1)
+    if names_at > len(body):
+        raise ValueError
+    names = body[names_at:]
+    at = 0
+    for _ in range(count):
+        end = names.find(b"\0", at)
+        if end < 0:
+            raise ValueError
+        yield names[at:end]
+        at = end + 1
 
 
 def credential_in_ar(
@@ -465,6 +488,18 @@ def credential_in_ar(
         resolved_name: str | None = None
         if raw_name == "//":
             gnu_names = body
+        elif raw_name in ("/", "/SYM64/"):
+            # gnu ar stores exported symbol names after a count and a table of member offsets. they
+            # are listing metadata, so each receives the same exact-value scan as a member name.
+            payload = b""
+            try:
+                for symbol in _ar_symbol_names(body, 8 if raw_name == "/SYM64/" else 4):
+                    if time.monotonic() > deadline:
+                        raise refusal("takes too long to decompress")
+                    if symbol and (kind := named(symbol.decode("ascii", "replace"))):
+                        return kind
+            except ValueError:
+                unreadable = unreadable or "an archive member this check cannot read"
         elif raw_name.startswith("#1/"):
             # BSD ar stores the real name at the front of the member body. Scanning only `#1/<len>`
             # left an encoded credential in that resolved name unpublished by the name check.

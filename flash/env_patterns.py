@@ -246,6 +246,58 @@ class _Searchable(Protocol):
     def search(self, data: bytes, /) -> re.Match[bytes] | None: ...
 
 
+# age identities are bech32 strings with this exact human-readable part, 32 bytes of key material,
+# and a six-character checksum. the fixed 74-character width and checksum distinguish the private
+# identity from prose mentioning age and from unrelated bech32 values such as bitcoin addresses.
+_AGE_IDENTITY = re.compile(
+    rb"(?<![A-Za-z0-9])AGE-SECRET-KEY-1[023456789AC-HJ-NP-Z]{58}(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_BECH32_CHARSET = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_BECH32_VALUES = {character: value for value, character in enumerate(_BECH32_CHARSET)}
+
+
+def _bech32_polymod(values: Iterator[int]) -> int:
+    """the bech32 checksum residue for `values`."""
+    generators = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    checksum = 1
+    for value in values:
+        top = checksum >> 25
+        checksum = ((checksum & 0x1FFFFFF) << 5) ^ value
+        for index, generator in enumerate(generators):
+            if top >> index & 1:
+                checksum ^= generator
+    return checksum
+
+
+def _valid_age_identity(candidate: bytes) -> bool:
+    """whether `candidate` is a checksum-valid age bech32 identity."""
+    if candidate.lower() != candidate and candidate.upper() != candidate:
+        return False
+    lowered = candidate.lower()
+    separator = lowered.rfind(b"1")
+    if separator != len(b"age-secret-key-") or len(lowered) != 74:
+        return False
+    try:
+        data = [_BECH32_VALUES[character] for character in lowered[separator + 1 :]]
+    except KeyError:
+        return False
+    hrp = lowered[:separator]
+    expanded = [character >> 5 for character in hrp]
+    expanded.extend((0, *(character & 31 for character in hrp), *data))
+    return _bech32_polymod(iter(expanded)) == 1
+
+
+class _AgeIdentity:
+    """a searchable age identity that accepts only checksum-valid candidates."""
+
+    def search(self, data: bytes, /) -> re.Match[bytes] | None:
+        return next(
+            (match for match in _AGE_IDENTITY.finditer(data) if _valid_age_identity(match.group())),
+            None,
+        )
+
+
 # The `kty` half of a JWK, named at module level because `_scan_stream` needs it too: the two
 # markers may sit further apart than one read chunk, and a chunked scan that only ever sees a
 # window cannot pair them without remembering that the `kty` went past.
@@ -431,6 +483,7 @@ _NETRC_PASSWORD = re.compile(
 
 
 _LITERAL_PATTERNS: tuple[tuple[str, _Searchable], ...] = (
+    ("an age private identity", _AgeIdentity()),
     #
     # `(?: BLOCK)?` because OpenPGP armours as `-----BEGIN PGP PRIVATE KEY BLOCK-----`. Without it
     # the trailing word made the header unmatchable and a `gpg --export-secret-keys --armor` file

@@ -107,6 +107,14 @@ _AGE_ARMORED_BODY = re.compile(
     rb"-----BEGIN AGE ENCRYPTED FILE-----[^\r\n]*\r?\n[ \t]*[A-Za-z0-9+/]{32}"
 )
 
+# native age text begins with the complete version line and at least one recipient stanza. requiring
+# both lines keeps a readme that merely names `age-encryption.org/v1` publishable, while indentation
+# permits the same document inside a yaml block scalar instead of only at byte zero.
+_AGE_NATIVE_HEADER = b"age-encryption.org/v1"
+_AGE_NATIVE_BODY = re.compile(
+    rb"(?m)^[ \t]*age-encryption\.org/v1[ \t]*\r?\n[ \t]*->[ \t]+[!-~]+[ \t]+[!-~]+"
+)
+
 # How much of a stream `_looks_like_textual` reads. A multi-byte UTF-8 character straddling the cut
 # would decode-fail on the truncation rather than on the content, so the sample is taken at a
 # 4 KiB boundary and the decode error is tolerated as "not text" -- which is the safe direction:
@@ -134,6 +142,11 @@ def _has_openpgp_message_armor(window: bytes) -> bool:
 def _has_age_file_armor(window: bytes) -> bool:
     """Whether `window` carries age armor with a plausible ciphertext body at any offset."""
     return _AGE_FILE_ARMOR in window and _AGE_ARMORED_BODY.search(window) is not None
+
+
+def _has_age_native_document(window: bytes) -> bool:
+    """whether `window` carries a native age header and recipient stanza at any offset."""
+    return _AGE_NATIVE_HEADER in window and _AGE_NATIVE_BODY.search(window) is not None
 
 
 def _is_openpgp_encrypted(head: bytes) -> bool | None:

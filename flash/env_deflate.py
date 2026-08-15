@@ -648,6 +648,7 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     # other bound here already refuses rather than truncating -- this one returned a verdict.
     if next(streams, None) is not None:
         raise _TooManyStreams
+    yield from _standalone_ascii85_payloads(data, budget)
     yield from _pdf_inline_payloads(data, budget)
 
 
@@ -781,6 +782,15 @@ def _filter_stages(data: bytes, at: int) -> tuple[list[bytes], list[bytes]]:
     return chain[:flate], chain[flate + 1 :]
 
 
+def _standalone_ascii85_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
+    """decoded payloads of streams whose complete filter chain is standalone ascii85."""
+    for found in _PDF_ANY_STREAM.finditer(data):
+        if _declared_filters(data, found.start()) != [_ASCII85_FILTER]:
+            continue
+        decoded = _undo_ascii85(data[found.end() :], [_ASCII85_FILTER])
+        yield None if len(decoded) > budget else decoded
+
+
 def _undo_ascii85(payload: bytes, filters: list[bytes]) -> bytes:
     """`payload` with `filters` undone, refusing any chain this cannot read.
 
@@ -800,6 +810,12 @@ def _undo_ascii85(payload: bytes, filters: list[bytes]) -> bytes:
     if filters != [_ASCII85_FILTER]:
         raise _UnreadableFilterChain
     try:
+        stripped = payload.lstrip(b" \t\r\n\v\f")
+        if stripped.startswith(b"<~"):
+            end = stripped.find(b"~>")
+            if end < 0:
+                raise ValueError
+            return base64.a85decode(stripped[: end + 2], adobe=True, ignorechars=b" \t\r\n\v\f")
         return base64.a85decode(payload.split(b"~>")[0], adobe=False, ignorechars=b" \t\r\n\v\f")
     except ValueError as exc:
         raise _UnreadableFilterChain from exc

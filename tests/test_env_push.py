@@ -1663,6 +1663,30 @@ def test_push_allows_ordinary_environments_and_datasets(monkeypatch, tmp_path):
     assert "dataset/train.jsonl" in _members(cap["package_b64"])
 
 
+def test_an_age_private_identity_requires_a_valid_age_bech32_value(tmp_path):
+    """an age identity decrypts published age files but was absent from the credential patterns."""
+    from flash.env_secrets import credential_in_file
+
+    identity = "AGE-SECRET-KEY-1QYPQXPQ9QCRSSZG2PVXQ6RS0ZQG3YYC5Z5TPWXQERGD3C8G7RUSQGPQYEE"
+    for name, contents in (
+        ("identity.txt", identity),
+        ("assigned.env", f"AGE_IDENTITY={identity}"),
+    ):
+        published = tmp_path / name
+        published.write_text(contents + "\n")
+        assert credential_in_file(published) == "an age private identity", name
+
+    # a checksum-valid bech32 value under another hrp is not an age identity.
+    unrelated = tmp_path / "bitcoin.txt"
+    unrelated.write_text("BC1QYPQXPQ9QCRSSZG2PVXQ6RS0ZQG3YYC5Z5TPWXQERGD3C8G7RUSQJY33QM\n")
+    assert credential_in_file(unrelated) is None
+
+    # the age prefix and alphabet alone are insufficient when the checksum is broken.
+    broken = tmp_path / "broken.txt"
+    broken.write_text(identity[:-1] + "Q\n")
+    assert credential_in_file(broken) is None
+
+
 def test_credential_scan_reads_across_chunk_boundaries_and_into_binaries(tmp_path):
     import sqlite3
 
@@ -6110,6 +6134,42 @@ def test_a_pdf_filter_chain_is_decoded_before_inflating(tmp_path):
     assert credential_in_file(plain) == "a Freesolo API key"
 
 
+def test_a_standalone_pdf_ascii85_stream_is_decoded(tmp_path):
+    """a readable ascii85-only filter chain was approved without enumerating its stream payload."""
+    import base64
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    def document(declaration, payload):
+        return (
+            b"%PDF-1.7\n1 0 obj\n<< /Filter "
+            + declaration
+            + b" /Length "
+            + str(len(payload)).encode()
+            + b" >>\nstream\n"
+            + payload
+            + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+        )
+
+    key = b"fslo_AbCdEf0123456789"
+    encoded = base64.a85encode(key, adobe=True)
+    assert base64.a85decode(encoded, adobe=True) == key
+    standalone = tmp_path / "standalone.pdf"
+    standalone.write_bytes(document(b"/ASCII85Decode", encoded))
+    assert credential_in_file(standalone) == "a Freesolo API key"
+
+    flate = tmp_path / "flate.pdf"
+    flate.write_bytes(document(b"/FlateDecode", zlib.compress(key)))
+    assert credential_in_file(flate) == "a Freesolo API key"
+
+    ordinary = tmp_path / "ordinary.pdf"
+    ordinary.write_bytes(
+        document(b"/ASCII85Decode", base64.a85encode(b"ordinary page content", adobe=True))
+    )
+    assert credential_in_file(ordinary) is None
+
+
 def test_a_gzip_with_a_maximum_extra_field_is_probed_past_its_header(tmp_path):
     """A legal 65,535-byte FEXTRA is longer than the 64 KiB probe, so no payload was in view.
 
@@ -8017,6 +8077,40 @@ def test_an_ar_archive_is_walked_member_by_member(tmp_path):
     assert credential_in_file(plain) is None
 
 
+def test_gnu_ar_symbol_table_names_are_scanned_as_exact_metadata(tmp_path):
+    """gnu ar symbol indexes bypassed exact metadata scanning and fell into the speculative pass."""
+    import base64
+    import subprocess
+    import zlib
+
+    from flash.env_secrets import credential_in_file, credential_in_name
+
+    key = b"fslo_AbCdEf0123456789"
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    symbol = base64.b64encode(compressor.compress(key) + compressor.flush()).rstrip(b"=").decode()
+    assert credential_in_name(symbol) == "a Freesolo API key"
+
+    source = tmp_path / "key.c"
+    source.write_text(f"int {symbol}(void) {{ return 0; }}\n")
+    obj = tmp_path / "key.o"
+    archive = tmp_path / "libkey.a"
+    subprocess.run(["cc", "-c", str(source), "-o", str(obj)], check=True)
+    subprocess.run(["ar", "rcs", str(archive), str(obj)], check=True)
+    symbols = subprocess.run(
+        ["nm", "-s", str(archive)], check=True, capture_output=True, text=True
+    ).stdout
+    assert symbol in symbols, "nm did not find the symbol in the real archive index"
+    assert credential_in_file(archive) == "a Freesolo API key"
+
+    ordinary_source = tmp_path / "ordinary.c"
+    ordinary_source.write_text("int ordinary_symbol(void) { return 0; }\n")
+    ordinary_obj = tmp_path / "ordinary.o"
+    ordinary = tmp_path / "libordinary.a"
+    subprocess.run(["cc", "-c", str(ordinary_source), "-o", str(ordinary_obj)], check=True)
+    subprocess.run(["ar", "rcs", str(ordinary), str(ordinary_obj)], check=True)
+    assert credential_in_file(ordinary) is None
+
+
 def test_an_age_encrypted_file_is_refused_like_every_other_ciphertext(tmp_path):
     """age was the one encryption this let through.
 
@@ -8444,6 +8538,51 @@ def test_a_tar_link_target_is_scanned_like_a_member_name(tmp_path):
         tar.addfile(info)
     with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
         credential_in_file(archive)
+
+
+def test_tar_owner_names_are_scanned_as_exact_metadata(tmp_path):
+    """ustar owner fields bypassed exact metadata scanning and fell into the speculative raw pass."""
+    import base64
+    import subprocess
+    import zlib
+
+    from flash.env_secrets import credential_in_file, credential_in_name
+
+    key = b"fslo_AbCdEf0123456789"
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    encoded = base64.b64encode(compressor.compress(key) + compressor.flush()).rstrip(b"=").decode()
+    assert len(encoded) == 31
+    assert credential_in_name(encoded) == "a Freesolo API key"
+
+    source = tmp_path / "ordinary.txt"
+    source.write_text("nothing here\n")
+    for field in ("owner", "group"):
+        archive = tmp_path / f"{field}.tar"
+        command = [
+            "tar",
+            "--format=ustar",
+            "--owner=ordinary-owner",
+            "--group=ordinary-group",
+            f"--{field}={encoded}",
+            "-cf",
+            str(archive),
+            source.name,
+        ]
+        subprocess.run(command, cwd=tmp_path, check=True)
+        listing = subprocess.run(
+            ["tar", "--list", "--verbose", "--file", str(archive)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert encoded in listing, "tar did not write the requested ustar metadata"
+        assert credential_in_file(archive) == "a Freesolo API key", field
+
+    plain = tmp_path / "plain.tar"
+    subprocess.run(
+        ["tar", "--format=ustar", "-cf", str(plain), source.name], cwd=tmp_path, check=True
+    )
+    assert credential_in_file(plain) is None
 
 
 def _pdf_with_stream(stream: bytes, entries: bytes, extra: bytes = b"") -> bytes:
@@ -9294,6 +9433,29 @@ def test_embedded_age_armor_requires_and_scans_its_body(tmp_path):
 
     mention = tmp_path / "README.md"
     mention.write_text("the header is -----BEGIN AGE ENCRYPTED FILE----- in documentation.\n")
+    assert credential_in_file(mention) is None
+
+
+def test_an_embedded_native_age_document_is_refused(tmp_path):
+    """native age recognition was anchored at byte zero and missed a yaml block scalar."""
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    document = (
+        "age-encryption.org/v1\n-> X25519 abcdefghijklmnopqrstuvwxyz012345\nsome ciphertext\n"
+    )
+    standalone = tmp_path / "control.age"
+    standalone.write_text(document)
+    with pytest.raises(_Unscannable, match="age-encrypted"):
+        credential_in_file(standalone)
+
+    embedded = tmp_path / "embedded.yaml"
+    embedded.write_text("secret: |\n" + "".join(f"  {line}\n" for line in document.splitlines()))
+    with pytest.raises(_Unscannable, match="age-encrypted"):
+        credential_in_file(embedded)
+
+    # the bare domain in ordinary prose is not a native age document.
+    mention = tmp_path / "README.md"
+    mention.write_text("we encrypt with age-encryption.org/v1 before sharing.\n")
     assert credential_in_file(mention) is None
 
 
