@@ -387,8 +387,11 @@ def run_rl_train():
             return state.progress["step"]
 
         def _reward_observability() -> dict:
-            """return reward metrics and sampled completions for one heartbeat."""
-            return reward_runtime.observability.heartbeat_fields()
+            """return reward observability and measured pace for one heartbeat."""
+            return {
+                **reward_runtime.observability.heartbeat_fields(),
+                **_step_timing_fields(inp, state),
+            }
 
         with liveness_heartbeat(
             "rl_step",
@@ -491,6 +494,7 @@ from flash.engine.worker.rl_train_runner import (  # noqa: E402,F401
     _RewardRuntime,
     _start_resume_uploader,
     _start_reward_runtime,
+    _step_timing_fields,
     _StepMetricState,
     _validate_rl_child,
     _write_rl_shim,
