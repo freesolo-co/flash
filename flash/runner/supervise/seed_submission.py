@@ -442,7 +442,13 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             ),
             provider=getattr(prepared.attempt_spec.gpu, "provider", ""),
             providers=getattr(prepared.attempt_spec.gpu, "providers", ()),
+            # `attempt_spec` is rebuilt from `ctx.spec` every attempt, so this is the authored pin
+            # rather than the class a previous attempt allocated -- which is what lets every retry
+            # re-search the whole acceptable set instead of narrowing to whichever class was tried
+            # first. `_spec_with_gpu` stamps the chosen class onto the submitted spec, downstream of
+            # here; the fallbacks ride along on it so a recovered run keeps its failover.
             gpu_type=getattr(prepared.attempt_spec.gpu, "type", ""),
+            gpu_type_fallbacks=getattr(prepared.attempt_spec.gpu, "type_fallbacks", ()),
             model_revision=prepared.attempt_spec.model_revision,
             # an authored gpu.count is a hard ceiling. the digest-stable integer 1 on an unpinned
             # spec is only a placeholder, so the marker must reach allocation as none or auto-sizing

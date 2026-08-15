@@ -196,10 +196,22 @@ def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = Fa
     # verbatim through allocation. The public half cannot supply it -- to_dict strips the marker and
     # keeps the placeholder count=1, making an auto-sized run's public spec byte-identical to an
     # authored single-card pin -- which is exactly why the worker half must keep it.
-    if worker_spec.gpu.type == public_gpu.type and worker_spec.gpu.count == public_gpu.count:
+    # the fallbacks restore with the class they qualify: an ordered pin whose head was rewritten to
+    # the allocated class would otherwise come back from recovery as a bare pin on whichever class
+    # the failed attempt happened to rent -- the one shape already known not to be available.
+    if (
+        worker_spec.gpu.type == public_gpu.type
+        and worker_spec.gpu.count == public_gpu.count
+        and worker_spec.gpu.type_fallbacks == public_gpu.type_fallbacks
+    ):
         return worker_spec
     restored = worker_spec.to_internal_dict()
-    restored["gpu"] = {**restored["gpu"], "type": public_gpu.type, "count": public_gpu.count}
+    restored["gpu"] = {
+        **restored["gpu"],
+        "type": public_gpu.type,
+        "count": public_gpu.count,
+        "type_fallbacks": public_gpu.type_fallbacks,
+    }
     return JobSpec.from_dict(restored)
 
 
