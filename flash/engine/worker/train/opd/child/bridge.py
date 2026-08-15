@@ -30,133 +30,62 @@ import urllib.request
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
 _FAILURE_FALLBACK_MAX_CHARS = 8192
-# the key and the value may each be quoted: a credential that reaches a diagnostic inside a json or
-# dict repr -- `{"access_token": "..."}` -- puts a closing quote between the name and the separator,
-# which an unquoted-only pattern cannot cross, so the value printed verbatim. a runtime-minted
-# credential is in no environment variable, so the value pass cannot catch it either and this shape
-# rule is the only thing standing between it and an artifact the user can fetch.
-# the auth scheme is consumed, not captured: `Authorization: Basic dXNlcjpwYXNz` otherwise matches
-# `Basic` as the value and prints the credential after it verbatim -- redacting the one token in the
-# line that is not secret. every scheme here is a fixed word, so consuming it cannot hide a value.
-# a QUOTED value runs to its matching quote, not to the first space: `{"password":"correct horse
-# battery staple"}` otherwise redacts `correct` and prints the rest. the quotes are what delimit a
-# serialized field, so whitespace inside them is part of the value. an UNQUOTED value still ends at
-# whitespace -- there the space is the delimiter, and running past it would eat the sentence around
-# the credential. no closing quote on the line means the value runs to the end of it: fail closed.
-# an ESCAPED quote inside that value is consumed as one unit (`\\.` first, so the backslash pairs
-# with whatever follows): a credential carrying a delimiter survives json/repr encoding as
-# `{"password":"abc\"tail"}`, and treating the escaped quote as the terminator redacts `abc` and
-# prints `tail` verbatim. it is runtime-minted, so the value pass cannot remove that suffix either.
-# a value ending in a literal backslash over-redacts to end of line, which is the fail-closed side.
-# DIGEST is the exception to all of that: its value is a comma-separated parameter list, not one
-# token, so both rules above stop inside it and print the `nonce` and `response` that are the actual
-# secrets. it gets its own branch running to end of line. over-redacting the tail of a digest line
-# costs a `username=` and an `algorithm=`; under-redacting it publishes a live credential.
-# digest is absent by design: its own branches below run first and consume the whole line, so
-# listing it here too would be dead alternation.
+# Shape-based redaction: the fail-closed net for a credential this process cannot know by VALUE.
+# A runtime-minted secret (presigned url, broker capability, session cookie) is in no environment
+# variable, so the value pass below contributes no needle and this pattern is the only thing between
+# it and an artifact the user can fetch. Rules, each with a test in test_opd_train.py:
+#   - key and value may each be quoted, and either quote may be backslash-escaped: a diagnostic
+#     embedding serialized json carries `{\"password\":\"secret\"}`, which an unquoted-only
+#     pattern cannot cross.
+#   - a quoted value runs to its matching quote, so whitespace inside it stays part of the value;
+#     an unquoted one stops at whitespace so the sentence around the credential survives.
+#   - a known auth scheme (bearer/basic/token) is consumed, not captured, or `Basic dXNlcjpwYXNz`
+#     redacts the scheme and prints the credential. An UNRECOGNISED scheme runs to end of line:
+#     the bare branch would otherwise treat the vendor word as the value.
+#   - digest and cookie values are delimited lists, not single tokens, so both run to end of line;
+#     stopping at `,` or `;` would print the `nonce` or the rest of the header verbatim.
+# Over-redaction is the safe side of each rule.
 _SECRET_SCHEME = r"(?:(?:bearer|basic|token)\s+)?"
-# AUTHORIZATION carries `scheme credential`, and the scheme space is open-ended -- Negotiate, NTLM,
-# AWS4-HMAC-SHA256, any vendor word. An unrecognised scheme is the dangerous case: the bare branch
-# matches the SCHEME as the value and prints the credential after it, redacting the one word on the
-# line that is not secret. So an authorization value whose scheme is NOT a known single-token one
-# runs to end of line, like digest. The known schemes keep the whitespace stop, because their value
-# is a single token and consuming the rest of the line would eat the diagnostic AROUND an already
-# fully redacted credential (`Authorization: Bearer tok while calling the teacher`).
 _SECRET_AUTH_KEY = r"(?P<auth>authorization)"
-# a scheme word followed by a credential; the negative lookahead is what routes the known ones back
-# to the bare branch. the guard is `(?![\w-])`, not `\b`: `\b` treats a hyphen as a boundary, so
-# `Digest-Custom` would read as the known `digest` and its credential would print verbatim.
-# `digest` is listed because its own branches run first and already consume that line.
+# `(?![\w-])` not `\b`: `\b` treats a hyphen as a boundary, so `Digest-Custom` would read as the
+# known `digest` and its credential would print verbatim.
 _SECRET_UNKNOWN_SCHEME = r"(?!(?:bearer|basic|token|digest)(?![\w-]))[A-Za-z][\w-]*\s+"
-# a presigned url carries its capability in QUERY PARAMETERS whose names look nothing like the
-# credential words above: `?X-Amz-Credential=...&X-Amz-Signature=...` is a complete, immediately
-# usable capability and matched none of them. it is minted per-request, so it is in no environment
-# variable and the value pass cannot see it either -- exactly the case this shape rule exists for.
-# `sig` (azure) needs a left guard: unanchored it would fire on any word ending in those letters.
+# presigned urls carry the capability in query parameters whose names match none of the words above.
+# `sig` (azure) needs a left guard or it fires on any word ending in those letters.
 _SECRET_URL_PARAM = (
     r"x-(?:amz|goog)-(?:signature|credential|security-token)|signature|(?<![\w-])sig"
 )
-# a URL carries its password in USERINFO -- `scheme://user:password@host` -- where no key name
-# precedes it, so the key-anchored pattern above cannot see it at all. A connection string built at
-# runtime (a broker dsn, a database url) is in no environment variable, so the value pass misses it
-# too. Only the password is replaced: the scheme, user and host say WHICH endpoint failed and are
-# the diagnostic. The password stops at `@`, and `[^\s/?#@]` keeps a later `@` in a path or query
-# from extending the match past the authority. The user may be EMPTY: `redis://:password@host` is
-# the ordinary shape for a password-only dsn, and requiring a user there would leak exactly the
-# runtime-built credential no environment variable holds. It is the PASSWORD being non-empty that
-# keeps a bare `scheme://:@host` out, and the scheme that keeps a `//` in prose out.
+# `scheme://user:password@host`: no key name precedes the password, so the key-anchored pattern
+# cannot see it. Only the password is replaced -- scheme, user and host say WHICH endpoint failed.
+# The user may be empty (`redis://:password@host` is the ordinary password-only dsn shape).
 _SECRET_URL_USERINFO = re.compile(r"(?i)\b([a-z][\w+.-]*://[^\s:/?#@]*:)[^\s/?#@]+(?=@)")
-# a KEY-suffixed field is a credential only when a qualifier says so. `key` alone cannot join the
-# list above: `cache_key`, `partition_key` and `idempotency_key` are ordinary diagnostic fields, and
-# redacting them eats the message this record exists to carry. So the qualifier is required and
-# enumerated -- `private_key` and `secret_key` name a credential, `primary_key` does not. The
-# separator is optional so `privateKey` (camelCase, as json from a js caller arrives) matches too,
-# which is also what makes azure's separator-less `AccountKey=` match the `account` qualifier.
+# `key` alone is too wide -- `cache_key`, `partition_key` are ordinary diagnostic fields -- so a
+# qualifier is required and enumerated. The separator is optional so `privateKey` and azure's
+# `AccountKey=` match too.
 _SECRET_KEY_FIELD = (
     r"(?:private|secret|signing|encryption|session|access|account)[-_ ]?key(?:[-_ ]?id)?"
 )
-# a COOKIE header is credential-bearing as a WHOLE value, not at one inner name: `Cookie: a=1;
-# sessionid=X; b=2` carries the session in a semicolon-delimited list, and matching only the inner
-# name leaves the rest -- including whatever else the header carries -- verbatim. So the header is
-# consumed to end of line like an unknown auth scheme, rather than stopping at `;` the way a bare
-# value does. A runtime-issued cookie is in no environment variable, so the value pass cannot reach
-# it either. `Set-Cookie` needs no branch of its own: the key is unanchored, so it matches the
-# `Cookie` inside it and the value is consumed identically -- only the literal `Set-` stays
-# visible, which is a header name rather than a secret.
+# unanchored, so `Set-Cookie` matches through the `Cookie` inside it.
 _SECRET_COOKIE_KEY = r"(?P<cookie>cookie)"
 _SECRET_DETAIL = re.compile(
-    # `pass(-|_| )?phrase` sits beside `password`/`passwd` rather than being covered by them: no
-    # prefix of one is a prefix of the other, so the existing words never matched it. It is the
-    # standard field name for the phrase unlocking a generated private key, and that phrase is
-    # minted at runtime, so it is in no environment variable and the value pass cannot reach it.
-    # The value stop is deliberately the same as `password`'s: a quoted value redacts whole, an
-    # unquoted one ends at whitespace. Consuming to end of line instead would eat the diagnostic
-    # around it, and a passphrase is a single field rather than a delimited list like a cookie.
     rf"(?i)(?P<key>{_SECRET_AUTH_KEY}|api[-_ ]?key|access[-_ ]?token|token|secret"
     rf"|pass(?:[-_ ]?phrase|word|wd)"
-    # `credential`/`credentials` is the generic label a library reaches for when the value has no
-    # more specific name, and it names the value outright rather than qualifying something else, so
-    # unlike `key` it needs no qualifier. plural included: `{"credentials": ...}` is the commoner
-    # json spelling. a runtime-minted value is in no environment variable, so the value pass cannot
-    # reach it and this shape rule is the only thing standing between it and the record.
     rf"|credentials?|{_SECRET_COOKIE_KEY}|{_SECRET_KEY_FIELD}|{_SECRET_URL_PARAM})"
-    # the quote around the key may itself be BACKSLASH-ESCAPED: a child exception that embeds
-    # serialized json carries `{\"password\":\"secret\"}`, and a bare `['\"]?` stops at the
-    # backslash, so the whole credential printed verbatim. a runtime-minted value is in no
-    # environment variable, so the value pass cannot catch it either. distinct from an escaped
-    # quote INSIDE the value, which `quoted` already handles.
     r"(?P<sep>(?:\\?['\"])?\s*[:=]\s*)"
-    # the VALUE's opening quote may be escaped too, and it is tried FIRST: `\"secret\"` starts with
-    # a backslash, so `quote` does not match it and `bare` stops dead at that backslash, printing
-    # the credential. it ends at the matching ESCAPED quote, which keeps the tail after the field
-    # (`{\"password\":\"s\"} while calling`) instead of consuming the rest of the diagnostic.
-    # a doubled backslash is consumed as ONE unit BEFORE the delimiter test, so an escaped quote
-    # INSIDE the encoded value (`\"abc\\\"tail\"`) is part of the value rather than its closer --
-    # otherwise the match ends early and the tail after it prints verbatim.
+    # escaped-quote branch first: `\"secret\"` starts with a backslash, so `quote` misses it and
+    # `bare` would stop dead there. `\\\\.` consumes a doubled backslash before the delimiter test.
     rf"(?:\\(?P<eq>['\"])(?P<escaped>(?:\\\\.|(?!\\(?P=eq))[^\r\n])*)"
     rf"|(?P<quote>['\"])(?:digest\s+(?P<qdigest>[^\r\n]+)"
     rf"|{_SECRET_SCHEME}(?P<quoted>(?:\\.|(?!(?P=quote))[^\r\n])*))"
     r"|digest\s+(?P<digest>[^\r\n]+)"
-    # an AUTHORIZATION value with an UNRECOGNISED scheme runs to end of line: the bare branch below
-    # would otherwise match that scheme and print the credential after it. This alternative is tried
-    # first and its lookahead fails for the known single-token schemes, so those fall through to the
-    # bare branch and keep the whitespace stop. It is guarded by `(?=...)` on the key rather than a
-    # conditional, because `(?(auth)yes|no)` makes the bare branch the ELSE -- unreachable for the
-    # very key that needs it, so `Bearer`/`Basic` would stop being consumed at all.
+    # `(?=...)`-style conditional, not `(?(auth)yes|no)` as the outer else: that would make the bare
+    # branch unreachable for the very key that needs it.
     rf"|(?(auth){_SECRET_UNKNOWN_SCHEME}[^\r\n]+|(?!))"
-    # an UNQUOTED cookie header runs to end of line for the same reason, but a different stop: the
-    # bare branch ends at `;`, which is the very delimiter a cookie list uses, so it would redact
-    # `sessionid=X` and print the rest of the header verbatim. Same conditional shape as `auth`,
-    # and it sits AFTER the quoted branches so a json-embedded cookie still ends at its closing
-    # quote and keeps the object structure around it.
     r"|(?(cookie)[^\r\n]+|(?!))"
-    # `&` terminates an unquoted value: without it the first signed-url parameter swallows every
-    # later one, so a single <redacted> replaces the whole query string including the benign
-    # `X-Amz-Expires` that says WHY a capability failed. each parameter is redacted on its own.
+    # `&` terminates an unquoted value so each signed-url parameter is redacted on its own, keeping
+    # the benign `X-Amz-Expires` that says WHY a capability failed.
     rf"|{_SECRET_SCHEME}(?P<bare>[^\s,;&'\"}}]+))"
 )
-# component lines of a multiline credential shorter than this are punctuation such as ``}``, not
-# secrets; redacting them would erase innocent text. Matches `bootstrap_secrets._MIN_SECRET_COMPONENT`.
 _MIN_SECRET_COMPONENT = 8
 # vocabulary ids run to ~7 digits at today's sizes; longer digit runs are not ids. see _is_token_id.
 _MAX_TOKEN_ID_DIGITS = 7

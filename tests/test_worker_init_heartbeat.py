@@ -317,53 +317,6 @@ def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
     assert seen[-1].get("liveness") is True, "a liveness ping is stamped liveness=True"
 
 
-def test_heartbeat_console_marks_only_an_attempted_upload_that_failed(monkeypatch):
-    """The console line must distinguish progress the PROVIDER can see from progress only we saw.
-
-    The provider's stall clock reads heartbeat.json from HF, so a heartbeat whose upload failed is
-    invisible to it. The console uploader keys its wedge timer on these lines, so an unmarked
-    failed heartbeat resets that timer while the stall clock keeps counting from the older
-    committed one -- and the wedge snapshot gets scheduled past the teardown it exists to beat.
-
-    The exemption is as load-bearing as the mark. A THROTTLED heartbeat is uncommitted too, but
-    marking it would fire the wedge path on every healthy run: the step stages coalesce at
-    _HB_MIN_INTERVAL_S (900s), nearly double the uploader's 480s quiet threshold. Both directions
-    are asserted here because a fix for either one alone reads as correct in isolation.
-    """
-    import json
-
-    import flash.engine.worker as ne
-
-    lines: list = []
-    monkeypatch.setattr("builtins.print", lambda *a, **k: lines.append(" ".join(map(str, a))))
-
-    def _console(index: int) -> dict:
-        return json.loads([ln for ln in lines if ln.startswith("HEARTBEAT {")][index][10:])
-
-    # a committed heartbeat is byte-identical to before: no marker at all.
-    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: True)
-    ne._HB_LAST_UPLOAD = 0.0
-    ne.heartbeat("rl_step", step=1)
-    assert "pending" not in _console(0)
-
-    # the upload was attempted and reported failure -> marked, because HF does not have it.
-    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: False)
-    ne._HB_LAST_UPLOAD = 0.0
-    ne.heartbeat("rl_step", step=2)
-    assert _console(-1)["pending"] is True
-
-    # THROTTLED, not failed: uncommitted, but the last commit is recent BY CONSTRUCTION, so this
-    # is real progress the provider's clock already has. Marking it is the false-wedge bug.
-    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: True)
-    ne._HB_LAST_UPLOAD = time.time()
-    ne.heartbeat("rl_step", liveness=True, step=3)
-    throttled = _console(-1)
-    assert "pending" not in throttled, "a throttled heartbeat is not a failed one"
-    assert throttled["step"] == 3, "the throttled heartbeat still reaches the console"
-
-
 def test_heartbeat_console_summarizes_metric_backlog():
     import json
 

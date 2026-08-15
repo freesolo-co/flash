@@ -22,7 +22,6 @@ from email.utils import parsedate_to_datetime
 if __package__:
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
-        _console_progress,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -32,7 +31,6 @@ else:
     # same directory, and the script directory leads sys.path.
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
-        _console_progress,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -41,10 +39,6 @@ else:
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
-_CONSOLE_UPLOAD_POLL_S = 120.0
-_CONSOLE_UPLOAD_QUIET_POLLS = 4
-_CONSOLE_UPLOAD_CREDITS = 2
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
@@ -223,19 +217,24 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dic
                 if remaining <= 0:
                     raise TimeoutError(f"{label} exceeded the run wall deadline") from None
                 delay = min(delay, remaining)
-            why = _safe_detail(exc, 500, secrets=secrets)
-            msg = f"{label} transient Hugging Face error; retrying in {delay:.0f}s: {why}"
-            print(msg, flush=True)
+            print(
+                f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
+                f"{_safe_detail(exc, 500, secrets=secrets)}",
+                flush=True,
+            )
             if delay > 0:
                 time.sleep(delay)
     raise AssertionError("unreachable")
 
 
 def hf_upload(
-    payload: dict, local_path: str, repo_subpath: str, *, enforce_deadline: bool = True
-) -> bool:
-    """Upload one artifact under the run's HF prefix; never raises. True only if it landed, so a
-    caller tracking what is stored cannot read a swallowed failure as success and skip its retry."""
+    payload: dict,
+    local_path: str,
+    repo_subpath: str,
+    *,
+    enforce_deadline: bool = True,
+) -> None:
+    """Upload one artifact under the run's HF prefix; never raises."""
     try:
         from huggingface_hub import HfApi
 
@@ -247,78 +246,39 @@ def hf_upload(
             repo_id=payload["hf_repo"],
             repo_type="dataset",
         )
-        return True
     except Exception as exc:
-        detail = _safe_detail(exc, secrets=_payload_secrets(payload))
-        print(f"hf upload warn ({repo_subpath}): {detail}", flush=True)
-        return False
+        print(
+            f"hf upload warn ({repo_subpath}): {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            flush=True,
+        )
 
 
-def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> bool:
-    """Upload one console snapshot from an isolated process. True only if it landed."""
+def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> None:
+    """Upload one console snapshot from an isolated process."""
     tail_path = console + ".tail"
-    secrets = _payload_secrets(payload)
-    tail = _read_console_tail(console, 64_000, secrets=secrets) + extra
+    tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
+    if extra:
+        tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
-        f.write(_safe_detail(tail, 64_000, secrets=secrets))
-    return hf_upload(payload, tail_path, f"console_{mode}.txt")
+        f.write(_safe_detail(tail, 64_000, secrets=_payload_secrets(payload)))
+    hf_upload(payload, tail_path, f"console_{mode}.txt")
 
 
 def _console_upload_loop(
-    payload: dict, console: str, mode: str, interval_s: float, stop_upload
+    payload: dict,
+    console: str,
+    mode: str,
+    interval_s: float,
+    stop_upload,
 ) -> None:
-    """Snapshot the console until ``stop_upload`` is set, polling cheaply for a wedge. Polling is
-    free; committing is not (the heartbeat spends 4 of this repo's 5 commits/hour), and the stall
-    classifier kills a wedged run at 1200s/3000s -- long before an hourly snapshot would capture the
-    hang. So commit only on un-uploaded bytes AND either the interval elapsing or sustained silence
-    (``_console_progress`` explains why bytes cannot be the signal). QUIET_POLLS is sized so
-    (it + 1) * poll stays under poll_job's 1200s stall.
-
-    ``armed`` is the wedge latch. A wedge is progress that STOPPED, so it arms only after a
-    heartbeat: startup is quiet by nature and counting it would spend a credit on an empty console.
-    WHICH of `_console_progress`'s two counts drives it switches at the first COMMITTED heartbeat
-    (``ever``), for the reason that function's docstring gives: until one lands, a ``pending``
-    heartbeat is the only evidence the run exists, and counts as progress.
-    It RE-ARMS on progress, because a healthy slow stage -- one transition, then only liveness pings,
-    which ``_console_progress`` subtracts -- reads as silence and buys a snapshot; with a single
-    permanent credit that run could never buy another, so a genuine hang later would wait for the
-    hourly cadence and die at 1200s with no failure-era console, the exact loss this uploader exists
-    to prevent. CREDITS keeps the re-arm honest: a run alternating a heartbeat with silence re-arms
-    every cycle, and uncapped that buys 6/hr against a 5.0/hr budget the heartbeat already spends 4
-    of; they are per RUN, so they never enter the SUSTAINED rate. ``wedged`` excludes an already-due
-    poll, so a credit is spent only when a stall BOUGHT an upload.
-
-    A setup that NEVER reaches a heartbeat stays uncovered on purpose: holding the first-snapshot
-    cadence until progress starts costs a commit in the SUSTAINED rate (5.25/hr against a hard 5.0,
-    measured by ..._keeps_a_slow_starting_run_in_budget), so it is left to the 3000s grace. A FAILED
-    upload advances neither ``sent`` nor the deadline: hf_upload swallows its exception and returns
-    falsy, so resetting ``since`` books a snapshot that reached no repo and puts the retry an
-    interval out, past both teardowns. Staying due retries until one lands."""
-    poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
-    due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
-    sent, size, since, quiet, armed, spent, ever = -1, -1, 0.0, 0.0, False, 0, False
-    while not stop_upload.wait(poll_s):
-        since += poll_s
-        size, staged, beats = _console_progress(console, max(size, 0))
-        ever = ever or bool(staged)
-        progress = staged if ever else beats
-        armed = armed or bool(progress)
-        quiet = 0.0 if progress else quiet + 1
-        due = since >= due_s
-        ok = armed and not due and spent < _CONSOLE_UPLOAD_CREDITS
-        wedged = ok and quiet >= _CONSOLE_UPLOAD_QUIET_POLLS
-        if size == sent or not (due or wedged):
-            continue
+    while not stop_upload.wait(interval_s):
         try:
-            up = _upload_console_snapshot(payload, console, mode)
+            _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
-            detail = _safe_detail(exc, secrets=_payload_secrets(payload))
-            print(f"console upload warn: {detail}", flush=True)
-            up = False
-        spent += 1 if wedged and up else 0
-        armed = armed and not (wedged and up)
-        if up:
-            sent, since, due_s = size, 0.0, interval_s
+            print(
+                f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+                flush=True,
+            )
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
@@ -681,21 +641,22 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         pump_secrets = _payload_secrets(payload)
 
         def pump():
-            """Tee the child's output to this process's stdout and the console file.
-
-            This process's stdout is the instance's container log, which the control plane pulls as
-            the failure detail (vast holds the box after a non-zero exit precisely so it can). Only
-            this process knows the run's secret VALUES, so each echoed child line is sanitized here
-            at the source -- the control-plane sanitizer downstream cannot value-redact a runtime
-            secret whose name it never sees. Mirrors the runpod serverless handler. The console FILE
-            keeps the raw line; its upload path sanitizes the tail. The bound keeps the END of an
-            oversized line: the root cause sits at the end of a native stack or json blob, and that
-            failure detail reads the instance log, not the console, so a prefix cut loses it."""
             try:
                 for line in proc.stdout:
                     with pump_write_lock:
                         if not pump_writes_enabled:
                             return
+                        # this process's stdout is the instance's container log, which the control
+                        # plane pulls as the failure detail (vast holds the box after a non-zero
+                        # exit precisely so it can). only this process knows the run's secret
+                        # VALUES, so each echoed child line is sanitized here at the source -- the
+                        # control-plane sanitizer downstream cannot value-redact a runtime secret
+                        # whose name it never sees. mirrors the runpod serverless handler. the
+                        # console FILE keeps the raw line; its upload path sanitizes the tail.
+                        # the bound keeps the END of an oversized line: the root cause sits at the
+                        # end of a native stack or json blob, and the control plane's failure
+                        # detail reads the provider's instance log rather than the uploaded
+                        # console, so a prefix cut here loses it everywhere.
                         print(
                             _safe_detail(line, 100_000, secrets=pump_secrets, keep="end"),
                             end="",
@@ -703,8 +664,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                         )
                         cf.write(line)
             except BaseException as exc:
-                detail = _safe_detail(exc, secrets=pump_secrets)
-                print(f"console pump warn: {detail}", flush=True)
+                print(
+                    f"console pump warn: {_safe_detail(exc, secrets=pump_secrets)}",
+                    flush=True,
+                )
             finally:
                 pump_done.set()
 
@@ -765,8 +728,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         ):
             print("final console upload exceeded its allowance", flush=True)
     except Exception as exc:
-        detail = _safe_detail(exc, secrets=_payload_secrets(payload))
-        print(f"console upload warn: {detail}", flush=True)
+        print(
+            f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            flush=True,
+        )
     if timed_out:
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
     return proc.returncode

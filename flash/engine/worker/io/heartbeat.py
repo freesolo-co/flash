@@ -128,32 +128,13 @@ def _rollback_throttle_slot(
             _w._HB_LAST_FORCED_UPLOAD = prev_last_forced
 
 
-def _console_heartbeat_snapshot(
-    payload: dict, payload_committed: bool = True, upload_due: bool = False
-) -> str:
-    """The heartbeat line echoed to the console. ``pending`` marks one whose upload did not land.
-
-    The console uploader keys its wedge timer on these lines, but the provider's stall clock reads
-    only what reached HF. A heartbeat that never landed there but looked like progress here would
-    reset that timer against a stall clock still anchored to the older committed one, so the wedge
-    snapshot could be scheduled after teardown had already killed the box.
-
-    Only an upload that was ATTEMPTED and failed is marked. A THROTTLED heartbeat is uncommitted
-    too, and marking it would be the more damaging bug in the opposite direction: the step stages
-    coalesce at ``_HB_MIN_INTERVAL_S`` (900s), far past the uploader's quiet threshold, so every
-    healthy run would read as wedged between commits. The throttle is only safe because the last
-    commit is recent by construction, which is exactly what a failed upload cannot promise. The
-    flag is additive, so a committed heartbeat is byte-identical to before.
-    """
+def _console_heartbeat_snapshot(payload: dict, payload_committed: bool = True) -> str:
     console_payload = dict(payload)
     metrics_last = console_payload.pop("metrics_last", None)
     if isinstance(metrics_last, list):
         console_payload["metrics_last_count"] = len(metrics_last)
-    if not payload_committed:
-        if console_payload.get("sampled_completions"):
-            console_payload.pop("sampled_completions", None)
-        if upload_due:
-            console_payload["pending"] = True
+    if not payload_committed and console_payload.get("sampled_completions"):
+        console_payload.pop("sampled_completions", None)
     return json.dumps(console_payload)
 
 
@@ -291,7 +272,7 @@ def heartbeat(
                     f"initial heartbeat upload lock remained busy >{lock_timeout}s for {stage}"
                 )
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
-    print("HEARTBEAT", _console_heartbeat_snapshot(payload, payload_committed, upload_due))
+    print("HEARTBEAT", _console_heartbeat_snapshot(payload, payload_committed))
     return payload_committed
 
 
