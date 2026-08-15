@@ -842,15 +842,14 @@ def test_env_test_reports_the_text_the_scorer_actually_received(monkeypatch, tmp
 
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
-    # the scorer really did receive the override, so that is the only honest thing to print. every
-    # call sees it, the real episode and the probes alike -- the env replaces the graded text
-    # whatever was replayed, which is the whole point of the override.
+    # the scorer really did receive the override, so that is the only honest thing to print.
     #
-    # the COUNT is pinned, not just the values. this env scores 0.0 on every row, so the run is one
-    # the warning fires on and both probes are legitimately spent: the episode itself, the per-turn
-    # separation probe, and the junk probe. asserting only `set(graded)` would accept any number of
-    # grader calls, and for an env graded by a paid judge the number is the billing.
-    assert graded == ["ENV_OVERRODE", "ENV_OVERRODE", "ENV_OVERRODE"]
+    # the COUNT is pinned, not just the value, because for an env graded by a paid judge the number
+    # IS the billing. exactly ONE call: the episode itself. this run is `sft`, which never trains
+    # from `env.reward`, so neither probe is spent -- their answer could only soften a warning about
+    # a number the algorithm does not read. that matches what `dev` bills for this shape, measured
+    # on a counting grader; a set assertion would accept the 3 calls an earlier revision made here.
+    assert graded == ["ENV_OVERRODE"]
     assert "scored text: 'ENV_OVERRODE'" in captured.err
     assert "scored text: 'RAW_TURN'" not in captured.err
 
@@ -906,12 +905,66 @@ def test_env_test_reports_an_empty_override_as_the_scored_text(monkeypatch, tmp_
     assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
     captured = capsys.readouterr()
     # the grader really did receive the empty override, so that is what must be reported. the count
-    # is pinned for the same reason as the test above: this env scores 0.0 everywhere, so the
-    # episode plus both probes is the expected spend, and a set assertion would hide a fourth call.
-    assert graded == ["", "", ""]
+    # is pinned for the same reason as the test above: this is an `sft` run, so the episode itself
+    # is the whole spend and neither probe is billed. a set assertion would hide a second call.
+    assert graded == [""]
     assert "scored text: ''" in captured.err
     # the replayed turn was never scored; naming it would send the reader to the wrong place.
     assert "scored text: 'RAW_TURN'" not in captured.err
+
+
+def test_env_test_does_not_bill_the_probes_for_a_non_reward_driven_algorithm(
+    monkeypatch, tmp_path, capsys
+):
+    """The advisory warning must not spend a paid judge on an algorithm that ignores the reward.
+
+    Both probes exist to decide whether the grader separates, and separation only ever SUPPRESSES
+    the warning. For sft and opd the reward is never read during training, so the answer cannot
+    change the verdict -- but `_separates_on_turn_rewards` calls the env's own `score_episodes` and
+    the junk probe drives a whole extra episode, so an unbounded rule billed the same judge three
+    times for an all-zero sft run where `dev` billed it once.
+
+    Paired with the grpo case below on the one input that differs, so a fix cannot pass by
+    disabling the probes everywhere -- that would strip the blocking gate of its junk comparison.
+    """
+    env_dir = _environment_dir(tmp_path)
+    graded: list[str] = []
+
+    class _CountingEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            graded.append(str(completion))
+            return 0.0
+
+    _patch_loader(monkeypatch, _CountingEnv(rows=[{"input": "q", "output": "a"}], reward=0.0))
+
+    assert cmd_env_test(_args(env_dir, algorithm="sft")) == 0
+    captured = capsys.readouterr()
+    # the episode itself, and nothing else.
+    assert len(graded) == 1
+    # the warning is still emitted -- bounding the SPEND must not cost the diagnostic.
+    assert "returned reward 0.000000" in captured.err
+
+
+def test_env_test_still_probes_for_grpo(monkeypatch, tmp_path, capsys):
+    """The paired positive: grpo trains from the reward, so the probes are worth their cost.
+
+    Without this, bounding the probes by algorithm could be "fixed" by never probing at all, which
+    would silently remove the junk comparison the LS-005 blocking gate decides on.
+    """
+    env_dir = _environment_dir(tmp_path)
+    graded: list[str] = []
+
+    class _CountingEnv(_SingleTurnEnv):
+        def reward(self, completion, example, state=None):
+            graded.append(str(completion))
+            return 0.0
+
+    _patch_loader(monkeypatch, _CountingEnv(rows=[{"input": "q", "output": "a"}], reward=0.0))
+
+    # every replayed gold answer scored zero and junk scores no worse, so the gate blocks.
+    assert cmd_env_test(_args(env_dir, algorithm="grpo")) == 1
+    # the episode, the per-turn separation probe, and the junk probe.
+    assert len(graded) > 1
 
 
 def test_env_test_surfaces_a_scorer_error_on_an_echo_episode(monkeypatch, tmp_path, capsys):

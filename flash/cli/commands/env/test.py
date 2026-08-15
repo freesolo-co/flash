@@ -602,18 +602,39 @@ def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
     probe_worth_running = (
         probe_subject is not None and tally.replayed_any and (blocking_gate_asks or uniformly_zero)
     )
-    # the per-turn check is cheap -- one metadata call, no episode driven -- so it runs wherever it
-    # might inform either consumer.
-    separates_on_turns = probe_worth_running and _separates_on_turn_rewards(env, *probe_subject)
+    # NOT free, and NOT unconditional: `rollout_rewards_many` runs the environment's own
+    # `score_episodes` (flash/envs/adapter.py), which may be the same paid judge the episodes just
+    # used. `probe_worth_running` alone is too loose a rule to spend it under, because
+    # `uniformly_zero` is algorithm-independent: an all-zero `--algorithm sft` run reached both
+    # probes where `dev` reached neither, billing a counting grader 3 times against dev's 1.
+    #
+    # what the extra spend would buy is `separates`, and `separates` only ever suppresses a WARNING.
+    # so it is worth a paid call exactly when the answer could change what this command prints AND
+    # the run is one whose reward drives training. for sft and opd the reward is not read at all
+    # (`_REWARD_DRIVEN_ALGORITHM`), so the warning's weaker wording is the honest output either way
+    # and the judge is left alone. a healthy environment reaches neither probe under any algorithm
+    # and is billed exactly what it was before this change (measured: 1 -> 1, sft and grpo).
+    separates_on_turns = (
+        probe_worth_running
+        and algorithm == _REWARD_DRIVEN_ALGORITHM
+        and _separates_on_turn_rewards(env, *probe_subject)
+    )
     # the junk probe drives a whole extra episode through user code and can bill a paid judge, so it
     # is spent only where its answer changes an outcome: the blocking gate asking (grpo, accountable
     # gold all zero), or the advisory warning about to fire on a run whose gold answers all scored
     # zero. the second condition is `all_accountable_gold_scored_zero`, NOT merely `uniformly_zero`:
     # a run whose accountable gold was never zero has nothing for the probe to compare against, and
     # driving it there bought an unusable number at the cost of an extra billed episode.
+    #
+    # bounded by algorithm for the same reason as the per-turn probe above: for sft and opd its
+    # answer can only soften a warning about a reward those algorithms never read, which is not
+    # worth an extra billed episode through user code.
     junk_reward = (
         _junk_reward(env, probe_subject[0])
-        if probe_worth_running and not separates_on_turns and all_accountable_gold_scored_zero
+        if probe_worth_running
+        and not separates_on_turns
+        and all_accountable_gold_scored_zero
+        and algorithm == _REWARD_DRIVEN_ALGORITHM
         else None
     )
     if (
