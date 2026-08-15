@@ -78,15 +78,19 @@ def test_non_step_and_validation_lines_do_not_consume_warmup() -> None:
 
     state.progress["step"] = 1
     _ingest_step_metrics(_line(1, 500.0), inp, state, dict)
-    assert state.step_timing.heartbeat_fields(
-        current_step=1, total_steps=3, remaining_wall_s=1000
-    ) == {}
+    assert (
+        state.step_timing.heartbeat_fields(current_step=1, total_steps=3, remaining_wall_s=1000)
+        == {}
+    )
 
     state.progress["step"] = 2
     _ingest_step_metrics(_line(2, 92.0), inp, state, dict)
-    assert state.step_timing.heartbeat_fields(
-        current_step=2, total_steps=3, remaining_wall_s=1000
-    )["step_duration_s"] == 92.0
+    assert (
+        state.step_timing.heartbeat_fields(current_step=2, total_steps=3, remaining_wall_s=1000)[
+            "step_duration_s"
+        ]
+        == 92.0
+    )
 
 
 def test_forced_first_metrics_retry_carries_pace_once_available(monkeypatch) -> None:
@@ -144,9 +148,12 @@ def test_pace_is_suppressed_for_superseded_finished_and_non_rl_heartbeats() -> N
         "projected_remaining_s": 17296.0,
     }
 
-    assert _step_timing_pairs(
-        {**heartbeat, "stage": "rl_finalizing"}, running=True, current_attempt=True
-    ) == []
+    assert (
+        _step_timing_pairs(
+            {**heartbeat, "stage": "rl_finalizing"}, running=True, current_attempt=True
+        )
+        == []
+    )
 
     superseded = {
         "state": "running",
