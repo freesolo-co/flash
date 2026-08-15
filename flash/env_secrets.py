@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import IO, NoReturn
 
 from flash.env_archive import (
+    _looks_like_cpio_header,
     credential_in_ar,
     credential_in_cpio,
     credential_in_tar,
@@ -84,6 +85,7 @@ from flash.env_joined import _rejoined
 # them, so the other direction would be a cycle. Re-exported because every other raise site and
 # every test still reads all three from here.
 from flash.env_keystores import _keystore_undecided, _openpgp_kind, _Unscannable
+from flash.env_names import exact_name_values
 from flash.env_openpgp import (
     _MAX_OPENPGP_MARKERS,
     _has_age_file_armor,
@@ -820,11 +822,7 @@ def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> s
     # file returned none here and incorrectly suppressed a later pdf or tar refusal as verified.
     if head.startswith((b"!<arch>\n", b"!<thin>\n")):
         walker = credential_in_ar
-    elif (
-        len(head) == 110
-        and head.startswith((b"070701", b"070702"))
-        and all(byte in b"0123456789abcdefABCDEF" for byte in head[6:])
-    ):
+    elif _looks_like_cpio_header(head):
         walker = credential_in_cpio
     else:
         raise zipfile.BadZipFile("not an ar or cpio archive")
@@ -906,10 +904,11 @@ def credential_in_name(name: str, *, deadline: float | None = None) -> str | Non
     a fresh 60-second budget made the package-wide bound advisory. A caller with no budget of its
     own -- the publish route, checking one name -- gets a fresh one.
     """
-    return _credential_kind(
-        name.encode("utf-8", "surrogatepass"),
-        deadline=time.monotonic() + _MAX_DECOMPRESS_SECONDS if deadline is None else deadline,
-    )
+    deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS if deadline is None else deadline
+    for value in exact_name_values(name.encode("utf-8", "surrogatepass")):
+        if kind := _credential_kind(value, deadline=deadline):
+            return kind
+    return None
 
 
 def _redacted(name: str, *, deadline: float | None = None) -> str:

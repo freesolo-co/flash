@@ -9466,3 +9466,194 @@ def test_python_raw_strings_are_not_escape_decoded(tmp_path):
     split = tmp_path / "split.py"
     split.write_text(f'KEY = r"fslo_{body[:12]}" r"{body[12:]}"\n')
     assert credential_in_file(split) == "a Freesolo API key"
+
+
+def test_encoded_name_run_uses_path_and_extension_boundaries():
+    """A component boundary or extension does not make an exact encoded ciphertext speculative.
+
+    The whole-name guard swallowed a refusal unless the base64 run occupied every byte, so putting
+    the same encoded OpenSSL envelope under a directory or adding `.enc` made it publishable.
+    """
+    import base64
+
+    from flash.env_secrets import _Unscannable, credential_in_name
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").decode().rstrip("=")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(encoded)
+
+    for name in (f"dir/{encoded}", f"{encoded}.enc", f"{encoded}.bin"):
+        with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+            credential_in_name(name)
+
+    assert credential_in_name(f"prefix{encoded}suffix") is None
+
+
+def test_portable_ascii_cpio_members_are_scanned(tmp_path):
+    """Portable-ASCII cpio uses octal fields and no newc alignment, but its members still publish.
+
+    Treating only the two 110-byte hex layouts as cpio skipped a compressed credential under the
+    distinct 76-byte `070707` header even though the same member alone was detected.
+    """
+    import zlib
+
+    from flash.env_secrets import credential_in_file
+
+    packed = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
+    control = tmp_path / "payload.zz"
+    control.write_bytes(packed)
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    archive = bytearray()
+
+    def add(name: str, body: bytes, inode: int) -> None:
+        fields = (0, inode, 0o100644, 0, 0, 1, 0)
+        archive.extend(b"070707" + b"".join(f"{value:06o}".encode() for value in fields))
+        archive.extend(f"{0:011o}{len(name) + 1:06o}{len(body):011o}".encode())
+        archive.extend(name.encode() + b"\0" + body)
+
+    add("payload.zz", packed, 1)
+    add("TRAILER!!!", b"", 2)
+    published = tmp_path / "portable.cpio"
+    published.write_bytes(bytes(archive).ljust(512, b"\0"))
+    assert credential_in_file(published) == "a Freesolo API key"
+
+
+def test_shell_arguments_are_not_joined_as_adjacent_literals(tmp_path):
+    """Shell quotes separate argv words, while Python adjacent literals form one runtime string.
+
+    Joining both grammars identically invented a key in `printf` arguments that no shell variable or
+    process ever receives, refusing a harmless script while the Python spelling is a real credential.
+    """
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}"
+    first, second = f"fslo_{_FAKE_KEY_BODY[:8]}", _FAKE_KEY_BODY[8:]
+
+    standalone = tmp_path / "fragment.sh"
+    standalone.write_text(f'X="{first}"\n')
+    assert credential_in_file(standalone) is None, "the first shell word must be sub-threshold"
+
+    python_control = tmp_path / "control.py"
+    python_control.write_text(f'x = "{first}" "{second}"\n')
+    assert credential_in_file(python_control) == "a Freesolo API key"
+
+    shell_control = tmp_path / "real.sh"
+    shell_control.write_text(f'X="{key}"\n')
+    assert credential_in_file(shell_control) == "a Freesolo API key"
+
+    harmless = tmp_path / "arguments.sh"
+    harmless.write_text(f'printf \'%s %s\' "{first}" "{second}"\n')
+    assert credential_in_file(harmless) is None
+
+
+def test_indirect_pdf_filter_is_read_only_from_a_stream_dictionary(tmp_path):
+    """`/Filter 2 0 R` drawn as page text is not the dictionary key controlling a stream.
+
+    A document-wide regex refused the literal string even though PDF tokenization already skips such
+    strings for `/Encrypt`; the same reference in the owning dictionary remains unreadable.
+    """
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    def pdf(body: bytes) -> bytes:
+        return b"%PDF-1.4\n" + body + b"\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+
+    control = tmp_path / "indirect.pdf"
+    control.write_bytes(
+        pdf(b"4 0 obj\n<< /Length 10 /Filter 2 0 R >>\nstream\nxxxxxxxxxx\nendstream\nendobj")
+    )
+    with pytest.raises(_Unscannable, match="filter this cannot undo"):
+        credential_in_file(control)
+
+    literal = tmp_path / "literal.pdf"
+    literal.write_bytes(
+        pdf(b"4 0 obj\n<< /Length 30 >>\nstream\nBT (/Filter 2 0 R) Tj ET\nendstream\nendobj")
+    )
+    assert credential_in_file(literal) is None
+
+
+def test_zip_extra_record_payloads_are_scanned_as_exact_metadata(tmp_path):
+    """A zip extra field publishes each record's data just as exactly as a name or comment.
+
+    Scanning only the archive bytes made the tag and size framing part of the base64 context, so an
+    encoded OpenSSL envelope in the data payload stayed speculative and its refusal was swallowed.
+    """
+    import base64
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    control = tmp_path / "name.zip"
+    with zipfile.ZipFile(control, "w") as archive:
+        archive.writestr(encoded.decode(), "harmless\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(control)
+
+    published = tmp_path / "extra.zip"
+    with zipfile.ZipFile(published, "w") as archive:
+        info = zipfile.ZipInfo("harmless.txt")
+        info.extra = b"\xff\xff" + len(encoded).to_bytes(2, "little") + encoded
+        archive.writestr(info, "harmless\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
+def test_single_quoted_record_values_do_not_expose_their_braces(tmp_path):
+    """A brace inside a single-quoted mapping value is data, not the end of its key record.
+
+    The tokenizer skipped only double-quoted strings, so the brace closed the object before `d` and
+    separated the two markers of a private JWK that the equivalent double-quoted object detects.
+    """
+    from flash.env_secrets import credential_in_file
+
+    payload = "AbCdEf0123456789AbCdEf"
+    control = tmp_path / "double.json"
+    control.write_text(f'{{"kty":"OKP","note":"}}","d":"{payload}"}}\n')
+    assert credential_in_file(control) == "a private key"
+
+    plain = tmp_path / "single_plain.py"
+    plain.write_text(f"{{'kty':'OKP','d':'{payload}'}}\n")
+    assert credential_in_file(plain) == "a private key"
+
+    quoted = tmp_path / "single_brace.py"
+    quoted.write_text(f"{{'kty':'OKP','note':'}}','d':'{payload}'}}\n")
+    assert credential_in_file(quoted) == "a private key"
+
+
+def test_a_broken_base64_container_run_is_reconstructed_at_one_seam(tmp_path):
+    """A non-base64 separator splits one encoded container into runs the decoder never sees whole.
+
+    JSON slash escaping, punctuation replacement, and an inserted key all caused the same gzip to
+    miss, proving the boundary rather than escape decoding is what must be reconstructed.
+    """
+    import gzip
+
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    suffix = bytes.fromhex("38b4e652e44da7f2370d9e260e27136550a4a3a6d07f5c0c")
+    packed = gzip.compress(key + b"\n" + suffix, mtime=0)
+    encoded = base64.b64encode(packed).decode()
+    middle = [
+        index
+        for index, character in enumerate(encoded)
+        if character == "/" and 20 <= index <= len(encoded) - 21
+    ]
+    assert middle, "the fixed gzip must carry one slash between two substantial runs"
+    at = middle[0]
+    assert b"fslo_" not in packed, "the control must require gzip expansion"
+
+    control = tmp_path / "plain.json"
+    control.write_text(f'{{"blob":"{encoded}"}}\n')
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    variants = {
+        "escaped": encoded[:at] + "\\/" + encoded[at + 1 :],
+        "punctuation": encoded[:at] + "!" + encoded[at + 1 :],
+        "json-key": encoded[:at] + '","x":"' + encoded[at + 1 :],
+    }
+    for name, value in variants.items():
+        published = tmp_path / f"{name}.json"
+        published.write_text(f'{{"blob":"{value}"}}\n')
+        assert credential_in_file(published) == "a Freesolo API key", name

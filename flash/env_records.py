@@ -41,7 +41,9 @@ if TYPE_CHECKING:
 # The closing quote is captured rather than merely optional: whether the string was terminated is
 # what the chunked scan needs, and a match that ends `\"` -- an ESCAPED quote -- ends with the same
 # byte as a terminated one, so testing the last byte reported an open string as closed.
-_JSON_RECORD_SPLIT = re.compile(rb'"(?:[^"\\]|\\.)*+(")?|(\{)|(\})', re.DOTALL)
+_JSON_RECORD_SPLIT = re.compile(
+    rb'(")(?:[^"\\]|\\.)*+(")?|(\')(?:[^\'\\]|\\.)*+(\')?|(\{)|(\})', re.DOTALL
+)
 
 # The remainder of a string that began in an earlier window. The chunked scan hands over one window
 # at a time and a quoted value may straddle the cut, so resuming with the pattern above starts the
@@ -51,19 +53,24 @@ _JSON_RECORD_SPLIT = re.compile(rb'"(?:[^"\\]|\\.)*+(")?|(\{)|(\})', re.DOTALL)
 # other as a private key that neither row held -- on a file that scanned clean in a single buffer.
 #
 # Consuming the open string first is what puts the phase back: everything up to the terminating
-# quote is the string's remainder, and tokenizing resumes from the byte after it.
-_JSON_STRING_TAIL = re.compile(rb'(?:[^"\\]|\\.)*+(")?', re.DOTALL)
+# quote is the string's remainder, and tokenizing resumes from the byte after it. single quotes are
+# included because Python-shaped mappings use the same brace syntax, and a brace in one is data too.
+_JSON_STRING_TAIL = {
+    ord('"'): re.compile(rb'(?:[^"\\]|\\.)*+(")?', re.DOTALL),
+    ord("'"): re.compile(rb"(?:[^'\\]|\\.)*+(')?", re.DOTALL),
+}
 
 # Just the strings, for a window with no brace in it. The phase still has to advance across those
-# bytes -- a quote left open here is what the NEXT window resumes inside -- but nothing else in
+# bytes -- a quote left open here is what the next window resumes inside -- but nothing else in
 # them can move the depth, so the brace alternatives are left out.
-_STRING_ONLY = re.compile(rb'"(?:[^"\\]|\\.)*+(")?', re.DOTALL)
+_STRING_ONLY = re.compile(rb'(")(?:[^"\\]|\\.)*+(")?|(\')(?:[^\'\\]|\\.)*+(\')?', re.DOTALL)
 
-# A string's body without its closing quote. Matched from the body's start to a point INSIDE the
-# string, it says whether that point falls between the two bytes of an escape pair: the body is
-# possessive and a lone trailing backslash matches neither alternative, so it stops short exactly
-# when the byte after it is escaped.
-_ESCAPE_BODY = re.compile(rb'(?:[^"\\]|\\.)*+', re.DOTALL)
+# A string's body without its closing quote. Matched from the body's start to a point inside the
+# string, it says whether that point falls between the two bytes of an escape pair.
+_ESCAPE_BODY = {
+    ord('"'): re.compile(rb'(?:[^"\\]|\\.)*+', re.DOTALL),
+    ord("'"): re.compile(rb"(?:[^'\\]|\\.)*+", re.DOTALL),
+}
 
 
 class _RecordSplitter:
@@ -87,6 +94,9 @@ class _RecordSplitter:
         # vanished. The rows merged, and a public JWK in one paired with an unrelated high-entropy
         # `d` in the other as a private key that neither row held.
         self.in_string = False
+        # the delimiter of the open string. carrying only a boolean made a resumed single-quoted
+        # value look for a double quote and exposed every brace behind it as structural.
+        self.quote: int | None = None
         # Whether the byte the next window STARTS on is the second half of an escape pair. A cut
         # falling between a backslash and the character it escapes left the next window reading
         # `\"` as a closing quote, which mispaired every quote after it exactly as a straddling
@@ -97,7 +107,7 @@ class _RecordSplitter:
         # tokenized twice -- and carrying the END state into a window that starts BEFORE it counted
         # those braces a second time. The depth never fell back to zero, so no record closed again
         # and every later row merged into one.
-        self.resume = (0, False, False)
+        self.resume = (0, False, False, None)
         self._pending = True
         # Where the currently-open string's BODY starts in the window being tokenized, so a resume
         # point inside it can be tested for a split escape pair.
@@ -126,61 +136,77 @@ class _RecordSplitter:
         a memchr scan and the tokenizer is not, so this keeps the cost off the padding, the binary
         members and the prose that make up almost every byte actually scanned.
         """
-        self.depth, self.in_string, self.escaped = self.resume
+        self.depth, self.in_string, self.escaped, self.quote = self.resume
         resume_at = max(0, len(data) - overlap) if overlap else len(data)
         self._pending = True
-        # A window resuming mid-string continues a body that began before it; one that resumes on
-        # the second byte of an escape pair skips that byte, so the `"` in a split `\"` cannot be
-        # read as the quote that closes the string.
+        # a window resuming mid-string continues a body that began before it; one that resumes on
+        # the second byte of an escape pair skips that byte, so it cannot close the string.
         self._string_from = 1 if self.escaped and self.in_string else 0
         at = 0
         if self.in_string:
-            # Consume the straddling string first, so the quote that ENDS it is not read as the
-            # quote that starts another one. A window resuming on the second byte of an escape pair
-            # skips it, so the `"` in a split `\"` cannot close the string.
-            tail = _JSON_STRING_TAIL.match(data, self._string_from)
-            self._mark(data, self._string_from, tail.end(), resume_at, in_string=True)
+            # consume the straddling string first, using the delimiter that opened it in the prior
+            # window. otherwise a single-quoted value waits for the next double quote and exposes
+            # braces that are still inside its text.
+            tail = _JSON_STRING_TAIL[self.quote].match(data, self._string_from)
+            self._mark(
+                data, self._string_from, tail.end(), resume_at, in_string=True, quote=self.quote
+            )
             if not tail.group(1):
-                # Never terminated, so the whole window is inside that value and no brace in it can
-                # be structural.
                 self._settle(data, resume_at)
                 return []
             at = tail.end()
             self.in_string = False
+            self.quote = None
         found: list[tuple[int, int]] = []
-        pattern = _JSON_RECORD_SPLIT if b"{" in data or b"}" in data else _STRING_ONLY
-        # The full tokenizer is skipped when the window holds no brace at all, but its quotes are
+        has_brace = b"{" in data or b"}" in data
+        if not has_brace and b'"' not in data and b"'" not in data:
+            # no token can change state in this window. skipping the regex keeps the added single-
+            # quote alternative off the 300 mib zero padding path, where it otherwise added seconds.
+            self._settle(data, resume_at)
+            return found
+        pattern = _JSON_RECORD_SPLIT if has_brace else _STRING_ONLY
+        # the full tokenizer is skipped when the window holds no brace at all, but its quotes are
         # still scanned: one left open here is what the next window resumes inside.
         for token in pattern.finditer(data, at):
-            brace = pattern is _JSON_RECORD_SPLIT and (token.group(2) or token.group(3))
-            self._mark(data, token.start(), token.end(), resume_at, in_string=not brace)
+            opener = token.group(1) or token.group(3)
+            closer = token.group(2) or token.group(4)
+            brace = pattern is _JSON_RECORD_SPLIT and (token.group(5) or token.group(6))
+            quote = opener[0] if opener else None
+            self._mark(
+                data, token.start(), token.end(), resume_at, in_string=not brace, quote=quote
+            )
             if not brace:
-                self.in_string = not token.group(1)
+                self.in_string = not closer
+                self.quote = quote if self.in_string else None
                 self._string_from = token.start() + 1
-            elif token.group(2):
+            elif token.group(5):
                 self.depth += 1
-                # An OPENING brace is reported too, with the depth it opens into. Without it a
+                # an opening brace is reported too, with the depth it opens into. without it a
                 # fragment spans several depths at once and cannot be credited to one object: in
                 # `{"kty":"RSA","meta":{"x":1}` the `kty` is on the outer object while the brace
                 # ending the fragment closes the inner one, and in `{"public":{"kty":"RSA"}` the
-                # `kty` is on the INNER object -- the two fragments are otherwise identical in
-                # shape. Splitting at every brace gives each piece exactly one depth.
+                # `kty` is on the inner object. splitting at every brace gives each piece one depth.
                 found.append((token.end(), self.depth))
             else:
-                # Never below zero: a stray `}` in prose would otherwise leave the depth negative
+                # never below zero: a stray `}` in prose would otherwise leave the depth negative
                 # and every later `{` would close a record early, splitting a real key in two.
                 self.depth = max(0, self.depth - 1)
-                # EVERY close is reported, with the depth left behind it, not just the ones that
-                # return to zero. A top-level boundary (depth 0) ends a record; a deeper one ends a
-                # SUBTREE, which is what tells the pairing that a half seen inside it is now out of
-                # scope. Reporting only the record boundaries let two sibling objects share one
-                # record, so `{"public":{"kty":"RSA"},"artifact":{"d":"..."}}` paired halves that
-                # belong to different keys and refused a legitimate publish.
+                # every close is reported, with the depth left behind it, not just the ones that
+                # return to zero. a top-level boundary ends a record; a deeper one ends a subtree.
                 found.append((token.end(), self.depth))
         self._settle(data, resume_at)
         return found
 
-    def _mark(self, data: bytes, start: int, end: int, resume_at: int, *, in_string: bool) -> None:
+    def _mark(
+        self,
+        data: bytes,
+        start: int,
+        end: int,
+        resume_at: int,
+        *,
+        in_string: bool,
+        quote: int | None,
+    ) -> None:
         """Record the state at `resume_at`, given a token about to be applied that reaches past it.
 
         Called before the token is applied, so `self.depth` is still the depth in front of it. A
@@ -195,8 +221,9 @@ class _RecordSplitter:
         # `start` is the token's start; the string's body begins one byte later. The open-string
         # remainder handled above has no opening quote in this window, so it passes its body start
         # directly and the two agree.
-        body_from = start + 1 if end - start > 1 and data[start : start + 1] == b'"' else start
-        self.resume = (self.depth, inside, inside and _escape_open(data, body_from, resume_at))
+        body_from = start + 1 if end - start > 1 and data[start] in (34, 39) else start
+        escaped = inside and _escape_open(data, body_from, resume_at, quote)
+        self.resume = (self.depth, inside, escaped, quote if inside else None)
 
     def _settle(self, data: bytes, resume_at: int) -> None:
         """Take the resume state from the end of the window when no token reached past it.
@@ -208,21 +235,21 @@ class _RecordSplitter:
         """
         if not self._pending:
             return
-        escaped = self.in_string and _escape_open(data, self._string_from, resume_at)
-        self.resume = (self.depth, self.in_string, escaped)
+        escaped = self.in_string and _escape_open(data, self._string_from, resume_at, self.quote)
+        self.resume = (self.depth, self.in_string, escaped, self.quote)
 
 
-def _escape_open(data: bytes, body_from: int, resume_at: int) -> bool:
+def _escape_open(data: bytes, body_from: int, resume_at: int, quote: int | None) -> bool:
     """Whether `resume_at` falls between a backslash and the character it escapes.
 
     `body_from` is where the open string's BODY starts, one byte past its opening quote. Matching
     the body up to `resume_at` stops short of a lone trailing backslash, since the escape
     alternative needs the byte after it -- so a short match is exactly the split-escape case.
     """
-    if body_from < 0 or body_from >= resume_at:
+    if body_from < 0 or body_from >= resume_at or quote is None:
         return False
     body = data[body_from:resume_at]
-    return _ESCAPE_BODY.match(body).end() < len(body)
+    return _ESCAPE_BODY[quote].match(body).end() < len(body)
 
 
 class _RecordHalves:

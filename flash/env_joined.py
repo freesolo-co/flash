@@ -114,6 +114,15 @@ _ESCAPE_MARKERS = (b"\\u", b"\\U", b"\\x", b"\\N{")
 # python statements, or adjacent top-level lines that the runtime never combines.
 _SHELL_ASSIGNMENT = re.compile(rb"(?<![^\s;|&()])[A-Za-z_][A-Za-z0-9_]*=")
 
+# at bracket depth zero, a bare command word followed by whitespace introduces shell argv rather
+# than a source expression. preserving seams on that shape stops `printf "a" "b"` from becoming
+# one value, while assignments, bracketed calls, and expression keywords retain literal joining.
+_SHELL_COMMAND_START = re.compile(rb"[ \t]*(?P<word>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]+")
+_EXPRESSION_WORDS = frozenset((b"assert", b"await", b"raise", b"return", b"yield"))
+_SHELL_ASSIGNMENT_COMMANDS = frozenset(
+    (b"declare", b"env", b"export", b"local", b"readonly", b"typeset")
+)
+
 # python keeps escapes literal when a string prefix contains `r`. finding these spans before the
 # adjacent-literal join matters because that join consumes the second prefix; doing it afterwards
 # decoded `\\x42` inside a raw string and invented a credential that python never constructs.
@@ -226,8 +235,22 @@ def _seam_depths(data: bytes, starts: set[int]) -> dict[int, int]:
     return depths
 
 
+def _is_shell_word_seam(data: bytes, at: int, depth: int) -> bool:
+    """Whether the seam at `at` separates shell words rather than source literals."""
+    if depth:
+        return False
+    line_start = data.rfind(b"\n", 0, at) + 1
+    prefix = data[line_start:at]
+    command = _SHELL_COMMAND_START.match(prefix)
+    if not command or command.group("word") in _EXPRESSION_WORDS:
+        return False
+    # an equals sign normally makes this a source assignment. shell declaration commands remain
+    # commands when later words assign values, so joining their quoted argv would still invent text.
+    return b"=" not in prefix or command.group("word") in _SHELL_ASSIGNMENT_COMMANDS
+
+
 def _join_adjacent_literals(data: bytes) -> bytes:
-    """Close same-line seams and newline seams inside implicit continuation brackets."""
+    """Close source-literal seams without welding separately quoted shell words."""
     matches = list(_ADJACENT_LITERALS.finditer(data))
     if not matches:
         return data
@@ -237,7 +260,8 @@ def _join_adjacent_literals(data: bytes) -> bytes:
     for match in matches:
         out += data[at : match.start()]
         seam = match.group(0)
-        if b"\n" in seam and depths.get(match.start(), 0) == 0:
+        depth = depths.get(match.start(), 0)
+        if (b"\n" in seam and depth == 0) or _is_shell_word_seam(data, match.start(), depth):
             out += seam
         at = match.end()
     out += data[at:]

@@ -20,7 +20,7 @@ import tarfile
 import time
 import zipfile
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO
 
@@ -59,6 +59,18 @@ Scanner = Callable[[IO[bytes], float, int], str | None]
 ContainerScanner = Callable[..., str | None]
 Namer = Callable[[str], str | None]
 MetadataScanner = Callable[[bytes], str | None]
+
+
+def _zip_extra_payloads(extra: bytes) -> Iterator[bytes]:
+    """The data portion of each complete tag-size-data record in a zip extra field."""
+    at = 0
+    while at + 4 <= len(extra):
+        size = int.from_bytes(extra[at + 2 : at + 4], "little")
+        end = at + 4 + size
+        if end > len(extra):
+            return
+        yield extra[at + 4 : end]
+        at = end
 
 
 def credential_in_zip(
@@ -110,6 +122,11 @@ def credential_in_zip(
             # directory shortcut covers comments attached to directory entries as well as files.
             if info.comment and (kind := metadata(info.comment)):
                 return kind
+            # each extra record's data is exact metadata too. the binary tag and size are framing,
+            # so including them in one raw scan made the encoded value speculative rather than whole.
+            for payload in _zip_extra_payloads(info.extra):
+                if payload and (kind := metadata(payload)):
+                    return kind
             if info.is_dir():
                 continue
             # Bit 0 of the general-purpose flags marks an encrypted member. Its bytes cannot be
@@ -451,10 +468,143 @@ def credential_in_ar(
 
 
 _CPIO_NEWC_MAGICS = (b"070701", b"070702")
-_CPIO_HEADER = 110
-_CPIO_HEX_FIELDS = 13
+_CPIO_ODC_MAGIC = b"070707"
+_CPIO_NEWC_HEADER = 110
+_CPIO_ODC_HEADER = 76
 _CPIO_FILESIZE = 6
 _CPIO_NAMESIZE = 11
+_CPIO_ODC_NAMESIZE = slice(59, 65)
+_CPIO_ODC_FILESIZE = slice(65, 76)
+_CPIO_OCTAL = frozenset(b"01234567")
+_CPIO_HEX = frozenset(b"0123456789abcdefABCDEF")
+
+
+def _looks_like_cpio_header(probe: bytes) -> bool:
+    """Whether `probe` carries a complete newc, crc, or portable-ASCII cpio header."""
+    if len(probe) >= _CPIO_NEWC_HEADER and probe.startswith(_CPIO_NEWC_MAGICS):
+        return all(byte in _CPIO_HEX for byte in probe[6:_CPIO_NEWC_HEADER])
+    if len(probe) < _CPIO_ODC_HEADER or not probe.startswith(_CPIO_ODC_MAGIC):
+        return False
+    # all 70 field bytes must be octal. including the six-byte magic, random acceptance is
+    # (1/256)^6 * (8/256)^70 = 2^-398, about 1.5e-120, before any member boundary is trusted.
+    return all(byte in _CPIO_OCTAL for byte in probe[6:_CPIO_ODC_HEADER])
+
+
+def _scan_cpio_member(
+    data: bytes,
+    name: str,
+    body_at: int,
+    body_end: int,
+    next_at: int,
+    deadline: float,
+    depth: int,
+    scan: Scanner,
+    refusal: type[Exception],
+    named: Namer,
+) -> tuple[str | None, bool]:
+    """Scan one parsed member and say whether its trailer ended the archive."""
+    if body_end > len(data):
+        raise refusal("contains an archive member this check cannot read")
+    if kind := named(name):
+        return kind, False
+    if name == "TRAILER!!!":
+        tail = data[next_at:].lstrip(b"\0")
+        return (scan(io.BytesIO(tail), deadline, depth) if tail else None), True
+    return scan(io.BytesIO(data[body_at:body_end]), deadline, depth), False
+
+
+def _credential_in_newc(
+    data: bytes,
+    *,
+    deadline: float,
+    depth: int,
+    scan: Scanner,
+    refusal: type[Exception],
+    named: Namer,
+    member_limit: int,
+) -> str | None:
+    """Walk the aligned eight-hex-digit fields used by newc and crc archives."""
+    at = 0
+    for _ in range(member_limit):
+        if time.monotonic() > deadline:
+            raise refusal("takes too long to decompress")
+        if at + _CPIO_NEWC_HEADER > len(data):
+            raise refusal("contains an archive member this check cannot read")
+        header = data[at : at + _CPIO_NEWC_HEADER]
+        encoded = header[6:]
+        if header[:6] not in _CPIO_NEWC_MAGICS or any(byte not in _CPIO_HEX for byte in encoded):
+            raise refusal("contains an archive member this check cannot read")
+        values = [int(encoded[index : index + 8], 16) for index in range(0, len(encoded), 8)]
+        size, name_size = values[_CPIO_FILESIZE], values[_CPIO_NAMESIZE]
+        name_at = at + _CPIO_NEWC_HEADER
+        name_end = name_at + name_size
+        if name_size < 1 or name_end > len(data) or data[name_end - 1] != 0:
+            raise refusal("contains an archive member this check cannot read")
+        body_at = (name_end + 3) & ~3
+        body_end = body_at + size
+        next_at = (body_end + 3) & ~3
+        kind, finished = _scan_cpio_member(
+            data,
+            data[name_at : name_end - 1].decode("utf-8", "replace"),
+            body_at,
+            body_end,
+            next_at,
+            deadline,
+            depth,
+            scan,
+            refusal,
+            named,
+        )
+        if kind or finished:
+            return kind
+        at = next_at
+    raise refusal("contains an archive with too many members to inspect")
+
+
+def _credential_in_odc(
+    data: bytes,
+    *,
+    deadline: float,
+    depth: int,
+    scan: Scanner,
+    refusal: type[Exception],
+    named: Namer,
+    member_limit: int,
+) -> str | None:
+    """Walk the unaligned octal fields used by portable-ASCII cpio archives."""
+    at = 0
+    for _ in range(member_limit):
+        if time.monotonic() > deadline:
+            raise refusal("takes too long to decompress")
+        if at + _CPIO_ODC_HEADER > len(data):
+            raise refusal("contains an archive member this check cannot read")
+        header = data[at : at + _CPIO_ODC_HEADER]
+        if header[:6] != _CPIO_ODC_MAGIC or any(byte not in _CPIO_OCTAL for byte in header[6:]):
+            raise refusal("contains an archive member this check cannot read")
+        name_size = int(header[_CPIO_ODC_NAMESIZE], 8)
+        size = int(header[_CPIO_ODC_FILESIZE], 8)
+        name_at = at + _CPIO_ODC_HEADER
+        name_end = name_at + name_size
+        if name_size < 1 or name_end > len(data) or data[name_end - 1] != 0:
+            raise refusal("contains an archive member this check cannot read")
+        body_at = name_end
+        body_end = body_at + size
+        kind, finished = _scan_cpio_member(
+            data,
+            data[name_at : name_end - 1].decode("utf-8", "replace"),
+            body_at,
+            body_end,
+            body_end,
+            deadline,
+            depth,
+            scan,
+            refusal,
+            named,
+        )
+        if kind or finished:
+            return kind
+        at = body_end
+    raise refusal("contains an archive with too many members to inspect")
 
 
 def credential_in_cpio(
@@ -468,60 +618,26 @@ def credential_in_cpio(
     member_limit: int,
     size_limit: int | None = None,
 ) -> str | None:
-    """The kind of credential in a structurally valid SVR4 cpio archive, or None."""
+    """The kind of credential in a structurally valid cpio archive, or None."""
     if isinstance(source, Path):
         with source.open("rb") as head:
-            probe = head.read(_CPIO_HEADER)
-        if not probe.startswith(_CPIO_NEWC_MAGICS):
+            probe = head.read(_CPIO_NEWC_HEADER)
+        if not _looks_like_cpio_header(probe):
             return None
         if size_limit is not None and source.stat().st_size > size_limit:
             raise refusal("contains an archive too large to inspect")
         data = source.read_bytes()
     else:
         data = source
-        probe = data[:_CPIO_HEADER]
-        if not probe.startswith(_CPIO_NEWC_MAGICS):
+        if not _looks_like_cpio_header(data[:_CPIO_NEWC_HEADER]):
             return None
-    fields = probe[6:_CPIO_HEADER]
-    # the magic alone is printable text. requiring all 104 field bytes, including the crc checksum,
-    # to be ascii hex makes random acceptance about 1.0e-125 across both signatures, so ordinary csv
-    # and model data never pay a member walk by chance.
-    if len(fields) != _CPIO_HEX_FIELDS * 8 or any(
-        byte not in b"0123456789abcdefABCDEF" for byte in fields
-    ):
-        return None
-    at = 0
-    for _ in range(member_limit):
-        if time.monotonic() > deadline:
-            raise refusal("takes too long to decompress")
-        if at + _CPIO_HEADER > len(data):
-            raise refusal("contains an archive member this check cannot read")
-        header = data[at : at + _CPIO_HEADER]
-        if header[:6] not in _CPIO_NEWC_MAGICS:
-            raise refusal("contains an archive member this check cannot read")
-        encoded = header[6:]
-        if any(byte not in b"0123456789abcdefABCDEF" for byte in encoded):
-            raise refusal("contains an archive member this check cannot read")
-        values = [int(encoded[index : index + 8], 16) for index in range(0, len(encoded), 8)]
-        size, name_size = values[_CPIO_FILESIZE], values[_CPIO_NAMESIZE]
-        name_at = at + _CPIO_HEADER
-        name_end = name_at + name_size
-        if name_size < 1 or name_end > len(data) or data[name_end - 1] != 0:
-            raise refusal("contains an archive member this check cannot read")
-        name = data[name_at : name_end - 1].decode("utf-8", "replace")
-        if kind := named(name):
-            return kind
-        body_at = (name_end + 3) & ~3
-        body_end = body_at + size
-        if body_end > len(data):
-            raise refusal("contains an archive member this check cannot read")
-        next_at = (body_end + 3) & ~3
-        if name == "TRAILER!!!":
-            tail = data[next_at:].lstrip(b"\0")
-            if tail and (kind := scan(io.BytesIO(tail), deadline, depth)):
-                return kind
-            return None
-        if kind := scan(io.BytesIO(data[body_at:body_end]), deadline, depth):
-            return kind
-        at = next_at
-    raise refusal("contains an archive with too many members to inspect")
+    walker = _credential_in_odc if data.startswith(_CPIO_ODC_MAGIC) else _credential_in_newc
+    return walker(
+        data,
+        deadline=deadline,
+        depth=depth,
+        scan=scan,
+        refusal=refusal,
+        named=named,
+        member_limit=member_limit,
+    )

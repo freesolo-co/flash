@@ -133,6 +133,13 @@ _BASE64_WINDOW_OVERLAP = 1024
 # into. Past it the windowed pass still runs, so a literal credential is still found.
 _MAX_WHOLE_RUN = 4 << 20
 
+# a broken encoded value is reconsidered only when two substantial runs sit close together and the
+# first decodes to a container header. the bounds keep arbitrary prose and wide csv rows out of the
+# reconstruction path; one missing base64 character requires at most 64 short decode attempts.
+_MAX_BROKEN_SEPARATOR = 32
+_MAX_REJOINED_CONTAINER_RUN = 64 << 10
+_STANDARD_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
 
 # What a container looks like in the first decoded bytes of a run, and how much of the run to
 # decode to find out. The magics are the compressed containers the scan can expand -- gzip, bzip2,
@@ -144,6 +151,10 @@ _MAX_WHOLE_RUN = 4 << 20
 # structural predicate is applied alongside these instead of a byte of it being spelled out here.
 _CONTAINER_MAGIC = (b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"PK\x03\x04", b"PK\x05\x06")
 _CONTAINER_SNIFF_CHARS = 64
+# gzip, bzip2, xz and zip begin with H, Q, / and U after base64 encoding. zlib's valid
+# `cinfo << 4 | 8` first byte yields exactly C, G, K, O, S, W, a or e. this byte gate avoids a
+# decode and assignment regex for the millions of ordinary csv fields beginning with anything else.
+_CONTAINER_BASE64_FIRST = frozenset(b"HQ/UCGKOSWae")
 
 
 class _RunTooLongToExpand(Exception):
@@ -157,6 +168,57 @@ class _RunTooLongToExpand(Exception):
     Defined here rather than reusing the scan's refusal so the dependency stays one way: this module
     knows about base64, and the caller is what turns "not expanded" into a refusal.
     """
+
+
+def _starts_with_container(run: bytes) -> bool:
+    """Whether `run` begins at the natural base64 encoding of a container header."""
+    if not run or run[0] not in _CONTAINER_BASE64_FIRST:
+        return False
+    head = run[:_CONTAINER_SNIFF_CHARS]
+    head = head[: len(head) - len(head) % 4]
+    try:
+        decoded = base64.b64decode(head.translate(_URL_SAFE_ALPHABET), validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    return decoded.startswith(_CONTAINER_MAGIC) or _looks_like_zlib(decoded)
+
+
+def _match_broken_container(
+    data: bytes,
+    left: re.Match[bytes],
+    right: re.Match[bytes],
+    inspect: _Inspector,
+) -> str | None:
+    """Inspect an assigned container encoding interrupted by one bounded separator."""
+    gap = right.start() - left.end()
+    joined_size = len(left.group(0)) + len(right.group(0))
+    if (
+        gap < 1
+        or gap > _MAX_BROKEN_SEPARATOR
+        or joined_size > _MAX_REJOINED_CONTAINER_RUN
+        or not _starts_with_container(left.group(0))
+        or not _is_assigned_value(data, left.start(), right.end())
+    ):
+        return None
+    first, second = left.group(0), right.group(0)
+    # removing the separator covers an inserted byte such as json's backslash in `\/`. if the
+    # separator replaced one encoded character, try each sextet at the one proven seam; wrong gzip
+    # candidates usually fail at that point rather than expanding their whole declared payload.
+    for missing in (None, *_STANDARD_ALPHABET):
+        candidate = first + second if missing is None else first + bytes((missing,)) + second
+        try:
+            decoded = base64.b64decode(
+                _padded(candidate).translate(_URL_SAFE_ALPHABET), validate=True
+            )
+        except (ValueError, binascii.Error):
+            continue
+        if kind := _match(decoded):
+            return kind
+        # each inserted sextet is speculative until expansion recovers a credential. using the
+        # speculative inspector keeps one wrong gzip checksum from ending the 64-way seam search.
+        if kind := inspect(decoded):
+            return kind
+    return None
 
 
 def _match_base64(
@@ -195,7 +257,15 @@ def _match_base64(
     8,769 real hub files decode to zero credential matches, so this costs no legitimate publish.
     """
     joined = _unwrapped(data)
+    previous: re.Match[bytes] | None = None
     for run in _BASE64_RUN.finditer(joined):
+        if (
+            inspect is not None
+            and previous is not None
+            and (kind := _match_broken_container(joined, previous, run, inspect))
+        ):
+            return kind
+        previous = run
         candidate = run.group(0)
         # A run touching the end of `data` may have been CUT there rather than ended there. The
         # caller reads a file in bounded chunks, so a long encoded blob arrives in pieces, and a

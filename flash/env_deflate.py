@@ -227,15 +227,6 @@ def _pdf_has_encryption_dictionary(data: bytes) -> bool:
     return False
 
 
-# A `/Filter` whose value is an indirect reference (`2 0 R`) rather than a name or an array of
-# names. Resolving it means following the xref table into another object. PDF comments are token
-# separators too: `%comment\n2 0 R` names the same reference as the spaced form, and the comment form
-# previously left the compressed credential unassociated with any filter and published it.
-_PDF_INDIRECT_FILTER = re.compile(
-    rb"/%s%s\d+%s\d+%sR\b"
-    % (_FILTER_NAME, _PDF_REQUIRED_SEPARATOR, _PDF_REQUIRED_SEPARATOR, _PDF_REQUIRED_SEPARATOR)
-)
-
 # `/DecodeParms` may also point at an indirect object. The predictor and its dimensions then sit
 # outside the local stream dictionary, so inflating and scanning the still-predicted bytes is not a
 # complete read. The key is escape-tolerant because `/#44ecodeParms` is the same PDF name.
@@ -574,12 +565,6 @@ def _pdf_stream_payloads(data: bytes, budget: int) -> Iterator[bytes | None]:
     # is also found here, so only a SURPLUS means one sits beyond the bound.
     if len(_PDF_LONG_DICTIONARY.findall(data)) > len(_PDF_STREAM.findall(data)):
         raise _UnreachedStream
-    # A filter named through an INDIRECT reference -- `/Filter 2 0 R`, resolved from another object
-    # -- cannot be read by a pattern that matches the name directly, so the stream it belongs to was
-    # never associated with flate and its credential published. Resolving object references means
-    # parsing the xref table; refusing is the bounded answer, and these are rare in practice.
-    if _PDF_INDIRECT_FILTER.search(data):
-        raise _UnreadableFilterChain
     # Indirect decode parameters hide whether a predictor must be undone. A predictor-encoded key
     # inflated into differences containing no literal credential, so unresolved parameters are
     # unreadable rather than evidence that the stream is clean.
@@ -651,6 +636,26 @@ def _object_dictionary(data: bytes, at: int) -> bytes:
     return data[_dictionary_start(data, at) : at + _PDF_DICTIONARY_REACH]
 
 
+def _dictionary_has_indirect_reference(data: bytes, at: int, key: bytes) -> bool:
+    """Whether the stream dictionary at `at` directly maps `key` to an object reference."""
+    depth = 0
+    direct: list[bytes] = []
+    for token in _pdf_tokens(data[_dictionary_start(data, at) : at]):
+        if token == b"<<":
+            depth += 1
+        elif token == b">>":
+            depth = max(0, depth - 1)
+        elif depth == 1:
+            direct.append(token)
+    return any(
+        direct[index] == key
+        and direct[index + 1].isdigit()
+        and direct[index + 2].isdigit()
+        and direct[index + 3] == b"R"
+        for index in range(len(direct) - 3)
+    )
+
+
 def _refuse_unreadable_streams(data: bytes) -> None:
     """Raise when any stream in `data` declares a filter chain this cannot reverse.
 
@@ -665,6 +670,10 @@ def _refuse_unreadable_streams(data: bytes) -> None:
     """
     streams = _PDF_ANY_STREAM.finditer(data)
     for found in itertools.islice(streams, _MAX_PDF_STREAMS):
+        # an indirect filter cannot be resolved without the xref table. inspect only the owning
+        # dictionary: `/Filter 2 0 R` inside page text is a literal string and changes no stream.
+        if _dictionary_has_indirect_reference(data, found.start(), b"/Filter"):
+            raise _UnreadableFilterChain
         chain = _declared_filters(data, found.start())
         if any(name not in (_FLATE_FILTER, _ASCII85_FILTER) for name in chain):
             raise _UnreadableFilterChain
