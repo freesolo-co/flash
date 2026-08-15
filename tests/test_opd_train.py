@@ -6852,6 +6852,83 @@ def test_the_arming_heartbeat_never_abandons_the_shared_upload_lock(monkeypatch)
     hb._HB_UPLOAD_LOCK.release()
 
 
+def test_a_stall_abort_still_stops_the_gpu_sampler(monkeypatch):
+    """The stall teardown raises, so sampler shutdown has to be exception-safe.
+
+    `_NvidiaSmiPeakSampler` is a daemon thread that exits only when `stop_gb` sets its event, and it
+    spawns an `nvidia-smi` subprocess every 0.5s until then. Before this change `stop_gb` sat after
+    the `try`, so the stall `RuntimeError` this PR introduces walked straight past it: on a reusable
+    worker the sampler outlived the failed run for the life of the process, and every subsequent
+    stalled attempt leaked another one.
+    """
+    from contextlib import nullcontext
+
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    class ProgressState:
+        def __init__(self, _resume_state):
+            pass
+
+        def start_training(self):
+            pass
+
+        def final_state(self, _bridge):
+            return {"loss_curve": [0.5], "train_wall_seconds": 1.0}
+
+    class Watcher:
+        def start(self):
+            pass
+
+        def stop(self, *, require_complete):
+            pass
+
+    stopped: list[bool] = []
+
+    class GpuSampler:
+        def start(self):
+            return self
+
+        def stop_gb(self):
+            stopped.append(True)
+            return 0.0
+
+    def wedged_child(*_args, **_kwargs):
+        raise RuntimeError("opd child produced no new output for 30 minutes")
+
+    monkeypatch.setattr(opd_runner._opd_train._w, "heartbeat", lambda stage, **kw: True)
+    monkeypatch.setattr(opd_runner._opd_train._w, "gpu_diagnostics", lambda include_torch=True: {})
+    monkeypatch.setattr(opd_runner._opd_train, "build_opd_overrides", lambda _config: [])
+    monkeypatch.setattr(opd_runner._opd_train, "_OpdProgressState", ProgressState)
+    monkeypatch.setattr(opd_runner, "_build_checkpoint_watcher", lambda *_args: Watcher())
+    monkeypatch.setattr(opd_runner, "_build_child_env", lambda *_args: {})
+    monkeypatch.setattr(opd_runner._opd_train, "_NvidiaSmiPeakSampler", GpuSampler)
+    monkeypatch.setattr(
+        opd_runner._opd_train, "liveness_heartbeat", lambda *_a, **_k: nullcontext()
+    )
+    monkeypatch.setattr(opd_runner._opd_train, "run_verl_training", wedged_child)
+
+    with pytest.raises(RuntimeError, match="no new output"):
+        opd_runner._run_child(
+            SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
+            object(),
+            SimpleNamespace(update_horizon=1, local_dir="/unused"),
+            SimpleNamespace(
+                resume_state=None,
+                resume_step=0,
+                python_bin="python",
+                entry_path="entry.py",
+                bridge=object(),
+            ),
+            {},
+            (),
+        )
+
+    assert stopped, (
+        "the stall abort raised past gpu_sampler.stop_gb(): the daemon sampler survives the failed "
+        "run and keeps spawning nvidia-smi every 0.5s, once more per stalled attempt"
+    )
+
+
 def test_arming_the_watchdog_restarts_the_providers_stall_clock(monkeypatch):
     """The two clocks must start from the same origin, or the provider gives up first.
 
@@ -7082,6 +7159,98 @@ def test_a_pre_training_diagnostic_step_does_not_start_the_providers_training_cl
         opd_train._w.heartbeat = original
 
 
+def test_a_resumed_child_reports_absolute_steps_once_it_has_stepped():
+    """Attempt-local must end at the first new step, or a resumed run is mispriced.
+
+    `status.last_heartbeat` is overwritten wholesale by every heartbeat, and
+    `costs.actual_steps_run` prices a cancellation straight off its `step`. A resumed attempt that
+    reports attempt-local forever therefore replaces the absolute `on_step(121)` payload with a `1`
+    on the next liveness tick: the CLI shows a step regression and the cancellation bills one step
+    instead of 121. Reporting 0 during cold start is still required, since a step >= 1 tells the
+    provider to swap its 3000s setup grace for the 1500s training window.
+    """
+    import flash.engine.worker.opd_train as opd_train
+    import flash.engine.worker.opd_train_runner as opd_runner
+    from flash.providers._lifecycle.poll import is_training_heartbeat
+
+    watcher = SimpleNamespace(raise_if_failed=lambda: None)
+    progress_state = SimpleNamespace(record_step=lambda *_args: None)
+    callbacks = opd_runner._build_child_callbacks(watcher, progress_state, object(), 120)
+
+    emitted: list = []
+    original = opd_train._w.heartbeat
+    opd_train._w.heartbeat = lambda stage, **kw: emitted.append((stage, kw))
+    try:
+        # cold start on a resumed attempt: the child has not stepped, so the provider must keep its
+        # setup grace and this ping must not read as training progress.
+        callbacks.child_heartbeat()
+        assert emitted[-1][1].get("step") == 0
+        assert callbacks.liveness_progress() == 0
+        assert not is_training_heartbeat("opd_step", emitted[-1][1].get("step")), (
+            "a resumed attempt still in cold start tightened the provider's stall window"
+        )
+        emitted.clear()
+
+        # the child now takes its own first step. absolute from here on.
+        callbacks.on_line("step:121 - actor/distillation/loss:0.5\n")
+        callbacks.on_step(121)
+        assert emitted[-1][1].get("step") == 121
+        emitted.clear()
+
+        callbacks.child_heartbeat()
+        assert emitted[-1][1].get("step") == 121, (
+            f"a liveness ping published {emitted[-1][1].get('step')} after the child completed step "
+            "121; it overwrites last_heartbeat, so the CLI regresses and a cancellation is billed "
+            "as one step instead of 121"
+        )
+        assert callbacks.liveness_progress() == 121
+    finally:
+        opd_train._w.heartbeat = original
+
+
+def test_a_diagnostic_after_a_real_step_still_does_not_commit_a_step():
+    """The step gate must judge the CURRENT line, not latch open after the first real step.
+
+    Gating on "has any validated step landed" is true forever once training starts, so every later
+    loose-scan match is waved through. verl keeps printing checkpoint paths and summaries carrying
+    `global_step: N` long after training begins, and committing one publishes a step verl never
+    took: the CLI shows the wrong step, and `actual_steps_run()` prices a cancellation from it.
+    """
+    import flash.engine.worker.opd_train as opd_train
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    watcher = SimpleNamespace(raise_if_failed=lambda: None)
+    progress_state = SimpleNamespace(record_step=lambda *_args: None)
+    callbacks = opd_runner._build_child_callbacks(watcher, progress_state, object(), 0)
+
+    emitted: list = []
+    original = opd_train._w.heartbeat
+    opd_train._w.heartbeat = lambda stage, **kw: emitted.append((stage, kw))
+    try:
+        # a genuine optimizer step lands first, so any latch is now open.
+        callbacks.on_line("step:1 - actor/distillation/loss:0.5\n")
+        callbacks.on_step(1)
+        assert emitted, "a real optimizer step published no heartbeat at all"
+        emitted.clear()
+
+        # verl then prints a checkpoint path. the loose reader scan matches it and drives on_step
+        # with a step number 499 higher than anything verl actually trained.
+        callbacks.on_line("saving checkpoint to /ckpt/global_step: 500\n")
+        callbacks.on_step(500)
+        assert not emitted, (
+            f"a post-training diagnostic committed a real step heartbeat {emitted}: the run now "
+            "reports step 500 after training exactly one step, and a cancellation is priced from it"
+        )
+
+        # and a genuine later step must still report, or training goes dark after step 1.
+        callbacks.on_line("step:2 - actor/distillation/loss:0.4\n")
+        callbacks.on_step(2)
+        assert emitted, "a real optimizer step stopped publishing once the gate tightened"
+        assert emitted[0][1].get("step") == 2
+    finally:
+        opd_train._w.heartbeat = original
+
+
 def test_liveness_progress_is_attempt_local_on_a_resumed_run():
     """The daemon's progress value must not tighten the provider's stall window on a resume.
 
@@ -7103,9 +7272,13 @@ def test_liveness_progress_is_attempt_local_on_a_resumed_run():
         "a resumed attempt's first liveness tick flipped the provider out of its setup grace"
     )
 
-    # a real step by THIS child is real training progress and should tighten the window.
+    # a real step by THIS child is real training progress and should tighten the window. it reports
+    # the ABSOLUTE step, not the attempt-local 1: this value reaches `status.last_heartbeat`, which
+    # `costs.actual_steps_run` prices a cancellation from, so attempt-local here would bill a run
+    # resumed at 120 as a single step. see
+    # `test_a_resumed_child_reports_absolute_steps_once_it_has_stepped`.
     callbacks.on_line("step:121 - actor/distillation/loss:0.5\n")
-    assert callbacks.liveness_progress() == 1
+    assert callbacks.liveness_progress() == 121
     assert is_training_heartbeat("opd_step", callbacks.liveness_progress())
 
 

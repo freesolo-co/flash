@@ -605,6 +605,9 @@ def _build_child_callbacks(
         # rest of the run AND, through the heartbeat `on_step` commits, flips the provider to its
         # 1500s stall window, 300s tighter than the 1800s watchdog meant to catch the wedge first.
         "validated_step": resume_step,
+        # the validated verdict for the line currently being processed, or None when that line is
+        # not a real step line. reset per line, unlike `validated_step` which only ever climbs.
+        "line_step": None,
         "loss": None,
         "truncation_rate": None,
         "truncation_step": None,
@@ -617,6 +620,10 @@ def _build_child_callbacks(
         if link is not None:
             wandb_link.update(link)
         step_number = _opd_train.verl_step_number(line)
+        # the verdict for THIS line, consumed by `on_step`. recorded including the None: the reader
+        # calls `on_line` then `on_step` for the same line, so this is what lets `on_step` judge the
+        # line currently driving it rather than a latch that stays open once any step has landed.
+        progress["line_step"] = step_number
         if step_number is None:
             return
         # recorded BEFORE the metric filter below: a step-tagged line with no distillation loss
@@ -638,10 +645,13 @@ def _build_child_callbacks(
         progress["truncation_step"] = step_number
 
     def on_step(step: int) -> None:
+        # judged on the CURRENT line's validated verdict, not the loose scan that called this and
+        # not a latch: a diagnostic like "global_step: 500" is refused whether it lands before the
+        # first optimizer step or after the thousandth. committing one publishes a step verl never
+        # took, corrupting the displayed step and the count a cancellation is priced from.
+        if progress["line_step"] != step:
+            return
         progress["step"] = step
-        # gated on the VALIDATED step (see `validated_step` above), not the loose scan that called
-        # this. `on_line` sets it for a line before the reader calls `on_step` for that same line,
-        # so this reads the current line's verdict rather than the previous one's.
         if not steps_this_child():
             return
         payload = {"step": step}
@@ -652,12 +662,8 @@ def _build_child_callbacks(
         _opd_train._w.heartbeat("opd_step", **payload)
 
     def child_heartbeat() -> None:
-        # attempt-local for the same reason as `liveness_progress`: this ping can be upgraded to a
-        # real heartbeat by the progress-carry latch, and an absolute restored step would then read
-        # as "training has started" and tighten the provider's stall window on a resumed attempt
-        # that is still in cold start. `poll.STEP_GATED_STAGES` documents the intended contract:
-        # an opd_step ping reports opt_steps, 0 until the first optimizer update lands.
-        _opd_train._w.heartbeat("opd_step", liveness=True, step=steps_this_child())
+        # 0 until this child takes its own step, then the ABSOLUTE step. see `liveness_progress`.
+        _opd_train._w.heartbeat("opd_step", liveness=True, step=liveness_progress())
 
     child_tail = _opd_train.ChildOutputTail()
     # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside
@@ -687,12 +693,24 @@ def _build_child_callbacks(
             steps_this_child(), child_tail, staleness=tail_staleness
         )
 
+    def liveness_progress() -> int:
+        """0 during this child's cold start, then the ABSOLUTE validated step.
+
+        0 at first because the progress-carry latch can upgrade a liveness ping to a real heartbeat,
+        and an absolute restored step would then read as "training started" and tighten the
+        provider's stall window on a resumed attempt still in cold start. absolute afterwards
+        because `status.last_heartbeat` is overwritten wholesale and `costs.actual_steps_run` prices
+        a cancellation off its `step`: attempt-local forever makes a run resumed at 120 that
+        completed step 121 report 1, regressing the CLI and billing one step.
+        """
+        return int(progress["validated_step"] or 0) if steps_this_child() else 0
+
     return _ChildCallbacks(
         on_line,
         on_step,
         child_heartbeat,
         liveness_fields,
-        steps_this_child,
+        liveness_progress,
         progress,
         wandb_link,
         child_tail,
@@ -746,7 +764,11 @@ def _run_child(
                 training_completed = return_code == 0
     finally:
         watcher.stop(require_complete=training_completed)
-    peak_gpu_gb = gpu_sampler.stop_gb()
+        # in the `finally` because this function can now raise: `run_verl_training` raises the stall
+        # RuntimeError on a torn-down child. the sampler is a daemon thread that exits only when
+        # `stop_gb` sets its event, so leaving it behind spawns nvidia-smi every 0.5s for the life
+        # of the worker, once more per stalled attempt.
+        peak_gpu_gb = gpu_sampler.stop_gb()
     truncation_window = None
     if return_code != 0:
         truncation_window = progress_state.truncation_window(
@@ -918,78 +940,9 @@ def _export_and_upload_adapter(
     return adapter_dir
 
 
-def _build_train_note_sections(
-    request: _OpdRequest,
-    prompt_state: _PromptState,
-    workload: _WorkloadState,
-    runtime: _RuntimeState,
-    result: _ChildResult,
-    download_seconds: float,
-) -> tuple[
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, Any],
-    tuple[dict[str, Any], dict[str, Any]],
-]:
-    final_accounting = result.final_accounting
-    knobs = request.knobs
-    initial = {
-        "epochs": knobs.epochs,
-        "retained_prompts": len(prompt_state.prompts),
-        "dropped_long_prompts": prompt_state.dropped_long,
-        "method": "gkd",
-        "init_from_adapter": request.spec.train.init_from_adapter or None,
-        "teacher_model": knobs.teacher_model,
-        "download_seconds": download_seconds,
-        "thinking": _opd_train._w.THINKING,
-        "loss_curve": final_accounting["loss_curve"],
-        "mean_coverage": (
-            float(final_accounting["coverage_sum"]) / int(final_accounting["aligned_sequences"])
-            if final_accounting["aligned_sequences"]
-            else 0.0
-        ),
-    }
-    accounting = {
-        "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
-        "forced_tokens": int(final_accounting["forced_tokens"]),
-        "dropped_forced_groups": int(final_accounting["dropped_forced_groups"]),
-        "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
-        "teacher_output_tokens": int(final_accounting["teacher_output_tokens"]),
-        "aligned_sequences": int(final_accounting["aligned_sequences"]),
-        "empty_alignments": int(final_accounting["empty_alignments"]),
-        "teacher_ok": int(final_accounting["teacher_ok"]),
-    }
-    training = {
-        "temperature": knobs.temperature,
-        "group_size": knobs.group_size,
-        "prompts_per_step": workload.prompts_per_step,
-        "max_completion_len": knobs.max_completion,
-        "multi_turn": request.multi_turn,
-        "max_turns": request.max_turns if request.multi_turn else None,
-        "episodes": int(final_accounting["episodes_seen"]) if request.multi_turn else None,
-        "mean_turns_per_episode": (
-            int(final_accounting["mt_turn_records"]) / int(final_accounting["episodes_seen"])
-            if request.multi_turn and final_accounting["episodes_seen"]
-            else None
-        ),
-    }
-    backend = (
-        {
-            "rollout_backend": "verl_vllm",
-            "verl_version": "0.8.0",
-            "verl_backend": "fsdp",
-            # report the EXECUTED width, not the allocation: the card count here would claim a
-            # sequence-parallel run that did not happen. token-balanced batching makes every
-            # allocated rank a dp rank, so unlike sft the executed dp width IS the card count.
-            "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
-            "data_parallel_size": runtime.gpu_count,
-        },
-        {
-            "peak_gpu_gb": result.peak_gpu_gb,
-            "warm_started": bool(workload.warmstart_adapter),
-            "resumed": bool(runtime.resume_step),
-            "wandb_project": runtime.project_name if "wandb" in runtime.loggers else None,
-            "wandb_run_name": runtime.experiment_name if "wandb" in runtime.loggers else None,
-        },
-    )
-    return initial, accounting, training, backend
+# training-note assembly, implemented in the sibling notes module. imported at the END and
+# re-exported so `opd_train` and the tests keep importing it from here: the notes module imports
+# this one's dataclasses under TYPE_CHECKING, so an import at the top would be circular.
+from flash.engine.worker.opd_train_notes import _build_train_note_sections  # noqa: E402
+
+__all__ = ["_build_train_note_sections"]
