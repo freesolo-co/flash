@@ -310,6 +310,9 @@ def api(tmp_path, monkeypatch):
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
     with TestClient(app_mod.create_app()) as client:
+        # startup preflight needs the fake token above; billing requests do not. keeping `ghp-test`
+        # here turns an offline billing test into a real environment-pin request to GitHub.
+        monkeypatch.delenv("GITHUB_TOKEN")
         yield client
 
 
