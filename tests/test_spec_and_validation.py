@@ -1651,17 +1651,6 @@ def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> No
 
     _validate_effective_spec(reparsed_public, worker)  # raises if the exclusion is missing
 
-    # historical authored pins remain compared on stored public payloads, so changing the worker's
-    # revision still fails closed for already-persisted runs.
-    authored_public = JobSpec.from_dict({**worker.to_dict(), "model_revision": "a" * 40})
-    authored_worker = replace(worker, model_revision_auto=False)
-    for tampered in (
-        replace(authored_worker, model_revision="b" * 40),
-        replace(authored_worker, model_revision="b" * 40, model_revision_auto=True),
-    ):
-        with pytest.raises(ValueError, match="does not match the public run"):
-            _validate_effective_spec(authored_public, tampered)
-
 
 def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
     with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revison"):

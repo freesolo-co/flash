@@ -665,13 +665,16 @@ class FreesoloEnvironment(BaseEnvironment):
         state["turn"] = int(state.get("turn", 0)) + 1
         if step.metadata:
             state.setdefault("step_metadata", []).append(step.metadata)
-        replies = [dict(message) for message in step.messages]
-        state.setdefault("messages", []).extend(replies)
-        for message in replies:
+        replies = [deepcopy(dict(message)) for message in step.messages]
+        scored_replies = deepcopy(replies)
+        state.setdefault("messages", []).extend(scored_replies)
+        for message in scored_replies:
+            # score_episode receives a structural copy of the environment's raw chat content. the
+            # parent bridge flattens only the separate child-bound reply returned below.
             state.setdefault("turns", []).append(
                 self._EnvironmentTurn(
                     role=str(message.get("role", "")),
-                    content=str(message.get("content", "")),
+                    content=deepcopy(message.get("content", "")),
                 )
             )
         return replies
