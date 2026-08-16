@@ -727,9 +727,7 @@ def _build_checkpoint_watcher(
         group_size=request.knobs.group_size,
         accounting_state=progress_state.checkpoint_state,
     )
-    watcher.processed_steps.update(
-        _opd_train._processed_resume_steps(request.knobs.save_at_steps, runtime.resume_step)
-    )
+    _opd_train._seed_resume_lifecycle(watcher, request.knobs.save_at_steps, runtime.resume_step)
     return watcher
 
 
