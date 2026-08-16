@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler
 from flash.engine.worker.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.score_batcher import ScoreBatcher
 from flash.engine.worker.train.rl.scoring import RolloutScoreRequest, score_rollouts
+from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
 # how many concurrently-finished episodes the multi-turn bridge scores in ONE env call. a whole
 # generation is prompts_per_step * group_size episodes and they finish at different turn counts,
@@ -131,6 +132,7 @@ class MultiTurnBridge:
         max_turns: int,
         per_turn_credit: bool = False,
         on_episode_scored: Callable[[object, object, float], None] | None = None,
+        parent_work: ParentWorkGauge | None = None,
         score_batch_size: int = _MULTI_TURN_SCORE_BATCH_SIZE,
         score_flush_wait_s: float = _MULTI_TURN_SCORE_FLUSH_WAIT_S,
         session_lease_s: float = _MULTI_TURN_SESSION_LEASE_S,
@@ -143,6 +145,7 @@ class MultiTurnBridge:
         self._max_turns = int(max_turns)
         self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
+        self._parent_work = parent_work or ParentWorkGauge()
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
@@ -200,6 +203,10 @@ class MultiTurnBridge:
             self._sessions.pop(session_id, None)
         return stale
 
+    def _env_call(self, method: str, *args):
+        with self._parent_work.busy():
+            return getattr(self._env, method)(*args)
+
     def start(self, payload: dict) -> dict:
         index = request_int(payload, "index")
         if index < 0 or index >= len(self._examples):
@@ -215,7 +222,7 @@ class MultiTurnBridge:
             reaped = self._reap_abandoned_sessions()
             if session_id in self._sessions:
                 raise _BadSession(f"duplicate multi-turn session {session_id}")
-            state = self._env.new_rollout_state(example)
+            state = self._env_call("new_rollout_state", example)
             # new_rollout_state calls start_episode again after dataset preparation. adopt the dataset's
             # prompt so randomized envs do not generate for episode a and score episode b; keep the
             # remaining state created by the env.
@@ -257,11 +264,11 @@ class MultiTurnBridge:
                     "content": str(payload.get("completion_text") or ""),
                 }
                 return {"terminal": True, "messages": []}
-            self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
-            if self._env.rollout_done(state, self._max_turns):
+            self._env_call("record_model_turn", state, str(payload.get("completion_text") or ""))
+            if self._env_call("rollout_done", state, self._max_turns):
                 return {"terminal": True, "messages": []}
-            replies = self._env.env_reply(list(state.get("messages") or ()), state)
-            terminal = bool(self._env.rollout_done(state, self._max_turns))
+            replies = self._env_call("env_reply", list(state.get("messages") or ()), state)
+            terminal = bool(self._env_call("rollout_done", state, self._max_turns))
         return {
             "terminal": terminal,
             "messages": [
@@ -276,7 +283,7 @@ class MultiTurnBridge:
         takes the same lock every other env touch takes, so scoring never overlaps a concurrent
         episode's ``env_reply``. the win is that one lock acquisition now covers a whole batch.
         """
-        with self._lock:
+        with self._lock, self._parent_work.busy():
             return score_rollouts(self._env, requests)
 
     def score(self, payload: dict) -> dict:

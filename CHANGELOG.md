@@ -21,6 +21,27 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- A RunPod attempt's stall window is now measured from evidence timestamps rather than from when
+  the control plane happened to look at it. The window was seeded from the moment polling started
+  and was reset again by the first status read, and a heartbeat was credited at the time it was
+  read rather than the time it was written. Every one of those is a wall-clock reading, so each
+  reattach handed a worker that was already wedged a complete fresh setup window, and a supervisor
+  that reattached repeatedly could keep a dead worker on a paid GPU until the run's wall deadline.
+  The window is now anchored to the persisted launch, a heartbeat is credited at its own timestamp
+  clamped to that launch, and only a genuine status transition counts as progress. Instance
+  polling (Vast/Lambda) already worked this way; this brings RunPod onto the same rule. A job that
+  is still queued is unaffected: the capacity wait keeps its own exemption, so a worker granted
+  late still gets its full cold-start budget.
+- An attempt's terminal artifacts (its strict marker plus `metrics.json`) are now interpreted by
+  one shared protocol instead of being decoded separately by live instance polling and by each
+  recovery path. The two decoders disagreed about identical bytes. A marker that could not be tied
+  to the attempt was a terminal failure to the live poller but indistinguishable from "no marker
+  yet" to recovery, so the same corrupt artifact produced a different story depending on which
+  layer happened to observe it; recovery now names it rather than logging silence. Neither path
+  ever adopted such a marker as completed work, and neither does now. Recovery also computed a
+  fresh observation window for the marker and then another for `metrics.json`, so the real ceiling
+  was their sum and moved with however long the first read took; both reads now share one window,
+  which makes the bound the cutoff rather than the sum.
 - CI runs the offline test suite on both supported interpreters (3.11 and 3.12) rather than
   3.11 alone, and sets `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` so a test that reaches the
   network fails deterministically instead of depending on runner connectivity.
@@ -29,6 +50,45 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- An ordered `[gpu] type` list is now priced over every class it declares acceptable, not just the
+  first. Allocation cost-ranks the whole set, so quoting the head alone priced a shape the run may
+  never be given — an authored `["B200", "H100"]` quoted roughly 3x the H100 the allocator would
+  really rent, and the submit-time affordability check runs on that estimate, so a run the
+  organization could afford could be refused before allocation ever got to choose. A single
+  authored class is still a hard pin, and a no-fit rejection now names every acceptable class
+  rather than whichever happened to be written first.
+
+- A provider preference that exhausts every configured provider no longer falls back to quoting
+  hardware this plane cannot rent. The final fallback dropped the restriction and ranked the
+  registered RunPod pool regardless of credentials, so a vast-only plane could quote a B200: the
+  estimate passed affordability and the run was recorded, only for live allocation to fail. The
+  quote now raises against the eligible set, which names the real constraint.
+
+- A GitHub token that is invalid, expired, or missing a scope now fails during preparation instead
+  of after a GPU is rented. Non-rate-limit 401 and 403 responses were left as untyped errors, which
+  the submit-time preflight treats as a transient blip worth deferring, so the run proceeded
+  through affordability and allocation and hit the same permanent credential error on the worker.
+  They are now classified permanent, like 404 and 422. The rate-limit 403 is still transient.
+
+- A slow heartbeat upload no longer stalls every other heartbeat behind it. The throttle clock only
+  advances once a commit lands, so during a slow HuggingFace commit other callers still saw an
+  upload as due and blocked on the upload lock for up to its acquire timeout — 30s, or 120s on a
+  critical stage — which stalled the liveness daemon and delayed leaving the wrapped stage by the
+  same window. A throttled heartbeat now skips while a commit is in flight, since that commit
+  already carries the stage's state. Terminal, error, initial, and forced step commits still queue
+  and land: they carry state no later heartbeat would repair.
+
+- A GRPO or OPD run whose rollout actor exited hard no longer wedges on a paid GPU until the
+  wall-time limit. The actor's `os._exit` bypassed verl's own prompt handler, so the prompt
+  stayed `running` forever and verl's unbounded replay poll waited on it at ~0% utilization. The
+  child now writes durable failure evidence, marks the prompt failed, cleans up, and only then
+  exits, and replay sampling fails the step on an explicit failure tag or a positively dead
+  actor instead of returning a survivor-only batch that would silently train on fewer rollouts
+  than were collected. A child that reaches the fit loop and then stops producing distinct
+  output, while the parent has no teacher or environment work in flight, is torn down with a
+  named cause rather than running silently to the limit; repeated identical lines count as
+  silence, and authoritative OOM, host-RAM, and infrastructure evidence still classifies the
+  exit first.
 - `flash models deploy` now warns before it moves the shared `<run-id>` model id onto a
   different checkpoint. Every checkpoint of a run is served under that one id, so deploying
   `<run-id>/step-50` while `step-100` was live silently changed what `<run-id>` served for

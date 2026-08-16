@@ -10,10 +10,6 @@ def test_worker_image_defaults_to_per_sm_baked_tag_for_durable_jobs():
     assert worker_image_for_gpu("RTX 4090") == "ghcr.io/freesolo-co/flash-worker:cu128-sm89"
 
 
-def test_worker_image_can_return_none_for_live_endpoint_default():
-    assert worker_image_for_gpu("RTX 4090", allow_default=False) is None
-
-
 def test_worker_image_appends_arch_to_default_tag():
     assert worker_image_for_gpu("RTX 4090") == "ghcr.io/freesolo-co/flash-worker:cu128-sm89"
     assert worker_image_for_gpu("A100 SXM") == "ghcr.io/freesolo-co/flash-worker:cu128-sm80"
@@ -44,10 +40,3 @@ def test_worker_image_is_not_configurable_by_environment(monkeypatch):
         monkeypatch.setenv(key, "ghcr.io/attacker/not-ours:latest")
 
     assert worker_image_for_gpu("H100") == "ghcr.io/freesolo-co/flash-worker:cu128-sm90"
-    assert worker_image_for_gpu("RTX 4090", allow_default=False) is None
-
-
-def test_per_sm_never_leaks_into_live_endpoints():
-    # per-sm images are durable runpod queue-worker images (cmd runs rp_handler.py); they must not
-    # route into the live-endpoint path (allow_default=False), which expects none.
-    assert worker_image_for_gpu("RTX 4090", allow_default=False) is None

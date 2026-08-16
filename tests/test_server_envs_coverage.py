@@ -259,7 +259,6 @@ def test_deployment_state_and_public_deployment():
             "previous_deployment": {"x": 1},
             "endpoint_name": "https://serve.example",
             "openai_base_url": "https://serve.example/v1",
-            "url": "https://stale.example/v1",
             "b": 2,
         }
     )

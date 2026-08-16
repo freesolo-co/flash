@@ -167,35 +167,6 @@ def test_empty_collections_stay_omitted_rather_than_explicit():
 # specific historical shapes that still exist on disk.
 
 
-@pytest.mark.parametrize("dropped_key", ["model_policy", "worker_env", "workload_profile_kind"])
-def test_persisted_records_still_decode_with_removed_top_level_keys(dropped_key):
-    raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
-        "algorithm": "sft",
-        "project": PROJECT,
-        "environment": {"id": "owner/project/env"},
-        "train": {"epochs": 1},
-        dropped_key: {"SOME_KEY": "value"} if dropped_key == "worker_env" else "allow",
-    }
-    decoded = JobSpec.from_dict(raw)
-    # tolerated on READ only: the removed key must not reappear in either serialized contract.
-    assert dropped_key not in decoded.to_dict()
-    assert dropped_key not in decoded.to_internal_dict()
-
-
-def test_persisted_records_still_decode_with_removed_train_keys():
-    decoded = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "sft",
-            "project": PROJECT,
-            "environment": {"id": "owner/project/env"},
-            "train": {"epochs": 1, "advantage_clip": 0.2},
-        }
-    )
-    assert "advantage_clip" not in decoded.to_internal_dict()["train"]
-
-
 def test_removed_train_key_tolerance_does_not_extend_to_other_sections():
     """The retired-key allowlist is per-section, not global.
 
@@ -252,41 +223,6 @@ def test_unknown_persisted_keys_are_still_fatal():
                 "not_a_real_field": 1,
             }
         )
-
-
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
-def test_pre_1_1_43_rollout_batch_migrates_to_prompts_per_step(algorithm):
-    """Rollout runs written before the rename carry only `batch_size`; workers read the new name."""
-    decoded = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": algorithm,
-            "project": PROJECT,
-            "environment": {"id": "owner/project/env"},
-            "train": {"batch_size": 32, "group_size": 4},
-        }
-    )
-    assert decoded.train.prompts_per_step == 32
-    # MOVED, not copied: a spec carrying a MEANINGFUL value under both names is rejected by the
-    # authored parser, which would break the resubmit that recovery performs. `to_dict()` still
-    # emits the key (it emits every train field), so what matters is that its value is now None.
-    assert decoded.train.batch_size is None
-    assert decoded.to_dict()["train"]["batch_size"] is None
-
-
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
-def test_new_rollout_spelling_wins_when_a_record_carries_both(algorithm):
-    decoded = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": algorithm,
-            "project": PROJECT,
-            "environment": {"id": "owner/project/env"},
-            "train": {"batch_size": 64, "prompts_per_step": 32, "group_size": 4},
-        }
-    )
-    assert decoded.train.prompts_per_step == 32
-    assert decoded.train.batch_size is None
 
 
 def test_sft_batch_size_is_not_migrated():

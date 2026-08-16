@@ -22,6 +22,7 @@ from flash.engine.result.rollout_samples import (
 )
 from flash.engine.worker.perf import gpu_diagnostics
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
 # Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
 # cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
@@ -96,6 +97,19 @@ _HB_UPLOAD_LOCK = threading.Lock()
 # Terminal/error commits wait longer — no later heartbeat can repair them.
 _HB_UPLOAD_LOCK_TIMEOUT_S = 30.0
 _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
+# True while a thread holds _HB_UPLOAD_LOCK and is inside the HF commit. Read under _HB_LOCK.
+#
+# The throttle clock (_HB_LAST_UPLOAD) only advances AFTER a commit lands, so during a slow HF
+# commit every other throttled caller still computes upload_due=True, walks into
+# _HB_UPLOAD_LOCK.acquire() and blocks there for up to the acquire timeout -- 30s, or 120s on a
+# critical stage. That stalls the liveness daemon, and `liveness_heartbeat`'s join delays leaving
+# the wrapped stage by the same window.
+#
+# A marker rather than claiming the clock before the upload: an optimistic claim has to be rolled
+# back when the commit fails, and the rollback has to decide whether a NEWER heartbeat already
+# moved the clock (the reason the old code carried a claim sequence). This says only "a commit is
+# in flight right now", is cleared in a finally, and so cannot strand the throttle on a failure.
+_HB_UPLOAD_IN_FLIGHT = False
 # retain at least one metric row per second across the 900s training heartbeat throttle window.
 GRPO_METRIC_HISTORY_LIMIT = 1024
 
@@ -126,6 +140,12 @@ def _console_heartbeat_snapshot(
     return json.dumps(console_payload)
 
 
+def _set_upload_in_flight(value: bool) -> None:
+    """Mark whether an HF heartbeat commit is running. Call with _HB_LOCK held."""
+    global _HB_UPLOAD_IN_FLIGHT
+    _HB_UPLOAD_IN_FLIGHT = value
+
+
 def _heartbeat_upload_due(
     stage: str,
     *,
@@ -139,6 +159,22 @@ def _heartbeat_upload_due(
     """return eligibility from committed throttle state while _HB_LOCK is held."""
     if initial or _is_critical_stage(stage):
         return True
+    # a commit is already in flight and will advance the throttle clock when it lands. an unforced
+    # ping would only queue behind it on _HB_UPLOAD_LOCK, publish a snapshot older than the one
+    # being written, and block its caller for the acquire timeout -- 30s, or 120s on a critical
+    # stage. that is what stalls the liveness daemon, whose `join` then delays leaving the wrapped
+    # stage by the same window. skipping loses nothing: the in-flight commit carries this stage.
+    #
+    # three exemptions, all above or inside this check:
+    #   - initial and critical stages return True earlier: a terminal or error snapshot has no later
+    #     heartbeat to repair it, so it must queue and land.
+    #   - `force` is excluded here because it carries billing state. a forced commit marks a
+    #     DISTINCT completed step, and a cancel bills the last step a heartbeat recorded, so
+    #     dropping one to avoid a wait could under-report a step the run really finished.
+    # the daemon's own pings are never forced (liveness and keepalive both leave it False), so this
+    # exemption does not reopen the stall it fixes.
+    if _HB_UPLOAD_IN_FLIGHT and not force:
+        return False
     if _w._HB_TERMINAL_ONLY:
         return (
             _w._HB_LAST_UPLOAD == 0.0 or (now - _w._HB_LAST_UPLOAD) >= _HB_TERMINAL_ONLY_INTERVAL_S
@@ -233,12 +269,18 @@ def heartbeat(
                     up = f"/tmp/.hb-upload-{os.getpid()}-{threading.get_ident()}.json"
                     with open(up, "w") as f:
                         f.write(snapshot)
+                    with _HB_LOCK:
+                        _set_upload_in_flight(True)
                     try:
                         if initial:
                             committed = _w.hf_upload_file(up, "heartbeat.json", required=True)
                         else:
                             committed = _w.hf_upload_file(up, "heartbeat.json")
                     finally:
+                        # cleared before the throttle clock is advanced below, and in a finally so a
+                        # raising upload cannot leave every later heartbeat permanently skipped.
+                        with _HB_LOCK:
+                            _set_upload_in_flight(False)
                         with contextlib.suppress(OSError):
                             os.remove(up)
                     if committed is False:
@@ -304,6 +346,7 @@ class RewardObservabilityBuffer:
 
     def __init__(self, *, generation_size: int = 0) -> None:
         self._lock = threading.Lock()
+        self.parent_work = ParentWorkGauge()
         # completions per generation, when the caller knows it: see the class docstring. 0 leaves
         # the boundary entirely caller-driven.
         self._generation_size = max(0, int(generation_size))
@@ -336,6 +379,7 @@ class RewardObservabilityBuffer:
         Fold breakdowns into per-name sums. Retaining bounded rows would silently evict valid
         large-batch completions and bias the mean; ``_bounded_reward_metrics`` already caps names.
         """
+        self.parent_work.complete()
         with self._lock:
             self._samples.append((prompt, completion, float(reward)))
             del self._samples[: -self._SAMPLE_BUFFER_LIMIT]
@@ -483,6 +527,9 @@ class RewardObservabilityBuffer:
         samples = select_rollout_samples(rows, generated_at_step=step)
         if samples:
             fields["sampled_completions"] = samples
+        work = self.parent_work.snapshot()
+        fields["reward_completions"] = work.completed
+        fields["reward_grading_depth"] = work.depth
         return fields
 
 
@@ -526,8 +573,49 @@ _LIVENESS_TICK_S = 30.0
 _STALL_DUMP_S = 1200.0
 
 
+class _OffThreadFieldSampler:
+    def __init__(self, fields, done: threading.Event, spawner: threading.Thread) -> None:
+        self._fields = fields
+        self._done = done
+        self._spawner = spawner
+        self._lock = threading.Lock()
+        self._latest: dict = {}
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _loop(self) -> None:
+        if threading.current_thread() is self._spawner:
+            return
+        while not self._done.is_set():
+            try:
+                sampled = self._fields() or {}
+            except Exception:
+                sampled = None
+            if sampled is not None:
+                with self._lock:
+                    self._latest = dict(sampled)
+            if self._done.wait(_LIVENESS_TICK_S):
+                return
+
+    def latest(self) -> dict:
+        with self._lock:
+            return dict(self._latest)
+
+    def join(self) -> None:
+        self._thread.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
+
+
 @contextlib.contextmanager
-def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, keepalive=False):
+def liveness_heartbeat(
+    stage,
+    progress=None,
+    fields=None,
+    progress_step=False,
+    keepalive=False,
+    sample_off_thread=False,
+):
     """Emit liveness heartbeats while a main-thread block runs.
     ``keepalive`` marks blocking uploads as progress (dev #445); use a throttled stage. ``fields``
     carries payload data, while ``progress_step`` wins for trainer steps (dev #442). Missing a step
@@ -535,6 +623,13 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, k
     """
     done = threading.Event()
     spawner = threading.current_thread()
+    field_sampler = (
+        _OffThreadFieldSampler(fields, done, spawner)
+        if sample_off_thread and fields is not None
+        else None
+    )
+    if field_sampler is not None:
+        field_sampler.start()
 
     def _loop() -> None:
         if threading.current_thread() is spawner:
@@ -561,8 +656,8 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, k
             gpu = gpu_diagnostics(include_torch=False)
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
-            extra = {}
-            if fields is not None:
+            extra = field_sampler.latest() if field_sampler is not None else {}
+            if fields is not None and field_sampler is None:
                 with contextlib.suppress(Exception):
                     extra = fields() or {}
             if progress_step and last_val is not None:
@@ -582,6 +677,8 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, k
     finally:
         done.set()
         t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
+        if field_sampler is not None:
+            field_sampler.join()
 
 
 # checkpoint drain time scales with model size and network throughput; a fixed timeout killed a
