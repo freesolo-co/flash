@@ -10,7 +10,6 @@ reference ``time`` as a module attribute so provider poll tests patch the shared
 from __future__ import annotations
 
 import contextlib
-import json
 import math
 import time
 from collections.abc import Callable
@@ -25,14 +24,25 @@ from flash.providers._lifecycle.poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
     PollErrorTracker,
-    _attempt_int,
     heartbeat_progress_ts,
     is_training_heartbeat,
     make_say,
     surface_heartbeat,
 )
+from flash.providers._lifecycle.terminal_artifacts import (
+    INVALID_MARKER_DETAIL,
+    AttemptIdentity,
+    ProbeBudget,
+    TerminalKind,
+    decode_terminal_marker,
+    read_within,
+    resolve_terminal_artifacts,
+)
 from flash.providers.artifacts.hf import worker_flagged_retriable
 from flash.providers.base import PollResult
+
+# re-exported: recovery imports the strict decoder through this module.
+__all__ = ["decode_terminal_marker", "poll_instance_job"]
 
 # a strict success marker can precede the separately uploaded metrics.json under hf read-after-write
 # lag. re-read metrics before falling back to the infra-retryable poll_error so marker-authorized
@@ -61,22 +71,12 @@ def _read_with_retries(
     deadline_at: float | None = None,
 ):
     """Re-read an artifact with every wait capped by the absolute run deadline."""
-    value = read()
-    while value is None and tries > 0:
-        delay = wait_s
-        if deadline_at is not None:
-            remaining = remaining_seconds(deadline_at)
-            if remaining <= 0:
-                break
-            delay = min(delay, remaining)
-        say(message)
-        if delay > 0:
-            time.sleep(delay)
-        if deadline_at is not None and remaining_seconds(deadline_at) <= 0:
-            break
-        value = read()
-        tries -= 1
-    return value
+    return read_within(
+        read,
+        ProbeBudget(tries=tries, wait_s=wait_s, cutoff_at=deadline_at),
+        say=say,
+        message=message,
+    )
 
 
 @dataclass
@@ -122,69 +122,6 @@ class InstancePollAdapter:
     first_liveness_detail: Callable[[float, float], str]  # (elapsed_s, first_liveness_s) -> str
 
 
-def decode_terminal_marker(
-    raw: str,
-    *,
-    run_id: str,
-    attempt: int,
-    launch_floor: float,
-    deadline_at: float | None = None,
-) -> dict:
-    """Validate one attempt-scoped terminal marker against its durable identity."""
-    marker = json.loads(raw)
-    if not isinstance(marker, dict) or set(marker) != {
-        "attempt",
-        "error",
-        "ok",
-        "retriable",
-        "run_id",
-        "ts",
-    }:
-        raise ValueError("invalid terminal marker schema")
-    marker_attempt = marker["attempt"]
-    ts = marker["ts"]
-    error = marker["error"]
-    now = time.time()
-    if (
-        isinstance(launch_floor, bool)
-        or not isinstance(launch_floor, (int, float))
-        or not math.isfinite(launch_floor)
-        or launch_floor <= 0
-        or isinstance(now, bool)
-        or not isinstance(now, (int, float))
-        or not math.isfinite(now)
-        or now <= 0
-        or _attempt_int(marker_attempt) is None
-        or marker_attempt != _attempt_int(attempt)
-        or type(marker["run_id"]) is not str
-        or marker["run_id"] != run_id
-        or type(marker["ok"]) is not bool
-        or type(marker["retriable"]) is not bool
-        or type(error) is not str
-        or len(error) > 4096
-        or isinstance(ts, bool)
-        or not isinstance(ts, (int, float))
-        or not math.isfinite(ts)
-        or ts < launch_floor
-        or ts > now + 120.0
-        or (deadline_at is not None and ts > deadline_at)
-    ):
-        raise ValueError("invalid terminal marker identity")
-    return marker
-
-
-def _decode_terminal_marker(
-    raw: str,
-    adapter: InstancePollAdapter,
-) -> dict:
-    return decode_terminal_marker(
-        raw,
-        run_id=adapter.run_id,
-        attempt=adapter.current_attempt,
-        launch_floor=adapter.launch_ts,
-    )
-
-
 class _TerminalArtifacts:
     """Reads HF terminal artifacts (marker, done, metrics) and classifies them into a ``PollResult``.
 
@@ -213,41 +150,21 @@ class _TerminalArtifacts:
         end_ts_hint: float | str | None = None,
         *,
         read_deadline_at: float | None = _UNSET_DEADLINE,
+        metrics: dict | None = None,
+        metrics_present: bool = False,
     ) -> PollResult:
         if read_deadline_at is _UNSET_DEADLINE:
             read_deadline_at = self._absolute_deadline
-        # the strict success marker authorizes completion, but metrics.json visibility can lag it on hf.
-        # re-read before falling back to the poll_error retry used for a success without metrics.
-        raw = _read_with_retries(
-            lambda: self._read_artifact(
-                self._adapter.metrics_reader,
-                force=True,
-                read_deadline_at=read_deadline_at,
-            ),
-            tries=_METRICS_AFTER_SUCCESS_RETRIES,
-            wait_s=_METRICS_AFTER_SUCCESS_WAIT_S,
-            say=self._say,
-            message="DONE seen but metrics.json not visible yet; waiting for HF read-after-write",
-            deadline_at=read_deadline_at,
-        )
-        if raw is None:
-            # the strict success marker has authorized completion, so missing metrics after the inline
-            # retries is a transient hf read gap, not a worker error. return the infra-retryable
-            # poll_error so the run gets its bounded infra budget instead of a hard terminal failure.
-            return PollResult(
-                False, failure="poll_error", detail="DONE without metrics.json (transient HF read)"
+        if metrics is None:
+            # the strict success marker has authorized completion, so unreadable metrics are a
+            # transient hf read gap, not a worker error. return the infra-retryable poll_error so the
+            # run gets its bounded infra budget instead of a hard terminal failure.
+            detail = (
+                "DONE with unparseable metrics.json (transient HF read)"
+                if metrics_present
+                else "DONE without metrics.json (transient HF read)"
             )
-        try:
-            metrics = json.loads(raw)
-        except ValueError:
-            # a present but unparseable metrics.json must not escape as a raw json decode error and
-            # bypass the poll result path. treat this marker-authorized success like missing metrics:
-            # infra-retryable poll_error, not job_failed.
-            return PollResult(
-                False,
-                failure="poll_error",
-                detail="DONE with unparseable metrics.json (transient HF read)",
-            )
+            return PollResult(False, failure="poll_error", detail=detail)
         # end_ts is the worker completion time: prefer the optional fresh done timestamp supplied by
         # the caller, otherwise use the strict ok marker timestamp. adopt only values in [launch, now].
         end_ts = time.time()
@@ -279,6 +196,8 @@ class _TerminalArtifacts:
         marker: dict,
         *,
         read_deadline_at: float | None = _UNSET_DEADLINE,
+        metrics: dict | None = None,
+        metrics_present: bool = False,
     ) -> PollResult:
         if read_deadline_at is _UNSET_DEADLINE:
             read_deadline_at = self._absolute_deadline
@@ -291,7 +210,12 @@ class _TerminalArtifacts:
         )
         fresh = d is not None and self._done_is_fresh(d)
         marker_ts = marker["ts"]
-        return self.finish_ok(d if fresh else marker_ts, read_deadline_at=read_deadline_at)
+        return self.finish_ok(
+            d if fresh else marker_ts,
+            read_deadline_at=read_deadline_at,
+            metrics=metrics,
+            metrics_present=metrics_present,
+        )
 
     def _fail_from_marker(self, marker: dict) -> PollResult:
         # a real worker error fails fast unless flagged retriable in the marker or the worker heartbeat.
@@ -318,23 +242,44 @@ class _TerminalArtifacts:
         # marker-authorized success, but it cannot complete a run by itself.
         if read_deadline_at is _UNSET_DEADLINE:
             read_deadline_at = self._absolute_deadline
-        raw = self._read_artifact(
-            self._adapter.marker_reader,
-            force=force,
-            read_deadline_at=read_deadline_at,
+        resolution = resolve_terminal_artifacts(
+            AttemptIdentity(
+                run_id=self._adapter.run_id,
+                attempt=self._adapter.current_attempt,
+                launch_floor=self._adapter.launch_ts,
+            ),
+            read_marker=lambda: self._read_artifact(
+                self._adapter.marker_reader,
+                force=force,
+                read_deadline_at=read_deadline_at,
+            ),
+            read_metrics=lambda: self._read_artifact(
+                self._adapter.metrics_reader,
+                force=True,
+                read_deadline_at=read_deadline_at,
+            ),
+            budget=ProbeBudget(
+                tries=_METRICS_AFTER_SUCCESS_RETRIES,
+                wait_s=_METRICS_AFTER_SUCCESS_WAIT_S,
+                cutoff_at=read_deadline_at,
+            ),
+            say=self._say,
+            metrics_message=(
+                "DONE seen but metrics.json not visible yet; waiting for HF read-after-write"
+            ),
         )
-        if raw is None:
+        if resolution.kind is TerminalKind.ABSENT:
             return None
-        try:
-            marker = _decode_terminal_marker(raw, self._adapter)
-        except (TypeError, ValueError):
-            return PollResult(
-                False,
-                failure="job_failed",
-                detail="terminal marker is invalid or unverifiable",
+        if resolution.invalid:
+            return PollResult(False, failure="job_failed", detail=INVALID_MARKER_DETAIL)
+        if resolution.kind is not TerminalKind.FAILURE:
+            return self._finish_from_ok_marker(
+                resolution.marker,
+                read_deadline_at=read_deadline_at,
+                metrics=resolution.metrics,
+                metrics_present=resolution.metrics_unparseable,
             )
-        if marker["ok"]:
-            return self._finish_from_ok_marker(marker, read_deadline_at=read_deadline_at)
+        marker = resolution.marker
         failure = self._fail_from_marker(marker)
         # the watchdog marker can race a successful final marker or lagging done upload. only the
         # deadline exit defers it; every other failure marker still terminates immediately.

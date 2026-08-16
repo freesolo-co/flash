@@ -1828,6 +1828,59 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     assert len(scheduled) == 1
 
 
+def test_completed_attempt_metrics_never_adopts_an_unverifiable_marker(monkeypatch):
+    """Recovery must not adopt an artifact it cannot tie to this attempt, and must SAY so.
+
+    Live polling classifies an unverifiable marker as a terminal failure while recovery used to
+    swallow the decode error into a bare ``None``, so identical bytes produced different stories
+    depending on which layer observed the attempt. Both now route through one resolver: recovery
+    still returns ``None`` (there is no completed work to adopt) but names the artifact instead of
+    logging silence, and a corrupt marker can never be mistaken for a success.
+    """
+    import io
+
+    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="corrupt-marker",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        train=TrainSpec(hf_repo="org/repo"),
+    )
+
+    def artifact_reader(_repo, path):
+        # a well-formed marker body that speaks for a DIFFERENT run: it decodes as json but can
+        # never be validated against this attempt's identity.
+        def read(force=False):
+            if path.endswith("/vast_attempt0.json"):
+                return (
+                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
+                    '"run_id":"some-other-run","ts":199.0}'
+                )
+            return json.dumps({"train_tokens": 4096})
+
+        return read
+
+    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+    monkeypatch.setattr(lifecycle.time, "time", lambda: 201.0)
+    log = io.StringIO()
+
+    assert (
+        lifecycle._completed_attempt_metrics(
+            spec,
+            provider="vast",
+            attempt=0,
+            launch_floor=100.0,
+            deadline_at=200.0,
+            log=log,
+        )
+        is None
+    )
+    assert "invalid or unverifiable" in log.getvalue()
+
+
 @pytest.mark.parametrize(
     ("marker_ts", "expected"),
     [

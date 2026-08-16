@@ -40,6 +40,14 @@ class _CompletedAttemptPending(RuntimeError):
     """A strict success marker exists, but its metrics are not readable yet."""
 
 
+def _say_invalid_marker(log) -> None:
+    """Name an unverifiable terminal artifact instead of logging it as silence."""
+    from flash.providers._lifecycle.poll import make_say
+    from flash.providers._lifecycle.terminal_artifacts import INVALID_MARKER_DETAIL
+
+    make_say(log)(f"recovery: {INVALID_MARKER_DETAIL}; not adopting it as completed work")
+
+
 def _canonical_provider_handle(handle):
     """Validate and canonicalize one complete provider-specific persisted handle."""
     from flash.providers.base import JobHandle
@@ -237,8 +245,12 @@ def _completed_attempt_metrics(
         _METRICS_AFTER_SUCCESS_WAIT_S,
         _TERMINAL_REREAD_RETRIES,
         _TERMINAL_REREAD_WAIT_S,
-        _read_with_retries,
-        decode_terminal_marker,
+    )
+    from flash.providers._lifecycle.terminal_artifacts import (
+        AttemptIdentity,
+        ProbeBudget,
+        TerminalKind,
+        resolve_terminal_artifacts,
     )
     from flash.providers.artifacts.hf import make_hf_text_reader
 
@@ -248,63 +260,43 @@ def _completed_attempt_metrics(
         f"{prefix}/{provider}_attempt{attempt}.json",
     )
     metrics_reader = make_hf_text_reader(spec.train.hf_repo, f"{prefix}/metrics.json")
-    say = make_say(log)
-    observation_deadline = time.time() + (_TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S)
-    marker_raw = _read_with_retries(
-        lambda: marker_reader(force=True),
-        tries=_TERMINAL_REREAD_RETRIES,
-        wait_s=_TERMINAL_REREAD_WAIT_S,
-        say=say,
-        message="recovery deadline reached; waiting for the terminal attempt marker",
-        deadline_at=observation_deadline,
+    # ONE observation window for both artifacts. it previously computed a fresh window for the
+    # marker and then another fresh one for metrics, so the real ceiling was their sum and moved
+    # with however long the marker read took.
+    resolution = resolve_terminal_artifacts(
+        AttemptIdentity(run_id=spec.run_id, attempt=attempt, launch_floor=launch_floor),
+        read_marker=lambda: marker_reader(force=True),
+        read_metrics=lambda: metrics_reader(force=True),
+        budget=ProbeBudget.of(
+            _TERMINAL_REREAD_RETRIES,
+            _TERMINAL_REREAD_WAIT_S,
+            span_s=max(
+                _TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S,
+                _METRICS_AFTER_SUCCESS_RETRIES * _METRICS_AFTER_SUCCESS_WAIT_S,
+            ),
+        ),
+        say=make_say(log),
+        marker_deadline_at=deadline_at + _RECOVERY_MARKER_GRACE_S,
+        marker_message="recovery deadline reached; waiting for the terminal attempt marker",
+        metrics_message="successful recovery marker seen; waiting for metrics.json",
+        wait_for_marker=True,
     )
-    if marker_raw is None:
+    if resolution.kind is TerminalKind.SUCCESS:
+        return resolution.metrics
+    if resolution.kind is not TerminalKind.PENDING:
+        # absence, a failure marker, and an unverifiable marker all mean "no completed work to
+        # adopt". an unverifiable marker is reported so recovery names it the way live polling does
+        # instead of logging it as silence.
+        if resolution.invalid:
+            _say_invalid_marker(log)
         return None
-    try:
-        marker = decode_terminal_marker(
-            marker_raw,
-            run_id=spec.run_id,
-            attempt=attempt,
-            launch_floor=launch_floor,
-            deadline_at=deadline_at + _RECOVERY_MARKER_GRACE_S,
-        )
-    except (TypeError, ValueError):
+    # a success marker landed but its metrics have not. keep reconciling within the grace window
+    # rather than tearing down an attempt that already finished its paid work.
+    if time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S:
         return None
-    if not marker["ok"]:
-        return None
-    metrics_observation_deadline = time.time() + (
-        _METRICS_AFTER_SUCCESS_RETRIES * _METRICS_AFTER_SUCCESS_WAIT_S
+    raise _CompletedAttemptPending(
+        "successful recovery marker is present but metrics.json is not readable yet"
     )
-    metrics_raw = _read_with_retries(
-        lambda: metrics_reader(force=True),
-        tries=_METRICS_AFTER_SUCCESS_RETRIES,
-        wait_s=_METRICS_AFTER_SUCCESS_WAIT_S,
-        say=say,
-        message="successful recovery marker seen; waiting for metrics.json",
-        deadline_at=metrics_observation_deadline,
-    )
-    metrics_grace_expired = time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S
-    if metrics_raw is None:
-        if metrics_grace_expired:
-            return None
-        raise _CompletedAttemptPending(
-            "successful recovery marker is present but metrics.json is not readable yet"
-        )
-    try:
-        metrics = json.loads(metrics_raw)
-    except (TypeError, ValueError) as exc:
-        if metrics_grace_expired:
-            return None
-        raise _CompletedAttemptPending(
-            "successful recovery marker is present but metrics.json is not parseable yet"
-        ) from exc
-    if not isinstance(metrics, dict):
-        if metrics_grace_expired:
-            return None
-        raise _CompletedAttemptPending(
-            "successful recovery marker is present but metrics.json is not an object yet"
-        )
-    return metrics
 
 
 def _adopt_completed_attempt(
