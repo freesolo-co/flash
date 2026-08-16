@@ -5707,6 +5707,62 @@ def test_ready_commit_status_read_failure_records_divergence(api, monkeypatch, c
     assert "status unavailable" in output
 
 
+def test_a_raising_ready_commit_is_reissued_once_the_recovery_read_succeeds(api, monkeypatch):
+    # the first ready commit raises AFTER the serving alias already flipped. recovery re-reads the
+    # status, sees no ready record, and must reissue the commit -- dropping it would leave the
+    # alias live with no matching record. the sibling divergence test forces the recovery READ to
+    # fail, so it exits before this retry and cannot cover it.
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+    from flash.server.domain.deployment_lifecycle import DeploymentLifecycle
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, run_id)
+        return Deployment(
+            run_id=run_id,
+            model=SPEC["model"],
+            adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            openai_base_url="https://serve.example/v1",
+            adapter_revision=revision,
+        )
+
+    real_commit_ready = DeploymentLifecycle.commit_ready
+    commit_calls = []
+
+    def raise_then_commit(self, *args, **kwargs):
+        commit_calls.append(1)
+        if len(commit_calls) == 1:
+            raise RuntimeError("ready commit failed")
+        return real_commit_ready(self, *args, **kwargs)
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod, "serve_chat", lambda **_kwargs: _smoke_chat_result(revision, run_id)
+    )
+    monkeypatch.setattr(DeploymentLifecycle, "commit_ready", raise_then_commit)
+
+    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    # the retry actually reissued the commit rather than swallowing the failure
+    assert len(commit_calls) == 2
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "ready"
+    assert deployment["adapter_revision"] == revision
+
+
 def test_commit_miss_with_same_attempt_retries_and_persists_ready(api, monkeypatch):
     # the run state moves under the cas guard (e.g. done -> deployed by a sibling write) while
     # this attempt still owns the deployment record: the ready commit must be retried against the
