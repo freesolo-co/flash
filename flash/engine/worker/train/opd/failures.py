@@ -336,16 +336,12 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
                 )
                 self.lifecycle.mark_deployable_published(step)
 
-        def record_resume_upload() -> None:
-            # runs only after the folder commit and its prune land, which the return value does not
-            # distinguish from "there was no repository to upload to".
-            self.lifecycle.mark_resume_uploaded(step)
-
         uploaded = _w.upload_resume_checkpoint(
             step,
             checkpoint_dir,
             before_upload=publish_required_adapter,
-            after_upload=record_resume_upload,
+            # the callback, not the return value: see mark_resume_uploaded's contract.
+            after_upload=lambda: self.lifecycle.mark_resume_uploaded(step),
         )
         if step in self.required_steps and not uploaded:
             self.lifecycle.mark_failed(step)

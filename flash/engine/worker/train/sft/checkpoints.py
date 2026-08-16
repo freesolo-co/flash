@@ -219,11 +219,6 @@ class _VerlCheckpointWatcher:
             if published:
                 self.lifecycle.mark_deployable_published(step)
 
-        def record_resume_upload() -> None:
-            # runs only once the folder commit and its prune have landed, which is the fact the
-            # return value cannot carry.
-            self.lifecycle.mark_resume_uploaded(step)
-
         # claimed before the work, not after it: `_pending` filters on the discovered set, so a step
         # left unclaimed while its export raises is handed straight back on the next sweep. the
         # watcher thread dies on that exception anyway, and the retry would race its own teardown.
@@ -251,7 +246,8 @@ class _VerlCheckpointWatcher:
                 step,
                 checkpoint_dir,
                 before_upload=publish_adapter,
-                after_upload=record_resume_upload,
+                # the callback, not the return value: see mark_resume_uploaded's contract.
+                after_upload=lambda: self.lifecycle.mark_resume_uploaded(step),
             )
         finally:
             shutil.rmtree(adapter_dir, ignore_errors=True)
