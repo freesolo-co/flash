@@ -21,6 +21,17 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- A RunPod attempt's stall window is now measured from evidence timestamps rather than from when
+  the control plane happened to look at it. The window was seeded from the moment polling started
+  and was reset again by the first status read, and a heartbeat was credited at the time it was
+  read rather than the time it was written. Every one of those is a wall-clock reading, so each
+  reattach handed a worker that was already wedged a complete fresh setup window, and a supervisor
+  that reattached repeatedly could keep a dead worker on a paid GPU until the run's wall deadline.
+  The window is now anchored to the persisted launch, a heartbeat is credited at its own timestamp
+  clamped to that launch, and only a genuine status transition counts as progress. Instance
+  polling (Vast/Lambda) already worked this way; this brings RunPod onto the same rule. A job that
+  is still queued is unaffected: the capacity wait keeps its own exemption, so a worker granted
+  late still gets its full cold-start budget.
 - An attempt's terminal artifacts (its strict marker plus `metrics.json`) are now interpreted by
   one shared protocol instead of being decoded separately by live instance polling and by each
   recovery path. The two decoders disagreed about identical bytes. A marker that could not be tied
