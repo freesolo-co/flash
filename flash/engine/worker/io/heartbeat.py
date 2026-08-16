@@ -111,17 +111,9 @@ def _dump_thread_stacks(reason: str) -> None:
 
 
 def _console_heartbeat_snapshot(
-    payload: dict,
-    payload_committed: bool = True,
-    upload_due: bool = False,
-    upload_attempted: bool = False,
+    payload: dict, payload_committed: bool = True, upload_due: bool = False
 ) -> str:
-    """Render one bounded console record with explicit HF commit state.
-
-    ``pending`` means a locally due or attempted upload did not settle. ``throttled`` means no upload
-    was due after serialized re-evaluation. Neither may reset the console wedge clock as if the
-    provider had observed it, but both still prove the worker reached the progress loop.
-    """
+    """render one bounded console record with explicit hf commit state."""
     console_payload = dict(payload)
     metrics_last = console_payload.pop("metrics_last", None)
     if isinstance(metrics_last, list):
@@ -130,8 +122,7 @@ def _console_heartbeat_snapshot(
     if isinstance(samples, list):
         console_payload["samples_count"] = len(samples)
     if not payload_committed:
-        key = "pending" if upload_due or upload_attempted else "throttled"
-        console_payload[key] = True
+        console_payload["pending" if upload_due else "throttled"] = True
     return json.dumps(console_payload)
 
 
@@ -145,7 +136,7 @@ def _heartbeat_upload_due(
     fields: dict,
     now: float,
 ) -> bool:
-    """Return upload eligibility from committed throttle state while ``_HB_LOCK`` is held."""
+    """return eligibility from committed throttle state while _HB_LOCK is held."""
     if initial or _is_critical_stage(stage):
         return True
     if _w._HB_TERMINAL_ONLY:
@@ -162,11 +153,11 @@ def _heartbeat_upload_due(
     if force and not upload_due:
         step = fields.get("step")
         has_samples = bool(fields.get("sampled_completions"))
-        first_timing_due = first_timing and "step_duration_s" in fields
         force_step_due = isinstance(step, (int, float)) and (
             step > _w._HB_LAST_COMMITTED_STEP
             or (has_samples and step == _w._HB_LAST_COMMITTED_STEP)
         )
+        first_timing_due = first_timing and "step_duration_s" in fields
         force_floor_due = (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
         upload_due = force_step_due and (first_timing_due or force_floor_due)
     return upload_due
@@ -188,7 +179,7 @@ def heartbeat(
             _w._HB_LAST_PROGRESS_TS = ts
             _w._HB_PROGRESS_SEQ += 1
         elif _w._HB_PROGRESS_SEQ > _w._HB_PROGRESS_UPLOADED_SEQ:
-            # progress-carry upgrades this ping so the provider sees uncommitted real progress.
+            # carry real progress that has not reached hf yet.
             liveness = False
         latest_progress_ts = float(_w._HB_LAST_PROGRESS_TS or 0.0)
         my_progress_seq = _w._HB_PROGRESS_SEQ
@@ -212,7 +203,6 @@ def heartbeat(
     if dc:
         payload.setdefault("dc", dc)
     snapshot = json.dumps(payload)
-
     with _HB_LOCK:
         upload_due = _heartbeat_upload_due(
             stage,
@@ -224,7 +214,6 @@ def heartbeat(
             now=time.time(),
         )
     payload_committed = False
-    upload_attempted = False
     if upload_due:
         critical = _is_critical_stage(stage)
         lock_timeout = _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S if critical else _HB_UPLOAD_LOCK_TIMEOUT_S
@@ -241,20 +230,17 @@ def heartbeat(
                         now=time.time(),
                     )
                 if upload_due:
-                    upload_attempted = True
-                    upload_path = f"/tmp/.hb-upload-{os.getpid()}-{threading.get_ident()}.json"
-                    with open(upload_path, "w") as handle:
-                        handle.write(snapshot)
+                    up = f"/tmp/.hb-upload-{os.getpid()}-{threading.get_ident()}.json"
+                    with open(up, "w") as f:
+                        f.write(snapshot)
                     try:
                         if initial:
-                            committed = _w.hf_upload_file(
-                                upload_path, "heartbeat.json", required=True
-                            )
+                            committed = _w.hf_upload_file(up, "heartbeat.json", required=True)
                         else:
-                            committed = _w.hf_upload_file(upload_path, "heartbeat.json")
+                            committed = _w.hf_upload_file(up, "heartbeat.json")
                     finally:
                         with contextlib.suppress(OSError):
-                            os.remove(upload_path)
+                            os.remove(up)
                     if committed is False:
                         print(f"HEARTBEAT upload failed for {stage}")
                     else:
@@ -280,15 +266,7 @@ def heartbeat(
                     f"initial heartbeat upload lock remained busy >{lock_timeout}s for {stage}"
                 )
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
-    print(
-        "HEARTBEAT",
-        _console_heartbeat_snapshot(
-            payload,
-            payload_committed,
-            upload_due,
-            upload_attempted,
-        ),
-    )
+    print("HEARTBEAT", _console_heartbeat_snapshot(payload, payload_committed, upload_due))
     return payload_committed
 
 

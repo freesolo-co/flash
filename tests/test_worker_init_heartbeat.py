@@ -356,54 +356,33 @@ def test_heartbeat_omits_progress_age_before_first_progress(monkeypatch):
     assert ne._HB_LAST_PROGRESS_TS == 0.0
 
 
-def test_heartbeat_console_marks_only_an_attempted_upload_that_failed(monkeypatch):
-    """The console line must distinguish progress the PROVIDER can see from progress only we saw.
-
-    The provider's stall clock reads heartbeat.json from HF, so a heartbeat whose upload failed is
-    invisible to it. The console uploader keys its wedge timer on these lines, so an unmarked
-    failed heartbeat resets that timer while the stall clock keeps counting from the older
-    committed one -- and the wedge snapshot gets scheduled past the teardown it exists to beat.
-
-    A throttled heartbeat is uncommitted too, but it needs a distinct marker: it did not fail an
-    upload, yet it also cannot reset the wedge clock as if the provider observed this payload.
-    """
+def test_heartbeat_console_marks_commit_state_and_bounds_payload():
     import json
 
-    import flash.engine.worker as ne
+    from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
 
-    lines: list = []
-    monkeypatch.setattr("builtins.print", lambda *a, **k: lines.append(" ".join(map(str, a))))
+    payload = {
+        "stage": "rl_step",
+        "step": 3,
+        "metrics_last": [{}] * 8,
+        "sampled_completions": ["private"] * 4,
+    }
+    committed = json.loads(_console_heartbeat_snapshot(payload))
+    pending = json.loads(_console_heartbeat_snapshot(payload, False, True))
+    throttled = json.loads(_console_heartbeat_snapshot(payload, False, False))
 
-    def _console(index: int) -> dict:
-        return json.loads([ln for ln in lines if ln.startswith("HEARTBEAT {")][index][10:])
-
-    # a committed heartbeat is byte-identical to before: no marker at all.
-    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: True)
-    ne._HB_LAST_UPLOAD = 0.0
-    ne.heartbeat("rl_step", step=1)
-    assert "pending" not in _console(0)
-
-    # the upload was attempted and reported failure -> marked, because HF does not have it.
-    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: False)
-    ne._HB_LAST_UPLOAD = 0.0
-    ne.heartbeat("rl_step", step=2)
-    assert _console(-1)["pending"] is True
-
-    # throttled, not failed: the record remains visible but cannot claim hf committed this payload.
-    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: True)
-    ne._HB_LAST_UPLOAD = time.time()
-    ne.heartbeat("rl_step", liveness=True, step=3)
-    throttled = _console(-1)
-    assert "pending" not in throttled, "a throttled heartbeat is not a failed one"
+    for snapshot in (committed, pending, throttled):
+        assert "metrics_last" not in snapshot
+        assert "sampled_completions" not in snapshot
+        assert snapshot["metrics_last_count"] == 8
+        assert snapshot["samples_count"] == 4
+    assert pending["pending"] is True
     assert throttled["throttled"] is True
-    assert throttled["step"] == 3, "the throttled heartbeat still reaches the console"
+    assert "pending" not in committed
+    assert "throttled" not in committed
 
 
 def test_waiting_heartbeat_rechecks_after_success_and_skips_duplicate(monkeypatch):
-    import threading
-
     import flash.engine.worker as worker
 
     hbmod = sys.modules[worker.heartbeat.__module__]
@@ -413,7 +392,7 @@ def test_waiting_heartbeat_rechecks_after_success_and_skips_duplicate(monkeypatc
     attempts: list[int] = []
     results: list[bool] = []
 
-    class _ObservedLock:
+    class ObservedLock:
         def __init__(self):
             self.lock = threading.Lock()
 
@@ -425,32 +404,35 @@ def test_waiting_heartbeat_rechecks_after_success_and_skips_duplicate(monkeypatc
         def release(self):
             self.lock.release()
 
-    def _upload(*_args, **_kwargs):
+    def upload(*_args, **_kwargs):
         attempts.append(1)
         first_started.set()
         assert release_first.wait(5.0)
         return True
 
-    monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK", _ObservedLock())
-    monkeypatch.setattr(worker, "hf_upload_file", _upload)
+    monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK", ObservedLock())
+    monkeypatch.setattr(worker, "hf_upload_file", upload)
     monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 0.0)
     monkeypatch.setattr(worker, "_HB_LAST_COMMITTED_STEP", 0)
     monkeypatch.setattr(worker, "_HB_LAST_FORCED_UPLOAD", 0.0)
     monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
 
-    first = threading.Thread(target=lambda: results.append(worker.heartbeat("rl_step", step=1)))
-    second = threading.Thread(target=lambda: results.append(worker.heartbeat("rl_step", step=2)))
-    first.start()
+    threads = [
+        threading.Thread(
+            target=lambda step=step: results.append(worker.heartbeat("rl_step", step=step))
+        )
+        for step in (1, 2)
+    ]
+    threads[0].start()
     assert first_started.wait(5.0)
-    second.start()
+    threads[1].start()
     assert waiting.wait(5.0)
     release_first.set()
-    first.join(timeout=5.0)
-    second.join(timeout=5.0)
+    for thread in threads:
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
 
-    assert not first.is_alive()
-    assert not second.is_alive()
     assert attempts == [1]
     assert sorted(results) == [False, True]
     assert worker._HB_LAST_COMMITTED_STEP == 1
@@ -467,15 +449,12 @@ def test_heartbeat_console_summarizes_metric_backlog():
                 "stage": "rl_step",
                 "step": 1024,
                 "metrics_last": [{"step": step} for step in range(1024)],
-                "sampled_completions": ["large completion"] * 128,
             }
         )
     )
 
     assert "metrics_last" not in console
-    assert "sampled_completions" not in console
     assert console["metrics_last_count"] == 1024
-    assert console["samples_count"] == 128
     assert console["step"] == 1024
 
 

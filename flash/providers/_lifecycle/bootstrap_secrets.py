@@ -17,7 +17,10 @@ _SECRET_RE = re.compile(
     r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
 )
 
-# a multiline secret is split.
+# a multiline secret (a PEM key) reaches diagnostics one component line at a time -- console tails
+# are truncated and child stdout is sanitized per line -- so the whole value never matches. long
+# component lines are registered as needles too; the floor keeps a common fragment such as ``}``
+# from erasing innocent output. Mirrors flash._internal.diagnostics.
 _MIN_SECRET_COMPONENT = 8
 
 
@@ -117,10 +120,6 @@ def _safe_detail(
     root cause is the last thing written -- the end of a native stack, a json blob, or a progress
     stream -- and cutting the front is what preserves it. An unknown value raises rather than
     silently keeping the front: a typo would quietly cut the side the caller asked to keep.
-
-    Redaction happens on the WHOLE text first, so a credential cannot be split by this bound. The
-    zero case is spelled out because ``text[-0:]`` is ``text[0:]`` -- the whole string, the exact
-    opposite of a zero bound.
     """
     if keep not in ("start", "end"):
         raise ValueError(f"keep must be 'start' or 'end', got {keep!r}")
@@ -135,6 +134,9 @@ def _safe_detail(
     text = _redact_values(text, values)
     text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
     text = _SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
+    # redaction happens on the WHOLE text first, so a credential cannot be split by this bound.
+    # the zero case is spelled out because ``text[-0:]`` is ``text[0:]`` -- the whole string, the
+    # exact opposite of a zero bound.
     bound = max(0, int(limit))
     if not bound:
         return ""

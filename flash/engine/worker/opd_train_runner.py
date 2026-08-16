@@ -36,11 +36,6 @@ from flash.engine.worker.verl.parallelism import (
 )
 
 
-def _spec_gpu_type(spec: Any) -> str:
-    """The selected card class, or empty when the spec has no resolved GPU."""
-    return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
-
-
 def _prepare_request(spec: Any) -> _OpdRequest:
     env = _opd_train._w.require_active_env()
     if getattr(env, "is_tool_env", False):
@@ -473,6 +468,16 @@ def _write_child_shims(
             + opd_shim_source
         )
     return entry_path, reward_path
+
+
+def _spec_gpu_type(spec: Any) -> str:
+    """The card class the run landed on, from the spec the caller passed.
+
+    Absent spec or absent gpu table answers "", which the zero-2 gate reads as "unknown hardware"
+    and falls closed to zero-3 on. Guessing a card here would price the gate off hardware the run
+    may not have.
+    """
+    return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
 
 
 def _build_base_config(

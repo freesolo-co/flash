@@ -15,8 +15,8 @@ Two fingerprints, because "out of date" has two flavors with very different cost
     itself (it decides which kernels get compiled).
 
   * fp_base = hash of everything else baked into :cu128 that is NOT in the cache (FA2 wheel spec
-    and their sha256 digests, causal-conv1d, the non-kernel pip stack, and the baked rp_handler =
-    handler.py + make_rp_handler.py). changing one of these leaves the cache valid but means the
+    AND their sha256 digests, causal-conv1d, the non-kernel pip stack, and the baked rp_handler =
+    endpoints.py + make_rp_handler.py). Changing one of these leaves the cache valid but means the
     per-arch tag is sitting on an old base, so it just needs a cheap re-layer (no GPU). fp_base folds
     fp_cache in, so it always moves when fp_cache does.
 
@@ -232,8 +232,8 @@ def collect_inputs(
         # whole-Dockerfile hash catches ANY base change the parsed fields miss (apt/ENV/CMD/cache-dir);
         # it lives in fp_base, so such a change triggers only the FREE re-layer, never a paid re-warm.
         "dockerfile_sha256": _sha256_file(root / "Dockerfile.worker"),
-        "handler_sha256": _sha256_file(
-            root / "flash" / "providers" / "runpod" / "serverless" / "handler.py"
+        "endpoints_sha256": _sha256_file(
+            root / "flash" / "providers" / "runpod" / "serverless" / "endpoints.py"
         ),
         "make_rp_handler_sha256": _sha256_file(root / "docker" / "make_rp_handler.py"),
     }

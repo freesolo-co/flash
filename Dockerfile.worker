@@ -456,9 +456,11 @@ print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)');
 print('  qwen3.5 archs registered; mask_truncated_completions present'); \
 print('  gdn boundary resets: fla', M.version('flash-linear-attention'), 'and causal_conv1d installed and importable (capability itself is cuda-gated, asserted on the worker)')"
 
-# runpod serverless worker entrypoint. generate /rp_handler.py from the real _train_body source in
-# providers/runpod/serverless/handler.py and run it as the cmd so the image is self-contained.
-COPY flash/providers/runpod/serverless/handler.py docker/make_rp_handler.py /tmp/rpgen/
-RUN python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/handler.py /rp_handler.py \
+# RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
+# from the real _train_body source in providers/runpod/serverless/endpoints.py (single source of truth;
+# _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
+# image is a self-contained RunPod Serverless worker. Build context is the repo root.
+COPY flash/providers/runpod/serverless/endpoints.py docker/make_rp_handler.py /tmp/rpgen/
+RUN python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/endpoints.py /rp_handler.py \
     && python -c "import ast; ast.parse(open('/rp_handler.py').read()); print('rp_handler OK')"
 CMD ["python", "-u", "/rp_handler.py"]

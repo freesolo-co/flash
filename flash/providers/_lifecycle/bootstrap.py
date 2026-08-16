@@ -1,8 +1,7 @@
 """Bootstrap shared by instance-based providers (e.g. Lambda). Runs inside the worker container.
 
-Stdlib + huggingface_hub only - never import flash here. Reads payload from ``/root/flash/payload.json``.
-Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and ``bootstrap_pip.py``
-next to this file.
+Stdlib + huggingface_hub only — never import flash here. Reads payload from ``/root/flash/payload.json``.
+Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and ``bootstrap_pip.py``.
 """
 
 from __future__ import annotations
@@ -29,6 +28,8 @@ if __package__:
         _safe_detail,
     )
 else:
+    # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
+    # same directory, and the script directory leads sys.path.
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
@@ -37,14 +38,9 @@ else:
         _safe_detail,
     )
 
-_CONSOLE_UPLOAD_CREDITS = _bootstrap_console._CONSOLE_UPLOAD_CREDITS
-_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = _bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-_CONSOLE_UPLOAD_INTERVAL_S = _bootstrap_console._CONSOLE_UPLOAD_INTERVAL_S
-_CONSOLE_UPLOAD_POLL_S = _bootstrap_console._CONSOLE_UPLOAD_POLL_S
-_CONSOLE_UPLOAD_QUIET_POLLS = _bootstrap_console._CONSOLE_UPLOAD_QUIET_POLLS
-
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
+_CONSOLE_UPLOAD_INTERVAL_S = _bootstrap_console._CONSOLE_UPLOAD_INTERVAL_S
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
@@ -223,19 +219,24 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dic
                 if remaining <= 0:
                     raise TimeoutError(f"{label} exceeded the run wall deadline") from None
                 delay = min(delay, remaining)
-            why = _safe_detail(exc, 500, secrets=secrets)
-            msg = f"{label} transient Hugging Face error; retrying in {delay:.0f}s: {why}"
-            print(msg, flush=True)
+            print(
+                f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
+                f"{_safe_detail(exc, 500, secrets=secrets)}",
+                flush=True,
+            )
             if delay > 0:
                 time.sleep(delay)
     raise AssertionError("unreachable")
 
 
 def hf_upload(
-    payload: dict, local_path: str, repo_subpath: str, *, enforce_deadline: bool = True
+    payload: dict,
+    local_path: str,
+    repo_subpath: str,
+    *,
+    enforce_deadline: bool = True,
 ) -> bool:
-    """Upload one artifact under the run's HF prefix; never raises. True only if it landed, so a
-    caller tracking what is stored cannot read a swallowed failure as success and skip its retry."""
+    """Upload one artifact under the run's HF prefix; never raises."""
     try:
         from huggingface_hub import HfApi
 
@@ -249,38 +250,42 @@ def hf_upload(
         )
         return True
     except Exception as exc:
-        detail = _safe_detail(exc, secrets=_payload_secrets(payload))
-        print(f"hf upload warn ({repo_subpath}): {detail}", flush=True)
+        print(
+            f"hf upload warn ({repo_subpath}): {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            flush=True,
+        )
         return False
 
 
 def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> bool:
-    """Upload one console snapshot from an isolated process. True only if it landed."""
+    """Upload one console snapshot from an isolated process."""
     tail_path = console + ".tail"
-    secrets = _payload_secrets(payload)
-    tail = _read_console_tail(console, 64_000, secrets=secrets) + extra
+    tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
+    if extra:
+        tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
-        f.write(_safe_detail(tail, 64_000, secrets=secrets))
+        f.write(_safe_detail(tail, 64_000, secrets=_payload_secrets(payload)))
     return hf_upload(payload, tail_path, f"console_{mode}.txt")
 
 
 def _console_upload_loop(
-    payload: dict, console: str, mode: str, interval_s: float, stop_upload
+    payload: dict,
+    console: str,
+    mode: str,
+    interval_s: float,
+    stop_upload,
 ) -> None:
     def upload() -> bool:
         try:
             return _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
-            detail = _safe_detail(exc, secrets=_payload_secrets(payload))
-            print(f"console upload warn: {detail}", flush=True)
+            print(
+                f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+                flush=True,
+            )
             return False
 
-    _bootstrap_console._run_console_upload_loop(
-        console,
-        interval_s,
-        stop_upload,
-        upload=upload,
-    )
+    _bootstrap_console._run_console_upload_loop(console, interval_s, stop_upload, upload=upload)
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
@@ -643,16 +648,11 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         pump_secrets = _payload_secrets(payload)
 
         def pump():
-            """Tee the child's output to this process's stdout and the console file.
+            """tee sanitized output to the provider log and raw output to the console file.
 
-            This process's stdout is the instance's container log, which the control plane pulls as
-            the failure detail (vast holds the box after a non-zero exit precisely so it can). Only
-            this process knows the run's secret VALUES, so each echoed child line is sanitized here
-            at the source -- the control-plane sanitizer downstream cannot value-redact a runtime
-            secret whose name it never sees. Mirrors the runpod serverless handler. The console FILE
-            keeps the raw line; its upload path sanitizes the tail. The bound keeps the END of an
-            oversized line: the root cause sits at the end of a native stack or json blob, and that
-            failure detail reads the instance log, not the console, so a prefix cut loses it."""
+            only this process knows payload secret values. keep the end of oversized lines because
+            native stacks and json diagnostics place the root cause there.
+            """
             try:
                 for line in proc.stdout:
                     with pump_write_lock:
@@ -665,8 +665,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                         )
                         cf.write(line)
             except BaseException as exc:
-                detail = _safe_detail(exc, secrets=pump_secrets)
-                print(f"console pump warn: {detail}", flush=True)
+                print(
+                    f"console pump warn: {_safe_detail(exc, secrets=pump_secrets)}",
+                    flush=True,
+                )
             finally:
                 pump_done.set()
 
@@ -727,8 +729,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         ):
             print("final console upload exceeded its allowance", flush=True)
     except Exception as exc:
-        detail = _safe_detail(exc, secrets=_payload_secrets(payload))
-        print(f"console upload warn: {detail}", flush=True)
+        print(
+            f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            flush=True,
+        )
     if timed_out:
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
     return proc.returncode

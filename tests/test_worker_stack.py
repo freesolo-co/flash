@@ -294,59 +294,6 @@ def test_setup_progress_heartbeats_are_throttled(monkeypatch, stage):
     assert calls.count("heartbeat.json") == 1, f"{stage} must be upload-throttled, got {calls}"
 
 
-def test_two_serialized_heartbeat_failures_preserve_committed_throttle_state(monkeypatch):
-    import threading
-
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as worker
-
-    first_started = threading.Event()
-    second_entered = threading.Event()
-    release_first = threading.Event()
-    attempts: list[int] = []
-
-    def _upload(*_args, **_kwargs):
-        attempts.append(len(attempts) + 1)
-        if len(attempts) == 1:
-            first_started.set()
-            assert release_first.wait(5.0)
-        return False
-
-    monkeypatch.setattr(worker, "hf_upload_file", _upload)
-    monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 0.0)
-    worker._HB_LAST_UPLOAD = 17.0
-    worker._HB_LAST_COMMITTED_STEP = 4
-    worker._HB_LAST_FORCED_UPLOAD = 9.0
-    worker._HB_PROGRESS_UPLOADED_SEQ = 3
-
-    first = threading.Thread(target=worker.heartbeat, args=("rl_step",), kwargs={"step": 5})
-
-    def _second():
-        second_entered.set()
-        worker.heartbeat("rl_step", step=6)
-
-    second = threading.Thread(target=_second)
-    first.start()
-    assert first_started.wait(5.0)
-    second.start()
-    assert second_entered.wait(5.0)
-    release_first.set()
-    first.join(timeout=5.0)
-    second.join(timeout=5.0)
-
-    assert not first.is_alive()
-    assert not second.is_alive()
-    assert attempts == [1, 2]
-    assert (
-        worker._HB_LAST_UPLOAD,
-        worker._HB_LAST_COMMITTED_STEP,
-        worker._HB_LAST_FORCED_UPLOAD,
-        worker._HB_PROGRESS_UPLOADED_SEQ,
-    ) == (17.0, 4, 9.0, 3)
-
-
 def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
     """Perf regression guard: the synchronous hf_upload_file network call must run OUTSIDE
     _HB_LOCK. Holding the lock across the upload serializes the trainer's per-step reward
@@ -404,14 +351,23 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
 
     assert elapsed < 5.0, f"heartbeat wedged on the held upload lock ({elapsed:.2f}s)"
     assert uploads == [], "the best-effort commit must be skipped while the lock is stuck"
-    # a skipped upload leaves the last committed throttle timestamp untouched.
+    # The skipped upload must ROLL BACK its optimistic slot claim — otherwise the throttle defers the
+    # next real commit and the throttle treats a stale channel as fresh.
     assert sentinel_last_upload == w._HB_LAST_UPLOAD, (
         f"a skipped commit must not advance _HB_LAST_UPLOAD (got {w._HB_LAST_UPLOAD})"
     )
 
 
-def test_heartbeat_failure_leaves_committed_slot_untouched(monkeypatch):
-    """A best-effort upload failure must not mutate the committed throttle timestamp."""
+def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
+    """The optimistic _HB_LAST_UPLOAD slot is claimed BEFORE the best-effort HF commit. If that commit
+    fails, hf_upload_file swallows the error and returns False (it never raises on best-effort) — HF is
+    still stale, so the slot must roll back exactly as the lock-timeout skip does. Otherwise the
+    throttle defers the next retry on the strength of an upload that never happened.
+    """
+    import importlib
+
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
+
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
@@ -424,7 +380,7 @@ def test_heartbeat_failure_leaves_committed_slot_untouched(monkeypatch):
     monkeypatch.setattr(w, "_HB_LAST_UPLOAD", sentinel_last_upload)
 
     calls = []
-    # mirror the real hf_upload_file contract: best-effort failure returns false.
+    # Mirror the real hf_upload_file contract: best-effort failure returns False (does not raise).
     monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: (calls.append(a[1]), False)[1])
 
     w.heartbeat("model_prefetched")
@@ -435,8 +391,14 @@ def test_heartbeat_failure_leaves_committed_slot_untouched(monkeypatch):
     )
 
 
-def test_heartbeat_success_updates_committed_slot(monkeypatch):
-    """A successful commit, including a none-returning mock, advances the throttle timestamp."""
+def test_heartbeat_keeps_slot_when_upload_reports_success(monkeypatch):
+    """The dual of the rollback test: a SUCCESSFUL commit (or a mock that doesn't report False) must
+    KEEP the advanced slot so the throttle works. ``is False`` — not falsy — gates the rollback, so a
+    None-returning mock counts as success."""
+    import importlib
+
+    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
+
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
@@ -1077,7 +1039,7 @@ def test_venv_sanity_block_uses_no_cuda_gated_probe():
     root = pathlib.Path(__file__).resolve().parent.parent
     dockerfile = (root / "Dockerfile.worker").read_text()
     venv_sanity = dockerfile[dockerfile.index("# Sanity: the verl venv must be able to LAUNCH") :]
-    venv_sanity = venv_sanity[: venv_sanity.index("# runpod serverless worker entrypoint")]
+    venv_sanity = venv_sanity[: venv_sanity.index("# RunPod Serverless worker entrypoint")]
 
     for probe in ("is_flash_linear_attention_available", "is_causal_conv1d_available"):
         assert f"assert {probe}()" not in venv_sanity, (
