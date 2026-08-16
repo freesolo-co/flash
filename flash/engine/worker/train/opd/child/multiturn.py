@@ -123,8 +123,8 @@ def _opd_turn_output_fields(
     turn_ordinal: int,
     generated_seconds: float,
     num_preempted: int,
-    multi_modal_data=None,
-    mm_processor_kwargs=None,
+    multi_modal_data,
+    mm_processor_kwargs,
 ) -> dict:
     """the fields one OPD turn contributes to its own AgentLoopOutput.
 

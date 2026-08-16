@@ -47,6 +47,7 @@ from flash.engine.worker.opd_train import (
 )
 from flash.engine.worker.teacher.client import TeacherScore
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
+from flash.engine.worker.train.core.child.glue import multi_modal_image_count
 from flash.engine.worker.train.core.child.runtime import install_checkpoint_handler_filter
 from flash.engine.worker.train.opd.child import plugin as opd_plugin
 from flash.engine.worker.train.opd.child.plugin import (
@@ -56,7 +57,6 @@ from flash.engine.worker.train.opd.child.plugin import (
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
     _init_transfer_queue,
-    _multi_modal_image_count,
     _post_json,
     _raw_prompt_has_image_block,
     _require_structured_runtime_versions,
@@ -2566,7 +2566,11 @@ def test_an_unusable_opd_turn_is_never_shown_to_the_environment():
     env = _RecordingEnv()
     bridge = _multiturn_bridge(env)
     bridge.start_multiturn(
-        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+        index=0,
+        session_id="s1",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
     )
 
     response = bridge.step_multiturn(
@@ -2596,7 +2600,11 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
     env = _RecordingEnv()
     bridge = _multiturn_bridge(env)
     bridge.start_multiturn(
-        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+        index=0,
+        session_id="s1",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
     )
 
     response = bridge.step_multiturn(
@@ -6238,7 +6246,7 @@ def test_child_teacher_bridge_payload_sends_boundary_and_image_count_without_pix
         "image_count": 2,
     }
     assert pixel_marker not in json.dumps(payload)
-    assert _multi_modal_image_count(None) == 0
+    assert multi_modal_image_count(None) == 0
 
 
 def test_image_token_suppression_is_gated_on_structured_image_blocks():

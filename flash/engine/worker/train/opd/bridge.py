@@ -469,7 +469,7 @@ class _TeacherAlignmentBridge:
         session_id: str,
         prompt_ids: list[int],
         raw_prompt: list[dict],
-        image_count: int = 0,
+        image_count: int,
     ) -> dict:
         self._require_multiturn()
         if index < 0 or index >= len(self.prompts):
@@ -838,7 +838,9 @@ class _TeacherAlignmentBridge:
                 session_id=payload["session_id"],
                 prompt_ids=payload["prompt_ids"],
                 raw_prompt=payload["raw_prompt"],
-                image_count=payload.get("image_count", 0),
+                # required like every sibling field: defaulting it to 0 would let a child that
+                # never sent the count pass the check for an image-bearing prompt.
+                image_count=payload["image_count"],
             ),
             "/multiturn/step": self.step_multiturn,
             "/multiturn/score": lambda payload: self.score_multiturn(payload["session_id"]),

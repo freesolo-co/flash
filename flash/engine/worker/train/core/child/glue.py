@@ -261,6 +261,31 @@ async def run_executor_call(loop, callback):
         raise
 
 
+def multi_modal_image_count(multi_modal_data) -> int:
+    """how many images a verl multimodal payload carries.
+
+    single-turn and multi-turn both report this count to the bridge, which compares it against the
+    frozen parent prompt. two counters would let the two paths disagree about the same payload, so
+    this is the one definition: verl carries "image" (singular) for a single-image row and "images"
+    for a list, and a bare non-sequence value under either key is one image.
+    """
+    if not multi_modal_data:
+        return 0
+    if not isinstance(multi_modal_data, dict):
+        raise TypeError("verl multimodal data must be a mapping")
+    images = multi_modal_data.get("images")
+    if images is None:
+        images = multi_modal_data.get("image")
+    if images is None:
+        return 0
+    if not isinstance(images, (list, tuple)):
+        return 1
+    try:
+        return len(images)
+    except TypeError as error:
+        raise TypeError("verl multimodal images must be a sized collection") from error
+
+
 class EpisodePrompt:
     """the tokenized initial prompt plus the decoded media every generate call must carry.
 
@@ -295,14 +320,10 @@ class EpisodePrompt:
         """how many images the engine actually decoded for this prompt.
 
         the bridge authenticates this against the frozen parent prompt, so it counts what the child
-        will condition on rather than what the transcript appears to mention.
+        will condition on rather than what the transcript appears to mention. it must agree with the
+        count the single-turn path reports, hence the shared counter rather than a second one.
         """
-        images = self.images
-        if images is None:
-            return 0
-        if not isinstance(images, (list, tuple)):
-            return 1
-        return len(images)
+        return multi_modal_image_count(self.multi_modal_data)
 
 
 async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
