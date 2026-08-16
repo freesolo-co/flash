@@ -25,8 +25,13 @@ _MAX_GIT_PACK_OUTPUT_BYTES = 64 << 20
 _MAX_GIT_BUNDLE_HEADER_BYTES = 4 << 20
 _RPM_LEAD_BYTES = 96
 _BUNDLE_UNFINISHED = object()
-_BUNDLE_REF = re.compile(rb"(?:[0-9a-f]{40}|[0-9a-f]{64}) refs/[^\s]+")
-_BUNDLE_PREREQUISITE = re.compile(rb"-(?:[0-9a-f]{40}|[0-9a-f]{64}) .+")
+# gitformat-bundle: `reference = obj-id SP refname LF`, and refname is unqualified. `git bundle
+# create --all` writes a bare `HEAD` line beside the `refs/...` ones, so requiring the prefix made
+# an ordinary bundle stop matching and fall through to the literal scan, where a pack's contents
+# are not contiguous. `prerequisite = "-" obj-id SP comment LF` with `comment = *CHAR`, so the
+# comment may be empty; the trailing space is still part of the line.
+_BUNDLE_REF = re.compile(rb"(?:[0-9a-f]{40}|[0-9a-f]{64}) \S+")
+_BUNDLE_PREREQUISITE = re.compile(rb"-(?:[0-9a-f]{40}|[0-9a-f]{64})(?: .*)?")
 
 
 class OpaqueDeadlineExceeded(Exception):
