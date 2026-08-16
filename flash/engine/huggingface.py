@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TypedDict
 
-def model_revision_kwargs(revision: str = "") -> dict[str, str]:
+
+class ModelRevisionKwargs(TypedDict, total=False):
+    revision: str
+
+
+def model_revision_kwargs(revision: str = "") -> ModelRevisionKwargs:
     """return the hub revision keyword for a nonempty pinned revision."""
     return {"revision": revision} if revision else {}
 

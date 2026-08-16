@@ -9,8 +9,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, Protocol, TypedDict, cast
 
+from flash.content.multimodal import NormalizedImages
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
 from flash.engine.profiling.sft_image_rows import (
@@ -64,12 +65,32 @@ class PreparedSftWorkload:
 _ImageRowResult = tuple[list[int], list[int], bytes, int, bool]
 
 
+class _NormalizeSftImageRow(Protocol):
+    def __call__(
+        self,
+        record: dict,
+        messages: list[dict],
+        package_root: str | Path | None,
+    ) -> NormalizedImages: ...
+
+
+class _TokenizeSftImageRow(Protocol):
+    def __call__(
+        self,
+        prompt_messages: list[dict],
+        completion_messages: list[dict],
+        descriptors: list[str],
+        *,
+        package_root: str | Path | None,
+    ) -> _ImageRowResult: ...
+
+
 @dataclass(frozen=True)
 class _SftImagePipeline:
     """the bound normalization and tokenization path for every image row in one run."""
 
-    normalize: Callable[..., Any]
-    tokenize: Callable[..., _ImageRowResult]
+    normalize: _NormalizeSftImageRow
+    tokenize: _TokenizeSftImageRow
 
 
 @dataclass(frozen=True)
@@ -474,15 +495,7 @@ def _tokenize_prompt_rows(
         coerced_scalar_output,
     ) in enumerate(prompt_rows):
         has_images = record_has_images(example, prompt_messages)
-        if has_images:
-            _reject_image_completion(completion_messages)
-        else:
-            _reject_image_completion(
-                completion_messages,
-                source_messages=[*prompt_messages, *completion_messages],
-                template_source=tokenizer,
-                template_kwargs={"enable_thinking": spec.thinking},
-            )
+        _reject_image_completion(completion_messages, image_bearing=has_images)
         # read before the image branch rewrites `completion_messages` to its text-only form.
         multiturn = len(completion_messages) > 1
         if multiturn:

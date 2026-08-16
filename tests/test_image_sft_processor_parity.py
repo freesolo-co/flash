@@ -222,6 +222,28 @@ def test_estimator_matches_the_pinned_processor_oracle(processor_oracle, case_na
     )
 
 
+def test_oracle_pins_model_revision_and_image_pad_registration(processor_oracle):
+    provenance = processor_oracle["provenance"]
+    assert {
+        "model": provenance["model"],
+        "revision": provenance["revision"],
+        "processor_revision": provenance["processor_revision"],
+        "tokenizer_revision": provenance["tokenizer_revision"],
+    } == {
+        "model": MODEL_ID,
+        "revision": MODEL_REVISION,
+        "processor_revision": MODEL_REVISION,
+        "tokenizer_revision": MODEL_REVISION,
+    }
+    assert provenance["image_pad_registration"] == {
+        "token": IMAGE_PAD_TOKEN,
+        "id": 248056,
+        "convert_ids_to_tokens": IMAGE_PAD_TOKEN,
+        "vocab_aliases": [IMAGE_PAD_TOKEN],
+    }
+    assert processor_oracle["tokens"][IMAGE_PAD_TOKEN] == 248056
+
+
 def test_oracle_cases_exercise_each_claimed_parity_boundary(processor_oracle):
     cases = processor_oracle["cases"]
     truncated = cases["truncated-role-fallback"]
@@ -473,6 +495,7 @@ def capture_processor_oracle(processor, tokenizer, preprocessor_config: dict) ->
             processor.image_processor.size.longest_edge,
         ) = original_size
     geometry = _published_geometry(preprocessor_config)
+    image_pad_id = tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
     return {
         "provenance": {
             "model": MODEL_ID,
@@ -484,6 +507,16 @@ def capture_processor_oracle(processor, tokenizer, preprocessor_config: dict) ->
             "transformers_version": transformers.__version__,
             "preprocessor_geometry_sha256": _digest(geometry),
             "case_source_sha256": _digest(CASE_SOURCES),
+            "image_pad_registration": {
+                "token": IMAGE_PAD_TOKEN,
+                "id": image_pad_id,
+                "convert_ids_to_tokens": tokenizer.convert_ids_to_tokens(image_pad_id),
+                "vocab_aliases": sorted(
+                    token
+                    for token, token_id in tokenizer.get_vocab().items()
+                    if token_id == image_pad_id
+                ),
+            },
             "capture_command": (
                 "FLASH_IMAGE_PROCESSOR_LIVE=1 uv run --extra gpu python "
                 "tests/capture_image_sft_processor_oracle.py"

@@ -9,6 +9,7 @@ import json
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 MAX_IMAGES_PER_EXAMPLE = 8
 MAX_IMAGE_SOURCE_BYTES = 20 * 1024 * 1024
@@ -695,7 +696,7 @@ def decode_image_descriptors(
                 f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
             )
         prepared.append(data)
-    images = []
+    images: list[Any] = []
     try:
         images.extend(_decode_image_bytes(data) for data in prepared)
     except Exception:

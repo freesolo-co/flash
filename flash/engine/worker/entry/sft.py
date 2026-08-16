@@ -154,15 +154,18 @@ def sft_under_ran(final_step: int, update_horizon: int) -> bool:
 def _reject_image_completion(
     completion,
     *,
+    image_bearing: bool,
     source_messages=None,
     template_source=None,
     template_kwargs: dict | None = None,
 ) -> None:
-    """reject image targets and literal pad tokens from every rendered source field.
+    """reject image targets always, and reserved pad tokens only on image-bearing rows.
 
-    the estimator tokenizes prompt and completion as one stream, so a literal image-pad token in any
-    field emitted by the chat template is indistinguishable from a real image block. the rendered
-    field probe covers content and nested tool-call fields without rejecting unrendered metadata.
+    the estimator tokenizes an image-bearing prompt and completion as one stream, so a literal
+    image-pad token in any field emitted by the chat template is indistinguishable from a real image
+    block. the rendered field probe covers content and nested tool-call fields without rejecting
+    unrendered metadata. on a text-only row the same registered token is ordinary authored text and
+    retains the normal prompt mask or completion supervision.
     """
     from flash.content.multimodal import (
         IMAGE_PAD_TOKEN,
@@ -172,6 +175,8 @@ def _reject_image_completion(
 
     if record_has_images({}, completion):
         raise ValueError("image-bearing SFT completions are not supported")
+    if not image_bearing:
+        return
     for message in completion or []:
         if IMAGE_PAD_TOKEN in message_content_text(
             message.get("content") if isinstance(message, dict) else None
