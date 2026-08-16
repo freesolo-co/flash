@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 
+from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -61,7 +62,7 @@ def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: i
         raise RuntimeError("the prepared SFT warm-start adapter could not be downloaded")
     with open(os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8") as file:
         config = json.load(file)
-    rank = int(config.get("r") or 0)
+    rank = rank_from_adapter_config(config, source=os.path.join(adapter_dir, "adapter_config.json"))
     if rank != expected_rank:
         raise ValueError(
             f"SFT warm-start adapter rank {rank} does not match the prepared train.lora_rank "
