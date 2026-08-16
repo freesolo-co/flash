@@ -35,9 +35,10 @@ SKIP_DIRS = {"__pycache__", ".git", ".venv", "build", ".ruff_cache"}
 # mechanism changes. Keep this list short: it is an escape hatch for a transport boundary, never
 # for a function that is merely hard to split.
 SOURCE_SHIPPED = {
-    # `build_function_input` sends this through `get_function_source` as `function_code`, and the
-    # RunPod worker executes that string on its own. `tests/test_flash_worker.py` pins the same
-    # contract from the other side: every name it uses must be imported inside its own body.
+    # `docker/make_rp_handler.py` AST-extracts this at image build time and writes it into
+    # `/rp_handler.py`, which the worker image runs as its CMD with nothing else from flash on the
+    # path. `tests/test_flash_worker.py` pins the same contract from the other side: every name it
+    # uses must be imported inside its own body.
     "flash/providers/runpod/serverless/endpoints.py::_train_body",
 }
 
