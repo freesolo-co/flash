@@ -88,12 +88,13 @@ def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
 
 
 def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
-    """Regression (HIGH): the slow HF upload runs OUTSIDE _HB_LOCK, so two heartbeat
-    threads could upload concurrently and reorder on HF, and a re-read could send a file a
-    newer heartbeat already replaced (stale snapshot). The fix serializes uploads under a
-    separate _HB_UPLOAD_LOCK and uploads the bytes captured under _HB_LOCK. This asserts:
-    (1) uploads never overlap (serialized), and (2) every upload's bytes match the payload
-    the caller wrote (no stale/re-read mismatch)."""
+    """Concurrent heartbeat uploads stay serialized and carry one claimed snapshot each.
+
+    Unforced calls now deliberately skip while an upload is in flight: queueing their already-stale
+    snapshots would block the caller and publish them after newer progress. The test therefore does
+    not require all 120 calls to upload. It requires every upload that *does* claim a slot to be
+    serialized and internally match the stage encoded by that caller's unique step.
+    """
     import contextlib
     import glob
     import json
@@ -131,10 +132,12 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
             obj = json.load(f)
         time.sleep(0.001)  # widen the window for an overlap to be observed if it can happen
         with guard:
-            seen_steps.add(obj["step"])
-            # the snapshot must be internally consistent: its step is the one written for it
-            if obj["stage"] not in ("rl_step", "ckpt"):
-                mismatches.append(("stage", obj))
+            step = obj["step"]
+            seen_steps.add(step)
+            producer, offset = divmod(step, 1000)
+            expected_stage = "rl_step" if (producer + offset) % 2 else "ckpt"
+            if obj["stage"] != expected_stage:
+                mismatches.append((expected_stage, obj))
             inflight -= 1
 
     monkeypatch.setattr(ne, "hf_upload_file", fake_upload)
@@ -161,7 +164,8 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
     assert not mismatches, mismatches
     # serialized: at most one upload in flight at any moment
     assert max_inflight == 1, f"uploads overlapped (max_inflight={max_inflight})"
-    # every claimed slot uploaded a distinct, valid snapshot (120 calls, no throttle)
-    assert len(seen_steps) == 6 * 20
+    # at least one call claimed the upload slot; concurrent unforced callers may be dropped while
+    # that upload is in flight, but no caller can invent a step outside the 120 submitted above.
+    assert 1 <= len(seen_steps) <= 6 * 20
     # the captured-snapshot temp files are cleaned up
     assert not glob.glob("/tmp/.hb-upload-*"), "upload temp files must be cleaned up"

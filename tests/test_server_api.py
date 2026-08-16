@@ -197,6 +197,10 @@ def api(tmp_path, monkeypatch):
         lambda **_kwargs: True,
     )
     with TestClient(app_mod.create_app()) as client:
+        # the fake token exists only to satisfy startup preflight. leaving it live for requests makes
+        # submit-time environment pinning call the real GitHub API with `ghp-test`; tokenless planes
+        # deliberately defer that work to the worker. tests that exercise a token set their own.
+        monkeypatch.delenv("GITHUB_TOKEN")
         yield client
 
 
@@ -2696,7 +2700,6 @@ def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch)
         "adapter_revision": revision,
         "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
         "verification_generation": 7,
-        "url": "https://stale.example/v1",
     }
     runner._save_status(status)
     monkeypatch.setattr(
@@ -2817,7 +2820,6 @@ def test_deployment_management_allows_matching_internal_scope_and_redacts_pollin
         "endpoint_name": "https://serve.example",
         "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
         "verification_generation": 7,
-        "url": "https://stale.example/v1",
     }
     runner._save_status(status)
 
@@ -2866,7 +2868,6 @@ def test_deployment_management_allows_matching_internal_scope_and_redacts_pollin
         assert body["state"] == "ready"
         assert "previous_deployment" not in body
         assert "verification_generation" not in body
-        assert "url" not in body
 
     deployed = api.post(
         f"/v1/runs/{run_id}/deploy",
@@ -3242,7 +3243,7 @@ def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
     assert runner.get_status(run_id).deployment == status.deployment
 
 
-def test_public_run_routes_redact_private_and_legacy_deployment_fields(api, monkeypatch):
+def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
     import flash.runner as runner
     import flash.serve.deploy as deploy_mod
 
@@ -3256,7 +3257,6 @@ def test_public_run_routes_redact_private_and_legacy_deployment_fields(api, monk
         "state": "ready",
         "endpoint_name": "https://serve.example",
         "openai_base_url": "https://serve.example/v1",
-        "url": "https://stale.example/v1",
         "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
         "adapter_revision": revision,
     }
@@ -3275,13 +3275,11 @@ def test_public_run_routes_redact_private_and_legacy_deployment_fields(api, monk
     for body in responses:
         deployment = body["deployment"]
         assert deployment["openai_base_url"] == "https://serve.example/v1"
-        assert "url" not in deployment
         assert "previous_deployment" not in deployment
 
     persisted = runner.get_status(run_id).deployment
     assert persisted["previous_deployment"]["endpoint_name"] == "https://old.example"
     assert persisted["openai_base_url"] == "https://serve.example/v1"
-    assert persisted["url"] == "https://stale.example/v1"
     assert runner.read_verified_adapter_revisions(run_id) == frozenset({revision})
 
     monkeypatch.setattr(deploy_mod, "undeploy_adapter", lambda target: [target])
@@ -9024,6 +9022,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     """POST /v1/envs publishes an uploaded package to the managed environment hub."""
+    monkeypatch.setenv("GITHUB_TOKEN", "token-for-publish-path")
     import base64
     import io
     import tarfile

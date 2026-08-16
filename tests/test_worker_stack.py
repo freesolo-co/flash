@@ -8,40 +8,42 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.providers.runpod.serverless import (
-    WORKER_DEPS,
-    resolve_worker_deps,
-)
 
+def _worker_image_specs() -> list[str]:
+    """The pinned stack the worker image actually installs.
 
-def test_resolve_worker_deps_default():
-    # The single pinned stack is the validated default (bench/results/phase1 matrix); fully
-    # managed, no per-run override.
-    assert resolve_worker_deps() == WORKER_DEPS
+    Dockerfile.worker is the single source of truth for the run stack: it is what the GPU runs.
+    """
+    import pathlib
+
+    import docker.kernel_fingerprint as kf
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    return kf._pip_stack_specs((root / "Dockerfile.worker").read_text())
 
 
 def test_gdn_fastpath_deps_present_and_kept_on_hopper():
     """The GDN fast-path stack (fla-from-git + tilelang + pinned apache-tvm-ffi) is baked in, and
     fla is KEPT on Hopper (sm90) — the #640 fix is fla's tilelang backend, not dropping fla."""
-    joined = " ".join(WORKER_DEPS)
+    specs = _worker_image_specs()
+    joined = " ".join(specs)
     assert (
         "git+https://github.com/fla-org/flash-linear-attention" in joined
     )  # complete fla, not the broken PyPI stub
     assert any(
-        d.startswith("tilelang==") for d in WORKER_DEPS
+        d.startswith("tilelang==") for d in specs
     )  # correct GDN backend on Triton>=3.4, PINNED for reproducibility
     assert any(
-        d.startswith("apache-tvm-ffi==0.1.11") for d in WORKER_DEPS
+        d.startswith("apache-tvm-ffi==0.1.11") for d in specs
     )  # pin (0.1.12 aborts tilelang import)
     # fla must NOT be dropped on Hopper anymore (it was, pre-fix).
-    deps = resolve_worker_deps()
-    assert any("flash-linear-attention" in d for d in deps), (
+    assert any("flash-linear-attention" in d for d in specs), (
         "fla must be kept on Hopper for the tilelang fast path"
     )
 
 
 def test_worker_stack_pins_qwen35_capable_versions():
-    joined = " ".join(WORKER_DEPS)
+    joined = " ".join(_worker_image_specs())
     assert "vllm==0.19" in joined  # first transformers-5-compatible vllm line
     assert "transformers>=5" in joined  # qwen3_5 model types need transformers 5.x
     assert "bitsandbytes" in joined  # 8-bit paged AdamW optimizer state (LoRA+ coexists)
@@ -292,40 +294,6 @@ def test_setup_progress_heartbeats_are_throttled(monkeypatch, stage):
     w.heartbeat(stage, elapsed_seconds=31)
     w.heartbeat(stage, elapsed_seconds=61)
     assert calls.count("heartbeat.json") == 1, f"{stage} must be upload-throttled, got {calls}"
-
-
-def test_heartbeat_rollback_guards_on_claim_seq_not_coarse_ts(monkeypatch):
-    """A failed/timed-out commit rolls its slot claim back, but the rollback is gated on a monotonic
-    claim SEQ, not on wall-clock-ts equality. So if a NEWER heartbeat claims the slot (which on a
-    coarse clock can share the same _HB_LAST_UPLOAD ts) before our older commit fails, our rollback
-    must NOT wipe that fresher claim — doing so would let the throttle / quiet_gate read the channel
-    as stale right after a real upload."""
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
-
-    hbmod = sys.modules[w.heartbeat.__module__]
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-
-    seen = []
-
-    def fake_upload(path, name):
-        seen.append(name)
-        if len(seen) == 1:
-            # A concurrent NEWER heartbeat claims the slot (higher claim seq) while our older commit
-            # is in flight; our commit then fails, so we attempt to roll our claim back.
-            hbmod._HB_CLAIM_SEQ += 1
-            return False
-        return True
-
-    monkeypatch.setattr(w, "hf_upload_file", fake_upload)
-
-    w.heartbeat("rl_step", step=1)
-    # The newer claim owns the slot now, so our failed older commit must NOT restore _HB_LAST_UPLOAD
-    # to its pre-claim 0.0. A ts-equality guard (now == _HB_LAST_UPLOAD) would have wrongly fired and
-    # wiped the fresh claim; the claim-seq guard does not.
-    assert w._HB_LAST_UPLOAD != 0.0
 
 
 def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
@@ -601,23 +569,19 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
     ]
 
 
-def test_35b_warmstart_requires_fused_expert_targets(monkeypatch):
+def test_worker_exports_only_the_current_warmstart_adapter_surface(monkeypatch):
     worker = _import_worker(monkeypatch)
-    model_id = "Qwen/Qwen3.6-35B-A3B"
 
-    with pytest.raises(ValueError, match="omits required expert targets"):
-        worker.validate_lora_target_parameters({"target_modules": "all-linear"}, model_id)
-
-    worker.validate_lora_target_parameters(
-        {
-            "target_parameters": [
-                "mlp.experts.gate_up_proj",
-                "mlp.experts.down_proj",
-            ]
-        },
-        model_id,
-    )
-    worker.validate_lora_target_parameters({}, "Qwen/Qwen3.5-9B")
+    assert callable(worker.validate_warmstart_adapter)
+    assert callable(worker.lora_target_parameters)
+    for deleted in (
+        "adapter_has_fused_expert_tensors",
+        "expected_fused_expert_modules",
+        "legacy_fused_expert_config_is_recoverable",
+        "prepare_warmstart_adapter_config",
+        "restore_fused_expert_targets",
+    ):
+        assert not hasattr(worker, deleted)
 
 
 def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
@@ -1085,25 +1049,17 @@ def test_venv_sanity_block_uses_no_cuda_gated_probe():
 
 def test_fla_git_pin_is_consistent_and_pinned():
     """The fla git dependency is PINNED to an exact commit (not the moving default branch) and the
-    SAME SHA is used in both WORKER_DEPS and Dockerfile.worker (worker venv == baked image)."""
+    worker's runtime reinstall uses that same SHA (baked image == what perf reinstalls)."""
     import pathlib
     import re
 
-    spec = next(d for d in WORKER_DEPS if "flash-linear-attention" in d)
+    spec = next(d for d in _worker_image_specs() if "flash-linear-attention" in d)
     m = re.search(r"flash-linear-attention\.git@([0-9a-f]{40})\b", spec)
-    assert m, f"fla dep must be pinned to a 40-char commit SHA, got: {spec!r}"
-    deps_sha = m.group(1)
+    assert m, f"Dockerfile.worker fla install must be pinned to a 40-char commit SHA, got: {spec!r}"
+    image_sha = m.group(1)
 
     # repo root: tests/ -> repo root is the parent.
     root = pathlib.Path(__file__).resolve().parent.parent
-    dockerfile = (root / "Dockerfile.worker").read_text()
-    dm = re.search(r"flash-linear-attention\.git@([0-9a-f]{40})\b", dockerfile)
-    assert dm, "Dockerfile.worker fla install must be pinned to a 40-char commit SHA"
-    assert dm.group(1) == deps_sha, (
-        "Dockerfile.worker fla SHA must match WORKER_DEPS so the baked image and the worker "
-        f"venv agree (deps={deps_sha}, dockerfile={dm.group(1)})"
-    )
-
     # The worker's runtime fla reinstall (perf._ensure_fla_fastpath_on_hopper) must use the SAME pin —
     # an unpinned reinstall would pull the moving default branch and defeat reproducibility.
     perf_src = (root / "flash" / "engine" / "worker" / "perf" / "__init__.py").read_text()
@@ -1111,32 +1067,26 @@ def test_fla_git_pin_is_consistent_and_pinned():
     #   "...flash-linear-attention.git"\n        "@<sha>" — so allow quotes/newline/space between.
     pm = re.search(r"flash-linear-attention\.git[\"'\s]*@([0-9a-f]{40})\b", perf_src)
     assert pm, "perf/__init__.py runtime fla reinstall must be pinned to a 40-char commit SHA"
-    assert pm.group(1) == deps_sha, (
-        f"perf/__init__.py fla SHA must match WORKER_DEPS (deps={deps_sha}, perf={pm.group(1)})"
+    assert pm.group(1) == image_sha, (
+        f"perf/__init__.py fla SHA must match Dockerfile.worker (image={image_sha}, perf={pm.group(1)})"
     )
 
 
 def test_tilelang_pin_is_consistent_and_pinned():
     """tilelang (the Hopper GDN correctness backend) is PINNED to an exact version (not unversioned)
-    and the SAME pin is used in WORKER_DEPS, Dockerfile.worker, and perf.py's runtime reinstall, so
-    cold-start installs / image rebuilds / runtime reinstalls all resolve the identical backend
-    (flash/providers/_lifecycle/worker.py)."""
+    and the SAME pin is used in Dockerfile.worker and perf.py's runtime reinstall, so image rebuilds
+    and runtime reinstalls resolve the identical backend."""
     import pathlib
     import re
 
-    spec = next(d for d in WORKER_DEPS if d.split("==")[0].split(">")[0].strip() == "tilelang")
+    spec = next(
+        d for d in _worker_image_specs() if d.split("==")[0].split(">")[0].strip() == "tilelang"
+    )
     m = re.match(r"tilelang==([0-9][0-9A-Za-z.\-]*)$", spec.strip())
     assert m, f"tilelang must be pinned to an exact version (tilelang==X.Y.Z), got: {spec!r}"
     pin = m.group(1)
 
     root = pathlib.Path(__file__).resolve().parent.parent
-    dockerfile = (root / "Dockerfile.worker").read_text()
-    dm = re.search(r'"tilelang==([0-9][0-9A-Za-z.\-]*)"', dockerfile)
-    assert dm, "Dockerfile.worker must install a PINNED tilelang==X.Y.Z (not unversioned)"
-    assert dm.group(1) == pin, (
-        f"Dockerfile.worker tilelang pin must match WORKER_DEPS (deps={pin}, dockerfile={dm.group(1)})"
-    )
-
     perf_src = (root / "flash" / "engine" / "worker" / "perf" / "__init__.py").read_text()
     # perf/__init__.py builds the spec via an f-string `f"tilelang=={TILELANG_PIN}"`, so assert the constant.
     pm = re.search(r'TILELANG_PIN\s*=\s*"([0-9][0-9A-Za-z.\-]*)"', perf_src)
@@ -1144,7 +1094,7 @@ def test_tilelang_pin_is_consistent_and_pinned():
         "perf/__init__.py must define a pinned TILELANG_PIN constant for the runtime reinstall"
     )
     assert pm.group(1) == pin, (
-        f"perf/__init__.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
+        f"perf/__init__.py TILELANG_PIN must match Dockerfile.worker (image={pin}, perf={pm.group(1)})"
     )
 
 

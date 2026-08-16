@@ -22,7 +22,8 @@ import types
 
 import pytest
 
-from flash.engine.worker.backend_common import parse_wandb_link, render_wandb_link_shim
+from flash.engine.worker.backend_common import parse_wandb_link
+from flash.engine.worker.train.core.child.runtime import install_wandb_link_reporting
 
 _URL = "https://wandb.ai/acme/flash/runs/abc123"
 _ID = "abc123"
@@ -46,7 +47,7 @@ def _exec_shim(init_impl):
     saved = sys.modules.get("wandb")
     sys.modules["wandb"] = fake
     try:
-        exec(compile(render_wandb_link_shim(), "<shim>", "exec"), {})
+        install_wandb_link_reporting()
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             returned = sys.modules["wandb"].init(project="flash")
@@ -112,7 +113,7 @@ def test_child_shim_is_inert_when_wandb_is_not_installed():
 
     builtins.__import__ = _no_wandb
     try:
-        exec(compile(render_wandb_link_shim(), "<shim>", "exec"), {})
+        install_wandb_link_reporting()
     finally:
         builtins.__import__ = real_import
 
