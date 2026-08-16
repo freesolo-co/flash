@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import shutil
 import struct
+import subprocess
+import zipfile
 import zlib
 
 import pytest
@@ -115,6 +118,16 @@ def _rpm_lead() -> bytes:
     return bytes(lead)
 
 
+@pytest.mark.parametrize("offset", [0, 512, 1024, 4096])
+def test_hdf5_signatures_at_superblock_positions_fail_closed(tmp_path, offset):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    artifact = tmp_path / "dataset.bin"
+    artifact.write_bytes(bytes(offset) + b"\x89HDF\r\n\x1a\n" + zlib.compress(_KEY))
+    with pytest.raises(_Unscannable, match="HDF5 archive"):
+        credential_in_file(artifact)
+
+
 def test_hdf5_false_positive_controls_remain_clean(tmp_path):
     from flash.env_secrets import credential_in_file
 
@@ -127,6 +140,23 @@ def test_hdf5_false_positive_controls_remain_clean(tmp_path):
         path = tmp_path / name
         path.write_bytes(content)
         assert credential_in_file(path) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _arrow_payload("file"),
+        _arrow_payload("stream"),
+        _arrow_payload("stream", legacy=True),
+    ],
+)
+def test_arrow_file_and_stream_framing_fail_closed(tmp_path, payload):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    artifact = tmp_path / "records.bin"
+    artifact.write_bytes(payload)
+    with pytest.raises(_Unscannable, match="Arrow IPC archive"):
+        credential_in_file(artifact)
 
 
 def test_arrow_false_positive_controls_remain_clean(tmp_path):
@@ -188,6 +218,23 @@ def test_native_gnupg_false_positive_controls_remain_clean(tmp_path):
         assert credential_in_file(path) is None
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _git_pack(),
+        _git_bundle(_git_pack(), version=2),
+        _git_bundle(_git_pack(version=3), version=3),
+    ],
+)
+def test_git_pack_and_bundle_fail_closed(tmp_path, payload):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    artifact = tmp_path / "objects.bin"
+    artifact.write_bytes(payload)
+    with pytest.raises(_Unscannable, match=r"Git (?:pack|bundle) archive"):
+        credential_in_file(artifact)
+
+
 def test_native_gnupg_oversized_recognized_header_fails_closed(tmp_path, monkeypatch):
     from flash import env_sensitive
     from flash.env_secrets import credential_in_file
@@ -225,6 +272,47 @@ def test_git_pack_and_bundle_false_positive_controls_remain_clean(tmp_path):
         path = tmp_path / name
         path.write_bytes(content)
         assert credential_in_file(path) is None
+
+
+def test_real_git_pack_is_structurally_recognized(tmp_path):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    object_ids = []
+    for value in (b"first object\n", b"second object\n"):
+        written = subprocess.run(
+            ["git", "-C", repo, "hash-object", "-w", "--stdin"],
+            input=value,
+            stdout=subprocess.PIPE,
+            check=True,
+        )
+        object_ids.append(written.stdout)
+    packed = subprocess.run(
+        ["git", "-C", repo, "pack-objects", "--stdout"],
+        input=b"".join(object_ids),
+        stdout=subprocess.PIPE,
+        check=True,
+    ).stdout
+    path = tmp_path / "real.pack"
+    path.write_bytes(packed)
+    with pytest.raises(_Unscannable, match="Git pack archive"):
+        credential_in_file(path)
+
+
+def test_git_bundle_preamble_past_buffer_bound_fails_closed(tmp_path, monkeypatch):
+    from flash import env_opaque
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    monkeypatch.setattr(env_opaque, "_MAX_GIT_BUNDLE_HEADER_BYTES", 256)
+    preamble = b"# v2 git bundle\n" + b"1" * 40 + b" refs/heads/main\n"
+    preamble += (b"-" + b"2" * 40 + b" prerequisite\n") * 8
+    path = tmp_path / "large.bundle"
+    path.write_bytes(preamble + b"\n" + _git_pack())
+    with pytest.raises(_Unscannable, match="Git bundle archive"):
+        credential_in_file(path)
 
 
 def test_uri_userinfo_passwords_are_detected_without_echoing_values(tmp_path):
@@ -402,3 +490,44 @@ def test_png_metadata_and_icc_payloads_keep_existing_behavior(tmp_path):
         )
     )
     assert credential_in_file(clean) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x89HDF\r\n\x1a\n" + bytes(64),
+        _arrow_payload("file"),
+        _arrow_payload("stream"),
+        _git_pack(),
+        _git_bundle(_git_pack()),
+        _rpm_lead(),
+    ],
+)
+def test_opaque_formats_fail_closed_inside_archives(tmp_path, payload):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    archive = tmp_path / "nested.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as packed:
+        packed.writestr("payload.bin", payload)
+    with pytest.raises(_Unscannable, match="cannot expand"):
+        credential_in_file(archive)
+
+
+def test_rpm_leads_fail_closed_without_filename_guessing(tmp_path):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    rpm = tmp_path / "payload.bin"
+    rpm.write_bytes(_rpm_lead() + zlib.compress(_KEY))
+    with pytest.raises(_Unscannable, match="RPM archive"):
+        credential_in_file(rpm)
+
+    controls = {
+        "package.rpm": b"ordinary package notes\n",
+        "short.bin": b"\xed\xab\xee\xdb\x03\x00",
+        "wrong-version.bin": b"\xed\xab\xee\xdb\x04\x00" + _rpm_lead()[6:],
+        "wrong-type.bin": _rpm_lead()[:6] + (3).to_bytes(2, "big") + _rpm_lead()[8:],
+    }
+    for name, content in controls.items():
+        path = tmp_path / name
+        path.write_bytes(content)
+        assert credential_in_file(path) is None
