@@ -136,10 +136,30 @@ def sft_under_ran(final_step: int, update_horizon: int) -> bool:
 
 
 def _reject_image_completion(completion) -> None:
-    from flash.content.multimodal import record_has_images
+    """Reject a target that carries an image, as a block or as the model's own pad token.
+
+    the two are the same rejection because they are the same thing at the id level: the estimator
+    tokenizes prompt and completion as one stream, so a literal ``<|image_pad|>`` in assistant text
+    encodes to the id the expander treats as an image slot and is indistinguishable from a real
+    image block. only the block form is representable as content, which is why the block check
+    alone looks sufficient and is not.
+    """
+    from flash.content.multimodal import (
+        IMAGE_PAD_TOKEN,
+        message_content_text,
+        record_has_images,
+    )
 
     if record_has_images({}, completion):
         raise ValueError("image-bearing SFT completions are not supported")
+    for message in completion or []:
+        if IMAGE_PAD_TOKEN in message_content_text(
+            message.get("content") if isinstance(message, dict) else None
+        ):
+            raise ValueError(
+                f"sft completion text contains the reserved image marker {IMAGE_PAD_TOKEN!r}; "
+                "remove it from the target"
+            )
 
 
 def run_sft():

@@ -540,6 +540,77 @@ def test_image_teacher_prompt_rejects_a_marker_split_across_adjacent_text_blocks
     assert rendered[0]["content"] == f"<|media_{mm.IMAGE_TEACHER_PLACEHOLDER}pad|>"
 
 
+@pytest.mark.parametrize(
+    ("record_images", "content"),
+    [
+        pytest.param(
+            False,
+            [{"type": "image"}, {"type": "text", "text": f"m {mm.IMAGE_PAD_TOKEN}"}],
+            id="blocks",
+        ),
+        pytest.param(True, f"m {mm.IMAGE_PAD_TOKEN}", id="string-content-top-level-image"),
+    ],
+)
+def test_normalization_rejects_the_pad_token_in_image_prompt_text(tmp_path, record_images, content):
+    """The pad token is the model's real image slot, so text carrying it is not text.
+
+    Both sft tokenizers walk the same id stream. The torch-free estimator expands every pad id into
+    that image's pad run and requires the count to match the supplied images, so a literal marker
+    is one placeholder too many and the quote fails. The processor path does not raise here, which
+    is worse rather than better: it hands the model more image-token positions than image
+    embeddings. Rejecting at normalization is what makes both paths agree.
+
+    The string case is the one a per-block check inside the normalization loop cannot see: string
+    content never enters that loop, and a top-level `image` field appends its block to a message
+    the loop has already passed. This is why the check runs over the finished blocks.
+    """
+    uri = _data_uri(_png_bytes())
+    record = {"image": uri} if record_images else {}
+    messages = [{"role": "user", "content": content}]
+    if not record_images:
+        messages[0]["content"] = [
+            {"type": "image_url", "image_url": {"url": uri}}
+            if block.get("type") == "image"
+            else block
+            for block in content
+        ]
+    with pytest.raises(ValueError, match="reserved image marker"):
+        mm.normalize_prompt_images(record, messages, None)
+
+
+def test_normalization_keeps_the_teacher_placeholder_out_of_the_local_sft_check(tmp_path):
+    """`<|media_pad|>` is ordinary text for a local sft run, so rejecting it would be a false refusal.
+
+    The teacher renderer must reject it because that renderer inserts it to mark image positions.
+    Nothing on the sft tokenization path does, so the only reserved marker there is the model's own
+    pad token. A shared guard that always checked both markers would refuse a legitimate dataset.
+    """
+    uri = _data_uri(_png_bytes())
+    normalized = mm.normalize_prompt_images(
+        {"image": uri},
+        [{"role": "user", "content": f"literally {mm.IMAGE_TEACHER_PLACEHOLDER} here"}],
+        None,
+    )
+    assert len(normalized.descriptors) == 1
+    assert normalized.messages[0]["content"][0]["text"].endswith("here")
+
+
+def test_sft_completion_text_carrying_the_pad_token_is_rejected():
+    """A target is rejected for the pad token for the same reason a prompt is.
+
+    The estimator tokenizes prompt and completion as one stream, so the marker in assistant text
+    reaches the expander as an extra image slot exactly like a prompt one. Only the block form is
+    representable as image content, which is why the existing block-only check looks complete.
+    """
+    from flash.engine.worker.entry.sft import _reject_image_completion
+
+    with pytest.raises(ValueError, match="reserved image marker"):
+        _reject_image_completion(
+            [{"role": "assistant", "content": f"it shows {mm.IMAGE_PAD_TOKEN} a cat"}]
+        )
+    _reject_image_completion([{"role": "assistant", "content": "it shows a cat"}])
+
+
 def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
     image_module = pytest.importorskip("PIL.Image")
     pil = image_module.new("RGB", (1, 1), "red")

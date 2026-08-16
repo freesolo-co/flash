@@ -302,7 +302,11 @@ def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
     return stripped
 
 
-def _reject_literal_image_placeholder(text: str, message_index: int) -> None:
+def _reject_literal_image_placeholder(
+    text: str,
+    message_index: int,
+    markers: tuple[str, ...] = (IMAGE_TEACHER_PLACEHOLDER, IMAGE_PAD_TOKEN),
+) -> None:
     """Reject prompt text that already contains a reserved image marker.
 
     two distinct markers, one reason. the rendered prompt marks image positions with
@@ -316,8 +320,12 @@ def _reject_literal_image_placeholder(text: str, message_index: int) -> None:
     contributes a run the renderer never produced -- and a run from text can make up for an image
     the provider silently dropped, which is exactly the failure the guard exists to catch. keeping
     it out of the source text is what makes "one run per image" mean what it says.
+
+    ``markers`` narrows the set for callers where only one of the two is live. local sft training
+    never renders the teacher placeholder, so a literal ``<|media_pad|>`` there is ordinary text
+    for a qwen tokenizer and rejecting it would be a false refusal.
     """
-    for marker in (IMAGE_TEACHER_PLACEHOLDER, IMAGE_PAD_TOKEN):
+    for marker in markers:
         if marker in text:
             raise ValueError(
                 f"message {message_index} text contains the reserved image marker "
@@ -493,6 +501,13 @@ def normalize_prompt_images(
             add_descriptor(source)
             image_blocks.append({"type": "image"})
         normalized[first_user]["content"] = [*content, *image_blocks]
+    # checked here, on the finished blocks, rather than inside the loop above: string content never
+    # enters that loop, and the top-level-image path appends to a message the loop already passed.
+    # this is the one point every shape has converged to the same form.
+    for message_index, message in enumerate(normalized):
+        for block in message["content"]:
+            if block.get("type") == "text":
+                _reject_literal_image_placeholder(block["text"], message_index, (IMAGE_PAD_TOKEN,))
     return NormalizedImages(normalized, descriptors)
 
 
