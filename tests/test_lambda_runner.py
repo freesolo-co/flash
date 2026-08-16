@@ -37,6 +37,23 @@ def _capsule_member(member: str) -> str:
     return contents[member].decode()
 
 
+def _run_capsule_member(member: str, namespace: dict) -> dict:
+    """RUN a shipped host program the way the capsule runs it, and return its namespace.
+
+    The host helpers keep their work under a ``__main__`` guard so that merely importing one is
+    inert, and the capsule reaches the work with ``runpy.run_module(run_name="__main__")``. A plain
+    ``exec`` does not: ``__name__`` falls through to builtins rather than raising, so the guard is
+    simply false and the program body never runs. Two tests here caught that by failing; a third
+    asserted that no upload happened and would have passed for the wrong reason.
+
+    So every site that means "run this program" goes through here, and nowhere else sets the name by
+    hand. Library members (bootstrap_secrets) are a different case and are exec'd as imports.
+    """
+    namespace["__name__"] = "__main__"
+    exec(_capsule_member(member), namespace)  # controlled run of the shipped host program
+    return namespace
+
+
 def _spec(gpu_type="A10", **gpu_kw) -> JobSpec:
     gpu = {"type": gpu_type, "max_wall_seconds": 3600, **gpu_kw}
     return JobSpec.from_dict(
@@ -3852,37 +3869,51 @@ def test_build_user_data_starts_no_spec_upload_at_deadline(monkeypatch):
 
 
 def test_host_artifact_helpers_start_no_hf_request_at_deadline(monkeypatch):
+    """At/after the deadline both helpers must abandon the upload BEFORE constructing HfApi.
+
+    This asserts an absence, so it needs a positive control: a helper that never ran also touches
+    HF zero times. The same clock is therefore replayed one second BEFORE the deadline, where each
+    helper must reach HfApi -- so the empty result at the deadline is the guard, not a no-op.
+    """
     import math
     import sys
     import types
 
-    calls = []
+    def run_at(now: float) -> list:
+        calls = []
 
-    class FakeApi:
-        def __init__(self, token=None):
-            calls.append("init")
+        class FakeApi:
+            def __init__(self, token=None):
+                calls.append("init")
 
-    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeApi))
-    monkeypatch.setattr(time, "time", lambda: 200.0)
-    payload = {
-        "flash_arm": "lambda",
-        "attempt": 0,
-        "run_id": "x",
-        "hf_prefix": "sft/x",
-        "hf_repo": "o/r",
-        "env": {},
-        "deadline_at": 200.0,
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 100.0,
-    }
+            def file_exists(self, **kwargs):
+                return True  # worker marker present: stop failmark before any upload
 
-    def fake_open(path, *args, **kwargs):
-        return io.StringIO(json.dumps(payload) if path == "/opt/flash/payload.json" else "")
+        monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeApi))
+        monkeypatch.setattr(time, "time", lambda: now)
+        payload = {
+            "flash_arm": "lambda",
+            "attempt": 0,
+            "run_id": "x",
+            "hf_prefix": "sft/x",
+            "hf_repo": "o/r",
+            "env": {},
+            "deadline_at": 200.0,
+            "run_created_at": 100.0,
+            "run_max_wall_seconds": 100.0,
+        }
 
-    namespace = {"json": json, "math": math, "time": time, "open": fake_open}
-    exec(_capsule_member("hostlog.py"), namespace)
-    exec(_capsule_member("failmark.py"), namespace)
-    assert calls == []
+        def fake_open(path, *args, **kwargs):
+            return io.StringIO(json.dumps(payload) if path == "/opt/flash/payload.json" else "")
+
+        for member in ("hostlog.py", "failmark.py"):
+            _run_capsule_member(
+                member, {"json": json, "math": math, "time": time, "open": fake_open}
+            )
+        return calls
+
+    assert run_at(200.0) == []
+    assert run_at(199.0) == ["init", "init"]
 
 
 def test_failmark_uses_truthful_detection_timestamp(monkeypatch):
@@ -3927,8 +3958,9 @@ def test_failmark_uses_truthful_detection_timestamp(monkeypatch):
             return io.StringIO(json.dumps(payload))
         return _Capture()
 
-    namespace = {"json": json, "math": math, "time": time, "open": fake_open}
-    exec(_capsule_member("failmark.py"), namespace)
+    _run_capsule_member(
+        "failmark.py", {"json": json, "math": math, "time": time, "open": fake_open}
+    )
 
     assert len(uploaded) == 1
     assert json.loads(written["marker"])["ts"] == 150.0
@@ -3987,12 +4019,14 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
         def fake_open(path, *a, **k):
             return io.StringIO(json.dumps(payload) if path == "/opt/flash/payload.json" else "")
 
-        glb = {
-            "json": json,
-            "sys": types.SimpleNamespace(argv=["failmark.py", "boom"]),
-            "open": fake_open,
-        }
-        exec(_capsule_member("failmark.py"), glb)  # controlled test of the shipped host script
+        _run_capsule_member(
+            "failmark.py",
+            {
+                "json": json,
+                "sys": types.SimpleNamespace(argv=["failmark.py", "boom"]),
+                "open": fake_open,
+            },
+        )
         return uploaded
 
     # Worker already wrote its marker -> host must NOT clobber it.
