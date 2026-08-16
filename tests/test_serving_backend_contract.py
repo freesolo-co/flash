@@ -25,6 +25,7 @@ REVISION = "run-abc@step-10." + "a" * 40
 SECOND_REVISION = "run-abc@step-20." + "b" * 40
 RUN_ID = "run-abc"
 BASE_MODEL = "Qwen/Qwen3.5-4B"
+_MESSAGES = [{"role": "user", "content": "hi"}]
 BAD_REPO = "bad/repo"
 REGISTRATION = {
     "adapter_id": REVISION,
@@ -585,11 +586,14 @@ def test_an_image_request_is_refused_rather_than_answered_blind(client, block_ty
 
 @pytest.mark.parametrize("limit", [0, -1, 1.5, True, "4"])
 def test_an_invalid_max_tokens_is_rejected(client, limit):
+    # the messages have to be valid, or the empty-messages guard answers 400 first and this
+    # passes without ever reaching the max_tokens check.
     response = client.post(
         "/v1/chat/completions",
-        json={"model": RUN_ID, "messages": [], "max_tokens": limit},
+        json={"model": RUN_ID, "messages": _MESSAGES, "max_tokens": limit},
     )
     assert response.status_code == 400
+    assert "max_tokens" in response.json()["detail"]
 
 
 @pytest.mark.parametrize(
@@ -604,12 +608,50 @@ def test_an_invalid_max_tokens_is_rejected(client, limit):
     ],
 )
 def test_invalid_sampling_values_are_rejected(client, field, value):
+    # same reason as max_tokens above: filler empty messages would trip the emptiness guard and
+    # return 400 without the sampling field being looked at.
     response = client.post(
         "/v1/chat/completions",
-        content=json.dumps({"model": RUN_ID, "messages": [], field: value}),
+        content=json.dumps({"model": RUN_ID, "messages": _MESSAGES, field: value}),
         headers={"Content-Type": "application/json"},
     )
     assert response.status_code == 400
+    assert field in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [None, [], "hi", {"role": "user"}, ["hi"], [{"role": "user", "content": "hi"}, "hi"]],
+)
+def test_unusable_messages_are_refused_before_a_gpu_is_woken(client, messages, monkeypatch):
+    """bad `messages` must 400 on the api container, not 500 from the gpu.
+
+    `_request` builds the `GenerationRequest` inside the engine, so without an api-side guard
+    these payloads reach `engine.generate.remote` first: modal wakes a gpu replica, and the
+    runtime's own rejection surfaces as an unhandled 500. every other bad chat input answers 400
+    without leaving the api container, so this asserts the gpu is never called at all.
+    """
+    # the adapter has to be ready and active, or the request 404s at model resolution and never
+    # reaches the engine no matter what the guard does -- which would make `calls == []` below
+    # true for the wrong reason.
+    _register_and_ready(client)
+    assert _activate(client).status_code == 200
+    calls: list[object] = []
+    module = client.app.state.generated_module
+    monkeypatch.setattr(
+        module.engine.generate,
+        "remote",
+        types.SimpleNamespace(aio=lambda *a, **k: calls.append(a)),
+    )
+    payload = {"model": RUN_ID}
+    if messages is not None:
+        payload["messages"] = messages
+
+    response = client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert "non-empty list" in response.json()["detail"]
+    assert calls == []
 
 
 def test_a_registered_grammar_reaches_the_adapter_spec(generated_module):
