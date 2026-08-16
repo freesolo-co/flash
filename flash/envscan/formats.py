@@ -5,7 +5,7 @@ filename: the extension is the publisher's choice, and a renamed archive is stil
 are deliberately structural rather than name-based, and several are the difference between a
 credential being expanded into view and being published intact.
 
-Split from `flash.env_secrets` to keep that module under the file-size limit. The dependency runs
+Split from `flash.envscan.secrets` to keep that module under the file-size limit. The dependency runs
 one way -- nothing here imports the pattern matching, so these can be tested on bytes alone.
 """
 
@@ -17,7 +17,7 @@ import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
-from flash.env_deflate import _gzip_header_unfinished
+from flash.envscan.deflate import _gzip_header_unfinished
 
 # The end-of-central-directory signature, and how much of a stream's tail to keep so it can be
 # found. A zip's end record is last in the file, within 64 KiB of the end (the comment field is
@@ -36,7 +36,7 @@ _ZIP64_END_BYTES = 76
 
 # How many members of one archive are inspected before it is refused as unscannable. Defined here
 # because the directory walk below needs a bound of its own, and re-exported through
-# `flash.env_secrets`, which is where the policy is applied and where tests rebind it.
+# `flash.envscan.secrets`, which is where the policy is applied and where tests rebind it.
 _MAX_ARCHIVE_MEMBERS = 100_000
 
 # Leading bytes of the compressed containers worth expanding. Detected by magic rather than by

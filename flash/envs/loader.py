@@ -285,9 +285,13 @@ def _urlopen(
                 ) from exc
             # 404 (no such repo, or one the token cannot read) and 422 (a ref that does not exist,
             # e.g. "No commit found for SHA: main" on a master-default repo) are settled answers.
+            # 401 and a non-rate-limit 403 join them: the rate-limit shapes are already claimed
+            # above, so what is left is a token this plane cannot fix by waiting -- invalid,
+            # expired, or lacking the scope. deferring those rents a GPU to rediscover the same
+            # credential error on the worker.
             # Typed so the submit-time pin can fail closed on them while still deferring a blip;
             # every other code keeps the untyped RuntimeError it has always raised.
-            if exc.code in (404, 422):
+            if exc.code in (401, 403, 404, 422):
                 raise GitHubPermanentError(
                     f"GitHub environment request failed ({exc.code}): {body[:500]}"
                 ) from exc

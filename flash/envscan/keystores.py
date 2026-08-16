@@ -4,14 +4,14 @@ Two formats whose verdict is not "is a credential here" but "have enough bytes a
 Both are walked entry by entry from the head of a stream, so a store or a keyring larger than one
 scan chunk is undecided rather than clean -- and undecided is what the caller turns into a refusal.
 
-Split out of `flash.env_secrets` to keep that module under the file-size limit. The dependency runs
+Split out of `flash.envscan.secrets` to keep that module under the file-size limit. The dependency runs
 one way: this knows about the two formats' structure, nothing about files, packages or the scan.
 """
 
 from __future__ import annotations
 
-from flash.env_formats import _KEYSTORE_MAGIC, _jks_private_key_entries
-from flash.env_openpgp import (
+from flash.envscan.formats import _KEYSTORE_MAGIC, _jks_private_key_entries
+from flash.envscan.openpgp import (
     _is_openpgp_encrypted,
     _is_openpgp_secret_key,
     _openpgp_secret_key_in_sequence,
@@ -39,7 +39,7 @@ class _Unscannable(Exception):
     about what they mean, which is "not verified", not "verified clean".
 
     Defined HERE rather than in the scanner because the two walks below raise it and the scanner
-    imports them, so the other direction would be a cycle. Re-exported from `flash.env_secrets`,
+    imports them, so the other direction would be a cycle. Re-exported from `flash.envscan.secrets`,
     which is where every other raise site and every test reads it from.
     """
 

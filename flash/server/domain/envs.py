@@ -15,13 +15,6 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from flash.env_secrets import (
-    _MAX_DECOMPRESS_SECONDS,
-    _redacted,
-    _Unscannable,
-    credential_in_name,
-    reject_credential_bearing_package,
-)
 from flash.envs.loader import _github_token
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
@@ -30,6 +23,13 @@ from flash.envs.package.limits import (
     LimitedArchiveReader,
     archive_stream_limit,
     tar_member_segments,
+)
+from flash.envscan.secrets import (
+    _MAX_DECOMPRESS_SECONDS,
+    _redacted,
+    _Unscannable,
+    credential_in_name,
+    reject_credential_bearing_package,
 )
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024

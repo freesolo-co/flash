@@ -7,7 +7,7 @@ and raised only after the rest of the archive has been scanned, so a credential 
 wins over the weaker "cannot read" answer, while an archive nothing could be read from is refused
 rather than approved.
 
-Split from `flash.env_secrets` to keep that module under the file-size limit. The scanner and its
+Split from `flash.envscan.secrets` to keep that module under the file-size limit. The scanner and its
 refusal are passed in rather than imported, so the dependency still runs one way: this knows about
 archive structure, and what a member's bytes MEAN stays with the caller.
 """
@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO
 
-from flash.env_formats import _read_at, _zip_end_offset, _zip_member_count
+from flash.envscan.formats import _read_at, _zip_end_offset, _zip_member_count
 
 # What "this member cannot be read" looks like, across both formats and every codec underneath them.
 #
