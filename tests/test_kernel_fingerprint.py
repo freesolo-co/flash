@@ -188,52 +188,65 @@ def test_the_flash_attn_wheel_digests_are_in_lockstep():
         )
 
 
-def test_huggingface_hub_floor_is_in_lockstep():
-    """The huggingface_hub floor is declared twice for the worker: Dockerfile.worker bakes it into the
-    per-arch image (the default run path) and WORKER_DEPS installs it on the no-image/live-function
-    path. They must stay equal so both paths carry the same built-in 429 RateLimit auto-retry floor."""
-    from flash.providers.runpod.serverless import WORKER_DEPS
+def _pyproject_specs(name: str) -> list[str]:
+    """Every requirement for `name` declared anywhere in pyproject's dependency tables."""
+    import tomllib
 
+    data = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    project = data.get("project", {})
+    groups: list[list] = [project.get("dependencies", []) or []]
+    groups += [v or [] for v in (project.get("optional-dependencies", {}) or {}).values()]
+    groups += [v or [] for v in (data.get("dependency-groups", {}) or {}).values()]
+    wanted = name.replace("_", "-").lower()
+    return [
+        str(s)
+        for group in groups
+        for s in group
+        if isinstance(s, str) and kf._pkg_name(s).replace("_", "-").lower() == wanted
+    ]
+
+
+def test_huggingface_hub_floor_is_in_lockstep():
+    """The huggingface_hub floor is declared for both halves of a run: Dockerfile.worker bakes it
+    into the per-arch image the GPU runs, and pyproject declares it for the control plane that
+    talks to the same Hub. They must stay equal so both carry the same built-in 429 RateLimit
+    auto-retry floor -- a lower floor on either side reintroduces unretried rate limits there."""
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
     docker_hf = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "huggingface_hub"]
-    worker_hf = [d for d in WORKER_DEPS if kf._pkg_name(d) == "huggingface_hub"]
     # Exactly one pin per source, else a duplicate/drifted entry could hide behind the first match.
     assert len(docker_hf) == 1, (
         f"expected one huggingface_hub pin in Dockerfile.worker, found {docker_hf}"
     )
-    assert len(worker_hf) == 1, (
-        f"expected one huggingface_hub pin in WORKER_DEPS, found {worker_hf}"
-    )
-    assert docker_hf[0] == worker_hf[0], (
-        f"huggingface_hub floor drift: Dockerfile.worker={docker_hf[0]!r} vs WORKER_DEPS={worker_hf[0]!r}; "
-        "bump both together so the baked image and the live-function path share the 429 retry floor"
+    project_hf = _pyproject_specs("huggingface_hub")
+    assert project_hf, "expected a huggingface-hub requirement in pyproject.toml"
+    # the two files spell the distribution differently (underscore in the Dockerfile, dash in
+    # pyproject), so compare the normalized name plus the version specifier.
+    docker_floor = docker_hf[0].replace("_", "-")
+    assert set(project_hf) == {docker_floor}, (
+        f"huggingface_hub floor drift: Dockerfile.worker={docker_hf[0]!r} vs "
+        f"pyproject={sorted(set(project_hf))}; bump them together so the worker image and the "
+        "control plane share the 429 retry floor"
     )
 
 
 def test_freesolo_floor_is_in_lockstep():
     """Same argument as the huggingface_hub floor, for the Freesolo SDK.
 
-    Dockerfile.worker bakes a freesolo floor into the per-arch image (the default run path) and
-    FREESOLO_WORKER_SPEC installs one on the no-image/live-function path. They must stay equal:
-    the image's floor is the one that actually governs, so a lower floor there means the default
-    path can resolve an SDK the no-image path would have rejected.
+    Dockerfile.worker bakes a freesolo floor into the per-arch image the GPU runs, and
+    FREESOLO_WORKER_SPEC is the floor env packaging installs. They must stay equal: the image's
+    floor is the one that actually governs, so a lower floor there means a run can resolve an SDK
+    the env package would have rejected.
     """
     from flash.envs.base import FREESOLO_WORKER_SPEC
-    from flash.providers.runpod.serverless import WORKER_DEPS
 
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
     docker_fs = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "freesolo"]
-    worker_fs = [d for d in WORKER_DEPS if kf._pkg_name(d) == "freesolo"]
     # Exactly one pin per source, else a duplicate/drifted entry could hide behind the first match.
     assert len(docker_fs) == 1, f"expected one freesolo pin in Dockerfile.worker, found {docker_fs}"
-    assert len(worker_fs) == 1, f"expected one freesolo pin in WORKER_DEPS, found {worker_fs}"
-    assert worker_fs[0] == FREESOLO_WORKER_SPEC, (
-        "WORKER_DEPS must carry FREESOLO_WORKER_SPEC itself, not a copy that can drift from it"
-    )
     assert docker_fs[0] == FREESOLO_WORKER_SPEC, (
         f"freesolo floor drift: Dockerfile.worker={docker_fs[0]!r} vs "
         f"FREESOLO_WORKER_SPEC={FREESOLO_WORKER_SPEC!r}; bump both together so the baked image and "
-        "the live-function path require the same SDK"
+        "the env package require the same SDK"
     )
 
 

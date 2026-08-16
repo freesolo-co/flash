@@ -85,9 +85,9 @@ class LambdaJobHandle(InstanceJobHandle):
 
 def lambda_image(gpu: str | None = None) -> str:
     """Return the worker Docker image for the given GPU class (per-SM tag or base)."""
-    from flash.providers._lifecycle.worker import WORKER_IMAGE, worker_image_for_gpu
+    from flash.providers._lifecycle.worker import worker_image_for_gpu
 
-    return worker_image_for_gpu(gpu, allow_default=True) or WORKER_IMAGE
+    return worker_image_for_gpu(gpu)
 
 
 def build_payload(
