@@ -3,7 +3,6 @@ cross-process cancel, and attach (CPU-only; all network mocked)."""
 
 from __future__ import annotations
 
-import base64
 import io
 import re
 import sys
@@ -94,13 +93,10 @@ def test_job_handle_roundtrip_and_rejects_legacy_shapes():
 
 
 def test_decode_output_success():
-    import cloudpickle
-
     from flash.providers.runpod.jobs import decode_output
 
     metrics = {"trained_eval_acc": 0.9, "cost_usd": 0.5}
-    out = {"success": True, "result": base64.b64encode(cloudpickle.dumps(metrics)).decode()}
-    assert decode_output(out) == metrics
+    assert decode_output(metrics) == metrics
 
 
 def test_decode_output_error_includes_stdout_tail():
@@ -179,8 +175,6 @@ def test_decode_output_tail_is_sanitized_before_the_bound(monkeypatch):
 # poll_job state machine (mocked runpod_api)
 # ---------------------------------------------------------------------------
 def _poll(monkeypatch, statuses, heartbeats=None, stall_after_s=10.0):
-    import cloudpickle
-
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
@@ -191,10 +185,7 @@ def _poll(monkeypatch, statuses, heartbeats=None, stall_after_s=10.0):
 
     reader = (lambda force=False: next(hb_iter, None)) if hb_iter is not None else None
     h = _runpod_handle(jobs)
-    ok_payload = {
-        "success": True,
-        "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
-    }
+    ok_payload = {"acc": 1.0}
     return jobs.poll_job(
         h,
         interval_s=0,
@@ -204,12 +195,7 @@ def _poll(monkeypatch, statuses, heartbeats=None, stall_after_s=10.0):
 
 
 def test_poll_job_completes(monkeypatch):
-    import cloudpickle
-
-    ok = {
-        "success": True,
-        "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
-    }
+    ok = {"acc": 1.0}
     res, _ = _poll(
         monkeypatch,
         [
@@ -1560,7 +1546,6 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
     monkeypatch.setattr(
         jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name", _RUNPOD_FINGERPRINT)
     )
-    monkeypatch.setattr(jobs, "build_function_input", lambda payload: payload)
     monkeypatch.setattr(
         runpod_api,
         "submit_job",
@@ -1594,7 +1579,6 @@ def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkey
     monkeypatch.setattr(
         jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name", _RUNPOD_FINGERPRINT)
     )
-    monkeypatch.setattr(jobs, "build_function_input", lambda payload: payload)
     monkeypatch.setattr(runpod_api, "submit_job", lambda *_a, **_kw: "job-1")
     monkeypatch.setattr(
         jobs,
@@ -1855,12 +1839,10 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     # A job that leaves IN_QUEUE (a worker picks it up) must clear the queue timer: the later
     # IN_PROGRESS/COMPLETED path is governed by the heartbeat/setup windows, never by queue_grace_s.
-    import cloudpickle
-
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    ok = {"success": True, "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode()}
+    ok = {"acc": 1.0}
     # A few IN_QUEUE polls, THEN IN_PROGRESS (a worker picked it up), then COMPLETED — exercising the
     # actual leave-the-queue transition the queue timer must clear on. Real wall-clock (no fake clock)
     # so elapsed stays far under queue_grace_s; the timer clears on leaving IN_QUEUE and never
@@ -1889,14 +1871,11 @@ def test_poll_job_throttled_timer_resets_on_leaving_queue(monkeypatch):
     # IN_PROGRESS spell: if RunPod re-queues the job (still throttled), the throttled grace must be
     # measured from the re-queue, not the original arm. Otherwise the first re-queue probe fires
     # no_capacity instantly, defeating throttled_grace_s. Clock advances one tick per job_status poll.
-    import base64
-
-    import cloudpickle
 
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    ok = {"success": True, "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode()}
+    ok = {"acc": 1.0}
     statuses = iter(
         [
             {"status": "IN_QUEUE"},  # arm throttled_timer (~t=100)
@@ -2392,10 +2371,7 @@ def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
 def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
     # A brief unhealthy blip during cold start that then yields a usable worker must NOT trip the
     # fast-fail (it resets once a usable/initializing worker appears) — only a STUCK unhealthy does.
-    import base64
     import itertools
-
-    import cloudpickle
 
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
@@ -2407,10 +2383,7 @@ def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
             {"status": "IN_PROGRESS"},
             {
                 "status": "COMPLETED",
-                "output": {
-                    "success": True,
-                    "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
-                },
+                "output": {"acc": 1.0},
             },
         ]
     )
@@ -2483,10 +2456,7 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
 def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
     # A brief throttle during cold start that then yields a usable worker must NOT trip the
     # fast-fail (it resets once a usable worker appears) — only a STUCK throttle does.
-    import base64
     import itertools
-
-    import cloudpickle
 
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
@@ -2498,10 +2468,7 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
             {"status": "IN_PROGRESS"},
             {
                 "status": "COMPLETED",
-                "output": {
-                    "success": True,
-                    "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
-                },
+                "output": {"acc": 1.0},
             },
         ]
     )
@@ -2585,6 +2552,32 @@ def test_failure_detail_reader_preserves_full_worker_artifacts(monkeypatch):
     assert "CONSOLE-END" in detail
 
 
+def test_failure_detail_reader_reads_only_the_current_attempt_console(monkeypatch):
+    from flash.providers.artifacts import hf as _hf_artifacts
+
+    requested: list[str] = []
+
+    def fake_reader(_hf_repo, path_in_repo, _min_interval_s):
+        requested.append(path_in_repo)
+        return lambda force=False: (
+            "last live bytes" if path_in_repo.endswith("console_sft_attempt2.txt") else None
+        )
+
+    monkeypatch.setattr(_hf_artifacts, "make_hf_text_reader", fake_reader)
+    reader = _hf_artifacts.make_hf_failure_detail_reader(
+        "org/repo", "sft/run-1/seed0", "sft", attempt=2
+    )
+
+    detail = reader(force=True)
+
+    assert requested[-2:] == [
+        "sft/run-1/seed0/console_sft.txt",
+        "sft/run-1/seed0/console_sft_attempt2.txt",
+    ]
+    assert "--- console_sft_attempt2.txt ---" in detail
+    assert "last live bytes" in detail
+
+
 def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
     # Without a heartbeat_reader we can't tell setup from training, so the larger
     # setup_grace must NOT silently slow stall detection — stay on stall_after_s.
@@ -2609,15 +2602,10 @@ def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
 
 
 def test_poll_job_tolerates_transient_api_errors(monkeypatch):
-    import cloudpickle
-
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    ok = {
-        "success": True,
-        "result": base64.b64encode(cloudpickle.dumps({"acc": 0.7})).decode(),
-    }
+    ok = {"acc": 0.7}
     calls = {"n": 0}
 
     def flaky(eid, jid, **_kw):
@@ -6096,7 +6084,7 @@ def _patch_deploy_deps(monkeypatch, jobs, *, set_key: bool = True):
     monkeypatch.setattr(jobs, "endpoint_name", lambda g, s: f"flash-{g}-test")
     monkeypatch.setattr(jobs, "min_cuda_for", lambda g: "12.8")
     monkeypatch.setattr(jobs, "WORKER_IMAGE", "fake-image")
-    monkeypatch.setattr(jobs, "worker_image_for_gpu", lambda g, allow_default=True: "fake-image")
+    monkeypatch.setattr(jobs, "worker_image_for_gpu", lambda g: "fake-image")
     monkeypatch.setattr(jobs, "DEFAULT_EXECUTION_TIMEOUT_MS", 3600000)
     monkeypatch.setattr(jobs, "apply_disk_gb", lambda c, d: None)
     monkeypatch.setattr(jobs, "time", type("T", (), {"sleep": staticmethod(lambda s: None)})())

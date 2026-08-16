@@ -7,25 +7,15 @@ import contextlib
 import os
 import re
 import threading
-from typing import Any
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.providers._lifecycle.worker import (
-    DEFAULT_EXECUTION_TIMEOUT_MS,
-    WORKER_SYSTEM_DEPS,
-    logger,
-    resolve_worker_deps,
-    worker_image_for_gpu,
-)
+from flash.providers._lifecycle.worker import logger
 from flash.providers.base import canonical_gpu, gpu_short
-from flash.providers.runpod.gpus import flash_gpu
 
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
 
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-
-_ENDPOINT_CACHE: dict[str, Any] = {}
 
 
 def _reset_flash_resource_manager(rm_module) -> None:
@@ -57,6 +47,7 @@ def _train_body(input_data: dict) -> dict:
     """
     import collections
     import contextlib
+    import importlib.util
     import json
     import math
     import os
@@ -447,6 +438,15 @@ def _train_body(input_data: dict) -> dict:
                         raise exc from None
             raise AssertionError("unreachable")
 
+        def _load_exact_module(code_dir: str, relative_path: str, name: str):
+            path = os.path.join(code_dir, relative_path)
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"could not load downloaded module: {relative_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
         def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
             from huggingface_hub import HfApi, hf_hub_download
 
@@ -484,6 +484,16 @@ def _train_body(input_data: dict) -> dict:
         code_prefix = _code_prefix()
         _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
         code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
+        console_module = _load_exact_module(
+            code_dir,
+            "flash/providers/_lifecycle/bootstrap_console.py",
+            "_flash_downloaded_bootstrap_console",
+        )
+        artifact_module = _load_exact_module(
+            code_dir,
+            "flash/adapters/artifacts.py",
+            "_flash_downloaded_artifacts",
+        )
 
         env = dict(os.environ)
         env.update(overrides)
@@ -503,16 +513,27 @@ def _train_body(input_data: dict) -> dict:
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
 
-        def _upload_console(mode: str) -> None:
-            """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
-            console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
-            from both the subprocess-failure path and the missing-metrics crash path: a worker killed
-            without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
-            ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
-            crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque."""
+        console_teardown = threading.Event()
+
+        def _upload_console(mode: str, final: bool = False) -> bool:
+            """Upload the captured console tail for ``mode`` to the run repo.
+
+            Idempotent and best-effort, so it is safe to call from both the subprocess-failure path
+            and the missing-metrics crash path: a worker killed without a Python exception
+            (OOM/SIGKILL, segfault, or a silent early exit) writes NO ``error_<mode>.txt``, so the
+            captured console is then the only root-cause record -- and a crash that exits 0 would
+            otherwise skip the upload entirely, leaving the failure opaque.
+
+            ``final`` writes the canonical ``console_<mode>.txt`` and closes the live path; live
+            snapshots are attempt-scoped so a retry cannot overwrite the previous attempt's tail.
+            """
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
-                return
+                return False
+            if final:
+                console_teardown.set()
+            elif console_teardown.is_set():
+                return False
             try:
                 from huggingface_hub import HfApi
 
@@ -520,7 +541,7 @@ def _train_body(input_data: dict) -> dict:
                 spec = json.loads(input_data["job_spec_json"])
                 phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
                 prefix = f"{phase_ns}/{spec['run_id']}"
-                # Keep the newest bytes only; the uploaded tail's end is never truncated.
+                # keep the newest bytes only; the uploaded tail's end is never truncated.
                 tail_bytes = 64_000
                 with open(console, "rb") as f:
                     f.seek(0, os.SEEK_END)
@@ -547,27 +568,37 @@ def _train_body(input_data: dict) -> dict:
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
-                with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
+                suffix = ".final.tail" if final else ".live.tail"
+                tail_path = console + suffix
+                with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
+                if not final and console_teardown.is_set():
+                    return False
+                attempt = int(env.get("ATTEMPT") or 0)
+                artifact = (
+                    f"console_{mode}.txt"
+                    if final
+                    else artifact_module.attempt_scoped_artifact_name("console", mode, attempt)
+                )
                 HfApi(token=env.get("HF_TOKEN")).upload_file(
-                    path_or_fileobj=console + ".tail",
-                    path_in_repo=f"{prefix}/console_{mode}.txt",
+                    path_or_fileobj=tail_path,
+                    path_in_repo=f"{prefix}/{artifact}",
                     repo_id=input_data["hf_repo"],
                     repo_type="dataset",
                 )
+                return True
             except Exception as e:
                 print("console upload warn:", _safe_detail(e, env))
+                return False
 
         def run_mode(mode: str, check: bool) -> int:
-            """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
+            """run the worker, stream its console, and upload live and terminal tails."""
             console = f"/tmp/console_{mode}.txt"
-            interval = 3600.0
             stop_upload = threading.Event()
 
-            def _upload_loop() -> None:
-                while not stop_upload.wait(interval):
-                    _upload_console(mode)  # best-effort; swallows its own errors
+            def _upload_live() -> bool:
+                return _upload_console(mode)
 
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
@@ -580,7 +611,12 @@ def _train_body(input_data: dict) -> dict:
                     text=True,
                     errors="replace",
                 )
-                uploader = threading.Thread(target=_upload_loop, daemon=True)
+                uploader = threading.Thread(
+                    target=console_module._run_console_upload_loop,
+                    args=(console, 3600.0, stop_upload),
+                    kwargs={"upload": _upload_live},
+                    daemon=True,
+                )
                 uploader.start()
                 try:
                     for line in proc.stdout:
@@ -594,7 +630,7 @@ def _train_body(input_data: dict) -> dict:
                 finally:
                     stop_upload.set()
                     uploader.join(timeout=10)
-            _upload_console(mode)
+            _upload_console(mode, final=True)
             if proc.returncode != 0 and check:
                 raise RuntimeError(
                     f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
@@ -610,7 +646,6 @@ def _train_body(input_data: dict) -> dict:
         run_mode(input_data["phase"], check=False)
         if not os.path.exists("/tmp/metrics.json"):
             phase = input_data["phase"]
-            _upload_console(phase)
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
                 f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
@@ -702,65 +737,6 @@ def endpoint_name(friendly_gpu: str, suffix: str | None = None) -> str:
     return f"{base}-{safe}" if safe else base
 
 
-def get_train_endpoint(
-    friendly_gpu: str,
-    execution_timeout_ms: int | None = None,
-    name_suffix: str | None = None,
-    disk_gb: int | None = None,
-    spec=None,
-):
-    """Build (and cache) the live Flash endpoint handler for a GPU class."""
-    from runpod_flash import Endpoint
-
-    from flash.core.spec import gpu_count_of
-    from flash.providers.runpod.auth import ensure_auth
-
-    ensure_auth()
-    _patch_runpod_backoff()
-
-    friendly = canonical_gpu(friendly_gpu)
-    name = endpoint_name(friendly, name_suffix)
-    cache_handler = name_suffix is None
-    with FLASH_SDK_LOCK:
-        isolate_flash_state(name_suffix)
-        if cache_handler and name in _ENDPOINT_CACHE:
-            return _ENDPOINT_CACHE[name]
-        kwargs = {
-            "name": name,
-            "gpu": flash_gpu(friendly),
-            # one worker occupies gpu.count cards of this class; count == 1 is the historical path.
-            "gpu_count": gpu_count_of(spec),
-            "min_cuda_version": min_cuda_for(friendly),
-            "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-            "workers": (0, 1),
-        }
-        image = worker_image_for_gpu(friendly, allow_default=False)
-        if image:
-            kwargs["image"] = image
-        else:
-            kwargs["dependencies"] = resolve_worker_deps()
-            kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-        # Local import: avoids a jobs<->endpoints import cycle (jobs imports this module).
-        from flash.providers.runpod.jobs import (
-            grow_weight_cache_volumes,
-            weight_cache_endpoint_kwargs,
-        )
-
-        # resize before attach because existing volumes keep their provisioned size.
-        # reread the key after waiting for the lock so resize and Endpoint use the same account.
-        grow_weight_cache_volumes(spec, ensure_auth())
-        kwargs.update(weight_cache_endpoint_kwargs(spec))
-        ep = Endpoint(**kwargs)
-        handler = ep(_train_body)
-        from flash.providers.runpod.jobs import apply_disk_gb
-
-        cfg = ep._build_resource_config()
-        apply_disk_gb(cfg, disk_gb)
-        if cache_handler:
-            _ENDPOINT_CACHE[name] = handler
-        return handler
-
-
 def _run_suffix(run_id: str | None) -> str | None:
     """Stable, collision-free per-run endpoint suffix: sha1(run_id)[:8] with a readable prefix.
 
@@ -774,27 +750,6 @@ def _run_suffix(run_id: str | None) -> str | None:
     h = hashlib.sha1(run_id.encode()).hexdigest()[:8]
     prefix = re.sub(r"[^a-z0-9]", "", run_id.lower())[-12:]
     return f"{prefix}{h}" if prefix else h
-
-
-def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
-    """Scale cached endpoint(s) to zero. Only touches in-process cache; use terminate_endpoint for cross-process teardown."""
-    friendly = canonical_gpu(friendly_gpu)
-    prefix = f"flash-{gpu_short(friendly)}"
-    if name:
-        match = [k for k in _ENDPOINT_CACHE if k == name]
-    else:
-        match = [k for k in _ENDPOINT_CACHE if k.startswith(prefix)]
-    for key in match:
-        handler = _ENDPOINT_CACHE.pop(key, None)
-        ep = getattr(handler, "__self__", None) or getattr(handler, "endpoint", None)
-        for meth in ("scale_to_zero", "stop", "delete"):
-            fn = getattr(ep, meth, None)
-            if callable(fn):
-                try:
-                    fn()
-                    break
-                except Exception:
-                    continue
 
 
 def _endpoint_name_matches_run(name: str, target: str) -> bool:
@@ -936,6 +891,4 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
     except Exception as exc:
         logger.warning("REST endpoint cleanup failed for %s: %s", target, exc)
 
-    with contextlib.suppress(Exception):
-        stop_endpoint(friendly, name=target)
     return results

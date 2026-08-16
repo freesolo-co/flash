@@ -14,11 +14,11 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import ClassVar
 
 from flash.providers._lifecycle.instance import (
     InstanceJobHandle,
+    _instance_capsule,
     _spill_large_spec_to_hf,
     instance_label,
     label_matches_run,
@@ -116,9 +116,9 @@ def vast_image(gpu: str | None = None) -> str:
     Vast runs the worker via its own onstart, so the image's CMD is irrelevant — only the baked
     deps/cache matter. The Blackwell driver floor lives in the ``cuda_max_good`` offer filter, not
     the image."""
-    from flash.providers._lifecycle.worker import WORKER_IMAGE, worker_image_for_gpu
+    from flash.providers._lifecycle.worker import worker_image_for_gpu
 
-    return worker_image_for_gpu(gpu) or WORKER_IMAGE
+    return worker_image_for_gpu(gpu)
 
 
 def build_payload(
@@ -161,14 +161,12 @@ def build_onstart(payload: dict) -> str:
     # base64 payload and can blow Vast's onstart length limit, failing the rent. Idempotent.
     payload = _spill_large_spec_to_hf(payload)
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
-    # Ship the SHARED instance bootstrap (providers/_lifecycle/bootstrap.py) plus EVERY sibling it
-    # imports as a bare module from its own directory. Those imports are unconditional on the box
-    # (``__package__`` is empty for a bare script), so a missing sibling is not a degraded install
-    # but a ModuleNotFoundError before any work starts -- on a box already rented and billing.
-    lifecycle_dir = Path(__file__).parent.parent.parent / "_lifecycle"
-    bootstrap_src = (lifecycle_dir / "bootstrap.py").read_text()
-    bootstrap_secrets_src = (lifecycle_dir / "bootstrap_secrets.py").read_text()
-    bootstrap_pip_src = (lifecycle_dir / "bootstrap_pip.py").read_text()
+    # Ship the SHARED instance bootstrap and its siblings as ONE verified capsule -- the same
+    # artifact Lambda runs, so the two providers cannot drift. Its members are sha256'd in the
+    # manifest and the archive is checked against the digest below before anything executes: on a
+    # box already rented and billing, a truncated or substituted payload must fail loudly rather
+    # than half-install.
+    capsule_b64, capsule_sha256 = _instance_capsule()
     # Vast's args-mode wrapper resets PATH, so `python3` can resolve to the OS python (PEP 668
     # externally-managed), not the image's stack python. Prefer the image's baked interpreter
     # (conda / /usr/local) where torch + huggingface_hub live; fall back to python3.
@@ -191,17 +189,19 @@ cat > /root/flash/payload.b64 <<'FLASH_PAYLOAD_EOF'
 {payload_b64}
 FLASH_PAYLOAD_EOF
 base64 -d /root/flash/payload.b64 > /root/flash/payload.json
-cat > /root/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
-{bootstrap_src}
-FLASH_BOOTSTRAP_EOF
-cat > /root/flash/bootstrap_secrets.py <<'FLASH_BOOTSTRAP_SECRETS_EOF'
-{bootstrap_secrets_src}
-FLASH_BOOTSTRAP_SECRETS_EOF
-cat > /root/flash/bootstrap_pip.py <<'FLASH_BOOTSTRAP_PIP_EOF'
-{bootstrap_pip_src}
-FLASH_BOOTSTRAP_PIP_EOF
-"$PYBIN" /root/flash/bootstrap.py
+cat > /root/flash/capsule.b64 <<'FLASH_CAPSULE_EOF'
+{capsule_b64}
+FLASH_CAPSULE_EOF
+base64 -d /root/flash/capsule.b64 > /root/flash/capsule.pyz
+# verify BEFORE the first execution. the expected digest is supplied by the control plane, not read
+# out of the archive, so a consistently-rewritten capsule still fails here.
+if ! echo "{capsule_sha256}  /root/flash/capsule.pyz" | sha256sum -c - >/dev/null 2>&1; then
+  echo "flash: runtime capsule failed verification" >&2
+  FLASH_RC=1
+else
+"$PYBIN" /root/flash/capsule.pyz bootstrap
 FLASH_RC=$?
+fi
 # On failure, hold the box for 10 min so the control plane can pull the container log tail via the
 # Vast logs API (the only home of early-bootstrap errors visible before the worker reaches HF); it
 # destroys us much sooner when alive. Success self-destroys immediately.
