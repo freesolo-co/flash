@@ -173,14 +173,30 @@ def test_pretokenize_completion_only_drops_empty_and_keeps_lockstep():
     from flash.engine.worker.entry.sft import _pretokenize_completion_only
 
     tok = _FakeTok(eos="!")
+    # every row carries the full source transcript and template kwargs the masker requires; these
+    # rows are not ChatML, so the mask stays the contiguous completion span.
     texts = [
-        {"text": "ABxy", "prompt_text": "AB", "target_messages": []},  # real completion -> kept
+        {
+            "text": "ABxy",
+            "prompt_text": "AB",
+            "target_messages": [],
+            "source_messages": [],
+            "template_kwargs": {},
+        },  # real completion -> kept
         {
             "text": "AB",
             "prompt_text": "AB!",
             "target_messages": [],
+            "source_messages": [],
+            "template_kwargs": {},
         },  # prompt == full row -> all-zero mask -> dropped
-        {"text": "CDz", "prompt_text": "CD", "target_messages": []},  # real completion -> kept
+        {
+            "text": "CDz",
+            "prompt_text": "CD",
+            "target_messages": [],
+            "source_messages": [],
+            "template_kwargs": {},
+        },  # real completion -> kept
     ]
     kept_texts, pretok, n_dropped = _pretokenize_completion_only(texts, tok, max_length=100)
     assert n_dropped == 1
@@ -205,11 +221,15 @@ def test_pretokenize_drops_content_free_completion():
             "text": "AB",
             "prompt_text": "AB",
             "target_messages": [],
+            "source_messages": [],
+            "template_kwargs": {},
         },  # full [1,A,B,!]; prompt [1,A,B] -> completion=[!] (EOS) -> dropped
         {
             "text": "ABx",
             "prompt_text": "AB",
             "target_messages": [],
+            "source_messages": [],
+            "template_kwargs": {},
         },  # completion=[x,!] has real token x -> kept
     ]
     kept_texts, _pretok, n_dropped = _pretokenize_completion_only(texts, tok, max_length=100)

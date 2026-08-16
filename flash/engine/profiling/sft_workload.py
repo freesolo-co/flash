@@ -146,24 +146,21 @@ def _processor_tokenized_row(
     input_ids = untruncated_ids[:max_length]
     prompt_ids = ids(prompt["input_ids"])[:max_length]
     # the span reader needs the text tokenizer's vocabulary; a processor exposes it as .tokenizer.
-    role_mask = assistant_only_mask(
+    mask, role_aware = assistant_only_mask(
         completion_mask_from_ids(prompt_ids, input_ids),
         input_ids,
         getattr(processor, "tokenizer", processor),
         completion_messages,
+        # this path appends nothing of its own, so there is no appended EOS to preserve.
         appended_eos=False,
         template_source=processor,
+        # the IMAGE-PREPARED messages, which is what the processor actually rendered: probing the
+        # unprepared list would validate a different transcript than the one being masked.
         source_messages=full_messages,
         template_kwargs={"enable_thinking": thinking},
     )
     full.pop("attention_mask", None)
-    return (
-        input_ids,
-        role_mask.mask,
-        _serialize_multimodal_inputs(full),
-        untruncated_length,
-        role_mask.role_aware,
-    )
+    return input_ids, mask, _serialize_multimodal_inputs(full), untruncated_length, role_aware
 
 
 def _materialize_verl_images(
@@ -287,8 +284,10 @@ class _TokenizedSftRows:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
-    assistant_mask_applied_by_index: dict[int, bool]
-    multiturn_indexes: set[int]
+    # multi-turn rows only: present means the row has a multi-turn target, and the value says whether
+    # its mask was role-aware or fell back to the contiguous span. one map rather than a set plus a
+    # parallel dict, so a row can never be counted as multi-turn while its mask status is missing.
+    multiturn_mask_applied: dict[int, bool]
     reasoning_by_index: dict[int, _RowReasoning]
     dropped: int
 
@@ -417,6 +416,7 @@ def _text_sft_row_spec(
     render_transcript: Callable[[list[dict]], str],
     max_length: int,
     row_index: int,
+    multiturn: bool,
 ) -> tuple[str, _RowReasoning, dict[str, Any]]:
     text = render_transcript([*prompt_messages, *completion_messages])
     prompt_text = tokenizer.apply_chat_template(
@@ -441,7 +441,10 @@ def _text_sft_row_spec(
             "target_messages": completion_messages,
             "source_messages": [*prompt_messages, *completion_messages],
             "template_kwargs": {"enable_thinking": spec.thinking},
+            # measurement carried alongside the row rather than in it: the parquet row is built from
+            # an explicit key list below, so neither key reaches verl.
             "row_index": row_index,
+            "multiturn": multiturn,
         },
     )
 
@@ -469,8 +472,7 @@ def _tokenize_prompt_rows(
     sampled_texts: list[str] = []
     multiturn_targets = 0
     coerced_singleturn_targets = 0
-    assistant_mask_applied_by_index: dict[int, bool] = {}
-    multiturn_indexes: set[int] = set()
+    multiturn_mask_applied: dict[int, bool] = {}
     # kept per row rather than summed here, for the same reason as `untruncated_by_index`: rows that
     # lose their whole completion to the cap are dropped below, and folding their reasoning into a
     # running total would report loss from rows the run never trains on against a retained-row
@@ -492,9 +494,10 @@ def _tokenize_prompt_rows(
         coerced_scalar_output,
     ) in enumerate(prompt_rows):
         _reject_image_completion(completion_messages)
-        if len(completion_messages) > 1:
+        # read before the image branch rewrites `completion_messages` to its text-only form.
+        multiturn = len(completion_messages) > 1
+        if multiturn:
             multiturn_targets += 1
-            multiturn_indexes.add(row_index)
         elif (
             coerced_scalar_output
             and len(completion_messages) == 1
@@ -522,7 +525,8 @@ def _tokenize_prompt_rows(
                 thinking=bool(spec.thinking),
             )
             untruncated_by_index[row_index] = untruncated_length
-            assistant_mask_applied_by_index[row_index] = assistant_mask_applied
+            if multiturn:
+                multiturn_mask_applied[row_index] = assistant_mask_applied
             row_by_index[row_index] = {
                 "input_ids": input_ids,
                 "loss_mask": loss_mask,
@@ -558,6 +562,7 @@ def _tokenize_prompt_rows(
                 render_transcript=render_transcript,
                 max_length=max_length,
                 row_index=row_index,
+                multiturn=multiturn,
             )
             sampled_texts.append(text)
             reasoning_by_index[row_index] = reasoning
@@ -575,7 +580,8 @@ def _tokenize_prompt_rows(
             row_index = spec_row["row_index"]
             input_ids = tokenized["input_ids"]
             untruncated_by_index[row_index] = tokenized["untruncated_length"]
-            assistant_mask_applied_by_index[row_index] = tokenized["assistant_mask_applied"]
+            if spec_row["multiturn"]:
+                multiturn_mask_applied[row_index] = tokenized["assistant_mask_applied"]
             row_by_index[row_index] = {
                 "input_ids": input_ids,
                 "loss_mask": tokenized["completion_mask"],
@@ -588,8 +594,7 @@ def _tokenize_prompt_rows(
         sampled_texts=sampled_texts,
         multiturn_targets=multiturn_targets,
         coerced_singleturn_targets=coerced_singleturn_targets,
-        assistant_mask_applied_by_index=assistant_mask_applied_by_index,
-        multiturn_indexes=multiturn_indexes,
+        multiturn_mask_applied=multiturn_mask_applied,
         reasoning_by_index=reasoning_by_index,
         dropped=dropped,
     )
@@ -614,8 +619,8 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
             # appended in lockstep with the row it measures, so the truncation counts below describe
             # the rows that are actually trained on rather than the ones that were dropped.
             retained_untruncated.append(tokenized.untruncated_by_index[row_index])
-            if row_index in tokenized.multiturn_indexes:
-                if tokenized.assistant_mask_applied_by_index.get(row_index, False):
+            if row_index in tokenized.multiturn_mask_applied:
+                if tokenized.multiturn_mask_applied[row_index]:
                     role_aware_multiturn_targets += 1
                 else:
                     fallback_multiturn_targets += 1

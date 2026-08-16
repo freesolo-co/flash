@@ -161,8 +161,7 @@ def test_retained_workload_counts_mixed_role_aware_and_fallback_multiturn_rows()
         sampled_texts=[],
         multiturn_targets=2,
         coerced_singleturn_targets=0,
-        assistant_mask_applied_by_index={0: True, 1: False},
-        multiturn_indexes={0, 1},
+        multiturn_mask_applied={0: True, 1: False},
         reasoning_by_index={0: _RowReasoning(0, 0, 0), 1: _RowReasoning(0, 0, 0)},
         dropped=0,
     )

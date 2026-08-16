@@ -267,8 +267,8 @@ def _appended_eos_index(
     return None
 
 
-def _active_chat_template(source) -> str | None:
-    """Return the metadata-selected template without rendering user-controlled messages."""
+def _chatml_template(source) -> str | None:
+    """Return the metadata-selected template, or ``None`` unless it is a ChatML one."""
     get_template = getattr(source, "get_chat_template", None)
     if callable(get_template):
         try:
@@ -279,20 +279,11 @@ def _active_chat_template(source) -> str | None:
         template = getattr(source, "chat_template", None)
         if isinstance(template, dict):
             template = template.get("default")
-    return template if isinstance(template, str) else None
-
-
-def _chatml_template(source) -> str | None:
-    template = _active_chat_template(source)
-    if template is None or not all(token in template for token in _CHATML_CONTROL_TOKENS):
+    if not isinstance(template, str) or not all(
+        token in template for token in _CHATML_CONTROL_TOKENS
+    ):
         return None
     return template
-
-
-def _sanitized_probe_text(text: str) -> str:
-    for token in _CHATML_CONTROL_TOKENS:
-        text = text.replace(token, "<|flash_reserved_control|>")
-    return text
 
 
 _MessagePath = tuple[str | int, ...]
@@ -311,37 +302,22 @@ class _RenderedMessageProbe:
     span_roles: tuple[str, ...]
 
 
-def _probed_text(text: str, path: _MessagePath, sentinels_for) -> str:
-    if not text:
-        return text
-    start, end = sentinels_for(path)
-    return f"{start}{_sanitized_probe_text(text)}{end}"
-
-
-def _probe_content(content, path: _MessagePath, sentinels_for):
-    if isinstance(content, str):
-        return _probed_text(content, path, sentinels_for)
-    if not isinstance(content, list):
-        return content
-    copied = []
-    for index, block in enumerate(content):
-        if not isinstance(block, dict):
-            copied.append(_probe_value(block, (*path, index), sentinels_for))
-            continue
-        copied.append(
-            {
-                key: value
-                if key == "type"
-                else _probe_value(value, (*path, index, key), sentinels_for)
-                for key, value in block.items()
-            }
-        )
-    return copied
-
-
 def _probe_value(value, path: _MessagePath, sentinels_for):
+    """Wrap every string leaf in a paired sentinel, keeping ``type`` discriminators intact.
+
+    ``type`` selects the template's branch for a content block, so sentinelizing it would render a
+    different transcript than the one being masked. An empty string is left alone so it keeps the
+    template's falsey branch; wrapping it would render as authored content.
+    """
     if isinstance(value, str):
-        return _probed_text(value, path, sentinels_for)
+        if not value:
+            return value
+        start, end = sentinels_for(path)
+        # reserved controls are neutralized in the probe render so a literal cannot forge a span
+        # boundary; `_reject_chatml_control_bodies` is what refuses the row.
+        for token in _CHATML_CONTROL_TOKENS:
+            value = value.replace(token, "<|flash_reserved_control|>")
+        return f"{start}{value}{end}"
     if isinstance(value, list):
         return [
             _probe_value(item, (*path, index), sentinels_for) for index, item in enumerate(value)
@@ -354,8 +330,9 @@ def _probe_value(value, path: _MessagePath, sentinels_for):
     return value
 
 
-def _chatml_text_spans(rendered: str) -> list[tuple[int, int, int, int, str]] | None:
-    spans: list[tuple[int, int, int, int, str]] = []
+def _chatml_text_spans(rendered: str) -> list[tuple[int, int, str]] | None:
+    """Locate each rendered message's body character range and role, or ``None`` if unparseable."""
+    spans: list[tuple[int, int, str]] = []
     index = 0
     while (start := rendered.find("<|im_start|>", index)) >= 0:
         header_start = start + len("<|im_start|>")
@@ -366,19 +343,9 @@ def _chatml_text_spans(rendered: str) -> list[tuple[int, int, int, int, str]] | 
         body_end = rendered.find("<|im_end|>", body_start)
         if body_end < 0:
             return None
-        message_end = body_end + len("<|im_end|>")
-        if rendered.startswith("\n", message_end):
-            message_end += 1
-        spans.append(
-            (
-                start,
-                body_start,
-                body_end,
-                message_end,
-                rendered[header_start : body_start - 1].strip().lower(),
-            )
-        )
-        index = message_end
+        role = rendered[header_start : body_start - 1].strip().lower()
+        spans.append((body_start, body_end, role))
+        index = body_end + len("<|im_end|>")
     return spans or None
 
 
@@ -401,28 +368,36 @@ def _marker_positions(rendered: str, marker: str) -> list[int]:
     return positions
 
 
+def _containing_body_spans(
+    text_spans: list[tuple[int, int, str]], start: int, end: int
+) -> list[int]:
+    return [
+        span_index
+        for span_index, (body_start, body_end, _role) in enumerate(text_spans)
+        if body_start <= start and end <= body_end
+    ]
+
+
 def _rendered_field_occurrences(
     rendered: str,
     sentinels: list[tuple[int, _MessagePath, str, str]],
-    text_spans: list[tuple[int, int, int, int, str]] | None,
+    text_spans: list[tuple[int, int, str]] | None,
 ) -> list[_RenderedFieldOccurrence]:
     occurrences = []
     for source_index, path, start, end in sentinels:
         starts = _marker_positions(rendered, start)
         ends = _marker_positions(rendered, end)
         if starts and ends:
+            # a paired survival bounds the authored leaf exactly, so both edges are known adjacency.
             offset = 0
             while (start_at := rendered.find(start, offset)) >= 0:
                 end_at = rendered.find(end, start_at + len(start))
                 if end_at < 0:
                     raise ValueError("chat template field probe lost an end sentinel")
-                after_end = end_at + len(end)
+                offset = end_at + len(end)
                 occurrences.append(
-                    _RenderedFieldOccurrence(
-                        source_index, path, start_at, after_end, start_at, after_end
-                    )
+                    _RenderedFieldOccurrence(source_index, path, start_at, offset, start_at, offset)
                 )
-                offset = after_end
             continue
         if len(starts) + len(ends) != 1 or text_spans is None:
             continue
@@ -434,12 +409,7 @@ def _rendered_field_occurrences(
             marker_start = ends[0]
             marker_end = marker_start + len(end)
             left, right = None, marker_end
-        containing = [
-            span_index
-            for span_index, (_start, body_start, body_end, _end, _role) in enumerate(text_spans)
-            if body_start <= marker_start and marker_end <= body_end
-        ]
-        if len(containing) == 1:
+        if len(_containing_body_spans(text_spans, marker_start, marker_end)) == 1:
             occurrences.append(
                 _RenderedFieldOccurrence(source_index, path, marker_start, marker_end, left, right)
             )
@@ -476,15 +446,14 @@ def _rendered_message_probe(
             sentinels.append((source_index, path, start, end))
             return start, end
 
-        copied = {}
-        for key, value in message.items():
-            if key == "role":
-                copied[key] = value
-            elif key == "content":
-                copied[key] = _probe_content(value, (key,), sentinels_for)
-            else:
-                copied[key] = _probe_value(value, (key,), sentinels_for)
-        probed.append(copied)
+        probed.append(
+            {
+                # role selects the template's branch and is emitted as a header rather than a body,
+                # so it is never sentinelized.
+                key: value if key == "role" else _probe_value(value, (key,), sentinels_for)
+                for key, value in message.items()
+            }
+        )
 
     rendered = template_source.apply_chat_template(
         probed,
@@ -526,24 +495,18 @@ def _rendered_message_probe(
 
     if text_spans is None:
         return _RenderedMessageProbe(source_fields, None, ())
+    span_roles = tuple(role for _, _, role in text_spans)
     source_span_indexes = [set() for _ in source_messages]
     for occurrence in occurrences:
-        containing = [
-            span_index
-            for span_index, (_start, body_start, body_end, _end, _role) in enumerate(text_spans)
-            if body_start <= occurrence.marker_start and occurrence.marker_end <= body_end
-        ]
+        containing = _containing_body_spans(
+            text_spans, occurrence.marker_start, occurrence.marker_end
+        )
+        # a leaf that straddles or escapes the body spans cannot be attributed to one message.
         if len(containing) != 1:
-            return _RenderedMessageProbe(
-                source_fields,
-                None,
-                tuple(span[4] for span in text_spans),
-            )
+            return _RenderedMessageProbe(source_fields, None, span_roles)
         source_span_indexes[occurrence.source_index].add(containing[0])
     return _RenderedMessageProbe(
-        source_fields,
-        tuple(frozenset(indexes) for indexes in source_span_indexes),
-        tuple(span[4] for span in text_spans),
+        source_fields, tuple(frozenset(indexes) for indexes in source_span_indexes), span_roles
     )
 
 
@@ -648,10 +611,8 @@ def _chatml_message_spans(
     ``render(messages)`` -- a shorter list re-renders earlier turns with a different tag layout and
     the derived offsets slide off the real turn boundaries.
 
-    Returns ``None`` when the render is not ChatML (no ``<|im_start|>``/``<|im_end|>`` pair, or no
-    message parsed), which is the signal for the caller to leave the mask untouched rather than
-    guess. Roles are lowercased; a header the tokenizer splits across several tokens is joined
-    before comparison so a multi-token role name still resolves.
+    ``None`` means the render is not parseable ChatML, which tells the caller to leave the mask
+    alone. A role header split across several tokens is joined before it is lowercased.
     """
     decode = getattr(tokenizer, "decode", None)
     control_ids = _chatml_control_ids(tokenizer)
@@ -690,12 +651,6 @@ def _chatml_message_spans(
     return spans or None
 
 
-@dataclass(frozen=True)
-class AssistantOnlyMask:
-    mask: list[int]
-    role_aware: bool
-
-
 def assistant_only_mask(
     loss_mask: list[int],
     full_ids: list[int],
@@ -703,10 +658,10 @@ def assistant_only_mask(
     target_messages: list[dict],
     *,
     appended_eos: bool,
+    source_messages: list[dict],
+    template_kwargs: dict,
     template_source=None,
-    source_messages: list[dict] | None = None,
-    template_kwargs: dict | None = None,
-) -> AssistantOnlyMask:
+) -> tuple[list[int], bool]:
     """Keep only assistant body supervision when the rendered transcript is parseable ChatML.
 
     ``completion_mask_from_ids`` returns ONE contiguous supervised span, which is right for a
@@ -716,93 +671,77 @@ def assistant_only_mask(
 
     Strictly subtractive: it only ever turns a 1 into a 0, so the prompt boundary, the truncation
     behaviour, and the pre-opened ``<think>\\n`` handling stay intact. ChatML role headers and static
-    template separators are never targets; authored assistant bodies and their original turn closers are.
-    When the transcript does not parse as ChatML the mask is returned unchanged and ``role_aware`` is
-    false rather than narrowing supervision on a guess.
+    template separators are never targets; authored assistant bodies and their original turn closers
+    are. Returns ``(mask, role_aware)``; whenever the render cannot be read unambiguously the mask is
+    returned unchanged with ``role_aware`` false rather than narrowing supervision on a guess.
 
-    ChatML control strings are reserved in every rendered string field across the complete source
-    transcript. Their token ids are identical to structural delimiters after rendering, so accepting
-    a literal would make the boundary ambiguous and could either expose an observation or hide real
-    assistant supervision. Only the target suffix metadata determines authored assistant bodies.
-    Non-ChatML targets keep their prior behavior. ``appended_eos`` is caller-supplied provenance, not
-    an inference from the final token value: text packing sets it from ``_eos_terminated`` semantics,
-    while processor tokenization leaves it false because that path appends nothing.
+    ``source_messages`` is the COMPLETE transcript, prompt included, because reserved ChatML control
+    strings have to be rejected wherever the template renders them: their token ids are identical to
+    structural delimiters afterwards, so a literal in a prompt field moves the same boundary a
+    literal in a target field would. Only the target suffix decides which assistant bodies are
+    authored. ``appended_eos`` is caller-supplied provenance, never an inference from the final token
+    value: text packing sets it from ``_eos_terminated`` semantics, while processor tokenization
+    leaves it false because that path appends nothing.
     """
     template_source = tokenizer if template_source is None else template_source
     template = _chatml_template(template_source)
     if template is None:
-        return AssistantOnlyMask(loss_mask, False)
-    source_messages_supplied = source_messages is not None
-    source_messages = target_messages if source_messages is None else source_messages
+        return loss_mask, False
     rendered_probe = _rendered_message_probe(
         template_source,
         template,
         source_messages,
         target_messages,
-        template_kwargs or {},
+        template_kwargs,
     )
     _reject_chatml_control_bodies(source_messages, rendered_probe.source_fields)
     target_start = len(source_messages) - len(target_messages)
     rendered_fields = rendered_probe.source_fields[target_start:]
     if not full_ids or not any(loss_mask):
-        return AssistantOnlyMask(loss_mask, False)
+        return loss_mask, False
     spans = _chatml_message_spans(full_ids, tokenizer)
     control_ids = _chatml_control_ids(tokenizer)
     if spans is None or control_ids is None:
-        return AssistantOnlyMask(loss_mask, False)
+        return loss_mask, False
     im_end = control_ids[1]
+    # a span whose closer the cap removed has no readable end, so its body cannot be bounded.
     if any(
         body_end >= len(full_ids) or full_ids[body_end] != im_end for _, _, body_end, _, _ in spans
     ):
-        return AssistantOnlyMask(loss_mask, False)
+        return loss_mask, False
+
+    actual_roles = tuple(span[4] for span in spans)
+    full_roles = rendered_probe.span_roles
+    # the token row may be a right-truncated PREFIX of the probed render, so the parsed roles have to
+    # match that render's leading spans; anything else means the two disagree about the transcript.
+    if (
+        rendered_probe.source_span_indexes is None
+        or len(actual_roles) > len(full_roles)
+        or actual_roles != full_roles[: len(actual_roles)]
+        or (
+            source_span_indexes := _source_span_association(
+                source_messages,
+                rendered_probe.source_span_indexes,
+                full_roles,
+            )
+        )
+        is None
+    ):
+        return loss_mask, False
 
     authored_assistant = [False] * len(spans)
     target_span_indexes: set[int] = set()
-    if source_messages_supplied:
-        actual_roles = tuple(span[4] for span in spans)
-        full_roles = rendered_probe.span_roles
-        if (
-            rendered_probe.source_span_indexes is None
-            or len(actual_roles) > len(full_roles)
-            or actual_roles != full_roles[: len(actual_roles)]
-            or (
-                source_span_indexes := _source_span_association(
-                    source_messages,
-                    rendered_probe.source_span_indexes,
-                    full_roles,
-                )
+    for source_index in range(max(0, target_start), len(source_messages)):
+        target_index = source_index - target_start
+        span_index = source_span_indexes[source_index]
+        if span_index >= len(spans):
+            continue
+        message = target_messages[target_index]
+        target_span_indexes.add(span_index)
+        if str(message.get("role")).strip().lower() == "assistant":
+            authored_assistant[span_index] = _has_authored_assistant_body(
+                message, rendered_fields[target_index]
             )
-            is None
-        ):
-            return AssistantOnlyMask(loss_mask, False)
-        for source_index in range(max(0, target_start), len(source_messages)):
-            target_index = source_index - target_start
-            span_index = source_span_indexes[source_index]
-            if span_index >= len(spans):
-                continue
-            message = target_messages[target_index]
-            target_span_indexes.add(span_index)
-            if str(message.get("role")).strip().lower() == "assistant":
-                authored_assistant[span_index] = _has_authored_assistant_body(
-                    message, rendered_fields[target_index]
-                )
-    else:
-        target_span_indexes = {
-            index
-            for index, (start, _body_start, _body_end, end, _role) in enumerate(spans)
-            if any(loss_mask[start : min(end, len(loss_mask))])
-        }
-        if len(target_span_indexes) > len(target_messages):
-            return AssistantOnlyMask(loss_mask, False)
-        for target_index, span_index in enumerate(sorted(target_span_indexes)):
-            message = target_messages[target_index]
-            role = str(message.get("role")).strip().lower()
-            if spans[span_index][4] != role:
-                return AssistantOnlyMask(loss_mask, False)
-            if role == "assistant":
-                authored_assistant[span_index] = _has_authored_assistant_body(
-                    message, rendered_fields[target_index]
-                )
     masked = [0] * len(loss_mask)
     last_target_span: tuple[str, bool] | None = None
     for span_index, (start, body_start, body_end, end, role) in enumerate(spans):
@@ -824,4 +763,4 @@ def assistant_only_mask(
         )
         if eos_index is not None:
             masked[eos_index] = loss_mask[eos_index]
-    return AssistantOnlyMask(masked, True)
+    return masked, True
