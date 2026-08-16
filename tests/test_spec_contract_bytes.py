@@ -344,8 +344,8 @@ def test_registries_match_the_declared_boundary():
     # is what catches an empty `providers` or `type_fallbacks` reaching the public bytes, which
     # would change every stored digest.
     assert not set(public) - set(worker)
-    # every section PRESENT in the public payload, not just the registered ones. driving this loop
-    # from MANAGED_SECTION_KEYS would let a key invented in an unregistered section (`wandb`) reach
+    # every section present in the public payload, not just the registered ones. driving this loop
+    # from the managed section registry would let a key in an unregistered section (`wandb`) reach
     # the public bytes unseen -- the same blind spot, in the opposite direction, as the section walk
     # in test_every_privately_held_field_is_named_in_a_registry.
     for section, public_section in public.items():
@@ -380,18 +380,13 @@ def test_every_privately_held_field_is_named_in_a_registry():
     distinction costs nothing and the test passes either way.
     """
     populated_profile = {"packing_mode": "packed", "examples_per_update": 2, "packed_blocks": 1}
-    public, worker = (
-        spec(
-            train={"epochs": 1, "init_from_adapter": "src/step-4"},
-            workload_profile=populated_profile,
-        ).to_dict(),
-        spec(
-            train={"epochs": 1, "init_from_adapter": "src/step-4"},
-            workload_profile=populated_profile,
-        ).to_internal_dict(),
+    candidate = spec(
+        train={"epochs": 1, "init_from_adapter": "src/step-4"},
+        workload_profile=populated_profile,
     )
+    public, worker = candidate.to_dict(), candidate.to_internal_dict()
     # `project` is public-only by construction (it has no worker counterpart), and the two warm-start
-    # topology keys are stripped CONDITIONALLY, so no registry can express them.
+    # topology keys are stripped conditionally, so no registry can express them.
     exempt = {"project", "lora_rank", "lora_alpha"}
     unregistered = {
         f"(top){name}" for name in set(worker) - set(public) - MANAGED_TOP_LEVEL_KEYS - exempt
