@@ -68,6 +68,17 @@ class _BadSession(_BadRequest, KeyError):
         return self.args[0] if self.args else ""
 
 
+class _BadEnvReply(_BadRequest, ValueError):
+    """A reply the environment produced that this transcript cannot carry. Also a ValueError.
+
+    The property the handler splits on is PERMANENT versus TRANSIENT, and this is permanent: the
+    environment will produce the same unrepresentable block on every retry, so it belongs with the
+    deliberate rejections rather than with the capacity faults. A bare ValueError here would fall
+    to the 503 branch and tell the reader the bridge had a resource problem, when the fix is to
+    change the environment's reply -- the same misdirection the 400/503 split exists to prevent.
+    """
+
+
 def _request_field(payload: dict, key: str):
     """Read one required payload field, or reject the request.
 
@@ -117,18 +128,18 @@ def _reject_unrepresentable_reply_blocks(content: list) -> None:
     """
     for position, block in enumerate(content):
         if not isinstance(block, dict):
-            raise ValueError(
+            raise _BadEnvReply(
                 f"environment reply content block {position} must be an object, not "
                 f"{type(block).__name__}"
             )
         block_type = block.get("type")
         if block_type != "text":
-            raise ValueError(
+            raise _BadEnvReply(
                 f"environment reply content block {position} has unsupported type {block_type!r}; "
                 "a multi-turn GRPO environment reply can carry text blocks only"
             )
         if not isinstance(block.get("text"), str):
-            raise ValueError(f"environment reply text block {position} is missing its text")
+            raise _BadEnvReply(f"environment reply text block {position} is missing its text")
 
 
 def _env_reply_message(message: dict) -> dict:
@@ -151,7 +162,7 @@ def _env_reply_message(message: dict) -> dict:
         # images get their own message ahead of the generic guard: it is the one unsupported block
         # with an action attached, so saying which one it is beats naming the type alone.
         if content_has_images(content):
-            raise ValueError(
+            raise _BadEnvReply(
                 "environment reply carries an image block; multi-turn GRPO conditions every turn on "
                 "the media from the INITIAL prompt, so an image returned by step_episode cannot "
                 "reach the model. return text, or put the image in the initial prompt"

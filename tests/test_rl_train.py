@@ -2942,6 +2942,49 @@ def test_the_generated_single_turn_reward_module_surfaces_the_bridges_cause(monk
         server.shutdown()
 
 
+def test_an_unrepresentable_env_reply_is_rejected_rather_than_reported_as_a_fault():
+    """A refused reply block is permanent, so it must reach the user as 400, not 503.
+
+    The reply validators raise on a block this transcript cannot carry. A bare ValueError there
+    falls to the handler's catch-all and answers 503, which the child prints as
+    ``could not serve`` -- telling the reader the bridge had a capacity problem when the actual fix
+    is to change what ``step_episode`` returns. Retrying produces the identical block forever, so
+    this asserts the status the 400/503 split promises rather than only the raise.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(
+            replies=[{"role": "user", "content": [{"type": "image_url", "image_url": "x"}]}],
+            done_after=99,
+        ),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=4,
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        _post("/multiturn/start", {"index": 0, "session_id": "a"}).close()
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _post("/multiturn/step", {"session_id": "a", "completion_text": "answer"})
+        assert exc_info.value.code == 400, (
+            "an env reply this transcript cannot carry is permanent, not a capacity fault"
+        )
+        assert "image block" in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+        bridge.shutdown()
+
+
 def test_reward_server_still_rejects_a_malformed_request_as_a_client_error():
     """The 5xx split must not turn genuine client errors into server faults.
 
