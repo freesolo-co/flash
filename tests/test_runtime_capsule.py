@@ -254,7 +254,13 @@ def test_capsule_members_import_with_flash_absent(tmp_path):
         "import pickle\n"
         "assert pickle.loads(pickle.dumps(bootstrap._console_upload_loop)) "
         "is bootstrap._console_upload_loop\n"
-        "for name in ('bootstrap_secrets', 'bootstrap_pip', 'hostlog', 'failmark'):\n"
+        # EVERY non-entry member, deadline_sleep included. Importing a member must be INERT: these
+        # are programs, and an unguarded one reads argv, reads the box payload, and can exit the
+        # importing process or fire a real HF upload. Anything that walks flash's modules (a
+        # packaging probe, a test collector) imports them, so a missing guard is a live defect --
+        # and an omission HERE is how it reaches main.
+        "for name in ('bootstrap_secrets', 'bootstrap_pip', 'deadline_sleep', 'hostlog', "
+        "'failmark'):\n"
         "    importlib.import_module(name)\n"
         "print('OK')\n"
     )
@@ -266,6 +272,51 @@ def test_capsule_members_import_with_flash_absent(tmp_path):
         env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
     )
     assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout
+
+
+def test_importing_any_member_is_inert(tmp_path):
+    """No member may DO anything when imported -- derived from the profile, not a hand list.
+
+    The helpers are programs; the capsule runs them with `runpy.run_module(run_name="__main__")`.
+    Without a `__main__` guard, an ordinary import runs the program: deadline_sleep exits the
+    importing process with 125, and hostlog attempts a real HF upload while its blanket `except`
+    hides that it tried. `tests/test_client_import_purity.py` imports every flash module, so this
+    is a live defect, not a hypothetical.
+
+    Enumerated from the profile so a member added later is covered automatically -- a hand-written
+    list is exactly how deadline_sleep slipped through in the first place.
+    """
+    from flash.runtime_capsule import get_profile
+
+    members = [
+        member.removesuffix(".py")
+        for _source, member in get_profile(PROFILE).sources
+        if member.endswith(".py")
+    ]
+    assert len(members) > 3, members
+
+    archive, _ = build_capsule(PROFILE)
+    capsule = tmp_path / "capsule.pyz"
+    write_capsule(capsule, archive)
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import importlib, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "for name in sys.argv[2:]:\n"
+        "    importlib.import_module(name)\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", str(probe), str(capsule), *members],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+    )
+    # a program that runs on import exits non-zero (or hangs); the entrypoint is included, because
+    # importing the bootstrap must not start a training run either.
+    assert result.returncode == 0, f"a member ran on import:\n{result.stderr}"
     assert "OK" in result.stdout
 
 
