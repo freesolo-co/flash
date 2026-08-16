@@ -641,7 +641,15 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
 
     provider = config.provider if config.provider != "auto" else "auto"
     if config.gpu_type:
-        names = (canonical_gpu(config.gpu_type),)
+        # rank every class the author declared acceptable, not just the head. `allocate()` cost-ranks
+        # the whole ordered set, so quoting the head alone prices a shape the run may never be given
+        # -- an authored ["B200", "H100"] quotes 3x the H100 the allocator would actually rent, and
+        # the submit-time affordability precheck refuses an affordable run on that inflated number.
+        names = tuple(
+            dict.fromkeys(
+                canonical_gpu(name) for name in (config.gpu_type, *config.gpu_type_fallbacks)
+            )
+        )
     elif provider == "auto":
         # `auto` ranks the RunPod pool: it is the default substrate, and the allocator only reaches a
         # lambda-only class after the cheaper runpod classes exhaust, so quoting one here would name
@@ -715,9 +723,20 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
         # falls through to the pool-wide message, which reports the count that would fit.
         remedy = _wider_shape_remedy(config, need, names)
         if config.gpu_type:
-            info = GPU_INFO[canonical_gpu(config.gpu_type)]
+            # name every acceptable class, not just the head: with fallbacks authored, reporting the
+            # head alone tells the user to fix a class that may not be the one that failed, and
+            # hides that the whole declared set was ranked and rejected.
+            declared = tuple(
+                GPU_INFO[canonical_gpu(name)].name
+                for name in (config.gpu_type, *config.gpu_type_fallbacks)
+            )
+            label = (
+                repr(declared[0])
+                if len(declared) == 1
+                else "none of " + ", ".join(repr(name) for name in declared)
+            )
             raise ValueError(
-                f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB"
+                f"exact GPU {label} cannot fit this run: it requires at least {need} GB"
                 + (
                     remedy
                     or _catalog_check_remedy(config, need, names)

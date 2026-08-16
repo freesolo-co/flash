@@ -1251,6 +1251,71 @@ def test_cost_quote_refuses_a_shape_no_configured_provider_can_rent(monkeypatch)
     assert estimate_cost(config).provider == "runpod"
 
 
+def test_cost_quote_prices_the_cheapest_acceptable_gpu_class() -> None:
+    """An ordered `[gpu] type` list must be quoted over the whole acceptable set.
+
+    ``allocate()`` cost-ranks every class ``acceptable_types`` returns, so pricing only the head
+    quotes a shape the run may never be given: a ["B200", "H100"] run is quoted ~3x the H100 the
+    allocator would really rent, and the submit-time affordability precheck can refuse a run the
+    organization can afford.
+    """
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.spec import runconfig_from_spec
+
+    listed = spec_from_dict(_raw(**{"gpu.type": ["B200", "H100"]}))
+    assert listed.gpu.acceptable_types == ("B200", "H100")
+
+    config = runconfig_from_spec(listed)
+    assert config.gpu_type == "B200"
+    assert config.gpu_type_fallbacks == ("H100",)
+
+    head_only = estimate_cost(runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": "B200"}))))
+    fallback_only = estimate_cost(runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": "H100"}))))
+    quoted = estimate_cost(config)
+
+    # the acceptable fallback is genuinely cheaper here, so the head-only quote is an overquote.
+    assert fallback_only.total_usd < head_only.total_usd
+    assert quoted.gpu == "H100"
+    assert quoted.total_usd == pytest.approx(fallback_only.total_usd)
+
+    # authoring order does not change the answer: allocation ranks on cost, not position.
+    reversed_order = estimate_cost(
+        runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": ["H100", "B200"]})))
+    )
+    assert reversed_order.gpu == "H100"
+
+    # a bare pin stays a hard pin -- carrying fallbacks must not widen a single authored class.
+    assert (
+        estimate_cost(runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": "B200"})))).gpu
+        == "B200"
+    )
+
+
+def test_cost_quote_no_fit_error_names_every_acceptable_class() -> None:
+    """The rejection must name the whole declared set, not just the head that happened to be first.
+
+    Built as a RunConfig rather than a spec: the parse gate rejects an unfittable pin before the
+    quote runs, so the spec door cannot reach this branch.
+    """
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.types import RunConfig
+
+    config = RunConfig(
+        model_id="Qwen/Qwen3.6-35B-A3B",
+        method="grpo",
+        steps=10,
+        batch_size=8,
+        group_size=4,
+        gpu_count=1,
+        gpu_type="RTX 4090",
+        gpu_type_fallbacks=("RTX 5090",),
+    )
+    with pytest.raises(ValueError, match="cannot fit this run") as exc:
+        estimate_cost(config)
+    assert "RTX 4090" in str(exc.value)
+    assert "RTX 5090" in str(exc.value)
+
+
 def test_soft_provider_preference_does_not_reject_an_ineligible_gpu_type_pair() -> None:
     spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"], "gpu.type": "RTX 4090"}))
 
