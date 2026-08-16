@@ -107,7 +107,8 @@ def _processor_tokenized_row(
     max_length: int,
     thinking: bool,
 ) -> tuple[list[int], list[int], bytes, int, bool]:
-    from flash.engine.worker.model.packing import assistant_only_mask, completion_mask_from_ids
+    from flash.engine.worker.model.chatml_mask import assistant_only_mask
+    from flash.engine.worker.model.packing import completion_mask_from_ids
 
     prepared_prompt = _multimodal_messages_with_images(prompt_messages, images)
     full_messages = [*prepared_prompt, *completion_messages]

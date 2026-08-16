@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import random
 
+from flash.engine.worker.model.chatml_mask import assistant_only_mask
 from flash.engine.worker.model.packing import (
-    assistant_only_mask,
     completion_mask_from_ids,
     packing_appends_eos,
     tokenize_for_packing,
