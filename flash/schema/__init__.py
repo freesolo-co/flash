@@ -232,9 +232,9 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
 # environment resolved_sha) are assigned by the control plane, so to_dict() omits them and this
 # parser rejects a user who sets them.
 #
-# Derived rather than listed, for the same reason _GPU_KEYS already is: what a user may author is
-# exactly what the public payload carries, and `to_dict()` builds that by removing
-# MANAGED_TOP_LEVEL_KEYS. Spelling the survivors out by hand made this a second copy of that
+# derived rather than listed, for the same reason the gpu key set already is: what a user may author
+# is exactly what the public payload carries, and `to_dict()` builds that by removing the managed
+# top-level registry. spelling the survivors out by hand made this a second copy of that
 # subtraction, and the two could disagree only by drifting -- a new managed field left off this list
 # is a field the parser invites a user to set and the serializer then silently drops.
 _TOP_LEVEL_KEYS = (
@@ -258,7 +258,7 @@ _GPU_KEYS = (
 )
 # [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
 # is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha) and
-# named once in MANAGED_ENVIRONMENT_KEYS rather than restated here.
+# named once in the managed environment registry rather than restated here.
 # pip is authorable: worker_pip_for_env returns only Flash's own worker requirement, so a scorer that
 # imports a third-party dependency has no other way to get it onto the worker, and the missing import
 # surfaces as a zero reward at training time. The submit paths append these to worker_pip_for_env

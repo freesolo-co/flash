@@ -82,7 +82,8 @@ def _fully_managed_internal_spec() -> JobSpec:
             },
             "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16, "hf_repo": "operator/runs"},
             "gpu": {
-                "type": "",
+                "type": "H100",
+                "providers": ["runpod"],
                 "disk_gb": 160,
                 "network_volume": "flash-weights",
                 "network_volume_gb": 100,
@@ -95,6 +96,8 @@ def _fully_managed_internal_spec() -> JobSpec:
     # sanity: the internal carrier really does hold every managed value
     assert spec.run_id == "flash-managed-run"
     assert spec.train.hf_repo == "operator/runs"
+    assert spec.gpu.type == "H100"
+    assert spec.gpu.providers == ("runpod",)
     assert spec.gpu.disk_gb == 160
     assert spec.gpu.network_volume == "flash-weights"
     assert spec.gpu.network_volume_gb == 100
@@ -157,16 +160,5 @@ def test_authored_surface_is_exactly_what_the_public_payload_carries():
     """
     public = _fully_managed_internal_spec().to_dict()
     assert set(public) == _TOP_LEVEL_KEYS
-    assert set(public["environment"]) <= _ENVIRONMENT_KEYS
-    assert set(public["gpu"]) <= _GPU_KEYS
-
-
-def test_every_public_payload_key_survives_the_authored_parser():
-    """The derived accept-set has to admit every key the serializer emits, nested ones included.
-
-    A subset check on the sections above passes if the parser accepts MORE than it should; this
-    closes that direction by proving the exact payload re-parses. Without it, widening a derived set
-    would go unnoticed until a real submit.
-    """
-    public = _fully_managed_internal_spec().to_dict()
-    spec_from_dict(public, run_id="flash-managed-run")
+    assert set(public["environment"]) == _ENVIRONMENT_KEYS
+    assert set(public["gpu"]) == _GPU_KEYS
