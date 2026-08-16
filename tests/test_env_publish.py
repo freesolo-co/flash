@@ -141,6 +141,59 @@ def test_publish_uploads_to_github_and_returns_slug(monkeypatch):
     assert captured["files"] == ["environment.py", "pyproject.toml"]
 
 
+@pytest.mark.parametrize(
+    ("key", "project_slug"),
+    [
+        ({"org_slug": "gl" + "pat-" + "a1b2c3d4e5f6g7h8i9j0"}, "ordinary"),
+        ({"org_slug": "ordinary"}, "gl" + "pat-" + "a1b2c3d4e5f6g7h8i9j0"),
+    ],
+)
+def test_publish_rejects_credentials_in_resolved_hub_segments(monkeypatch, key, project_slug):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    reached = False
+
+    def fail_publish(**_kwargs):
+        nonlocal reached
+        reached = True
+
+    monkeypatch.setattr(envs, "_github_publish_once", fail_publish)
+    with pytest.raises(envs.EnvPublishError, match="GitLab personal access token") as excinfo:
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL),
+            name="example",
+            key=key,
+            project_slug=project_slug,
+        )
+    assert not reached
+    assert "gl" + "pat-" + "a1b2c3d4e5f6g7h8i9j0" not in str(excinfo.value)
+
+
+def test_publish_scans_resolved_hub_segments_separately(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    published: list[str] = []
+    monkeypatch.setattr(
+        envs,
+        "_github_publish_once",
+        lambda *, publish_root, **_kwargs: published.append(publish_root),
+    )
+
+    ordinary = envs.publish_package(
+        package_b64=_pkg_b64(_MINIMAL),
+        name="example",
+        key={"org_slug": "ordinary"},
+        project_slug="project",
+    )
+    split = envs.publish_package(
+        package_b64=_pkg_b64(_MINIMAL),
+        name="example",
+        key={"org_slug": "glpat-"},
+        project_slug="a1b2c3d4e5f6g7h8i9j0",
+    )
+    assert ordinary == "ordinary/project/example"
+    assert split == "glpat-/a1b2c3d4e5f6g7h8i9j0/example"
+    assert published == [ordinary, split]
+
+
 def test_same_name_in_two_projects_publishes_to_separate_roots(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     published_roots: list[str] = []
@@ -1263,6 +1316,104 @@ def test_copy_package_to_checkout_rejects_escape(tmp_path):
     (source / "environment.py").write_text("def load_environment(**k): pass\n")
     with pytest.raises(envs.EnvPublishError, match="unsafe"):
         envs._copy_package_to_checkout(source=source, checkout=checkout, publish_root="../escape")
+
+
+def test_publish_refuses_a_package_carrying_a_credential(monkeypatch):
+    """The CLI check is not the trust boundary; the server writes to the hub, so it checks too.
+
+    `flash env push` scans before uploading, but an older client, a direct `Client.publish_env` or
+    a raw `POST /v1/envs` arrives here having skipped it entirely. The hub's history is permanent,
+    so a credential that reaches `_github_publish` is already unrecoverable.
+    """
+    reached = False
+
+    def _fail(*args, **kwargs):
+        nonlocal reached
+        reached = True
+        raise AssertionError("a credential-bearing package reached the hub")
+
+    monkeypatch.setattr(envs, "_github_publish", _fail)
+    key = "fslo_" + "a1B2c3D4" * 6
+    package = _pkg_b64({**_MINIMAL, "env.sh": f"export FREESOLO_API_KEY={key}\n"})
+
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.publish_package(
+            package_b64=package, name="demo", key={"org_slug": "acme"}, project_slug="p"
+        )
+
+    assert not reached
+    assert excinfo.value.status == 400
+    assert "Freesolo API key" in str(excinfo.value)
+    assert key not in str(excinfo.value), "the refusal must not echo the credential"
+
+    # the control: the same package without the key publishes, so the gate is not refusing
+    # everything that passes through it.
+    monkeypatch.setattr(envs, "_github_publish", lambda *a, **k: "acme/p/demo")
+    assert (
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL),
+            name="demo",
+            key={"org_slug": "acme"},
+            project_slug="p",
+        )
+        == "acme/p/demo"
+    )
+
+
+def test_publish_refuses_a_credential_supplied_as_the_env_name():
+    """The name becomes the hub path and the commit message, so it leaks just as permanently.
+
+    Only the extracted package was scanned, and the name never reaches that check -- so a key
+    passed as the environment name was published intact even though the same bytes in a file
+    would have been refused.
+    """
+    key = "fslo_" + "a1B2c3D4" * 6
+
+    for name in (key, f"my-env-{key}"):
+        with pytest.raises(envs.EnvPublishError) as excinfo:
+            envs.validate_publish_inputs(package_b64=_pkg_b64(_MINIMAL), name=name)
+        assert "Freesolo API key" in str(excinfo.value)
+        assert key not in str(excinfo.value), "the refusal must not echo the credential"
+
+    # an ordinary name is unaffected
+    assert envs.validate_publish_inputs(package_b64=_pkg_b64(_MINIMAL), name="demo")
+
+
+def test_an_oversized_env_name_is_rejected_before_encoded_content_scanning():
+    """A caller-controlled base64 run must not escape as the scanner's internal size exception.
+
+    `credential_in_name` refuses to expand a run beyond 4 MiB, but the route translated only the
+    archive scanner's refusal. An overlong name therefore produced a 500 instead of an ordinary
+    validation response, even though no publishable environment name needs millions of characters.
+    """
+    package = _pkg_b64(_MINIMAL)
+    assert envs.validate_publish_inputs(package_b64=package, name="demo")
+
+    with pytest.raises(envs.EnvPublishError, match="name is too long") as excinfo:
+        envs.validate_publish_inputs(package_b64=package, name="A" * ((4 << 20) + 1))
+    assert excinfo.value.status == 400
+
+
+def test_a_qualified_env_name_is_normalized_one_segment_at_a_time():
+    """The fold that catches a hidden key must not weld unrelated segments into one.
+
+    Normalization is scanned because it is what gets written, but `publish_slug_for_name` writes a
+    qualified id as three directory segments -- so folding the whole path into one string invented
+    a credential the publish never writes. `acme/fslo_/AbCdEf0123456789` became
+    `acme-fslo_-abcdef0123456789` and was refused as a Freesolo key, while the published path is
+    `acme/fslo_/abcdef0123456789`, in which no key is contiguous.
+    """
+    assert envs.validate_publish_inputs(
+        package_b64=_pkg_b64(_MINIMAL), name="acme/fslo_/AbCdEf0123456789"
+    )
+
+    # the fold still has to catch a key that only normalization makes contiguous, and a key inside
+    # any one segment is still refused -- neither is what the per-segment split gives up.
+    key = "fslo_" + "a1B2c3D4" * 6
+    folded = key.replace("_", "_!", 1).replace("D4", "D4!")
+    for name in (folded, f"acme/proj/{key}", f"acme/{key}"):
+        with pytest.raises(envs.EnvPublishError, match="Freesolo API key"):
+            envs.validate_publish_inputs(package_b64=_pkg_b64(_MINIMAL), name=name)
 
 
 def test_safe_extract_rejects_traversal(tmp_path):
