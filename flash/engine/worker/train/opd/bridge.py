@@ -411,7 +411,14 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
         if prompt_ids != list(prompt.prompt_ids):
             raise ValueError("multi-turn rollout prompt ids do not match the frozen flash prompt")
         raw_prompt = validate_transcript_messages(raw_prompt, source="child initial prompt")
-        if raw_prompt != prompt.student_messages:
+        # both sides flattened to the SAME representation before comparing. the child sends the text
+        # transcript it can actually carry, while the frozen prompt keeps image rows as content
+        # BLOCKS, so comparing the two shapes directly would fail every image episode even when the
+        # ids and image count already proved they are the same prompt.
+        frozen_prompt = validate_transcript_messages(
+            prompt.student_messages, source="frozen environment prompt", allow_content_blocks=True
+        )
+        if raw_prompt != frozen_prompt:
             raise ValueError("multi-turn child prompt does not match the frozen environment prompt")
         session_id = self._validate_session_id(session_id)
         start_identity = (
@@ -434,9 +441,11 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
                 state = self._env_call("new_rollout_state", prompt.example)
                 initial_messages = state.get("prompt") or state.get("messages")
                 initial_messages = validate_transcript_messages(
-                    initial_messages, source="environment initial prompt"
+                    initial_messages,
+                    source="environment initial prompt",
+                    allow_content_blocks=True,
                 )
-            if initial_messages != prompt.student_messages:
+            if initial_messages != frozen_prompt:
                 raise ValueError(
                     "multi-turn environment initial prompt changed after prompt freezing"
                 )

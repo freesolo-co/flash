@@ -7868,3 +7868,64 @@ def test_a_multi_turn_opd_episode_carries_its_frozen_media_on_every_turn(
     assert instance.generate_mm_kwargs == [{"flash_probe": True}] * 2
     # the bridge authenticates this against the frozen parent prompt before the episode runs.
     assert posted["start"][0]["image_count"] == expected_image_count
+
+
+class _ImageBlockEnv(_RecordingEnv):
+    """An environment whose initial prompt carries image content blocks, as a real one does."""
+
+    def new_rollout_state(self, _example):
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image"}, {"type": "text", "text": "describe"}],
+                }
+            ],
+            "prompt": None,
+        }
+
+
+def test_a_block_list_frozen_prompt_authenticates_against_the_flattened_child_prompt():
+    """The child sends the transcript it can carry; the frozen prompt keeps blocks. Both must pass.
+
+    `normalize_prompt_images` stores an image row's prompt as content BLOCKS, while the child
+    flattens to text in `prepare_episode_prompt` because a multi-turn transcript cannot carry
+    pixels. Comparing those two shapes directly fails start authentication for EVERY image episode,
+    even when the prompt ids and image count have already proved they are the same prompt. The
+    comparison therefore has to happen in one representation.
+
+    Driven through the real `start_multiturn` rather than a stub: stubbing that endpoint is what
+    let this mismatch sit behind a green end-to-end test, since the stub is the very check at issue.
+    """
+    env = _ImageBlockEnv()
+    bridge = _multiturn_bridge(env)
+    bridge.prompts[0] = _BridgePrompt(
+        student_messages=[
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "describe"}]}
+        ],
+        teacher_messages=[{"role": "user", "content": "describe"}],
+        prompt_ids=(10, 11),
+        image_descriptors=("descriptor",),
+        package_root=None,
+        example=object(),
+    )
+
+    started = bridge.start_multiturn(
+        index=0,
+        session_id="s1",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "describe"}],
+        image_count=1,
+    )
+
+    assert started["max_turns"] >= 1
+
+    # the guard still has to reject a genuinely different prompt, or flattening bought a hole.
+    with pytest.raises(ValueError, match="does not match the frozen environment prompt"):
+        bridge.start_multiturn(
+            index=0,
+            session_id="s2",
+            prompt_ids=[10, 11],
+            raw_prompt=[{"role": "user", "content": "describe something else"}],
+            image_count=1,
+        )
