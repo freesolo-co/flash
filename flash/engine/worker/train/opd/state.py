@@ -78,6 +78,7 @@ class _ChildCallbacks:
     progress: dict[str, Any]
     wandb_link: dict[str, str | None]
     child_tail: Any
+    silence_watchdog: Any
 
 
 @dataclass(frozen=True)

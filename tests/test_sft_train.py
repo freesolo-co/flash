@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.content.multimodal import message_content_text
 from flash.engine.profiling.sft_workload import _serialize_multimodal_inputs
 from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.entry.sft import _pretokenize_completion_only
@@ -534,22 +535,789 @@ def test_steps_xor_epochs_is_enforced():
 
 class _ExactTokenizer:
     eos_token = "!"
-    all_special_ids = (0,)
+    all_special_ids = (0, ord("!"))
 
     def __call__(self, texts, *, truncation=False, max_length=None):
         ids = [[ord(char) for char in text] for text in texts]
-        # the uncapped encode is how a truncated row reports its real size rather than the cap.
         if not truncation:
             return {"input_ids": ids}
         assert max_length is not None, "truncation=True requires an explicit max_length"
         return {"input_ids": [row[:max_length] for row in ids]}
 
 
+class _ExactChatMlTokenizer(_ExactTokenizer):
+    IM_START = 0x110000
+    IM_END = 0x110001
+    chat_template = (
+        "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+        "{% if message['role'] == 'assistant' %}{{ message['reasoning_content'] }}{% endif %}"
+        "{{ message['content'] }}<|im_end|>\n{% endfor %}"
+    )
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        enable_thinking=False,
+        **_kwargs,
+    ):
+        assert not tokenize
+        rendered = _render_chatml_messages(messages)
+        if add_generation_prompt:
+            rendered += "<|im_start|>assistant\n"
+        return rendered
+
+    def convert_tokens_to_ids(self, token):
+        return {"<|im_start|>": self.IM_START, "<|im_end|>": self.IM_END}.get(token)
+
+    def decode(self, ids):
+        pieces = []
+        for token_id in ids:
+            if token_id == self.IM_START:
+                pieces.append("<|im_start|>")
+            elif token_id == self.IM_END:
+                pieces.append("<|im_end|>")
+            else:
+                pieces.append(chr(token_id))
+        return "".join(pieces)
+
+    def __call__(self, texts, *, truncation=False, max_length=None):
+        rows = []
+        for text in texts:
+            row = []
+            index = 0
+            while index < len(text):
+                if text.startswith("<|im_start|>", index):
+                    row.append(self.IM_START)
+                    index += len("<|im_start|>")
+                elif text.startswith("<|im_end|>", index):
+                    row.append(self.IM_END)
+                    index += len("<|im_end|>")
+                else:
+                    row.append(ord(text[index]))
+                    index += 1
+            rows.append(row)
+        if not truncation:
+            return {"input_ids": rows}
+        assert max_length is not None, "truncation=True requires an explicit max_length"
+        return {"input_ids": [row[:max_length] for row in rows]}
+
+
+class _ConfigurableChatMlTokenizer(_ExactChatMlTokenizer):
+    def __init__(
+        self,
+        *,
+        reasoning="assistant",
+        body_mode="content",
+        assistant_scaffold="",
+        separator="",
+        plain=False,
+    ):
+        self.reasoning = reasoning
+        self.body_mode = body_mode
+        self.assistant_scaffold = assistant_scaffold
+        self.separator = separator
+        self.plain = plain
+        self.chat_template = self._template()
+
+    def _template(self):
+        if self.plain:
+            return "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}"
+        reasoning = {
+            "none": "",
+            "assistant": (
+                "{% if message['role'] == 'assistant' %}"
+                "{{ message['reasoning_content'] }}{% endif %}"
+            ),
+            "all": "{{ message['reasoning_content'] }}",
+        }[self.reasoning]
+        body = {
+            "content": "{{ message['content'] }}",
+            "constant": "constant",
+            "tool_parenthesized": (
+                "{{ message['content'] }}{{ message['tool_calls'][0]['function']['name'] }}("
+                "{{ message['tool_calls'][0]['function']['arguments'] }})"
+            ),
+            "tool_adjacent": (
+                "{{ message['content'] }}{{ message['tool_calls'][0]['function']['name'] }}"
+                "{{ message['tool_calls'][0]['function']['arguments'] }}"
+            ),
+            "tool_truthy": (
+                "{% if message['content'] %}{{ message['content'] }}{% else %}"
+                "{{ message['tool_calls'][0]['function']['name'] }}"
+                "{{ message['tool_calls'][0]['function']['arguments'] }}{% endif %}"
+            ),
+        }[self.body_mode]
+        scaffold = (
+            f"{{% if message['role'] == 'assistant' %}}{self.assistant_scaffold}{{% endif %}}"
+            if self.assistant_scaffold
+            else ""
+        )
+        return (
+            "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+            f"{reasoning}{scaffold}{body}<|im_end|>\n{self.separator}{{% endfor %}}"
+        )
+
+    def _body(self, message):
+        content = message_content_text(message.get("content"))
+        if self.body_mode == "constant":
+            body = "constant"
+        elif self.body_mode == "tool_truthy" and content:
+            body = content
+        elif self.body_mode.startswith("tool_"):
+            calls = []
+            for call in message.get("tool_calls", []):
+                if call.get("type") != "function":
+                    continue
+                function = call.get("function", {})
+                name = function.get("name", "")
+                arguments = function.get("arguments", "")
+                if self.body_mode == "tool_parenthesized":
+                    calls.append(f"{name}({arguments})")
+                else:
+                    calls.append(f"{name}{arguments}")
+            body = content + "".join(calls)
+        else:
+            body = content
+        reasoning = message.get("reasoning_content")
+        role = str(message.get("role"))
+        if isinstance(reasoning, str) and (
+            self.reasoning == "all"
+            or (self.reasoning == "assistant" and role.strip().lower() == "assistant")
+        ):
+            body = f"{reasoning}{body}"
+        if self.assistant_scaffold and role.strip().lower() == "assistant":
+            body = f"{self.assistant_scaffold}{body}"
+        return body
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **_kwargs):
+        assert not tokenize
+        if self.plain:
+            rendered = "".join(
+                f"{message.get('role')}: {self._body(message)}\n" for message in messages
+            )
+            if add_generation_prompt:
+                rendered += "assistant: "
+            return rendered
+        rendered = "".join(
+            f"{_chatml(str(message.get('role')), self._body(message))}{self.separator}"
+            for message in messages
+        )
+        if add_generation_prompt:
+            # the generation prompt carries the same assistant scaffold the body opens with, which
+            # is what puts a pre-opened `<think>` inside the shared prompt prefix.
+            rendered += f"<|im_start|>assistant\n{self.assistant_scaffold}"
+        return rendered
+
+
+class _QwenInlineThinkingChatMlTokenizer(_ExactChatMlTokenizer):
+    chat_template = (
+        "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+        "{{ message['prefix'] }}{{ message['content'] }}<|im_end|>\n{% endfor %}"
+    )
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **_kwargs):
+        assert not tokenize
+        rendered = []
+        for message in messages:
+            role = str(message.get("role"))
+            content = message_content_text(message.get("content"))
+            prefix = message.get("prefix", "")
+            if role.strip().lower() == "assistant" and "</think>" in content:
+                before_end, answer = content.split("</think>", 1)
+                reasoning = before_end.rsplit("<think>", 1)[-1]
+                body = f"{prefix}<think>{reasoning}</think>{answer}"
+            else:
+                body = f"{prefix}{content}"
+            rendered.append(_chatml(role, body))
+        if add_generation_prompt:
+            rendered.append("<|im_start|>assistant\n")
+        return "".join(rendered)
+
+
+class _QwenToolChatMlTokenizer(_ExactChatMlTokenizer):
+    chat_template = (
+        "{% for message in messages %}<|im_start|>"
+        "{% if message['role'] == 'tool' %}user{% else %}{{ message['role'] }}{% endif %}\n"
+        "{{ message['content'] }}<|im_end|>\n{% endfor %}"
+    )
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **_kwargs):
+        assert not tokenize
+        rendered = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            if message.get("role") != "tool":
+                rendered.append(
+                    _chatml(str(message.get("role")), message_content_text(message.get("content")))
+                )
+                index += 1
+                continue
+            tool_bodies = []
+            while index < len(messages) and messages[index].get("role") == "tool":
+                tool_bodies.append(message_content_text(messages[index].get("content")))
+                index += 1
+            tool_body = "\n".join(tool_bodies)
+            rendered.append(_chatml("user", f"<tool_response>\n{tool_body}\n</tool_response>"))
+        if add_generation_prompt:
+            rendered.append("<|im_start|>assistant\n")
+        return "".join(rendered)
+
+
+class _PreparedSourceProcessor:
+    def __init__(self, tokenizer, prepared_image):
+        self.tokenizer = tokenizer
+        self.prepared_image = prepared_image
+        self.prepared_renders = 0
+        self.chat_template = (
+            "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+            "{{ message['content'] }}{{ message['tool_calls'][0]['function']['name'] }}"
+            "{{ message['tool_calls'][0]['function']['arguments'] }}<|im_end|>\n{% endfor %}"
+        )
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        return_dict=False,
+        return_tensors=None,
+        enable_thinking=False,
+    ):
+        assert enable_thinking is False
+        prepared = any(
+            isinstance(message.get("content"), list)
+            and any(
+                isinstance(block, dict) and block.get("image") is self.prepared_image
+                for block in message["content"]
+            )
+            for message in messages
+        )
+        if prepared:
+            self.prepared_renders += 1
+        rendered = []
+        for message in messages:
+            body = message_content_text(message.get("content"))
+            if prepared:
+                for call in message.get("tool_calls", []):
+                    function = call.get("function", {})
+                    body += f"{function.get('name', '')}{function.get('arguments', '')}"
+            rendered.append(_chatml(str(message.get("role")), body))
+        if add_generation_prompt:
+            rendered.append("<|im_start|>assistant\n")
+        text = "".join(rendered)
+        if not tokenize:
+            return text
+        assert return_dict is True
+        assert return_tensors == "pt"
+        input_ids = self.tokenizer([text])["input_ids"]
+        return {"input_ids": input_ids, "attention_mask": [[1] * len(input_ids[0])]}
+
+
+def _chatml(role: str, content: str) -> str:
+    return f"<|im_start|>{role}\n{content}<|im_end|>\n"
+
+
+def _render_chatml_messages(messages: list[dict]) -> str:
+    rendered = []
+    for message in messages:
+        content = message_content_text(message.get("content"))
+        reasoning = message.get("reasoning_content")
+        if str(message.get("role")).strip().lower() == "assistant" and isinstance(reasoning, str):
+            content = f"<think>\n{reasoning.strip()}\n</think>\n\n{content}"
+        rendered.append(_chatml(str(message.get("role")), content))
+    return "".join(rendered)
+
+
+def _arrange_mask(
+    tokenizer,
+    target_messages,
+    *,
+    prompt_messages=None,
+    max_length=4096,
+    prompt_text=None,
+    full_text=None,
+):
+    prompt_messages = prompt_messages or [{"role": "user", "content": "q"}]
+    source_messages = [*prompt_messages, *target_messages]
+    if prompt_text is None:
+        prompt_text = tokenizer.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True
+        )
+    if full_text is None:
+        full_text = tokenizer.apply_chat_template(
+            source_messages, tokenize=False, add_generation_prompt=False
+        )
+    texts = [
+        {
+            "text": full_text,
+            "prompt_text": prompt_text,
+            "target_messages": target_messages,
+            "source_messages": source_messages,
+            "template_kwargs": {},
+        }
+    ]
+    kept, rows, dropped = _pretokenize_completion_only(texts, tokenizer, max_length=max_length)
+    assert kept == texts
+    assert dropped == 0
+    return tokenizer, rows[0]
+
+
+def _selected_text(tokenizer, row):
+    return tokenizer.decode(
+        [
+            token
+            for token, selected in zip(row["input_ids"], row["completion_mask"], strict=True)
+            if selected
+        ]
+    )
+
+
+def _assert_selected_text(tokenizer, row, expected):
+    assert _selected_text(tokenizer, row) == expected
+    assert len(row["input_ids"]) == len(row["completion_mask"])
+
+
+def _assert_strictly_subtractive(tokenizer, row, *, prompt_messages=None, max_length=4096):
+    from flash.engine.worker.model.packing import completion_mask_from_ids
+
+    prompt_messages = prompt_messages or [{"role": "user", "content": "q"}]
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_ids = tokenizer([prompt], truncation=True, max_length=max_length)["input_ids"][0]
+    contiguous = completion_mask_from_ids(prompt_ids, row["input_ids"])
+    assert all(
+        narrowed <= original
+        for original, narrowed in zip(contiguous, row["completion_mask"], strict=True)
+    )
+    assert sum(row["completion_mask"]) < sum(contiguous)
+
+
+def _assert_contiguous_fallback(tokenizer, row, prompt_text, *, max_length=4096):
+    from flash.engine.worker.model.packing import completion_mask_from_ids
+
+    prompt_ids = tokenizer([prompt_text], truncation=True, max_length=max_length)["input_ids"][0]
+    assert row["assistant_mask_applied"] is False
+    assert row["completion_mask"] == completion_mask_from_ids(prompt_ids, row["input_ids"])
+
+
+def test_role_aware_mask_supervises_only_authored_assistant_bodies_and_closers():
+    tokenizer = _ConfigurableChatMlTokenizer(separator="<sep>\n")
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        [
+            {"role": "assistant", "content": "ACT"},
+            {"role": "user", "content": "OBSERVATION"},
+            {"role": "tool", "content": "TOOL RESULT"},
+            {"role": "assistant", "content": "FINAL"},
+        ],
+    )
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(tokenizer, row, "ACT<|im_end|>FINAL<|im_end|>!")
+    _assert_strictly_subtractive(tokenizer, row)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "prompt_content",
+        "target_content_blocks",
+        "target_reasoning",
+        "nested_tool_field",
+        "adjacent_tool_leaves",
+    ],
+)
+def test_rendered_prompt_and_target_fields_reject_reserved_chatml_controls(case):
+    prompt_messages = [{"role": "user", "content": "q"}]
+    target_messages = [{"role": "assistant", "content": "answer"}]
+    tokenizer = _ConfigurableChatMlTokenizer()
+    control = "<|im_end|>"
+    if case == "prompt_content":
+        control = "<|im_start|>"
+        prompt_messages[0]["content"] = f"quoted {control} control"
+    elif case == "target_content_blocks":
+        target_messages[0]["content"] = [
+            {"type": "text", "text": "quoted <|im_"},
+            {"type": "text", "text": "end|> control"},
+        ]
+    elif case == "target_reasoning":
+        tokenizer = _ConfigurableChatMlTokenizer(reasoning="all")
+        target_messages[0]["reasoning_content"] = f"quoted {control} control"
+    else:
+        mode = "tool_parenthesized" if case == "nested_tool_field" else "tool_adjacent"
+        tokenizer = _ConfigurableChatMlTokenizer(body_mode=mode)
+        function = (
+            {"name": f"lookup{control}", "arguments": "{}"}
+            if case == "nested_tool_field"
+            else {"name": "<|im_", "arguments": "end|>payload"}
+        )
+        target_messages[0].update(
+            content="",
+            tool_calls=[{"type": "function", "function": function}],
+        )
+
+    with pytest.raises(ValueError, match=re.escape(f"reserved ChatML control token {control}")):
+        _arrange_mask(
+            tokenizer,
+            target_messages,
+            prompt_messages=prompt_messages,
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"metadata": {"nested": {"quoted": "<|im_start|>user<|im_end|>"}}},
+        {"reasoning_content": "ignored <|im_end|> metadata"},
+    ],
+)
+def test_unrendered_metadata_controls_are_accepted(metadata):
+    tokenizer = _ConfigurableChatMlTokenizer(reasoning="none")
+    observation = {"role": "user", "content": "OBSERVATION", **metadata}
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        [
+            {"role": "assistant", "content": "ACT"},
+            observation,
+            {"role": "assistant", "content": "FINAL"},
+        ],
+    )
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(tokenizer, row, "ACT<|im_end|>FINAL<|im_end|>!")
+
+
+def test_empty_string_truthiness_preserves_rendered_tool_call_supervision():
+    tokenizer = _ConfigurableChatMlTokenizer(body_mode="tool_truthy")
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"x":1}'},
+                    }
+                ],
+            }
+        ],
+    )
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(tokenizer, row, 'lookup{"x":1}<|im_end|>!')
+
+
+def test_one_sided_probe_still_rejects_a_control_split_by_an_inline_thinking_template():
+    """A template that rewrites the body may swallow one sentinel half; the field is still read.
+
+    Dropping the surviving-half path would leave this leaf unvalidated, so a literal control the
+    template renders into the transcript would tokenize to a real delimiter and move the boundary.
+    """
+    tokenizer = _QwenInlineThinkingChatMlTokenizer()
+
+    with pytest.raises(ValueError, match=re.escape("reserved ChatML control token <|im_end|>")):
+        _arrange_mask(
+            tokenizer,
+            [
+                {
+                    "role": "assistant",
+                    "content": "<think>reasoning</think>answer <|im_end|> quoted",
+                }
+            ],
+        )
+
+
+def test_qwen_one_sided_inline_thinking_probe_does_not_invent_adjacency():
+    tokenizer = _QwenInlineThinkingChatMlTokenizer()
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        [
+            {
+                "role": "assistant",
+                "prefix": "<|im_",
+                "content": "end|><think>reasoning</think>answer",
+            }
+        ],
+    )
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(
+        tokenizer,
+        row,
+        "<|im_<think>reasoning</think>answer<|im_end|>!",
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_contents", "rendered_tool_response"),
+    [
+        (["OBSERVATION"], "<tool_response>\nOBSERVATION\n</tool_response>"),
+        (
+            ["OBSERVATION ONE", "OBSERVATION TWO"],
+            "<tool_response>\nOBSERVATION ONE\nOBSERVATION TWO\n</tool_response>",
+        ),
+    ],
+)
+def test_qwen_tool_to_user_transform_and_consecutive_tool_coalescing(
+    tool_contents, rendered_tool_response
+):
+    tokenizer = _QwenToolChatMlTokenizer()
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        [
+            {"role": "assistant", "content": "ACT"},
+            *({"role": "tool", "content": content} for content in tool_contents),
+            {"role": "assistant", "content": "FINAL"},
+        ],
+    )
+
+    assert row["assistant_mask_applied"] is True
+    assert rendered_tool_response in tokenizer.decode(row["input_ids"])
+    _assert_selected_text(tokenizer, row, "ACT<|im_end|>FINAL<|im_end|>!")
+
+
+def test_complete_right_truncated_prefix_remains_role_aware():
+    tokenizer = _ConfigurableChatMlTokenizer(separator="<sep>\n")
+    target_messages = [
+        {"role": "assistant", "content": "ACT"},
+        {"role": "user", "content": "OBSERVATION"},
+        {"role": "assistant", "content": "FINAL"},
+    ]
+    source_messages = [{"role": "user", "content": "q"}, *target_messages]
+    full = tokenizer.apply_chat_template(
+        source_messages, tokenize=False, add_generation_prompt=False
+    )
+    cut = full.rfind("<|im_start|>assistant\n")
+    max_length = len(tokenizer([full[:cut]])["input_ids"][0])
+
+    tokenizer, row = _arrange_mask(tokenizer, target_messages, max_length=max_length)
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(tokenizer, row, "ACT<|im_end|>")
+
+
+@pytest.mark.parametrize("boundary", ["observation", "assistant_header", "assistant_body"])
+def test_incomplete_right_truncated_spans_preserve_contiguous_fallback(boundary):
+    tokenizer = _ConfigurableChatMlTokenizer(separator="<sep>\n")
+    target_messages = [
+        {"role": "assistant", "content": "ACT"},
+        {"role": "user", "content": "OBSERVATION"},
+        {"role": "assistant", "content": "FINAL"},
+    ]
+    prompt_messages = [{"role": "user", "content": "q"}]
+    source_messages = [*prompt_messages, *target_messages]
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True
+    )
+    full = tokenizer.apply_chat_template(
+        source_messages, tokenize=False, add_generation_prompt=False
+    )
+    if boundary == "observation":
+        cut = full.index("OBSERVATION") + len("OBS")
+    elif boundary == "assistant_header":
+        cut = full.rfind("<|im_start|>assistant\n") + len("<|im_start|>assistant\n")
+    else:
+        cut = full.rfind("FINAL") + len("FI")
+    max_length = len(tokenizer([full[:cut]])["input_ids"][0])
+
+    tokenizer, row = _arrange_mask(tokenizer, target_messages, max_length=max_length)
+
+    _assert_contiguous_fallback(tokenizer, row, prompt, max_length=max_length)
+
+
+@pytest.mark.parametrize(
+    ("separator", "target_messages", "expected"),
+    [
+        ("", [{"role": "assistant", "content": "FINAL"}], "FINAL<|im_end|>!"),
+        (
+            "",
+            [
+                {"role": "assistant", "content": "ACT"},
+                {"role": "user", "content": "OBSERVATION"},
+            ],
+            "ACT<|im_end|>",
+        ),
+        ("<sep>!", [{"role": "assistant", "content": "FINAL"}], "FINAL<|im_end|>"),
+        ("<sep>!x\n", [{"role": "assistant", "content": "FINAL"}], "FINAL<|im_end|>!"),
+    ],
+    ids=[
+        "appended-after-assistant",
+        "appended-after-observation",
+        "template-terminal-eos",
+        "template-internal-eos-plus-appended-eos",
+    ],
+)
+def test_eos_requires_explicit_provenance_after_final_authored_assistant(
+    separator, target_messages, expected
+):
+    tokenizer = _ConfigurableChatMlTokenizer(separator=separator)
+    tokenizer, row = _arrange_mask(tokenizer, target_messages)
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(tokenizer, row, expected)
+
+
+def test_empty_assistant_scaffold_is_not_an_authored_target():
+    tokenizer = _ConfigurableChatMlTokenizer(assistant_scaffold="<think>\n</think>\n\n")
+    prompt_messages = [{"role": "user", "content": "q"}]
+    target_messages = [{"role": "assistant", "content": ""}]
+    source_messages = [*prompt_messages, *target_messages]
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True
+    )
+    full = tokenizer.apply_chat_template(
+        source_messages, tokenize=False, add_generation_prompt=False
+    )
+
+    kept, rows, dropped = _pretokenize_completion_only(
+        [
+            {
+                "text": full,
+                "prompt_text": prompt,
+                "target_messages": target_messages,
+                "source_messages": source_messages,
+                "template_kwargs": {},
+            }
+        ],
+        tokenizer,
+        max_length=4096,
+    )
+
+    assert "<think>\n</think>\n\n" in full
+    assert kept == []
+    assert rows == []
+    assert dropped == 1
+
+
+def test_a_chatml_template_that_renders_plain_text_reports_fallback_not_role_aware():
+    """The template names ChatML but the render carries no delimiters, so no span is parseable.
+
+    ``assistant_mask_applied`` feeds the runner's disclosure, so returning true here would report
+    rows as observation-masked while they still train on the whole contiguous target.
+    """
+    tokenizer = _ConfigurableChatMlTokenizer()
+    prompt_messages = [{"role": "user", "content": "q"}]
+    target_messages = [
+        {"role": "assistant", "content": "ACT"},
+        {"role": "user", "content": "OBSERVATION"},
+    ]
+    plain = _ConfigurableChatMlTokenizer(plain=True)
+    prompt = plain.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+    full = plain.apply_chat_template(
+        [*prompt_messages, *target_messages], tokenize=False, add_generation_prompt=False
+    )
+
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        target_messages,
+        prompt_messages=prompt_messages,
+        prompt_text=prompt,
+        full_text=full,
+    )
+
+    _assert_contiguous_fallback(tokenizer, row, prompt)
+
+
+def test_role_aware_mask_never_supervises_a_token_the_prompt_prefix_owns():
+    """The narrowed mask is an intersection, so a token the prompt already covers stays masked.
+
+    The thinking template pre-opens the assistant scaffold inside the generation prompt, so those
+    tokens sit in the shared prefix. Writing literal ``1`` bits over the assistant body instead of
+    intersecting would supervise them and undo the completion boundary.
+    """
+    tokenizer = _ConfigurableChatMlTokenizer(assistant_scaffold="<think>\n</think>\n\n")
+    prompt_messages = [{"role": "user", "content": "q"}]
+    target_messages = [{"role": "assistant", "content": "FINAL"}]
+
+    tokenizer, row = _arrange_mask(tokenizer, target_messages, prompt_messages=prompt_messages)
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_ids = tokenizer([prompt], truncation=True, max_length=4096)["input_ids"][0]
+
+    assert row["assistant_mask_applied"] is True
+    assert prompt.endswith("<think>\n</think>\n\n")
+    assert all(row["completion_mask"][position] == 0 for position in range(len(prompt_ids)))
+    _assert_selected_text(tokenizer, row, "FINAL<|im_end|>!")
+
+
+@pytest.mark.parametrize("case", ["non_chatml", "ambiguous_constant_body"])
+def test_non_chatml_and_ambiguous_renders_keep_contiguous_fallback(case):
+    prompt_messages = [{"role": "user", "content": "q"}]
+    if case == "non_chatml":
+        tokenizer = _ConfigurableChatMlTokenizer(plain=True)
+        target_messages = [
+            {"role": "assistant", "content": "ACT"},
+            {"role": "user", "content": "OBSERVATION"},
+        ]
+    else:
+        tokenizer = _ConfigurableChatMlTokenizer(body_mode="constant")
+        target_messages = [{"role": "user", "content": "OBSERVATION"}]
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True
+    )
+
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        target_messages,
+        prompt_messages=prompt_messages,
+    )
+
+    _assert_contiguous_fallback(tokenizer, row, prompt)
+
+
+def test_multimodal_probe_uses_exact_prepared_source_messages():
+    from flash.engine.profiling.sft_workload import _processor_tokenized_row
+
+    tokenizer = _ExactChatMlTokenizer()
+    prepared_image = object()
+    processor = _PreparedSourceProcessor(tokenizer, prepared_image)
+
+    with pytest.raises(ValueError, match="reserved ChatML control token <\\|im_end\\|>"):
+        _processor_tokenized_row(
+            processor,
+            [{"role": "user", "content": [{"type": "image"}]}],
+            [
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {"name": "<|im_", "arguments": "end|>payload"},
+                        }
+                    ],
+                }
+            ],
+            [prepared_image],
+            max_length=4096,
+            thinking=False,
+        )
+
+    assert processor.prepared_renders >= 3
+
+
 def test_exact_mask_keeps_prompt_assistant_history_masked_and_full_target_active():
     tokenizer = _ExactTokenizer()
     prompt = "<user>q</user><assistant>history</assistant><assistant>"
     full = prompt + "first</assistant><user>tool</user><assistant>second</assistant>"
-    texts = [{"text": full, "prompt_text": prompt}]
+    texts = [
+        {
+            "text": full,
+            "prompt_text": prompt,
+            "target_messages": [],
+            "source_messages": [],
+            "template_kwargs": {},
+        }
+    ]
 
     kept, rows, dropped = _pretokenize_completion_only(texts, tokenizer, max_length=512)
 
@@ -565,8 +1333,15 @@ def test_exact_mask_drops_right_truncated_completion_and_handles_thinking_prefix
     tokenizer = _ExactTokenizer()
     prompt = "<think>prompt<assistant>"
     full = "<think>prompt<assistant>answer"
+    row = {
+        "text": full,
+        "prompt_text": prompt,
+        "target_messages": [],
+        "source_messages": [],
+        "template_kwargs": {},
+    }
     kept, rows, dropped = _pretokenize_completion_only(
-        [{"text": full, "prompt_text": prompt}],
+        [row],
         tokenizer,
         max_length=len(prompt),
     )
@@ -575,7 +1350,7 @@ def test_exact_mask_drops_right_truncated_completion_and_handles_thinking_prefix
     assert dropped == 1
 
     kept, rows, dropped = _pretokenize_completion_only(
-        [{"text": full, "prompt_text": prompt}],
+        [row],
         tokenizer,
         max_length=512,
     )
@@ -1859,8 +2634,37 @@ def test_sft_collapse_warning_stays_quiet_for_structured_multiturn_targets(monke
     sft_train_runner._prepare_sft_data(options)
 
     output = capsys.readouterr().out
-    assert "[sft] multi-turn SFT: 2/2 rows" in output
+    assert "2/2 rows use completion-only fallback" in output
+    assert "observations are not proven masked" in output
     assert "bare assistant target coerced" not in output
+
+
+def test_sft_runner_logs_role_aware_and_fallback_multiturn_counts_separately(monkeypatch, capsys):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    real_prepare = sft_train.prepare_sft_workload
+
+    def prepare_with_mixed_masking(*args, **kwargs):
+        prepared = real_prepare(*args, **kwargs)
+        return replace(
+            prepared,
+            multiturn_targets=2,
+            role_aware_multiturn_targets=1,
+            fallback_multiturn_targets=1,
+        )
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", prepare_with_mixed_masking)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
+    assert "1/2 rows use assistant-body masking" in output
+    assert "observations are masked out of the loss" in output
+    assert "1/2 rows use completion-only fallback" in output
+    assert "observations are not proven masked" in output
 
 
 def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monkeypatch, capsys):

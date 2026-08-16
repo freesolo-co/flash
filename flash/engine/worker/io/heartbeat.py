@@ -22,6 +22,7 @@ from flash.engine.result.rollout_samples import (
 )
 from flash.engine.worker.perf import gpu_diagnostics
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
 # Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
 # cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
@@ -304,6 +305,7 @@ class RewardObservabilityBuffer:
 
     def __init__(self, *, generation_size: int = 0) -> None:
         self._lock = threading.Lock()
+        self.parent_work = ParentWorkGauge()
         # completions per generation, when the caller knows it: see the class docstring. 0 leaves
         # the boundary entirely caller-driven.
         self._generation_size = max(0, int(generation_size))
@@ -336,6 +338,7 @@ class RewardObservabilityBuffer:
         Fold breakdowns into per-name sums. Retaining bounded rows would silently evict valid
         large-batch completions and bias the mean; ``_bounded_reward_metrics`` already caps names.
         """
+        self.parent_work.complete()
         with self._lock:
             self._samples.append((prompt, completion, float(reward)))
             del self._samples[: -self._SAMPLE_BUFFER_LIMIT]
@@ -483,6 +486,9 @@ class RewardObservabilityBuffer:
         samples = select_rollout_samples(rows, generated_at_step=step)
         if samples:
             fields["sampled_completions"] = samples
+        work = self.parent_work.snapshot()
+        fields["reward_completions"] = work.completed
+        fields["reward_grading_depth"] = work.depth
         return fields
 
 
@@ -526,8 +532,49 @@ _LIVENESS_TICK_S = 30.0
 _STALL_DUMP_S = 1200.0
 
 
+class _OffThreadFieldSampler:
+    def __init__(self, fields, done: threading.Event, spawner: threading.Thread) -> None:
+        self._fields = fields
+        self._done = done
+        self._spawner = spawner
+        self._lock = threading.Lock()
+        self._latest: dict = {}
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _loop(self) -> None:
+        if threading.current_thread() is self._spawner:
+            return
+        while not self._done.is_set():
+            try:
+                sampled = self._fields() or {}
+            except Exception:
+                sampled = None
+            if sampled is not None:
+                with self._lock:
+                    self._latest = dict(sampled)
+            if self._done.wait(_LIVENESS_TICK_S):
+                return
+
+    def latest(self) -> dict:
+        with self._lock:
+            return dict(self._latest)
+
+    def join(self) -> None:
+        self._thread.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
+
+
 @contextlib.contextmanager
-def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, keepalive=False):
+def liveness_heartbeat(
+    stage,
+    progress=None,
+    fields=None,
+    progress_step=False,
+    keepalive=False,
+    sample_off_thread=False,
+):
     """Emit liveness heartbeats while a main-thread block runs.
     ``keepalive`` marks blocking uploads as progress (dev #445); use a throttled stage. ``fields``
     carries payload data, while ``progress_step`` wins for trainer steps (dev #442). Missing a step
@@ -535,6 +582,13 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, k
     """
     done = threading.Event()
     spawner = threading.current_thread()
+    field_sampler = (
+        _OffThreadFieldSampler(fields, done, spawner)
+        if sample_off_thread and fields is not None
+        else None
+    )
+    if field_sampler is not None:
+        field_sampler.start()
 
     def _loop() -> None:
         if threading.current_thread() is spawner:
@@ -561,8 +615,8 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, k
             gpu = gpu_diagnostics(include_torch=False)
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
-            extra = {}
-            if fields is not None:
+            extra = field_sampler.latest() if field_sampler is not None else {}
+            if fields is not None and field_sampler is None:
                 with contextlib.suppress(Exception):
                     extra = fields() or {}
             if progress_step and last_val is not None:
@@ -582,6 +636,8 @@ def liveness_heartbeat(stage, progress=None, fields=None, progress_step=False, k
     finally:
         done.set()
         t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
+        if field_sampler is not None:
+            field_sampler.join()
 
 
 # checkpoint drain time scales with model size and network throughput; a fixed timeout killed a
