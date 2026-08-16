@@ -458,6 +458,97 @@ def test_heartbeat_console_summarizes_metric_backlog():
     assert console["step"] == 1024
 
 
+def _last_console_heartbeat(capsys) -> dict:
+    import json
+
+    lines = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("HEARTBEAT {")
+    ]
+    assert lines
+    return json.loads(lines[-1].removeprefix("HEARTBEAT "))
+
+
+def _reset_console_heartbeat_state(monkeypatch, worker) -> None:
+    monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(worker, "_HB_LAST_COMMITTED_STEP", -1)
+    monkeypatch.setattr(worker, "_HB_LAST_FORCED_UPLOAD", 0.0)
+    monkeypatch.setattr(worker, "_HB_LAST_PROGRESS_TS", 0.0)
+    monkeypatch.setattr(worker, "_HB_PROGRESS_SEQ", 0)
+    monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "upload_result", "expected_result", "marker"),
+    [
+        pytest.param("success", True, True, None, id="success"),
+        pytest.param("upload-false", False, False, "pending", id="upload-false"),
+        pytest.param("lock-skip", None, False, "pending", id="noninitial-lock-skip"),
+        pytest.param("local-throttle", None, False, "throttled", id="local-throttle"),
+    ],
+)
+def test_heartbeat_console_and_upload_marker_matrix(
+    monkeypatch, capsys, scenario, upload_result, expected_result, marker
+):
+    import json
+
+    import flash.engine.worker as worker
+
+    heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
+    uploaded: list[dict] = []
+    samples = [{"completion": "visible only in the uploaded payload"}]
+
+    def _upload(local, *args, **kwargs):
+        with open(local) as handle:
+            uploaded.append(json.load(handle))
+        return upload_result
+
+    _reset_console_heartbeat_state(monkeypatch, worker)
+    held = False
+    if scenario in {"success", "upload-false"}:
+        monkeypatch.setattr(worker, "hf_upload_file", _upload)
+    elif scenario == "lock-skip":
+        monkeypatch.setattr(heartbeat_module, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(
+            worker,
+            "hf_upload_file",
+            lambda *args, **kwargs: pytest.fail("a skipped upload must not call hf"),
+        )
+        assert heartbeat_module._HB_UPLOAD_LOCK.acquire(timeout=1.0)
+        held = True
+    else:
+        monkeypatch.setattr(heartbeat_module.time, "time", lambda: 1000.0)
+        monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 999.0)
+        monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
+        monkeypatch.setattr(
+            worker,
+            "hf_upload_file",
+            lambda *args, **kwargs: pytest.fail("a throttled heartbeat must not call hf"),
+        )
+
+    stage = "sft_step" if scenario == "local-throttle" else "rl_train_start"
+    kwargs = {"step": 1} if scenario == "local-throttle" else {}
+    try:
+        result = worker.heartbeat(stage, sampled_completions=samples, **kwargs)
+    finally:
+        if held:
+            heartbeat_module._HB_UPLOAD_LOCK.release()
+
+    assert result is expected_result
+    console = _last_console_heartbeat(capsys)
+    assert "sampled_completions" not in console
+    assert console["samples_count"] == 1
+    assert ("pending" in console) is (marker == "pending")
+    assert ("throttled" in console) is (marker == "throttled")
+
+    if uploaded:
+        assert len(uploaded) == 1
+        assert uploaded[0]["sampled_completions"] == samples
+        assert "pending" not in uploaded[0]
+        assert "throttled" not in uploaded[0]
+    else:
+        assert scenario in {"lock-skip", "local-throttle"}
+
+
 def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     import ast
     import textwrap
