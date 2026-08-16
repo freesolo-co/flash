@@ -89,6 +89,7 @@ refuse that combination rather than serve broken output.
 ```json
 {
   "ok": true,
+  "base_models": ["Qwen/Qwen3.5-4B"],
   "requires_key": true,
   "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"]
 }
@@ -96,6 +97,10 @@ refuse that combination rather than serve broken output.
 
 Must answer before the model is loaded. The client calls it during deploy preflight, and a cold
 container that blocks health on a multi-minute weight load reads as an unreachable backend.
+
+`base_models` is optional for a custom backend because the client treats an absent or non-array
+value as no advertised models. The generated single-model backend always returns a one-element JSON
+array of strings containing its exact base model, as shown above.
 
 `requires_key` is optional and reports whether the backend authenticates writes at all - not
 whether the caller's own key is correct. `flash serve status` follows up with an authenticated
