@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 if __package__:
+    from flash.providers._lifecycle import bootstrap_console as _bootstrap_console
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
         _payload_secrets,
@@ -27,6 +28,9 @@ if __package__:
         _safe_detail,
     )
 else:
+    # running as a bare script on the box: the launch scripts ship the sibling modules into the
+    # same directory, and the script directory leads sys.path.
+    import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
@@ -36,13 +40,7 @@ else:
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
-_CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-_CONSOLE_PROGRESS_READ_LIMIT = 1_048_576
-_CONSOLE_PROGRESS_LINE_LIMIT = 64_000
-_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
-_CONSOLE_UPLOAD_POLL_S = 120.0
-_CONSOLE_UPLOAD_QUIET_POLLS = 4
-_CONSOLE_UPLOAD_CREDITS = 2
+_CONSOLE_UPLOAD_INTERVAL_S = _bootstrap_console._CONSOLE_UPLOAD_INTERVAL_S
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
@@ -116,6 +114,7 @@ def arm_deadline_watchdog(
     payload: dict,
 ) -> tuple[threading.Timer, threading.Event]:
     """Hard-stop setup or training that remains alive at the absolute cutoff."""
+    # done is set by the caller on clean finish; _fire checks it first to avoid a racing false alarm.
     done = threading.Event()
 
     def _fire() -> None:
@@ -251,87 +250,36 @@ def hf_upload(
         return False
 
 
-def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> bool:
-    tail_path = console + ".tail"
+def _upload_console_snapshot(
+    payload: dict, console: str, mode: str, extra: str = "", final: bool = False
+) -> bool:
+    """Upload one console snapshot from an isolated process.
+
+    The periodic snapshot writes to its own scratch file and its own repo destination. Reaping the
+    periodic child at teardown is best-effort, so one killed mid-write would otherwise truncate the
+    scratch file the terminal snapshot is uploading, or overwrite the terminal artifact itself --
+    losing the failure detail the control plane reads (including the wall-clock-cap marker). The
+    terminal snapshot keeps the canonical name; only the periodic one is suffixed.
+    """
+    kind = "" if final else "_live"
+    tail_path = console + (".terminal.tail" if final else ".live.tail")
     secrets = _payload_secrets(payload)
     tail = _read_console_tail(console, 64_000, secrets=secrets) + extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
         f.write(_safe_detail(tail, 64_000, secrets=secrets))
-    return hf_upload(payload, tail_path, f"console_{mode}.txt")
+    return hf_upload(payload, tail_path, f"console_{mode}{kind}.txt")
 
 
-def _console_progress(path, state):
-    committed = beats = 0
-    try:
-        with open(path, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            eof, offset = handle.tell(), state["offset"]
-            if eof < offset:
-                state.update(offset=0, partial=b"", dropping=False)
-                offset = 0
-            while offset < eof:
-                handle.seek(offset)
-                chunk = handle.read(min(_CONSOLE_PROGRESS_READ_LIMIT, eof - offset))
-                if not chunk:
-                    break
-                offset += len(chunk)
-                lines = (state["partial"] + chunk).split(b"\n")
-                state["partial"] = lines.pop()
-                if state["dropping"]:
-                    if not lines:
-                        state["partial"] = b""
-                        state["offset"] = offset
-                        continue
-                    state["dropping"], lines = False, lines[1:]
-                if len(state["partial"]) > _CONSOLE_PROGRESS_LINE_LIMIT:
-                    state.update(partial=b"", dropping=True)
-                for line in lines:
-                    if len(line) > _CONSOLE_PROGRESS_LINE_LIMIT or not line.startswith(
-                        b"HEARTBEAT "
-                    ):
-                        continue
-                    try:
-                        payload = json.loads(line[len(b"HEARTBEAT ") :])
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(payload, dict) and not payload.get("liveness"):
-                        beats += 1
-                        committed += not {"pending", "throttled"} & set(payload)
-                state["offset"] = offset
-    except OSError:
-        return -1, 0, 0
-    return eof, committed, beats
-
-
-def _console_upload_loop(job: dict, console: str, mode: str, interval: float, stop) -> None:
-    poll = min(_CONSOLE_UPLOAD_POLL_S, interval)
-    due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval)
-    sent, size, since, quiet, armed, spent, ever = -1, -1, 0.0, 0.0, False, 0, False
-    progress_state = {"offset": 0, "partial": b"", "dropping": False}
-    while not stop.wait(poll):
-        since += poll
-        size, staged, beats = _console_progress(console, progress_state)
-        if staged and not ever and since < due_s:
-            due_s = interval
-        ever |= bool(staged)
-        progress = staged if ever else beats
-        armed = armed or bool(progress)
-        quiet = 0.0 if progress else quiet + 1
-        due = since >= due_s
-        ok = armed and not due and spent < _CONSOLE_UPLOAD_CREDITS
-        wedged = ok and quiet >= _CONSOLE_UPLOAD_QUIET_POLLS
-        if size == sent or not (due or wedged):
-            continue
+def _console_upload_loop(payload: dict, console: str, mode: str, interval_s: float, stop) -> None:
+    def upload() -> bool:
         try:
-            up = _upload_console_snapshot(job, console, mode)
+            return _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
-            detail = _safe_detail(exc, secrets=_payload_secrets(job))
+            detail = _safe_detail(exc, secrets=_payload_secrets(payload))
             print(f"console upload warn: {detail}", flush=True)
-            up = False
-        spent += 1 if wedged and up else 0
-        armed = armed and not (wedged and up)
-        if up:
-            sent, since, due_s = size, 0.0, interval
+            return False
+
+    _bootstrap_console.run_console_upload_loop(console, interval_s, stop, upload=upload)
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
@@ -499,7 +447,7 @@ def _upload_console_tail_bounded(
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_upload_console_snapshot,
-        args=(payload, console, mode, extra),
+        args=(payload, console, mode, extra, True),
         daemon=True,
     )
     process.start()
@@ -531,6 +479,7 @@ def remote_completion_confirmed(payload: dict) -> bool:
     try:
         return hf_file_exists(payload, "DONE") and hf_file_exists(payload, "metrics.json")
     except Exception as exc:
+        # read errors are infra-shaped and leave completion unconfirmed.
         print(
             f"remote-completion check warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
             flush=True,
@@ -563,6 +512,7 @@ def build_worker_env(payload: dict) -> dict:
     env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
     spec_json = payload.get("job_spec_json")
     if not spec_json and payload.get("job_spec_in_hf"):
+        # Pre-worker fetch; failure is infra-shaped -> raise RetriableBootstrapError so poller retries.
         try:
             spec_json = fetch_spec_from_hf(payload)
         except Exception:
@@ -572,6 +522,7 @@ def build_worker_env(payload: dict) -> dict:
             "bootstrap payload carries no job spec: both job_spec_json and the job_spec_in_hf "
             "sentinel are absent/empty — the control plane built an invalid worker payload"
         )
+    # Large specs go via a file to avoid execve "Argument list too long".
     if len(spec_json) > 96_000:
         with open("/tmp/job_spec.json", "w") as f:
             f.write(spec_json)
@@ -581,10 +532,12 @@ def build_worker_env(payload: dict) -> dict:
         env["FLASH_JOB_SPEC_JSON"] = spec_json
     env["PHASE"] = payload["phase"]
     env["SEED"] = str(payload["seed"])
+    # drives the poller's stale-heartbeat rejection across retries.
     attempt = payload.get("attempt")
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise RuntimeError("bootstrap attempt identity is invalid")
     env["ATTEMPT"] = str(attempt)
+    # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
     code_dir = _code_dir(payload)
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -677,11 +630,14 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            # the worker's own output can carry bytes invalid under the container locale; strict
+            # decoding would raise mid-stream and fail a paid run whose training actually ran.
             errors="replace",
         )
         pump_done = threading.Event()
         pump_write_lock = threading.Lock()
         pump_writes_enabled = True
+        # resolved once: the payload does not change, and this runs per child line.
         pump_secrets = _payload_secrets(payload)
 
         def pump():
@@ -866,6 +822,7 @@ def run_preload(payload: dict) -> dict:
     done, already, failed = [], [], {}
     for repo_id in payload.get("models") or []:
         try:
+            # Probe with local_files_only first (HF's own resolution, not a dir-name guess).
             try:
                 snapshot_download(
                     repo_id=repo_id,
@@ -891,6 +848,18 @@ def run_preload(payload: dict) -> dict:
 
 
 def main() -> int:
+    """Run one bootstrap attempt and return its process exit code.
+
+    Two rules govern the train path below, kept here because every byte of an on-box COMMENT is
+    charged against the cloud-init budget while this docstring is stripped on the way in:
+
+    * ``run_mode`` enforces the absolute subprocess deadline, so once it returns, required completion
+      artifacts take precedence over bootstrap bookkeeping that happens to cross the boundary.
+    * Missing local metrics while HF confirms completion (DONE + metrics uploaded) means the run
+      SUCCEEDED and the idempotency replay merely hit a transient HF read -- retry so a fresh worker
+      re-fetches the metrics, and never fail a confirmed-complete run as a crash.
+    """
+    # SIGTERM -> sys.exit so the finally block still uploads the terminal marker.
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(1))
     payload = load_payload()
     ok = False
@@ -911,6 +880,7 @@ def main() -> int:
             result = run_preload(payload)
             with open("/tmp/preload_result.json", "w") as f:
                 json.dump(result, f)
+            # preload_result.json is the completion signal the warm driver polls.
             confirmed = False
             for attempt in range(3):
                 remaining = deadline - _finite_positive_number(time.time(), "current clock")
@@ -943,6 +913,8 @@ def main() -> int:
             return 0 if ok else 1
         deadline_watchdog = arm_deadline_watchdog(deadline, payload)
         install_extra_pip(payload)
+        # Pre-worker HF fetch of the run's own code (control plane uploaded it before submit), same
+        # infra-shaped class as fetch_spec_from_hf above: a transient HF blip must retry, not fail.
         try:
             fetch_code(payload)
         except Exception:
@@ -954,9 +926,6 @@ def main() -> int:
                 os.remove(stale)
         rc = run_mode(payload, env, phase, deadline)
         if not os.path.exists("/tmp/metrics.json"):
-            # Missing local metrics but the run is confirmed complete on HF (DONE+metrics uploaded) —
-            # e.g. the idempotency replay hit a transient HF read. The run SUCCEEDED; retry so a fresh
-            # worker re-fetches the metrics, never fail a confirmed-complete run as a crash.
             if remote_completion_confirmed(payload):
                 raise RetriableBootstrapError(
                     f"train phase '{phase}' is complete on HF but its local metrics.json is missing "

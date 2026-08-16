@@ -1097,7 +1097,7 @@ def test_first_console_snapshot_precedes_stall_teardown():
     import importlib
     import inspect
 
-    from flash.providers._lifecycle import bootstrap as instance_bootstrap
+    from flash.providers._lifecycle import bootstrap_console
     from flash.providers.runpod.serverless import endpoints
 
     importlib.import_module("flash.providers.runpod.jobs")
@@ -1108,13 +1108,13 @@ def test_first_console_snapshot_precedes_stall_teardown():
 
     for first_snapshot_s in (
         endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
-        instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
+        bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
     ):
         assert first_snapshot_s < training_stall_s
         assert first_snapshot_s < setup_grace_s
     for poll_s in (
         endpoints._CONSOLE_UPLOAD_POLL_S,
-        instance_bootstrap._CONSOLE_UPLOAD_POLL_S,
+        bootstrap_console._CONSOLE_UPLOAD_POLL_S,
     ):
         assert 2 * poll_s < training_stall_s
 
@@ -1154,9 +1154,9 @@ def _source_shipped_console_progress(*, open_fn=None):
 @pytest.fixture(params=("instance", "source-shipped"))
 def console_progress_impl(request):
     if request.param == "instance":
-        from flash.providers._lifecycle import bootstrap
+        from flash.providers._lifecycle import bootstrap_console
 
-        return request.param, bootstrap._console_progress, bootstrap
+        return request.param, bootstrap_console.console_progress, bootstrap_console
     progress = _source_shipped_console_progress()
     return request.param, progress, progress.__globals__
 
@@ -1212,6 +1212,7 @@ def test_console_progress_parser_matrix(console_progress_impl, tmp_path, content
 
 def _drive_console_cadence(monkeypatch, provider: str, progress, outcomes=True):
     from flash.providers._lifecycle import bootstrap as instance_bootstrap
+    from flash.providers._lifecycle import bootstrap_console
 
     polls = {"count": 0}
     waits: list[float] = []
@@ -1241,7 +1242,9 @@ def _drive_console_cadence(monkeypatch, provider: str, progress, outcomes=True):
             attempts.append(polls["count"])
             return _outcome()
 
-        monkeypatch.setattr(instance_bootstrap, "_console_progress", _progress)
+        # the loop resolves the parser in bootstrap_console's own namespace, so patching it on
+        # bootstrap would silently miss and the test would pass without exercising the schedule.
+        monkeypatch.setattr(bootstrap_console, "console_progress", _progress)
         monkeypatch.setattr(instance_bootstrap, "_upload_console_snapshot", _upload)
         instance_bootstrap._console_upload_loop(
             {}, "/tmp/console.txt", "train", instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S, _Stop()
@@ -1402,10 +1405,10 @@ def test_console_progress_split_boundaries(console_progress_impl, tmp_path):
 
 
 def test_console_progress_bounds_multi_chunk_reads(console_progress_impl, tmp_path, monkeypatch):
-    from flash.providers._lifecycle import bootstrap
+    from flash.providers._lifecycle import bootstrap_console
 
     name, progress, owner = console_progress_impl
-    read_limit = bootstrap._CONSOLE_PROGRESS_READ_LIMIT
+    read_limit = bootstrap_console._CONSOLE_PROGRESS_READ_LIMIT
     console = tmp_path / f"large_{name}.txt"
     console.write_bytes(b"x" * (2 * read_limit + 123))
     state = {"offset": 0, "partial": b"", "dropping": False}
@@ -1448,11 +1451,11 @@ def test_console_progress_bounds_multi_chunk_reads(console_progress_impl, tmp_pa
 
 
 def test_console_progress_recovers_after_overlong_line(console_progress_impl, tmp_path):
-    from flash.providers._lifecycle import bootstrap
+    from flash.providers._lifecycle import bootstrap_console
 
     name, progress, _owner = console_progress_impl
     console = tmp_path / f"overlong_{name}.txt"
-    console.write_bytes(b"x" * (bootstrap._CONSOLE_PROGRESS_LINE_LIMIT + 1))
+    console.write_bytes(b"x" * (bootstrap_console._CONSOLE_PROGRESS_LINE_LIMIT + 1))
     state = {"offset": 0, "partial": b"", "dropping": False}
 
     assert progress(str(console), state)[1:] == (0, 0)
@@ -1465,7 +1468,7 @@ def test_console_progress_recovers_after_overlong_line(console_progress_impl, tm
 
 
 def test_console_progress_source_parity_across_writes(tmp_path):
-    from flash.providers._lifecycle import bootstrap
+    from flash.providers._lifecycle import bootstrap_console
 
     source_progress = _source_shipped_console_progress()
     console = tmp_path / "console_parity.txt"
@@ -1474,7 +1477,7 @@ def test_console_progress_source_parity_across_writes(tmp_path):
     writes = [
         b"HEARTBEAT {not json}\n" + valid[:17],
         valid[17:] + pending,
-        b"x" * (bootstrap._CONSOLE_PROGRESS_READ_LIMIT + 1),
+        b"x" * (bootstrap_console._CONSOLE_PROGRESS_READ_LIMIT + 1),
         b"\n" + valid,
     ]
     instance_state = {"offset": 0, "partial": b"", "dropping": False}
@@ -1484,7 +1487,7 @@ def test_console_progress_source_parity_across_writes(tmp_path):
     for chunk in writes:
         with open(console, "ab") as handle:
             handle.write(chunk)
-        assert bootstrap._console_progress(str(console), instance_state) == source_progress(
+        assert bootstrap_console.console_progress(str(console), instance_state) == source_progress(
             str(console), source_state
         )
         assert instance_state == source_state
@@ -1492,7 +1495,7 @@ def test_console_progress_source_parity_across_writes(tmp_path):
 
 def test_console_progress_keeps_compacted_managed_heartbeat(tmp_path):
     from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
-    from flash.providers._lifecycle import bootstrap
+    from flash.providers._lifecycle import bootstrap_console
 
     snapshot = _console_heartbeat_snapshot(
         {
@@ -1502,13 +1505,13 @@ def test_console_progress_keeps_compacted_managed_heartbeat(tmp_path):
         }
     )
     line = f"HEARTBEAT {snapshot}\n".encode()
-    assert len(line) <= bootstrap._CONSOLE_PROGRESS_LINE_LIMIT
+    assert len(line) <= bootstrap_console._CONSOLE_PROGRESS_LINE_LIMIT
     assert '"sample_count": 1' in snapshot
     assert "sampled_completions" not in snapshot
     console = tmp_path / "console_large_managed_heartbeat.txt"
     console.write_bytes(line)
     state = {"offset": 0, "partial": b"", "dropping": False}
-    assert bootstrap._console_progress(str(console), state)[1:] == (1, 1)
+    assert bootstrap_console.console_progress(str(console), state)[1:] == (1, 1)
 
 
 def test_console_upload_uses_distinct_sanitized_live_and_terminal_artifacts(monkeypatch):

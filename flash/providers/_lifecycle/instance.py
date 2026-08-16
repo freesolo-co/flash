@@ -28,17 +28,11 @@ _USER_DATA_CAP = 64_000
 _USER_DATA_MARGIN = 2_000
 _USER_DATA_BUDGET = _USER_DATA_CAP - _USER_DATA_MARGIN
 
-# Fast path only: above this, the spec is spilled to HF without first rendering a payload that
-# cannot fit. What is left of the ~64,000-byte cap after the fixed framing -- this module's template
-# plus every source it heredocs in (bootstrap.py, bootstrap_secrets.py, bootstrap_pip.py) -- is
-# ~5,800 bytes, and base64 + json escaping inflate the spec ~1.35x on the way in. Shrink this again
-# whenever those sources grow; docstrings are stripped on the way in, so only code and COMMENTS
-# count, and prose belongs in a docstring rather than a comment for exactly that reason.
-# test_build_user_data_spills_large_spec_out_of_cloud_init pins the worst inline case against the
-# cap so the two cannot drift apart silently. Sized for a REAL payload, which carries ~760 bytes of
-# env, deadline, and cache fields that the test's minimal one does not: at 4_000 the worst case
-# cleared the test but a production launch would re-render and force-spill anyway.
-_SPEC_SPILL_THRESHOLD = 3_000
+# fast path only: above this, spill before rendering the complete user data. the fixed framing
+# includes bootstrap.py and its console, secret, and pip siblings. the representative payload test
+# pins the full encoding below the 62,000-byte budget; 3,000 bytes exceeds it after this sibling was
+# added, while 2,000 leaves the required margin.
+_SPEC_SPILL_THRESHOLD = 2_000
 
 
 def run_label_prefix(run_id: str) -> str:
@@ -490,7 +484,38 @@ def _strip_docstrings(source: str) -> str:
 
 
 def _render_user_data(payload: dict, *, image: str) -> str:
-    """The user_data text for an already-spill-decided ``payload``."""
+    """The user_data text for an already-spill-decided ``payload``.
+
+    Everything below the ``return`` ships verbatim to the box and is charged against
+    ``_USER_DATA_BUDGET`` on every launch, INCLUDING the bash comments -- only the heredoc'd python
+    sources get their docstrings stripped. So the on-box comments stay one terse line each, and the
+    reasoning behind those steps lives here instead:
+
+    * ``exec >>host_boot.log``: Lambda exposes no provider console API, so consolidating this
+      script's and the container's output into one host log is the only window into a failure that
+      happens before the worker starts.
+    * boot-log uploader: started BEFORE the docker wait and the slow image pull so a box that really
+      ran cloud-init leaves a liveness artifact within ~2 min. The poller keys its fast "instance
+      active but worker never started" failover on that artifact's PRESENCE -- it separates a healthy
+      box still pulling a multi-GB image from a silently dead one, failing the latter over in ~15 min
+      instead of burning the full ~50 min setup grace. Throttled to 120s and bounded (~30 min) for
+      HF's per-repo hourly commit cap. The ``docker inspect`` guard is what lets it keep emitting
+      THROUGH the pull window: before the container exists the inspect fails, so "not started yet" is
+      never mistaken for "started then exited".
+    * docker+gpu wait: the provider's default image ships Docker and the NVIDIA Container Toolkit,
+      but cloud-init can run before either finishes initializing.
+    * pull retries: the image is large and a transient registry blip must not fail the run; on total
+      failure write a retryable marker and exit NOW rather than idle a billed box through the grace.
+    * detached ``docker run``: lets cloud-init complete promptly; completion is signaled through the
+      worker's HF artifacts, never a return channel from the box.
+    * the exit-code check: the bootstrap returns 0 only on genuine success (metrics.json confirmed
+      and its ok-marker uploaded), so exit 0 IS the success signal and the host must write no marker
+      -- the worker owns that path and a host write would clobber its ok-marker, since HF listing can
+      lag a just-finished upload. A non-zero exit reaches ``fail()``, whose failmark uploader is
+      itself marker-aware: a container that started and fast-failed on a real user error already
+      wrote ``ok=false``, and failmark skips the write when that marker exists, so a genuine user
+      error is never relabeled retriable. Only a never-started container gets the retriable failmark.
+    """
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     # Both shipped modules are stripped of docstrings on the way in. They are for the reader of the
     # repo, not the box, and user_data is a hard-capped budget shared with the payload's runtime
@@ -501,6 +526,9 @@ def _render_user_data(payload: dict, *, image: str) -> str:
     # shipped next to bootstrap.py: the bootstrap imports each as a bare sibling module on the box.
     bootstrap_secrets_src = _strip_docstrings(
         (Path(__file__).parent / "bootstrap_secrets.py").read_text()
+    )
+    bootstrap_console_src = _strip_docstrings(
+        (Path(__file__).parent / "bootstrap_console.py").read_text()
     )
     bootstrap_pip_src = _strip_docstrings((Path(__file__).parent / "bootstrap_pip.py").read_text())
     # Bind the host cache mount into the container at the fixed /weight-cache so prefetch persists; absent -> cold.
@@ -513,8 +541,7 @@ def _render_user_data(payload: dict, *, image: str) -> str:
 # flash instance worker (generated by flash.providers._lifecycle.instance.build_user_data; arm={payload.get("flash_arm")})
 set -x
 mkdir -p /opt/flash
-# Consolidate ALL boot output (this script + the container) into one host log the uploader ships
-# to HF since Lambda has no provider console API, so this is the only window into a pre-worker failure.
+# collect host and container boot output for lambda diagnostics.
 exec >>/opt/flash/host_boot.log 2>&1
 cat > /opt/flash/payload.b64 <<'FLASH_PAYLOAD_EOF'
 {payload_b64}FLASH_PAYLOAD_EOF
@@ -523,6 +550,8 @@ cat > /opt/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
 {bootstrap_src}FLASH_BOOTSTRAP_EOF
 cat > /opt/flash/bootstrap_secrets.py <<'FLASH_BOOTSTRAP_SECRETS_EOF'
 {bootstrap_secrets_src}FLASH_BOOTSTRAP_SECRETS_EOF
+cat > /opt/flash/bootstrap_console.py <<'FLASH_BOOTSTRAP_CONSOLE_EOF'
+{bootstrap_console_src}FLASH_BOOTSTRAP_CONSOLE_EOF
 cat > /opt/flash/bootstrap_pip.py <<'FLASH_BOOTSTRAP_PIP_EOF'
 {bootstrap_pip_src}FLASH_BOOTSTRAP_PIP_EOF
 cat > /opt/flash/deadline_sleep.py <<'FLASH_DEADLINE_SLEEP_EOF'
@@ -538,16 +567,7 @@ deadline_sleep() {{ python3 /opt/flash/deadline_sleep.py "$1"; }}
 deadline_sleep 0 || exit 124
 pip3 install -q huggingface_hub >/dev/null 2>&1 \\
   || python3 -m pip install -q --break-system-packages huggingface_hub >/dev/null 2>&1 || true
-# Host->HF boot-log uploader, STARTED EARLY — BEFORE the docker-readiness wait and the (large, slow)
-# image pull — so a box that actually executed cloud-init leaves a liveness artifact on HF within
-# ~2 min. The control plane's poller keys its fast "instance active but the worker never started"
-# failover on this artifact's PRESENCE: it tells a healthy box still pulling the multi-GB image
-# (boot.log present, no heartbeat yet) from a silently dead one (cloud-init never ran -> no boot.log),
-# so the latter fails over in ~15 min instead of burning the full ~50 min setup grace. THROTTLED to
-# 120s and bounded (~30 min) to respect HF's per-repo hourly commit cap; it self-stops once the
-# worker container has STARTED and then exited (inspect succeeds + not running). The `docker inspect`
-# guard is what lets it keep emitting THROUGH the pull/start window: before the container exists the
-# inspect fails, so it does not mistake "not started yet" for "started then exited".
+# upload the host log while docker and the worker image start.
 ( for i in $(seq 1 15); do
     python3 /opt/flash/hostlog.py >/dev/null 2>&1 || true
     if docker inspect flashrun >/dev/null 2>&1 \\
@@ -558,8 +578,7 @@ pip3 install -q huggingface_hub >/dev/null 2>&1 \\
     deadline_sleep 120 || break
   done ) &
 disown || true
-# The provider's default image ships Docker + the NVIDIA Container Toolkit, but cloud-init can run
-# before they finish initializing — wait for both (up to ~10 min) before launching the worker.
+# wait for docker and the gpu before launching the worker.
 for i in $(seq 1 100); do
   deadline_sleep 0 || fail "run wall deadline exceeded"
   if docker info >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then break; fi
@@ -569,9 +588,7 @@ done
 docker info >/dev/null 2>&1 || fail "docker never became ready"
 nvidia-smi >/dev/null 2>&1 || fail "gpu never became ready"
 {cache_setup}
-# Pull with retries (the image is large; a transient registry blip must not fail the run). On total
-# failure, write a RETRYABLE marker and exit NOW instead of leaving a billed box idling the whole
-# setup grace with no DONE/marker.
+# retry transient image-pull failures before writing the failure marker.
 PULLED=0
 for i in 1 2 3 4 5; do
   deadline_sleep 0 || fail "run wall deadline exceeded"
@@ -580,23 +597,13 @@ for i in 1 2 3 4 5; do
   deadline_sleep 20 || fail "run wall deadline exceeded"
 done
 [ "$PULLED" -eq 1 ] || fail "worker image pull failed after retries"
-# Run the worker container detached so cloud-init completes promptly; completion is signaled via the
-# worker's HF artifacts (DONE/metrics.json/marker), never a return channel from the box.
+# run detached; worker artifacts signal completion.
 deadline_sleep 0 || fail "run wall deadline exceeded"
 docker run -d --name flashrun --gpus all --shm-size=16g --network host \\
   -v /opt/flash:/root/flash {cache_bind}-w /root/flash \\
   "$IMAGE" python /root/flash/bootstrap.py || fail "docker run failed"
 deadline_sleep 5 || fail "run wall deadline exceeded"
-# The container must be running OR have already exited CLEANLY. The bootstrap returns 0 ONLY on
-# genuine success (it confirms metrics.json and uploads its ok-marker first) — so an exit code of 0
-# is itself the success signal (e.g. an already-complete retry that finished in <5s), and the host
-# must NOT write any marker for it: the worker OWNS the attempt marker, and writing to that path here
-# would clobber its ok-marker (HF listing can lag the worker's just-finished upload). A NON-zero
-# exit reaches fail(), but its failmark uploader is itself marker-aware: a container that started
-# and then fast-failed on a real user/config error has ALREADY written its own ok=false marker here,
-# and the host failmark SKIPS the write when that marker exists (so a genuine user error is never
-# relabeled retriable/job_preempted). Only a never-started container — no worker marker — gets the
-# retriable host failmark.
+# a stopped container succeeds only at exit 0; failmark preserves any worker marker.
 if ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; then
   EXIT="$(docker inspect -f '{{{{.State.ExitCode}}}}' flashrun 2>/dev/null || echo 1)"
   [ "$EXIT" = "0" ] || fail "worker container did not start (exit ${{EXIT}})"
