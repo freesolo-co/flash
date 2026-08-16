@@ -1079,6 +1079,15 @@ def test_only_the_lifecycle_coordinator_writes_durable_serving_state():
         if isinstance(node, ast.AsyncFunctionDef)
         and node.name in {"register_adapter", "activate", "remove"}
     }
+    concurrency = [
+        decorator
+        for decorator in coordinator.decorator_list
+        if isinstance(decorator, ast.Call)
+        and isinstance(decorator.func, ast.Attribute)
+        and isinstance(decorator.func.value, ast.Name)
+        and decorator.func.value.id == "modal"
+        and decorator.func.attr == "concurrent"
+    ]
 
     def durable_writes(node):
         return [
@@ -1097,6 +1106,11 @@ def test_only_the_lifecycle_coordinator_writes_durable_serving_state():
         ]
 
     assert durable_writes(coordinator)
+    assert len(concurrency) == 1
+    assert concurrency[0].args == []
+    assert [
+        (keyword.arg, ast.literal_eval(keyword.value)) for keyword in concurrency[0].keywords
+    ] == [("max_inputs", 1)]
     assert not durable_writes(engine)
     assert set(handlers) == {"register_adapter", "activate", "remove"}
     assert all(not durable_writes(handler) for handler in handlers.values())
