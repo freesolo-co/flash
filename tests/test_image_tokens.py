@@ -462,3 +462,52 @@ class TestDescriptorPadTokens:
         assert descriptor_pad_tokens([valid], None, QWEN_GEOMETRY, state) == [64]
         assert successful_decodes == [(10, 10), (10, 10)]
         assert state.decoded_work_bytes == 300
+
+
+def test_the_estimator_supervises_only_assistant_turns_in_a_multi_turn_image_row():
+    """The torch-free quote narrows multi-turn supervision the same way training does.
+
+    `completion_mask_from_ids` supervises one contiguous span, so an interleaved environment reply
+    between two assistant turns would be a target. The worker's processor path narrows this, so an
+    estimator that did not would quote a supervised-token count for a different run than the one
+    that executes -- and the mismatch is invisible in a text-only suite because it only appears
+    once image expansion is in the id stream.
+
+    Torch-free on purpose: the full processor-vs-estimator parity test needs torch and skips
+    wherever it is absent, which is exactly where this invariant would rot unnoticed.
+    """
+    transformers = pytest.importorskip("transformers")
+    from flash.engine.profiling.sft_image_rows import estimate_sft_image_row
+
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            "Qwen/Qwen3.5-0.8B", trust_remote_code=False
+        )
+    except Exception as exc:  # pragma: no cover - network/hub availability
+        pytest.skip(f"could not load the tokenizer: {exc}")
+
+    descriptors = [multimodal.normalize_image_source(_png_bytes(56, 56), None)]
+    input_ids, mask, blob, _untruncated, role_aware = estimate_sft_image_row(
+        tokenizer,
+        [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "look"}]}],
+        [
+            {"role": "assistant", "content": "first"},
+            {"role": "user", "content": "environment reply"},
+            {"role": "assistant", "content": "second"},
+        ],
+        descriptors,
+        package_root=None,
+        geometry=QWEN_GEOMETRY,
+        validation_state=ImageProfileValidationState(),
+        max_length=8192,
+        thinking=False,
+    )
+
+    assert role_aware is True, "the estimator fell back to contiguous supervision"
+    assert blob == b""
+    supervised = tokenizer.decode(
+        [token for token, keep in zip(input_ids, mask, strict=True) if keep]
+    )
+    assert "environment reply" not in supervised
+    assert "first" in supervised
+    assert "second" in supervised
