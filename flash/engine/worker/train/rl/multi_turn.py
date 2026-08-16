@@ -420,24 +420,22 @@ class MultiTurnBridge:
             return len(self._sessions)
 
 
-# the three stdlib-only modules the child needs beside its shim, mapped to the flat names it
-# imports them under. flat and `flash_`-prefixed because the child imports them as top-level
-# modules, not as a package: flash itself is NOT importable in the verl interpreter (incompatible
-# torch/vllm pins), which is why they are copied rather than imported. same mechanism the opd verl
-# path uses for its own loop.
-# (path relative to flash/engine/worker/, flat name the child imports it under). the child code
-# lives under train/, so these are package-relative paths rather than bare siblings.
-MULTI_TURN_CHILD_MODULES = (
+# every GRPO child receives one complete flat plugin bundle. copying the multi-turn module even for
+# single-turn runs keeps the bundle shape invariant while the plugin decides whether to register it.
+GRPO_CHILD_MODULES = (
+    (os.path.join("train", "core", "child", "runtime.py"), "flash_verl_runtime.py"),
     (os.path.join("train", "core", "child", "glue.py"), "flash_multiturn_glue.py"),
+    (os.path.join("train", "rl", "child", "patches.py"), "flash_grpo_patches.py"),
     (os.path.join("train", "rl", "child", "multiturn.py"), "flash_grpo_multiturn.py"),
     (os.path.join("train", "rl", "child", "plugin.py"), "flash_grpo_plugin.py"),
+    (os.path.join("train", "rl", "child", "entry.py"), "flash_grpo_entry.py"),
 )
 
 
-def copy_multi_turn_child_modules(shim_dir: str) -> tuple[str, ...]:
-    """copy the child-side agent loop next to the shim; returns the paths written."""
+def copy_grpo_child_modules(shim_dir: str) -> tuple[str, ...]:
+    """copy the complete GRPO plugin bundle and return the paths written."""
     written = []
-    for source_name, child_name in MULTI_TURN_CHILD_MODULES:
+    for source_name, child_name in GRPO_CHILD_MODULES:
         target = os.path.join(shim_dir, child_name)
         shutil.copy2(os.path.join(_WORKER_DIR, source_name), target)
         written.append(target)
@@ -451,10 +449,6 @@ def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[
     turn limits, halting, and glue rendering into strings.
     """
     return {
-        # verl imports this at the end of `verl/__init__` (import_external_libs), which is what
-        # registers the loop under the name the agent-loop override selects. without it the
-        # override names a loop that was never registered and the child dies at rollout build.
-        "VERL_USE_EXTERNAL_MODULES": "flash_grpo_plugin",
         "FLASH_VERL_MULTITURN_URL": reward_url,
         "FLASH_VERL_MAX_TURNS": str(int(inp["max_turns"])),
         "FLASH_VERL_MAX_MODEL_LEN": str(int(inp["engine_len"])),

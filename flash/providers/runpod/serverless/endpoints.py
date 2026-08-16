@@ -57,6 +57,7 @@ def _train_body(input_data: dict) -> dict:
     """
     import collections
     import contextlib
+    import importlib.util
     import json
     import math
     import os
@@ -447,6 +448,15 @@ def _train_body(input_data: dict) -> dict:
                         raise exc from None
             raise AssertionError("unreachable")
 
+        def _load_exact_module(code_dir: str, relative_path: str, name: str):
+            path = os.path.join(code_dir, relative_path)
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"could not load downloaded module: {relative_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
         def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
             from huggingface_hub import HfApi, hf_hub_download
 
@@ -484,6 +494,16 @@ def _train_body(input_data: dict) -> dict:
         code_prefix = _code_prefix()
         _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
         code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
+        console_module = _load_exact_module(
+            code_dir,
+            "flash/providers/_lifecycle/bootstrap_console.py",
+            "_flash_downloaded_bootstrap_console",
+        )
+        artifact_module = _load_exact_module(
+            code_dir,
+            "flash/adapters/artifacts.py",
+            "_flash_downloaded_artifacts",
+        )
 
         env = dict(os.environ)
         env.update(overrides)
@@ -503,16 +523,27 @@ def _train_body(input_data: dict) -> dict:
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
 
-        def _upload_console(mode: str) -> None:
-            """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
-            console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
-            from both the subprocess-failure path and the missing-metrics crash path: a worker killed
-            without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
-            ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
-            crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque."""
+        console_teardown = threading.Event()
+
+        def _upload_console(mode: str, final: bool = False) -> bool:
+            """Upload the captured console tail for ``mode`` to the run repo.
+
+            Idempotent and best-effort, so it is safe to call from both the subprocess-failure path
+            and the missing-metrics crash path: a worker killed without a Python exception
+            (OOM/SIGKILL, segfault, or a silent early exit) writes NO ``error_<mode>.txt``, so the
+            captured console is then the only root-cause record -- and a crash that exits 0 would
+            otherwise skip the upload entirely, leaving the failure opaque.
+
+            ``final`` writes the canonical ``console_<mode>.txt`` and closes the live path; live
+            snapshots are attempt-scoped so a retry cannot overwrite the previous attempt's tail.
+            """
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
-                return
+                return False
+            if final:
+                console_teardown.set()
+            elif console_teardown.is_set():
+                return False
             try:
                 from huggingface_hub import HfApi
 
@@ -520,7 +551,7 @@ def _train_body(input_data: dict) -> dict:
                 spec = json.loads(input_data["job_spec_json"])
                 phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
                 prefix = f"{phase_ns}/{spec['run_id']}"
-                # Keep the newest bytes only; the uploaded tail's end is never truncated.
+                # keep the newest bytes only; the uploaded tail's end is never truncated.
                 tail_bytes = 64_000
                 with open(console, "rb") as f:
                     f.seek(0, os.SEEK_END)
@@ -547,27 +578,37 @@ def _train_body(input_data: dict) -> dict:
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
-                with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
+                suffix = ".final.tail" if final else ".live.tail"
+                tail_path = console + suffix
+                with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
+                if not final and console_teardown.is_set():
+                    return False
+                attempt = int(env.get("ATTEMPT") or 0)
+                artifact = (
+                    f"console_{mode}.txt"
+                    if final
+                    else artifact_module.attempt_scoped_artifact_name("console", mode, attempt)
+                )
                 HfApi(token=env.get("HF_TOKEN")).upload_file(
-                    path_or_fileobj=console + ".tail",
-                    path_in_repo=f"{prefix}/console_{mode}.txt",
+                    path_or_fileobj=tail_path,
+                    path_in_repo=f"{prefix}/{artifact}",
                     repo_id=input_data["hf_repo"],
                     repo_type="dataset",
                 )
+                return True
             except Exception as e:
                 print("console upload warn:", _safe_detail(e, env))
+                return False
 
         def run_mode(mode: str, check: bool) -> int:
-            """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
+            """run the worker, stream its console, and upload live and terminal tails."""
             console = f"/tmp/console_{mode}.txt"
-            interval = 3600.0
             stop_upload = threading.Event()
 
-            def _upload_loop() -> None:
-                while not stop_upload.wait(interval):
-                    _upload_console(mode)  # best-effort; swallows its own errors
+            def _upload_live() -> bool:
+                return _upload_console(mode)
 
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
@@ -580,7 +621,12 @@ def _train_body(input_data: dict) -> dict:
                     text=True,
                     errors="replace",
                 )
-                uploader = threading.Thread(target=_upload_loop, daemon=True)
+                uploader = threading.Thread(
+                    target=console_module._run_console_upload_loop,
+                    args=(console, 3600.0, stop_upload),
+                    kwargs={"upload": _upload_live},
+                    daemon=True,
+                )
                 uploader.start()
                 try:
                     for line in proc.stdout:
@@ -594,7 +640,7 @@ def _train_body(input_data: dict) -> dict:
                 finally:
                     stop_upload.set()
                     uploader.join(timeout=10)
-            _upload_console(mode)
+            _upload_console(mode, final=True)
             if proc.returncode != 0 and check:
                 raise RuntimeError(
                     f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
@@ -610,7 +656,6 @@ def _train_body(input_data: dict) -> dict:
         run_mode(input_data["phase"], check=False)
         if not os.path.exists("/tmp/metrics.json"):
             phase = input_data["phase"]
-            _upload_console(phase)
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
                 f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
