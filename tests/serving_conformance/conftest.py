@@ -94,8 +94,19 @@ def adapter_source(request) -> dict:
 
 
 @pytest.fixture(scope="session")
-def ready_timeout(request) -> float:
-    return float(request.config.getoption("--conformance-ready-timeout"))
+def ready_timeout(request, adapter_source) -> float:
+    """How long a revision may take to reach ready, matching what the shipped client allows.
+
+    The client's budget scales with base-model size, so a fixed default would certify the wrong
+    thing in both directions: too small fails a backend `flash models deploy` would have driven,
+    too large passes one it would abandon. An explicit `--conformance-ready-timeout` still wins.
+    """
+    from flash.serve.deploy import revision_ready_budget_seconds
+
+    override = request.config.getoption("--conformance-ready-timeout")
+    if override is not None:
+        return float(override)
+    return revision_ready_budget_seconds(adapter_source["base_model"])
 
 
 def _require_httpx() -> None:

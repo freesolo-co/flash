@@ -97,3 +97,28 @@ def test_a_complete_invocation_is_accepted(monkeypatch):
     assert source["repo_id"] == "acme/artifacts"
     assert source["hf_revision"] == _COMPLETE["--conformance-hf-revision"]
     assert source["repo_type"] == "dataset"
+
+
+_READY_TIMEOUT = gate.ready_timeout._get_wrapped_function()
+
+
+def test_the_readiness_default_tracks_the_clients_own_budget(monkeypatch):
+    """The default must be the budget `flash models deploy` actually enforces, not a constant.
+
+    That budget scales with base-model size, so a fixed default is wrong in both directions: too
+    small fails a backend the client would have driven to ready, too large certifies one the client
+    abandons. Asserting against `revision_ready_budget_seconds` rather than a literal is what keeps
+    the two from drifting -- a hardcoded number here would still pass if the client's budget moved.
+    """
+    from flash.serve.deploy import revision_ready_budget_seconds
+
+    for base_model in ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-35B-A3B"):
+        source = {"base_model": base_model}
+        request = _request({"--conformance-ready-timeout": None}, monkeypatch)
+        assert _READY_TIMEOUT(request, source) == revision_ready_budget_seconds(base_model)
+
+
+def test_an_explicit_readiness_override_still_wins(monkeypatch):
+    # a first cold start pulling weights can exceed the client budget, which is what the flag is for.
+    request = _request({"--conformance-ready-timeout": 42.0}, monkeypatch)
+    assert _READY_TIMEOUT(request, {"base_model": "Qwen/Qwen3.5-4B"}) == 42.0
