@@ -179,6 +179,49 @@ def test_persisted_records_still_decode_with_removed_train_keys():
     assert "advantage_clip" not in decoded.to_internal_dict()["train"]
 
 
+def test_removed_train_key_tolerance_does_not_extend_to_other_sections():
+    """The retired-key allowlist is per-section, not global.
+
+    `validated_section` takes `removed` as an argument, so the allowlist is now something a caller
+    passes rather than something the decoder hardcodes -- and passing it to the wrong section is a
+    failure the inline code it replaced could not express. `advantage_clip` is a retired [train] key;
+    under [gpu] it is just an unknown key and must stay fatal. Without this, widening the allowlist to
+    another section would let a stored key vanish silently instead of failing.
+    """
+    with pytest.raises(ValueError, match="gpu has unknown key"):
+        JobSpec.from_dict(
+            {
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "sft",
+                "project": PROJECT,
+                "environment": {"id": "owner/project/env"},
+                "gpu": {"type": "H100 SXM", "advantage_clip": 0.2},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("section", "payload"),
+    [("train", {"epochs": 1, "nope": 1}), ("gpu", {"type": "H100 SXM", "nope": 1})],
+)
+def test_unknown_keys_inside_a_section_are_fatal(section, payload):
+    """Unknown-key rejection has to hold INSIDE a section, not just at the top level.
+
+    Both nested blocks are read through one shared validator now, so a regression there would open
+    every section at once -- and a top-level-only assertion stays green while it happens.
+    """
+    with pytest.raises(ValueError, match=f"{section} has unknown key"):
+        JobSpec.from_dict(
+            {
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "sft",
+                "project": PROJECT,
+                "environment": {"id": "owner/project/env"},
+                section: payload,
+            }
+        )
+
+
 def test_unknown_persisted_keys_are_still_fatal():
     """Tolerance is an explicit allowlist, not a blanket ignore, or a typo silently becomes a default."""
     with pytest.raises(ValueError, match="unknown key"):

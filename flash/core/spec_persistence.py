@@ -188,7 +188,7 @@ def opt_int(value: Any) -> int | None:
 
 
 def opt_float(value: Any) -> float | None:
-    """Parse optional float; rejects bools (mirrors _opt_int)."""
+    """Parse optional float; rejects bools (mirrors ``opt_int``)."""
     if value is None:
         return None
     if isinstance(value, bool):
