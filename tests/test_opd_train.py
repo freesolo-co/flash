@@ -30,11 +30,11 @@ from flash.engine.worker.opd_train import (
     _failure_accounting_metadata,
     _OpdProgressState,
     _OpdVerlCheckpointWatcher,
-    _processed_resume_steps,
     _processor_expanded_prompt_ids,
     _prompt_pool_fingerprint,
     _raise_verl_failure,
     _restore_verl_resume,
+    _seed_resume_lifecycle,
     _stage_retry_contract,
     _TeacherAlignmentBridge,
     _TextTeacherBatcher,
@@ -3051,46 +3051,168 @@ def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(monkeyp
         accounting_state=lambda _step: _resume_accounting(3),
     )
 
-    watcher.processed_steps.update(_processed_resume_steps((3,), 3))
+    _seed_resume_lifecycle(watcher, (3,), 3)
     published = []
 
     def publish(step, path):
         published.append((step, path))
-        watcher.processed_steps.add(step)
+        watcher.lifecycle.mark_discovered(step)
+        watcher.lifecycle.mark_deployable_published(step)
 
     watcher._publish = publish
     watcher.start()
     watcher.stop(require_complete=True)
 
     assert published == [(3, str(checkpoint_dir))]
-    assert watcher.processed_steps == {3}
-    assert _processed_resume_steps((4,), 3) == {3}
+    assert watcher.lifecycle.discovered_steps == {3}
+
+    # a non-required resume step is claimed outright, because nothing is owed for it.
+    other = _OpdVerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(4,),
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=2,
+        group_size=3,
+        accounting_state=lambda _step: _resume_accounting(3),
+    )
+    _seed_resume_lifecycle(other, (4,), 3)
+    assert other.lifecycle.discovered_steps == {3}
+    assert other.lifecycle.facts(3).resume_uploaded
 
 
-def test_the_watcher_marks_every_step_processed_but_publishes_only_required_ones():
-    # the two facts that make the final-publish guard below wrong. processed_steps.add(step) is
-    # unconditional, while the deployable publish is gated on `step in self.required_steps`, so a
-    # default run (save_at_steps empty -> required_steps empty) processes its last step without ever
-    # publishing a deployable for it.
-    source = inspect.getsource(_OpdVerlCheckpointWatcher)
-    publish_gate = "if step in self.required_steps:"
-    assert publish_gate in source
-    assert "self.processed_steps.add(step)" in source
-    # the unconditional mark must not sit inside the required-only publish branch.
-    assert source.index(publish_gate) < source.index("self.processed_steps.add(step)")
+def test_the_watcher_claims_every_step_but_publishes_only_required_ones(monkeypatch, tmp_path):
+    """a default opd run claims its steps without ever owing a deployable for them.
+
+    asserted by running the watcher rather than by grepping its source: a source check passes on a
+    comment and cannot fail when the logic moves. with save_at_steps empty, required_steps is empty,
+    so every step must be discovered and none may be published.
+    """
+    import flash.engine.worker as worker
+
+    local_dir = tmp_path / "checkpoints"
+    checkpoint_dir = local_dir / "global_step_2"
+    (checkpoint_dir / "actor").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("2")
+
+    from flash.engine.worker.train.opd import failures as opd_failures
+
+    published: list[int] = []
+    # patched where the watcher resolves them, not on opd_train: `_publish` calls the names bound
+    # into this module, so patching the re-export would leave the real merger running.
+    monkeypatch.setattr(opd_failures, "_export_checkpoint_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_failures, "_stage_retry_contract", lambda *a, **k: None)
+    monkeypatch.setattr(
+        worker,
+        "publish_deployable_checkpoint",
+        lambda adapter, step, **kwargs: published.append(step) or "sub",
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, path, **kwargs: (kwargs["before_upload"](), kwargs["after_upload"](), True)[2],
+    )
+
+    watcher = _OpdVerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=2,
+        group_size=3,
+        accounting_state=lambda _step: _resume_accounting(2),
+    )
+    watcher._publish(2, str(checkpoint_dir))
+
+    assert published == []
+    assert watcher.lifecycle.discovered_steps == {2}
+    assert watcher.lifecycle.facts(2).resume_uploaded
+    assert not watcher.lifecycle.facts(2).deployable_published
 
 
-def test_the_final_deployable_publish_is_not_suppressed_by_the_processed_marker():
+def test_an_opd_backlog_stages_a_retry_contract_for_every_step(monkeypatch, tmp_path):
+    """opd must never coalesce: each checkpoint carries its own accounting and retry contract.
+
+    the sft watcher it inherits from drops all but the newest of an optional backlog, which for opd
+    would discard resume points whose teacher accounting is not recoverable from any other step.
+    driven through a real three-step backlog rather than asserted on `_publishable` alone, so the
+    contract staging and the upload are both counted.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker.train.opd import failures as opd_failures
+
+    local_dir = tmp_path / "checkpoints"
+    for step in (1, 2, 3):
+        (local_dir / f"global_step_{step}" / "actor").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("3")
+
+    staged: list[int] = []
+    uploaded: list[int] = []
+    monkeypatch.setattr(opd_failures, "_export_checkpoint_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(
+        opd_failures,
+        "_stage_retry_contract",
+        lambda checkpoint_dir, **kwargs: staged.append(kwargs["step"]),
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, path, **kwargs: (
+            uploaded.append(step),
+            kwargs["before_upload"](),
+            kwargs["after_upload"](),
+            True,
+        )[3],
+    )
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda *a, **kw: pytest.fail("no required steps")
+    )
+
+    watcher = _OpdVerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=2,
+        group_size=3,
+        accounting_state=lambda _step: _resume_accounting(1),
+    )
+    watcher._stop.set()
+    watcher._run()
+
+    assert watcher._error is None
+    assert staged == [1, 2, 3], f"opd coalesced a retry contract away: {staged}"
+    assert uploaded == [1, 2, 3], f"opd lost a resume point: {uploaded}"
+    assert watcher.lifecycle.discovered_steps == {1, 2, 3}
+    assert all(watcher.lifecycle.facts(step).resume_uploaded for step in (1, 2, 3))
+    # no exact saves were requested, so nothing is owed a servable adapter.
+    assert watcher.lifecycle.deployable_published_steps == set()
+
+
+def test_the_final_deployable_publish_is_not_suppressed_by_the_watcher_lifecycle():
     # final_save_due applies only when save_at_steps is empty, while the watcher publishes only
-    # requested steps. the paths are disjoint, so processed_steps cannot suppress the final publish.
+    # requested steps. the paths are disjoint, so the watcher's ledger cannot suppress the final
+    # publish -- and above all it must not be consulted for it.
     source = inspect.getsource(opd_train.run_opd_train)
     assert "final_save_due(final_step, knobs.save_at_steps)" in source
-    assert "final_step not in watcher.processed_steps" not in source
+    assert "watcher.lifecycle" not in source
 
 
 def test_final_save_due_and_the_watcher_publish_set_never_overlap():
     # the invariant the fix above rests on, asserted rather than assumed: if these two could ever be
-    # true for the same step, dropping the processed_steps clause would double-publish.
+    # true for the same step, dropping the watcher-ledger clause would double-publish.
     from flash.engine.plan.steps import final_save_due
 
     for save_at_steps in ((), (1,), (4,), (2, 4), (1, 2, 3, 4)):
