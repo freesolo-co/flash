@@ -81,6 +81,73 @@ def content_block_text(content, *, source: str, position: int) -> str:
     return "".join(parts)
 
 
+def validate_structured_messages(messages: list[dict], *, source: str) -> list[dict]:
+    """validate and canonicalize role/content messages without dropping media placement."""
+    if not isinstance(messages, list):
+        raise ValueError(f"{source} messages must be a list")
+    normalized: list[dict[str, Any]] = []
+    for position, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ValueError(f"{source} message {position} must be an object")
+        extras = sorted(
+            key
+            for key, value in message.items()
+            if key not in _ALLOWED_MESSAGE_KEYS and value is not None
+        )
+        if extras:
+            raise ValueError(
+                f"{source} message {position} carries unsupported transcript metadata {extras}; "
+                "tool names, call ids, tool calls, and other message fields cannot be represented "
+                "in a role/content multi-turn transcript"
+            )
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError(f"{source} message {position} has an invalid role")
+        if isinstance(content, str):
+            normalized.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            raise ValueError(
+                f"{source} message {position} content must be text or content blocks for multi-turn"
+            )
+        blocks: list[dict[str, Any]] = []
+        for block_index, block in enumerate(content):
+            if not isinstance(block, dict):
+                raise ValueError(
+                    f"{source} message {position} has a content block that is not an object"
+                )
+            block_type = block.get("type")
+            allowed_keys = (
+                {"type", block_type} if block_type in _MEDIA_BLOCK_TYPES else {"type", "text"}
+            )
+            extras = sorted(
+                key for key, value in block.items() if key not in allowed_keys and value is not None
+            )
+            if extras:
+                raise ValueError(
+                    f"{source} message {position} content block {block_index} carries unsupported "
+                    f"fields {extras}"
+                )
+            if block_type in _MEDIA_BLOCK_TYPES:
+                blocks.append({"type": block_type})
+            elif block_type == "text" and isinstance(block.get("text"), str):
+                text = block["text"]
+                if not text:
+                    continue
+                if blocks and blocks[-1].get("type") == "text":
+                    blocks[-1]["text"] += text
+                else:
+                    blocks.append({"type": "text", "text": text})
+            else:
+                raise ValueError(
+                    f"{source} message {position} has an unsupported content block at index "
+                    f"{block_index}"
+                )
+        normalized.append({"role": role, "content": blocks})
+    return normalized
+
+
 def validate_transcript_messages(
     messages: list[dict], *, source: str, allow_content_blocks: bool = False
 ) -> list[dict]:
@@ -357,20 +424,18 @@ class EpisodePrompt:
     __slots__ = (
         "audios",
         "images",
-        "messages",
         "mm_processor_kwargs",
         "multi_modal_data",
         "prompt_ids",
+        "structured_messages",
         "videos",
     )
 
-    def __init__(self, multi_modal_data, mm_processor_kwargs, prompt_ids, messages):
+    def __init__(self, multi_modal_data, mm_processor_kwargs, prompt_ids, structured_messages):
         self.multi_modal_data = multi_modal_data
         self.mm_processor_kwargs = mm_processor_kwargs
         self.prompt_ids = prompt_ids
-        # the flattened text view of the same prompt. GRPO discards it and generates from the ids;
-        # OPD sends it to the bridge as the transcript the teacher scores.
-        self.messages = messages
+        self.structured_messages = structured_messages
         self.images = multi_modal_data.get("images")
         self.videos = multi_modal_data.get("videos")
         self.audios = multi_modal_data.get("audios")
@@ -386,21 +451,11 @@ class EpisodePrompt:
 
 
 async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
-    """extract the media and render the ids from the ORIGINAL blocks, then validate the transcript.
+    """extract media and ids before building the canonical structured prompt view.
 
-    ORDER MATTERS, which is why all three steps live in one function rather than as statements a
-    caller could reorder or forget. an image prompt does not arrive as text: verl's RLHFDataset
-    rewrites the parquet's string content into blocks, splitting on the `<image>` placeholder and
-    substituting an image block (rl_dataset.py `_build_messages`), so `raw_prompt` is
-    [{"type": "image", ...}, {"type": "text", ...}] for exactly the rows flash writes for a
-    multimodal job. the media has to come out of those ORIGINAL blocks first, or the pixels are gone
-    by the time the rollout asks for them -- and validating first would reject the block shape
-    outright, which is how multi-turn image rollouts died before this was centralized here.
-
-    blocks are permitted in that check precisely because the two steps above already hold the media
-    and the block-rendered ids, so flattening to text is lossless. the check still runs: it is what
-    rejects a transcript neither loop can represent (unsupported blocks, tool-call metadata) before
-    the episode is paid for.
+    order matters: an image prompt arrives as content blocks, so the media and block-rendered ids
+    must be captured before structured validation. the canonical view preserves media placement for
+    bridge authentication and rejects unsupported blocks and message metadata before rollout.
     """
     messages = [dict(message) for message in raw_prompt]
     multi_modal_data = await loop_self.process_multi_modal_info(messages)
@@ -415,7 +470,5 @@ async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
         audios=audios,
         mm_processor_kwargs=mm_processor_kwargs,
     )
-    validated = validate_transcript_messages(
-        messages, source="initial prompt", allow_content_blocks=True
-    )
-    return EpisodePrompt(multi_modal_data, mm_processor_kwargs, prompt_ids, validated)
+    structured = validate_structured_messages(messages, source="initial prompt")
+    return EpisodePrompt(multi_modal_data, mm_processor_kwargs, prompt_ids, structured)

@@ -29,6 +29,7 @@ from flash.engine.worker.teacher.tokenizer_align import groupwise_alignment, gro
 from flash.engine.worker.train.core.child.glue import (
     EnvGlueTokenizer,
     dedup_seam_terminator,
+    validate_structured_messages,
     validate_transcript_messages,
 )
 from flash.engine.worker.train.opd.batching import (
@@ -48,7 +49,11 @@ from flash.engine.worker.train.opd.prompts import (
     _validate_forced_mask,
     encode_shifted_group_metadata,
 )
-from flash.engine.worker.train.opd.scoring import score_rollout
+from flash.engine.worker.train.opd.scoring import (
+    build_multimodal_score_items,
+    score_multimodal_items,
+    score_rollout,
+)
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
@@ -410,14 +415,18 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
         prompt_ids = [int(token_id) for token_id in prompt_ids]
         if prompt_ids != list(prompt.prompt_ids):
             raise ValueError("multi-turn rollout prompt ids do not match the frozen flash prompt")
-        raw_prompt = validate_transcript_messages(raw_prompt, source="child initial prompt")
-        # both sides flattened to the SAME representation before comparing. the child sends the text
-        # transcript it can actually carry, while the frozen prompt keeps image rows as content
-        # BLOCKS, so comparing the two shapes directly would fail every image episode even when the
-        # ids and image count already proved they are the same prompt.
-        frozen_prompt = validate_transcript_messages(
-            prompt.student_messages, source="frozen environment prompt", allow_content_blocks=True
-        )
+        if prompt.image_descriptors:
+            raw_prompt = validate_structured_messages(raw_prompt, source="child initial prompt")
+            frozen_prompt = validate_structured_messages(
+                prompt.student_messages, source="frozen environment prompt"
+            )
+        else:
+            raw_prompt = validate_transcript_messages(raw_prompt, source="child initial prompt")
+            frozen_prompt = validate_transcript_messages(
+                prompt.student_messages,
+                source="frozen environment prompt",
+                allow_content_blocks=True,
+            )
         if raw_prompt != frozen_prompt:
             raise ValueError("multi-turn child prompt does not match the frozen environment prompt")
         session_id = self._validate_session_id(session_id)
@@ -440,12 +449,26 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
             with self._env_lock:
                 state = self._env_call("new_rollout_state", prompt.example)
                 initial_messages = state.get("prompt") or state.get("messages")
-                initial_messages = validate_transcript_messages(
-                    initial_messages,
-                    source="environment initial prompt",
-                    allow_content_blocks=True,
-                )
-            if initial_messages != frozen_prompt:
+                if prompt.image_descriptors:
+                    from flash.content.multimodal import normalize_prompt_images
+
+                    normalized = normalize_prompt_images(
+                        prompt.example,
+                        initial_messages,
+                        prompt.package_root,
+                    )
+                    initial_messages = validate_structured_messages(
+                        normalized.messages, source="environment initial prompt"
+                    )
+                    fresh_descriptors = tuple(normalized.descriptors)
+                else:
+                    initial_messages = validate_transcript_messages(
+                        initial_messages,
+                        source="environment initial prompt",
+                        allow_content_blocks=True,
+                    )
+                    fresh_descriptors = ()
+            if initial_messages != frozen_prompt or fresh_descriptors != prompt.image_descriptors:
                 raise ValueError(
                     "multi-turn environment initial prompt changed after prompt freezing"
                 )
@@ -603,31 +626,45 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
                 if not turn["truncated"] and not turn["skip_reason"] and turn["response_ids"]
             ]
             if scorable:
-                items = [
-                    (
-                        _teacher_prompt_text(
-                            turns[position]["context_messages"], self.thinking_prefill
-                        ),
-                        turns[position]["completion_text"],
+                prompt = self.prompts[session["index"]]
+                if prompt.image_descriptors:
+                    multimodal_items = build_multimodal_score_items(
+                        prompt,
+                        [
+                            (
+                                turns[position]["context_messages"],
+                                turns[position]["completion_text"],
+                            )
+                            for position in scorable
+                        ],
+                        thinking_prefill=self.thinking_prefill,
                     )
-                    for position in scorable
-                ]
-                # ONE call, not a chunk-and-drain loop. score_many already bounds itself to
-                # OPD_TEACHER_SCORING_CONCURRENCY workers, so slicing the items first did not lower
-                # the provider-facing rate -- it only added a BARRIER every 32 items, where the
-                # slowest request in a wave held back the whole next wave and the gpu idled behind
-                # it. handing the full list over keeps the same concurrency ceiling while letting a
-                # finished worker start the next item immediately. `executor.map` preserves input
-                # order, so the zip with `scorable` below is unchanged.
-                if isinstance(self.teacher, TeacherClient):
-                    teacher_batches = self.teacher.score_many(
-                        items,
+                    teacher_batches = score_multimodal_items(
+                        self.teacher,
+                        multimodal_items,
                         on_scored=self.parent_work.complete,
                     )
                 else:
-                    teacher_batches = self.teacher.score_many(items)
-                    for _score in teacher_batches:
-                        self.parent_work.complete()
+                    text_items = [
+                        (
+                            _teacher_prompt_text(
+                                turns[position]["context_messages"], self.thinking_prefill
+                            ),
+                            turns[position]["completion_text"],
+                        )
+                        for position in scorable
+                    ]
+                    # one call, not a chunk-and-drain loop. score_many already bounds its own
+                    # provider-facing concurrency while preserving input order.
+                    if isinstance(self.teacher, TeacherClient):
+                        teacher_batches = self.teacher.score_many(
+                            text_items,
+                            on_scored=self.parent_work.complete,
+                        )
+                    else:
+                        teacher_batches = self.teacher.score_many(text_items)
+                        for _score in teacher_batches:
+                            self.parent_work.complete()
                 if len(teacher_batches) != len(scorable):
                     raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
                 with self._stats_lock:

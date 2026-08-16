@@ -45,9 +45,13 @@ from flash.engine.worker.opd_train import (
     build_opd_overrides,
     encode_shifted_group_metadata,
 )
+from flash.engine.worker.opd_train_runner import _prepare_prompt_messages
 from flash.engine.worker.teacher.client import TeacherScore
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
-from flash.engine.worker.train.core.child.glue import multi_modal_image_count
+from flash.engine.worker.train.core.child.glue import (
+    multi_modal_image_count,
+    validate_structured_messages,
+)
 from flash.engine.worker.train.core.child.runtime import install_checkpoint_handler_filter
 from flash.engine.worker.train.opd.child import plugin as opd_plugin
 from flash.engine.worker.train.opd.child.plugin import (
@@ -872,6 +876,167 @@ def test_processor_expanded_prompt_ids_enforce_visual_token_budget(tmp_path):
     assert len(prompt_ids) > 3
     assert processor.rendered[0]["content"][0]["image"].size == (2, 2)
     assert [image.size for image in processor.images] == [(2, 2)]
+
+
+_IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n1c"
+    "AAAAASUVORK5CYII="
+)
+_OTHER_IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLs"
+    "AAAAAElFTkSuQmCC"
+)
+
+
+def test_parent_preparation_normalizes_real_image_blocks_before_transcript_validation():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "image_url", "image_url": {"url": _IMAGE_DATA_URI}},
+                {"type": "text", "text": "b"},
+            ],
+        }
+    ]
+
+    student_messages, descriptors = _prepare_prompt_messages(
+        {}, messages, multi_turn=True, package_root=None
+    )
+
+    assert student_messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "image"},
+                {"type": "text", "text": "b"},
+            ],
+        }
+    ]
+    assert len(descriptors) == 1
+    assert messages[0]["content"][1]["type"] == "image_url"
+
+
+def test_parent_preparation_attaches_top_level_image_without_flattening_text():
+    student_messages, descriptors = _prepare_prompt_messages(
+        {"image": _IMAGE_DATA_URI},
+        [{"role": "user", "content": "describe"}],
+        multi_turn=True,
+        package_root=None,
+    )
+
+    assert student_messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image"},
+            ],
+        }
+    ]
+    assert len(descriptors) == 1
+
+
+def test_parent_preparation_orders_image_normalization_before_block_validation(monkeypatch):
+    from flash.content import multimodal
+
+    calls = []
+    normalized_messages = [
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "q"}]}
+    ]
+
+    def normalize(_example, _messages, _package_root):
+        calls.append("normalize")
+        return SimpleNamespace(messages=normalized_messages, descriptors=["descriptor"])
+
+    def validate(messages, **kwargs):
+        calls.append(("validate", messages, kwargs))
+        assert kwargs["allow_content_blocks"] is True
+        return [{"role": "user", "content": "q"}]
+
+    monkeypatch.setattr(multimodal, "normalize_prompt_images", normalize)
+    monkeypatch.setattr(opd_train, "validate_transcript_messages", validate)
+
+    result = _prepare_prompt_messages(
+        {"image": _IMAGE_DATA_URI},
+        [{"role": "user", "content": "q"}],
+        multi_turn=True,
+        package_root=None,
+    )
+
+    assert calls == [
+        "normalize",
+        (
+            "validate",
+            normalized_messages,
+            {
+                "source": "environment initial prompt",
+                "allow_content_blocks": True,
+            },
+        ),
+    ]
+    assert result == (normalized_messages, ("descriptor",))
+
+
+@pytest.mark.parametrize(
+    ("messages", "match"),
+    [
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": _IMAGE_DATA_URI}],
+                    "tool_calls": [],
+                }
+            ],
+            "unsupported transcript metadata",
+        ),
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": _IMAGE_DATA_URI},
+                        {"type": "text"},
+                    ],
+                }
+            ],
+            "malformed text block",
+        ),
+    ],
+)
+def test_parent_preparation_rejects_unsupported_image_prompt_shapes(messages, match):
+    with pytest.raises(ValueError, match=match):
+        _prepare_prompt_messages({}, messages, multi_turn=True, package_root=None)
+
+
+def test_parent_preparation_keeps_text_only_messages_exact():
+    messages = [{"role": "system", "content": "rules"}, {"role": "user", "content": "q"}]
+
+    prepared, descriptors = _prepare_prompt_messages(
+        {}, messages, multi_turn=True, package_root=None
+    )
+
+    assert json.dumps(prepared, separators=(",", ":")) == json.dumps(
+        messages, separators=(",", ":")
+    )
+    assert descriptors == ()
+
+
+def test_structured_prompt_canonicalization_rejects_unsupported_block_fields():
+    with pytest.raises(ValueError, match=r"unsupported fields.*detail"):
+        validate_structured_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": "ref", "detail": "high"}],
+                }
+            ],
+            source="initial prompt",
+        )
 
 
 class _BridgeTokenizer:
@@ -4495,6 +4660,7 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
     bridge = _text_bridge(teacher)
     monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
     bridge._sessions["session-1"] = {
+        "index": 0,
         "turns": [
             {
                 "prompt_ids": [10, 11],
@@ -4517,6 +4683,109 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
     assert [_teacher_logsum(turn) for turn in result["turns"]] == [
         -float(index) for index in range(1, turns + 1)
     ]
+
+
+def test_image_multiturn_teacher_scores_structured_histories_in_one_ordered_batch(monkeypatch):
+    from flash.content import multimodal
+
+    descriptor_calls = []
+    captured = []
+
+    def data_uris(descriptors, package_root):
+        descriptor_calls.append((descriptors, package_root))
+        return ["data:image/png;base64,frozen"]
+
+    class Teacher:
+        def score_many_multimodal(self, items):
+            captured.extend(items)
+            return [
+                _teacher_score(
+                    [TeacherToken(text="AB", logprob=-float(index), start=0, end=2)],
+                    input_tokens=10 + index,
+                )
+                for index, _item in enumerate(items, start=1)
+            ]
+
+    monkeypatch.setattr(multimodal, "image_descriptors_to_data_uris", data_uris)
+    prompt = _BridgePrompt(
+        student_messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a"},
+                    {"type": "image"},
+                    {"type": "text", "text": "b"},
+                ],
+            }
+        ],
+        teacher_messages=[{"role": "user", "content": "a<|media_pad|>b"}],
+        prompt_ids=(10, 11),
+        image_descriptors=("descriptor",),
+        package_root="/package",
+    )
+    bridge = _TeacherAlignmentBridge(
+        prompts=[prompt],
+        tokenizer=_BridgeTokenizer(),
+        teacher=Teacher(),
+        thinking_prefill="<think>\n",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+    monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
+    first_history = list(prompt.student_messages)
+    second_history = [
+        *first_history,
+        {"role": "assistant", "content": "prior"},
+        {"role": "user", "content": "next"},
+    ]
+    bridge._sessions["image-session"] = {
+        "index": 0,
+        "turns": [
+            {
+                "prompt_ids": [10, 11],
+                "response_ids": [65, 66],
+                "completion_text": "AB",
+                "context_messages": history,
+                "truncated": False,
+                "skip_reason": "",
+            }
+            for history in (first_history, second_history)
+        ],
+        "score_cache": None,
+        "score_lock": threading.Lock(),
+        "lease_deadline": time.monotonic() + 60,
+    }
+
+    result = bridge.score_multiturn("image-session")
+
+    assert descriptor_calls == [(("descriptor",), "/package")]
+    assert captured == [
+        (
+            [
+                {"role": "user", "content": "a<|media_pad|>b"},
+                {"role": "assistant", "content": "<think>\n"},
+            ],
+            "AB",
+            ["data:image/png;base64,frozen"],
+            True,
+        ),
+        (
+            [
+                {"role": "user", "content": "a<|media_pad|>b"},
+                {"role": "assistant", "content": "prior"},
+                {"role": "user", "content": "next"},
+                {"role": "assistant", "content": "<think>\n"},
+            ],
+            "AB",
+            ["data:image/png;base64,frozen"],
+            True,
+        ),
+    ]
+    assert [_teacher_logsum(turn) for turn in result["turns"]] == [-1.0, -2.0]
+    assert bridge.teacher_input_tokens == 23
+    assert bridge.teacher_output_tokens == 2
+    assert bridge.parent_work.snapshot().completed == 2
 
 
 def test_multiturn_transient_bridge_failure_latches_terminal_cause():
@@ -7848,66 +8117,190 @@ def test_a_multi_turn_opd_episode_carries_its_frozen_media_on_every_turn(
     assert [out["multi_modal_data"] for out in outputs] == [multi_modal_data] * 2
     assert [out["mm_processor_kwargs"] for out in outputs] == [{"flash_probe": True}] * 2
     assert instance.generate_mm_kwargs == [{"flash_probe": True}] * 2
-    # the bridge authenticates this against the frozen parent prompt before the episode runs.
+    # the bridge authenticates both the decoded count and canonical block placement.
     assert posted["start"][0]["image_count"] == expected_image_count
-
-
-class _ImageBlockEnv(_RecordingEnv):
-    """An environment whose initial prompt carries image content blocks, as a real one does."""
-
-    def new_rollout_state(self, _example):
-        return {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"type": "image"}, {"type": "text", "text": "describe"}],
-                }
-            ],
-            "prompt": None,
-        }
-
-
-def test_a_block_list_frozen_prompt_authenticates_against_the_flattened_child_prompt():
-    """The child sends the transcript it can carry; the frozen prompt keeps blocks. Both must pass.
-
-    `normalize_prompt_images` stores an image row's prompt as content BLOCKS, while the child
-    flattens to text in `prepare_episode_prompt` because a multi-turn transcript cannot carry
-    pixels. Comparing those two shapes directly fails start authentication for EVERY image episode,
-    even when the prompt ids and image count have already proved they are the same prompt. The
-    comparison therefore has to happen in one representation.
-
-    Driven through the real `start_multiturn` rather than a stub: stubbing that endpoint is what
-    let this mismatch sit behind a green end-to-end test, since the stub is the very check at issue.
-    """
-    env = _ImageBlockEnv()
-    bridge = _multiturn_bridge(env)
-    bridge.prompts[0] = _BridgePrompt(
-        student_messages=[
-            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "describe"}]}
-        ],
-        teacher_messages=[{"role": "user", "content": "describe"}],
-        prompt_ids=(10, 11),
-        image_descriptors=("descriptor",),
-        package_root=None,
-        example=object(),
+    assert posted["start"][0]["raw_prompt"] == (
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": "describe"}],
+            }
+        ]
+        if expected_image_count
+        else _TEXT_PROMPT
     )
 
-    started = bridge.start_multiturn(
+
+class _StructuredImageEnv(_RecordingEnv):
+    def __init__(self, initial_messages):
+        super().__init__()
+        self.initial_messages = initial_messages
+        self.reply_contexts = []
+
+    def new_rollout_state(self, _example):
+        return {"messages": self.initial_messages, "prompt": None}
+
+    def env_reply(self, messages, _state):
+        self.reply_contexts.append(messages)
+        return [{"role": "user", "content": "next"}]
+
+
+def _image_prompt(image_source=_IMAGE_DATA_URI, *, image_first: bool = False):
+    image = {"type": "image", "image": image_source}
+    content = (
+        [image, {"type": "text", "text": "ab"}]
+        if image_first
+        else [{"type": "text", "text": "a"}, image, {"type": "text", "text": "b"}]
+    )
+    return [{"role": "user", "content": content}]
+
+
+def _structured_image_bridge(env, initial_messages):
+    from flash.content.multimodal import image_teacher_prompt_messages, normalize_prompt_images
+
+    normalized = normalize_prompt_images({}, initial_messages, None)
+    bridge = _multiturn_bridge(env)
+    bridge.prompts[0] = _BridgePrompt(
+        student_messages=normalized.messages,
+        teacher_messages=image_teacher_prompt_messages(
+            normalized.messages, len(normalized.descriptors)
+        ),
+        prompt_ids=(10, 11),
+        image_descriptors=tuple(normalized.descriptors),
+        package_root=None,
+        example={},
+    )
+    return bridge, normalized
+
+
+def test_multiturn_start_authenticates_parquet_text_block_canonicalization():
+    frozen = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+                {"type": "image", "image": _IMAGE_DATA_URI},
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
+    reconstructed = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "ab"},
+                {"type": "image", "image": _IMAGE_DATA_URI},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
+    env = _StructuredImageEnv(reconstructed)
+    bridge, _normalized = _structured_image_bridge(env, frozen)
+
+    bridge.start_multiturn(
         index=0,
-        session_id="s1",
+        session_id="canonical",
         prompt_ids=[10, 11],
-        raw_prompt=[{"role": "user", "content": "describe"}],
+        raw_prompt=reconstructed,
         image_count=1,
     )
 
-    assert started["max_turns"] >= 1
+    assert bridge._sessions["canonical"]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "ab"},
+                {"type": "image"},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
 
-    # the guard still has to reject a genuinely different prompt, or flattening bought a hole.
-    with pytest.raises(ValueError, match="does not match the frozen environment prompt"):
+
+def test_multiturn_start_rejects_rehydrated_media_placement_drift_at_same_count():
+    frozen = _image_prompt()
+    drifted = _image_prompt(image_first=True)
+    env = _StructuredImageEnv(drifted)
+    bridge, normalized = _structured_image_bridge(env, frozen)
+
+    with pytest.raises(ValueError, match="changed after prompt freezing"):
         bridge.start_multiturn(
             index=0,
-            session_id="s2",
+            session_id="placement-drift",
             prompt_ids=[10, 11],
-            raw_prompt=[{"role": "user", "content": "describe something else"}],
+            raw_prompt=normalized.messages,
             image_count=1,
         )
+
+
+def test_multiturn_start_rejects_same_structure_with_different_fresh_descriptor():
+    from flash.content.multimodal import normalize_prompt_images
+
+    frozen = _image_prompt()
+    changed_source = _image_prompt(_OTHER_IMAGE_DATA_URI)
+    env = _StructuredImageEnv(changed_source)
+    bridge, normalized = _structured_image_bridge(env, frozen)
+    fresh = normalize_prompt_images({}, changed_source, None)
+    assert fresh.messages == normalized.messages
+    assert len(fresh.descriptors) == len(normalized.descriptors) == 1
+    assert fresh.descriptors != normalized.descriptors
+
+    with pytest.raises(ValueError, match="changed after prompt freezing"):
+        bridge.start_multiturn(
+            index=0,
+            session_id="descriptor-drift",
+            prompt_ids=[10, 11],
+            raw_prompt=normalized.messages,
+            image_count=1,
+        )
+
+
+def test_valid_image_prompt_reaches_environment_with_media_placement_intact():
+    initial = _image_prompt()
+    env = _StructuredImageEnv(initial)
+    bridge, normalized = _structured_image_bridge(env, initial)
+
+    started = bridge.start_multiturn(
+        index=0,
+        session_id="valid",
+        prompt_ids=[10, 11],
+        raw_prompt=normalized.messages,
+        image_count=1,
+    )
+    bridge.step_multiturn(
+        {
+            "session_id": "valid",
+            "turn_ordinal": 0,
+            "accepted_prefix": [10, 11],
+            "raw_response_ids": [65],
+            "response_ids": [65],
+            "completion_text": "A",
+            "termination": "stop",
+            "stop_reason": "stop",
+            "max_tokens": 8,
+            "truncated": False,
+            "skip_reason": "",
+        }
+    )
+
+    assert started["max_turns"] >= 1
+    assert bridge._sessions["valid"]["messages"][0] == normalized.messages[0]
+    assert env.reply_contexts[0][0] == normalized.messages[0]
+    assert env.reply_contexts[0][1] == {"role": "assistant", "content": "A"}
+
+
+def test_text_only_multiturn_start_keeps_flat_transcript_state():
+    env = _RecordingEnv()
+    bridge = _multiturn_bridge(env)
+
+    bridge.start_multiturn(
+        index=0,
+        session_id="text",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
+    )
+
+    assert bridge._sessions["text"]["messages"] == [{"role": "user", "content": "q"}]
