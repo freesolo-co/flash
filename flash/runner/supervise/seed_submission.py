@@ -55,6 +55,7 @@ class _SubmitContext:
     def on_handle(self, handle: dict) -> None:
         from flash.runner import (
             _preserve_cleanup_remote,
+            _record_launched_attempt_resource,
             _TerminalHandleRace,
             _update,
         )
@@ -85,8 +86,22 @@ class _SubmitContext:
                 "on_last_gpu": bool(self.current_on_last_gpu),
                 "code_prefix": self.code_prefix,
             }
-            if _update(self.spec.run_id, "running", remote=persisted_handle):
+            # the ledger entry is written by this same guarded status write (see status._update),
+            # so a paid resource can never exist without a durable record of it.
+            if _update(
+                self.spec.run_id,
+                "running",
+                remote=persisted_handle,
+                _attempt_resource_gpu=dict(self.current_gpu),
+            ):
                 return
+            # the run went terminal first, so the handle never reached status.remote -- but the
+            # resource was still provisioned and is still billable. record it BEFORE teardown, so
+            # losing this race cannot erase the evidence that it was paid for.
+            with contextlib.suppress(Exception):
+                _record_launched_attempt_resource(
+                    self.spec.run_id, persisted_handle, gpu=dict(self.current_gpu)
+                )
             resource_deleted = False
             with contextlib.suppress(Exception):
                 resource_deleted = _lifecycle._strict_teardown_handle(
@@ -593,6 +608,10 @@ def _build_candidate_plan(
         name=chosen.gpu,
         provider=chosen.provider,
         count=int(getattr(chosen, "gpu_count", 1) or 1),
+        # the rate this attempt ACCEPTED, per card, recorded in the attempt-resource ledger. an
+        # instance handle stamps its own whole-box hourly_usd, but a runpod handle carries no rate
+        # at all, and the market moves -- so the accepted price has to be captured at selection.
+        hourly_usd=float(getattr(chosen, "hourly_usd", 0.0) or 0.0),
     )
     ctx.current_attempt = prepared.attempt
     return _CandidatePlan(allocation, candidates, chosen, on_last_gpu, effective_spec, run_spec)

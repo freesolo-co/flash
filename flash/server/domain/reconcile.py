@@ -1,7 +1,13 @@
 """Daily realized-cost reconciliation for finished runs.
 
-Reports provider COGS with the operator key, best-effort and off-path. Attribution uses the last
-`RunStatus.remote`, so multi-resource retries may be undercounted.
+Reports provider COGS with the operator key, best-effort and off-path. Attribution settles over the
+durable attempt-resource ledger (flash/runner/attempt_resources.py), so a retried run bills every
+resource it created and a cancelled run whose handle was cleared still bills the one it burned.
+
+Settlement is partial-now, top-up-later: the settled subset is reported immediately, and the run is
+left unreconciled while any resource is still within its settle delay so a later sweep can restate a
+higher total. `reconciled_at` closes the run only once every resource has settled or the window has
+closed. Per-resource usage is persisted, so a restatement never double-counts.
 """
 
 from __future__ import annotations
@@ -68,66 +74,209 @@ def _terminal_ts(status: runner.RunStatus) -> float:
     return float(status.finished_at if status.finished_at is not None else status.updated_at)
 
 
+def _resource_terminal_ts(record: dict, status: runner.RunStatus) -> float:
+    """When one resource stopped costing money: its own teardown, else the run's terminal time.
+
+    A retried run's earlier resource was destroyed long before the run ended, so billing it to the
+    run's `finished_at` invents rental nobody was charged for.
+    """
+    terminal = record.get("terminal_at")
+    if isinstance(terminal, (int, float)) and not isinstance(terminal, bool) and terminal > 0:
+        return float(terminal)
+    return _terminal_ts(status)
+
+
+def _resource_start_ts(record: dict, status: runner.RunStatus) -> float:
+    """When one resource started costing money, falling back the way `reconcile_run` always has.
+
+    A persisted handle may omit `started_ts` or hold a falsey value; 0.0 means an unknown launch
+    rather than the epoch, and billing flat-rate instances from 1970 would be catastrophic.
+    """
+    launched = record.get("launched_at")
+    if isinstance(launched, (int, float)) and not isinstance(launched, bool) and launched > 0:
+        return float(launched)
+    identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    return float(identity.get("started_ts") or status.created_at)
+
+
+def _resource_settled(record: dict, status: runner.RunStatus, now: float) -> bool:
+    """Whether this resource's provider invoice has had time to settle."""
+    return (now - _resource_terminal_ts(record, status)) >= _SETTLE_SECONDS
+
+
+def _window_closed(status: runner.RunStatus, now: float) -> bool:
+    """Whether the run has aged out, after which its total is final however partial it is."""
+    return (now - _terminal_ts(status)) > _WINDOW_SECONDS
+
+
 def _due(status: runner.RunStatus, now: float) -> bool:
     """Whether a run should be reconciled this pass: a billable run whose training is finished
     (a terminal billable state, or `deployed` -- see _RECONCILABLE_STATES), not yet reconciled,
-    past the settle delay, still within the window, and carrying a provider handle."""
+    still within the window, and holding at least one settled paid resource.
+
+    Eligibility comes from the ledger rather than `status.remote`, which is why a cleanly cancelled
+    run -- whose handle was cleared by its own confirmed teardown -- is still reconciled.
+    """
     if status.state not in _RECONCILABLE_STATES:
         return False
     if status.reconciled_at:
         return False
-    age = now - _terminal_ts(
-        status
-    )  # from teardown, not a later updated_at bump (see _terminal_ts)
-    if age < _SETTLE_SECONDS or age > _WINDOW_SECONDS:
+    # window bounds the RUN (from teardown, not a later updated_at bump -- see _terminal_ts); the
+    # settle delay is per-resource, since each one stopped billing at its own teardown.
+    if _window_closed(status, now):
         return False
-    return bool(status.remote)
+    try:
+        records = runner.attempt_resources_for_status(status)
+    except Exception:
+        return False
+    return any(_resource_settled(record, status, now) for record in records)
+
+
+def _settle_resource(record: dict, status: runner.RunStatus):
+    """Pull realized cost for exactly one paid resource, over ITS OWN billing window."""
+    identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    if not identity:
+        return None
+    start = _resource_start_ts(record, status)
+    resource_end = _resource_terminal_ts(record, status)
+    # RunPod's billing query pads past the resource's end so the settled invoice is in range; the
+    # instance providers bill flat $/hr to teardown, so they get the UN-padded end (no extra hour).
+    return realized_cost_for_remote(
+        identity, start=start, end=resource_end + _SETTLE_SECONDS, run_end=resource_end
+    )
+
+
+def _resource_audit(record: dict, realized) -> dict:
+    """Per-resource audit detail, nested under the report's free-form `source`."""
+    return {
+        "attempt": record.get("attempt"),
+        "provider": realized.provider,
+        "allocation": record.get("allocation"),
+        "acceptedRateUsdHr": record.get("accepted_rate_usd_hr"),
+        "launchedAt": record.get("launched_at"),
+        "terminalAt": record.get("terminal_at"),
+        "teardownRequestedAt": record.get("teardown_requested_at"),
+        "deletionConfirmedAt": record.get("deletion_confirmed_at"),
+        "outcome": record.get("outcome"),
+        "realizedCostUsd": realized.realized_usd,
+        "costByResource": realized.by_resource,
+        "wallSeconds": realized.wall_seconds,
+        "source": realized.source,
+    }
+
+
+def _settled_totals(records: list[dict], status: runner.RunStatus, now: float) -> dict:
+    """Settle every resource whose invoice has had time to land, and total them."""
+    total = 0.0
+    wall = 0.0
+    by_resource: dict[str, float] = {}
+    providers: set[str] = set()
+    gpus: set[str] = set()
+    audit: list[dict] = []
+    usage: dict[tuple, dict] = {}
+    unsettled = 0
+    for record in records:
+        if not _resource_settled(record, status, now):
+            unsettled += 1
+            continue
+        realized = _settle_resource(record, status)
+        if realized is None or realized.realized_usd <= 0:
+            # nothing billed yet: treat as unsettled so a later sweep can still top it up rather
+            # than closing the run at a total that silently omits it.
+            unsettled += 1
+            continue
+        total += realized.realized_usd
+        wall += float(realized.wall_seconds or 0.0)
+        for key, value in (realized.by_resource or {}).items():
+            by_resource[key] = by_resource.get(key, 0.0) + float(value)
+        providers.add(realized.provider)
+        allocation = record.get("allocation") if isinstance(record.get("allocation"), dict) else {}
+        if allocation.get("gpu"):
+            gpus.add(str(allocation["gpu"]))
+        audit.append(_resource_audit(record, realized))
+        key = runner._attempt_resource_key(record.get("identity"))
+        if key is not None:
+            usage[key] = _resource_audit(record, realized)
+    return {
+        "total": round(total, 6),
+        "wall_seconds": wall or None,
+        "by_resource": by_resource,
+        "providers": providers,
+        "gpus": gpus,
+        "audit": audit,
+        "usage": usage,
+        "unsettled": unsettled,
+    }
+
+
+def _single(values: set[str], fallback=None):
+    """One value when every resource agrees, "mixed" when they genuinely differ."""
+    if not values:
+        return fallback
+    if len(values) == 1:
+        return next(iter(values))
+    return "mixed"
 
 
 def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool:
-    """Pull + report realized cost for one run; mark it reconciled on success. Returns True when
-    a positive realized cost was reported. A zero/None result leaves the run unreconciled so a
-    later cycle (within the window) retries once the provider invoice settles."""
+    """Pull + report realized cost for one run. Returns True when a positive total was reported.
+
+    Every paid resource in the run's ledger is queried over its own billing window and summed, so a
+    retried run reports what it actually spent rather than only its last handle. The run is marked
+    reconciled ONLY once nothing is left to settle (or the window closed): while any resource is
+    still unsettled the total is reported but left open, so a later sweep restates it upward. A
+    zero/None total leaves the run unreconciled and is retried within the window.
+    """
     now = time.time() if now is None else now
-    remote = status.remote or {}
     spec = status.spec or {}
-    # raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
-    # unknown launch rather than the epoch; falling back to created_at prevents inflated flat-rate
-    # instance billing.
-    start = float(remote.get("started_ts") or status.created_at)
-    # The run's true terminal time (~teardown / billing stop); see _terminal_ts for why this is
-    # the frozen finished_at rather than the mutable updated_at (which deploy/heartbeat move past
-    # teardown and would make the instance providers' flat $/hr bill until that later event).
-    run_end = _terminal_ts(status)
-    # RunPod's billing query pads past run end so the settled invoice is in range; the instance
-    # providers bill flat $/hr to teardown, so they get the UN-padded run_end (no extra settle hour).
-    realized = realized_cost_for_remote(
-        remote, start=start, end=run_end + _SETTLE_SECONDS, run_end=run_end
-    )
-    if realized is None or realized.realized_usd <= 0:
+    try:
+        records = runner.attempt_resources_for_status(status)
+    except Exception:
+        return False
+    if not records:
         return False
 
+    settled = _settled_totals(records, status, now)
+    if settled["total"] <= 0:
+        return False
+
+    remote = status.remote or {}
     body = {
         "runId": status.run_id,
-        "realizedCostUsd": realized.realized_usd,
-        "provider": realized.provider,
-        "gpu": remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type"),
-        "costByResource": realized.by_resource,
-        "wallSeconds": realized.wall_seconds,
+        "realizedCostUsd": settled["total"],
+        "provider": _single(settled["providers"]),
+        "gpu": _single(
+            settled["gpus"],
+            remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type"),
+        ),
+        "costByResource": settled["by_resource"],
+        "wallSeconds": settled["wall_seconds"],
         "costBasis": "realized",
-        "source": realized.source,
+        # per-resource audit detail rides inside the existing free-form `source`, so the top-level
+        # report fields keep the names and types the backend already reads.
+        "source": {"attemptResources": settled["audit"]},
     }
     if not _report(body):
         return False
 
+    # persist per-resource usage first: a later top-up restates from these records, so they have to
+    # survive even if the aggregate write below is lost.
+    with contextlib.suppress(Exception):
+        runner._record_attempt_resource_usage(status.run_id, settled["usage"])
     # persist realized-cost fields only. `status` is stale, and writing its state could revert a run
     # that advanced to nonterminal `deployed`, which terminal-sticky CAS would not protect.
+    # `reconciled_at` closes the run for good, so it is withheld while anything can still be billed:
+    # an unsettled resource must be able to raise this total on a later sweep.
+    fully_settled = settled["unsettled"] == 0 or _window_closed(status, now)
     with contextlib.suppress(Exception):
-        runner.record_realized_cost(
-            status.run_id,
-            realized_cost_usd=realized.realized_usd,
-            reconciled_at=now,
-        )
+        if fully_settled:
+            runner.record_realized_cost(
+                status.run_id,
+                realized_cost_usd=settled["total"],
+                reconciled_at=now,
+            )
+        else:
+            runner.record_partial_realized_cost(status.run_id, realized_cost_usd=settled["total"])
     return True
 
 

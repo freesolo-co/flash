@@ -350,13 +350,25 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     return float(cost)
 
 
-def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
+def _update(
+    run_id: str,
+    state: str,
+    *,
+    allow_from_terminal: bool = False,
+    _attempt_resource_gpu: dict | None = None,
+    **updates,
+) -> bool:
     """Atomically transition run state with terminal-stickiness. Returns False if rejected.
 
     Returns ``True`` if the transition was applied, ``False`` if it was rejected because the run was
     already in a terminal state (the sticky compare-and-set below). Callers that gate PAID work on a
     transition (e.g. the recovery path resuming ``_run_training``) must check this return so a run
     concurrently flipped terminal does not get resumed.
+
+    A ``remote`` update also records that paid resource in the attempt-resource ledger, in this same
+    write: the durable proof that a billable resource exists must never be one crash away from the
+    handle that names it. ``_attempt_resource_gpu`` supplies the selected allocation for the
+    accepted rate, which a RunPod handle does not carry.
     """
     report_status: RunStatus | None = None
     with runner._status_guard(run_id):
@@ -376,7 +388,20 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
             status.finished_at = prev_updated_at if was_terminal else status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
-        runner._save_status_unlocked(status)
+        attempt_resources = runner._PRIVATE_VALUE_UNSET
+        if isinstance(updates.get("remote"), dict):
+            # bookkeeping must never cost us the handle: if the ledger cannot be built (corrupt
+            # history, or the same resource already claimed by another attempt), the run still
+            # persists the remote that names its live paid resource, and reconciliation falls back
+            # to what it can read. the strict parse still fails closed when SETTLING.
+            with contextlib.suppress(Exception):
+                attempt_resources = (
+                    runner._record_attempt_resource_launch(
+                        run_id, updates["remote"], gpu=_attempt_resource_gpu
+                    )
+                    or runner._PRIVATE_VALUE_UNSET
+                )
+        runner._save_status_unlocked(status, _attempt_resources=attempt_resources)
         report_status = status
     if report_status is not None:
         runner._report_status(report_status)

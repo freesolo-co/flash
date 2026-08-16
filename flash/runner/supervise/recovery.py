@@ -178,18 +178,45 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
     return False
 
 
+def _stamp_teardown_requested(run_id: str, data: dict) -> None:
+    """Record that exact teardown was requested. Bookkeeping only -- never raises."""
+    from flash.runner import _record_attempt_resource_teardown_requested
+
+    with contextlib.suppress(Exception):
+        _record_attempt_resource_teardown_requested(run_id, data)
+
+
+def _stamp_deletion_confirmed(run_id: str, data: dict) -> bool:
+    """Record CONFIRMED deletion and return True, preserving the teardown boolean contract.
+
+    Returns True unconditionally: the caller has already proven the resource is gone, and a failure
+    to write bookkeeping must never be reported as a failure to delete.
+    """
+    from flash.runner import _record_attempt_resource_deletion_confirmed
+
+    with contextlib.suppress(Exception):
+        _record_attempt_resource_deletion_confirmed(run_id, data)
+    return True
+
+
 def _strict_teardown_handle(handle, run_id: str) -> bool:
     """Request exact teardown, then prove the captured attempt's worker is gone.
 
     Returns true when the billable resource deletion itself was confirmed. Returns false only for a
     RunPod job proven terminal while its endpoint deletion remains unconfirmed; callers must persist
     that exact endpoint in cleanup_remotes before clearing the active remote.
+
+    This is the single runner-owned teardown gate -- retry cleanup, terminal GC, cancellation and
+    the cleanup drain all arrive here -- so it is also where the attempt-resource ledger learns
+    when teardown was requested and when deletion was actually confirmed. That bookkeeping is
+    strictly best-effort and never alters the boolean contract or the fail-closed behavior below.
     """
     from flash.providers import INSTANCE_PROVIDERS, get_provider
 
     handle = _canonical_provider_handle(handle)
     provider = get_provider(handle.provider)
     data = handle.to_dict()
+    _stamp_teardown_requested(run_id, data)
     if handle.provider == "runpod":
         if data.get("job_id"):
             with contextlib.suppress(Exception):
@@ -198,11 +225,13 @@ def _strict_teardown_handle(handle, run_id: str) -> bool:
             provider.destroy(handle)
         except Exception as exc:
             if _worker_provably_gone(run_id, handle):
+                # the worker is terminal but the ENDPOINT deletion is unconfirmed, so it may still
+                # be billable: deliberately not stamped as deleted.
                 return False
             raise RuntimeError(
                 "runpod endpoint deletion could not be confirmed and its worker may still be live"
             ) from exc
-        return True
+        return _stamp_deletion_confirmed(run_id, data)
     if handle.provider in INSTANCE_PROVIDERS:
         destroy_error: Exception | None = None
         try:
@@ -210,13 +239,13 @@ def _strict_teardown_handle(handle, run_id: str) -> bool:
         except Exception as exc:
             destroy_error = exc
         if _worker_provably_gone(run_id, handle):
-            return True
+            return _stamp_deletion_confirmed(run_id, data)
         raise RuntimeError(
             "instance teardown could not be confirmed absent; its worker may still be live"
         ) from destroy_error
     provider.cancel(handle)
     provider.destroy(handle)
-    return True
+    return _stamp_deletion_confirmed(run_id, data)
 
 
 def _completed_attempt_metrics(

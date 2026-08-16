@@ -443,7 +443,8 @@ def test_reconcile_sums_every_paid_retry_resource_not_just_the_surviving_handle(
     assert reconcile.reconcile_run(status, now=now) is True
     assert posted["realizedCostUsd"] == 3.00  # today: 2.00, the first attempt billed as free
     audit = repr(posted.get("source"))
-    assert "ep-0" in audit and "ep-1" in audit
+    assert "ep-0" in audit
+    assert "ep-1" in audit
 
 
 def test_cancelled_run_with_cleared_handle_still_reconciles_its_paid_resource(

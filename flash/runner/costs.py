@@ -369,6 +369,29 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
     runner._report_status(status)
 
 
+def record_partial_realized_cost(run_id: str, *, realized_cost_usd: float) -> None:
+    """Persist a PARTIAL realized total, leaving the run open for a later top-up.
+
+    Deliberately does not set ``reconciled_at``: some resource of this run has not settled yet, and
+    marking it reconciled would suppress the sweep that raises the total. Never lowers the stored
+    figure -- a later sweep can only restate upward, so a transient provider omission cannot erase
+    COGS that was already reported. No-ops if the run vanished or is already closed.
+    """
+    with runner._status_guard(run_id):
+        try:
+            status = runner.get_status(run_id)
+        except FileNotFoundError:
+            return
+        if status.reconciled_at:
+            return
+        if status.realized_cost_usd is not None and status.realized_cost_usd >= realized_cost_usd:
+            return
+        status.realized_cost_usd = realized_cost_usd
+        status.updated_at = time.time()
+        runner._save_status_unlocked(status)
+    runner._report_status(status)
+
+
 def record_billing_state(run_id: str, **fields) -> None:
     """Persist billing fields without touching run state. Never downgrades a charged run."""
     bad = set(fields) - runner._BILLING_FIELDS

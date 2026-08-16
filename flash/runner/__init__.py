@@ -64,12 +64,16 @@ _STATUS_REPORT_LAST_QUEUED: dict[str, int] = {}
 _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
+# durable per-resource billing history (flash/runner/attempt_resources.py). private for the same
+# reason as the rest: it is operator accounting, not customer-facing run status.
+_ATTEMPT_RESOURCES_KEY = "attempt_resources"
 _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
         _NEXT_ATTEMPT_KEY,
         _CLEANUP_REMOTES_KEY,
+        _ATTEMPT_RESOURCES_KEY,
         _OPD_RETRY_CONTRACT_KEY,
     }
 )
@@ -681,6 +685,7 @@ def _save_status(
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
+    _attempt_resources: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     with _status_guard(status.run_id):
@@ -705,6 +710,7 @@ def _save_status(
             _run_deadline_at=_run_deadline_at,
             _next_attempt=_next_attempt,
             _cleanup_remotes=_cleanup_remotes,
+            _attempt_resources=_attempt_resources,
             _opd_retry_contract_version=_opd_retry_contract_version,
         )
 
@@ -715,6 +721,7 @@ def _save_status_unlocked(
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
+    _attempt_resources: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
@@ -733,6 +740,7 @@ def _save_status_unlocked(
         _RUN_DEADLINE_AT_KEY: _run_deadline_at,
         _NEXT_ATTEMPT_KEY: _next_attempt,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
+        _ATTEMPT_RESOURCES_KEY: _attempt_resources,
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
     }
     data = _status_storage_dict(status)
@@ -772,6 +780,25 @@ from flash.runner.artifacts import (  # noqa: E402,F401
     managed_hf_repo_for_environment,
     preflight_validate_environment_ref,
 )
+from flash.runner.attempt_resources import (  # noqa: E402,F401
+    _attempt_resource_key,
+    _attempt_resource_rate,
+    _attempt_resource_record,
+    _attempt_resources_from_raw,
+    _find_attempt_resource,
+    _legacy_attempt_resources,
+    _mark_open_attempt_resources_cancelled,
+    _merged_attempt_resource,
+    _record_attempt_resource_deletion_confirmed,
+    _record_attempt_resource_launch,
+    _record_attempt_resource_outcome,
+    _record_attempt_resource_teardown_requested,
+    _record_attempt_resource_usage,
+    _record_launched_attempt_resource,
+    _stamp_attempt_resource,
+    _upsert_attempt_resource_unlocked,
+    attempt_resources_for_status,
+)
 from flash.runner.attempts import (  # noqa: E402,F401
     _heartbeat_attempt_is_current,
     _infer_next_attempt,
@@ -787,6 +814,7 @@ from flash.runner.costs import (  # noqa: E402,F401
     cancelled_charge_usd,
     charge_usd_for_spec,
     record_billing_state,
+    record_partial_realized_cost,
     record_realized_cost,
 )
 from flash.runner.deadlines import (  # noqa: E402,F401

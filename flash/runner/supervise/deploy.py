@@ -322,9 +322,19 @@ def _teardown_persisted_remotes(
 
     Stops on the first remote that could not be confirmed torn down, unless the status has since
     moved to a different one -- an already-confirmed identity is cleared without a second teardown.
-    """
-    from flash.runner import _remote_resource_identity, get_status
 
+    Teardown clears the active handle, so every resource this run paid for is dispositioned in the
+    ledger first: afterwards `status.remote` no longer names them. Provider COGS only -- customer
+    cancellation charging is a separate concern (see `_cancellation_billing`).
+    """
+    from flash.runner import (
+        _mark_open_attempt_resources_cancelled,
+        _remote_resource_identity,
+        get_status,
+    )
+
+    with contextlib.suppress(Exception):
+        _mark_open_attempt_resources_cancelled(run_id)
     processed_remote_identities = set()
     while True:
         status = get_status(run_id)
