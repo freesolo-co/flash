@@ -12,8 +12,8 @@ from __future__ import annotations
 import math
 import os
 
+from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
-from flash.engine.profiling.sft_image_rows import _multimodal_messages_with_images
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
@@ -125,7 +125,7 @@ def _processor_expanded_prompt(
     from flash.content.multimodal import decode_image_descriptors
 
     images = decode_image_descriptors(list(image_descriptors), package_root)
-    prepared = _multimodal_messages_with_images(messages, images)
+    prepared = messages_with_decoded_images(messages, images)
     rendered = processor.apply_chat_template(
         prepared, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
     )

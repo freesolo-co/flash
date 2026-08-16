@@ -7,7 +7,7 @@ import binascii
 import io
 import json
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 MAX_IMAGES_PER_EXAMPLE = 8
@@ -31,20 +31,6 @@ IMAGE_PAD_TOKEN = "<|image_pad|>"
 class NormalizedImages:
     messages: list[dict]
     descriptors: list[str]
-
-
-@dataclass(frozen=True)
-class ImageDescriptorMetadata:
-    source_bytes: int
-    decoded_rgb_bytes: int
-    width: int
-    height: int
-
-
-@dataclass
-class ImageProfileValidationState:
-    descriptor_metadata: dict[str, ImageDescriptorMetadata] = field(default_factory=dict)
-    decoded_work_bytes: int = 0
 
 
 def _is_pil_image(value: object) -> bool:
@@ -154,18 +140,21 @@ def _validate_dimensions(width: int, height: int) -> int:
     return pixels * 3
 
 
-def _inspect_image_metadata(data: bytes) -> ImageDescriptorMetadata:
+def inspect_image_bytes(data: bytes) -> tuple[int, int, int]:
+    """Validate one image's header and return its (decoded_rgb_bytes, width, height).
+
+    Reads the header only: the pixels are not decoded here.
+    """
     try:
         from PIL import Image
     except ImportError as exc:
         raise RuntimeError("Pillow is required for multimodal image training") from exc
     try:
         with Image.open(io.BytesIO(data)) as image:
-            return ImageDescriptorMetadata(
-                source_bytes=len(data),
-                decoded_rgb_bytes=_validate_dimensions(image.width, image.height),
-                width=image.width,
-                height=image.height,
+            return (
+                _validate_dimensions(image.width, image.height),
+                image.width,
+                image.height,
             )
     except ValueError:
         raise
@@ -174,7 +163,7 @@ def _inspect_image_metadata(data: bytes) -> ImageDescriptorMetadata:
 
 
 def _inspect_image_bytes(data: bytes) -> int:
-    return _inspect_image_metadata(data).decoded_rgb_bytes
+    return inspect_image_bytes(data)[0]
 
 
 def _pil_descriptor(image: object) -> str:
@@ -192,15 +181,22 @@ def normalize_image_source(
     source: object,
     package_root: str | Path | None,
     *,
-    defer_path_validation: bool = False,
+    defer_validation: bool = False,
 ) -> str:
-    """Convert one supported image source to an Arrow-safe descriptor."""
+    """Convert one supported image source to an Arrow-safe descriptor.
+
+    ``defer_validation`` skips the per-source pixel inspection for EVERY source kind, for a caller
+    that validates the resulting descriptors itself. Profiling does exactly that, through one cached
+    pass that bounds total decode work; inspecting here as well would decode each image twice and
+    charge only some kinds to that budget. Every other caller validates eagerly.
+    """
     root = Path(package_root) if package_root is not None else None
     if isinstance(source, bytearray):
         source = bytes(source)
     if isinstance(source, bytes):
         _check_source_size(len(source))
-        _inspect_image_bytes(source)
+        if not defer_validation:
+            _inspect_image_bytes(source)
         return _descriptor("bytes", base64.b64encode(source).decode("ascii"))
     if _is_pil_image(source):
         return _pil_descriptor(source)
@@ -211,7 +207,8 @@ def normalize_image_source(
     scheme = parsed.scheme.lower()
     if scheme == "data":
         data = _data_uri_bytes(value)
-        _inspect_image_bytes(data)
+        if not defer_validation:
+            _inspect_image_bytes(data)
         return _descriptor("data_uri", value)
     if scheme in {"http", "https"}:
         # flash never fetches a user-supplied URL server-side. download the image ahead of time
@@ -227,7 +224,7 @@ def normalize_image_source(
         raise ValueError(f"unsupported image URL scheme: {scheme}")
     path = _package_image_path(value, root)
     descriptor = _descriptor("path", path.relative_to(root.resolve()).as_posix())
-    if not defer_path_validation:
+    if not defer_validation:
         _inspect_image_bytes(path.read_bytes())
     return descriptor
 
@@ -386,9 +383,13 @@ def normalize_prompt_images(
     messages: list[dict],
     package_root: str | Path | None,
     *,
-    defer_path_validation: bool = False,
+    defer_validation: bool = False,
 ) -> NormalizedImages:
-    """Normalize prompt image blocks and top-level fields without mutating the record."""
+    """Normalize prompt image blocks and top-level fields without mutating the record.
+
+    ``defer_validation`` is forwarded to :func:`normalize_image_source`; see it for when a caller
+    may skip the per-source pixel inspection.
+    """
     if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
         raise ValueError("prompt messages must be a list of message objects")
     pending = list(_top_level_sources(record))
@@ -407,7 +408,7 @@ def normalize_prompt_images(
         descriptor = normalize_image_source(
             source,
             package_root,
-            defer_path_validation=defer_path_validation,
+            defer_validation=defer_validation,
         )
         descriptor_bytes += _descriptor_size(descriptor)
         if descriptor_bytes > MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES:
@@ -508,7 +509,8 @@ def _descriptor_source_size(descriptor: str, package_root: str | Path | None) ->
     raise ValueError("invalid internal image descriptor kind")
 
 
-def _read_descriptor_source(descriptor: str, package_root: str | Path | None) -> bytes:
+def read_descriptor_source(descriptor: str, package_root: str | Path | None) -> bytes:
+    """Read one descriptor's raw source bytes under the per-source size limit."""
     kind, value = _parse_descriptor(descriptor)
     if kind == "bytes":
         try:
@@ -559,7 +561,7 @@ def image_descriptors_to_data_uris(
     source_bytes = 0
     decoded_bytes = 0
     for descriptor in descriptors:
-        data = _read_descriptor_source(descriptor, package_root)
+        data = read_descriptor_source(descriptor, package_root)
         source_bytes += len(data)
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
@@ -598,60 +600,41 @@ def _decode_image_bytes(data: bytes):
         raise ValueError("image source is not a valid image") from exc
 
 
-def image_descriptor_metadata(
-    descriptors: list[str],
-    package_root: str | Path | None,
-    validation_state: ImageProfileValidationState,
-    *,
-    profile_decoded_work_limit: int,
-) -> list[ImageDescriptorMetadata]:
-    """return fully validated dimensions while bounding unique profile decode work."""
-    if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
-        raise ValueError(
-            f"example contains {len(descriptors)} images, exceeding the {MAX_IMAGES_PER_EXAMPLE}-image limit"
-        )
-    pending: dict[str, tuple[bytes, ImageDescriptorMetadata]] = {}
-    metadata = []
-    source_bytes = 0
-    decoded_bytes = 0
-    new_decoded_work = 0
-    for descriptor in descriptors:
-        item = validation_state.descriptor_metadata.get(descriptor)
-        if item is None:
-            prepared = pending.get(descriptor)
-            if prepared is None:
-                data = _read_descriptor_source(descriptor, package_root)
-                item = _inspect_image_metadata(data)
-                pending[descriptor] = data, item
-                new_decoded_work += item.decoded_rgb_bytes
-            else:
-                item = prepared[1]
-        metadata.append(item)
-        source_bytes += item.source_bytes
-        if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
-            raise ValueError(
-                f"example image sources exceed the {MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit"
-            )
-        decoded_bytes += item.decoded_rgb_bytes
-        if decoded_bytes > MAX_TOTAL_DECODED_BYTES:
-            raise ValueError(
-                f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
-            )
+def messages_with_decoded_images(messages: list[dict], images: list[object]) -> list[dict]:
+    """Bind decoded images into a message list's image blocks, in order.
 
-    prospective_decoded_work = validation_state.decoded_work_bytes + new_decoded_work
-    if prospective_decoded_work > profile_decoded_work_limit:
-        raise ValueError(
-            f"profile decoded image work exceeds the {profile_decoded_work_limit}-byte limit"
-        )
+    Shared by sft, opd, and grpo: each algorithm decodes the row's descriptors itself and then
+    needs the same binding into the chat-template input.
+    """
+    image_iter = iter(images)
+    prepared = []
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                copied_block = dict(block)
+                if copied_block.get("type") == "image":
+                    copied_block["image"] = next(image_iter)
+                blocks.append(copied_block)
+            copied["content"] = blocks
+        prepared.append(copied)
+    try:
+        next(image_iter)
+    except StopIteration:
+        return prepared
+    raise ValueError("unused decoded image while preparing multimodal sft tokens")
 
-    for data, _item in pending.values():
-        image = _decode_image_bytes(data)
-        image.close()
-    validation_state.descriptor_metadata.update(
-        {descriptor: item for descriptor, (_data, item) in pending.items()}
-    )
-    validation_state.decoded_work_bytes = prospective_decoded_work
-    return metadata
+
+def decode_descriptor_pixels(data: bytes) -> None:
+    """Fully decode one image's pixels for validation, then release it.
+
+    Header inspection accepts an image whose pixel data is truncated or corrupt; only a full decode
+    finds that, and the caller wants the failure, not the image.
+    """
+    image = _decode_image_bytes(data)
+    image.close()
 
 
 def decode_image_descriptors(
@@ -666,7 +649,7 @@ def decode_image_descriptors(
     source_bytes = 0
     decoded_bytes = 0
     for descriptor in descriptors:
-        data = _read_descriptor_source(descriptor, package_root)
+        data = read_descriptor_source(descriptor, package_root)
         source_bytes += len(data)
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(

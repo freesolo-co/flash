@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from flash.content.multimodal import (
     MAX_IMAGES_PER_EXAMPLE,
     MAX_TOTAL_DECODED_BYTES,
-    ImageProfileValidationState,
-    image_descriptor_metadata,
+    MAX_TOTAL_IMAGE_SOURCE_BYTES,
+    decode_descriptor_pixels,
+    inspect_image_bytes,
+    read_descriptor_source,
 )
 
 # qwen VL publishes its pixel budget under `size`, older revisions under min_pixels/max_pixels.
@@ -29,6 +31,89 @@ _DEFAULT_MAX_PIXELS = 14 * 14 * 4 * 1280
 _MAX_ASPECT_RATIO = 200
 # profile-wide unique full-decode work; per-row decoded bytes keep their separate bound.
 MAX_PROFILE_DECODED_WORK_BYTES = MAX_TOTAL_DECODED_BYTES * MAX_IMAGES_PER_EXAMPLE
+
+
+@dataclass(frozen=True)
+class ImageDescriptorMetadata:
+    source_bytes: int
+    decoded_rgb_bytes: int
+    width: int
+    height: int
+
+
+@dataclass
+class ImageProfileValidationState:
+    """one profile's descriptor cache and cumulative decode budget.
+
+    a descriptor repeated across rows is validated and decoded ONCE; every occurrence still counts
+    toward the per-row limits below, so repetition cannot be used to smuggle a row past them.
+    """
+
+    descriptor_metadata: dict[str, ImageDescriptorMetadata] = field(default_factory=dict)
+    decoded_work_bytes: int = 0
+
+
+def image_descriptor_metadata(
+    descriptors: list[str],
+    package_root: str | Path | None,
+    validation_state: ImageProfileValidationState,
+    *,
+    profile_decoded_work_limit: int,
+) -> list[ImageDescriptorMetadata]:
+    """return fully validated dimensions while bounding unique profile decode work."""
+    if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
+        raise ValueError(
+            f"example contains {len(descriptors)} images, exceeding the {MAX_IMAGES_PER_EXAMPLE}-image limit"
+        )
+    pending: dict[str, tuple[bytes, ImageDescriptorMetadata]] = {}
+    metadata = []
+    source_bytes = 0
+    decoded_bytes = 0
+    new_decoded_work = 0
+    for descriptor in descriptors:
+        item = validation_state.descriptor_metadata.get(descriptor)
+        if item is None:
+            prepared = pending.get(descriptor)
+            if prepared is None:
+                data = read_descriptor_source(descriptor, package_root)
+                decoded_rgb_bytes, width, height = inspect_image_bytes(data)
+                item = ImageDescriptorMetadata(
+                    source_bytes=len(data),
+                    decoded_rgb_bytes=decoded_rgb_bytes,
+                    width=width,
+                    height=height,
+                )
+                pending[descriptor] = data, item
+                new_decoded_work += item.decoded_rgb_bytes
+            else:
+                item = prepared[1]
+        metadata.append(item)
+        source_bytes += item.source_bytes
+        if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
+            raise ValueError(
+                f"example image sources exceed the {MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit"
+            )
+        decoded_bytes += item.decoded_rgb_bytes
+        if decoded_bytes > MAX_TOTAL_DECODED_BYTES:
+            raise ValueError(
+                f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
+            )
+
+    prospective_decoded_work = validation_state.decoded_work_bytes + new_decoded_work
+    if prospective_decoded_work > profile_decoded_work_limit:
+        raise ValueError(
+            f"profile decoded image work exceeds the {profile_decoded_work_limit}-byte limit"
+        )
+
+    # fully decode each new descriptor before committing anything: a header that parses but whose
+    # pixels are corrupt must fail the row, and must leave neither the cache nor the budget touched.
+    for data, _item in pending.values():
+        decode_descriptor_pixels(data)
+    validation_state.descriptor_metadata.update(
+        {descriptor: item for descriptor, (_data, item) in pending.items()}
+    )
+    validation_state.decoded_work_bytes = prospective_decoded_work
+    return metadata
 
 
 class ImageGeometryUnavailable(ValueError):

@@ -11,7 +11,6 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from flash.content.multimodal import ImageProfileValidationState
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
 from flash.engine.profiling.sft_image_rows import (
@@ -60,6 +59,25 @@ class PreparedSftWorkload:
     truncated_reasoning_spans: int
 
 
+@dataclass(frozen=True)
+class _SftTokenization:
+    """the tokenizer plus the one bound way this run turns an image row into tokens.
+
+    the processor and the torch-free estimator are alternatives, never both: binding the choice
+    once here keeps every later caller from re-deriving it, and makes the invalid combination
+    (neither available, or both) unrepresentable rather than merely unreached.
+    """
+
+    tokenizer: Any
+    # the real processor when one was loaded, else None. exposed only because
+    # PreparedSftWorkload publishes it; the image path goes through image_row.
+    processor: Any | None
+    # None for a text-only run; no image row can reach the caller in that case.
+    image_row: Callable[..., tuple[list[int], list[int], bytes, int]] | None
+    # profiling defers per-source validation to one cached pass; the worker validates eagerly.
+    defer_image_validation: bool
+
+
 def _resolve_sft_tokenization(
     spec,
     *,
@@ -67,13 +85,15 @@ def _resolve_sft_tokenization(
     require_processor: bool,
     tokenizer_loader: Callable[[str, str], Any],
     processor_loader: Callable[[str, str], Any] | None,
-):
-    """resolve the tokenizer plus exactly one image processor or geometry source."""
+    max_length: int,
+) -> _SftTokenization:
+    """resolve the tokenizer and bind the image-row tokenizer this run will use."""
     from flash.content.multimodal import validate_multimodal_training
-    from flash.engine.profiling.image_tokens import load_image_geometry
+    from flash.engine.profiling.image_tokens import ImageProfileValidationState, load_image_geometry
 
     processor = None
-    image_geometry = None
+    image_row = None
+    defer_image_validation = False
     if multimodal:
         validate_multimodal_training(
             spec.model,
@@ -86,14 +106,29 @@ def _resolve_sft_tokenization(
                 spec.model_revision,
             )
             tokenizer = processor.tokenizer
+            image_row = partial(
+                process_sft_image_row,
+                processor,
+                max_length=max_length,
+                thinking=bool(spec.thinking),
+            )
         else:
-            image_geometry = load_image_geometry(spec.model, spec.model_revision)
+            geometry = load_image_geometry(spec.model, spec.model_revision)
             tokenizer = tokenizer_loader(spec.model, spec.model_revision)
+            image_row = partial(
+                estimate_sft_image_row,
+                tokenizer,
+                geometry=geometry,
+                validation_state=ImageProfileValidationState(),
+                max_length=max_length,
+                thinking=bool(spec.thinking),
+            )
+            defer_image_validation = True
     else:
         tokenizer = tokenizer_loader(spec.model, spec.model_revision)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer, processor, image_geometry
+    return _SftTokenization(tokenizer, processor, image_row, defer_image_validation)
 
 
 def _materialize_verl_images(
@@ -344,9 +379,7 @@ def _tokenize_prompt_rows(
     *,
     package_root,
     tokenizer,
-    processor,
-    image_geometry,
-    validation_state: ImageProfileValidationState,
+    image_row: Callable[..., tuple[list[int], list[int], bytes, int]] | None,
     max_length: int,
     image_dir: str | None,
     normalize_prompt_images: Callable,
@@ -394,30 +427,14 @@ def _tokenize_prompt_rows(
         if record_has_images(example, prompt_messages):
             normalized = normalize_prompt_images(example, prompt_messages, package_root)
             completion_messages = text_only_prompt_messages(completion_messages)
-            if processor is None:
-                input_ids, loss_mask, multimodal_inputs, untruncated_length = (
-                    estimate_sft_image_row(
-                        tokenizer,
-                        normalized.messages,
-                        completion_messages,
-                        normalized.descriptors,
-                        package_root=package_root,
-                        geometry=image_geometry,
-                        validation_state=validation_state,
-                        max_length=max_length,
-                        thinking=bool(spec.thinking),
-                    )
-                )
-            else:
-                input_ids, loss_mask, multimodal_inputs, untruncated_length = process_sft_image_row(
-                    processor,
-                    normalized.messages,
-                    completion_messages,
-                    normalized.descriptors,
-                    package_root=package_root,
-                    max_length=max_length,
-                    thinking=bool(spec.thinking),
-                )
+            if image_row is None:
+                raise RuntimeError("multimodal sft row has no image tokenizer")
+            input_ids, loss_mask, multimodal_inputs, untruncated_length = image_row(
+                normalized.messages,
+                completion_messages,
+                normalized.descriptors,
+                package_root=package_root,
+            )
             untruncated_by_index[row_index] = untruncated_length
             row_by_index[row_index] = {
                 "input_ids": input_ids,
@@ -779,33 +796,31 @@ def prepare_sft_workload(
         completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
         prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     package_root = getattr(env, "package_root", None)
-    validation_state = ImageProfileValidationState()
     multimodal = any(
         record_has_images(example, prompt_messages)
         for example, prompt_messages, _completion, _used_fallback in prompt_rows
     )
-    tokenizer, processor, image_geometry = _resolve_sft_tokenization(
+    tokenization = _resolve_sft_tokenization(
         spec,
         multimodal=multimodal,
         require_processor=require_processor,
         tokenizer_loader=tokenizer_loader,
         processor_loader=processor_loader,
+        max_length=max_length,
     )
+    tokenizer = tokenization.tokenizer
 
     tokenized = _tokenize_prompt_rows(
         spec,
         prompt_rows,
         package_root=package_root,
         tokenizer=tokenizer,
-        processor=processor,
-        image_geometry=image_geometry,
-        validation_state=validation_state,
+        image_row=tokenization.image_row,
         max_length=max_length,
         image_dir=image_dir,
-        normalize_prompt_images=(
-            partial(normalize_prompt_images, defer_path_validation=True)
-            if processor is None
-            else normalize_prompt_images
+        normalize_prompt_images=partial(
+            normalize_prompt_images,
+            defer_validation=tokenization.defer_image_validation,
         ),
         record_has_images=record_has_images,
         text_only_prompt_messages=text_only_prompt_messages,
@@ -850,7 +865,7 @@ def prepare_sft_workload(
         profile=profile,
         multimodal=multimodal,
         tokenizer=tokenizer,
-        processor=processor,
+        processor=tokenization.processor,
         sampled_texts=tokenized.sampled_texts,
         multiturn_targets=tokenized.multiturn_targets,
         coerced_singleturn_targets=tokenized.coerced_singleturn_targets,

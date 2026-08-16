@@ -9,10 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.content.multimodal import ImageProfileValidationState
+from flash.engine.profiling import image_tokens
 from flash.engine.profiling.image_tokens import (
     ImageGeometry,
     ImageGeometryUnavailable,
+    ImageProfileValidationState,
     descriptor_pad_tokens,
     expand_image_pad_runs,
     geometry_from_preprocessor_config,
@@ -412,7 +413,7 @@ class TestDescriptorPadTokens:
             {"image": "dataset/corrupt.bmp"},
             [{"role": "user", "content": "describe"}],
             tmp_path,
-            defer_path_validation=True,
+            defer_validation=True,
         )
 
         assert reads == []
@@ -428,10 +429,10 @@ class TestDescriptorPadTokens:
 
         data = _png_bytes(10, 10)
         descriptors = [multimodal.normalize_image_source(data, None) for _ in range(2)]
-        monkeypatch.setattr(multimodal, "MAX_TOTAL_DECODED_BYTES", 599)
+        monkeypatch.setattr(image_tokens, "MAX_TOTAL_DECODED_BYTES", 599)
         monkeypatch.setattr(
-            multimodal,
-            "_decode_image_bytes",
+            image_tokens,
+            "decode_descriptor_pixels",
             lambda _data: (_ for _ in ()).throw(AssertionError("full decode reached")),
         )
 
@@ -446,17 +447,17 @@ class TestDescriptorPadTokens:
         second = multimodal.normalize_image_source(_png_bytes(11, 10), None)
         descriptors = [first, first, second]
         reads = []
-        real_read = multimodal._read_descriptor_source
+        real_read = image_tokens.read_descriptor_source
 
         def record_read(descriptor, package_root):
             reads.append(descriptor)
             return real_read(descriptor, package_root)
 
-        monkeypatch.setattr(multimodal, "MAX_TOTAL_IMAGE_SOURCE_BYTES", len(data) * 2 - 1)
-        monkeypatch.setattr(multimodal, "_read_descriptor_source", record_read)
+        monkeypatch.setattr(image_tokens, "MAX_TOTAL_IMAGE_SOURCE_BYTES", len(data) * 2 - 1)
+        monkeypatch.setattr(image_tokens, "read_descriptor_source", record_read)
         monkeypatch.setattr(
-            multimodal,
-            "_decode_image_bytes",
+            image_tokens,
+            "decode_descriptor_pixels",
             lambda _data: (_ for _ in ()).throw(AssertionError("full decode reached")),
         )
 
@@ -479,9 +480,9 @@ class TestDescriptorPadTokens:
         def count_successful_decode(data):
             image = real_decode(data)
             successful_decodes.append(image.size)
-            return image
+            image.close()
 
-        monkeypatch.setattr(multimodal, "_decode_image_bytes", count_successful_decode)
+        monkeypatch.setattr(image_tokens, "decode_descriptor_pixels", count_successful_decode)
         state = ImageProfileValidationState()
 
         with pytest.raises(ValueError, match="not a valid image"):

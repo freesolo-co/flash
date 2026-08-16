@@ -7,11 +7,12 @@ from pathlib import Path
 
 from flash.content.multimodal import (
     IMAGE_PAD_TOKEN,
-    ImageProfileValidationState,
     decode_image_descriptors,
+    messages_with_decoded_images,
 )
 from flash.engine.profiling.image_tokens import (
     ImageGeometry,
+    ImageProfileValidationState,
     descriptor_pad_tokens,
     expand_image_pad_runs,
 )
@@ -35,28 +36,6 @@ def _serialize_multimodal_inputs(values: dict) -> bytes:
     payload = io.BytesIO()
     np.savez(payload, **arrays)
     return payload.getvalue()
-
-
-def _multimodal_messages_with_images(messages: list[dict], images: list[object]) -> list[dict]:
-    image_iter = iter(images)
-    prepared = []
-    for message in messages:
-        copied = dict(message)
-        content = copied.get("content")
-        if isinstance(content, list):
-            blocks = []
-            for block in content:
-                copied_block = dict(block)
-                if copied_block.get("type") == "image":
-                    copied_block["image"] = next(image_iter)
-                blocks.append(copied_block)
-            copied["content"] = blocks
-        prepared.append(copied)
-    try:
-        next(image_iter)
-    except StopIteration:
-        return prepared
-    raise ValueError("unused decoded image while preparing multimodal sft tokens")
 
 
 def _ids(value) -> list[int]:
@@ -127,7 +106,7 @@ def process_sft_image_row(
     """tokenize one image row through the real processor and serialize its tensors."""
     images = decode_image_descriptors(descriptors, package_root)
     try:
-        prepared_prompt = _multimodal_messages_with_images(prompt_messages, images)
+        prepared_prompt = messages_with_decoded_images(prompt_messages, images)
         common = {
             "tokenize": True,
             "return_dict": True,

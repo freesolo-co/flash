@@ -16,7 +16,7 @@ import os
 import time
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.engine.huggingface import hub_error_is_transient, model_revision_kwargs
+from flash.engine.huggingface import hub_error_transience, model_revision_kwargs
 from flash.engine.worker.perf import RetriableInfraError
 from flash.envs.loader import is_commit_sha
 
@@ -111,7 +111,7 @@ def _hf_cache_bytes(model_id: str, cache_dir: str | None = None) -> int | None:
 
 def _prefetch_error_is_retriable(exc: BaseException) -> bool:
     # generic local os errors remain permanent here; only hub/cache and transport failures retry.
-    return hub_error_is_transient(exc)
+    return hub_error_transience(exc) is True
 
 
 def resolve_cached_model_commit(model_id: str, revision: str = "") -> str:

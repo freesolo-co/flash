@@ -53,8 +53,3 @@ def hub_error_transience(exc: BaseException) -> bool | None:
     if isinstance(exc, RequestException):
         return False
     return None
-
-
-def hub_error_is_transient(exc: BaseException) -> bool:
-    """return whether a known hub or transport failure is transient."""
-    return hub_error_transience(exc) is True
