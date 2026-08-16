@@ -599,20 +599,20 @@ def _update_heartbeat(context: _PollContext, state: _PollState) -> None:
     # untimestamped heartbeat counts as progress. It is computed only where it is used: this loop's
     # clock is observable through `_jobs.time.time`, so an unused read would be a visible side effect.
     #
-    # Assigned, not max()'d: the branch conditions below already establish that this observation is
-    # newer than the credited one (an older ts is rejected by the ts gate, and a ts-less heartbeat
-    # clamps to now), so a monotonic guard here would be unreachable and untestable.
+    # heartbeat ordering is independent of other progress sources. a queue exemption or status
+    # transition may already have advanced `last_progress` beyond this heartbeat's timestamp, so
+    # preserve the newer stall anchor while updating heartbeat-specific bookkeeping.
     if hb_attempt > state.last_hb_attempt:
         # fresh attempt: reset ts baseline and re-derive seen_training_hb so cold-start grace rearms.
         state.last_hb_attempt = hb_attempt
         state.last_hb_ts = hb_ts or 0.0
-        state.last_progress = _progress_ts(context, new_key)
+        state.last_progress = max(state.last_progress, _progress_ts(context, new_key))
         state.seen_training_hb = is_training_hb
     elif hb_attempt == state.last_hb_attempt and (hb_ts is None or hb_ts > state.last_hb_ts):
         # gate progress on ts advancing: a stale late upload must not buy a fresh stall window.
         if hb_ts is not None:
             state.last_hb_ts = hb_ts
-        state.last_progress = _progress_ts(context, new_key)
+        state.last_progress = max(state.last_progress, _progress_ts(context, new_key))
         if is_training_hb:
             state.seen_training_hb = True
 

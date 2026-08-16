@@ -2243,6 +2243,47 @@ def test_poll_job_stale_late_heartbeat_does_not_reset_progress(monkeypatch):
     assert fresh_run > none_run, "a genuinely newer heartbeat does reset progress (stalls later)"
 
 
+@pytest.mark.parametrize(
+    ("last_hb_attempt", "last_hb_ts"),
+    [(-1, 0.0), (0, 50.0)],
+    ids=["first-current-attempt-heartbeat", "later-current-attempt-heartbeat"],
+)
+def test_older_heartbeat_cannot_regress_status_progress_anchor(
+    monkeypatch, last_hb_attempt, last_hb_ts
+):
+    # a queue exemption or status transition can advance the shared progress anchor beyond the
+    # worker timestamp. a heartbeat that becomes visible later may still advance heartbeat-specific
+    # bookkeeping, but neither credit branch may move the stall anchor backward.
+    from flash.providers.runpod import jobs
+
+    job_execution = sys.modules["flash.providers.runpod.job_execution"]
+    heartbeat_key = ("boot", None, 100.0, 0)
+    monkeypatch.setattr(
+        job_execution,
+        "surface_heartbeat",
+        lambda _reader, _last_key, _say: (heartbeat_key, "boot"),
+    )
+    monkeypatch.setattr(jobs.time, "time", lambda: 600.0)
+    context = SimpleNamespace(
+        heartbeat_reader=lambda: None,
+        say=lambda _message: None,
+        current_attempt=0,
+        launch_ts=1.0,
+    )
+    state = SimpleNamespace(
+        last_hb_key=None,
+        last_hb_ts=last_hb_ts,
+        last_hb_attempt=last_hb_attempt,
+        last_progress=500.0,
+        seen_training_hb=False,
+        ever_saw_worker=True,
+    )
+
+    job_execution._update_heartbeat(context, state)
+
+    assert state.last_progress == 500.0
+
+
 def _stall_clock_at_giveup(
     monkeypatch, *, started_ts, heartbeats=(), step_s=100.0, clock_at=5000.0
 ):
