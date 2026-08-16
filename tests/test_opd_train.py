@@ -7640,48 +7640,46 @@ _IMAGE_BLOCK_PROMPT = [
 _TEXT_PROMPT = [{"role": "user", "content": "describe"}]
 
 
-def test_multi_turn_opd_resends_the_frozen_image_on_every_turn(monkeypatch):
-    """The pixels have to ride along on turn 2+, not just the opening turn.
+_PIXELS = ["pixels"]
+
+
+@pytest.mark.parametrize(
+    ("raw_prompt", "multi_modal_data", "expected_media", "expected_image_count"),
+    [
+        pytest.param(_IMAGE_BLOCK_PROMPT, {"images": _PIXELS}, _PIXELS, 1, id="image"),
+        # the text control is not decoration: it pins the ABSENCE as None rather than {}, which verl
+        # would read as a multimodal row and push down the multimodal collate path.
+        pytest.param(_TEXT_PROMPT, None, None, 0, id="text-only"),
+    ],
+)
+def test_a_multi_turn_opd_episode_carries_its_frozen_media_on_every_turn(
+    monkeypatch, raw_prompt, multi_modal_data, expected_media, expected_image_count
+):
+    """The pixels ride along on turn 2+, not just the opening turn.
 
     Each OPD turn re-sends the whole accumulated prefix, and that prefix still holds the episode's
     image placeholder tokens. A `generate` call without the media leaves the engine with
     placeholders it cannot expand: the rollout either dies on a feature/placeholder mismatch or
     silently conditions on no image at all. The OPD child previously passed media on NO turn.
+
+    Both rows run the same assertions because the contract is the same one: whatever the episode
+    froze is what every turn sends. Only the frozen value differs, so a regression that hardcodes
+    either answer fails the other row.
     """
-    sentinel = ["pixels"]
     instance, outputs, posted = _drive_opd_multi_turn_episode(
         monkeypatch=monkeypatch,
         turns=_TWO_COMPLETED_TURNS,
         env_replies=_TWO_TURN_REPLIES,
-        raw_prompt=_IMAGE_BLOCK_PROMPT,
-        multi_modal_data={"images": sentinel},
+        raw_prompt=raw_prompt,
+        multi_modal_data=multi_modal_data,
     )
 
-    assert instance.generate_media == [sentinel, sentinel], (
+    assert instance.generate_media == [expected_media] * 2, (
         "every turn must carry the frozen media, not just the first"
     )
-    assert instance.generate_mm_kwargs == [{"flash_probe": True}] * 2
     # the actor re-tokenizes each turn's prompt, so each turn's OUTPUT needs the media too.
-    assert [out["multi_modal_data"] for out in outputs] == [{"images": sentinel}] * 2
+    assert [out["multi_modal_data"] for out in outputs] == [multi_modal_data] * 2
     assert [out["mm_processor_kwargs"] for out in outputs] == [{"flash_probe": True}] * 2
+    assert instance.generate_mm_kwargs == [{"flash_probe": True}] * 2
     # the bridge authenticates this against the frozen parent prompt before the episode runs.
-    assert posted["start"][0]["image_count"] == 1
-
-
-def test_multi_turn_opd_keeps_a_text_only_episode_free_of_multimodal_fields(monkeypatch):
-    """A text-only row must stay exactly as it was: verl treats {} as a multimodal row.
-
-    Passing an empty dict rather than None would push a text-only rollout down the multimodal
-    collate path, so the absence has to be None on every turn.
-    """
-    instance, outputs, posted = _drive_opd_multi_turn_episode(
-        monkeypatch=monkeypatch,
-        turns=_TWO_COMPLETED_TURNS,
-        env_replies=_TWO_TURN_REPLIES,
-        raw_prompt=_TEXT_PROMPT,
-        multi_modal_data=None,
-    )
-
-    assert instance.generate_media == [None, None]
-    assert [out["multi_modal_data"] for out in outputs] == [None, None]
-    assert posted["start"][0]["image_count"] == 0
+    assert posted["start"][0]["image_count"] == expected_image_count
