@@ -203,12 +203,22 @@ def _persist_effective_worker_spec(
         adapter_identity = None
     _reject_managed_volume_removal(snapshot, worker_spec)
     _runner()._validate_effective_spec(public_spec, worker_spec)
+    # status.spec is never rewritten, so a pre-upgrade run keeps its dropped keys for life and every
+    # later read rehashes with them restored. re-persisting (quote refresh, realloc) has to hash the
+    # same way or the digest it writes now is one the next integrity check cannot reproduce.
+    raw_public = status.spec if isinstance(status.spec, dict) else {}
+    # only the public half is replayed here, so no worker payload is read: the worker half is
+    # rewritten right below, so its stored bytes already match what is hashed. `status.spec` is
+    # never rewritten, so a legacy run keeps its old spelling for life and every read replays it --
+    # hashing without that replay writes a digest the next integrity check cannot reproduce, and the
+    # run recovers until its first quote refresh or realloc and fails afterwards.
+    persisted_envelope = _runner().VersionedPersistedSpecEnvelope.read(None, raw_public)
     effective_preparation = {
         "worker_spec": worker_spec.to_internal_dict(),
         "workload_profile": worker_spec.workload_profile or None,
         "adapter_identity": adapter_identity,
         "preparation_digest": _runner()._preparation_digest(
-            public_spec, worker_spec, adapter_identity
+            public_spec, worker_spec, adapter_identity, persisted=persisted_envelope
         ),
         "backend": _runner().TRAINER_BACKEND,
     }

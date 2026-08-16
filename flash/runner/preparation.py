@@ -18,6 +18,7 @@ import re
 from dataclasses import replace
 
 from flash.core.spec import JobSpec
+from flash.core.spec_persistence import VersionedPersistedSpecEnvelope
 
 
 def _runner():
@@ -300,13 +301,21 @@ def _preparation_digest(
     public_spec: JobSpec,
     worker_spec: JobSpec,
     adapter_identity: dict | None,
+    *,
+    persisted: VersionedPersistedSpecEnvelope | None = None,
 ) -> str:
+    persisted = persisted or VersionedPersistedSpecEnvelope()
     worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
-    # absent and empty pip are the same install, so they must hash alike.
+    # ``[environment] pip`` became user-authorable, so to_dict() now emits it where it used to be
+    # stripped, and a pre-upgrade snapshot hashed an environment with no pip key at all. dropping it
+    # when empty reproduces those bytes without needing to know when the run was prepared: absent
+    # and empty are the same install, so they must hash alike. an authored pip is non-empty and
+    # stays bound, so tampering with the persisted value is still caught. unlike the rewinds below
+    # this needs no stored reading, which is why it is not part of one.
     if not public_payload["environment"].get("pip"):
         public_payload["environment"].pop("pip", None)
-    # omit empty managed fields so the hashed payload carries only what the run actually set.
+    # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
         "model_revision_auto",
         "gpu_count_auto",
@@ -316,8 +325,9 @@ def _preparation_digest(
     ):
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
+    persisted.rewind(public_payload, worker_payload)
     payload = {
-        "version": 1,
+        "version": persisted.version,
         "public_spec": public_payload,
         "worker_spec": worker_payload,
         "adapter_identity": adapter_identity,
@@ -346,12 +356,11 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         "workload_profile",
     ):
         effective[managed_top] = public.get(managed_top)
-    # the pin value is stripped from EVERY public spec (`to_dict` drops it), so the worker half
-    # legitimately carries a revision the public half cannot: a runner-assigned pin, or an authored
-    # pin a warm-start child inherited. the asymmetry is therefore unconditional and excluded here.
-    # it stays digest-protected: the auto marker triggers digest verification, and every warm start
-    # verifies its complete preparation snapshot.
-    effective["model_revision"] = public.get("model_revision")
+    # new public specs omit the pin, so their worker half legitimately carries the only copy. a
+    # historical public spec can still carry an authored pin; keep comparing that value because a
+    # plain source run reaches neither digest branch and this structural check is its only cover.
+    if not public.get("model_revision"):
+        effective["model_revision"] = public.get("model_revision")
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
     public_ref = public_train.get("init_from_adapter") or ""

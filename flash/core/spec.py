@@ -28,6 +28,10 @@ from uuid import UUID
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
 from flash.core.spec_persistence import (
+    DROPPED_TOP_LEVEL_KEYS,
+    REMOVED_PERSISTED_TRAIN_KEYS,
+    announce_dropped_keys,
+    migrated_optimizer_batch,
     opt_float,
     opt_int,
     str_tuple,
@@ -642,9 +646,10 @@ class JobSpec:
         if not isinstance(data, dict):
             raise TypeError("job spec must be an object")
         allowed_top_level = {item.name for item in fields(cls)}
-        unknown_top_level = sorted(set(data) - allowed_top_level)
+        unknown_top_level = sorted(set(data) - allowed_top_level - DROPPED_TOP_LEVEL_KEYS)
         if unknown_top_level:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
+        announce_dropped_keys(data)
         env = data.get("environment") or {}
         # Reject stale payloads carrying a local `path`; worker only runs published env ids.
         if isinstance(env, dict) and env.get("path"):
@@ -652,7 +657,12 @@ class JobSpec:
                 "local environment paths are no longer supported; the worker only runs "
                 "published Freesolo environment ids"
             )
-        train = validated_section(data, "train", {item.name for item in fields(TrainSpec)})
+        train = validated_section(
+            data,
+            "train",
+            {item.name for item in fields(TrainSpec)},
+            removed=REMOVED_PERSISTED_TRAIN_KEYS,
+        )
         gpu = validated_section(data, "gpu", {item.name for item in fields(GpuSpec)})
         gpu_type, gpu_type_fallbacks = _parse_persisted_gpu_types(gpu)
         provider, providers = validated_persisted_providers(gpu, gpu_type, gpu_type_fallbacks)
@@ -661,8 +671,9 @@ class JobSpec:
             raise TypeError("project must be a string")
         project = require_project_id(project_raw) if project_raw.strip() else ""
         algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
-        batch_size = opt_int(train.get("batch_size"))
-        prompts_per_step = opt_int(train.get("prompts_per_step"))
+        # one reading of the optimizer batch for both keys: the rollout spelling changed in 1.1.43
+        # and a persisted spec can still carry the old one.
+        batch_size, prompts_per_step = migrated_optimizer_batch(train, algorithm)
         return cls(
             model=data.get("model", cls.model),
             model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
