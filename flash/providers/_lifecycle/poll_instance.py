@@ -61,21 +61,12 @@ _TERMINAL_REREAD_RETRIES = 6
 _TERMINAL_REREAD_WAIT_S = 5.0
 
 
-def _read_with_retries(
-    read,
-    *,
-    tries: int,
-    wait_s: float,
-    say,
-    message: str,
-    deadline_at: float | None = None,
-):
-    """Re-read an artifact with every wait capped by the absolute run deadline."""
-    return read_within(
-        read,
-        ProbeBudget(tries=tries, wait_s=wait_s, cutoff_at=deadline_at),
-        say=say,
-        message=message,
+def _reread_budget(cutoff_at: float | None) -> ProbeBudget:
+    """The give-up-path reread window, read from the module constants tests patch."""
+    return ProbeBudget(
+        tries=_TERMINAL_REREAD_RETRIES,
+        wait_s=_TERMINAL_REREAD_WAIT_S,
+        cutoff_at=cutoff_at,
     )
 
 
@@ -145,37 +136,6 @@ class _TerminalArtifacts:
             **deadline_kwargs(reader, read_deadline_at),
         )
 
-    def finish_ok(
-        self,
-        end_ts_hint: float | str | None = None,
-        *,
-        read_deadline_at: float | None = _UNSET_DEADLINE,
-        metrics: dict | None = None,
-        metrics_present: bool = False,
-    ) -> PollResult:
-        if read_deadline_at is _UNSET_DEADLINE:
-            read_deadline_at = self._absolute_deadline
-        if metrics is None:
-            # the strict success marker has authorized completion, so unreadable metrics are a
-            # transient hf read gap, not a worker error. return the infra-retryable poll_error so the
-            # run gets its bounded infra budget instead of a hard terminal failure.
-            detail = (
-                "DONE with unparseable metrics.json (transient HF read)"
-                if metrics_present
-                else "DONE without metrics.json (transient HF read)"
-            )
-            return PollResult(False, failure="poll_error", detail=detail)
-        # end_ts is the worker completion time: prefer the optional fresh done timestamp supplied by
-        # the caller, otherwise use the strict ok marker timestamp. adopt only values in [launch, now].
-        end_ts = time.time()
-        if end_ts_hint is not None:
-            with contextlib.suppress(TypeError, ValueError):
-                ts = float(end_ts_hint)
-                if self._launch_ts <= ts <= end_ts:
-                    end_ts = ts
-        self._adapter.stamp_cost_and_notes(metrics, end_ts=end_ts, launch_ts=self._launch_ts)
-        return PollResult(True, metrics=metrics)
-
     def _done_is_fresh(self, content: str) -> bool:
         # done carries only a finite completion timestamp bound to this attempt and deadline.
         try:
@@ -191,31 +151,27 @@ class _TerminalArtifacts:
             and (self._absolute_deadline is None or ts <= self._absolute_deadline)
         )
 
-    def _finish_from_ok_marker(
-        self,
-        marker: dict,
-        *,
-        read_deadline_at: float | None = _UNSET_DEADLINE,
-        metrics: dict | None = None,
-        metrics_present: bool = False,
+    def _succeed(
+        self, marker: dict, metrics: dict, *, read_deadline_at: float | None
     ) -> PollResult:
-        if read_deadline_at is _UNSET_DEADLINE:
-            read_deadline_at = self._absolute_deadline
-        # a strict ok marker authorizes completion even if done is stale or absent. prefer a fresh done
-        # timestamp when available; otherwise use the marker's completion timestamp for the wall note.
+        """Stamp a marker-authorized success with the best completion timestamp available.
+
+        A strict ok marker authorizes completion even if DONE is stale or absent, so DONE only
+        refines the wall note. Adopt a timestamp only inside [launch, now].
+        """
         d = self._read_artifact(
             self._adapter.done_reader,
             force=True,
             read_deadline_at=read_deadline_at,
         )
-        fresh = d is not None and self._done_is_fresh(d)
-        marker_ts = marker["ts"]
-        return self.finish_ok(
-            d if fresh else marker_ts,
-            read_deadline_at=read_deadline_at,
-            metrics=metrics,
-            metrics_present=metrics_present,
-        )
+        hint = d if (d is not None and self._done_is_fresh(d)) else marker["ts"]
+        end_ts = time.time()
+        with contextlib.suppress(TypeError, ValueError):
+            ts = float(hint)
+            if self._launch_ts <= ts <= end_ts:
+                end_ts = ts
+        self._adapter.stamp_cost_and_notes(metrics, end_ts=end_ts, launch_ts=self._launch_ts)
+        return PollResult(True, metrics=metrics)
 
     def _fail_from_marker(self, marker: dict) -> PollResult:
         # a real worker error fails fast unless flagged retriable in the marker or the worker heartbeat.
@@ -270,14 +226,26 @@ class _TerminalArtifacts:
         )
         if resolution.kind is TerminalKind.ABSENT:
             return None
-        if resolution.invalid:
+        if resolution.kind is TerminalKind.UNVERIFIABLE:
             return PollResult(False, failure="job_failed", detail=INVALID_MARKER_DETAIL)
-        if resolution.kind is not TerminalKind.FAILURE:
-            return self._finish_from_ok_marker(
+        if resolution.kind is TerminalKind.SUCCESS:
+            return self._succeed(
                 resolution.marker,
+                resolution.metrics,
                 read_deadline_at=read_deadline_at,
-                metrics=resolution.metrics,
-                metrics_present=resolution.metrics_unparseable,
+            )
+        if resolution.kind is TerminalKind.PENDING:
+            # the strict success marker has authorized completion, so unreadable metrics are a
+            # transient hf read gap, not a worker error. return the infra-retryable poll_error so the
+            # run gets its bounded infra budget instead of a hard terminal failure.
+            return PollResult(
+                False,
+                failure="poll_error",
+                detail=(
+                    "DONE with unparseable metrics.json (transient HF read)"
+                    if resolution.metrics_unparseable
+                    else "DONE without metrics.json (transient HF read)"
+                ),
             )
         marker = resolution.marker
         failure = self._fail_from_marker(marker)
@@ -303,13 +271,11 @@ class _TerminalArtifacts:
 
     def reread_before_giving_up(self, message: str) -> PollResult | None:
         """Bounded terminal reread shared by the dead-host, poll-outage, and stall give-up paths."""
-        terminal = _read_with_retries(
+        terminal = read_within(
             self.result,
-            tries=_TERMINAL_REREAD_RETRIES,
-            wait_s=_TERMINAL_REREAD_WAIT_S,
+            _reread_budget(self._absolute_deadline),
             say=self._say,
             message=message,
-            deadline_at=self._absolute_deadline,
         )
         if terminal is not None:
             self.surface_final_heartbeat()
@@ -321,16 +287,14 @@ class _TerminalArtifacts:
         self.deferred_deadline_failure = None
         self.surface_final_heartbeat()
         read_deadline = time.time() + (_TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S)
-        terminal = _read_with_retries(
+        terminal = read_within(
             lambda: self.result(
                 read_deadline_at=read_deadline,
                 defer_deadline_failure=True,
             ),
-            tries=_TERMINAL_REREAD_RETRIES,
-            wait_s=_TERMINAL_REREAD_WAIT_S,
+            _reread_budget(read_deadline),
             say=self._say,
             message="deadline reached; waiting for HF to expose any terminal DONE/marker before stalled",
-            deadline_at=read_deadline,
         )
         if terminal is not None:
             self.surface_final_heartbeat()

@@ -18,9 +18,10 @@ two things diverged.
 
 this module owns that decode exactly once. it is evidence only: it never mutates run state, never
 performs the exact-remote CAS, and never decides whether a run retries -- the attempt ledger stays
-the sole persisted authority. callers adapt a resolution into their own vocabulary (a ``PollResult``
-for the poller, a metrics dict for recovery) because finishing a success is provider-specific (cost
-stamping, done-timestamp refinement) while the DECISION is not.
+the sole persisted authority. it answers exactly one question, as a ``TerminalKind``, and callers
+adapt that into their own vocabulary (a ``PollResult`` for the poller, a metrics dict for recovery)
+because finishing a success is provider-specific (cost stamping, done-timestamp refinement) while
+the DECISION is not.
 """
 
 from __future__ import annotations
@@ -31,16 +32,27 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from typing import TypeVar
 
 from flash.providers._lifecycle.deadline import remaining_seconds
 from flash.providers._lifecycle.poll import _attempt_int
 
+T = TypeVar("T")
+
 
 class TerminalKind(Enum):
-    """What one bounded observation of an attempt's terminal artifacts established."""
+    """What one bounded observation of an attempt's terminal artifacts established.
+
+    These five are exhaustive and mutually exclusive, so callers dispatch on the kind alone. In
+    particular UNVERIFIABLE is its OWN kind rather than a flag on FAILURE: recovery used to fold it
+    into "no evidence", and keeping it distinct is what stops that from reappearing.
+    """
 
     # no marker is visible. the attempt may still be running, or hf has not exposed the upload yet.
     ABSENT = "absent"
+    # a marker exists but cannot be tied to this attempt, so it cannot be trusted to speak for it.
+    # distinct from ABSENT: absence means nothing settled, this means something settled unreadably.
+    UNVERIFIABLE = "unverifiable"
     # a strict success marker exists but its metrics are not readable yet. callers must keep
     # observing rather than tearing down: the attempt already finished its paid work.
     PENDING = "pending"
@@ -57,17 +69,14 @@ class TerminalResolution:
     kind: TerminalKind
     metrics: dict | None = None
     marker: dict | None = None
-    detail: str | None = None
-    # true when the artifact exists but failed validation, so it cannot be trusted to speak for this
-    # attempt. distinct from ABSENT: absence means nothing has settled, this means something settled
-    # and cannot be read. either way it is never adopted as completed work.
-    invalid: bool = False
-    # true when metrics were present but unparseable, rather than missing entirely. the marker has
-    # already authorized completion in both cases, so callers treat them alike.
+    # PENDING only, and diagnostic only: metrics were present but unparseable rather than missing.
+    # both are the same visibility gap behind an already-authorized completion, so this narrows an
+    # operator message and nothing else.
     metrics_unparseable: bool = False
 
 
 ABSENT = TerminalResolution(TerminalKind.ABSENT)
+UNVERIFIABLE = TerminalResolution(TerminalKind.UNVERIFIABLE)
 
 INVALID_MARKER_DETAIL = "terminal marker is invalid or unverifiable"
 
@@ -99,31 +108,14 @@ class ProbeBudget:
     wait_s: float
     cutoff_at: float | None = None
 
-    @classmethod
-    def of(
-        cls,
-        tries: int,
-        wait_s: float,
-        *,
-        cutoff_at: float | None = None,
-        span_s: float | None = None,
-        now: float | None = None,
-    ) -> ProbeBudget:
-        """Build a budget, optionally clipping the shared cutoff to ``span_s`` from now."""
-        if span_s is not None:
-            start = time.time() if now is None else now
-            span_cutoff = start + span_s
-            cutoff_at = span_cutoff if cutoff_at is None else min(cutoff_at, span_cutoff)
-        return cls(tries=tries, wait_s=wait_s, cutoff_at=cutoff_at)
-
 
 def read_within(
-    read: Callable[[], object | None],
+    read: Callable[[], T | None],
     budget: ProbeBudget,
     *,
     say: Callable[[str], None] | None = None,
     message: str = "",
-):
+) -> T | None:
     """Re-read one artifact until it is visible or the SHARED budget is spent.
 
     Every wait is clipped to the budget's absolute cutoff, so the window cannot be restarted by a
@@ -249,7 +241,7 @@ def resolve_terminal_artifacts(
             deadline_at=marker_deadline_at,
         )
     except (TypeError, ValueError):
-        return TerminalResolution(TerminalKind.FAILURE, detail=INVALID_MARKER_DETAIL, invalid=True)
+        return UNVERIFIABLE
     if not marker["ok"]:
         return TerminalResolution(TerminalKind.FAILURE, marker=marker)
     raw_metrics = read_within(read_metrics, budget, say=say, message=metrics_message)

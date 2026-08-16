@@ -40,14 +40,6 @@ class _CompletedAttemptPending(RuntimeError):
     """A strict success marker exists, but its metrics are not readable yet."""
 
 
-def _say_invalid_marker(log) -> None:
-    """Name an unverifiable terminal artifact instead of logging it as silence."""
-    from flash.providers._lifecycle.poll import make_say
-    from flash.providers._lifecycle.terminal_artifacts import INVALID_MARKER_DETAIL
-
-    make_say(log)(f"recovery: {INVALID_MARKER_DETAIL}; not adopting it as completed work")
-
-
 def _canonical_provider_handle(handle):
     """Validate and canonicalize one complete provider-specific persisted handle."""
     from flash.providers.base import JobHandle
@@ -241,12 +233,11 @@ def _completed_attempt_metrics(
         return None
     from flash.providers._lifecycle.poll import make_say
     from flash.providers._lifecycle.poll_instance import (
-        _METRICS_AFTER_SUCCESS_RETRIES,
-        _METRICS_AFTER_SUCCESS_WAIT_S,
         _TERMINAL_REREAD_RETRIES,
         _TERMINAL_REREAD_WAIT_S,
     )
     from flash.providers._lifecycle.terminal_artifacts import (
+        INVALID_MARKER_DETAIL,
         AttemptIdentity,
         ProbeBudget,
         TerminalKind,
@@ -260,6 +251,8 @@ def _completed_attempt_metrics(
         f"{prefix}/{provider}_attempt{attempt}.json",
     )
     metrics_reader = make_hf_text_reader(spec.train.hf_repo, f"{prefix}/metrics.json")
+    say = make_say(log)
+    marker_bound = deadline_at + _RECOVERY_MARKER_GRACE_S
     # ONE observation window for both artifacts. it previously computed a fresh window for the
     # marker and then another fresh one for metrics, so the real ceiling was their sum and moved
     # with however long the marker read took.
@@ -267,36 +260,31 @@ def _completed_attempt_metrics(
         AttemptIdentity(run_id=spec.run_id, attempt=attempt, launch_floor=launch_floor),
         read_marker=lambda: marker_reader(force=True),
         read_metrics=lambda: metrics_reader(force=True),
-        budget=ProbeBudget.of(
-            _TERMINAL_REREAD_RETRIES,
-            _TERMINAL_REREAD_WAIT_S,
-            span_s=max(
-                _TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S,
-                _METRICS_AFTER_SUCCESS_RETRIES * _METRICS_AFTER_SUCCESS_WAIT_S,
-            ),
+        budget=ProbeBudget(
+            tries=_TERMINAL_REREAD_RETRIES,
+            wait_s=_TERMINAL_REREAD_WAIT_S,
+            cutoff_at=time.time() + _TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S,
         ),
-        say=make_say(log),
-        marker_deadline_at=deadline_at + _RECOVERY_MARKER_GRACE_S,
+        say=say,
+        marker_deadline_at=marker_bound,
         marker_message="recovery deadline reached; waiting for the terminal attempt marker",
         metrics_message="successful recovery marker seen; waiting for metrics.json",
         wait_for_marker=True,
     )
     if resolution.kind is TerminalKind.SUCCESS:
         return resolution.metrics
-    if resolution.kind is not TerminalKind.PENDING:
-        # absence, a failure marker, and an unverifiable marker all mean "no completed work to
-        # adopt". an unverifiable marker is reported so recovery names it the way live polling does
-        # instead of logging it as silence.
-        if resolution.invalid:
-            _say_invalid_marker(log)
+    if resolution.kind is TerminalKind.UNVERIFIABLE:
+        # name it the way live polling does instead of logging it as silence. it is still not
+        # completed work, so recovery does not adopt it either way.
+        say(f"recovery: {INVALID_MARKER_DETAIL}; not adopting it as completed work")
         return None
     # a success marker landed but its metrics have not. keep reconciling within the grace window
     # rather than tearing down an attempt that already finished its paid work.
-    if time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S:
-        return None
-    raise _CompletedAttemptPending(
-        "successful recovery marker is present but metrics.json is not readable yet"
-    )
+    if resolution.kind is TerminalKind.PENDING and time.time() < marker_bound:
+        raise _CompletedAttemptPending(
+            "successful recovery marker is present but metrics.json is not readable yet"
+        )
+    return None
 
 
 def _adopt_completed_attempt(

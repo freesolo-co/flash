@@ -49,7 +49,6 @@ def test_absent_marker_is_absence_not_failure():
     """No marker means the attempt has not settled. It must never look terminal."""
     resolution = _resolve(None, None)
     assert resolution.kind is TerminalKind.ABSENT
-    assert not resolution.invalid
 
 
 @pytest.mark.parametrize(
@@ -63,7 +62,7 @@ def test_absent_marker_is_absence_not_failure():
     ],
 )
 def test_unverifiable_marker_fails_closed_and_is_never_absence(raw):
-    """An artifact that cannot be tied to this attempt is a FAILURE, not silence.
+    """An artifact that cannot be tied to this attempt is its OWN kind, not silence.
 
     Recovery used to swallow exactly these into ``None``, so the same bytes told two different
     stories depending on which layer observed them. Reading it as absence is the regression this
@@ -71,16 +70,14 @@ def test_unverifiable_marker_fails_closed_and_is_never_absence(raw):
     will never become valid.
     """
     resolution = _resolve(raw, json.dumps({"train_tokens": 1}))
-    assert resolution.kind is TerminalKind.FAILURE
-    assert resolution.invalid
+    assert resolution.kind is TerminalKind.UNVERIFIABLE
     assert resolution.metrics is None
-    assert "invalid or unverifiable" in resolution.detail
+    assert resolution.marker is None
 
 
 def test_failure_marker_is_terminal_without_reading_metrics():
     resolution = _resolve(_marker(ok=False, error="worker exploded"), None)
     assert resolution.kind is TerminalKind.FAILURE
-    assert not resolution.invalid
     assert resolution.marker["error"] == "worker exploded"
 
 
@@ -107,8 +104,7 @@ def test_success_marker_without_readable_metrics_is_pending_not_failure(metrics_
 
 def test_marker_deadline_bound_rejects_a_timestamp_past_the_caller_bound():
     resolution = _resolve(_marker(ts=900.0), None, marker_deadline_at=200.0)
-    assert resolution.kind is TerminalKind.FAILURE
-    assert resolution.invalid
+    assert resolution.kind is TerminalKind.UNVERIFIABLE
 
 
 def test_decode_rejects_bool_disguised_as_attempt_number():
@@ -142,7 +138,7 @@ def test_one_budget_is_shared_across_both_reads(monkeypatch):
         return
 
     # a 10s window: the marker read burns half of it before metrics is ever consulted.
-    budget = ProbeBudget.of(10, 5.0, span_s=10.0)
+    budget = ProbeBudget(tries=10, wait_s=5.0, cutoff_at=clock["now"] + 10.0)
     marker_reads = {"n": 0}
 
     def read_marker():
@@ -180,12 +176,6 @@ def test_read_within_stops_at_the_cutoff_rather_than_the_try_count(monkeypatch):
         return
 
     # 100 tries would wait ~500s; the 6s cutoff bounds it to one 5s sleep plus a 1s clipped one
-    read_within(read, ProbeBudget.of(100, 5.0, span_s=6.0))
+    read_within(read, ProbeBudget(tries=100, wait_s=5.0, cutoff_at=clock["now"] + 6.0))
     assert clock["now"] == 1006.0
     assert reads["n"] < 100
-
-
-def test_budget_of_clips_span_to_an_earlier_absolute_cutoff():
-    """The run deadline always wins over a span: observation never outlives the run's bound."""
-    budget = ProbeBudget.of(6, 5.0, cutoff_at=100.0, span_s=30.0, now=95.0)
-    assert budget.cutoff_at == 100.0
