@@ -74,6 +74,23 @@ def _lock_for_run(run_id: str) -> asyncio.Lock:
     return _RUN_LOCKS.setdefault(run_id, asyncio.Lock())
 
 
+def _lifecycle_state(record: dict[str, Any] | None) -> str | None:
+    return (record.get("metadata") or {}).get("lifecycle_state") if record else None
+
+
+def _is_terminal(record: dict[str, Any] | None) -> bool:
+    """whether a record is undeployed or dead, so nothing may load or serve it.
+
+    state lives in two fields: `status` is the public wire value the flash client and the
+    conformance suite read, and `lifecycle_state` carries the finer registered/ready/failed
+    distinction. a record is terminal if either says so, and writing that test once keeps the two
+    from being checked inconsistently at the four sites that ask.
+    """
+    return bool(record) and (
+        record.get("status") == "disabled" or _lifecycle_state(record) in ("disabled", "failed")
+    )
+
+
 async def _read(adapter_id: str) -> dict[str, Any] | None:
     return await adapter_records.get.aio(_record_key(adapter_id))
 
@@ -92,6 +109,30 @@ async def _records_for_run(run_id: str) -> list[dict[str, Any]]:
         if isinstance(record, dict) and (record.get("metadata") or {}).get("run_id") == run_id:
             records.append(record)
     return records
+
+
+async def _fail_settlement(record: dict[str, Any], failure: str) -> None:
+    """mark a settlement attempt failed, but only if that exact attempt still owns the record.
+
+    both settlement dispatch paths fence the same way. the attempt check stops a slow failure from
+    burying a later attempt's work, and the `registered` check stops it from disabling a record
+    that already reached ready -- an adapter that is serving must not be killed by the failure of
+    the attempt that loaded it.
+    """
+    current = await _read(record["adapter_id"])
+    if not isinstance(current, dict):
+        return
+    metadata = current.get("metadata") or {}
+    attempt = (record.get("metadata") or {}).get("settle_attempt")
+    if (
+        metadata.get("settle_attempt") != attempt
+        or current.get("status") != "registered"
+        or metadata.get("lifecycle_state") != "registered"
+    ):
+        return
+    current["status"] = "disabled"
+    current["metadata"] = {**metadata, "lifecycle_state": "failed", "failure": failure}
+    await _write(current)
 
 
 def _fingerprint(record: dict[str, Any]) -> tuple:
@@ -282,9 +323,7 @@ class Engine(RuntimeContainer):
         adapter_id = record["adapter_id"]
         if adapter_id in self._registered:
             return
-        current = await _read(adapter_id)
-        state = (current.get("metadata") or {}).get("lifecycle_state") if current else None
-        if current and (current.get("status") == "disabled" or state in ("disabled", "failed")):
+        if _is_terminal(await _read(adapter_id)):
             raise RuntimeError(f"{adapter_id} was undeployed before it could load")
         path = await self._adapter_path(record)
         spec = _adapter_spec(record, path)
@@ -298,10 +337,7 @@ class Engine(RuntimeContainer):
         except Exception:
             await self._unload_locked(adapter_id)
             raise
-        latest_state = (latest.get("metadata") or {}).get("lifecycle_state") if latest else None
-        if latest and (
-            latest.get("status") == "disabled" or latest_state in ("disabled", "failed")
-        ):
+        if _is_terminal(latest):
             await self._unload_locked(adapter_id)
             raise RuntimeError(f"{adapter_id} was undeployed while it was loading")
 
@@ -414,23 +450,7 @@ async def settle_adapter(record: dict[str, Any]) -> None:
     try:
         await engine.settle.remote.aio(record)
     except Exception as exc:
-        adapter_id = record["adapter_id"]
-        current = await _read(adapter_id)
-        attempt = (record.get("metadata") or {}).get("settle_attempt")
-        metadata = current.get("metadata") or {} if isinstance(current, dict) else {}
-        if (
-            isinstance(current, dict)
-            and metadata.get("settle_attempt") == attempt
-            and current.get("status") == "registered"
-            and metadata.get("lifecycle_state") == "registered"
-        ):
-            current["status"] = "disabled"
-            current["metadata"] = {
-                **metadata,
-                "lifecycle_state": "failed",
-                "failure": f"the serving engine did not answer: {exc}",
-            }
-            await _write(current)
+        await _fail_settlement(record, f"the serving engine did not answer: {exc}")
 
 
 def _require_key(request: Request) -> None:
@@ -458,19 +478,7 @@ async def _spawn_settle(record: dict[str, Any]) -> None:
     try:
         settle_adapter.spawn(record)
     except Exception as exc:
-        current = await _read(record["adapter_id"])
-        attempt = (record.get("metadata") or {}).get("settle_attempt")
-        if (
-            isinstance(current, dict)
-            and (current.get("metadata") or {}).get("settle_attempt") == attempt
-        ):
-            current["status"] = "disabled"
-            current["metadata"] = {
-                **(current.get("metadata") or {}),
-                "lifecycle_state": "failed",
-                "failure": f"could not enqueue the adapter load: {exc}",
-            }
-            await _write(current)
+        await _fail_settlement(record, f"could not enqueue the adapter load: {exc}")
         raise
 
 
@@ -545,10 +553,14 @@ async def activate(revision_id: str, payload: dict[str, Any], request: Request) 
         if payload.get("expected_adapter_revision") != previous:
             raise HTTPException(status.HTTP_409_CONFLICT, "stale adapter revision expectation")
         alias["status"] = "ready"
+        # every record carries both `status` and `lifecycle_state`, and readers check either one.
+        # rebuilding the alias metadata without the lifecycle key would leave it as the only record
+        # whose state is readable from just one of the two.
         alias["metadata"] = {
             "record_type": "alias",
             "run_id": run_id,
             "alias_of": revision_id,
+            "lifecycle_state": "ready",
         }
         await _write(alias)
     return {
@@ -618,8 +630,7 @@ def _validate_chat_payload(payload: dict[str, Any]) -> None:
         if not isinstance(content, list):
             continue
         if any(
-            isinstance(block, dict) and block.get("type") in IMAGE_BLOCK_TYPES
-            for block in content
+            isinstance(block, dict) and block.get("type") in IMAGE_BLOCK_TYPES for block in content
         ):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
@@ -657,7 +668,7 @@ def _validate_chat_payload(payload: dict[str, Any]) -> None:
 
 async def _resolve_chat_record(requested: str) -> dict[str, Any] | JSONResponse:
     record = await _read(requested)
-    if record is None or record.get("status") == "disabled":
+    if record is None or _is_terminal(record):
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown model {requested}")
     metadata = record.get("metadata") or {}
     if metadata.get("record_type") == "alias":
@@ -665,8 +676,8 @@ async def _resolve_chat_record(requested: str) -> dict[str, Any] | JSONResponse:
         record = await _read(target) if target else None
         if record is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown model {requested}")
-    state = (record.get("metadata") or {}).get("lifecycle_state")
-    if record.get("status") == "disabled" or state in ("disabled", "failed"):
+    state = _lifecycle_state(record)
+    if _is_terminal(record):
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown model {requested}")
     if state != "ready":
         return JSONResponse(

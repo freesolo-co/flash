@@ -654,6 +654,48 @@ def test_unusable_messages_are_refused_before_a_gpu_is_woken(client, messages, m
     assert calls == []
 
 
+def test_a_failed_settlement_dispatch_cannot_disable_a_ready_record(client):
+    """Both dispatch paths fence identically, and neither may kill a record that reached ready.
+
+    `settle_adapter` and `_spawn_settle` used to open-code the same fence with different guards:
+    only one checked that the record was still `registered`. A settlement failure arriving after
+    the adapter is serving would then disable a live adapter, which is exactly the case a
+    stale-attempt fence exists to prevent.
+    """
+    _register_and_ready(client)
+    module = client.app.state.generated_module
+    record = module.adapter_records[module._record_key(REVISION)]
+    assert record["status"] == "ready"
+
+    # the failure carries the same settle_attempt, so only the ready check can reject it.
+    _run_awaitable(module._fail_settlement(record, "engine did not answer"))
+
+    after = module.adapter_records[module._record_key(REVISION)]
+    assert after["status"] == "ready", "a settlement failure disabled an already-serving adapter"
+    assert module._lifecycle_state(after) == "ready"
+    assert "failure" not in after["metadata"]
+
+
+def test_an_activated_alias_carries_both_state_fields(client):
+    """The alias must record `lifecycle_state`, not just `status`.
+
+    Records carry state in two fields and readers check either one. `activate` rebuilds the alias
+    metadata from scratch, so omitting the lifecycle key leaves the alias as the only record whose
+    state is legible from just one field -- and the only reason a `lifecycle_state`-based check
+    does not then reject a healthy alias is that `_resolve_chat_record` rebinds to the alias
+    target first. That makes a user-visible 200-vs-503 depend on statement ordering.
+    """
+    _register_and_ready(client)
+    assert _activate(client).status_code == 200
+    module = client.app.state.generated_module
+    alias = module.adapter_records[module._record_key(RUN_ID)]
+
+    assert alias["status"] == "ready"
+    assert alias["metadata"]["lifecycle_state"] == "ready"
+    assert module._is_terminal(alias) is False
+    assert alias["metadata"]["alias_of"] == REVISION
+
+
 def test_a_registered_grammar_reaches_the_adapter_spec(generated_module):
     record = {**REGISTRATION, "structured_outputs": {"regex": "[ab]+"}}
     spec = generated_module._adapter_spec(record, "/tmp/adapter")
