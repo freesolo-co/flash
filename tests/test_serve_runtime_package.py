@@ -36,6 +36,7 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
         TRANSFORMERS_REQUIREMENT,
         "vllm==0.23.0",
     ]
+    assert extras["serve-modal"] == ["modal>=1.0", "fastapi"]
     assert all("serve-runtime" not in dependency for dependency in extras["serve-modal"])
     assert "vllm==0.19.1" in extras["gpu"]
     assert project["tool"]["uv"]["conflicts"] == [[{"extra": "gpu"}, {"extra": "serve-runtime"}]]

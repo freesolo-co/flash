@@ -818,5 +818,4 @@ from flash.cli.ui.tables import (  # noqa: E402,F401
     models_table,
     projects_table,
     runs_table,
-    serving_gpus_table,
 )

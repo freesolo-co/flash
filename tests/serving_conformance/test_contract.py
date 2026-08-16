@@ -671,7 +671,7 @@ def test_reregistering_while_the_first_load_is_pending_is_idempotent(
     """Idempotence is required in the PENDING state, which is where the retry actually happens.
 
     Asserting it only after `ready` tests the easy half. The case that matters is the recovery
-    path: a cold load exceeds the client's five-minute readiness budget, the operator reruns
+    path: a cold load exceeds the client's model-scaled readiness budget, the operator reruns
     `models deploy`, and the identical registration arrives while the first load is still
     `registered`. A backend that accepts duplicates only once loading has finished answers 409
     there and strands exactly the retry the client is built to make.

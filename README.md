@@ -181,8 +181,8 @@ into `dev`**.
   SFT targets and RL rewards route through the active environment, so task-specific grading
   lives with the example, not in the engine
 - `flash/envs/` — environment registry and the Freesolo SDK adapter
-- `flash/serve/`, `flash/server/` — serving client and the FastAPI control plane (run via the
-  separate `flash-server` command)
+- `flash/serve/` — serving client, shared runtime, and generated Modal backend
+- `flash/server/` — the FastAPI control plane (run via the separate `flash-server` command)
 - `tests/` — pytest suite, CPU-only and offline
 
 Within `flash/engine/worker/`, trainers live under `train/`, split by algorithm (`sft/`,

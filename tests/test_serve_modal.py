@@ -1,4 +1,4 @@
-"""shared modal plumbing: import purity, cache environment, drain handling, and class binding."""
+"""shared modal plumbing: import purity, cache environment, runtime lifecycle, and draining."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from flash.serve.modal import (
     CUDA_IMAGE,
     RuntimeContainer,
     base_image,
-    bind_module_class,
     cache_environment,
 )
 from flash.serve.runtime import EngineConfig
@@ -40,6 +39,7 @@ def test_package_imports_without_modal_or_the_gpu_stack() -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "RuntimeContainer" in result.stdout
+    assert "bind_module_class" not in result.stdout
 
 
 def test_cache_environment_pins_every_cache_to_one_mount() -> None:
@@ -88,26 +88,6 @@ def test_base_image_applies_toolchain_and_cache_environment(monkeypatch) -> None
     assert "pip" not in calls
 
 
-def test_bind_module_class_names_the_real_class_before_decoration() -> None:
-    namespace: dict[str, Any] = {}
-
-    class _Engine:
-        pass
-
-    bound = bind_module_class(namespace, _Engine, "LoraEngine_A100_c16")
-    assert bound is _Engine
-    assert _Engine.__name__ == "LoraEngine_A100_c16"
-    # a `<locals>` qualname fails modal's global-scope validation.
-    assert "<locals>" not in _Engine.__qualname__
-    assert namespace["LoraEngine_A100_c16"] is _Engine
-
-
-@pytest.mark.parametrize("name", ["", "not an identifier", "9leading"])
-def test_bind_module_class_rejects_an_unusable_name(name) -> None:
-    with pytest.raises(ValueError, match="class_name"):
-        bind_module_class({}, type("X", (), {}), name)
-
-
 class _Container(RuntimeContainer):
     def engine_config(self) -> EngineConfig:
         return EngineConfig(model="model")
@@ -146,24 +126,94 @@ def test_engine_config_is_required() -> None:
         RuntimeContainer().engine_config()
 
 
-def test_a_failed_start_leaves_no_runtime_behind(monkeypatch) -> None:
-    """a runtime that never finished starting must not look started.
+def test_concurrent_start_constructs_and_starts_one_runtime(monkeypatch) -> None:
+    constructed = []
+    started = []
 
-    publishing it before `start()` returns would let later requests reach a half-initialized
-    engine, and the container would answer them instead of failing and being replaced.
-    """
-
-    class _DeadRuntime:
+    class _Runtime:
         def __init__(self, config, on_engine_death=None) -> None:
-            self.config = config
+            constructed.append(self)
 
         async def start(self) -> None:
-            raise RuntimeError("engine core died during startup")
+            started.append(self)
+            await asyncio.sleep(0)
 
-    monkeypatch.setattr("flash.serve.modal.engine.VllmLoraRuntime", _DeadRuntime)
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("flash.serve.modal.engine.VllmLoraRuntime", _Runtime)
+    container = _Container()
+
+    async def run():
+        return await asyncio.gather(container.start_runtime(), container.start_runtime())
+
+    first, second = asyncio.run(run())
+    assert constructed == [first]
+    assert started == [first]
+    assert second is first
+    assert container.runtime is first
+
+
+def test_failed_start_is_not_published_and_can_be_retried(monkeypatch) -> None:
+    attempts = []
+
+    class _Runtime:
+        def __init__(self, config, on_engine_death=None) -> None:
+            self.attempt = len(attempts) + 1
+            attempts.append(self)
+
+        async def start(self) -> None:
+            if self.attempt == 1:
+                raise RuntimeError("engine core died during startup")
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("flash.serve.modal.engine.VllmLoraRuntime", _Runtime)
     container = _Container()
     with pytest.raises(RuntimeError, match="died during startup"):
         asyncio.run(container.start_runtime())
-    # the failure must be visible to every later caller, not swallowed into a usable-looking one.
+    with pytest.raises(RuntimeError, match="has not been started"):
+        _ = container.runtime
+
+    recovered = asyncio.run(container.start_runtime())
+    assert len(attempts) == 2
+    assert attempts[1] is recovered
+    assert recovered.attempt == 2
+    assert container.runtime is recovered
+
+
+def test_close_serializes_with_startup(monkeypatch) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    closed = []
+
+    class _Runtime:
+        def __init__(self, config, on_engine_death=None) -> None:
+            pass
+
+        async def start(self) -> None:
+            started.set()
+            await release.wait()
+
+        async def close(self) -> None:
+            closed.append(self)
+
+    monkeypatch.setattr("flash.serve.modal.engine.VllmLoraRuntime", _Runtime)
+    container = _Container()
+
+    async def run():
+        start_task = asyncio.create_task(container.start_runtime())
+        await started.wait()
+        close_task = asyncio.create_task(container.close_runtime())
+        await asyncio.sleep(0)
+        assert not close_task.done()
+        release.set()
+        runtime = await start_task
+        await close_task
+        return runtime
+
+    runtime = asyncio.run(run())
+    assert closed == [runtime]
     with pytest.raises(RuntimeError, match="has not been started"):
         _ = container.runtime

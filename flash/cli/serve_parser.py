@@ -5,54 +5,19 @@ from __future__ import annotations
 import argparse
 
 
-def _serving_context_len(value: str) -> int:
-    """A context length for `serve gpus`, rejecting negatives at parse time.
-
-    The estimator multiplies KV bytes per token by this number, so a negative SUBTRACTS memory:
-    `--context-len -900000` reports a 24 GB A10 as fitting with 124 GB spare. That is the exact
-    inverse of what a sizing command is for, and it is silent -- the table looks ordinary. Zero
-    stays valid: it is the documented sentinel for "use the model's own serving context".
-    """
-    try:
-        length = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a number of tokens, got {value!r}") from None
-    if length < 0:
-        raise argparse.ArgumentTypeError(
-            f"--context-len cannot be negative, got {value!r} (0 means the model's own context)"
-        )
-    return length
-
-
 def _add_serve_commands(sub: argparse._SubParsersAction) -> None:
-    """`serve gpus|setup|status|teardown`: run a serving backend on your own Modal account.
+    """`serve setup|status|teardown`: run a serving backend on your own Modal account.
 
-    Kept separate from `models deploy` on purpose: those commands USE a serving backend, these
-    ones stand one up. A hosted-plane user never needs these.
+    Kept separate from `models deploy` on purpose: those commands use a serving backend, while
+    these commands stand one up. A hosted-plane user never needs these.
     """
-    from flash.cli.commands.serve import (
-        cmd_serve_gpus,
-        cmd_serve_setup,
-        cmd_serve_status,
-        cmd_serve_teardown,
-    )
+    from flash.cli.commands.serve import cmd_serve_setup, cmd_serve_status, cmd_serve_teardown
 
     serve = sub.add_parser("serve", help="host a serving backend on your own Modal account")
     serve_sub = serve.add_subparsers(dest="serve_cmd", required=True)
 
-    gpus = serve_sub.add_parser("gpus", help="show Modal GPUs that can serve a model")
-    gpus.add_argument("--model", required=True, help="base model id, e.g. Qwen/Qwen3.5-4B")
-    gpus.add_argument(
-        "--context-len",
-        type=_serving_context_len,
-        default=0,
-        help="context length to size the KV cache for (default: the model's serving context)",
-    )
-    gpus.set_defaults(func=cmd_serve_gpus)
-
     setup = serve_sub.add_parser("setup", help="generate and deploy a serving app for a model")
     setup.add_argument("--model", required=True, help="base model id to serve")
-    setup.add_argument("--gpu", default=None, help="Modal GPU class (default: the validated one)")
     setup.add_argument(
         "--output", default=None, help="where to write the app (default: flash_serving_app.py)"
     )

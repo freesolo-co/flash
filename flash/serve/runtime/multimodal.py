@@ -61,20 +61,6 @@ def has_image_blocks(messages: Any) -> bool:
     return False
 
 
-def validate_multimodal_request(
-    messages: Any,
-    *,
-    supports_images: bool,
-    image_limit: int | None,
-) -> None:
-    """validate messages and fully decode images inside the safety boundary."""
-    _template_messages, sources = _normalize_messages(messages)
-    if sources and not supports_images:
-        raise MultimodalRequestError("this runtime does not support image input")
-    images = _decode_images(sources, image_limit=image_limit)
-    _close_images(images)
-
-
 def prepare_multimodal_request(
     messages: Any,
     *,

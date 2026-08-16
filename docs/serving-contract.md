@@ -1,8 +1,8 @@
 # The Flash serving contract
 
 `flash models deploy`, `flash models chat`, and `flash models undeploy` talk to a multi-LoRA
-serving backend over HTTP. Freesolo operates one at `serve.freesolo.co`; `flash/serve/` is the
-client for it, and that client is in this repository even though the hosted backend is not.
+serving backend over HTTP. Freesolo operates one at `serve.freesolo.co`; `flash/serve/` contains
+the client, shared runtime, and generated Modal backend, while the hosted backend remains external.
 
 This document is the interface between them. Anything that implements it works with the shipped
 CLI unchanged - point `FREESOLO_SERVING_URL` at it and every deploy command works. The hosted
@@ -51,6 +51,9 @@ async-result polls rely on this), and a cross-origin redirect silently arrives u
 do not build one into a request path and expect it to authenticate.
 
 Compare the key in constant time (`hmac.compare_digest`). Reject with 401 when it does not match.
+The generated Modal backend requires `FLASH_SERVING_KEY` in its secret and fails closed if the
+runtime value is absent. A custom backend may intentionally be keyless under the health contract
+below.
 
 ## Capabilities
 
@@ -200,7 +203,7 @@ Returns the authoritative record, for a revision or an alias. Either the record 
     "base_model": "Qwen/Qwen3.5-4B",
     "checkpoint": "run-abc/step-10",
     "thinking": false,
-    "status": "active",
+    "status": "ready",
     "metadata": {
       "record_type": "revision",
       "lifecycle_state": "ready",
@@ -245,11 +248,12 @@ mystery 500 long after the deploy claimed success. Validate by actually loading 
 The client gives up after its readiness budget and reports the last state it saw, leaving the
 previous alias serving. A revision that never reaches `ready` never takes traffic.
 
-That budget is **5 minutes** (`REVISION_READY_BUDGET_SECONDS`), and on a scale-to-zero backend it
-is easy to exceed without anything being wrong: the first deploy after an idle period pays a cold
-start, and for a GDN-hybrid model that is a multi-minute `torch.compile` before the engine can
-load anything. Two things follow. Return `Retry-After` while loading, so the wait is paced by your
-estimate rather than the client's backoff. And do the load somewhere that outlives the request:
+That budget scales with the base model from **10 to 15 minutes**
+(`revision_ready_budget_seconds`), and on a scale-to-zero backend the first deploy after an idle
+period pays a cold start. For a GDN-hybrid model that includes a multi-minute `torch.compile`
+before the engine can load anything. Two things follow. Return `Retry-After` while loading, so the
+wait is paced by your estimate rather than the client's backoff. And do the load somewhere that
+outlives the request:
 if the work is a fire-and-forget task on a web container, an autoscaler can take the container
 away mid-load and the record sits at `registered` forever, which the client can only report as a
 timeout.
@@ -460,11 +464,11 @@ commit the backend downloads and the suffix of the immutable revision id, so a b
 placeholder would pass the id grammar and then fail minutes later, on the GPU, as an unresolvable
 revision rather than as the missing argument it is.
 
-`--conformance-ready-timeout` defaults to 300 seconds because that is the budget `flash models
-deploy` itself enforces (`REVISION_READY_BUDGET_SECONDS`). A backend that only reaches `ready` after
-longer than this is one the shipped client cannot drive, so the suite would otherwise pass a target
-that fails in real use. Raise it deliberately if a first cold start has to pull weights over a slow
-link, but know that a pass above 300s no longer means "works with flash unchanged".
+`--conformance-ready-timeout` defaults to the same model-scaled 10-to-15-minute budget that
+`flash models deploy` computes. A backend that only reaches `ready` after that budget is one the
+shipped client cannot drive, so the suite would otherwise pass a target that fails in real use.
+An explicit override remains available for diagnosis, but a pass above the shipped budget no longer
+means "works with flash unchanged".
 
 It writes: registering, activating, and deleting adapters are all real state changes on the target.
 Run it against a backend you own.

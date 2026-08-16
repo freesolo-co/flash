@@ -82,7 +82,6 @@ server = [
 # 'freesolo-flash[serve-modal]'` fails at `modal deploy` with ModuleNotFoundError: fastapi.
 serve-modal = [
     "modal>=1.0",
-    "httpx>=0.27",
     "fastapi",
 ]
 # reusable gpu execution runtime. these are the model-path dependencies validated by the current

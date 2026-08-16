@@ -10,8 +10,6 @@ is how every call site and `monkeypatch.setattr(commands.render, ...)` reach the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from flash._internal.channel import CLI_NAME
 from flash.cli.ui.render import (
     _ACCENT2,
@@ -33,9 +31,6 @@ from flash.cli.ui.render import (
     run_cost,
 )
 from flash.core.spec import persisted_gpu_types
-
-if TYPE_CHECKING:
-    from flash.serve.backend.gpus import Fit
 
 
 def models_table(rows: list[dict]) -> str:
@@ -73,41 +68,6 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
         body.append([(name, _ACCENT2), (f"{vram} GB", _GRAY), rate_cell])
     table = _table(["GPU", "VRAM", "$/HR"], body, aligns=["l", "r", "r"])
     return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
-
-
-def serving_gpus_table(rows: list[Fit], tip: str) -> str:
-    """Modal serving GPUs for one model: fit, relative speed, and price.
-
-    Headroom is what decides the choice, so it carries the color: green fits comfortably, amber is
-    tight enough that a longer context or another hot adapter may not fit, red does not fit at all.
-    The catalog's own card is marked because it was validated on real hardware, which outranks
-    every estimate in this table.
-    """
-    headroom_style = {
-        "ample": _GREEN,
-        "good": _GREEN,
-        "tight": _AMBER,
-        "no": _RED,
-    }
-    body = []
-    for fit in rows:
-        name = fit.gpu.name + (" *" if fit.is_catalog_default else "")
-        body.append(
-            [
-                (name, _ACCENT2 if fit.fits else _FAINT),
-                (f"{fit.gpu.vram_gb} GB", _GRAY),
-                (fit.headroom, headroom_style.get(fit.headroom, _GRAY)),
-                (f"{fit.free_gb:.0f} GB" if fit.fits else "-", _GRAY),
-                (fit.speed, _GRAY),
-                (f"${fit.gpu.usd_hr:.2f}", _TEAL if fit.fits else _FAINT),
-            ]
-        )
-    table = _table(
-        ["GPU", "VRAM", "FITS", "SPARE", "SPEED", "$/HR"],
-        body,
-        aligns=["l", "r", "l", "r", "l", "r"],
-    )
-    return _safe(f"{header('serve gpus', 'Modal serving GPUs')}\n{table}\n\n{_dim(tip)}")
 
 
 def gpu_label(spec: dict, remote: dict) -> str:

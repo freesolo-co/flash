@@ -14,6 +14,7 @@ import re
 import shlex
 import sys
 import tomllib
+from dataclasses import replace
 from importlib import resources
 from pathlib import Path
 
@@ -29,7 +30,6 @@ from flash.serve.backend.generate import (
     render_app,
     write_app,
 )
-from flash.serve.backend.gpus import MODAL_GPUS_BY_NAME
 from flash.serve.modal import APT_PACKAGES, CUDA_IMAGE
 
 _MODEL_IDS = sorted(MODELS)
@@ -93,6 +93,14 @@ def test_engine_values_come_from_the_catalog(model_id):
     assert "[serve-runtime]==" in values["FLASH_REQUIREMENT"]
 
 
+def test_generation_refuses_a_model_without_an_exact_serving_gpu():
+    info = MODELS["Qwen/Qwen3.5-4B"]
+    with pytest.raises(ValueError, match="no serving configuration"):
+        render_app(replace(info, serving=None))
+    with pytest.raises(ValueError, match="no validated serving GPU"):
+        render_app(replace(info, serving=replace(info.serving, gpu="   ")))
+
+
 def test_the_pinned_distribution_follows_the_release_channel():
     """the two channels ship under different distribution names.
 
@@ -151,6 +159,7 @@ def test_the_serve_modal_extra_installs_what_the_generated_app_imports_locally()
     # neither modal nor the gpu stack.
     missing = sorted(imported - sys.stdlib_module_names - packages - {"flash"})
     assert not missing, f"[serve-modal] does not install {missing}, imported at module scope"
+    assert packages == {"modal", "fastapi"}
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)
@@ -245,8 +254,10 @@ def test_retryable_unavailable_envelope_is_returned_not_raised(model_id):
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)
-def test_serving_key_is_compared_in_constant_time(model_id):
+def test_serving_key_is_mandatory_and_compared_in_constant_time(model_id):
     source = render_app(MODELS[model_id])
+    assert 'required_keys=["HF_TOKEN", "FLASH_SERVING_KEY"]' in source
+    assert '"requires_key": True' in source
     assert "hmac.compare_digest" in source
     # hashlib has no compare_digest; that spelling raises AttributeError on every authed request.
     assert "hashlib.compare_digest" not in source
@@ -269,19 +280,6 @@ def test_app_name_is_a_valid_modal_identifier():
         name = app_name_for(model_id)
         assert re.fullmatch(r"[a-z0-9-]+", name), name
     assert app_name_for("Qwen/Qwen3.5-4B") == "flash-serve-qwen3-5-4b"
-
-
-def test_a_non_default_gpu_keeps_the_catalog_engine_values():
-    """Choosing a bigger card is supported; silently re-tuning the engine for it is not.
-
-    max_loras and max_lora_rank were validated per model, and raising them changes what vLLM
-    pre-allocates. The card is the user's choice; the engine config stays the validated one.
-    """
-    info = MODELS["Qwen/Qwen3.5-4B"]
-    values = _constants(render_app(info, gpu=MODAL_GPUS_BY_NAME["H100"]))
-    assert values["GPU"] == "H100"
-    assert values["MAX_LORAS"] == info.serving.max_loras
-    assert values["MAX_LORA_RANK"] == info.serving.max_lora_rank
 
 
 def test_write_app_refuses_to_clobber_an_edited_file(tmp_path):

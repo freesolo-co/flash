@@ -125,7 +125,6 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     (
         "self-hosted serving",
         [
-            ("serve gpus", "show Modal GPUs that can serve a model"),
             ("serve setup", "generate and deploy a serving app you own"),
             ("serve status", "check the configured serving backend"),
             ("serve teardown", "stop the Modal serving app"),

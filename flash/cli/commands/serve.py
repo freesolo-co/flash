@@ -17,26 +17,13 @@ from pathlib import Path
 from flash._internal.channel import CLI_NAME
 from flash.cli.ui import render
 from flash.core.catalog import MODELS, ModelInfo, get_model
-from flash.serve.backend.generate import (
-    DEFAULT_SCALEDOWN_WINDOW,
-    app_name_for,
-    gpu_named,
-    write_app,
-)
-from flash.serve.backend.gpus import (
-    MODAL_GPUS,
-    Fit,
-    cheapest_fitting,
-    default_gpu,
-    estimate_fit,
-    recommend,
-)
+from flash.serve.backend.generate import DEFAULT_SCALEDOWN_WINDOW, app_name_for, write_app
 from flash.serve.contract import (
     REQUIRED_SERVING_CAPABILITIES,
     ServingHealthError,
     parse_serving_health,
 )
-from flash.serve.probe import healthz_with_retry, probe_serving_key, redacted_error, request_json
+from flash.serve.probe import probe_serving_key, redacted_error, request_json
 
 DEFAULT_APP_FILE = "flash_serving_app.py"
 SECRET_NAME = "flash-serving"
@@ -58,55 +45,6 @@ def _require_model(model_id: str) -> ModelInfo:
     except (KeyError, ValueError) as exc:
         known = ", ".join(sorted(MODELS))
         raise ValueError(f"unknown model {model_id!r}. supported: {known}") from exc
-
-
-def _gpus_tip(info: ModelInfo, rows: list[Fit], model_id: str) -> str:
-    """What the table cannot show in a column, and the honest caveats.
-
-    The estimates are arithmetic over the catalog's model geometry, not measurements, and saying so
-    is the difference between a useful guide and a number someone budgets against.
-    """
-    marked = next((fit for fit in rows if fit.is_catalog_default), None)
-    lines = []
-    if marked is not None:
-        lines.append(
-            f"* {marked.gpu.name} is what Freesolo runs this model on in production, validated on "
-            "real hardware. Prefer it unless you have a reason not to."
-        )
-    non_native = [fit.gpu.name for fit in rows if not fit.fp8_native and fit.fits]
-    if non_native:
-        lines.append(
-            f"{', '.join(non_native)} lack native fp8 tensor cores (compute capability < 8.9), so "
-            "they serve fp8 through a slower weight-only path."
-        )
-    lines.append(
-        "FITS/SPARE are ESTIMATES computed from model geometry (weights + KV cache + the LoRA "
-        "buffers vLLM pre-allocates), measured against the fraction of the card vLLM claims. "
-        "SPEED is a relative band from memory bandwidth, not a measured tokens/sec. $/HR is "
-        "approximate and Modal bills per second while a container runs, so an idle app costs "
-        "nothing."
-    )
-    lines.append(f"Generate an app for one: {CLI_NAME} serve setup --model {model_id}")
-    return "\n".join(lines)
-
-
-def cmd_serve_gpus(args) -> int:
-    """Show which Modal GPUs can serve a model, with fit, speed, and price."""
-    info = _require_model(args.model)
-    rows = recommend(info, context_len=getattr(args, "context_len", 0) or 0)
-    tip = _gpus_tip(info, rows, info.id)
-    if render.styled():
-        print(render.serving_gpus_table(rows, tip))
-        return 0
-    print(f"{'gpu':<12}{'vram':>6}{'fits':>8}{'spare':>8}{'speed':>10}{'$/hr':>8}")
-    for fit in rows:
-        spare = f"{fit.free_gb:.0f}G" if fit.fits else "-"
-        print(
-            f"{fit.gpu.name:<12}{fit.gpu.vram_gb:>5}G{fit.headroom:>8}{spare:>8}"
-            f"{fit.speed:>10}{fit.gpu.usd_hr:>8.2f}"
-        )
-    print(f"\n{tip}")
-    return 0
 
 
 def _modal_cli() -> str | None:
@@ -161,31 +99,10 @@ def _confirm(prompt: str) -> bool:
 def cmd_serve_setup(args) -> int:
     """Generate a Modal serving app for a model and, with consent, deploy it."""
     info = _require_model(args.model)
-
-    gpu = default_gpu(info)
-    if getattr(args, "gpu", None):
-        gpu = gpu_named(args.gpu)
-        if gpu is None:
-            offered = ", ".join(card.name for card in MODAL_GPUS)
-            return _err(f"unknown Modal GPU {args.gpu!r}. choose one of: {offered}")
-        # An explicit card still has to hold the model. Without this the same estimate that
-        # `serve gpus` shows as "no" is skipped on the one path that spends money: setup writes
-        # the catalog's fixed config, deploys, pulls the weights, and the engine OOMs on a cold
-        # start the user paid for. Refused with the number, not just a verdict.
-        fit = estimate_fit(info, gpu)
-        if not fit.fits:
-            return _err(
-                f"{gpu.name} cannot serve {info.id}: needs about {fit.total_gb:.0f} GB but "
-                f"{gpu.name} offers about {fit.budget_gb:.0f} GB usable. "
-                f"run `{CLI_NAME} serve gpus --model {info.id}` to see what fits."
-            )
-    if gpu is None:
-        # no validated card for this model; fall back to the cheapest that fits and say so.
-        fit = cheapest_fitting(recommend(info))
-        if fit is None:
-            return _err(f"no Modal GPU is large enough to serve {info.id}")
-        gpu = fit.gpu
-        print(f"note: {info.id} has no production-validated card; using the cheapest that fits.")
+    serving = getattr(info, "serving", None)
+    if serving is None or not isinstance(serving.gpu, str) or not serving.gpu.strip():
+        return _err(f"{info.id} has no validated serving GPU in the flash catalog")
+    gpu = serving.gpu
 
     destination = Path(getattr(args, "output", None) or DEFAULT_APP_FILE).resolve()
     dry_run = bool(getattr(args, "dry_run", False))
@@ -200,9 +117,8 @@ def cmd_serve_setup(args) -> int:
         write_app(
             info,
             destination,
-            gpu=gpu,
-            # `is None`, not `or`: 0 is a meaningful value (stop the container as soon as it goes
-            # idle) and `or` would silently rewrite it to the 300s default.
+            # `is None`, not `or`: 0 must reach validation and be rejected rather than silently
+            # rewritten to the default.
             scaledown_window=(
                 DEFAULT_SCALEDOWN_WINDOW
                 if getattr(args, "scaledown_window", None) is None
@@ -224,7 +140,7 @@ def cmd_serve_setup(args) -> int:
         return _err(f"could not write {destination}: {exc}")
     print(f"wrote {destination}")
     print(f"  model  {info.id}")
-    print(f"  gpu    {gpu.name}  (~${gpu.usd_hr:.2f}/hr while serving, $0 idle)")
+    print(f"  gpu    {gpu}")
 
     if dry_run:
         # Quoted, because this line is meant to be COPIED into a shell. `--output` accepts any
@@ -239,7 +155,7 @@ def cmd_serve_setup(args) -> int:
     if not getattr(args, "yes", False):
         prompt = (
             f"deploy {destination.name} to Modal now? "
-            f"this starts a {gpu.name} container on first use [y/N] "
+            f"this starts a {gpu} container on first use [y/N] "
         )
         if not _confirm(prompt):
             print(
@@ -278,7 +194,6 @@ def _deploy(app_file: Path) -> int:
         return 0
     print(f"\ndeployed at {url}")
     print(_control_plane_instructions(url))
-    _warn_if_unauthenticated(url, app_file)
     return 0
 
 
@@ -299,40 +214,6 @@ def _control_plane_instructions(url: str) -> str:
         f"  export FREESOLO_INTERNAL_KEY=<the FLASH_SERVING_KEY you put in the modal secret>\n"
         f"  {SERVER_NAME} --host 0.0.0.0 --port 8080   # restart it\n"
         f"then: {CLI_NAME} models deploy <run-id> && {CLI_NAME} models chat <run-id> -m 'hi'"
-    )
-
-
-def _warn_if_unauthenticated(url: str, app_file: Path | None = None) -> None:
-    """Say so if the deployed app accepts unauthenticated writes.
-
-    The app only enforces a key when FLASH_SERVING_KEY is in its secret, and the URL is public.
-    Ask the app itself rather than guessing from local env: the secret lives in Modal, so the
-    deployed container is the only thing that knows whether a key is set. Silence on an
-    unreadable or older /healthz is deliberate -- warning without evidence trains users to
-    ignore the warning.
-
-    ``app_file`` is the file that was actually deployed. The redeploy step names it rather than
-    the default: under ``--output`` a hardcoded name would deploy an unrelated file or fail, and
-    the public keyless endpoint would stay up after the user did exactly what they were told.
-    """
-    payload = healthz_with_retry(url)
-    if payload is None:
-        return
-    try:
-        health = parse_serving_health(payload)
-    except ServingHealthError:
-        return
-    if health.requires_key is not False:
-        return
-    print(
-        "\nwarning: this app has no FLASH_SERVING_KEY, so anyone with the URL can register "
-        "adapters and spend your GPU budget. set one and redeploy:\n"
-        "  export FREESOLO_INTERNAL_KEY=$(python -c "
-        "'import secrets; print(secrets.token_urlsafe(32))')\n"
-        f"  modal secret create {SECRET_NAME} HF_TOKEN=hf_... "
-        'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"\n'
-        f"  modal deploy {shlex.quote(str(app_file if app_file is not None else DEFAULT_APP_FILE))}",
-        file=sys.stderr,
     )
 
 

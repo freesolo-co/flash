@@ -8,7 +8,6 @@ failure is caught before anything is written or deployed.
 from __future__ import annotations
 
 import os
-import shlex
 import subprocess
 import sys
 import types
@@ -18,10 +17,7 @@ from pathlib import Path
 import pytest
 
 from flash.cli.commands import serve as serve_cmd
-from flash.core.catalog import MODELS
 from flash.serve.probe import ProbeResult
-
-_REQUIRED_CAPABILITIES = ["immutable_adapter_revisions", "alias_compare_and_swap"]
 
 
 def _probe_result(payload=None, status_code=200, error=""):
@@ -44,16 +40,6 @@ def _patch_status_probes(monkeypatch, request):
     )
 
 
-def _health_payload(**overrides):
-    payload = {
-        "ok": True,
-        "base_models": ["Qwen/Qwen3.5-4B"],
-        "capabilities": list(_REQUIRED_CAPABILITIES),
-    }
-    payload.update(overrides)
-    return payload
-
-
 def _args(**kwargs):
     return types.SimpleNamespace(**kwargs)
 
@@ -61,7 +47,6 @@ def _args(**kwargs):
 def _setup_args(tmp_path, **overrides):
     base = {
         "model": "Qwen/Qwen3.5-4B",
-        "gpu": None,
         "output": str(tmp_path / "flash_serving_app.py"),
         "scaledown_window": None,
         "dry_run": True,
@@ -72,51 +57,14 @@ def _setup_args(tmp_path, **overrides):
     return _args(**base)
 
 
-# --- serve gpus -------------------------------------------------------------------------------
-
-
-def test_gpus_lists_cards_and_marks_the_validated_one(capsys):
-    assert serve_cmd.cmd_serve_gpus(_args(model="Qwen/Qwen3.5-4B", context_len=0)) == 0
-    out = capsys.readouterr().out
-    assert "L4" in out
-    assert "H200" in out
-    assert "validated on real hardware" in out
-
-
-def test_gpus_labels_the_numbers_as_estimates(capsys):
-    """These are computed, not measured, and a reader deciding what to rent must be told.
-
-    flash has no serving throughput dataset, so an unqualified speed or fit column would present
-    arithmetic as though it were a benchmark.
-    """
-    serve_cmd.cmd_serve_gpus(_args(model="Qwen/Qwen3.5-4B", context_len=0))
-    out = capsys.readouterr().out
-    assert "ESTIMATES" in out
-    assert "not a measured tokens/sec" in out
-
-
-def test_gpus_shows_the_largest_model_fitting_only_the_largest_cards(capsys):
-    from flash.serve.backend.gpus import MODAL_GPUS_BY_NAME
-
-    serve_cmd.cmd_serve_gpus(_args(model="Qwen/Qwen3.6-35B-A3B", context_len=0))
-    # read only the table rows: the tip below the table is prose and would otherwise be parsed
-    # as data. a row starts with a known card name.
-    fits = set()
-    for line in capsys.readouterr().out.splitlines():
-        parts = line.split()
-        if len(parts) >= 4 and parts[0] in MODAL_GPUS_BY_NAME and parts[2] != "no":
-            fits.add(parts[0])
-    assert fits == {"H200", "B200"}
+# --- serve setup ------------------------------------------------------------------------------
 
 
 def test_unknown_model_is_rejected_with_the_supported_list(capsys):
     from flash.cli import main
 
-    assert main(["serve", "gpus", "--model", "Llama/Nope"]) == 1
+    assert main(["serve", "setup", "--model", "Llama/Nope", "--dry-run"]) == 1
     assert "Qwen/Qwen3.5-4B" in capsys.readouterr().err
-
-
-# --- serve setup ------------------------------------------------------------------------------
 
 
 def test_setup_dry_run_writes_the_app_without_deploying(tmp_path, capsys, monkeypatch):
@@ -247,19 +195,6 @@ def test_force_overwrites(tmp_path):
     assert "BASE_MODEL" in destination.read_text()
 
 
-def test_an_unknown_gpu_is_rejected_before_anything_is_written(tmp_path, capsys):
-    """T4 is the case that matters: excluded because vLLM silently downgrades bf16 on pre-Ampere
-    silicon, so it would serve at degraded quality with no error to see."""
-    assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path, gpu="T4")) == 1
-    assert not (tmp_path / "flash_serving_app.py").exists()
-    assert "unknown Modal GPU" in capsys.readouterr().err
-
-
-def test_a_chosen_gpu_is_honored(tmp_path):
-    assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path, gpu="H100")) == 0
-    assert "GPU = 'H100'" in (tmp_path / "flash_serving_app.py").read_text()
-
-
 # --- deploy output parsing --------------------------------------------------------------------
 
 
@@ -307,93 +242,10 @@ def test_an_explicit_scaledown_window_is_not_collapsed_by_the_default(tmp_path, 
     assert "outside Modal's supported range" in capsys.readouterr().err
 
 
-def test_a_gpu_that_cannot_hold_the_model_is_refused(tmp_path, capsys):
-    """An explicit `--gpu` must face the same fit check `serve gpus` shows.
-
-    Skipped on the one path that spends money: setup writes the catalog's fixed 32K config,
-    deploys, pulls the weights, and the engine OOMs on a cold start the user paid for. The refusal
-    carries the numbers so the choice is actionable rather than a bare verdict.
-    """
-    args = _setup_args(tmp_path, model="Qwen/Qwen3.6-35B-A3B", gpu="L4")
-    assert serve_cmd.cmd_serve_setup(args) == 1
-    err = capsys.readouterr().err
-    assert "cannot serve" in err
-    assert "L4" in err
-    assert not Path(args.output).exists(), "an app was written for a card that cannot run it"
-
-
-def test_the_validated_gpu_for_every_model_still_passes_the_fit_check(tmp_path):
-    """The guard must not reject the catalog's own production-validated card.
-
-    A fit estimate stricter than reality would make `serve setup` refuse exactly the configuration
-    Freesolo runs in production, which is worse than the bug being fixed.
-    """
-    for model_id in MODELS:
-        args = _setup_args(tmp_path, model=model_id, output=str(tmp_path / f"{hash(model_id)}.py"))
-        assert serve_cmd.cmd_serve_setup(args) == 0, (
-            f"the validated card was refused for {model_id}"
-        )
-
-
 def test_a_valid_non_default_scaledown_window_reaches_the_generated_app(tmp_path):
     args = _setup_args(tmp_path, scaledown_window=60)
     assert serve_cmd.cmd_serve_setup(args) == 0
     assert "SCALEDOWN_WINDOW_SECONDS = 60" in Path(args.output).read_text()
-
-
-@pytest.mark.parametrize(
-    ("healthz", "warns"),
-    [
-        (_health_payload(requires_key=False), True),
-        (_health_payload(requires_key=True), False),
-        # An older app predating the field, and an unreachable one. Neither is evidence the app is
-        # unauthenticated, so neither may cry wolf.
-        ({"ok": True}, False),
-        (None, False),
-    ],
-    ids=["no-key", "keyed", "field-absent", "unreachable"],
-)
-def test_a_keyless_deploy_warns_that_anyone_can_spend_the_gpu_budget(
-    tmp_path, monkeypatch, capsys, healthz, warns
-):
-    """A Modal URL is public. Deploying without a key is a real exposure, so say so out loud."""
-
-    def _fake_run(cmd, **kwargs):
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout="https://acme--flash-serve-api.modal.run\n", stderr=""
-        )
-
-    monkeypatch.setattr(subprocess, "run", _fake_run)
-    monkeypatch.setattr(serve_cmd, "healthz_with_retry", lambda url: healthz)
-    assert serve_cmd._deploy(tmp_path / "app.py") == 0
-    err = capsys.readouterr().err
-    assert ("no FLASH_SERVING_KEY" in err) is warns
-
-
-def test_the_keyless_warning_redeploys_the_file_that_was_actually_deployed(
-    tmp_path, monkeypatch, capsys
-):
-    """The remediation must name the deployed file, not the default one.
-
-    Under `--output` a hardcoded `flash_serving_app.py` either fails or deploys an unrelated app,
-    so a user who follows the warning exactly is left with the same public keyless endpoint they
-    were warned about -- the one instruction that has to work is the one closing the exposure.
-    """
-
-    def _fake_run(cmd, **kwargs):
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout="https://acme--flash-serve-api.modal.run\n", stderr=""
-        )
-
-    monkeypatch.setattr(subprocess, "run", _fake_run)
-    monkeypatch.setattr(
-        serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False)
-    )
-    app_file = tmp_path / "serving" / "my_app.py"
-    assert serve_cmd._deploy(app_file) == 0
-    err = capsys.readouterr().err
-    assert f"modal deploy {app_file}" in err
-    assert serve_cmd.DEFAULT_APP_FILE not in err
 
 
 def test_status_sends_the_internal_key_the_way_deploy_does(monkeypatch, capsys):
@@ -661,95 +513,12 @@ def test_the_authenticated_probe_waits_as_long_as_the_control_plane_does(monkeyp
     )
 
 
-def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, capsys):
-    """Both key-setup paths must generate into a variable, not inline into `modal secret create`.
-
-    The key is symmetric: flash sends the same value back on every request. Generated inline, the
-    only copy goes into Modal and is unrecoverable, so the app is authenticated against a secret
-    nobody holds and every deploy 401s -- with a setup transcript that looked like it worked.
-    """
-    monkeypatch.setattr(
-        serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False)
-    )
-    serve_cmd._warn_if_unauthenticated("https://acme--flash-serve-api.modal.run")
-    for text in (serve_cmd._setup_instructions(), capsys.readouterr().err):
-        assert "export FREESOLO_INTERNAL_KEY=$(" in text
-        assert 'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"' in text
-        assert "FLASH_SERVING_KEY=$(python" not in text, "the generated key is discarded inline"
-
-
-def test_the_key_warning_survives_a_cold_start_on_the_first_probe(monkeypatch):
-    import flash.serve.probe as probe_mod
-
-    attempts = {"n": 0}
-
-    class _Payload:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    def _urlopen(target, timeout=None):
-        attempts["n"] += 1
-        if attempts["n"] < 3:
-            raise TimeoutError("cold start")
-        return _Payload()
-
-    monkeypatch.setattr(probe_mod.urllib.request, "urlopen", _urlopen)
-    monkeypatch.setattr(probe_mod.time, "sleep", lambda _: None)
-    monkeypatch.setattr(
-        probe_mod.json,
-        "load",
-        lambda _: _health_payload(requires_key=False),
-    )
-
-    assert probe_mod.healthz_with_retry(
-        "https://acme--flash-serve-api.modal.run",
-        retry_delay_s=0.0,
-    ) == _health_payload(requires_key=False)
-    assert attempts["n"] == 3, f"the probe did not retry: {attempts['n']} attempt(s)"
-
-
-def test_the_key_probe_gives_up_within_its_budget(monkeypatch):
-    import flash.serve.probe as probe_mod
-
-    attempts = {"n": 0}
-
-    def _always_fails(target, timeout=None):
-        attempts["n"] += 1
-        raise TimeoutError("never comes up")
-
-    monkeypatch.setattr(probe_mod.urllib.request, "urlopen", _always_fails)
-    monkeypatch.setattr(probe_mod.time, "sleep", lambda _: None)
-
-    assert probe_mod.healthz_with_retry("https://acme.modal.run", budget_s=0.0) is None
-    assert attempts["n"] == 1, (
-        f"a zero budget still made {attempts['n']} attempts; the probe is not bounded by it"
-    )
-
-
-def test_deploy_instructions_quote_a_path_with_spaces(tmp_path, monkeypatch, capsys):
-    """These lines are meant to be COPIED into a shell, so an unquoted path is a broken command.
-
-    `--output` accepts any writable path. One containing a space splits into two arguments when
-    pasted, so the instruction for deploying the file that was just written fails to deploy it --
-    and the keyless-warning variant leaves a public endpoint up after the user did exactly what
-    they were told.
-    """
-    spaced = tmp_path / "my apps" / "flash_serving_app.py"
-    spaced.parent.mkdir()
-    spaced.write_text("# generated\n")
-
-    monkeypatch.setattr(
-        serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=False)
-    )
-    serve_cmd._warn_if_unauthenticated("https://acme.modal.run", spaced)
-    warning = capsys.readouterr().err
-    assert f"modal deploy {shlex.quote(str(spaced))}" in warning, (
-        f"the redeploy instruction did not quote a path containing a space: {warning}"
-    )
-    assert f"modal deploy {spaced}\n" not in warning, "the unquoted form is still being printed"
+def test_the_printed_key_is_kept_where_the_user_can_send_it_back():
+    """the mandatory key must be generated into a variable the control plane can reuse."""
+    text = serve_cmd._setup_instructions()
+    assert "export FREESOLO_INTERNAL_KEY=$(" in text
+    assert 'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"' in text
+    assert "FLASH_SERVING_KEY=$(python" not in text, "the generated key is discarded inline"
 
 
 def test_the_deploy_output_points_at_the_control_plane_process(tmp_path, monkeypatch, capsys):
@@ -767,9 +536,6 @@ def test_the_deploy_output_points_at_the_control_plane_process(tmp_path, monkeyp
         )
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    monkeypatch.setattr(
-        serve_cmd, "healthz_with_retry", lambda url: _health_payload(requires_key=True)
-    )
     assert serve_cmd._deploy(tmp_path / "app.py") == 0
     out = capsys.readouterr().out
     assert serve_cmd.SERVER_NAME in out, "the output never names the control-plane process"
@@ -819,7 +585,6 @@ def test_teardown_stops_the_apps_own_name(monkeypatch, capsys):
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["serve", "gpus", "--model", "Qwen/Qwen3.5-4B"], "cmd_serve_gpus"),
         (["serve", "setup", "--model", "Qwen/Qwen3.5-4B"], "cmd_serve_setup"),
         (["serve", "status"], "cmd_serve_status"),
         (["serve", "teardown", "--model", "Qwen/Qwen3.5-4B"], "cmd_serve_teardown"),
@@ -832,26 +597,18 @@ def test_subcommands_are_registered(argv, expected):
     assert args.func.__name__ == expected
 
 
-def test_a_negative_context_length_is_rejected_at_parse_time():
-    """A negative `--context-len` inverts the sizing math instead of failing.
-
-    The estimator multiplies KV bytes per token by this value, so a negative SUBTRACTS memory:
-    `--context-len -900000` reports a 24 GB A10 as fitting `ample` with 124 GB spare. The table
-    looks entirely ordinary, which is what makes it worth rejecting at the boundary -- the command
-    exists to answer "will this fit", and this is the one input that makes it answer backwards.
-
-    Zero stays valid: it is the documented sentinel for the model's own serving context.
-    """
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["serve", "gpus", "--model", "Qwen/Qwen3.5-4B"],
+        ["serve", "setup", "--model", "Qwen/Qwen3.5-4B", "--gpu", "H100"],
+    ],
+)
+def test_removed_gpu_guidance_commands_are_rejected(argv):
     from flash.cli import _build_parser
 
-    parser = _build_parser()
-    assert parser.parse_args(["serve", "gpus", "--model", "Qwen/Qwen3.5-4B"]).context_len == 0
-    ok = parser.parse_args(["serve", "gpus", "--model", "Qwen/Qwen3.5-4B", "--context-len", "0"])
-    assert ok.context_len == 0
     with pytest.raises(SystemExit):
-        parser.parse_args(
-            ["serve", "gpus", "--model", "Qwen/Qwen3.5-4B", "--context-len", "-900000"]
-        )
+        _build_parser().parse_args(argv)
 
 
 def test_setup_defaults_are_safe():

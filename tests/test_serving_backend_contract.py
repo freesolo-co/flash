@@ -40,6 +40,7 @@ REGISTRATION = {
         "run_id": RUN_ID,
         "checkpoint_step": 10,
         "hf_revision": "a" * 40,
+        "settle_attempt": "caller-attempt",
     },
     "thinking": False,
 }
@@ -284,6 +285,7 @@ def _stub_modal(
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLASH_SERVING_KEY", "test-serving-key")
     module_box = {}
     spawned = []
     spawn_queue = []
@@ -343,6 +345,7 @@ def client(monkeypatch, tmp_path):
     module_box["module"] = module
     exec(compile(source, str(tmp_path / "app.py"), "exec"), module.__dict__)
     test_client = TestClient(module.api())
+    test_client.headers["X-Freesolo-Internal-Key"] = "test-serving-key"
     test_client.app.state.generated_module = module
     test_client.app.state.engine_classes = engine_classes
     test_client.app.state.cls_options = cls_options
@@ -433,7 +436,7 @@ def _request_for(engine_class, record, payload=None):
     instance._registered = {adapter_id: "incarnation"}
 
     async def no_op(*args):
-        return None
+        return "incarnation"
 
     instance._ensure_loaded = no_op
     instance._reap_terminal_residents = no_op
@@ -443,6 +446,7 @@ def _request_for(engine_class, record, payload=None):
 
 def test_healthz_advertises_the_required_capabilities(client):
     payload = client.get("/healthz").json()
+    assert payload["requires_key"] is True
     assert payload["capabilities"] == [
         "immutable_adapter_revisions",
         "alias_compare_and_swap",
@@ -460,6 +464,10 @@ def test_engine_coordinator_and_api_are_pinned_to_one_container(client):
 
 def test_registration_is_accepted_and_reaches_ready(client):
     _register_and_ready(client)
+    record = client.get(f"/adapters/{REVISION}").json()["adapter"]
+    attempt = record["metadata"]["settle_attempt"]
+    assert attempt
+    assert attempt != REGISTRATION["metadata"]["settle_attempt"]
     assert client.app.state.spawned[0][0] == "LifecycleCoordinator.settle"
 
 
@@ -1021,6 +1029,47 @@ def test_generation_uses_the_record_grammar_not_the_request(engine_class, genera
     assert request.structured_outputs is None
 
 
+@pytest.mark.parametrize("field", ["settle_attempt", "run_id", "hf_revision"])
+def test_revision_records_require_canonical_metadata(generated_module, field):
+    record = copy.deepcopy(REGISTRATION)
+    record["metadata"].pop(field)
+    with pytest.raises(RuntimeError, match=field):
+        generated_module._record_incarnation(record)
+
+
+def test_missing_hf_revision_fails_before_download_or_provenance_reconstruction(
+    engine_class, generated_module, monkeypatch
+):
+    record = copy.deepcopy(REGISTRATION)
+    record["metadata"].pop("hf_revision")
+    downloads = []
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = lambda **kwargs: downloads.append(kwargs)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    instance = engine_class.__new__(engine_class)
+
+    with pytest.raises(RuntimeError, match="hf_revision"):
+        _run_awaitable(engine_class._adapter_path(instance, record))
+    with pytest.raises(RuntimeError, match="hf_revision"):
+        generated_module._provenance(record)
+    assert downloads == []
+
+
+def test_malformed_request_fails_before_resident_mutation(engine_class):
+    record = copy.deepcopy(REGISTRATION)
+    record["metadata"].pop("settle_attempt")
+    reaped = []
+    instance = engine_class.__new__(engine_class)
+
+    async def reap():
+        reaped.append(True)
+
+    instance._reap_terminal_residents = reap
+    with pytest.raises(RuntimeError, match="settle_attempt"):
+        _run_awaitable(engine_class._request(instance, {"messages": _MESSAGES}, record))
+    assert reaped == []
+
+
 def test_an_omitted_max_tokens_gets_the_default(engine_class):
     assert _request_for(engine_class, REGISTRATION).max_tokens == 512
 
@@ -1029,6 +1078,40 @@ def test_stop_sequences_reach_the_runtime_request(engine_class):
     request = _request_for(engine_class, REGISTRATION, {"stop": ["END"]})
     assert request.stop == ("END",)
     assert _request_for(engine_class, REGISTRATION).stop == ()
+
+
+def test_request_uses_the_incarnation_captured_while_loading(engine_class):
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._registered = {REVISION: "newer-incarnation"}
+
+    async def no_reap():
+        return None
+
+    async def capture_then_replace(record):
+        instance._registered.pop(record["adapter_id"])
+        return "captured-incarnation"
+
+    instance._reap_terminal_residents = no_reap
+    instance._ensure_loaded = capture_then_replace
+    request = _run_awaitable(engine_class._request(instance, {"messages": _MESSAGES}, REGISTRATION))
+
+    assert request.expected_incarnation == "captured-incarnation"
+    assert REVISION not in instance._registered
+
+
+def test_malformed_undeploy_state_fails_before_durable_or_cache_mutation(client, lifecycle_class):
+    module = client.app.state.generated_module
+    record = copy.deepcopy(REGISTRATION)
+    record["metadata"].pop("run_id")
+    module.adapter_records[module._record_key(REVISION)] = record
+    before = copy.deepcopy(dict(module.adapter_records))
+    instance = lifecycle_class.__new__(lifecycle_class)
+
+    with pytest.raises(RuntimeError, match="run_id"):
+        _run_awaitable(lifecycle_class.remove(instance, REVISION))
+    assert dict(module.adapter_records) == before
+    assert module.cache_volume.remove_calls == []
 
 
 def test_undeploy_disables_the_alias_and_its_revisions(client):
@@ -1312,7 +1395,7 @@ def test_a_raising_post_load_read_still_unloads_what_it_just_registered(
     monkeypatch.setattr(module, "_read", read)
     with pytest.raises(RuntimeError, match="dict unavailable"):
         _run_awaitable(engine_class._load_lora_locked(instance, REGISTRATION))
-    assert unloaded == [(REVISION, REVISION)]
+    assert unloaded == [(REVISION, module._record_incarnation(REGISTRATION))]
     assert REVISION not in instance._registered
 
 
@@ -1350,21 +1433,22 @@ def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_removable(
     result = _run_awaitable(engine_class._load_lora_locked(instance, REGISTRATION))
 
     assert result["superseded"] is True
-    assert instance._registered[REVISION] == REVISION
+    incarnation = module._record_incarnation(REGISTRATION)
+    assert instance._registered[REVISION] == incarnation
     unloaded = []
 
     async def unload_ok(adapter_id, *, expected_incarnation):
         unloaded.append((adapter_id, expected_incarnation))
 
     instance._runtime.unload_adapter = unload_ok
-    assert _run_awaitable(engine_class._unload_locked(instance, REVISION, REVISION)) is True
-    assert unloaded == [(REVISION, REVISION)]
+    assert _run_awaitable(engine_class._unload_locked(instance, REVISION, incarnation)) is True
+    assert unloaded == [(REVISION, incarnation)]
     assert REVISION not in instance._registered
 
 
 @pytest.mark.parametrize(
     ("configured", "presented", "status_code"),
-    [(" secret ", "secret", 404), ("secret", " wrong ", 401), ("   ", "wrong", 404)],
+    [(" secret ", "secret", 404), ("secret", " wrong ", 401), ("   ", "wrong", 503)],
 )
 def test_the_serving_key_is_compared_after_stripping(
     client, monkeypatch, configured, presented, status_code
@@ -1382,7 +1466,8 @@ def test_serving_key_uses_constant_time_comparison(client, monkeypatch):
     seen = []
     monkeypatch.setenv("FLASH_SERVING_KEY", "secret")
     monkeypatch.setattr(module.hmac, "compare_digest", lambda a, b: seen.append((a, b)) or True)
-    assert client.get("/adapters/unknown").status_code == 404
+    response = client.get("/adapters/unknown", headers={"X-Freesolo-Internal-Key": ""})
+    assert response.status_code == 404
     assert seen == [("", "secret")]
 
 

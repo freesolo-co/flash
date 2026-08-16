@@ -389,12 +389,11 @@ export FREESOLO_INTERNAL_KEY=$(python -c 'import secrets; print(secrets.token_ur
 modal secret create flash-serving HF_TOKEN=hf_... \
   FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"
 
-flash serve gpus --model Qwen/Qwen3.5-4B   # what fits where, and what it costs
 flash serve setup --model Qwen/Qwen3.5-4B  # generate, then ask before deploying
 ```
 
-`[serve-modal]` is deliberately light: it installs Modal and its HTTP dependencies but no GPU
-stack, so `modal deploy` can import the generated file on your laptop. vLLM runs only in the GPU
+`[serve-modal]` is deliberately light: it installs Modal and FastAPI but no GPU stack, so
+`modal deploy` can import the generated file on your laptop. vLLM runs only in the GPU
 container, which installs `freesolo-flash[serve-runtime]` pinned to the exact version of the CLI
 that generated the app. That pin is read from installed package metadata rather than hardcoded,
 so a dev-channel CLI generates an app that installs the dev-channel build instead of silently
@@ -416,7 +415,8 @@ only where you run the CLI leaves every deploy failing on an unset serving URL. 
 other setting here, `flash-server` reads its **process** environment, so an already-running
 server needs a restart.
 
-`flash serve setup` checks after deploying and warns if the app came up without a key.
+The generated app requires both `HF_TOKEN` and `FLASH_SERVING_KEY` in its Modal secret and fails
+closed if the serving key is absent.
 
 The generated file is yours to read and edit - it is written into your working directory,
 not hidden inside the package. Its engine settings come from the catalog's own
@@ -425,12 +425,13 @@ production-validated serving config for that model.
 Writing your own instead is fully supported: [docs/serving-contract.md](docs/serving-contract.md)
 documents every endpoint, and its conformance suite checks an implementation in one command.
 
-**The generated app serves text only.** Every catalog model can be trained on images, but this
-app renders messages through the chat template and passes token ids to vLLM - it does not decode
-images or pass `multi_modal_data`. An image-bearing request (what `flash env eval` sends for an
-image example) is rejected with a 400 rather than answered, because a model replying without
-having seen the image would produce eval scores that look valid and measure nothing. Serving
-images means adding image decoding and validating it on a GPU.
+The shared serving runtime supports bounded multimodal preparation. **The generated reference app
+remains text only:** it renders messages through the chat template and passes token ids to vLLM,
+without decoding images or passing `multi_modal_data`. An image-bearing request (what `flash env
+eval` sends for an image example) is rejected with a 400 rather than answered, because a model
+replying without having seen the image would produce eval scores that look valid and measure
+nothing. Enabling images in the generated wrapper requires wiring the runtime path and validating
+it on a GPU.
 
 On a standalone plane those three commands **error out** until you point it at a backend
 you operate. Every serving request carries `FREESOLO_INTERNAL_KEY`, and on your plane that

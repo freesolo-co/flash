@@ -7,7 +7,7 @@ happens inside `base_image`, and the runtime import happens when a container sta
 
 from __future__ import annotations
 
-from .engine import RuntimeContainer, bind_module_class
+from .engine import RuntimeContainer
 from .image import APT_PACKAGES, CUDA_IMAGE, PYTHON_VERSION, base_image, cache_environment
 
 __all__ = [
@@ -16,6 +16,5 @@ __all__ = [
     "PYTHON_VERSION",
     "RuntimeContainer",
     "base_image",
-    "bind_module_class",
     "cache_environment",
 ]

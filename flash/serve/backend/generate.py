@@ -15,7 +15,6 @@ from pathlib import Path
 from flash._internal.channel import DIST_NAME
 from flash.content.multimodal import _IMAGE_BLOCK_TYPES
 from flash.core.catalog import ModelInfo
-from flash.serve.backend.gpus import MODAL_GPUS_BY_NAME, ModalGpu, default_gpu
 from flash.serve.contract import ADAPTER_REVISION_PATTERN, REFERENCE_SERVING_CAPABILITIES
 
 # Modal stops the container after this idle period and the GPU stops costing anything. 5 minutes
@@ -52,23 +51,16 @@ def app_name_for(model_id: str) -> str:
 def render_app(
     info: ModelInfo,
     *,
-    gpu: ModalGpu | None = None,
     scaledown_window: int = DEFAULT_SCALEDOWN_WINDOW,
     secret_name: str = "flash-serving",
     app_file: str = "flash_serving_app.py",
 ) -> str:
-    """Render the Modal app source for ``info``.
-
-    ``gpu`` defaults to the catalog's production-validated card. Passing a different one is
-    supported -- `flash serve gpus` exists to make that an informed choice -- but the engine values
-    still come from the catalog, since those are what was validated for this model.
-    """
+    """Render the Modal app source for ``info`` using its validated serving configuration."""
     serving = getattr(info, "serving", None)
     if serving is None:
         raise ValueError(f"{info.id} has no serving configuration in the flash catalog")
-    card = gpu or default_gpu(info)
-    if card is None:
-        raise ValueError(f"{info.id} names serving GPU {serving.gpu!r}, which Modal does not offer")
+    if not isinstance(serving.gpu, str) or not serving.gpu.strip():
+        raise ValueError(f"{info.id} has no validated serving GPU in the flash catalog")
     # Modal accepts 2s to 20min. Catch it here rather than letting `modal deploy` fail after the
     # file is already written and the user thinks setup succeeded.
     if not MIN_SCALEDOWN_WINDOW <= scaledown_window <= MAX_SCALEDOWN_WINDOW:
@@ -83,7 +75,7 @@ def render_app(
     config = {
         "APP_NAME": app_name_for(info.id),
         "BASE_MODEL": info.id,
-        "GPU": card.name,
+        "GPU": serving.gpu,
         "QUANTIZATION": serving.quantization,
         "KV_CACHE_DTYPE": "fp8",
         "MAX_MODEL_LEN": serving.max_model_len,
@@ -108,7 +100,6 @@ def write_app(
     info: ModelInfo,
     destination: Path,
     *,
-    gpu: ModalGpu | None = None,
     scaledown_window: int = DEFAULT_SCALEDOWN_WINDOW,
     secret_name: str = "flash-serving",
     overwrite: bool = False,
@@ -127,7 +118,6 @@ def write_app(
         raise FileExistsError(f"{destination} already exists; pass --force to overwrite it")
     source = render_app(
         info,
-        gpu=gpu,
         scaledown_window=scaledown_window,
         secret_name=secret_name,
         app_file=str(destination),
@@ -136,7 +126,3 @@ def write_app(
         destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(source)
     return destination
-
-
-def gpu_named(name: str) -> ModalGpu | None:
-    return MODAL_GPUS_BY_NAME.get(str(name or "").strip())

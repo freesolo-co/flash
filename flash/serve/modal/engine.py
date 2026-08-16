@@ -1,12 +1,13 @@
 """shared gpu-process mechanics for modal serving containers.
 
-this owns the parts that are identical for every vllm deployment: starting one runtime lazily,
-draining the container when its engine core dies, and giving a dynamically built class a stable
-module-level identity. adapter policy, persistence, authorization, and billing stay with callers.
+this owns the parts that are identical for every vllm deployment: starting one runtime lazily and
+draining the container when its engine core dies. adapter policy, persistence, authorization, and
+billing stay with callers.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -22,6 +23,7 @@ class RuntimeContainer:
 
     def __init__(self) -> None:
         self._runtime: VllmLoraRuntime | None = None
+        self._runtime_lock = asyncio.Lock()
         self._drained = False
 
     def engine_config(self) -> EngineConfig:
@@ -40,19 +42,21 @@ class RuntimeContainer:
         container with no runtime rather than one that looks started and answers requests from a
         half-initialized engine.
         """
-        if self._runtime is None:
-            runtime = VllmLoraRuntime(
-                self.engine_config(),
-                on_engine_death=self._drain_on_engine_death,
-            )
-            await runtime.start()
-            self._runtime = runtime
-        return self._runtime
+        async with self._runtime_lock:
+            if self._runtime is None:
+                runtime = VllmLoraRuntime(
+                    self.engine_config(),
+                    on_engine_death=self._drain_on_engine_death,
+                )
+                await runtime.start()
+                self._runtime = runtime
+            return self._runtime
 
     async def close_runtime(self) -> None:
-        runtime, self._runtime = self._runtime, None
-        if runtime is not None:
-            await runtime.close()
+        async with self._runtime_lock:
+            if self._runtime is not None:
+                await self._runtime.close()
+                self._runtime = None
 
     async def _drain_on_engine_death(self, _health: Any) -> None:
         """stop accepting work so later demand starts a healthy container.
@@ -75,19 +79,3 @@ class RuntimeContainer:
         except Exception:
             # without a drain hook the only safe move is to end the container outright.
             os._exit(1)
-
-
-def bind_module_class(namespace: dict[str, Any], cls: type, class_name: str) -> type:
-    """give a dynamically created class a real module-level identity.
-
-    modal validates that a registered class lives at module scope and re-imports it by name in the
-    container, so the rename and the module binding must happen before any class decorator runs.
-    a decorator returns a wrapper holding the user class separately, so renaming afterwards would
-    rename the wrapper instead and every instance would register under the original name.
-    """
-    if not class_name or not class_name.isidentifier():
-        raise ValueError("class_name must be a valid python identifier")
-    cls.__name__ = class_name
-    cls.__qualname__ = class_name
-    namespace[class_name] = cls
-    return cls
