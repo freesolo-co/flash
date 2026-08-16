@@ -213,6 +213,11 @@ def runconfig_from_spec(spec) -> RunConfig:
         # and a caller that predates the preference has no such attribute to offer.
         providers=getattr(g, "providers", ()) or (),
         gpu_type=g.type,
+        # the rest of an ordered `[gpu] type` list. allocation cost-ranks every acceptable class, so
+        # dropping these here quotes the head alone and the affordability precheck can refuse a run
+        # whose cheaper authored fallback it would really have rented. read defensively for the same
+        # reason as `providers` above: this is not always a GpuSpec.
+        gpu_type_fallbacks=tuple(getattr(g, "type_fallbacks", ()) or ()),
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
         # deliberately NOT spec.authored_gpu_count: this asks whether a shape has been RESOLVED
