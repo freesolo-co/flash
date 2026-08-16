@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+import shlex
 import sys
 import tomllib
 from importlib import resources
@@ -299,11 +300,17 @@ def test_write_app_refuses_to_clobber_an_edited_file(tmp_path):
     assert "flash-serve-qwen3-5-4b" in destination.read_text()
 
 
-def test_generated_app_names_itself_in_its_deploy_instructions(tmp_path):
-    """The header tells the user what to run; a wrong filename there sends them to a missing file."""
-    destination = tmp_path / "my_serving_app.py"
+def test_generated_app_names_its_actual_path_in_deploy_instructions(tmp_path):
+    """The header must deploy the file that was written, including its directory and quoting.
+
+    `write_app` receives an absolute destination from the CLI. Passing only its basename makes
+    `--output deploy/generated/app.py` print a command for a different, missing file in the current
+    directory; failing to quote the actual path breaks any output directory containing spaces.
+    """
+    destination = tmp_path / "generated apps" / "my_serving_app.py"
     write_app(MODELS["Qwen/Qwen3.5-4B"], destination)
-    assert "modal deploy my_serving_app.py" in destination.read_text()
+    expected = f"modal deploy {shlex.quote(str(destination))}"
+    assert expected in destination.read_text()
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)

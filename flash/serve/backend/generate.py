@@ -8,6 +8,7 @@ than invented, so an OSS deploy starts from the configuration Freesolo validated
 from __future__ import annotations
 
 import re
+import shlex
 from importlib import metadata, resources
 from pathlib import Path
 
@@ -94,7 +95,7 @@ def render_app(
         "FLASH_REQUIREMENT": flash_requirement(),
         "SCALEDOWN_WINDOW_SECONDS": scaledown_window,
         "SECRET_NAME": secret_name,
-        "DEPLOY_COMMAND": f"modal deploy {app_file}",
+        "DEPLOY_COMMAND": f"modal deploy {shlex.quote(app_file)}",
         "IMAGE_BLOCK_TYPES": tuple(sorted(_IMAGE_BLOCK_TYPES)),
         "ADAPTER_REVISION_PATTERN": ADAPTER_REVISION_PATTERN,
         "SERVING_CAPABILITIES": REFERENCE_SERVING_CAPABILITIES,
@@ -129,7 +130,7 @@ def write_app(
         gpu=gpu,
         scaledown_window=scaledown_window,
         secret_name=secret_name,
-        app_file=destination.name,
+        app_file=str(destination),
     )
     if destination.parent != Path():
         destination.parent.mkdir(parents=True, exist_ok=True)
