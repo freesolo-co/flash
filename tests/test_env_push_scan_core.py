@@ -117,6 +117,44 @@ def test_a_credential_inside_a_gzip_member_is_found(tmp_path):
     assert credential_in_file(path) == "a Freesolo API key"
 
 
+def test_the_compressed_magic_probe_closes_its_handle(tmp_path, monkeypatch):
+    from flash.envscan import secrets as env_secrets
+
+    class Probe:
+        entered = False
+        exited = False
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def __exit__(self, *_args):
+            self.exited = True
+
+        def read(self, size):
+            assert size == 13
+            return b"ordinary data"
+
+    class Stream:
+        def __enter__(self):
+            return io.BytesIO(b"harmless")
+
+        def __exit__(self, *_args):
+            return None
+
+    path = tmp_path / "data.gz"
+    probe = Probe()
+    monkeypatch.setattr(type(path), "open", lambda *_args, **_kwargs: probe)
+    monkeypatch.setattr(env_secrets.gzip, "open", lambda *_args, **_kwargs: Stream())
+
+    assert (
+        env_secrets._credential_in_compressed(path, deadline=time.monotonic() + 1.0, depth=1)
+        is None
+    )
+    assert probe.entered
+    assert probe.exited
+
+
 def test_a_credential_inside_a_zip_member_is_found(tmp_path):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
