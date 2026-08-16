@@ -68,6 +68,11 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     runner._validate_effective_spec(public_spec, worker_spec)
     expected = snapshot.get("adapter_identity")
     stored_digest = snapshot.get("preparation_digest")
+    # a pre-upgrade snapshot hashed a different serialization than this build produces -- dropped
+    # top-level keys, the old rollout-batch spelling, a public half without lora_alpha. reproducing
+    # its digest means replaying the bytes it actually stored, read once from both halves.
+    raw_public = status.spec if isinstance(status.spec, dict) else {}
+    persisted_envelope = runner.VersionedPersistedSpecEnvelope.read(raw_worker, raw_public)
     has_workload_profile = bool(
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
@@ -95,7 +100,10 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     # the geometry cap still constrain.
     if (has_workload_profile or worker_spec.model_revision_auto) and (
         not isinstance(stored_digest, str)
-        or stored_digest != runner._preparation_digest(public_spec, worker_spec, expected)
+        or stored_digest
+        != runner._preparation_digest(
+            public_spec, worker_spec, expected, persisted=persisted_envelope
+        )
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
@@ -105,7 +113,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
                 "because its original artifact identity is unavailable"
             )
         if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
-            public_spec, worker_spec, expected
+            public_spec, worker_spec, expected, persisted=persisted_envelope
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:
@@ -341,7 +349,7 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         status.state = state
         status.updated_at = time.time()
         if state in runner.TERMINAL_STATES and status.finished_at is None:
-            # an already-terminal run keeps its teardown time: backfill from prior updated_at.
+            # legacy run already terminal: backfill from prior updated_at, not now.
             status.finished_at = prev_updated_at if was_terminal else status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
