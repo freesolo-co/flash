@@ -7473,6 +7473,7 @@ def _drive_opd_multi_turn_episode(
     monkeypatch,
     turns,
     env_replies,
+    raw_prompt,
     multi_modal_data=None,
 ):
     """Run the real OPD child loop end to end against a stub bridge, returning what it produced.
@@ -7609,7 +7610,7 @@ def _drive_opd_multi_turn_episode(
         driven["instance"] = instance
         await instance.run(
             {},
-            raw_prompt=[{"role": "user", "content": "describe"}],
+            raw_prompt=raw_prompt,
             index=0,
             global_steps=0,
             session_id=0,
@@ -7626,6 +7627,17 @@ _TWO_TURN_REPLIES = [
     {"messages": [{"role": "user", "content": "and now?"}], "terminal": False},
     {"messages": [], "terminal": True},
 ]
+# the shape verl's RLHFDataset actually hands the child for an image row: it splits the parquet
+# string on the `<image>` placeholder and substitutes a block (rl_dataset.py `_build_messages`).
+# a string prompt would enter the loop through a door a real image row cannot use, and would pass
+# even while the transcript validator rejected every genuine image episode before generation.
+_IMAGE_BLOCK_PROMPT = [
+    {
+        "role": "user",
+        "content": [{"type": "image", "image": "ref"}, {"type": "text", "text": "describe"}],
+    }
+]
+_TEXT_PROMPT = [{"role": "user", "content": "describe"}]
 
 
 def test_multi_turn_opd_resends_the_frozen_image_on_every_turn(monkeypatch):
@@ -7641,6 +7653,7 @@ def test_multi_turn_opd_resends_the_frozen_image_on_every_turn(monkeypatch):
         monkeypatch=monkeypatch,
         turns=_TWO_COMPLETED_TURNS,
         env_replies=_TWO_TURN_REPLIES,
+        raw_prompt=_IMAGE_BLOCK_PROMPT,
         multi_modal_data={"images": sentinel},
     )
 
@@ -7665,6 +7678,7 @@ def test_multi_turn_opd_keeps_a_text_only_episode_free_of_multimodal_fields(monk
         monkeypatch=monkeypatch,
         turns=_TWO_COMPLETED_TURNS,
         env_replies=_TWO_TURN_REPLIES,
+        raw_prompt=_TEXT_PROMPT,
         multi_modal_data=None,
     )
 

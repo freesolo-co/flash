@@ -197,10 +197,11 @@ async def _opd_run(
     exit_process,
     **kwargs,
 ):
-    raw_prompt = validate_transcript_messages(
-        [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
-    )
-    prompt = await prepare_episode_prompt(self, raw_prompt)
+    # the media comes out of the ORIGINAL blocks before the transcript is flattened, and the
+    # flattened form is what the bridge authenticates against. an image prompt arrives as blocks, so
+    # validating it as text-only here would reject every image episode before generation.
+    prompt = await prepare_episode_prompt(self, kwargs["raw_prompt"])
+    raw_prompt = prompt.messages
     prompt_ids = prompt.prompt_ids
     settings = _OpdEpisodeSettings()
     bridge_url = settings.bridge_url

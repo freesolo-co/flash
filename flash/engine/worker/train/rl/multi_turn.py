@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler
 
+from flash.content.multimodal import content_has_images, message_content_text
 from flash.engine.worker.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.score_batcher import ScoreBatcher
 from flash.engine.worker.train.rl.scoring import RolloutScoreRequest, score_rollouts
@@ -67,6 +68,17 @@ class _BadSession(_BadRequest, KeyError):
         return self.args[0] if self.args else ""
 
 
+class _BadEnvReply(_BadRequest, ValueError):
+    """A reply the environment produced that this transcript cannot carry. Also a ValueError.
+
+    The property the handler splits on is PERMANENT versus TRANSIENT, and this is permanent: the
+    environment will produce the same unrepresentable block on every retry, so it belongs with the
+    deliberate rejections rather than with the capacity faults. A bare ValueError here would fall
+    to the 503 branch and tell the reader the bridge had a resource problem, when the fix is to
+    change the environment's reply -- the same misdirection the 400/503 split exists to prevent.
+    """
+
+
 def _request_field(payload: dict, key: str):
     """Read one required payload field, or reject the request.
 
@@ -102,6 +114,66 @@ def request_session_id(payload: dict) -> str:
 # module's 503 split exists to fix, one layer down. so the rejecting code raises _BadRequest itself
 # and anything else reaching the handler is this side failing to serve a well-formed request.
 _BAD_REQUEST_ERRORS = (_BadRequest,)
+
+
+def _reject_unrepresentable_reply_blocks(content: list) -> None:
+    """Refuse every reply block this transcript cannot carry, not just the image ones.
+
+    ``message_content_text`` keeps ``type == "text"`` blocks and joins them, which means any OTHER
+    block -- video, audio, a tool-use payload, a type this code has never heard of -- contributes
+    nothing and vanishes without a trace. that is the same silent corruption as the stringified
+    image: the environment intended the model to see something, the model never saw it, and every
+    metric still reports a healthy run. so the flattening below is only allowed to run once the
+    content is known to be text and nothing but text.
+    """
+    for position, block in enumerate(content):
+        if not isinstance(block, dict):
+            raise _BadEnvReply(
+                f"environment reply content block {position} must be an object, not "
+                f"{type(block).__name__}"
+            )
+        block_type = block.get("type")
+        if block_type != "text":
+            raise _BadEnvReply(
+                f"environment reply content block {position} has unsupported type {block_type!r}; "
+                "a multi-turn GRPO environment reply can carry text blocks only"
+            )
+        if not isinstance(block.get("text"), str):
+            raise _BadEnvReply(f"environment reply text block {position} is missing its text")
+
+
+def _env_reply_message(message: dict) -> dict:
+    """one environment reply message, as the role/content text the child transcript can carry.
+
+    the adapter lets an environment return arbitrary message dicts from ``step_episode``, so a reply
+    may carry openai-style content BLOCKS rather than a string. ``str()`` on a block list does not
+    fail -- it produces the python repr, and the model then reads a literal
+    ``[{'type': 'image_url', ...}]`` as its prompt text while every metric reports a healthy run.
+
+    a block the transcript cannot represent is refused outright instead. the media a rollout
+    conditions on is fixed from the initial prompt (see ``_EpisodePrompt``), so a mid-episode image
+    cannot reach the engine no matter what this returns; stringifying it would train on the repr of
+    a dropped image, and dropping it would train on a turn the environment never wrote. refusing is
+    the interim contract until per-turn media is threaded into the rollout, and it is LOUD -- the
+    bridge turns a raise into a 400 that fails the episode -- because silence is the actual defect.
+    """
+    content = message.get("content")
+    if isinstance(content, list):
+        # images get their own message ahead of the generic guard: it is the one unsupported block
+        # with an action attached, so saying which one it is beats naming the type alone.
+        if content_has_images(content):
+            raise _BadEnvReply(
+                "environment reply carries an image block; multi-turn GRPO conditions every turn on "
+                "the media from the INITIAL prompt, so an image returned by step_episode cannot "
+                "reach the model. return text, or put the image in the initial prompt"
+            )
+        _reject_unrepresentable_reply_blocks(content)
+        # text-only blocks are a shape this transcript CAN represent exactly, so flatten them
+        # through the same definition of "the text of a message" the graders and reward path use.
+        return {"role": str(message.get("role", "")), "content": message_content_text(content)}
+    # unchanged for every non-block reply, which is what every existing multi-turn env returns.
+    return {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
+
 
 # size the listen backlog for the full prompts_per_step * group_size connection burst.
 # socketserver's default of 5 resets overflowed clients, and bridge_post intentionally does not retry.
@@ -262,12 +334,17 @@ class MultiTurnBridge:
                 return {"terminal": True, "messages": []}
             replies = self._env.env_reply(list(state.get("messages") or ()), state)
             terminal = bool(self._env.rollout_done(state, self._max_turns))
+        if terminal:
+            # nothing here is ever shown to the model: the child breaks on `terminal` BEFORE it
+            # reads `messages`. env_reply has already recorded these replies into the state that
+            # score_episodes reads, so the episode is scored on them either way. validating them
+            # for transcript representability would turn a completed episode whose env signed off
+            # with an image or a tool payload into a 400 with no reward -- refusing a turn the
+            # model was never going to see.
+            return {"terminal": True, "messages": []}
         return {
-            "terminal": terminal,
-            "messages": [
-                {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
-                for message in replies
-            ],
+            "terminal": False,
+            "messages": [_env_reply_message(message) for message in replies],
         }
 
     def _score_batch(self, requests: list) -> list:

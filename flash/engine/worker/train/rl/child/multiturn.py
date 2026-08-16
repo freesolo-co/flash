@@ -297,10 +297,7 @@ async def _grpo_run(
     agent_loop_output,
     **kwargs,
 ):
-    raw_prompt = validate_transcript_messages(
-        [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
-    )
-    prompt = await prepare_episode_prompt(self, raw_prompt)
+    prompt = await prepare_episode_prompt(self, kwargs["raw_prompt"])
     prompt_ids = prompt.prompt_ids
     mm_processor_kwargs = prompt.mm_processor_kwargs
     settings = _EpisodeSettings()
