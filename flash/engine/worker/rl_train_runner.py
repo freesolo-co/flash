@@ -239,14 +239,15 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
     def _score_batch(requests: list[tuple[int, str]]) -> list[float]:
         # grade the whole batch before touching the observability lock. the env's scorer may block on
         # judge i/o, while record is intentionally a short per-result critical section.
-        scored = score_single_turn_batch(
-            env,
-            [(solution_str, rollout_examples[int(index)]) for index, solution_str in requests],
-            tok=tok,
-            thinking=bool(_w.THINKING),
-            prompt_opened_thinking=inp["prompt_opened_thinking"],
-            think_penalty=inp["think_penalty"],
-        )
+        with observability.parent_work.busy():
+            scored = score_single_turn_batch(
+                env,
+                [(solution_str, rollout_examples[int(index)]) for index, solution_str in requests],
+                tok=tok,
+                thinking=bool(_w.THINKING),
+                prompt_opened_thinking=inp["prompt_opened_thinking"],
+                think_penalty=inp["think_penalty"],
+            )
         results = []
         for (index, solution_str), (score, breakdowns) in zip(requests, scored, strict=True):
             observability.record(message_prompts[int(index)], solution_str, score, breakdowns)
@@ -255,16 +256,17 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
 
     def _score_for_profile(index: int, solution_str: str) -> float:
         """score one bridge request without training observability side effects."""
-        return score_single_turn(
-            env,
-            solution_str,
-            rollout_examples[int(index)],
-            tok=tok,
-            thinking=bool(_w.THINKING),
-            prompt_opened_thinking=inp["prompt_opened_thinking"],
-            think_penalty=inp["think_penalty"],
-            raise_on_error=True,
-        )
+        with observability.parent_work.busy():
+            return score_single_turn(
+                env,
+                solution_str,
+                rollout_examples[int(index)],
+                tok=tok,
+                thinking=bool(_w.THINKING),
+                prompt_opened_thinking=inp["prompt_opened_thinking"],
+                think_penalty=inp["think_penalty"],
+                raise_on_error=True,
+            )
 
     multi_turn_bridge = (
         MultiTurnBridge(
@@ -275,6 +277,7 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
             max_turns=int(inp["max_turns"]),
             per_turn_credit=bool(inp["per_turn_credit"]),
             on_episode_scored=observability.record,
+            parent_work=observability.parent_work,
         )
         if inp["multi_turn"]
         else None
@@ -469,7 +472,17 @@ def _execute_rl_child(
         env=env_for_verl,
         start_new_session=True,
     )
-    child_stream = _rl_train()._GrpoSubprocessStream(proc)
+    child_tail = _rl_train().ChildOutputTail()
+    silence_watchdog = _rl_train().VerlChildSilenceWatchdog(
+        child_tail,
+        baseline_step=int((files or {}).get("resume_step", 0)),
+        parent_work=reward_runtime.observability.parent_work,
+    )
+    child_stream = _rl_train()._GrpoSubprocessStream(
+        proc,
+        tail=child_tail,
+        silence_watchdog=silence_watchdog,
+    )
     progress, last_dump_step = state.progress, state.last_dump_step
     shim_markers = (files or {}).get("shim_markers")
     expected_shims = (files or {}).get("expected_shims", ())
@@ -483,6 +496,7 @@ def _execute_rl_child(
             step_number = verl_step_number(line)
             if step_number is not None:
                 progress["step"] = step_number
+                silence_watchdog.observe_step(step_number)
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
                 # flash patch at all, so fail now rather than after the whole run is paid for. not

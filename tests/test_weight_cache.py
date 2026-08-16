@@ -4814,8 +4814,11 @@ def test_the_owning_key_is_read_inside_the_serialized_section():
     """
     import inspect
 
-    from flash.providers.runpod.serverless import endpoints
+    from flash.providers.runpod import job_execution
 
-    src = inspect.getsource(endpoints.get_train_endpoint)
-    assert "grow_weight_cache_volumes(spec, ensure_auth())" in src
-    assert "owning_key" not in src
+    src = inspect.getsource(job_execution.deploy_train_endpoint)
+    # the key is read under FLASH_SDK_LOCK and that same value is what the grow is charged to, so
+    # a key another thread advances after admission cannot grow one account while Endpoint attaches
+    # a different one.
+    assert "owning_key = ensure_auth()" in src
+    assert "grow_weight_cache_volumes(spec, owning_key" in src
