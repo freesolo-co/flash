@@ -136,7 +136,8 @@ class FreesoloEnvironment(BaseEnvironment):
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None
-        # cached dataset rows own one stable task for single-turn prompt and scoring hooks.
+        # cached dataset rows own the task that prompt preparation mutates. single-turn scoring
+        # reuses it directly; multi-turn rollouts clone its prepared episode state per sibling.
         self._row_tasks: dict[int, Any] = {}
         # whether this run samples <think> blocks. the worker sets it from the JobSpec once the
         # env is loaded; off by default so a CLI-side load (flash env test) grades raw text, which
@@ -562,15 +563,24 @@ class FreesoloEnvironment(BaseEnvironment):
     def tools(self) -> list:
         return []
 
-    def new_rollout_state(self, example: dict) -> dict:
-        record = deepcopy(self._canonical_record(example))
-        task = self._task_example_from_record(record)
-        prompt = self._with_system_prompt(self._env.start_episode(task, self._contract_text))
+    def new_rollout_state(self, example: dict, prepared_prompt: list[dict] | None = None) -> dict:
+        if prepared_prompt is None:
+            record = deepcopy(self._canonical_record(example))
+            task = self._task_example_from_record(record)
+            prompt = self._with_system_prompt(self._env.start_episode(task, self._contract_text))
+        else:
+            prepared_task = self._row_tasks.get(id(example))
+            if prepared_task is None:
+                raise RuntimeError("prepared Freesolo rollout requires its dataset row task")
+            task = deepcopy(prepared_task)
+            prompt = deepcopy(prepared_prompt)
         try:
             episode_turns: int | None = int(self._env.max_episode_turns(task))
         except Exception:
             episode_turns = None
-        messages = [dict(message) for message in prompt]
+        messages = (
+            [dict(message) for message in prompt] if prepared_prompt is None else deepcopy(prompt)
+        )
         return {
             "task": task,
             "prompt": prompt,
@@ -655,13 +665,16 @@ class FreesoloEnvironment(BaseEnvironment):
         state["turn"] = int(state.get("turn", 0)) + 1
         if step.metadata:
             state.setdefault("step_metadata", []).append(step.metadata)
-        replies = [dict(message) for message in step.messages]
-        state.setdefault("messages", []).extend(replies)
-        for message in replies:
+        replies = [deepcopy(dict(message)) for message in step.messages]
+        scored_replies = deepcopy(replies)
+        state.setdefault("messages", []).extend(scored_replies)
+        for message in scored_replies:
+            # score_episode receives a structural copy of the environment's raw chat content. the
+            # parent bridge flattens only the separate child-bound reply returned below.
             state.setdefault("turns", []).append(
                 self._EnvironmentTurn(
                     role=str(message.get("role", "")),
-                    content=str(message.get("content", "")),
+                    content=deepcopy(message.get("content", "")),
                 )
             )
         return replies

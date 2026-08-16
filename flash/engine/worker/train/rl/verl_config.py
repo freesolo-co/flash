@@ -17,6 +17,7 @@ from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
+    rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
     trainer_dtype_overrides,
@@ -332,6 +333,7 @@ def _rollout_overrides(cfg: dict) -> list[str]:
         ),
         # safetensors load format is required for lora rollout on vllm.
         "actor_rollout_ref.rollout.load_format=safetensors",
+        *rollout_mm_processor_cache_overrides(),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
         # sleep_unsupported). shared with the opd driver, which runs the same verl sleep path.
         *rollout_resident_overrides(bool(cfg.get("sleep_unsupported"))),
