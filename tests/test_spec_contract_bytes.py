@@ -344,8 +344,14 @@ def test_registries_match_the_declared_boundary():
     # is what catches an empty `providers` or `type_fallbacks` reaching the public bytes, which
     # would change every stored digest.
     assert not set(public) - set(worker)
-    for section, _ in MANAGED_SECTION_KEYS:
-        assert not set(public[section]) - set(worker[section]), (
+    # every section PRESENT in the public payload, not just the registered ones. driving this loop
+    # from MANAGED_SECTION_KEYS would let a key invented in an unregistered section (`wandb`) reach
+    # the public bytes unseen -- the same blind spot, in the opposite direction, as the section walk
+    # in test_every_privately_held_field_is_named_in_a_registry.
+    for section, public_section in public.items():
+        if not isinstance(public_section, dict):
+            continue
+        assert not set(public_section) - set(worker.get(section) or {}), (
             f"the public payload emitted a [{section}] key the worker payload does not have"
         )
 
