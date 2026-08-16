@@ -350,6 +350,223 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
     assert persisted.reconciled_at == now
 
 
+# ------------------------------------------------- multi-resource ledger regressions (#undercount)
+# These pin the defect documented in flash/server/domain/reconcile.py: attribution reads only the
+# final RunStatus.remote, so every earlier paid resource of a retried run reports $0, a cancelled
+# run whose handle was cleared reports nothing at all, and instance providers bill a prior
+# resource's wall to the RUN's finished_at instead of that resource's own teardown.
+#
+# They depend on the durable attempt-resource ledger: a private per-run status key
+# `attempt_resources` holding one record per paid resource (identity, attempt, provider,
+# allocation, accepted rate, launched_at, outcome, teardown_requested_at, deletion_confirmed_at,
+# terminal_at, realized_usage) that survives retries, cancellation, and confirmed deletion.
+def _ledger_record(**kw) -> dict:
+    """One paid-resource ledger record, with the fields reconciliation settles over."""
+    base = {
+        "attempt": 0,
+        "provider": "runpod",
+        "identity": {},
+        "allocation": {"gpu": "B200", "gpu_count": 1},
+        "accepted_rate_usd_hr": 0.0,
+        "launched_at": 0.0,
+        "outcome": "succeeded",
+        "outcome_at": 0.0,
+        "teardown_requested_at": 0.0,
+        "deletion_confirmed_at": 0.0,
+        "terminal_at": 0.0,
+        "realized_usage": None,
+    }
+    base.update(kw)
+    return base
+
+
+def _seed_ledger(tmp_path, monkeypatch, status: runner.RunStatus, records: list[dict]) -> None:
+    """Persist `status` with an `attempt_resources` ledger, the way the runner will write it.
+
+    The ledger is a PRIVATE raw status key, not a RunStatus field (that is what keeps it out of
+    to_dict() and /v1/runs), so it has to be seeded on disk rather than passed to the dataclass."""
+    import json as _json
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path))
+    data = runner._status_storage_dict(status)
+    data["attempt_resources"] = records
+    with open(runner.runs_file_path(status.run_id, ".json"), "w") as f:
+        _json.dump(data, f, indent=2, sort_keys=True)
+
+
+def test_reconcile_sums_every_paid_retry_resource_not_just_the_surviving_handle(
+    tmp_path, monkeypatch
+):
+    """A retried run pays for EVERY endpoint it created, not only the one left in status.remote.
+
+    attempt 0 burned ep-0 ($1.00) and was torn down before attempt 1 launched ep-1 ($2.00). Only
+    ep-1 survives in `remote`, so today's last-handle attribution reports $2.00 and silently drops
+    the first attempt's real spend. COGS must be $3.00 and name both endpoints."""
+    now = 1_000_000.0
+    settled = now - 7200.0
+    ep_cost = {"ep-0": 1.00, "ep-1": 2.00}
+
+    def fake_realized(remote, **kw):
+        eid = remote.get("endpoint_id")
+        amount = ep_cost[eid]
+        return realized.RealizedCost(
+            provider="runpod",
+            realized_usd=amount,
+            by_resource={"gpu": amount},
+            source={"endpoint_id": eid},
+        )
+
+    monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
+    posted: dict = {}
+    monkeypatch.setattr(reconcile, "_report", lambda body: posted.update(body) or True)
+    monkeypatch.setattr(runner, "record_realized_cost", lambda run_id, **kw: None)
+
+    torn_down = {"provider": "runpod", "endpoint_id": "ep-0", "attempt": 0}
+    surviving = {"provider": "runpod", "endpoint_id": "ep-1", "attempt": 1}
+    status = _status(
+        run_id="r-retry",
+        state="done",
+        updated_at=settled,
+        finished_at=settled,
+        remote=surviving,
+    )
+    _seed_ledger(
+        tmp_path,
+        monkeypatch,
+        status,
+        [
+            _ledger_record(attempt=0, identity=torn_down, terminal_at=settled - 1800.0),
+            _ledger_record(attempt=1, identity=surviving, terminal_at=settled),
+        ],
+    )
+
+    assert reconcile.reconcile_run(status, now=now) is True
+    assert posted["realizedCostUsd"] == 3.00  # today: 2.00, the first attempt billed as free
+    audit = repr(posted.get("source"))
+    assert "ep-0" in audit and "ep-1" in audit
+
+
+def test_cancelled_run_with_cleared_handle_still_reconciles_its_paid_resource(
+    tmp_path, monkeypatch
+):
+    """Cancelling a run tears the resource down and clears `remote`, but the GPU time was real.
+
+    `_due` requires status.remote, so a cleanly cancelled run is never reconciled and its whole
+    spend reports as nothing. The ledger keeps the torn-down resource, so the run stays due."""
+    now = 1_000_000.0
+    settled = now - 7200.0
+    cancelled_resource = {"provider": "runpod", "endpoint_id": "ep-cancel", "attempt": 0}
+    status = _status(
+        run_id="r-cancel",
+        state="cancelled",
+        updated_at=settled,
+        finished_at=settled,
+        remote=None,  # cleared by a confirmed teardown during cancel_run
+    )
+    _seed_ledger(
+        tmp_path,
+        monkeypatch,
+        status,
+        [
+            _ledger_record(
+                attempt=0,
+                identity=cancelled_resource,
+                outcome="cancelled",
+                terminal_at=settled,
+            )
+        ],
+    )
+
+    assert reconcile._due(status, now) is True  # today: False, so it is never even queried
+
+    monkeypatch.setattr(
+        reconcile,
+        "realized_cost_for_remote",
+        lambda remote, **kw: realized.RealizedCost(
+            provider="runpod", realized_usd=1.5, by_resource={"gpu": 1.5}
+        ),
+    )
+    posted: dict = {}
+    monkeypatch.setattr(reconcile, "_report", lambda body: posted.update(body) or True)
+    monkeypatch.setattr(runner, "record_realized_cost", lambda run_id, **kw: None)
+
+    assert reconcile.reconcile_run(status, now=now) is True
+    assert posted["realizedCostUsd"] == 1.5
+
+
+def test_instance_resource_bills_to_its_own_teardown_not_the_runs_finished_at(
+    tmp_path, monkeypatch
+):
+    """A flat-$/hr instance stops billing when IT is destroyed, not when the run ends.
+
+    attempt 0's instance was torn down an hour before the run finished on attempt 1. Charging it
+    to the run's finished_at invents an extra hour of rental that nobody was billed for."""
+    now = 1_000_000.0
+    run_end = now - 7200.0
+    first_launch = run_end - 7200.0  # attempt 0 ran 1h, then was destroyed
+    first_teardown = run_end - 3600.0
+    captured: list[dict] = []
+
+    def fake_realized(remote, *, start, end, run_end=None):
+        captured.append({"remote": remote, "start": start, "run_end": run_end})
+        return realized.RealizedCost(provider="lambda", realized_usd=1.0)
+
+    monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
+    monkeypatch.setattr(reconcile, "_report", lambda body: True)
+    monkeypatch.setattr(runner, "record_realized_cost", lambda run_id, **kw: None)
+
+    first = {
+        "provider": "lambda",
+        "instance_id": "i-0",
+        "hourly_usd": 2.0,
+        "attempt": 0,
+        "started_ts": first_launch,
+    }
+    surviving = {
+        "provider": "lambda",
+        "instance_id": "i-1",
+        "hourly_usd": 2.0,
+        "attempt": 1,
+        "started_ts": first_teardown,
+    }
+    status = _status(
+        run_id="r-inst",
+        state="done",
+        created_at=first_launch,
+        updated_at=run_end,
+        finished_at=run_end,
+        remote=surviving,
+    )
+    _seed_ledger(
+        tmp_path,
+        monkeypatch,
+        status,
+        [
+            _ledger_record(
+                attempt=0,
+                provider="lambda",
+                identity=first,
+                launched_at=first_launch,
+                terminal_at=first_teardown,
+            ),
+            _ledger_record(
+                attempt=1,
+                provider="lambda",
+                identity=surviving,
+                launched_at=first_teardown,
+                terminal_at=run_end,
+            ),
+        ],
+    )
+
+    assert reconcile.reconcile_run(status, now=now) is True
+    by_instance = {c["remote"].get("instance_id"): c for c in captured}
+    assert set(by_instance) == {"i-0", "i-1"}  # today: only i-1 is queried at all
+    # the destroyed instance stops billing at ITS teardown, not an hour later at the run's end
+    assert by_instance["i-0"]["run_end"] == first_teardown
+    assert by_instance["i-1"]["run_end"] == run_end
+
+
 def test_reconcile_once_disabled_without_internal_key(monkeypatch):
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     monkeypatch.setattr(runner, "list_runs", lambda: [_status(updated_at=0)])
