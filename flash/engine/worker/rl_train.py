@@ -233,8 +233,6 @@ def _write_terminal_metadata(
             wandb_run_name=experiment_name if "wandb" in loggers else None,
             wandb_url=reward_runtime.wandb_link.get("wandb_url"),
             wandb_id=reward_runtime.wandb_link.get("wandb_id"),
-            reward_profile=reward_runtime.reward_profile,
-            step_intervals=_step_intervals(state.step_line_times),
             reward_bridge_batching=not inp["multi_turn"],
             gdn_boundary_resets=gdn_hybrid or None,
         ),
@@ -300,6 +298,9 @@ def _configure_rl_child(
         project_name=project_name,
         experiment_name=experiment_name,
         gpu_type=(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else ""),
+        # the authored knobs the allocator sized this run's shape from, so the zero-2 gate the
+        # worker applies is the same one the allocator admitted the shape under.
+        train_spec=(_w.JOB_SPEC.train if _w.JOB_SPEC else None),
         # the ranks verl will actually run, not the cards rented: with ulysses pinned off every rank
         # is a dp rank, and verl chunks the step's sequences across them with an exact-divisibility
         # assert. a wider launch than the sequences divide aborts at step 0 on a paid box. resolved
@@ -386,8 +387,11 @@ def run_rl_train():
             return state.progress["step"]
 
         def _reward_observability() -> dict:
-            """return reward metrics and sampled completions for one heartbeat."""
-            return reward_runtime.observability.heartbeat_fields()
+            """return reward observability and measured pace for one heartbeat."""
+            return {
+                **reward_runtime.observability.heartbeat_fields(),
+                **_step_timing_fields(inp, state),
+            }
 
         with liveness_heartbeat(
             "rl_step",
@@ -469,15 +473,7 @@ def run_rl_train():
     )
 
 
-# the total startup delay the reward profile hook is allowed to add, covering reference extraction
-# AND timing. both call user code, so one shared ceiling is the only number that means anything to a
-# caller. it stays HERE rather than moving with `_log_reward_profile`: the reward-profile tests
-# shorten the probe by patching it on this module, and the implementation reads it back through
-# `rl_train` at call time.
-_PROFILE_BUDGET_S = 30.0
-
-# single-turn scoring and the reward-wall probe, implemented in `.train.rl.single_turn`. imported at
-# the BOTTOM because that module reads the budget above, so a top-level import would be circular.
+# single-turn scoring, implemented in `.train.rl.single_turn`.
 # verl config rendering, implemented in `.train.rl.verl_config`.
 # the parent side of the multi-turn rollout loop, implemented in `.train.rl.multi_turn`.
 # checkpoint upload and the zero-gradient publish guard, implemented in `.train.rl.checkpoints`.
@@ -498,6 +494,7 @@ from flash.engine.worker.rl_train_runner import (  # noqa: E402,F401
     _RewardRuntime,
     _start_resume_uploader,
     _start_reward_runtime,
+    _step_timing_fields,
     _StepMetricState,
     _validate_rl_child,
     _write_rl_shim,
@@ -528,7 +525,6 @@ from flash.engine.worker.train.rl.multi_turn import (  # noqa: E402,F401
 )
 from flash.engine.worker.train.rl.single_turn import (  # noqa: E402,F401
     _finalize_single_turn_reward,
-    _log_reward_profile,
     _single_turn_scoring_state,
     score_single_turn,
     score_single_turn_batch,
@@ -537,9 +533,7 @@ from flash.engine.worker.train.rl.verl_config import (  # noqa: E402,F401
     _DEFAULT_GPU_MEM_UTIL,
     _build_verl_train_notes,
     _build_verl_training_cfg,
-    _measured_idle_fraction,
     _processor_expanded_prompt,
-    _step_intervals,
     _verl_epochs_for_horizon,
     _verl_grpo_parquet_features,
     build_verl_dataset_rows,

@@ -34,6 +34,7 @@ from flash.core.spec import (  # noqa: F401
     GpuSpec,
     JobSpec,
 )
+from flash.engine.plan.prompt_budget import PromptBudget
 from flash.providers._lifecycle.poll import _attempt_int as _attempt_int
 from flash.teacher.retry_contract import (
     OPD_RETRY_CONTRACT_STATUS_KEY,
@@ -190,6 +191,10 @@ class RunStatus:
     gpu_status: dict | None = None
     workload_profile_input_digest: str | None = None
     workload_profile: dict | None = None
+    # submit-time derived grpo/opd prompt budget from flash.engine.plan.prompt_budget. workers drop
+    # over-budget prompts rather than truncating them, so record the value before gpu allocation.
+    # none for sft, which reports truncation through workload_profile, and for older records.
+    prompt_budget: PromptBudget | None = None
     effective_preparation: dict | None = None
 
     def to_dict(self) -> dict:
@@ -288,6 +293,14 @@ class WarmStartPreparationError(ValueError):
 
 class WorkloadProfileUnavailable(ValueError):
     """the sft packaged-dataset estimate failed or cannot be trusted."""
+
+
+class EnvironmentRefNotFound(ValueError):
+    """the environment ref does not exist on GitHub, or the plane's token cannot read it.
+
+    A ValueError so the submit route's existing classifier answers 400: this is a spec the submitter
+    must change, not an outage they can wait out.
+    """
 
 
 class _RunCancelled(RuntimeError):
@@ -416,6 +429,8 @@ class PreparedJob:
     worker_spec: JobSpec
     estimated_cost_usd: float
     adapter_identity: dict | None = None
+    # derived grpo/opd prompt budget, resolved where the warm-start source is authorized and read.
+    prompt_budget: PromptBudget | None = None
 
 
 _BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
@@ -751,9 +766,11 @@ from flash.runner.artifacts import (  # noqa: E402,F401
     _assign_resolved_env_sha,
     _environment_artifact_repo_name,
     _file_digest,
+    _pin_env_sha_with_reason,
     artifact_namespace,
     flash_code_prefix,
     managed_hf_repo_for_environment,
+    preflight_validate_environment_ref,
 )
 from flash.runner.attempts import (  # noqa: E402,F401
     _heartbeat_attempt_is_current,

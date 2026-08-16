@@ -171,6 +171,15 @@ def test_save_step_validation_rejects_unreachable_runtime_step():
         validate_save_steps((2, 7), 6)
 
 
+@pytest.mark.parametrize("interval", [0, -1, -20])
+def test_nonpositive_save_every_canonicalizes_to_the_unset_sentinel(interval):
+    # the public schema rejects these, but a persisted or internally built spec reaches TrainSpec
+    # directly. without canonicalization the horizon clamp reads a signed interval as one and
+    # checkpoints every optimizer step.
+    assert TrainSpec(save_every=interval).save_every is None
+    assert TrainSpec(save_every=20).save_every == 20
+
+
 def test_resume_first_companion_retries_without_reuploading_full_state(monkeypatch, tmp_path):
     import flash.engine.worker as worker
     from flash.engine.worker.io import hf as worker_hf

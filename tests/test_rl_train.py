@@ -6,6 +6,7 @@ import ast
 import asyncio
 import contextlib
 import inspect
+import io
 import json
 import math
 import os
@@ -314,6 +315,444 @@ def test_build_verl_dataset_rows_length_mismatch_raises():
 
 def _image_placeholder_count(row) -> int:
     return sum(str(m["content"]).count("<image>") for m in row["prompt"])
+
+
+def _exec_shim_fragment(source, namespace=None):
+    """exec a rendered fragment the way the child does, and run the patch it defers.
+
+    Every fragment now registers its body with the deferral registry instead of patching at import
+    (see ``shims.render_deferred_patch_runtime``), because touching verl at sitecustomize time
+    initializes cuda against every gpu and collapses the rank->device map. A test that exec'd the
+    fragment alone would therefore assert on a patch that never ran.
+
+    Draining the registry here rather than importing the target keeps these tests independent of
+    whether a stub module is already in ``sys.modules``: the registry applies immediately for an
+    imported target and waits for the rest, and this runs whatever is still pending either way.
+
+    A deferred body also records its own applied-shim marker, so the recorder the real
+    sitecustomize always defines above the fragments has to exist here too. It is stubbed rather
+    than pointed at a file: these tests assert on the patch, and the marker contract has its own
+    coverage in ``test_a_deferred_fragment_records_its_marker_only_once_the_patch_applies``.
+    """
+    namespace = {} if namespace is None else namespace
+    namespace.setdefault("_flash_record_applied_shim", lambda name: None)
+    # the registry is cached on `sys` so one sitecustomize can hold many fragments, which also means
+    # it OUTLIVES a test. drop any existing one first and uninstall ours after, or a later test
+    # inherits this one's pending callbacks and its finder stays on meta_path for the whole session.
+    previous = getattr(sys, "_flash_defer_registry", None)
+    if previous is not None:
+        previous.uninstall()
+        del sys._flash_defer_registry
+    try:
+        exec(
+            compile(verl_shims.render_deferred_patch_runtime(), "sitecustomize.py", "exec"),
+            namespace,
+        )
+        exec(compile(source, "sitecustomize.py", "exec"), namespace)
+        registry = sys._flash_defer_registry
+        for target in list(registry._pending):
+            registry._run(target)
+        registry.uninstall()
+    finally:
+        del sys._flash_defer_registry
+        if previous is not None:
+            sys._flash_defer_registry = previous
+    return namespace
+
+
+def _module_scope_imports(source: str) -> set[str]:
+    """top-level packages imported at MODULE scope by ``source`` (nested defs excluded)."""
+    names = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            names.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Try):
+            # the unwrapped tf32 fragment is a bare try/except at module scope; look inside it.
+            for inner in node.body:
+                if isinstance(inner, ast.Import):
+                    names.update(alias.name.split(".")[0] for alias in inner.names)
+                elif isinstance(inner, ast.ImportFrom) and inner.module and inner.level == 0:
+                    names.add(inner.module.split(".")[0])
+    return names
+
+
+def test_no_rl_fragment_imports_verl_or_vllm_at_module_scope():
+    """the regression barrier for the multi-gpu rank->device collapse.
+
+    sitecustomize runs at interpreter startup, BEFORE ray narrows an actor's CUDA_VISIBLE_DEVICES to
+    its own card. importing verl there reaches `verl/utils/device.py`, whose module scope calls
+    `torch.cuda.is_available()` -- which runs cuInit and freezes the cuda device map against every
+    visible gpu. The later narrowing cannot rebuild it, so every rank keeps device 0 and nccl aborts
+    with "Duplicate GPU detected". That killed 7/7 multi-gpu runs on hardware that was entirely idle.
+
+    Every fragment must therefore defer through `_deferred_patch`. This asserts the property that
+    matters -- no module-scope verl/vllm import -- rather than the mechanism, so a future fragment
+    that finds another way to defer still passes and an eager one still fails.
+
+    torch itself is allowed: the tf32 fragment imports it and only sets matmul flags. It is
+    `torch.cuda`, not the import, that runs cuInit.
+    """
+    rendered = {
+        # the two unwrapped fragments count too: they are composed into the same sitecustomize, so
+        # an eager verl import in either collapses the map just as thoroughly.
+        "tf32": backend_common.render_tf32_shim(),
+        "tilelang-cudart": backend_common.render_tilelang_cudart_shim(),
+        "kl-ref-adapter": verl_shims.render_kl_ref_adapter_shim(True),
+        "structured-outputs": verl_shims.render_structured_outputs_shim({"type": "json_object"}),
+        "exact-save-steps": verl_shims.render_exact_save_steps_shim((3,), 10),
+        "stop-sequences": verl_shims.render_stop_sequences_shim(("</answer>",)),
+        "image-pad-ban": verl_shims.render_image_pad_ban_shim(151655),
+        "per-turn-credit": verl_shims.render_per_turn_credit_shim(True),
+        "reentrant-checkpointing": verl_shims.render_reentrant_checkpointing_shim(True),
+        "entropy-quantile": verl_shims.render_entropy_quantile_shim(0.2),
+        "rank-device-assert": verl_shims.render_rank_device_assert_shim(2),
+    }
+    # each renderer was called with its feature ON, so an empty one would silently exempt itself.
+    assert all(rendered.values()), sorted(name for name, src in rendered.items() if not src)
+    offenders = {
+        name: sorted(_module_scope_imports(src) & {"verl", "vllm"})
+        for name, src in rendered.items()
+    }
+    assert {name: bad for name, bad in offenders.items() if bad} == {}
+
+
+@contextlib.contextmanager
+def _defer_registry(tmp_path=None):
+    """install a fresh deferral registry, and take it back off meta_path afterwards.
+
+    The registry is cached on ``sys`` so one sitecustomize can hold every fragment, which also means
+    it outlives a test. Without this, a later test inherits the pending callbacks and the finder
+    stays on ``meta_path`` for the rest of the session.
+    """
+    previous = getattr(sys, "_flash_defer_registry", None)
+    if previous is not None:
+        previous.uninstall()
+        del sys._flash_defer_registry
+    try:
+        exec(compile(verl_shims.render_deferred_patch_runtime(), "sitecustomize.py", "exec"), {})
+        yield sys._flash_defer_registry
+    finally:
+        current = getattr(sys, "_flash_defer_registry", None)
+        if current is not None:
+            current.uninstall()
+            del sys._flash_defer_registry
+        if previous is not None:
+            sys._flash_defer_registry = previous
+
+
+def test_a_deferred_fragment_records_its_marker_only_once_the_patch_applies(tmp_path, monkeypatch):
+    """the marker must mean "patched", not "queued".
+
+    Deferral moved the patch off sitecustomize time, which silently changed what
+    `wrap_shim_fragment`'s own `_flash_record_applied_shim` call proved: it now sits after the
+    REGISTRATION. A child that armed the registry and then never imported the target would record
+    every marker and train with no patch at all, and the parent's `verify_applied_shim_markers`
+    would wave it through -- the exact fail-closed hole the wrapper exists to close.
+
+    So the marker is written from inside the deferred body, and this pins both halves: nothing at
+    arming time, exactly one on application.
+    """
+    markers = tmp_path / "applied_shims.txt"
+    (tmp_path / "flash_marker_probe.py").write_text("PATCHED = False\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("flash_marker_probe", None)
+    source = verl_shims.render_deferred_patch_runtime() + backend_common.wrap_shim_fragment(
+        "probe-fragment",
+        verl_shims._deferred_patch(
+            "markerprobe",
+            "flash_marker_probe",
+            "import flash_marker_probe as _m\n_m.PATCHED = True\n",
+            "probe-fragment",
+        ),
+        record_immediately=False,
+    )
+    namespace: dict = {}
+    with _defer_registry():
+        try:
+            exec(
+                compile(
+                    backend_common.render_shim_marker_prologue(str(markers)) + source,
+                    "sitecustomize.py",
+                    "exec",
+                ),
+                namespace,
+            )
+            # armed, not applied: the fragment ran to completion at sitecustomize time and still
+            # owes its marker, because the module it patches has not been imported.
+            assert backend_common.read_applied_shim_markers(str(markers)) == set()
+            with pytest.raises(RuntimeError, match="never proved these required runtime patches"):
+                backend_common.verify_applied_shim_markers(str(markers), ["probe-fragment"])
+
+            import flash_marker_probe
+
+            assert flash_marker_probe.PATCHED is True
+            assert backend_common.read_applied_shim_markers(str(markers)) == {"probe-fragment"}
+            # and the parent now accepts it -- one marker, written once, meaning the patch is in.
+            backend_common.verify_applied_shim_markers(str(markers), ["probe-fragment"])
+            assert markers.read_text().count("probe-fragment") == 1
+        finally:
+            sys.modules.pop("flash_marker_probe", None)
+
+
+def test_every_rl_fragment_defers_its_marker_rather_than_recording_it_at_arming(tmp_path):
+    # the wiring half of the property above: _write_rl_shim must disable immediate recording for
+    # registry-backed fragments, or the wrapper writes the name at registration and the guarantee is
+    # gone. asserted on the composed file, so a future fragment wired the old way fails here.
+    files = _shim_files(tmp_path)
+    inp = {
+        "dp_cards": 2,
+        "reentrant_checkpointing": True,
+        "multimodal": False,
+        "entropy_quantile": None,
+        "per_turn_credit": False,
+        "stop_sequences": (),
+        "image_pad_token_id": None,
+        "structured_outputs": None,
+        "save_at_steps": (),
+        "steps": 20,
+        "warmstart_adapter": None,
+        "kl_coef": 0.0,
+        "multi_turn": False,
+    }
+    expected = rl_train._write_rl_shim(inp, files)
+    source = Path(files["shim_py"]).read_text()
+    for name in expected:
+        assert source.count(f"_flash_record_applied_shim({name!r})") == 1
+        if name == "lora-rollout-guard":
+            # dev's guard has its own deferred finder and applied hook rather than this registry.
+            continue
+        # the record call sits inside the deferred body, before the register() that queues it.
+        marker_at = source.index(f"_flash_record_applied_shim({name!r})")
+        register_after = source.index("_flash_defer_registry.register", marker_at)
+        assert marker_at < register_after
+
+
+def test_the_deferred_registry_runs_patches_at_the_targets_real_import(tmp_path, monkeypatch):
+    """the property the whole fix rests on, exercised through an actual import statement.
+
+    Two callbacks share one target on purpose: that is the case the per-fragment finder design
+    could not survive (siblings either recursed forever or the first match silently dropped the
+    other's patch), and it is not hypothetical -- stop-sequences and image-pad-ban both hook
+    `verl.experimental.agent_loop`.
+    """
+    (tmp_path / "flash_defer_probe.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("flash_defer_probe", None)
+    fired: list[str] = []
+    with _defer_registry() as registry:
+        try:
+            registry.register("flash_defer_probe", lambda: fired.append("first"))
+            registry.register("flash_defer_probe", lambda: fired.append("second"))
+            # registering is not applying: nothing has imported the target, so nothing may have run.
+            # this is the whole point -- at sitecustomize time, touching verl is what breaks ranks.
+            assert fired == []
+
+            import flash_defer_probe
+
+            # both bodies ran, in registration order, and the module they patched is fully executed
+            # by the time they see it.
+            assert fired == ["first", "second"]
+            assert flash_defer_probe.VALUE == "imported"
+            # the registry drains and takes itself back off meta_path once nothing is pending.
+            assert not any(f is registry for f in sys.meta_path)
+        finally:
+            sys.modules.pop("flash_defer_probe", None)
+
+
+def test_a_deferred_patch_registered_after_its_target_is_imported_applies_immediately(monkeypatch):
+    # ordering must not decide whether a patch happens. a target already in sys.modules has nothing
+    # left to intercept, so the body runs now rather than waiting for an import that will not come.
+    fired: list[str] = []
+    with _defer_registry() as registry:
+        monkeypatch.setitem(sys.modules, "flash_defer_present", types.ModuleType("x"))
+        registry.register("flash_defer_present", lambda: fired.append("now"))
+        assert fired == ["now"]
+
+
+def test_a_deferred_body_that_raises_hard_exits_and_cannot_be_retried_around(tmp_path):
+    """a fragment that cannot apply must kill the child, not let it train unpatched.
+
+    Raising is NOT enough here, which is the trap. `wrap_shim_fragment`'s try/except spans the
+    registration, and that has already returned by the time the body runs -- so a raise surfaces as
+    an ordinary ImportError out of the target's import. An importer that catches it and retries
+    then gets a CLEAN load: python drops the failed module from sys.modules and the registry has
+    already popped the callback, so the target comes back with no patch and no marker, and the
+    interpreter keeps running unpatched.
+
+    Runs in a subprocess because the guarantee being tested is `os._exit`, which no in-process
+    assertion can survive. The retry is performed explicitly: reaching it at all is the failure.
+    """
+    (tmp_path / "flash_defer_boom.py").write_text("VALUE = 1\n")
+    probe = tmp_path / "probe.py"
+    # derived from the imported package rather than hardcoded, so the subprocess loads the same
+    # checkout this test session did.
+    repo_root = str(Path(W.__file__).resolve().parents[3])
+    probe.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {repo_root!r})\n"
+        f"sys.path.insert(0, {str(tmp_path)!r})\n"
+        "from flash.engine.worker.train.rl import shims\n"
+        "exec(compile(shims.render_deferred_patch_runtime(), 'sc.py', 'exec'), {})\n"
+        "def boom():\n"
+        "    raise RuntimeError('fragment could not apply')\n"
+        "boom._flash_shim_name = 'boom-fragment'\n"
+        "sys._flash_defer_registry.register('flash_defer_boom', boom)\n"
+        "try:\n"
+        "    import flash_defer_boom\n"
+        "except BaseException:\n"
+        "    pass\n"
+        "import flash_defer_boom as retried\n"
+        "print('REACHED_RETRY', retried.VALUE)\n"
+    )
+    done = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=120)
+    assert done.returncode == backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, done.stdout
+    # the retry must never be reached: if it is, the child is running with the patch missing.
+    assert "REACHED_RETRY" not in done.stdout
+    # and the message has to name the fragment, not just the module -- several fragments share a
+    # target, so the module alone does not say which patch is missing.
+    assert "boom-fragment" in done.stderr
+
+
+def test_the_rank_device_assert_is_inert_on_a_single_card_run():
+    # one rank cannot collide with itself and the collective path never runs, so the fragment must
+    # not render at all -- an assertion that can only ever pass is noise in every single-card log.
+    assert verl_shims.render_rank_device_assert_shim(1) == ""
+    assert verl_shims.render_rank_device_assert_shim(0) == ""
+    multi = verl_shims.render_rank_device_assert_shim(2)
+    assert multi
+    compile(multi, "sitecustomize.py", "exec")
+
+
+def test_the_rank_device_assert_compares_uuids_after_verls_own_init():
+    """the two properties that decide whether this check works at all.
+
+    It must read the binding AFTER verl's `Worker.__init__` (that is what applies ray's narrowing
+    and calls set_device -- checking before it measures the unpinned state and always passes), and
+    it must compare gpu UUIDs, not ordinals: with per-actor CUDA_VISIBLE_DEVICES every rank reports
+    ordinal 0 whether the mapping is correct or collapsed, so ordinals cannot tell the two apart.
+    """
+    source = verl_shims.render_rank_device_assert_shim(2)
+    wrapper = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "_flash_rank_init"
+    )
+
+    def _statement_calling(name: str) -> int:
+        for index, node in enumerate(wrapper.body):
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and getattr(inner.func, "id", "") == name:
+                    return index
+        raise AssertionError(f"{name} is not called in _flash_rank_init")
+
+    # structural ordering, not a comment: the original init has already returned by the statement
+    # that runs the check, so the binding being measured is the one ray actually applied.
+    assert _statement_calling("_flash_rank_original_init") < _statement_calling("_flash_rank_check")
+    assert "get_device_properties" in source
+    assert "uuid" in source
+    # a collision must raise rather than print: a warning in a log nobody reads is what the current
+    # failure already is.
+    assert "raise RuntimeError(" in source
+
+
+def _run_rank_device_check(tmp_path, monkeypatch, bindings, *, env_rank=None):
+    """run the rendered check once per (rank, ordinal, uuid), against a fake torch and verl.
+
+    Returns the error each rank raised, or None. Ranks share one claims file exactly as they do on
+    the worker, which is what lets a rank see a device another rank already took.
+
+    ``env_rank`` overrides what RANK says in the environment, so a test can drive the worker's own
+    rank and the environment's apart and see which one the check actually reads.
+    """
+    claims = tmp_path / "rank_device_claims.txt"
+    monkeypatch.setenv("FLASH_RANK_DEVICE_CLAIMS", str(claims))
+    source = verl_shims.render_rank_device_assert_shim(len(bindings))
+    results = []
+    for rank, ordinal, uuid in bindings:
+        torch_stub = types.ModuleType("torch")
+        torch_stub.cuda = SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda ordinal=ordinal: ordinal,
+            get_device_properties=lambda _o, uuid=uuid: SimpleNamespace(uuid=uuid),
+        )
+
+        class _Worker:
+            def __init__(self, rank=rank):
+                # verl's Worker.__init__ stores the rank on the instance before it returns, so the
+                # wrapper that runs after it can read the same value verl will use downstream.
+                self._rank = rank
+
+        worker_module = types.ModuleType("verl.single_controller.base.worker")
+        worker_module.Worker = _Worker
+        base = types.ModuleType("verl.single_controller.base")
+        base.worker = worker_module
+        for name, module in {
+            "torch": torch_stub,
+            "verl": types.ModuleType("verl"),
+            "verl.single_controller": types.ModuleType("verl.single_controller"),
+            "verl.single_controller.base": base,
+            "verl.single_controller.base.worker": worker_module,
+        }.items():
+            monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setenv("RANK", str(rank if env_rank is None else env_rank))
+        monkeypatch.setenv("LOCAL_RANK", str(rank))
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(ordinal))
+        with _defer_registry():
+            _exec_shim_fragment(source)
+        try:
+            _Worker()
+            results.append(None)
+        except RuntimeError as exc:
+            results.append(str(exc))
+    return results
+
+
+def test_the_rank_device_assert_passes_when_every_rank_opened_its_own_card(tmp_path, monkeypatch):
+    # the healthy multi-card shape: distinct uuids, so nothing is refused. both ranks report
+    # ordinal 0 because ray gave each actor its own CUDA_VISIBLE_DEVICES -- which is exactly why
+    # ordinals cannot be the thing compared.
+    errors = _run_rank_device_check(tmp_path, monkeypatch, [(0, 0, "GPU-aaaa"), (1, 0, "GPU-bbbb")])
+    assert errors == [None, None]
+
+
+def test_the_rank_device_assert_refuses_when_two_ranks_land_on_one_card(tmp_path, monkeypatch):
+    # the failure that killed 7/7 multi-gpu runs. the second rank finds rank 0's uuid already
+    # claimed and refuses, minutes before nccl would abort with a pci id and no rank mapping.
+    errors = _run_rank_device_check(tmp_path, monkeypatch, [(0, 0, "GPU-same"), (1, 0, "GPU-same")])
+    assert errors[0] is None
+    assert errors[1] is not None
+    # the message has to carry the mapping: naming the colliding ranks is the entire diagnostic
+    # value over the nccl abort it front-runs.
+    assert "GPU-same" in errors[1]
+    assert "[0, 1]" in errors[1]
+
+
+def test_the_rank_device_assert_reads_the_rank_verl_resolved_not_the_environment(
+    tmp_path, monkeypatch
+):
+    # the claims file is keyed by rank, so a rank that every actor agrees on collapses the set to
+    # one entry and the collision stops being visible. pin the source: RANK is held at 0 for both
+    # actors while the workers carry 0 and 1, and the check must still refuse.
+    errors = _run_rank_device_check(
+        tmp_path,
+        monkeypatch,
+        [(0, 0, "GPU-same"), (1, 0, "GPU-same")],
+        env_rank=0,
+    )
+    assert errors[0] is None
+    assert errors[1] is not None
+    assert "[0, 1]" in errors[1]
+
+
+def test_the_rank_device_assert_has_no_rank_zero_default_to_fall_back_on():
+    # a getenv("RANK", "0") would make an unset RANK report every actor as rank 0, which is the one
+    # value that turns this check into a no-op. verl reads os.environ["RANK"] unconditionally in the
+    # same __init__, so an absent RANK is already fatal there -- this keeps it fatal here too.
+    source = verl_shims.render_rank_device_assert_shim(2)
+    assert 'environ.get("RANK"' not in source
+    assert 'environ["RANK"]' in source
 
 
 def test_multimodal_rows_match_verl_placeholder_assertion():
@@ -1358,9 +1797,9 @@ def _save_steps_inputs(monkeypatch, *, save_at_steps=None, save_every=None, max_
 
 
 def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
-    # verl only saves when global_step % save_freq == 0, so it cannot hit an arbitrary set directly.
-    # the gcd is the largest interval every required step divides, so verl writes a superset of the
-    # checkpoints and the uploader publishes deployables at exactly the requested ones.
+    # periodic saves land only when global_step % save_freq == 0, so they cannot hit an arbitrary set
+    # directly. the gcd is the largest interval every required step divides, so verl writes a superset
+    # of the checkpoints and the uploader publishes deployables at exactly the requested ones.
     inp = _save_steps_inputs(monkeypatch, save_at_steps=(10, 25, 100))
     assert inp["save_freq"] == 5
     assert inp["save_at_steps"] == (10, 25, 100)
@@ -1369,10 +1808,22 @@ def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
 
 
 def test_save_freq_falls_back_to_save_every_without_exact_steps(monkeypatch):
-    # no exact steps: periodic saves are preserved on the customer's own interval.
+    # a long run preserves the customer's interval, so the clamp never increases normal frequency.
     inp = _save_steps_inputs(monkeypatch, save_every=15)
+    assert inp["steps"] == 100
     assert inp["save_freq"] == 15
     assert inp["save_at_steps"] == ()
+
+
+def test_short_derived_horizon_clamps_save_freq_to_the_final_step(monkeypatch):
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(example_count=800),
+        train={"max_examples": 800, "epochs": 1, "prompts_per_step": 64},
+    )
+    assert inp["steps"] == 13
+    assert inp["save_freq"] == 13
+    assert inp["steps"] % inp["save_freq"] == 0
 
 
 def test_save_steps_reach_the_horizon_they_were_validated_against(monkeypatch):
@@ -2241,6 +2692,8 @@ def test_reward_server_rejects_out_of_range_index_before_lookup(index):
 
 
 def test_reward_bridge_lookup_failure_raises(monkeypatch):
+    # the index is IN range, so the scorer's own IndexError is the ENV failing, not a bad request:
+    # it is reported as a server fault carrying the cause rather than as a malformed-payload 400.
     def missing_example(idx, solution_str):
         raise IndexError(idx)
 
@@ -2250,7 +2703,7 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
         ns: dict = {}
         src = rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
         exec(compile(src, "<reward>", "exec"), ns)
-        with pytest.raises(RuntimeError, match="reward bridge request failed"):
+        with pytest.raises(RuntimeError, match=r"could not serve the request .*IndexError: 99"):
             ns["compute_score"](
                 "flash_env",
                 "answer",
@@ -2259,6 +2712,201 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
             )
     finally:
         server.shutdown()
+
+
+def test_reward_server_reports_thread_exhaustion_as_a_server_fault():
+    """Thread exhaustion is 503 WITH its cause, not 400.
+
+    Under rollout concurrency the scoring thread pool can fail to start a thread; the handler used
+    to answer 400 for that, which asserts the caller sent something wrong. Here score_episode
+    cannot produce a 400 at all (it returns a well-formed result carrying `error`), so a 400 sent
+    every reader to the one component provably not at fault.
+    """
+
+    def exhausted(index, solution_str):
+        raise RuntimeError("can't start new thread")
+
+    server, url = rl_train.start_reward_server(exhausted, example_count=4)
+    try:
+        body = json.dumps({"index": 0, "solution_str": "answer"}).encode()
+        req = urllib.request.Request(
+            url + "/score", data=body, headers={"Content-Type": "application/json"}
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 503, "a resource fault must not be reported as a bad request"
+        # the cause has to survive to the client: naming the failing resource is the whole point.
+        assert "can't start new thread" in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "env_error",
+    [IndexError("list index out of range"), KeyError("grader internal lookup failed")],
+)
+def test_an_env_raising_indexerror_or_keyerror_is_a_server_fault_not_a_bad_request(env_error):
+    """Classifying by exception TYPE reintroduces the bug one layer down.
+
+    The bridge rejects a bad index with IndexError and an unknown session with KeyError, so a tuple
+    of those types around the ROUTE CALL also catches the same types raised by a user env deep
+    inside its own scoring -- reporting a valid request as malformed. ScoreBatcher re-raises a GRPO
+    batch error into every waiter as-is, so one env KeyError would 400 every request in the batch.
+    """
+
+    def failing_env_scorer(index, solution_str):
+        raise env_error
+
+    server, url = rl_train.start_reward_server(failing_env_scorer, example_count=4)
+    try:
+        req = urllib.request.Request(
+            url + "/score",
+            data=json.dumps({"index": 0, "solution_str": "x"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 503, (
+            "the request was valid and the ENV failed; blaming the caller is the original bug"
+        )
+        assert type(env_error).__name__ in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"index": 1e309, "solution_str": "x"}, "not an integer"),  # json inf -> int() overflows
+        ([], "must be a json object"),  # valid json, invalid request object
+        ({"solution_str": "x"}, "missing required field"),
+    ],
+)
+def test_a_malformed_request_shape_is_a_client_error_not_a_server_fault(payload, expected):
+    """A body this bridge cannot read is the caller's fault, so it must not read as unavailable."""
+    server, url = rl_train.start_reward_server(lambda i, s: 1.0, example_count=4)
+    try:
+        req = urllib.request.Request(
+            url + "/score",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 400
+        body = exc_info.value.read().decode()
+        assert expected in body
+        # the private class name is not something a caller can act on.
+        assert "_Bad" not in body, "an internal exception class leaked into the client message"
+    finally:
+        server.shutdown()
+
+
+def test_the_generated_single_turn_reward_module_surfaces_the_bridges_cause(monkeypatch):
+    """The REAL single-turn caller must not drop the detail the server now supplies.
+
+    `HTTPError` is a `URLError` subclass, so a single `except URLError` catches it first and never
+    reads the body -- leaving "HTTP Error 503: Service Unavailable", which names no cause. Asserting
+    on the server response alone would pass while the user-visible path stayed detail-free.
+    """
+
+    def exhausted(index, solution_str):
+        raise RuntimeError("can't start new thread")
+
+    server, url = rl_train.start_reward_server(exhausted, example_count=4)
+    try:
+        monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
+        ns: dict = {}
+        src = rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
+        exec(compile(src, "<reward>", "exec"), ns)
+        with pytest.raises(RuntimeError) as exc_info:
+            ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": 0})
+        message = str(exc_info.value)
+        assert "can't start new thread" in message, "the cause never reached the training loop"
+        assert "could not serve" in message
+    finally:
+        server.shutdown()
+
+
+def test_reward_server_still_rejects_a_malformed_request_as_a_client_error():
+    """The 5xx split must not turn genuine client errors into server faults.
+
+    A non-integer index and an unknown session id are the caller's fault at any capacity, so both
+    stay 400 -- otherwise the new status would tell a caller to retry a request that can never work.
+    A no-regression guard, not evidence of the split: these were 400 under the old catch-all too.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=2,
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+    try:
+        for path, payload in (
+            ("/score", {"index": "not-an-int", "solution_str": "x"}),
+            ("/multiturn/step", {"session_id": "nope", "completion_text": "x"}),
+        ):
+            req = urllib.request.Request(
+                url + path,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                urllib.request.urlopen(req, timeout=10)
+            assert exc_info.value.code == 400, f"{path} is a client error at any capacity"
+    finally:
+        server.shutdown()
+        bridge.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "expected_fault"),
+    [
+        (503, "RuntimeError: can't start new thread", "could not serve"),
+        (400, "IndexError: index 9 is outside [0, 4)", "rejected"),
+    ],
+)
+def test_the_child_surfaces_the_bridges_error_text_not_just_the_status(
+    monkeypatch, status, detail, expected_fault
+):
+    """`suppress(Exception)` around the raise swallowed the detail-bearing error itself.
+
+    The bridge puts its real cause in the response body, the child decoded it, built the
+    RuntimeError naming it -- and the suppress ate that raise, so the generic "returned HTTP 400"
+    was the ONLY message that could ever escape. The cause must reach the user, and a 5xx must not
+    read as a rejected request.
+    """
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
+
+    def raise_http_error(*_a, **_k):
+        payload = json.dumps({"error": detail}).encode()
+        raise urllib.error.HTTPError(
+            "http://bridge/multiturn/score", status, "err", {}, io.BytesIO(payload)
+        )
+
+    monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(RuntimeError) as exc_info:
+        grpo_multiturn.post_json("http://bridge", "/multiturn/score", {})
+    message = str(exc_info.value)
+    assert detail in message, "the bridge's own cause never reached the caller"
+    assert expected_fault in message
+
+
+def test_the_child_names_the_status_when_the_body_carries_no_detail(monkeypatch):
+    """An undecodable body must still produce a message naming what happened."""
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
+
+    def raise_http_error(*_a, **_k):
+        raise urllib.error.HTTPError(
+            "http://bridge/multiturn/score", 503, "err", {}, io.BytesIO(b"not json")
+        )
+
+    monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(RuntimeError, match=r"could not serve .*HTTP 503 with no error detail"):
+        grpo_multiturn.post_json("http://bridge", "/multiturn/score", {})
 
 
 def test_reward_server_scorer_can_capture_samples():
@@ -2334,7 +2982,25 @@ def test_the_reentrant_shim_installs_vision_input_grads_only_for_multimodal_runs
     assert "visual.patch_embed" in multimodal
     # the call has to land INSIDE the checkpointing branch: dedented one level it would run for
     # every module verl builds, including engines whose checkpointing verl deliberately left off.
-    assert "\n        _flash_install_vision_input_grads(module)\n" in multimodal
+    # asserted over the PARSED tree rather than a fixed indent, because the whole fragment is
+    # indented into a deferred body (see shims._deferred_patch) and a literal-column check would
+    # then fail for a reason that has nothing to do with where the call sits.
+    import ast as _ast
+
+    guards = [
+        node
+        for node in _ast.walk(_ast.parse(multimodal))
+        if isinstance(node, _ast.If) and "enable_gradient_checkpointing" in _ast.dump(node.test)
+    ]
+    assert len(guards) == 1, "expected exactly one gradient-checkpointing guard"
+    nested = [
+        node
+        for node in _ast.walk(guards[0])
+        if isinstance(node, _ast.Call)
+        and isinstance(node.func, _ast.Name)
+        and node.func.id == "_flash_install_vision_input_grads"
+    ]
+    assert nested, "the vision hook must be called inside the checkpointing branch"
     # the flag is independent of the shim: a multimodal run on a model that does not need reentrant
     # checkpointing gets no shim at all, and therefore no hook.
     assert rl_train.render_reentrant_checkpointing_shim(False, multimodal=True) == ""
@@ -2543,7 +3209,7 @@ def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alon
         for name in parents:
             sys.modules.setdefault(name, types.ModuleType(name))
         sys.modules[module_stub.__name__] = module_stub
-        exec(rl_train.render_reentrant_checkpointing_shim(True), {})
+        _exec_shim_fragment(rl_train.render_reentrant_checkpointing_shim(True))
         # checkpointing on -> the flag is put back to reentrant, and the lora-frozen embeddings
         # get input grads so the checkpointed segment actually produces a backward (GRAD-001)
         engine = _Engine(True)
@@ -2690,7 +3356,7 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(source, "sitecustomize.py", "exec"), {})
+        _exec_shim_fragment(source)
         asyncio.run(_AgentLoopWorker()._run_agent_loop({"temperature": 1.0}))
     finally:
         for name in stubs:
@@ -2757,7 +3423,7 @@ def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(source, "sitecustomize.py", "exec"), {})
+        _exec_shim_fragment(source)
         # called exactly as verl calls it (agent_loop.py:583): two positionals plus keywords.
         asyncio.run(
             _AgentLoopWorker()._run_agent_loop(
@@ -2910,7 +3576,7 @@ def _load_kl_ref_engine():
         sys.modules[name] = module
     try:
         source = rl_train.render_kl_ref_adapter_shim(True)
-        exec(compile(source, "sitecustomize.py", "exec"), {})
+        _exec_shim_fragment(source)
     finally:
         for name in stubs:
             sys.modules.pop(name, None)
@@ -3866,7 +4532,7 @@ def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
 # each test pins one rejection message so deleting a guard cannot pass via another raise.
 
 
-def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
+def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None, example_count=8):
     """a minimal single-turn text env, optionally flipped to a shape verl grpo handles differently.
 
     ``image_uri`` must be a source the normalizer accepts offline (a data uri): a remote https url
@@ -3883,7 +4549,7 @@ def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
             self.max_turns = 3 if multi_turn else 0
 
         def dataset(self):
-            return [{"index": i} for i in range(8)]
+            return [{"index": i} for i in range(example_count)]
 
         # the four calls the multi-turn bridge drives an env through. defined unconditionally so a
         # test can delete one and assert the capability gate catches it.
@@ -4856,6 +5522,27 @@ def test_bridge_score_converts_a_non_finite_episode_to_zero():
         assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
 
 
+def test_per_turn_credit_without_turn_rewards_warns_once_and_keeps_fallback(capsys):
+    env = _BridgeEnv(episode=0.75)
+    bridge = _bridge(env, per_turn_credit=True)
+    for index, session_id in enumerate(("a", "b")):
+        bridge.start({"index": index, "session_id": session_id})
+        bridge.step({"session_id": session_id, "completion_text": "answer"})
+        assert bridge.score({"session_id": session_id, "turn_count": 1}) == {
+            "score": 0.75,
+            "turns": None,
+        }
+
+    out = capsys.readouterr().out
+    warning = "per-turn credit was requested"
+    assert out.count(warning) == 1
+    # the fallback the shim actually applies is per group, not per run
+    # (test_per_turn_credit_shim_leaves_other_groups_on_episode_credit), so a warning claiming the
+    # run switched schemes would misreport which credit assignment trained the model.
+    assert "rollout group" in out
+    assert "this run falls back" not in out
+
+
 def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
     # multi-turn has no per-completion breakdown -- the env scores a whole episode to a scalar --
     # so the transcript IS the only thing this path can publish for `flash runs log`.
@@ -5373,301 +6060,6 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
     assert f"data.max_response_length={inp['max_response_len']}" in rl_train.build_verl_overrides(
         cfg
     )
-
-
-# ---------------------- measured reward latency in train_meta ----------------------
-def _resolved_inputs_for_notes(monkeypatch):
-    """A resolved single-turn input dict, offline.
-
-    Mirrors the resolver fixture above: _resolve_grpo_inputs needs a loaded env, a spec and
-    a tokenizer, none of which exist in a unit test.
-    """
-    from flash.core.spec import JobSpec
-    from flash.engine.worker.runtime.pkg_proxy import W
-
-    class _Env:
-        multi_turn = False
-        is_tool_env = False
-
-        def dataset(self):
-            return [{"index": i} for i in range(33)]
-
-        def prompt_messages(self, ex):
-            return [{"role": "user", "content": f"question {ex['index']}"}]
-
-    class _Tokenizer:
-        pad_token = None
-        eos_token = "<eos>"
-
-        def apply_chat_template(self, messages, **kwargs):
-            return messages[0]["content"]
-
-        def __call__(self, text, **kwargs):
-            return SimpleNamespace(input_ids=[1])
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "grpo",
-            "train": {"prompts_per_step": 16, "epochs": 2},
-        }
-    )
-    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
-    monkeypatch.setattr(W, "SEED", 42, raising=False)
-    monkeypatch.setattr(W, "THINKING", False, raising=False)
-    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    monkeypatch.setattr(W, "grpo_overrides", dict, raising=False)
-    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
-    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
-    monkeypatch.setattr(rl_train, "seed_training_rngs", lambda seed: None)
-    monkeypatch.setattr(rl_train, "model_max_position_embeddings", lambda *a, **k: 40960)
-    return rl_train._resolve_grpo_inputs()
-
-
-def _profile(seconds: float, *, trustworthy: bool = True):
-    """A RewardProfile shaped like the profiler's real output."""
-    from flash.engine.profiling.reward_profile import RewardProfile
-
-    return RewardProfile(
-        seconds_per_completion=seconds,
-        samples=0 if not trustworthy else 3,
-        degenerate=False,
-        failures=0,
-    )
-
-
-def test_train_notes_record_the_measured_grading_latency(monkeypatch):
-    """The measurement has to outlive the log line to be usable by anything downstream.
-
-    A latency that only reaches stdout cannot price a run or place one: the cost model would keep
-    using its single 1.0s average for an env just measured at 0.02s.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=5,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(0.25),
-        step_intervals=[10.0],
-    )
-    assert notes["reward_seconds_per_completion"] == 0.25
-
-
-def test_train_notes_omit_an_untrustworthy_profile(monkeypatch):
-    """A profile that measured nothing must record None, not a number.
-
-    RewardProfile.trustworthy is False when no sample graded successfully; writing its 0.0 into
-    train_meta would read downstream as a genuinely instant grader.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=5,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(0.0, trustworthy=False),
-        step_intervals=[10.0],
-    )
-    assert notes["reward_seconds_per_completion"] is None
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_train_notes_report_idle_fraction_from_the_runs_own_step_wall(monkeypatch):
-    """The idle share is computed from measured wall time, not from the cost model's estimate.
-
-    Deriving it from the modelled step would report the estimator's own opinion back to it, which
-    is exactly the number an operator would want to CHECK against reality.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    # a step wall of 10s, of which grading accounts for 8s -> 80% idle.
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 10,
-    )
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_train_notes_do_not_publish_the_serial_idle_projection_when_batching(monkeypatch):
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(8.0 / completions),
-        step_intervals=[10.0] * 10,
-        reward_bridge_batching=True,
-    )
-
-    assert notes["reward_bridge_batching"] is True
-    assert notes["reward_seconds_per_completion"] == 8.0 / completions
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_idle_fraction_is_none_when_grading_exceeds_the_measured_step(monkeypatch):
-    """Grading that fills the whole step leaves no gpu-bound remainder to divide.
-
-    The profile and the observed wall disagree here (a warm-up latency that no longer holds, or a
-    step wall dominated by something else), and neither can arbitrate, so the honest record is no
-    reading rather than a fabricated 100%.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        # 20s of grading inside a 10s measured step
-        reward_profile=_profile(20.0 / completions),
-        step_intervals=[10.0] * 10,
-    )
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_idle_fraction_ignores_steps_this_worker_did_not_run(monkeypatch):
-    """A resumed run must divide by ITS steps, not by the checkpoint's absolute step number.
-
-    steps_run comes from the checkpoint directory and counts every step the run has ever taken;
-    the wall clock only ever covers this session. A worker resuming at 90 and training to 100
-    walled ten steps, and charging those seconds against a hundred understates each step by 10x --
-    which inflates the idle share toward 100% and would route the run to a co-location tier it
-    cannot sustain. Feeding the measured intervals removes the term entirely.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        # the checkpoint says 100 steps; this worker observed ten, each a real 10s step.
-        steps_run=100,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 10,
-    )
-    # unchanged from the fresh-run case above: resume does not move the reading.
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_idle_fraction_is_unmoved_by_one_slow_step(monkeypatch):
-    """A checkpoint save lands inside a single step interval and must not set the verdict.
-
-    Every save-step gap carries an upload that the other steps never pay. Averaging lets one such
-    step drag the whole reading -- here a 200s outlier among 10s steps would report ~28s/step and
-    flip an 80% idle run to 29%. The median needs MOST steps to be slow before it moves.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 9 + [200.0],
-    )
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_idle_fraction_is_none_when_no_step_was_timed(monkeypatch):
-    """A run that never emitted two step lines has no measured step to divide by.
-
-    One step line yields zero intervals by design (the span before it is engine startup), and a
-    run that died in its first step yields none at all. Both must record no reading rather than
-    fall back to a modelled step, which is the number this metric exists to check.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=1,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(8.0 / completions),
-        step_intervals=[],
-    )
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_step_intervals_exclude_the_span_before_the_first_step():
-    """Engine init, weight load and cudagraph capture precede the first step line.
-
-    That span is setup, paid once, and often larger than a step. Counting it as a step would
-    inflate the step wall and understate the idle share on exactly the short runs where the
-    startup cost dominates. N step lines bound N-1 steps, never N.
-    """
-    assert rl_train._step_intervals([100.0, 110.0, 122.0]) == [10.0, 12.0]
-    # a single step line bounds no whole step: nothing is known about what came before it or after.
-    assert rl_train._step_intervals([100.0]) == []
-    assert rl_train._step_intervals([]) == []
-
-
-def test_the_profile_hook_returns_its_reading_to_the_caller():
-    """_log_reward_profile must RETURN the profile, not only print it.
-
-    Asserted against the real hook rather than a fixture: the wiring under test is that the run
-    body can capture what the profiler measured.
-    """
-
-    class Env:
-        def sft_completion(self, example):
-            return [{"role": "assistant", "content": "an answer worth grading"}]
-
-    profile = rl_train._log_reward_profile(
-        Env(), lambda index, completion: 1.0, [{"id": i} for i in range(4)], 32
-    )
-    assert profile is not None
-    assert profile.trustworthy
-
-
-def test_the_run_body_passes_the_measured_profile_into_train_meta():
-    """The captured profile must actually reach the notes builder.
-
-    Source-level, because reaching this line in a live run needs a gpu. Without it the hook could
-    return a profile that the run body drops on the floor, and every other test here would still
-    pass while train_meta always recorded None.
-    """
-    reward_src = inspect.getsource(rl_train._start_reward_runtime)
-    entry_src = inspect.getsource(rl_train.run_rl_train)
-    metadata_src = inspect.getsource(rl_train._write_terminal_metadata)
-    assert "_log_reward_profile(" in reward_src, "the hook is never called"
-    assert "reward_profile = " in reward_src, "the hook's reading is discarded"
-    assert "reward_runtime=reward_runtime" in entry_src, "the reading never reaches train_meta"
-    assert "reward_profile=reward_runtime.reward_profile" in metadata_src, (
-        "the reading never reaches train_meta"
-    )
-    assert 'reward_bridge_batching=not inp["multi_turn"]' in metadata_src
-
-
-def test_the_reward_profiler_is_skipped_on_multi_turn():
-    """The profiler times the SINGLE-TURN grading path, which a multi-turn env does not have.
-
-    Source-level for the same reason as above. Running it on a multi-turn env would call
-    env.reward/scores_breakdown on one completion -- a call that env's contract does not define --
-    and record the resulting number as if it described the episode reward path.
-    """
-    src = inspect.getsource(rl_train._start_reward_runtime)
-    profile_call = src[src.index("reward_profile = ") : src.index("multi_turn_bridge = ")]
-    assert 'if inp["multi_turn"]' in profile_call, "the profiler is not gated off multi-turn"
-    assert "None" in profile_call, "multi-turn must record no profile rather than a wrong one"
 
 
 # ---------------- reward observability: the buffer and the heartbeat drain ----------------
@@ -6315,10 +6707,11 @@ def test_the_first_sample_bearing_heartbeat_is_forced():
     # drops a second payload at an already-committed step. without force, the first heartbeat
     # carrying samples is exactly the one most likely to be suppressed.
     src = inspect.getsource(rl_train._ingest_step_metrics)
-    forced = src[src.index("if not sent_first_metrics:") :]
+    forced = src[src.index("if not state.sent_first_metrics or") :]
     forced = forced[: forced.index("gpu=gpu_diagnostics")]
+    assert "heartbeat_fields = _reward_observability()" in src
     assert "force=True" in forced
-    assert "**_reward_observability()" in forced
+    assert "**heartbeat_fields" in forced
 
 
 def test_the_liveness_fields_hook_carries_reward_observability():
@@ -6347,7 +6740,7 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     # sealed on the new-step branch, and BEFORE the preview reads the published rows so the logged
     # sample and the heartbeat describe the same generation.
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = int(m.group(1))') :]
+    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = step_number') :]
     assert 'reward_runtime.observability.close_generation(progress["step"])' in stdout_loop
     assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
         'samp = reward_runtime.observability.latest_for_step(progress["step"])'
@@ -6468,7 +6861,7 @@ def _run_per_turn_shim(rows, uids, episode_advantages, response_mask=None):
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(rl_train.render_per_turn_credit_shim(True), "sitecustomize.py", "exec"), {})
+        _exec_shim_fragment(rl_train.render_per_turn_credit_shim(True))
         # call the module global by name, exactly as ray_trainer.fit does at its call site.
         out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
     finally:
@@ -6642,7 +7035,7 @@ def test_per_turn_credit_shim_passes_through_a_batch_without_per_turn_metadata()
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(rl_train.render_per_turn_credit_shim(True), "sitecustomize.py", "exec"), {})
+        _exec_shim_fragment(rl_train.render_per_turn_credit_shim(True))
         out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
     finally:
         for name in stubs:
@@ -7128,6 +7521,9 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     files = _shim_files(tmp_path)
     inp = {
+        # one card: the rank/device assertion renders empty, so it owes no marker here. the
+        # multi-card case is pinned by the test below.
+        "dp_cards": 1,
         "reentrant_checkpointing": True,
         "multimodal": False,
         "entropy_quantile": 0.2,
@@ -7149,6 +7545,9 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
         "stop-sequences",
         "exact-save-steps",
         "kl-ref-adapter",
+        # unconditional: every flash rollout is a lora rollout, so there is no configuration in
+        # which a base-model fallback is the intended behavior.
+        "lora-rollout-guard",
     ]
     source = Path(files["shim_py"]).read_text()
     # the wrap indents whole fragments into try blocks; a syntax slip would turn the child's
@@ -7156,11 +7555,46 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
     compile(source, "sitecustomize.py", "exec")
     for name in expected:
         assert f"_flash_record_applied_shim({name!r})" in source
+    # the canonical fragment records once through its deferred hook, never at wrapper startup.
+    assert source.count("_flash_record_applied_shim('lora-rollout-guard')") == 1
+    assert "_flash_lora_rollout_guard_applied()" in source
     assert "per-turn-credit" not in source
     # tf32 stays first and unwrapped: it swallows its own failures by design and a later fragment
     # that raised must not be able to cost the run its tensor-core throughput.
     assert source.index("tf32") < source.index("_FLASH_SHIM_MARKER_FILE")
     assert f"_flash_shim_os._exit({backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
+
+
+def test_write_rl_shim_puts_the_rank_device_assert_first_when_the_run_spans_cards(
+    tmp_path, monkeypatch
+):
+    # the whole point of the assertion is to report a collapsed rank->device map before the model
+    # load that currently buries it, so it owes a marker and it owes the first position. a run that
+    # reaches nccl before this fragment applies has already lost the diagnostic.
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    files = _shim_files(tmp_path)
+    inp = {
+        "dp_cards": 2,
+        "reentrant_checkpointing": True,
+        "multimodal": False,
+        "entropy_quantile": None,
+        "per_turn_credit": False,
+        "stop_sequences": (),
+        "image_pad_token_id": None,
+        "structured_outputs": None,
+        "save_at_steps": (),
+        "steps": 20,
+        "warmstart_adapter": None,
+        "kl_coef": 0.0,
+        "multi_turn": False,
+    }
+    expected = rl_train._write_rl_shim(inp, files)
+    assert expected == ["rank-device-assert", "reentrant-checkpointing", "lora-rollout-guard"]
+    source = Path(files["shim_py"]).read_text()
+    compile(source, "sitecustomize.py", "exec")
+    assert source.index("_flash_record_applied_shim('rank-device-assert')") < source.index(
+        "_flash_record_applied_shim('reentrant-checkpointing')"
+    )
 
 
 def test_the_gdn_varlen_append_is_wrapped_and_extends_the_expected_marker_set():
@@ -7177,7 +7611,7 @@ def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
     provably finished (fragments print while later ones are still applying, so the first OUTPUT
     line would race the file). a missing marker there means the child trains unpatched."""
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    step_at = stdout_loop.index('progress["step"] = int(m.group(1))')
+    step_at = stdout_loop.index("step_number = verl_step_number(line)")
     verify_at = stdout_loop.index("verify_applied_shim_markers(shim_markers, expected_shims)")
     assert step_at < verify_at < stdout_loop.index("close_generation")
     # and the entry point wires the files dict (marker path + expected set) into both the loop

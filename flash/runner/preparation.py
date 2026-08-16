@@ -92,7 +92,7 @@ def _inherit_warmstart_revision(
     """Adopt a warm-start source's pin BEFORE the spec is sized against it.
 
     Sizing reads the revision: ``resolve_model`` re-derives params/vocab/disk from the pinned
-    commit's geometry, and ``min_disk_gb`` becomes ``params_b * 2 + 64``, which for half of today's
+    commit's geometry, and ``min_disk_gb`` becomes ``ceil(2 * params_b) + 64``, which for half of today's
     catalog is strictly larger than the catalog default. Adopting the pin only inside
     ``_prepare_init_from_adapter`` -- which runs after ``resolve_model``, ``_with_model_disk``, and
     ``_assign_weight_cache_volume`` -- would provision the child as if unpinned while training it
@@ -143,7 +143,7 @@ def _prepare_init_from_adapter(
     owner_org_id: str = "",
     owner_key_id: int | None = None,
     token: str | None = None,
-) -> tuple[JobSpec, JobSpec, dict | None]:
+) -> tuple[JobSpec, JobSpec, dict | None, int | None]:
     """prepare public and worker specs with source-authoritative adapter metadata.
 
     Failures here are genuinely about the warm-start source, so they are tagged
@@ -168,11 +168,11 @@ def _prepare_init_from_adapter_inner(
     owner_org_id: str = "",
     owner_key_id: int | None = None,
     token: str | None = None,
-) -> tuple[JobSpec, JobSpec, dict | None]:
+) -> tuple[JobSpec, JobSpec, dict | None, int | None]:
     _runner()._require_supported_adapter_continuation(spec)
     ref = spec.train.init_from_adapter
     if not ref:
-        return spec, spec, None
+        return spec, spec, None, None
     from flash.adapters.lora_rank import (
         adapter_artifact_identity,
         load_hf_adapter_config,
@@ -265,7 +265,8 @@ def _prepare_init_from_adapter_inner(
         worker_spec,
         train=replace(worker_spec.train, lora_rank=metadata.rank, lora_alpha=metadata.alpha),
     )
-    return public_spec, worker_spec, identity
+    source_context = int(getattr(src_spec.train, "max_context_tokens", 0) or 0) or None
+    return public_spec, worker_spec, identity, source_context
 
 
 def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
@@ -527,7 +528,18 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
             effective_environment["resolved_sha"] = ""
     effective["environment"] = effective_environment
     public_gpu = dict(public["gpu"])
+    # `type` is excluded for the same reason `count` is below: _spec_with_gpu writes the selected
+    # class onto the worker spec. the fallbacks ride with it -- they qualify `type`, so comparing
+    # them against a public half whose head has not been rewritten would fail every ordered pin
+    # that allocated to anything but its first class.
     effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
+    # `to_internal_dict` omits an empty fallback list rather than emitting one, so mirror the key's
+    # presence as well as its value -- writing an unconditional `()` here would add a key the public
+    # half does not carry and fail every single-class run.
+    if public_gpu.get("type_fallbacks"):
+        effective_gpu["type_fallbacks"] = public_gpu["type_fallbacks"]
+    else:
+        effective_gpu.pop("type_fallbacks", None)
     # _spec_with_gpu writes the SELECTED count onto the worker spec -- the worker sizes its
     # rank count from it and the provider payload rents it -- so comparing it against the
     # authored ceiling would fail every narrowed run here, before any provider is reached.
@@ -619,14 +631,20 @@ def _profile_producer_version() -> str:
 
 
 def _require_pinned_profile_environment(spec: JobSpec) -> JobSpec:
-    pinned = _runner()._assign_resolved_env_sha(spec)
+    pinned, reason = _runner()._pin_env_sha_with_reason(spec)
     if not pinned.environment.id:
         raise _runner().WorkloadProfileUnavailable(
             "sft workload profiling requires an environment id"
         )
     if not pinned.environment.resolved_sha:
+        # the pin is best-effort, so reaching here says only that it did not happen -- and the four
+        # causes (a ref that does not exist, a rate limit, an outage, a private repo the token
+        # cannot read) need four different fixes. GitHub already answered with which one; name it
+        # instead of describing the missing pin it produced.
+        detail = f": {reason}" if reason else ""
         raise _runner().WorkloadProfileUnavailable(
-            "sft workload profiling requires a pinned environment package revision"
+            f"sft workload profiling requires a pinned environment package revision, but "
+            f"{spec.environment.id!r} could not be resolved{detail}"
         )
     return pinned
 

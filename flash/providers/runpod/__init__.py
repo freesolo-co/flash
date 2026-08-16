@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 from flash.providers._lifecycle.deadline import deadline_kwargs
@@ -14,6 +15,16 @@ from flash.providers.base import (
     Provider,
     rentable_gpu_counts,
 )
+
+
+def terminate_persisted_endpoints(spec: Any, run_id: str) -> None:
+    """Best-effort teardown for every GPU class named by a raw persisted spec."""
+    from flash.core.spec import persisted_gpu_types
+    from flash.providers.runpod.serverless import terminate_endpoint
+
+    for gpu_type in persisted_gpu_types(spec):
+        with contextlib.suppress(Exception):
+            terminate_endpoint(gpu_type, run_id)
 
 
 class RunpodProvider:
@@ -98,7 +109,7 @@ class RunpodProvider:
         log: Any = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        from flash.core.spec import require_matching_seed
+        from flash.core.spec import gpu_count_of, require_matching_seed
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.jobs import (
             make_hf_failure_detail_reader,
@@ -147,7 +158,12 @@ class RunpodProvider:
             # the persisted scarcity flag controls stall grace, not capacity wording. recovery
             # rebuilds the unpinned allocation with a fresh candidate set, so claiming no escalation
             # remains would be false.
-            **stall_kwargs(on_last_gpu=on_last_gpu),
+            #
+            # the card count comes from the spec rather than the handle's `allocated_gpu_count`:
+            # attach polls the persisted EFFECTIVE worker spec, which submission already stamped
+            # with the count allocation resolved, and the attach context pops that handle key off
+            # before the handle reaches here. same number, but sourced where it is always present.
+            **stall_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
         )
 
     def cancel(self, handle: JobHandle) -> None:
@@ -184,7 +200,11 @@ class RunpodProvider:
     def gc(self, spec) -> None:
         from flash.providers.runpod.serverless import terminate_endpoint
 
-        terminate_endpoint(spec.gpu.type, spec.run_id)
+        # every acceptable class, not just the head: allocation ranks a multi-class pin on cost and
+        # may rent a fallback, whose endpoint name is derived from that class. matching is by name,
+        # so naming a class this run never rented is a no-op.
+        for gpu_type in spec.gpu.acceptable_types:
+            terminate_endpoint(gpu_type, spec.run_id)
 
     def sweep_orphans(
         self,

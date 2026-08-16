@@ -93,10 +93,15 @@ def prepare_job(
                 raise ValueError(f"unknown gpu.provider {spec.gpu.provider!r}")
             if provider not in configured:
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
-        elif spec.gpu.type and not any(name in configured for name in providers_for(spec.gpu.type)):
-            # the preference stays soft even when none of its named providers carries this class:
-            # unnamed configured providers still serve it, and only a fleet-wide miss is unsatisfiable.
-            raise ValueError(f"no configured provider can provision gpu.type {spec.gpu.type!r}")
+            for gpu_type in spec.gpu.acceptable_types:
+                if provider not in providers_for(gpu_type):
+                    raise ValueError(
+                        f"gpu.provider {provider!r} cannot provision gpu.type {gpu_type!r}"
+                    )
+        else:
+            for gpu_type in spec.gpu.acceptable_types:
+                if not any(name in configured for name in providers_for(gpu_type)):
+                    raise ValueError(f"no configured provider can provision gpu.type {gpu_type!r}")
     info = _runner().resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
     if spec.algorithm == "opd" and spec.train.structured_outputs:
         # the generic serving preflight above validates the schema's SHAPE, but the
@@ -122,20 +127,44 @@ def prepare_job(
     owner_org_id = _runner()._context_org_id(billing_context) or _runner()._context_org_id(
         platform_context
     )
-    public_spec, worker_spec, adapter_identity = _runner()._prepare_init_from_adapter(
-        spec,
-        owner_org_id=owner_org_id,
-        owner_key_id=owner_key_id,
-        token=os.environ.get("HF_TOKEN"),
+    public_spec, worker_spec, adapter_identity, warm_start_context = (
+        _runner()._prepare_init_from_adapter(
+            spec,
+            owner_org_id=owner_org_id,
+            owner_key_id=owner_key_id,
+            token=os.environ.get("HF_TOKEN"),
+        )
     )
+    # these read-only gates belong to preparation: every submit path passes here exactly once, and
+    # callers receive the pinned worker spec before quoting, affordability, persistence, or allocation.
+    worker_spec, environment_ref_deferred = _runner().preflight_validate_environment_ref(
+        worker_spec
+    )
+    from flash.content.multimodal import preflight_validate_image_opd
+    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+
+    preflight_validate_image_opd(
+        worker_spec,
+        scan_packaged_environment=not environment_ref_deferred,
+    )
+    preflight_validate_managed_teacher(worker_spec)
     from flash.cost.spec import estimate_for_spec
 
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
+    # derive the rl prompt budget from the same resolved spec the quote is built from, so the
+    # reported budget describes the run that was actually priced and submitted.
+    from flash.engine.plan.prompt_budget import rl_prompt_budget
+
+    prompt_budget = rl_prompt_budget(
+        worker_spec,
+        warm_start_context=warm_start_context,
+    )
     return _runner().PreparedJob(
         public_spec=public_spec,
         worker_spec=worker_spec,
         estimated_cost_usd=estimated_cost_usd,
         adapter_identity=adapter_identity,
+        prompt_budget=prompt_budget,
     )
 
 
@@ -230,11 +259,6 @@ def submit_job(
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
-    from flash.content.multimodal import preflight_validate_image_opd
-    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
-
-    preflight_validate_image_opd(worker_spec)
-    preflight_validate_managed_teacher(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     if not dry_run:
@@ -254,6 +278,7 @@ def submit_job(
         platform_context=platform_context,
         workload_profile_input_digest=worker_spec.workload_profile_input_digest or None,
         workload_profile=worker_spec.workload_profile or None,
+        prompt_budget=prepared.prompt_budget,
         effective_preparation={
             "worker_spec": worker_spec.to_internal_dict(),
             "workload_profile": worker_spec.workload_profile or None,

@@ -45,6 +45,21 @@ class GitHubUnavailableError(GitHubTransientError):
     """
 
 
+class GitHubPermanentError(RuntimeError):
+    """GitHub answered, and the answer will not change on a retry: a 404 or a 422.
+
+    Deliberately NOT a GitHubTransientError. Waiting is the right response to a blip and the wrong
+    response to a typo, and the two are indistinguishable once both are a bare RuntimeError -- which
+    is what let a misspelled environment repo defer past submit and rent a GPU to discover its own
+    404. The env ref->sha pin stays best-effort for the transient base, and fails closed on this.
+
+    A 404 is not proof the repo does not exist -- GitHub also 404s a private repo the token cannot
+    read, rather than leaking its existence with a 403. Both are permanent for this caller: no
+    amount of retrying makes an unreadable ref resolvable, and the fix (check the name, or grant the
+    token access) is the user's either way. The message carries GitHub's own text so it names which.
+    """
+
+
 @dataclass(frozen=True)
 class GitHubEnvironmentRef:
     owner: str

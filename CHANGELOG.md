@@ -29,6 +29,37 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- `flash models deploy` now warns before it moves the shared `<run-id>` model id onto a
+  different checkpoint. Every checkpoint of a run is served under that one id, so deploying
+  `<run-id>/step-50` while `step-100` was live silently changed what `<run-id>` served for
+  everyone using it — which made "deploy a second checkpoint to compare" a destructive
+  operation on the first, and read as a serving regression rather than the deploy that caused
+  it. The warning names both checkpoints and points at `flash models chat <run-id>/step-N`,
+  which addresses a checkpoint directly and does not depend on where the id points. It is
+  advisory: the deploy still proceeds, the pre-deploy read is abandoned outright once it exceeds
+  a few seconds so no shape of slow plane can hold a deploy behind it, and a control plane that
+  cannot answer (or answers with a checkpoint step this client cannot read) does not fail the
+  command. A deployment whose activation outcome was never settled still warns, but without
+  naming a checkpoint: that record's step describes the incoming attempt rather than what the id
+  currently serves, and the authoritative target is server-side only, so the warning says the
+  live checkpoint cannot be determined and points at `flash models deployments`.
+
+- A response deadline did not actually bound a response that arrived slowly. The deadline is
+  checked between reads, but each read asked for a fixed number of bytes and blocked until all of
+  them arrived, so a peer trickling a short body kept one read inside the socket timeout
+  indefinitely and the check never ran: a 2s deadline took 12s on a 42-byte body, and 61s when
+  the socket timeout was the client default. Reading whatever has already arrived lets the check
+  run, which bounds every stall shape. This affected `flash env list`, whose deadline exists to
+  stop a slow environment hub hanging the command, as well as the new pre-deploy read.
+
+- A response deadline could still be overrun by a read that began near its end. The socket timeout
+  is installed once, when the request opens, and time spent connecting and waiting for headers is
+  charged to the deadline but not to that timeout, so a peer that delayed its headers and then
+  stalled mid-body held the call open past the deadline: 3.5s against a 2s budget. Each read now
+  re-caps the socket to the remaining budget, so the two bounds agree instead of stacking. On a
+  body still arriving this surfaces as a timeout rather than the "stalled" message; both bound the
+  call, and which one wins is a race not worth depending on.
+
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
   usage strings, `next:` hints) now name the executable actually invoked rather than always
   `flash`. On a host where `runpod-flash` owns the `flash` script, the printed
