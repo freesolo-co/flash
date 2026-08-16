@@ -70,6 +70,10 @@ def _record_key(adapter_id: str) -> str:
     return f"record:{adapter_id}"
 
 
+def _run_index_key(run_id: str) -> str:
+    return f"run-index:{run_id}"
+
+
 def _lock_for_run(run_id: str) -> asyncio.Lock:
     return _RUN_LOCKS.setdefault(run_id, asyncio.Lock())
 
@@ -100,15 +104,23 @@ async def _write(record: dict[str, Any]) -> None:
     await adapter_records.put.aio(_record_key(record["adapter_id"]), record)
 
 
+async def _index_run_records(run_id: str, *adapter_ids: str) -> None:
+    """add record ids to one run's durable index before their records can become visible.
+
+    callers hold `_lock_for_run(run_id)`, so this read-modify-write is serialized with registration
+    and undeploy. indexing first can leave a harmless missing-record entry if the later record write
+    fails; writing the record first could leave a live revision undeploy can never find.
+    """
+    key = _run_index_key(run_id)
+    current = await adapter_records.get.aio(key) or []
+    indexed = list(dict.fromkeys([*current, run_id, *adapter_ids]))
+    await adapter_records.put.aio(key, indexed)
+
+
 async def _records_for_run(run_id: str) -> list[dict[str, Any]]:
-    records = []
-    async for key in adapter_records.keys.aio():
-        if not isinstance(key, str) or not key.startswith("record:"):
-            continue
-        record = await adapter_records.get.aio(key)
-        if isinstance(record, dict) and (record.get("metadata") or {}).get("run_id") == run_id:
-            records.append(record)
-    return records
+    adapter_ids = await adapter_records.get.aio(_run_index_key(run_id)) or []
+    records = await asyncio.gather(*(_read(adapter_id) for adapter_id in adapter_ids))
+    return [record for record in records if isinstance(record, dict)]
 
 
 async def _fail_settlement(record: dict[str, Any], failure: str) -> None:
@@ -462,7 +474,8 @@ def _require_key(request: Request) -> None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid serving key")
 
 
-async def _ensure_run_alias(run_id: str) -> None:
+async def _ensure_run_alias(run_id: str, *revision_ids: str) -> None:
+    await _index_run_records(run_id, *revision_ids)
     if await _read(run_id) is None:
         await _write(
             {
@@ -502,7 +515,7 @@ async def register_adapter(payload: dict[str, Any], request: Request) -> dict[st
                 raise HTTPException(
                     status.HTTP_409_CONFLICT, "immutable adapter revision already exists"
                 )
-            await _ensure_run_alias(run_id)
+            await _ensure_run_alias(run_id, record["adapter_id"])
             state = (existing.get("metadata") or {}).get("lifecycle_state")
             if state == "ready":
                 return {"ok": True, "adapter": existing}
@@ -516,7 +529,7 @@ async def register_adapter(payload: dict[str, Any], request: Request) -> dict[st
             await _write(existing)
             await _spawn_settle(existing)
             return {"ok": True, "adapter": existing}
-        await _ensure_run_alias(run_id)
+        await _ensure_run_alias(run_id, record["adapter_id"])
         await _write(record)
         await _spawn_settle(record)
         return {"ok": True, "adapter": record}

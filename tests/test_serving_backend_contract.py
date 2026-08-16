@@ -740,6 +740,32 @@ def test_undeploy_disables_the_alias_and_its_revisions(client):
     assert client.app.state.unregistered == [REVISION]
 
 
+def test_undeploy_reads_only_the_runs_durable_index(client, monkeypatch):
+    """undeploy must not scan every historical key in the app-wide modal dict.
+
+    Records are never deleted, so a full scan grows without bound and makes one remote `get` per
+    checkpoint ever registered by any run. The run index must name both the alias and its immutable
+    revision, and `keys()` is made fatal here so a fallback scan cannot silently return later.
+    """
+    _register_and_ready(client)
+    assert _activate(client).status_code == 200
+    module = client.app.state.generated_module
+    assert module.adapter_records[module._run_index_key(RUN_ID)] == [RUN_ID, REVISION]
+    unrelated = {"adapter_id": "other-run", "status": "ready", "metadata": {"run_id": "other"}}
+    module.adapter_records[module._record_key("other-run")] = unrelated
+
+    def scanned_every_key(_records):
+        raise AssertionError("undeploy scanned the app-wide modal.Dict instead of the run index")
+
+    monkeypatch.setattr(type(module.adapter_records), "keys", property(scanned_every_key))
+    response = client.delete(f"/adapters/{RUN_ID}")
+
+    assert response.status_code == 200
+    assert response.json()["disabled_aliases"] == [RUN_ID]
+    assert response.json()["disabled_revisions"] == [REVISION]
+    assert module.adapter_records[module._record_key("other-run")] == unrelated
+
+
 def test_undeploying_an_unknown_run_is_a_clean_404(client):
     assert client.delete("/adapters/unknown-run").status_code == 404
 
