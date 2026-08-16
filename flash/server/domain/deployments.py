@@ -725,8 +725,15 @@ class DeploymentService:
             effective_spec = effective_spec_from_status(status)
         except ValueError as exc:
             raise DeploymentConflict(str(exc)) from exc
-        has_ready_deploy = pinned_revision is not None or ready_deployment is not None
-        if pinned_revision is None and ready_deployment is not None:
+        if pinned_revision is not None:
+            # `resolve_explicit_chat_revision` already checked it against the ledger.
+            has_ready_deploy = True
+        elif ready_deployment is None:
+            has_ready_deploy = False
+        else:
+            # a record can claim ready for a revision the ledger never vouched for, so the bare
+            # alias is only servable when the record's own revision belongs to this run AND the
+            # ledger holds it.
             ready_revision = ready_deployment.get("adapter_revision")
             parsed_ready_revision = (
                 parse_adapter_revision(ready_revision) if isinstance(ready_revision, str) else None
