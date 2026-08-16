@@ -526,6 +526,17 @@ def _train_body(input_data: dict) -> dict:
         console_teardown = threading.Event()
 
         def _upload_console(mode: str, final: bool = False) -> bool:
+            """Upload the captured console tail for ``mode`` to the run repo.
+
+            Idempotent and best-effort, so it is safe to call from both the subprocess-failure path
+            and the missing-metrics crash path: a worker killed without a Python exception
+            (OOM/SIGKILL, segfault, or a silent early exit) writes NO ``error_<mode>.txt``, so the
+            captured console is then the only root-cause record -- and a crash that exits 0 would
+            otherwise skip the upload entirely, leaving the failure opaque.
+
+            ``final`` writes the canonical ``console_<mode>.txt`` and closes the live path; live
+            snapshots are attempt-scoped so a retry cannot overwrite the previous attempt's tail.
+            """
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
                 return False
@@ -540,16 +551,30 @@ def _train_body(input_data: dict) -> dict:
                 spec = json.loads(input_data["job_spec_json"])
                 phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
                 prefix = f"{phase_ns}/{spec['run_id']}"
+                # keep the newest bytes only; the uploaded tail's end is never truncated.
                 tail_bytes = 64_000
                 with open(console, "rb") as f:
                     f.seek(0, os.SEEK_END)
                     start = max(0, f.tell() - tail_bytes)
+                    # over-read one byte so a boundary landing exactly after a newline is
+                    # recognized as starting a COMPLETE line rather than assumed partial.
                     f.seek(max(0, start - 1))
                     raw = f.read()
                 if start == 0:
                     tail = raw.decode("utf-8", "replace")
                 else:
                     tail = raw[1:].decode("utf-8", "replace")
+                    # the byte boundary can land inside a one-line credential, and a partial
+                    # value no longer matches full-value redaction, so a truncated first line is
+                    # dropped before sanitizing. a line the boundary did not split is kept: it
+                    # may hold the root-cause exception.
+                    # a tail that is ONE unterminated line is dropped whole. that loses the only
+                    # diagnostic on a crash whose evidence is a single huge line, but any bound
+                    # that would let it through is measured against the credentials this process
+                    # KNOWS, and the value at risk is the one it does not: a capability minted at
+                    # runtime contributes no needle, so a margin sized from an unrelated configured
+                    # secret leaves a long fragment of it behind. an empty tail never leaked.
+                    # mirrors bootstrap_secrets._read_console_tail.
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
@@ -585,7 +610,7 @@ def _train_body(input_data: dict) -> dict:
             def _upload_live() -> bool:
                 return _upload_console(mode)
 
-            with open(console, "w", buffering=1) as cf:
+            with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
                 proc = subprocess.Popen(
                     [sys.executable, "-m", "flash.engine.worker_entrypoint"],
@@ -605,6 +630,10 @@ def _train_body(input_data: dict) -> dict:
                 uploader.start()
                 try:
                     for line in proc.stdout:
+                        # the handler's own stdout is captured by runpod and surfaced in provider
+                        # status, where only this process knows the run's worker-env secret values,
+                        # so each echoed child line is sanitized here at the source. the console
+                        # file keeps the raw line; its upload path sanitizes the selected tail.
                         print(_safe_detail(line, env, 100_000), end="")
                         cf.write(line)
                     proc.wait()
