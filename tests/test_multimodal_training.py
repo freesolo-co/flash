@@ -598,8 +598,8 @@ def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
     resolver = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert "image_pad_token_id = resolve_image_pad_token_id(processor, tok)" in resolver
 
-    entry = inspect.getsource(rl_train._write_rl_shim)
-    assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in entry
+    entry = inspect.getsource(rl_train._write_rl_plugin_config)
+    assert '"image_pad_token_id": inp["image_pad_token_id"]' in entry
 
 
 def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path):

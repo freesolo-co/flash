@@ -484,38 +484,7 @@ def _strip_docstrings(source: str) -> str:
 
 
 def _render_user_data(payload: dict, *, image: str) -> str:
-    """The user_data text for an already-spill-decided ``payload``.
-
-    Everything below the ``return`` ships verbatim to the box and is charged against
-    ``_USER_DATA_BUDGET`` on every launch, INCLUDING the bash comments -- only the heredoc'd python
-    sources get their docstrings stripped. So the on-box comments stay one terse line each, and the
-    reasoning behind those steps lives here instead:
-
-    * ``exec >>host_boot.log``: Lambda exposes no provider console API, so consolidating this
-      script's and the container's output into one host log is the only window into a failure that
-      happens before the worker starts.
-    * boot-log uploader: started BEFORE the docker wait and the slow image pull so a box that really
-      ran cloud-init leaves a liveness artifact within ~2 min. The poller keys its fast "instance
-      active but worker never started" failover on that artifact's PRESENCE -- it separates a healthy
-      box still pulling a multi-GB image from a silently dead one, failing the latter over in ~15 min
-      instead of burning the full ~50 min setup grace. Throttled to 120s and bounded (~30 min) for
-      HF's per-repo hourly commit cap. The ``docker inspect`` guard is what lets it keep emitting
-      THROUGH the pull window: before the container exists the inspect fails, so "not started yet" is
-      never mistaken for "started then exited".
-    * docker+gpu wait: the provider's default image ships Docker and the NVIDIA Container Toolkit,
-      but cloud-init can run before either finishes initializing.
-    * pull retries: the image is large and a transient registry blip must not fail the run; on total
-      failure write a retryable marker and exit NOW rather than idle a billed box through the grace.
-    * detached ``docker run``: lets cloud-init complete promptly; completion is signaled through the
-      worker's HF artifacts, never a return channel from the box.
-    * the exit-code check: the bootstrap returns 0 only on genuine success (metrics.json confirmed
-      and its ok-marker uploaded), so exit 0 IS the success signal and the host must write no marker
-      -- the worker owns that path and a host write would clobber its ok-marker, since HF listing can
-      lag a just-finished upload. A non-zero exit reaches ``fail()``, whose failmark uploader is
-      itself marker-aware: a container that started and fast-failed on a real user error already
-      wrote ``ok=false``, and failmark skips the write when that marker exists, so a genuine user
-      error is never relabeled retriable. Only a never-started container gets the retriable failmark.
-    """
+    """The user_data text for an already-spill-decided ``payload``."""
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     # Both shipped modules are stripped of docstrings on the way in. They are for the reader of the
     # repo, not the box, and user_data is a hard-capped budget shared with the payload's runtime

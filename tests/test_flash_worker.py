@@ -874,15 +874,15 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     The previous version of this test read run_sft's source. That body was trl's and is deleted:
     run_sft now delegates to run_sft_train. Rather than drop the coverage, assert against the module
-    that really runs. Three of the old assertions are intentionally NOT reproduced -- kernel
-    installation, LoRA+ B-matrix ratio plumbing, and the chunked_nll loss_type -- because they were
-    properties of trl's SFTTrainer call, and verl owns its own loss and kernel path.
+    that really runs. Two of the old assertions are intentionally NOT reproduced -- kernel
+    installation and the chunked_nll loss_type -- because they were properties of trl's SFTTrainer
+    call, and verl owns its own loss and kernel path.
 
-    the optimizations now live in two modules rather than one. dataset preprocessing moved to
+    the optimizations now live in three modules rather than one. dataset preprocessing moved to
     flash.engine.profiling.sft_workload so estimate construction and training share one implementation,
-    and the sizing/memory choices stayed with the trainer that makes them. each assertion reads the
-    module that actually owns its behaviour: pointing them all at one module would let a symbol
-    disappear from the other and still pass.
+    sizing and memory choices stayed with the trainer and hydra config, and LoRA+ grouping moved to the
+    external child plugin. each assertion reads the module that actually owns its behaviour: pointing
+    them all at one module would let a symbol disappear from another and still pass.
     """
     import inspect
 
@@ -902,8 +902,10 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
     # this guard spans both modules. keep these in step when sft_train is split further.
     from flash.engine.worker.train.sft import config as sft_config
+    from flash.engine.worker.train.sft.child import plugin as sft_plugin
 
     train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
+    plugin_src = inspect.getsource(sft_plugin)
     # revision-aware vocab resolution: the worker must size the realized batch through the SAME
     # resolver the cost quote priced with, else a revision-pinned run drifts from its quote.
     assert "resolve_vocab_size(" in train_src
@@ -913,8 +915,8 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     # gradient checkpointing, with the MoE/GDN reentrant rule shared with grpo.
     assert "grad_checkpointing_on(" in train_src
     assert "grpo_use_reentrant(" in train_src
-    # LoRA+ survives (verl builds the optimizer itself, but flash still supplies the grouping).
-    assert "create_loraplus_optimizer" in train_src
+    # LoRA+ survives in the external child plugin that owns verl's optimizer grouping.
+    assert "create_loraplus_optimizer" in plugin_src
 
 
 @pytest.mark.parametrize(
@@ -947,6 +949,17 @@ def test_train_body_uploads_console_on_missing_metrics(
     from flash.providers.runpod.serverless import endpoints
 
     code_prefix = "code/0123456789abcdef0123456789abcdef/flash"
+    run_code = tmp_path / "runcode"
+    late_marker = tmp_path / "late-live-attempted"
+    real_join = os.path.join
+
+    def mapped_join(*parts):
+        joined = real_join(*parts)
+        if joined == "/runcode" or joined.startswith("/runcode/"):
+            return str(run_code) + joined.removeprefix("/runcode")
+        return joined
+
+    monkeypatch.setattr(os.path, "join", mapped_join)
     list_calls = []
     download_calls = []
     monkeypatch.setattr(
@@ -968,11 +981,17 @@ def test_train_body_uploads_console_on_missing_metrics(
             return [
                 types.SimpleNamespace(path=f"{code_prefix}/__init__.py", size=0),
                 types.SimpleNamespace(path=f"{code_prefix}/engine/worker.py", size=10),
+                types.SimpleNamespace(
+                    path=f"{code_prefix}/providers/_lifecycle/bootstrap_console.py", size=10
+                ),
+                types.SimpleNamespace(path=f"{code_prefix}/adapters/artifacts.py", size=10),
                 types.SimpleNamespace(path=f"{code_prefix}/engine", tree_id="folder"),
             ]
 
         def upload_file(self, **kw):
             uploads.append(kw)
+            if str(kw.get("path_in_repo", "")).endswith("/console_sft.txt"):
+                time.sleep(0.05)
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
@@ -987,14 +1006,34 @@ def test_train_body_uploads_console_on_missing_metrics(
 
     def fake_hf_hub_download(*, filename, local_dir, **kw):
         download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
-        return os.path.join(local_dir, filename)
+        target = run_code / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if filename.endswith("bootstrap_console.py"):
+            target.write_text(
+                "import threading, time\n"
+                "def _run_console_upload_loop(console, interval, stop, *, upload):\n"
+                "    upload()\n"
+                "    def late():\n"
+                "        stop.wait(); time.sleep(0.01); upload()\n"
+                f"        open({str(late_marker)!r}, 'w').write('1')\n"
+                "    threading.Thread(target=late, daemon=True).start()\n"
+                "    stop.wait()\n"
+            )
+        elif filename.endswith("artifacts.py"):
+            target.write_text(
+                "def attempt_scoped_artifact_name(kind, phase, attempt):\n"
+                "    return f'exact_{kind}_{phase}_attempt{attempt}.txt'\n"
+            )
+        else:
+            target.write_text("")
+        return str(target)
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
 
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
-            assert k["cwd"] == "/runcode/code/0123456789abcdef0123456789abcdef"
+            assert k["cwd"] == str(run_code / "code/0123456789abcdef0123456789abcdef")
             self.stdout = iter(console_lines)
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
@@ -1009,7 +1048,7 @@ def test_train_body_uploads_console_on_missing_metrics(
         "seed": 0,
         "hf_repo": "owner/runs",
         "job_spec_json": job_spec,
-        "env": {"HF_TOKEN": "tok", "PYTHONPATH": ""},
+        "env": {"HF_TOKEN": "tok", "PYTHONPATH": "", "ATTEMPT": "7"},
         "code_prefix": code_prefix,
         **_run_deadline_fields(),
     }
@@ -1018,15 +1057,15 @@ def test_train_body_uploads_console_on_missing_metrics(
         with pytest.raises(RuntimeError, match=r"produced no /tmp/metrics\.json"):
             endpoints._train_body(input_data)
 
-        # The fix: the console for the crashed phase is uploaded so the failure is root-causable.
-        console_uploads = [
-            u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")
+        paths = [upload["path_in_repo"] for upload in uploads]
+        assert paths == [
+            "sft/flash-test-run/exact_console_sft_attempt7.txt",
+            "sft/flash-test-run/console_sft.txt",
         ]
-        assert console_uploads, (
-            f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
+        assert late_marker.exists(), (
+            "the late live callback must run after terminal teardown begins"
         )
-        assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
-        with open(console_uploads[0]["path_or_fileobj"], encoding="utf-8") as f:
+        with open(uploads[-1]["path_or_fileobj"], encoding="utf-8") as f:
             uploaded_console = f.read()
         if terminated:
             assert not uploaded_console.startswith("worker booting\n")
@@ -1047,11 +1086,19 @@ def test_train_body_uploads_console_on_missing_metrics(
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",
             f"{code_prefix}/engine/worker.py",
+            f"{code_prefix}/providers/_lifecycle/bootstrap_console.py",
+            f"{code_prefix}/adapters/artifacts.py",
         ]
     finally:
-        # _train_body writes the hardcoded /tmp/console_sft.txt(.tail); remove them so this test
-        # doesn't leak state across tests (flaky under isolated/parallel runners).
-        for _p in ("/tmp/console_sft.txt", "/tmp/console_sft.txt.tail"):
+        # _train_body writes hardcoded console paths; remove them for parallel runs.
+        import shutil
+
+        shutil.rmtree(run_code, ignore_errors=True)
+        for _p in (
+            "/tmp/console_sft.txt",
+            "/tmp/console_sft.txt.live.tail",
+            "/tmp/console_sft.txt.final.tail",
+        ):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(_p)
 
@@ -1098,7 +1145,6 @@ def test_first_console_snapshot_precedes_stall_teardown():
     import inspect
 
     from flash.providers._lifecycle import bootstrap_console
-    from flash.providers.runpod.serverless import endpoints
 
     importlib.import_module("flash.providers.runpod.jobs")
     poll_job = importlib.import_module("flash.providers.runpod.job_execution").poll_job
@@ -1106,17 +1152,11 @@ def test_first_console_snapshot_precedes_stall_teardown():
     training_stall_s = defaults["stall_after_s"].default
     setup_grace_s = defaults["setup_grace_s"].default
 
-    for first_snapshot_s in (
-        endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
-        bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
-    ):
-        assert first_snapshot_s < training_stall_s
-        assert first_snapshot_s < setup_grace_s
-    for poll_s in (
-        endpoints._CONSOLE_UPLOAD_POLL_S,
-        bootstrap_console._CONSOLE_UPLOAD_POLL_S,
-    ):
-        assert 2 * poll_s < training_stall_s
+    # the serverless handler loads this exact module rather than shipping its own copy, so these
+    # constants have one home and both providers are bound by the same margin.
+    assert training_stall_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    assert setup_grace_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    assert training_stall_s > 2 * bootstrap_console._CONSOLE_UPLOAD_POLL_S
 
 
 def _source_shipped_namespace(*names: str, namespace: dict | None = None) -> dict:
@@ -1141,359 +1181,16 @@ def _source_shipped_namespace(*names: str, namespace: dict | None = None) -> dic
     return result
 
 
-def _source_shipped_console_progress(*, open_fn=None):
-    import json
-    import os
+def test_console_heartbeat_stays_flat_so_the_scanner_can_match_on_substrings(tmp_path):
+    """the console scanner matches marker keys as raw substrings, which is only sound because the
+    producer compacts every nested field away first.
 
-    namespace = {"json": json, "os": os}
-    if open_fn is not None:
-        namespace["open"] = open_fn
-    return _source_shipped_namespace("_console_progress", namespace=namespace)["_console_progress"]
-
-
-@pytest.fixture(params=("instance", "source-shipped"))
-def console_progress_impl(request):
-    if request.param == "instance":
-        from flash.providers._lifecycle import bootstrap_console
-
-        return request.param, bootstrap_console.console_progress, bootstrap_console
-    progress = _source_shipped_console_progress()
-    return request.param, progress, progress.__globals__
-
-
-def _heartbeat_line(**fields) -> bytes:
+    a nested ``{"pending": ...}`` anywhere in the line would read as an uncommitted beat and make a
+    healthy run look wedged. that cannot happen while the producer replaces list values with counts,
+    so this pins the producer side of that contract rather than the scanner's.
+    """
     import json
 
-    payload = {"stage": "train", "step": 1, **fields}
-    return f"HEARTBEAT {json.dumps(payload)}\n".encode()
-
-
-@pytest.mark.parametrize(
-    ("content", "expected"),
-    [
-        pytest.param(_heartbeat_line(), (1, 1), id="committed"),
-        pytest.param(_heartbeat_line(pending=True), (0, 1), id="pending"),
-        pytest.param(_heartbeat_line(throttled=True), (0, 1), id="throttled"),
-        pytest.param(_heartbeat_line(liveness=True), (0, 0), id="liveness"),
-        pytest.param(
-            _heartbeat_line(
-                sampled_completions=[
-                    {
-                        "liveness": 'model text: "liveness":',
-                        "pending": 'model text: "pending":',
-                        "throttled": 'model text: "throttled":',
-                    }
-                ]
-            ),
-            (1, 1),
-            id="nested-marker-text-is-inert",
-        ),
-        pytest.param(
-            b"HEARTBEAT {not json}\n" + _heartbeat_line(step=2),
-            (1, 1),
-            id="malformed-line-isolation",
-        ),
-        pytest.param(
-            b'(raylet) {"stage":"train","pending":false}\n',
-            (0, 0),
-            id="non-heartbeat-json-is-inert",
-        ),
-    ],
-)
-def test_console_progress_parser_matrix(console_progress_impl, tmp_path, content, expected):
-    name, progress, _owner = console_progress_impl
-    console = tmp_path / f"console_{name}.txt"
-    console.write_bytes(content)
-    state = {"offset": 0, "partial": b"", "dropping": False}
-
-    assert progress(str(console), state) == (len(content), *expected), name
-    assert state["offset"] == len(content), name
-
-
-def _drive_console_cadence(monkeypatch, provider: str, progress, outcomes=True):
-    from flash.providers._lifecycle import bootstrap as instance_bootstrap
-    from flash.providers._lifecycle import bootstrap_console
-
-    polls = {"count": 0}
-    waits: list[float] = []
-    attempts: list[int] = []
-
-    class _Stop:
-        def wait(self, seconds: float) -> bool:
-            waits.append(seconds)
-            if polls["count"] >= len(progress):
-                return True
-            polls["count"] += 1
-            return False
-
-    def _progress(_console, _state):
-        return progress[polls["count"] - 1]
-
-    def _outcome() -> bool:
-        if callable(outcomes):
-            return outcomes(len(attempts))
-        if isinstance(outcomes, list):
-            return outcomes[min(len(attempts) - 1, len(outcomes) - 1)]
-        return outcomes
-
-    if provider == "instance":
-
-        def _upload(_payload, _console, _mode):
-            attempts.append(polls["count"])
-            return _outcome()
-
-        # the loop resolves the parser in bootstrap_console's own namespace, so patching it on
-        # bootstrap would silently miss and the test would pass without exercising the schedule.
-        monkeypatch.setattr(bootstrap_console, "console_progress", _progress)
-        monkeypatch.setattr(instance_bootstrap, "_upload_console_snapshot", _upload)
-        instance_bootstrap._console_upload_loop(
-            {}, "/tmp/console.txt", "train", instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S, _Stop()
-        )
-    else:
-
-        def _upload(_mode):
-            attempts.append(polls["count"])
-            return _outcome()
-
-        loop = _source_shipped_namespace(
-            "_upload_loop",
-            namespace={
-                "console": "/tmp/console.txt",
-                "mode": "train",
-                "stop_upload": _Stop(),
-                "_console_progress": _progress,
-                "_upload_console": _upload,
-            },
-        )["_upload_loop"]
-        loop()
-    return waits, attempts
-
-
-@pytest.mark.parametrize("provider", ["instance", "source-shipped"])
-@pytest.mark.parametrize(
-    ("progress", "outcomes", "expected"),
-    [
-        pytest.param(
-            [(1000 * (index + 1), 0, 0) for index in range(6)],
-            True,
-            [5],
-            id="600s-no-commit-fallback",
-        ),
-        pytest.param(
-            [(1000 * (index + 1), 1, 1) for index in range(29)],
-            True,
-            [],
-            id="healthy-first-hour-write-budget",
-        ),
-        pytest.param(
-            [(1000 * (index + 1), 1, 1) for index in range(31)],
-            True,
-            [30],
-            id="committed-promotion-hourly",
-        ),
-        pytest.param(
-            [(1000 * (index + 1), int(index < 2), int(index < 2)) for index in range(7)],
-            True,
-            [6],
-            id="pre-teardown-quiet-snapshot",
-        ),
-        pytest.param(
-            [(1000 * (index + 1), int(index == 4), int(index == 4)) for index in range(9)],
-            True,
-            [5, 9],
-            id="startup-does-not-spend-credit",
-        ),
-        pytest.param(
-            [
-                (1000 * (index + 1), int(index in {0, 5}), int(index in {0, 5}))
-                for index in range(10)
-            ],
-            True,
-            [5, 10],
-            id="progress-rearms-wedge-credit",
-        ),
-        pytest.param(
-            [
-                (1000 * (index + 1), int(index in {0, 5, 10}), int(index in {0, 5, 10}))
-                for index in range(15)
-            ],
-            True,
-            [5, 10],
-            id="two-credit-flapping-cap",
-        ),
-        pytest.param(
-            [
-                (
-                    1000 * (index + 1),
-                    int(index < 26 or index in {30, 35}),
-                    int(index < 26 or index in {30, 35}),
-                )
-                for index in range(40)
-            ],
-            True,
-            [30, 35, 40],
-            id="due-snapshot-does-not-spend-credit",
-        ),
-        pytest.param(
-            [
-                (1000 * (index + 1), int(index == 5), int(index in {0, 5, 6, 7, 8, 9}))
-                for index in range(10)
-            ],
-            True,
-            [5, 10],
-            id="pending-progress-only-before-first-commit",
-        ),
-        pytest.param(
-            [(1000, 0, 0) for _ in range(6)],
-            [False, True],
-            [5, 6],
-            id="failed-upload-retries-next-poll",
-        ),
-    ],
-)
-def test_console_upload_cadence_matrix(monkeypatch, provider, progress, outcomes, expected):
-    waits, attempts = _drive_console_cadence(monkeypatch, provider, progress, outcomes)
-    assert attempts == expected
-    assert set(waits) == {120.0}
-
-
-def test_console_upload_loop_never_waits_longer_than_interval():
-    from flash.providers._lifecycle import bootstrap
-
-    waits: list[float] = []
-
-    class _Stop:
-        def wait(self, seconds: float) -> bool:
-            waits.append(seconds)
-            return True
-
-    bootstrap._console_upload_loop({}, "/tmp/console.txt", "train", 30.0, _Stop())
-    assert waits == [30.0]
-
-
-def test_console_progress_split_boundaries(console_progress_impl, tmp_path):
-    name, progress, _owner = console_progress_impl
-    state = {"offset": 0, "partial": b"", "dropping": False}
-    console = tmp_path / f"split_{name}.txt"
-    valid = _heartbeat_line(step=7)
-    console.write_bytes(valid[:20])
-
-    first = progress(str(console), state)
-    assert first == (20, 0, 0), name
-    assert state["offset"] == 20
-    assert state["partial"] == valid[:20]
-
-    with open(console, "ab") as handle:
-        handle.write(valid[20:] + _heartbeat_line(step=8)[:17])
-    second = progress(str(console), state)
-    assert second[1:] == (1, 1), name
-    assert second[0] == console.stat().st_size
-    assert state["offset"] == console.stat().st_size
-    assert progress(str(console), state)[1:] == (0, 0), f"{name} recounted caught-up bytes"
-
-    liveness = _heartbeat_line(step=9, liveness=True)
-    live_console = tmp_path / f"liveness_{name}.txt"
-    live_state = {"offset": 0, "partial": b"", "dropping": False}
-    cut = liveness.index(b'"liveness":') - 5
-    live_console.write_bytes(liveness[:cut])
-    live_first = progress(str(live_console), live_state)
-    with open(live_console, "ab") as handle:
-        handle.write(liveness[cut:])
-    live_second = progress(str(live_console), live_state)
-    assert live_first[1] + live_second[1] == 0, name
-    assert live_first[2] + live_second[2] == 0, name
-
-
-def test_console_progress_bounds_multi_chunk_reads(console_progress_impl, tmp_path, monkeypatch):
-    from flash.providers._lifecycle import bootstrap_console
-
-    name, progress, owner = console_progress_impl
-    read_limit = bootstrap_console._CONSOLE_PROGRESS_READ_LIMIT
-    console = tmp_path / f"large_{name}.txt"
-    console.write_bytes(b"x" * (2 * read_limit + 123))
-    state = {"offset": 0, "partial": b"", "dropping": False}
-    real_open = open
-    read_sizes: list[int] = []
-
-    class _TrackedFile:
-        def __init__(self, handle):
-            self.handle = handle
-
-        def __enter__(self):
-            self.handle.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self.handle.__exit__(*args)
-
-        def __getattr__(self, key):
-            return getattr(self.handle, key)
-
-        def read(self, size=-1):
-            read_sizes.append(size)
-            return self.handle.read(size)
-
-    def _open(file, mode="r", *args, **kwargs):
-        handle = real_open(file, mode, *args, **kwargs)
-        return _TrackedFile(handle) if str(file) == str(console) and mode == "rb" else handle
-
-    if isinstance(owner, dict):
-        monkeypatch.setitem(owner, "open", _open)
-    else:
-        monkeypatch.setattr(owner, "open", _open, raising=False)
-
-    result = progress(str(console), state)
-    assert result == (console.stat().st_size, 0, 0), name
-    assert read_sizes == [read_limit, read_limit, 123], name
-    assert state == {"offset": console.stat().st_size, "partial": b"", "dropping": True}
-    assert progress(str(console), state)[1:] == (0, 0)
-    assert read_sizes == [read_limit, read_limit, 123], "caught-up bytes were reread"
-
-
-def test_console_progress_recovers_after_overlong_line(console_progress_impl, tmp_path):
-    from flash.providers._lifecycle import bootstrap_console
-
-    name, progress, _owner = console_progress_impl
-    console = tmp_path / f"overlong_{name}.txt"
-    console.write_bytes(b"x" * (bootstrap_console._CONSOLE_PROGRESS_LINE_LIMIT + 1))
-    state = {"offset": 0, "partial": b"", "dropping": False}
-
-    assert progress(str(console), state)[1:] == (0, 0)
-    assert state["dropping"] is True
-    assert state["partial"] == b""
-    with open(console, "ab") as handle:
-        handle.write(b"\n" + _heartbeat_line(step=3))
-    assert progress(str(console), state)[1:] == (1, 1), name
-    assert state["dropping"] is False
-
-
-def test_console_progress_source_parity_across_writes(tmp_path):
-    from flash.providers._lifecycle import bootstrap_console
-
-    source_progress = _source_shipped_console_progress()
-    console = tmp_path / "console_parity.txt"
-    valid = _heartbeat_line(step=1)
-    pending = _heartbeat_line(step=2, pending=True)
-    writes = [
-        b"HEARTBEAT {not json}\n" + valid[:17],
-        valid[17:] + pending,
-        b"x" * (bootstrap_console._CONSOLE_PROGRESS_READ_LIMIT + 1),
-        b"\n" + valid,
-    ]
-    instance_state = {"offset": 0, "partial": b"", "dropping": False}
-    source_state = {"offset": 0, "partial": b"", "dropping": False}
-    console.write_bytes(b"")
-
-    for chunk in writes:
-        with open(console, "ab") as handle:
-            handle.write(chunk)
-        assert bootstrap_console.console_progress(str(console), instance_state) == source_progress(
-            str(console), source_state
-        )
-        assert instance_state == source_state
-
-
-def test_console_progress_keeps_compacted_managed_heartbeat(tmp_path):
     from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
     from flash.providers._lifecycle import bootstrap_console
 
@@ -1501,90 +1198,20 @@ def test_console_progress_keeps_compacted_managed_heartbeat(tmp_path):
         {
             "stage": "rl_step",
             "step": 3,
-            "sampled_completions": [{"completion": "x" * 100_000}],
+            "sampled_completions": [{"completion": "x" * 100_000, "pending": True}],
+            "metrics_last": [{"throttled": True}],
         }
     )
-    line = f"HEARTBEAT {snapshot}\n".encode()
-    assert len(line) <= bootstrap_console._CONSOLE_PROGRESS_LINE_LIMIT
-    assert '"sample_count": 1' in snapshot
+    assert '"samples_count": 1' in snapshot
+    assert '"metrics_last_count": 1' in snapshot
     assert "sampled_completions" not in snapshot
+    assert "metrics_last" not in snapshot.replace('"metrics_last_count"', "")
+    # no nested container survives, so no marker substring can come from anything but a real marker.
+    assert not any(isinstance(value, (dict, list)) for value in json.loads(snapshot).values())
+
     console = tmp_path / "console_large_managed_heartbeat.txt"
-    console.write_bytes(line)
-    state = {"offset": 0, "partial": b"", "dropping": False}
-    assert bootstrap_console.console_progress(str(console), state)[1:] == (1, 1)
-
-
-def test_console_upload_uses_distinct_sanitized_live_and_terminal_artifacts(monkeypatch):
-    import contextlib
-    import json
-    import os
-    import re
-
-    import huggingface_hub
-
-    mode = f"artifact_{os.getpid()}_{time.time_ns()}"
-    console = f"/tmp/console_{mode}.txt"
-    calls: list[dict] = []
-    deadline_checks: list[None] = []
-
-    class _Api:
-        def __init__(self, token=None):
-            assert token == "hf-token"
-
-        def upload_file(self, **kwargs):
-            with open(kwargs["path_or_fileobj"], encoding="utf-8") as handle:
-                kwargs["payload"] = handle.read()
-            calls.append(kwargs)
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-    env = {
-        "HF_TOKEN": "hf-token",
-        "DEPLOY_KEY": "secret-value-123",
-        "FLASH_SECRET_ENV_KEYS": "DEPLOY_KEY",
-    }
-    namespace = _source_shipped_namespace(
-        "_needles",
-        "_safe_detail",
-        "_upload_console",
-        namespace={
-            "json": json,
-            "os": os,
-            "re": re,
-            "env": env,
-            "input_data": {
-                "hf_repo": "org/runs",
-                "job_spec_json": json.dumps({"algorithm": "grpo", "run_id": "run-1"}),
-            },
-            "_require_deadline_allowance": lambda: deadline_checks.append(None) or 100.0,
-        },
-    )
-    upload = namespace["_upload_console"]
-    live_tail = console + ".live.tail"
-    terminal_tail = console + ".terminal.tail"
-
-    try:
-        with open(console, "w", encoding="utf-8") as handle:
-            handle.write("prefix\n" + "x" * 65_000 + "\nsecret-value-123 live root cause\n")
-        assert upload(mode) is True
-        with open(console, "a", encoding="utf-8") as handle:
-            handle.write("secret-value-123 terminal root cause\n")
-        assert upload(mode, final=True) is True
-
-        assert [call["path_or_fileobj"] for call in calls] == [live_tail, terminal_tail]
-        assert [call["path_in_repo"] for call in calls] == [
-            f"rl/run-1/console_{mode}_live.txt",
-            f"rl/run-1/console_{mode}.txt",
-        ]
-        assert all(len(call["payload"].encode()) <= 64_000 for call in calls)
-        assert all("secret-value-123" not in call["payload"] for call in calls)
-        assert all("<redacted>" in call["payload"] for call in calls)
-        assert "terminal root cause" not in calls[0]["payload"]
-        assert "terminal root cause" in calls[1]["payload"]
-        assert len(deadline_checks) == 4
-    finally:
-        for target in (console, live_tail, terminal_tail):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(target)
+    console.write_bytes(f"HEARTBEAT {snapshot}\n".encode())
+    assert bootstrap_console._console_progress(str(console), 0)[2:] == (1, 1)
 
 
 def test_min_cuda_for_uses_the_gpu_class_floor():

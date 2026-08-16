@@ -96,9 +96,6 @@ _HB_UPLOAD_LOCK = threading.Lock()
 # Terminal/error commits wait longer — no later heartbeat can repair them.
 _HB_UPLOAD_LOCK_TIMEOUT_S = 30.0
 _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
-# Monotonic claim counter; rollback guard uses SEQ not wall-clock (two threads can share same ts).
-_HB_CLAIM_SEQ = 0
-
 # retain at least one metric row per second across the 900s training heartbeat throttle window.
 GRPO_METRIC_HISTORY_LIMIT = 1024
 
@@ -113,36 +110,57 @@ def _dump_thread_stacks(reason: str) -> None:
         faulthandler.dump_traceback(all_threads=True)
 
 
-def _rollback_throttle_slot(
-    my_claim: int, prev_last_upload: float, prev_last_step: int, prev_last_forced: float
-) -> None:
-    """Restore the throttle slot after a failed/abandoned upload, but only if this heartbeat still
-    owns the latest claim — a newer heartbeat that bumped the slot after us must not be rolled back.
-    Restores the committed-step marker too, so a failed forced commit doesn't permanently record its
-    step as committed (which would wrongly stop the retry from forcing through), and the forced-commit
-    clock, so a failed forced commit doesn't start the floor window (which would delay the retry)."""
-    with _HB_LOCK:
-        if my_claim == _HB_CLAIM_SEQ:
-            _w._HB_LAST_UPLOAD = prev_last_upload
-            _w._HB_LAST_COMMITTED_STEP = prev_last_step
-            _w._HB_LAST_FORCED_UPLOAD = prev_last_forced
-
-
 def _console_heartbeat_snapshot(
-    payload: dict, upload_due: bool = True, payload_committed: bool = True
+    payload: dict, payload_committed: bool = True, upload_due: bool = False
 ) -> str:
+    """render one bounded console record with explicit hf commit state."""
     console_payload = dict(payload)
     metrics_last = console_payload.pop("metrics_last", None)
     if isinstance(metrics_last, list):
         console_payload["metrics_last_count"] = len(metrics_last)
     samples = console_payload.pop("sampled_completions", None)
     if isinstance(samples, list):
-        console_payload["sample_count"] = len(samples)
-    if upload_due and not payload_committed:
-        console_payload["pending"] = True
-    elif not upload_due:
-        console_payload["throttled"] = True
+        console_payload["samples_count"] = len(samples)
+    if not payload_committed:
+        console_payload["pending" if upload_due else "throttled"] = True
     return json.dumps(console_payload)
+
+
+def _heartbeat_upload_due(
+    stage: str,
+    *,
+    liveness: bool,
+    force: bool,
+    initial: bool,
+    first_timing: bool,
+    fields: dict,
+    now: float,
+) -> bool:
+    """return eligibility from committed throttle state while _HB_LOCK is held."""
+    if initial or _is_critical_stage(stage):
+        return True
+    if _w._HB_TERMINAL_ONLY:
+        return (
+            _w._HB_LAST_UPLOAD == 0.0 or (now - _w._HB_LAST_UPLOAD) >= _HB_TERMINAL_ONLY_INTERVAL_S
+        )
+    throttled = stage in _HB_THROTTLED_STAGES
+    if stage in _HB_MODEL_LOAD_STAGES and not liveness:
+        throttled = False
+    interval_s = _w._HB_MIN_INTERVAL_S
+    if stage in _HB_TIGHT_LIVENESS_STAGES:
+        interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
+    upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
+    if force and not upload_due:
+        step = fields.get("step")
+        has_samples = bool(fields.get("sampled_completions"))
+        force_step_due = isinstance(step, (int, float)) and (
+            step > _w._HB_LAST_COMMITTED_STEP
+            or (has_samples and step == _w._HB_LAST_COMMITTED_STEP)
+        )
+        first_timing_due = first_timing and "step_duration_s" in fields
+        force_floor_due = (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
+        upload_due = force_step_due and (first_timing_due or force_floor_due)
+    return upload_due
 
 
 def heartbeat(
@@ -154,7 +172,6 @@ def heartbeat(
     first_timing: bool = False,
     **kw,
 ):
-    global _HB_CLAIM_SEQ
     genuine_progress = not liveness
     with _HB_LOCK:
         ts = time.time()
@@ -162,11 +179,7 @@ def heartbeat(
             _w._HB_LAST_PROGRESS_TS = ts
             _w._HB_PROGRESS_SEQ += 1
         elif _w._HB_PROGRESS_SEQ > _w._HB_PROGRESS_UPLOADED_SEQ:
-            # progress-carry: a real heartbeat since the last committed snapshot never reached HF
-            # (throttled away or its upload failed). upgrade this ping to a real heartbeat so the
-            # control plane's stall clock sees that progress instead of killing a healthy run.
-            # carried progress is not new progress, so do not advance _HB_LAST_PROGRESS_TS: the
-            # worker's own stall-dump timer and the published age keep the original reference point.
+            # carry real progress that has not reached hf yet.
             liveness = False
         latest_progress_ts = float(_w._HB_LAST_PROGRESS_TS or 0.0)
         my_progress_seq = _w._HB_PROGRESS_SEQ
@@ -186,113 +199,74 @@ def heartbeat(
         payload["progress_age_s"] = round(max(0.0, ts - latest_progress_ts), 1)
     else:
         payload.pop("progress_age_s", None)
-    _dc = os.environ.get("RUNPOD_DC_ID") or ""
-    if _dc:
-        payload.setdefault("dc", _dc)
+    dc = os.environ.get("RUNPOD_DC_ID") or ""
+    if dc:
+        payload.setdefault("dc", dc)
     snapshot = json.dumps(payload)
     with _HB_LOCK:
-        now = time.time()
-        if _is_critical_stage(stage):
-            upload_due = True  # never miss a terminal transition
-        elif _w._HB_TERMINAL_ONLY:
-            upload_due = (
-                _w._HB_LAST_UPLOAD == 0.0
-                or (now - _w._HB_LAST_UPLOAD) >= _HB_TERMINAL_ONLY_INTERVAL_S
-            )
-        else:
-            throttled = stage in _HB_THROTTLED_STAGES
-            # a one-shot STAGE TRANSITION into a model-load stage is the only ping that says the run
-            # reached it. the repeated liveness ticks that follow are what the throttle exists to
-            # coalesce, and they carry liveness=True -- so throttling the stage as a whole silently
-            # drops the transition whenever the preceding setup ping (usually model_prefetching,
-            # which pings all through the download right before it) committed inside the interval.
-            # that is the common case, and losing it defeats the stage this set was extended for.
-            if stage in _HB_MODEL_LOAD_STAGES and not liveness:
-                throttled = False
-            interval_s = _w._HB_MIN_INTERVAL_S
-            if stage in _HB_TIGHT_LIVENESS_STAGES:
-                interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
-            upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
-            # ``force`` bypasses the per-stage throttle when this payload must be on record. it normally
-            # requires a step advance, but a sample-bearing payload may match the committed step because
-            # the liveness daemon can commit that step first without the samples. the per-force floor still
-            # coalesces fast bursts to protect the hf commit cap, while an unrelated liveness commit does
-            # not arm the floor and therefore cannot suppress the first sample-bearing payload. the first
-            # timing payload gets one dedicated floor bypass because the forced metrics-only payload just
-            # before it armed that clock; its caller retries this flag until the timing upload succeeds.
-            if force and not upload_due:
-                fstep = kw.get("step")
-                has_samples = bool(kw.get("sampled_completions"))
-                first_timing_due = first_timing and "step_duration_s" in kw
-                force_step_due = isinstance(fstep, (int, float)) and (
-                    fstep > _w._HB_LAST_COMMITTED_STEP
-                    or (has_samples and fstep == _w._HB_LAST_COMMITTED_STEP)
-                )
-                force_floor_due = (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
-                if force_step_due and (first_timing_due or force_floor_due):
-                    upload_due = True
-        # the initial training snapshot must land before the shared throttle can hide it.
-        if initial:
-            upload_due = True
-        prev_last_upload = _w._HB_LAST_UPLOAD
-        prev_last_step = _w._HB_LAST_COMMITTED_STEP
-        prev_last_forced = _w._HB_LAST_FORCED_UPLOAD
-        if upload_due:
-            _HB_CLAIM_SEQ += 1
-            my_claim = _HB_CLAIM_SEQ
-            _w._HB_LAST_UPLOAD = now
-            # any committing force=True heartbeat arms the burst floor, even when the regular
-            # throttle was due. non-forced commits stay exempt so the next forced update lands.
-            if force:
-                _w._HB_LAST_FORCED_UPLOAD = now
-            _committed_step = kw.get("step")
-            if (
-                isinstance(_committed_step, (int, float))
-                and _committed_step > _w._HB_LAST_COMMITTED_STEP
-            ):
-                _w._HB_LAST_COMMITTED_STEP = int(_committed_step)
+        upload_due = _heartbeat_upload_due(
+            stage,
+            liveness=liveness,
+            force=force,
+            initial=initial,
+            first_timing=first_timing,
+            fields=kw,
+            now=time.time(),
+        )
     payload_committed = False
     if upload_due:
         critical = _is_critical_stage(stage)
         lock_timeout = _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S if critical else _HB_UPLOAD_LOCK_TIMEOUT_S
         if _HB_UPLOAD_LOCK.acquire(timeout=lock_timeout):
             try:
-                up = f"/tmp/.hb-upload-{os.getpid()}-{threading.get_ident()}.json"
-                with open(up, "w") as f:
-                    f.write(snapshot)
-                try:
-                    if initial:
-                        committed = _w.hf_upload_file(up, "heartbeat.json", required=True)
-                    else:
-                        committed = _w.hf_upload_file(up, "heartbeat.json")
-                finally:
-                    with contextlib.suppress(OSError):
-                        os.remove(up)
-                if committed is False:
-                    # ``is False`` (not falsy) so a mock/None never trips the rollback.
-                    _rollback_throttle_slot(
-                        my_claim, prev_last_upload, prev_last_step, prev_last_forced
+                with _HB_LOCK:
+                    upload_due = _heartbeat_upload_due(
+                        stage,
+                        liveness=liveness,
+                        force=force,
+                        initial=initial,
+                        first_timing=first_timing,
+                        fields=kw,
+                        now=time.time(),
                     )
-                    print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
-                else:
-                    payload_committed = True
-                    if not liveness:
-                        # this committed snapshot carried real progress; settle the progress-carry
-                        # latch up to the seq captured when the snapshot was built (max: a concurrent
-                        # newer real heartbeat that lost the upload race must stay pending).
+                if upload_due:
+                    up = f"/tmp/.hb-upload-{os.getpid()}-{threading.get_ident()}.json"
+                    with open(up, "w") as f:
+                        f.write(snapshot)
+                    try:
+                        if initial:
+                            committed = _w.hf_upload_file(up, "heartbeat.json", required=True)
+                        else:
+                            committed = _w.hf_upload_file(up, "heartbeat.json")
+                    finally:
+                        with contextlib.suppress(OSError):
+                            os.remove(up)
+                    if committed is False:
+                        print(f"HEARTBEAT upload failed for {stage}")
+                    else:
+                        payload_committed = True
                         with _HB_LOCK:
-                            if my_progress_seq > _w._HB_PROGRESS_UPLOADED_SEQ:
+                            committed_at = time.time()
+                            _w._HB_LAST_UPLOAD = committed_at
+                            if force:
+                                _w._HB_LAST_FORCED_UPLOAD = committed_at
+                            committed_step = kw.get("step")
+                            if (
+                                isinstance(committed_step, (int, float))
+                                and committed_step > _w._HB_LAST_COMMITTED_STEP
+                            ):
+                                _w._HB_LAST_COMMITTED_STEP = int(committed_step)
+                            if not liveness and my_progress_seq > _w._HB_PROGRESS_UPLOADED_SEQ:
                                 _w._HB_PROGRESS_UPLOADED_SEQ = my_progress_seq
             finally:
                 _HB_UPLOAD_LOCK.release()
         else:
-            _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
             if initial:
                 raise _w.RetriableInfraError(
                     f"initial heartbeat upload lock remained busy >{lock_timeout}s for {stage}"
                 )
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
-    print("HEARTBEAT", _console_heartbeat_snapshot(payload, upload_due, payload_committed))
+    print("HEARTBEAT", _console_heartbeat_snapshot(payload, payload_committed, upload_due))
     return payload_committed
 
 

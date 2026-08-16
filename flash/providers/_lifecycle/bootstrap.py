@@ -1,7 +1,7 @@
 """Bootstrap shared by instance-based providers (e.g. Lambda). Runs inside the worker container.
 
 Stdlib + huggingface_hub only — never import flash here. Reads payload from ``/root/flash/payload.json``.
-Launch scripts must ship ``bootstrap_secrets.py`` (credential redaction) next to this file.
+Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and ``bootstrap_pip.py``.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ if __package__:
         _safe_detail,
     )
 else:
-    # running as a bare script on the box: the launch scripts ship the sibling modules into the
+    # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
     # same directory, and the script directory leads sys.path.
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
@@ -114,7 +114,6 @@ def arm_deadline_watchdog(
     payload: dict,
 ) -> tuple[threading.Timer, threading.Event]:
     """Hard-stop setup or training that remains alive at the absolute cutoff."""
-    # done is set by the caller on clean finish; _fire checks it first to avoid a racing false alarm.
     done = threading.Event()
 
     def _fire() -> None:
@@ -220,18 +219,24 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dic
                 if remaining <= 0:
                     raise TimeoutError(f"{label} exceeded the run wall deadline") from None
                 delay = min(delay, remaining)
-            why = _safe_detail(exc, 500, secrets=secrets)
-            msg = f"{label} transient Hugging Face error; retrying in {delay:.0f}s: {why}"
-            print(msg, flush=True)
+            print(
+                f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
+                f"{_safe_detail(exc, 500, secrets=secrets)}",
+                flush=True,
+            )
             if delay > 0:
                 time.sleep(delay)
     raise AssertionError("unreachable")
 
 
 def hf_upload(
-    payload: dict, local_path: str, repo_subpath: str, *, enforce_deadline: bool = True
+    payload: dict,
+    local_path: str,
+    repo_subpath: str,
+    *,
+    enforce_deadline: bool = True,
 ) -> bool:
-    """upload one artifact under the run's hf prefix and return whether it landed."""
+    """Upload one artifact under the run's HF prefix; never raises."""
     try:
         from huggingface_hub import HfApi
 
@@ -245,8 +250,10 @@ def hf_upload(
         )
         return True
     except Exception as exc:
-        detail = _safe_detail(exc, secrets=_payload_secrets(payload))
-        print(f"hf upload warn ({repo_subpath}): {detail}", flush=True)
+        print(
+            f"hf upload warn ({repo_subpath}): {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            flush=True,
+        )
         return False
 
 
@@ -255,31 +262,40 @@ def _upload_console_snapshot(
 ) -> bool:
     """Upload one console snapshot from an isolated process.
 
-    The periodic snapshot writes to its own scratch file and its own repo destination. Reaping the
-    periodic child at teardown is best-effort, so one killed mid-write would otherwise truncate the
-    scratch file the terminal snapshot is uploading, or overwrite the terminal artifact itself --
-    losing the failure detail the control plane reads (including the wall-clock-cap marker). The
-    terminal snapshot keeps the canonical name; only the periodic one is suffixed.
+    The periodic snapshot and the terminal one never share a scratch file or a repo destination.
+    Reaping the periodic child at teardown is best-effort, so one killed mid-write would otherwise
+    truncate the scratch file the terminal snapshot is uploading, or overwrite the terminal artifact
+    itself -- losing the failure detail the control plane reads, including the wall-clock-cap marker.
+    The terminal snapshot keeps the canonical name; only the periodic one is suffixed.
     """
     kind = "" if final else "_live"
     tail_path = console + (".terminal.tail" if final else ".live.tail")
-    secrets = _payload_secrets(payload)
-    tail = _read_console_tail(console, 64_000, secrets=secrets) + extra
+    tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
+    if extra:
+        tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
-        f.write(_safe_detail(tail, 64_000, secrets=secrets))
+        f.write(_safe_detail(tail, 64_000, secrets=_payload_secrets(payload)))
     return hf_upload(payload, tail_path, f"console_{mode}{kind}.txt")
 
 
-def _console_upload_loop(payload: dict, console: str, mode: str, interval_s: float, stop) -> None:
+def _console_upload_loop(
+    payload: dict,
+    console: str,
+    mode: str,
+    interval_s: float,
+    stop_upload,
+) -> None:
     def upload() -> bool:
         try:
             return _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
-            detail = _safe_detail(exc, secrets=_payload_secrets(payload))
-            print(f"console upload warn: {detail}", flush=True)
+            print(
+                f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+                flush=True,
+            )
             return False
 
-    _bootstrap_console.run_console_upload_loop(console, interval_s, stop, upload=upload)
+    _bootstrap_console._run_console_upload_loop(console, interval_s, stop_upload, upload=upload)
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
@@ -512,7 +528,7 @@ def build_worker_env(payload: dict) -> dict:
     env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
     spec_json = payload.get("job_spec_json")
     if not spec_json and payload.get("job_spec_in_hf"):
-        # Pre-worker fetch; failure is infra-shaped -> raise RetriableBootstrapError so poller retries.
+        # Pre-worker fetch; failure is infra-shaped → raise RetriableBootstrapError so poller retries.
         try:
             spec_json = fetch_spec_from_hf(payload)
         except Exception:
@@ -604,7 +620,8 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     console = f"/tmp/console_{mode}.txt"
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
     worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
-    # unused boot grace cannot extend the declared worker budget.
+    # cap work from its actual start: the absolute deadline includes boot grace, whose unused
+    # portion must not extend the declared wall-time budget.
     budget = payload.get("run_max_wall_seconds")
     if isinstance(budget, (int, float)) and not isinstance(budget, bool):
         budget = float(budget)
@@ -641,16 +658,11 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         pump_secrets = _payload_secrets(payload)
 
         def pump():
-            """Tee the child's output to this process's stdout and the console file.
+            """tee sanitized output to the provider log and raw output to the console file.
 
-            This process's stdout is the instance's container log, which the control plane pulls as
-            the failure detail (vast holds the box after a non-zero exit precisely so it can). Only
-            this process knows the run's secret VALUES, so each echoed child line is sanitized here
-            at the source -- the control-plane sanitizer downstream cannot value-redact a runtime
-            secret whose name it never sees. Mirrors the runpod serverless handler. The console FILE
-            keeps the raw line; its upload path sanitizes the tail. The bound keeps the END of an
-            oversized line: the root cause sits at the end of a native stack or json blob, and that
-            failure detail reads the instance log, not the console, so a prefix cut loses it."""
+            only this process knows payload secret values. keep the end of oversized lines because
+            native stacks and json diagnostics place the root cause there.
+            """
             try:
                 for line in proc.stdout:
                     with pump_write_lock:
@@ -663,8 +675,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                         )
                         cf.write(line)
             except BaseException as exc:
-                detail = _safe_detail(exc, secrets=pump_secrets)
-                print(f"console pump warn: {detail}", flush=True)
+                print(
+                    f"console pump warn: {_safe_detail(exc, secrets=pump_secrets)}",
+                    flush=True,
+                )
             finally:
                 pump_done.set()
 
@@ -725,8 +739,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         ):
             print("final console upload exceeded its allowance", flush=True)
     except Exception as exc:
-        detail = _safe_detail(exc, secrets=_payload_secrets(payload))
-        print(f"console upload warn: {detail}", flush=True)
+        print(
+            f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            flush=True,
+        )
     if timed_out:
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
     return proc.returncode
@@ -773,6 +789,7 @@ def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Eve
     """Arm the absolute run-deadline watchdog around in-process snapshot downloads."""
     deadline_at = require_deadline_at(payload)
     remaining = deadline_at - time.time()
+    # done is set by the caller on clean finish; _fire checks it first to avoid a racing false alarm.
     done = threading.Event()
 
     def _fire() -> None:
@@ -848,18 +865,7 @@ def run_preload(payload: dict) -> dict:
 
 
 def main() -> int:
-    """Run one bootstrap attempt and return its process exit code.
-
-    Two rules govern the train path below, kept here because every byte of an on-box COMMENT is
-    charged against the cloud-init budget while this docstring is stripped on the way in:
-
-    * ``run_mode`` enforces the absolute subprocess deadline, so once it returns, required completion
-      artifacts take precedence over bootstrap bookkeeping that happens to cross the boundary.
-    * Missing local metrics while HF confirms completion (DONE + metrics uploaded) means the run
-      SUCCEEDED and the idempotency replay merely hit a transient HF read -- retry so a fresh worker
-      re-fetches the metrics, and never fail a confirmed-complete run as a crash.
-    """
-    # SIGTERM -> sys.exit so the finally block still uploads the terminal marker.
+    # SIGTERM → sys.exit so the finally block still uploads the terminal marker.
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(1))
     payload = load_payload()
     ok = False
@@ -925,7 +931,12 @@ def main() -> int:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stale)
         rc = run_mode(payload, env, phase, deadline)
+        # run_mode enforces the absolute subprocess deadline. once it returns, required completion
+        # artifacts take precedence over bootstrap bookkeeping that happens to cross the boundary.
         if not os.path.exists("/tmp/metrics.json"):
+            # Missing local metrics but the run is confirmed complete on HF (DONE+metrics uploaded) —
+            # e.g. the idempotency replay hit a transient HF read. The run SUCCEEDED; retry so a fresh
+            # worker re-fetches the metrics, never fail a confirmed-complete run as a crash.
             if remote_completion_confirmed(payload):
                 raise RetriableBootstrapError(
                     f"train phase '{phase}' is complete on HF but its local metrics.json is missing "

@@ -24,53 +24,8 @@ from flash.providers.runpod.gpus import flash_gpu
 FLASH_SDK_LOCK = threading.Lock()
 
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-# committed progress promotes the 600s fallback to hourly; wedges still beat the 1200s stall.
-_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
-# polling observes wedges without spending repository commits.
-_CONSOLE_UPLOAD_POLL_S = 120.0
+
 _ENDPOINT_CACHE: dict[str, Any] = {}
-
-
-def _patch_runpod_backoff() -> None:
-    """Cap the backoff exponent before the power to prevent overflow on long runs."""
-    try:
-        import math
-        import random
-
-        from runpod_flash.core.utils import backoff as _bo
-
-        if getattr(_bo, "_flash_backoff_patched", False):
-            return
-
-        def _safe_get_backoff_delay(
-            attempt,
-            base=0.1,
-            max_seconds=10.0,
-            jitter=0.2,
-            strategy=_bo.BackoffStrategy.EXPONENTIAL,
-        ):
-            capped_attempt = min(int(attempt), 30)
-            if strategy == _bo.BackoffStrategy.EXPONENTIAL:
-                delay = base * (2**capped_attempt)
-            elif strategy == _bo.BackoffStrategy.LINEAR:
-                delay = base + (attempt * base)
-            elif strategy == _bo.BackoffStrategy.LOGARITHMIC:
-                delay = base * math.log2(attempt + 2)
-            else:
-                raise ValueError(f"Unsupported backoff strategy: {strategy}")
-            delay = min(delay, max_seconds)
-            return delay * random.uniform(1 - jitter, 1 + jitter)
-
-        _bo.get_backoff_delay = _safe_get_backoff_delay
-        _bo._flash_backoff_patched = True
-        try:
-            from runpod_flash.core.resources import serverless as _sl
-
-            _sl.get_backoff_delay = _safe_get_backoff_delay
-        except Exception:
-            pass
-    except Exception as exc:
-        logger.warning("runpod backoff patch skipped: %s", exc)
 
 
 def _reset_flash_resource_manager(rm_module) -> None:
@@ -102,6 +57,7 @@ def _train_body(input_data: dict) -> dict:
     """
     import collections
     import contextlib
+    import importlib.util
     import json
     import math
     import os
@@ -315,11 +271,12 @@ def _train_body(input_data: dict) -> dict:
                 r"|returned error: (?:429|5\d\d)|could not resolve (?:host|proxy)"
             )
             # Build/resolution failures, which name the cause and outrank a transient warning pip
-            # already recovered from in the same tail; without that precedence one early "Retrying
-            # (Retry(" makes a deterministic failure look retriable and this ladder repeats it for
-            # nothing. Kept identical to the instance bootstrap's _PIP_TERMINAL_RE: the two
-            # classifiers must agree on what is retriable, including excluding the bare
-            # subprocess-exited-with-error marker a network-interrupted VCS `git clone` also prints.
+            # already recovered from in the same tail; without that precedence one early
+            # "Retrying (Retry(" makes a deterministic failure look retriable and this ladder
+            # repeats it for nothing. Kept identical to the instance bootstrap's _PIP_TERMINAL_RE:
+            # the two classifiers must agree on what is retriable, including excluding the bare
+            # subprocess-exited-with-error marker that a network-interrupted VCS `git clone` also
+            # prints.
             pip_terminal_re = re.compile(
                 r"(?i)failed building wheel|metadata-generation-failed|could not build wheels"
                 r"|no matching distribution|could not find a version|resolutionimpossible"
@@ -491,6 +448,15 @@ def _train_body(input_data: dict) -> dict:
                         raise exc from None
             raise AssertionError("unreachable")
 
+        def _load_exact_module(code_dir: str, relative_path: str, name: str):
+            path = os.path.join(code_dir, relative_path)
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"could not load downloaded module: {relative_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
         def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
             from huggingface_hub import HfApi, hf_hub_download
 
@@ -528,6 +494,16 @@ def _train_body(input_data: dict) -> dict:
         code_prefix = _code_prefix()
         _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
         code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
+        console_module = _load_exact_module(
+            code_dir,
+            "flash/providers/_lifecycle/bootstrap_console.py",
+            "_flash_downloaded_bootstrap_console",
+        )
+        artifact_module = _load_exact_module(
+            code_dir,
+            "flash/adapters/artifacts.py",
+            "_flash_downloaded_artifacts",
+        )
 
         env = dict(os.environ)
         env.update(overrides)
@@ -547,12 +523,27 @@ def _train_body(input_data: dict) -> dict:
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
 
+        console_teardown = threading.Event()
+
         def _upload_console(mode: str, final: bool = False) -> bool:
-            """Upload a bounded sanitized console tail, best-effort."""
+            """Upload the captured console tail for ``mode`` to the run repo.
+
+            Idempotent and best-effort, so it is safe to call from both the subprocess-failure path
+            and the missing-metrics crash path: a worker killed without a Python exception
+            (OOM/SIGKILL, segfault, or a silent early exit) writes NO ``error_<mode>.txt``, so the
+            captured console is then the only root-cause record -- and a crash that exits 0 would
+            otherwise skip the upload entirely, leaving the failure opaque.
+
+            ``final`` writes the canonical ``console_<mode>.txt`` and closes the live path; live
+            snapshots are attempt-scoped so a retry cannot overwrite the previous attempt's tail.
+            """
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
                 return False
-            tail_path = console + (".terminal.tail" if final else ".live.tail")
+            if final:
+                console_teardown.set()
+            elif console_teardown.is_set():
+                return False
             try:
                 from huggingface_hub import HfApi
 
@@ -560,26 +551,49 @@ def _train_body(input_data: dict) -> dict:
                 spec = json.loads(input_data["job_spec_json"])
                 phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
                 prefix = f"{phase_ns}/{spec['run_id']}"
+                # keep the newest bytes only; the uploaded tail's end is never truncated.
                 tail_bytes = 64_000
                 with open(console, "rb") as f:
                     f.seek(0, os.SEEK_END)
                     start = max(0, f.tell() - tail_bytes)
+                    # over-read one byte so a boundary landing exactly after a newline is
+                    # recognized as starting a COMPLETE line rather than assumed partial.
                     f.seek(max(0, start - 1))
                     raw = f.read()
                 if start == 0:
                     tail = raw.decode("utf-8", "replace")
                 else:
                     tail = raw[1:].decode("utf-8", "replace")
+                    # the byte boundary can land inside a one-line credential, and a partial
+                    # value no longer matches full-value redaction, so a truncated first line is
+                    # dropped before sanitizing. a line the boundary did not split is kept: it
+                    # may hold the root-cause exception.
+                    # a tail that is ONE unterminated line is dropped whole. that loses the only
+                    # diagnostic on a crash whose evidence is a single huge line, but any bound
+                    # that would let it through is measured against the credentials this process
+                    # KNOWS, and the value at risk is the one it does not: a capability minted at
+                    # runtime contributes no needle, so a margin sized from an unrelated configured
+                    # secret leaves a long fragment of it behind. an empty tail never leaked.
+                    # mirrors bootstrap_secrets._read_console_tail.
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
+                suffix = ".final.tail" if final else ".live.tail"
+                tail_path = console + suffix
                 with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
-                console_name = f"console_{mode}.txt" if final else f"console_{mode}_live.txt"
+                if not final and console_teardown.is_set():
+                    return False
+                attempt = int(env.get("ATTEMPT") or 0)
+                artifact = (
+                    f"console_{mode}.txt"
+                    if final
+                    else artifact_module.attempt_scoped_artifact_name("console", mode, attempt)
+                )
                 HfApi(token=env.get("HF_TOKEN")).upload_file(
                     path_or_fileobj=tail_path,
-                    path_in_repo=f"{prefix}/{console_name}",
+                    path_in_repo=f"{prefix}/{artifact}",
                     repo_id=input_data["hf_repo"],
                     repo_type="dataset",
                 )
@@ -588,75 +602,13 @@ def _train_body(input_data: dict) -> dict:
                 print("console upload warn:", _safe_detail(e, env))
                 return False
 
-        def _console_progress(path: str, state: dict) -> tuple[int, int, int]:
-            committed = beats = 0
-            try:
-                with open(path, "rb") as handle:
-                    handle.seek(0, os.SEEK_END)
-                    eof, offset = handle.tell(), state["offset"]
-                    if eof < offset:
-                        state.update(offset=0, partial=b"", dropping=False)
-                        offset = 0
-                    while offset < eof:
-                        handle.seek(offset)
-                        chunk = handle.read(min(1_048_576, eof - offset))
-                        if not chunk:
-                            break
-                        offset += len(chunk)
-                        lines = (state["partial"] + chunk).split(b"\n")
-                        state["partial"] = lines.pop()
-                        if state["dropping"]:
-                            if not lines:
-                                state["partial"] = b""
-                                state["offset"] = offset
-                                continue
-                            state["dropping"], lines = False, lines[1:]
-                        if len(state["partial"]) > 64_000:
-                            state.update(partial=b"", dropping=True)
-                        for line in lines:
-                            if len(line) > 64_000 or not line.startswith(b"HEARTBEAT "):
-                                continue
-                            try:
-                                payload = json.loads(line[len(b"HEARTBEAT ") :])
-                            except (TypeError, ValueError):
-                                continue
-                            if isinstance(payload, dict) and not payload.get("liveness"):
-                                beats += 1
-                                committed += not {"pending", "throttled"} & set(payload)
-                        state["offset"] = offset
-            except OSError:
-                return -1, 0, 0
-            return eof, committed, beats
-
         def run_mode(mode: str, check: bool) -> int:
-            """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
+            """run the worker, stream its console, and upload live and terminal tails."""
             console = f"/tmp/console_{mode}.txt"
             stop_upload = threading.Event()
 
-            def _upload_loop() -> None:
-                due_s, since, quiet_polls = 600.0, 0.0, 0
-                uploaded_size, size, quiet_spent, armed, committed = -1, -1, 0, False, False
-                progress_state = {"offset": 0, "partial": b"", "dropping": False}
-                while not stop_upload.wait(120.0):
-                    since += 120.0
-                    size, staged, beats = _console_progress(console, progress_state)
-                    if staged and not committed and since < due_s:
-                        due_s = 3600.0
-                    committed = committed or bool(staged)
-                    progress = staged if committed else beats
-                    armed = armed or bool(progress)
-                    quiet_polls = 0 if progress else quiet_polls + 1
-                    due = since >= due_s
-                    wedged = armed and quiet_polls >= 4 and quiet_spent < 2 and not due
-                    if size == uploaded_size or not (due or wedged):
-                        continue
-                    ok = _upload_console(mode)  # swallows its own errors; False if it did not land
-                    uploaded_size = size if ok else uploaded_size
-                    quiet_spent += 1 if wedged and ok else 0
-                    armed = armed and not (wedged and ok)
-                    # only a landed upload advances the deadline.
-                    if ok:
-                        since, due_s = 0.0, 3600.0
+            def _upload_live() -> bool:
+                return _upload_console(mode)
 
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
@@ -669,12 +621,19 @@ def _train_body(input_data: dict) -> dict:
                     text=True,
                     errors="replace",
                 )
-                uploader = threading.Thread(target=_upload_loop, daemon=True)
+                uploader = threading.Thread(
+                    target=console_module._run_console_upload_loop,
+                    args=(console, 3600.0, stop_upload),
+                    kwargs={"upload": _upload_live},
+                    daemon=True,
+                )
                 uploader.start()
                 try:
                     for line in proc.stdout:
-                        # sanitize child output before runpod captures it; the console file remains
-                        # raw until its bounded upload path sanitizes the selected tail.
+                        # the handler's own stdout is captured by runpod and surfaced in provider
+                        # status, where only this process knows the run's worker-env secret values,
+                        # so each echoed child line is sanitized here at the source. the console
+                        # file keeps the raw line; its upload path sanitizes the selected tail.
                         print(_safe_detail(line, env, 100_000), end="")
                         cf.write(line)
                     proc.wait()
@@ -697,7 +656,6 @@ def _train_body(input_data: dict) -> dict:
         run_mode(input_data["phase"], check=False)
         if not os.path.exists("/tmp/metrics.json"):
             phase = input_data["phase"]
-            _upload_console(phase, final=True)
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
                 f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
@@ -728,6 +686,49 @@ def isolate_flash_state(scope: str | None = None) -> None:
             _reset_flash_resource_manager(rm)
     except Exception as exc:
         logger.warning("flash state isolation skipped: %s", exc)
+
+
+def _patch_runpod_backoff() -> None:
+    """Cap the backoff exponent before the power to prevent OverflowError on long runs (~80 min+)."""
+    try:
+        import math
+        import random
+
+        from runpod_flash.core.utils import backoff as _bo
+
+        if getattr(_bo, "_flash_backoff_patched", False):
+            return
+
+        def _safe_get_backoff_delay(
+            attempt,
+            base=0.1,
+            max_seconds=10.0,
+            jitter=0.2,
+            strategy=_bo.BackoffStrategy.EXPONENTIAL,
+        ):
+            a = min(int(attempt), 30)
+            if strategy == _bo.BackoffStrategy.EXPONENTIAL:
+                delay = base * (2**a)
+            elif strategy == _bo.BackoffStrategy.LINEAR:
+                delay = base + (attempt * base)
+            elif strategy == _bo.BackoffStrategy.LOGARITHMIC:
+                delay = base * math.log2(attempt + 2)
+            else:
+                raise ValueError(f"Unsupported backoff strategy: {strategy}")
+            delay = min(delay, max_seconds)
+            return delay * random.uniform(1 - jitter, 1 + jitter)
+
+        _bo.get_backoff_delay = _safe_get_backoff_delay
+        _bo._flash_backoff_patched = True
+        # serverless.py imported the symbol directly; patch its ref too.
+        try:
+            from runpod_flash.core.resources import serverless as _sl
+
+            _sl.get_backoff_delay = _safe_get_backoff_delay
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("runpod backoff patch skipped: %s", exc)
 
 
 def min_cuda_for(friendly_gpu: str) -> str:
