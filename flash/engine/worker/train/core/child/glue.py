@@ -20,6 +20,12 @@ from uuid import uuid4
 
 _ALLOWED_MESSAGE_KEYS = frozenset({"role", "content"})
 _PROBE_PREFIX = "flash-env-glue-probe"
+# the media block types verl's own dataset parser substitutes for a placeholder, and the exact set
+# it then extracts (rl_dataset.py `_build_messages`: `<image>`/`<video>`/`<audio>` become blocks of
+# the matching type, and `_process_multi_modal_info` returns images, videos, audios). duplicated
+# here as literals rather than imported from flash.content.multimodal because this module is copied
+# into the verl child, where flash is not importable -- see the module docstring.
+_MEDIA_BLOCK_TYPES = frozenset({"image", "video", "audio"})
 
 
 def normalize_token_ids(value) -> list[int]:
@@ -39,8 +45,53 @@ def normalize_token_ids(value) -> list[int]:
     return [int(token_id.item() if hasattr(token_id, "item") else token_id) for token_id in value]
 
 
-def validate_transcript_messages(messages: list[dict], *, source: str) -> list[dict]:
-    """require the exact role/content transcript shape the child rollout loops can represent."""
+def content_block_text(content, *, source: str, position: int) -> str:
+    """flatten one openai-style content block list to the text the transcript represents.
+
+    an image-bearing prompt does NOT reach the child as a string. verl's RLHFDataset rewrites the
+    parquet's string content into blocks -- it splits on the `<image>` placeholder and replaces that
+    segment with an image block (rl_dataset.py `_build_messages`) -- so `raw_prompt` arrives as
+    [{"type": "image", ...}, {"type": "text", "text": ...}] for exactly the multimodal rows flash
+    writes. validating that shape as text-only would reject every image episode at turn one.
+
+    the media blocks are dropped rather than rendered here: they are carried separately, as decoded
+    pixels in `multi_modal_data`, and the prompt ids come from the chat template applied to the
+    ORIGINAL block list. this text view exists for the transcript and the inter-turn glue, which are
+    token-level text operations. a block whose type is neither text nor known media is an error
+    rather than a silent drop -- it would mean the model saw something this transcript cannot show.
+    """
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            raise ValueError(
+                f"{source} message {position} has a content block that is not an object"
+            )
+        block_type = block.get("type")
+        if block_type in _MEDIA_BLOCK_TYPES:
+            continue
+        if block_type != "text":
+            raise ValueError(
+                f"{source} message {position} has an unsupported content block type "
+                f"{block_type!r}; a multi-turn transcript can represent text and media blocks only"
+            )
+        text = block.get("text")
+        if not isinstance(text, str):
+            raise ValueError(f"{source} message {position} has a text block without text")
+        parts.append(text)
+    return "".join(parts)
+
+
+def validate_transcript_messages(
+    messages: list[dict], *, source: str, allow_content_blocks: bool = False
+) -> list[dict]:
+    """require the exact role/content transcript shape the child rollout loops can represent.
+
+    ``allow_content_blocks`` flattens openai-style block lists to their text instead of rejecting
+    them. it is OFF by default and opted into only by a caller that has already extracted the media
+    out of the ORIGINAL blocks, because dropping to text is lossless only once the pixels are held
+    somewhere else. a caller that has not done that extraction must keep raising: silently training
+    on a caption whose image was discarded is the failure this default exists to prevent.
+    """
     if not isinstance(messages, list):
         raise ValueError(f"{source} messages must be a list")
     normalized = []
@@ -62,7 +113,11 @@ def validate_transcript_messages(messages: list[dict], *, source: str) -> list[d
         content = message.get("content")
         if not isinstance(role, str) or not role.strip():
             raise ValueError(f"{source} message {position} has an invalid role")
-        if not isinstance(content, str):
+        if allow_content_blocks and isinstance(content, list):
+            # a multimodal prompt arrives as content BLOCKS, not a string; flatten to the text this
+            # transcript can represent. the media rides separately as decoded pixels.
+            content = content_block_text(content, source=source, position=position)
+        elif not isinstance(content, str):
             raise ValueError(f"{source} message {position} content must be text for multi-turn")
         normalized.append({"role": role, "content": content})
     return normalized

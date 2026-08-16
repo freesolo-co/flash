@@ -1467,6 +1467,17 @@ def test_multimodal_overrides_hand_verl_the_images_column():
     assert "data.dataloader_num_workers=0" in o
 
 
+def test_shared_rollout_cache_override_uses_the_current_vllm_key():
+    assert backend_common.rollout_mm_processor_cache_overrides() == [
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0"
+    ]
+
+
+def test_grpo_unconditionally_disables_the_vllm_multimodal_processor_cache():
+    overrides = rl_train.build_verl_overrides(_overrides_cfg())
+    assert set(backend_common.rollout_mm_processor_cache_overrides()) <= set(overrides)
+
+
 def test_text_overrides_omit_every_multimodal_key():
     # the control: these keys must be absent, not merely false. data.image_key=images on a text job
     # points verl at a column the parquet does not have.
@@ -2920,6 +2931,49 @@ def test_the_generated_single_turn_reward_module_surfaces_the_bridges_cause(monk
         assert "could not serve" in message
     finally:
         server.shutdown()
+
+
+def test_an_unrepresentable_env_reply_is_rejected_rather_than_reported_as_a_fault():
+    """A refused reply block is permanent, so it must reach the user as 400, not 503.
+
+    The reply validators raise on a block this transcript cannot carry. A bare ValueError there
+    falls to the handler's catch-all and answers 503, which the child prints as
+    ``could not serve`` -- telling the reader the bridge had a capacity problem when the actual fix
+    is to change what ``step_episode`` returns. Retrying produces the identical block forever, so
+    this asserts the status the 400/503 split promises rather than only the raise.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(
+            replies=[{"role": "user", "content": [{"type": "image_url", "image_url": "x"}]}],
+            done_after=99,
+        ),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=4,
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        _post("/multiturn/start", {"index": 0, "session_id": "a"}).close()
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _post("/multiturn/step", {"session_id": "a", "completion_text": "answer"})
+        assert exc_info.value.code == 400, (
+            "an env reply this transcript cannot carry is permanent, not a capacity fault"
+        )
+        assert "image block" in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+        bridge.shutdown()
 
 
 def test_reward_server_still_rejects_a_malformed_request_as_a_client_error():
@@ -5102,6 +5156,102 @@ def test_bridge_start_passes_the_index_aligned_prepared_prompt_into_state_creati
     assert state["messages"] == prepared_prompt
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "image", "image_url": "x"}],
+        [{"type": "image_url", "image_url": "x"}],
+        [{"type": "input_image", "image_url": "x"}],
+        [
+            {"type": "text", "text": "what changed?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ],
+    ],
+    ids=["image", "image-url", "input-image", "mixed-text-image"],
+)
+def test_bridge_refuses_every_image_reply_shape(content):
+    # every image spelling and a mixed text/image reply must fail rather than reach the child as text.
+    env = _BridgeEnv(
+        replies=[{"role": "user", "content": content}],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="image block"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+@pytest.mark.parametrize("block_type", ["video", "audio", "tool_use", "input_file"])
+def test_bridge_refuses_a_non_text_reply_block_instead_of_dropping_it(block_type):
+    # the flattener keeps `type == "text"` and joins it, so any other block contributes NOTHING and
+    # disappears. that is the stringified-image defect wearing a different type: the env meant the
+    # model to see something, the model never saw it, and the run still looks healthy.
+    env = _BridgeEnv(
+        replies=[
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "look"}, {"type": block_type, "data": "x"}],
+            }
+        ],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="unsupported type"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+def test_bridge_refuses_a_malformed_text_block_rather_than_flattening_it_to_nothing():
+    # a text block with no string text flattens to "", so the turn silently loses its content.
+    env = _BridgeEnv(
+        replies=[{"role": "user", "content": [{"type": "text", "text": None}]}],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="missing its text"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+def test_bridge_refuses_a_non_object_reply_block():
+    env = _BridgeEnv(replies=[{"role": "user", "content": ["plain string"]}], done_after=99)
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="must be an object"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+def test_bridge_flattens_a_text_only_block_reply_instead_of_stringifying_it():
+    # text blocks ARE representable, so they must not become a repr either: an env that returns
+    # openai-style text blocks would otherwise train the model on "[{'type': 'text', ...}]".
+    env = _BridgeEnv(
+        replies=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": " second"},
+                ],
+            }
+        ],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    step = bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert step["messages"] == [{"role": "user", "content": "first second"}]
+
+
+def test_bridge_still_passes_a_plain_string_reply_through_unchanged():
+    # the control: the ordinary text path is what every existing multi-turn env uses, and it must be
+    # untouched by the block handling above.
+    env = _BridgeEnv(replies=[{"role": "user", "content": "next"}], done_after=99)
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    step = bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert step["messages"] == [{"role": "user", "content": "next"}]
+
+
 def test_bridge_rejects_prompts_that_do_not_align_with_its_examples():
     # the two are indexed by the SAME integer the child sends. a length mismatch means some index
     # reads the wrong row's prompt, or IndexErrors mid-rollout; both are worth failing at
@@ -5165,6 +5315,57 @@ def test_bridge_step_stops_before_asking_a_finished_env_for_a_reply():
         "terminal": True,
         "messages": [],
     }
+
+
+class _SignOffEnv(_BridgeEnv):
+    """an env whose ``env_reply`` ENDS the episode, the way the adapter's does when ``step_episode``
+    returns ``done=True``: ``rollout_done`` is false at the bridge's check BEFORE the reply and true
+    at the one after. that ordering is what puts a final sign-off message on the terminal path;
+    a plain ``done_after=1`` stops at the earlier check and never calls ``env_reply`` at all."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._signed_off = False
+        self.last_state: dict = {}
+
+    def env_reply(self, messages, state):
+        self._signed_off = True
+        self.last_state = state
+        return super().env_reply(messages, state)
+
+    def rollout_done(self, state, max_turns):
+        return self._signed_off or super().rollout_done(state, max_turns)
+
+
+def test_bridge_step_does_not_validate_a_terminal_reply_the_child_never_reads():
+    # an env that signs off with a final image (or any non-text block) alongside done=True used to
+    # take the reply-block guard and 400 the episode -- losing a completed rollout's reward over a
+    # message that was never going to be shown to the model. the child breaks on `terminal` BEFORE
+    # it reads `messages`, and env_reply has already recorded the reply into the scored state.
+    env = _SignOffEnv(
+        done_after=9,
+        replies=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}],
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    out = bridge.step({"session_id": "a", "completion_text": "first"})
+    assert out == {"terminal": True, "messages": []}
+    # the sign-off still reached the state the reward path reads; it was skipped, not dropped.
+    # _BridgeEnv.env_reply extends the same `state["messages"]` the adapter's does.
+    assert env.replies[0] in env.last_state["messages"]
+
+
+def test_bridge_step_still_refuses_a_non_terminal_image_reply():
+    # the terminal exemption above must not weaken the live path: a mid-episode image still cannot
+    # reach the engine, so it stays a loud failure rather than a silently dropped turn.
+    env = _BridgeEnv(
+        done_after=9,
+        replies=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}],
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="image block"):
+        bridge.step({"session_id": "a", "completion_text": "first"})
 
 
 def test_bridge_step_on_an_unknown_session_raises_rather_than_scoring_a_blank_episode():
@@ -6783,6 +6984,7 @@ def _drive_multi_turn_episode(
     monkeypatch=None,
     multi_modal_data=None,
     return_instance=False,
+    raw_prompt=None,
 ):
     """run the real child loop end to end against a real bridge, returning its agent loop output.
 
@@ -6837,6 +7039,11 @@ def _drive_multi_turn_episode(
             return {}
 
         async def process_multi_modal_info(self, messages):
+            # verl extracts media from the message CONTENT BLOCKS (rl_dataset.process_multi_modal_info
+            # keys off `item["type"] in {"image", "video"}`), so record what shape this was handed:
+            # a loop that flattened the prompt to text before extracting would arrive here with
+            # nothing left to find, and the images would be silently gone.
+            self.mm_info_contents = [message.get("content") for message in messages]
             return dict(multi_modal_data or {})
 
         async def apply_chat_template(self, messages, **kwargs):
@@ -6883,7 +7090,13 @@ def _drive_multi_turn_episode(
         # one actually running the coroutine.
         instance.loop = asyncio.get_running_loop()
         driven["instance"] = instance
-        await instance.run({}, raw_prompt=[{"role": "user", "content": "go"}], index=0)
+        await instance.run(
+            {},
+            raw_prompt=(
+                raw_prompt if raw_prompt is not None else [{"role": "user", "content": "go"}]
+            ),
+            index=0,
+        )
 
     asyncio.run(_go())
     if return_instance:
@@ -6916,6 +7129,38 @@ class _SpanEnv:
         from flash.envs.base import RolloutReward
 
         return [RolloutReward(episode=1.0, turns=tuple(0.5 for _ in self.recorded)) for _ in items]
+
+
+def test_an_image_prompt_reaches_media_extraction_and_the_rollout(monkeypatch):
+    # verl rewrites the parquet prompt into blocks before the child loop. media extraction must see
+    # those blocks before the model-facing transcript is flattened, and the decoded pixels must stay
+    # attached to the emitted episode for training.
+    env = _SpanEnv()
+    out, instance = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed")],
+        env=env,
+        monkeypatch=monkeypatch,
+        max_turns=1,
+        multi_modal_data={"images": ["PIXELS"]},
+        return_instance=True,
+        raw_prompt=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "/tmp/x.png"},
+                    {"type": "text", "text": "\nDescribe this image."},
+                ],
+            }
+        ],
+    )
+
+    assert out["multi_modal_data"] == {"images": ["PIXELS"]}
+    assert env.recorded == ["ab"]
+    contents = instance.mm_info_contents
+    assert isinstance(contents[0], list), (
+        "media extraction was handed flattened text; the images are already gone by this point"
+    )
+    assert {"type": "image", "image": "/tmp/x.png"} in contents[0]
 
 
 def test_a_truncated_final_turn_still_earns_per_turn_credit_for_the_turns_before_it(monkeypatch):
