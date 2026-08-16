@@ -20,10 +20,11 @@ from uuid import uuid4
 
 _ALLOWED_MESSAGE_KEYS = frozenset({"role", "content"})
 _PROBE_PREFIX = "flash-env-glue-probe"
-# the media block types verl's own dataset parser looks for when it decides whether a prompt has
-# anything to extract (rl_dataset.py: `item.get("type") in {"image", "video"}`). duplicated here as
-# literals rather than imported from flash.content.multimodal because this module is copied into the
-# verl child, where flash is not importable -- see the module docstring.
+# the media block types verl's own dataset parser substitutes for a placeholder, and the exact set
+# it then extracts (rl_dataset.py `_build_messages`: `<image>`/`<video>`/`<audio>` become blocks of
+# the matching type, and `_process_multi_modal_info` returns images, videos, audios). duplicated
+# here as literals rather than imported from flash.content.multimodal because this module is copied
+# into the verl child, where flash is not importable -- see the module docstring.
 _MEDIA_BLOCK_TYPES = frozenset({"image", "video", "audio"})
 
 
