@@ -266,10 +266,16 @@ def _upload_console_snapshot(
     Reaping the periodic child at teardown is best-effort, so one killed mid-write would otherwise
     truncate the scratch file the terminal snapshot is uploading, or overwrite the terminal artifact
     itself -- losing the failure detail the control plane reads, including the wall-clock-cap marker.
-    The terminal snapshot keeps the canonical name; only the periodic one is suffixed.
+
+    The terminal snapshot keeps the canonical ``console_<mode>.txt`` the control plane reads; the
+    periodic one takes the attempt-scoped name it reads separately, matching the serverless handler,
+    so a retry cannot overwrite the attempt that reproduced the failure. This module can never
+    import flash, so the format is spelled out here and pinned against
+    ``flash.adapters.artifacts.attempt_scoped_artifact_name`` by test rather than by coincidence --
+    a name the reader does not expect looks exactly like a worker that uploaded nothing.
     """
-    kind = "" if final else "_live"
-    tail_path = console + (".terminal.tail" if final else ".live.tail")
+    kind = "" if final else f"_attempt{payload.get('attempt', 0)}"
+    tail_path = f"{console}{kind}.tail"
     tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
     if extra:
         tail += extra

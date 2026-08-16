@@ -1159,28 +1159,6 @@ def test_first_console_snapshot_precedes_stall_teardown():
     assert training_stall_s > 2 * bootstrap_console._CONSOLE_UPLOAD_POLL_S
 
 
-def _source_shipped_namespace(*names: str, namespace: dict | None = None) -> dict:
-    import ast
-    import inspect
-    import textwrap
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    nodes = [
-        next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == name
-        )
-        for name in names
-    ]
-    nodes.sort(key=lambda node: node.lineno)
-    result = dict(namespace or {})
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<handler>", "exec"), result)
-    return result
-
-
 def test_console_heartbeat_stays_flat_so_the_scanner_can_match_on_substrings(tmp_path):
     """the console scanner matches marker keys as raw substrings, which is only sound because the
     producer compacts every nested field away first.

@@ -1945,6 +1945,7 @@ def test_periodic_console_snapshot_cannot_clobber_the_terminal_one(tmp_path, mon
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "sft/run",
+        "attempt": 3,
         "env": {"WANDB_API_KEY": _PAYLOAD_SECRET},
     }
     cap = "\n--- bootstrap: mode 'sft' hit the wall-clock cap; killed ---\n"
@@ -1956,12 +1957,18 @@ def test_periodic_console_snapshot_cannot_clobber_the_terminal_one(tmp_path, mon
     terminal_path, terminal_name = uploads[1]
     # distinct scratch files and distinct destinations, so neither write can reach the other.
     assert (live_path, terminal_path) != (terminal_path, terminal_path)
-    assert live_path == str(console) + ".live.tail"
-    assert terminal_path == str(console) + ".terminal.tail"
-    assert (live_name, terminal_name) == ("console_sft_live.txt", "console_sft.txt")
+    assert live_path == str(console) + "_attempt3.tail"
+    assert terminal_path == str(console) + ".tail"
+    # the terminal artifact keeps the canonical name the control plane reads; the live one takes the
+    # attempt-scoped name it reads separately. bootstrap.py cannot import flash, so the inlined
+    # format is pinned against the canonical helper here rather than trusted to stay in step.
+    from flash.adapters.artifacts import attempt_scoped_artifact_name
+
+    assert live_name == attempt_scoped_artifact_name("console", "sft", 3)
+    assert terminal_name == "console_sft.txt"
     # only the terminal artifact carries the wall-clock-cap evidence, and it survives intact.
-    terminal_tail = (tmp_path / "console_sft.txt.terminal.tail").read_text()
-    live_tail = (tmp_path / "console_sft.txt.live.tail").read_text()
+    terminal_tail = (tmp_path / "console_sft.txt.tail").read_text()
+    live_tail = (tmp_path / "console_sft.txt_attempt3.tail").read_text()
     assert "hit the wall-clock cap" in terminal_tail
     assert "hit the wall-clock cap" not in live_tail
     # both are sanitized: the split must not create an unredacted path.
@@ -1988,13 +1995,13 @@ def test_console_snapshot_redacts_a_payload_env_secret(tmp_path, monkeypatch):
 
     b._upload_console_snapshot(payload, str(console), "sft")
 
-    tail = (tmp_path / "console_sft.txt.live.tail").read_text()
+    tail = (tmp_path / "console_sft.txt_attempt0.tail").read_text()
     assert _PAYLOAD_SECRET not in tail
     assert "RuntimeError: wandb login rejected <redacted>" in tail
     # the surrounding traceback is the whole point of the upload; redaction must not eat it.
     assert "Traceback (most recent call last):" in tail
     assert '  File "train.py", line 7, in <module>' in tail
-    assert uploads == [(str(console) + ".live.tail", "console_sft_live.txt")]
+    assert uploads == [(str(console) + "_attempt0.tail", "console_sft_attempt0.txt")]
 
 
 def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
@@ -2253,7 +2260,7 @@ def test_console_snapshot_drops_the_truncated_first_line_before_redacting(tmp_pa
 
     b._upload_console_snapshot(payload, str(console), "sft")
 
-    tail = (tmp_path / "console_sft.txt.live.tail").read_text()
+    tail = (tmp_path / "console_sft.txt_attempt0.tail").read_text()
     assert secret not in tail
     for fragment_length in range(6, len(secret)):
         assert secret[-fragment_length:] not in tail
