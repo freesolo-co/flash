@@ -25,7 +25,9 @@ import json
 import pytest
 
 from flash.core.spec import (
+    MANAGED_ENVIRONMENT_KEYS,
     MANAGED_GPU_KEYS,
+    MANAGED_SECTION_KEYS,
     MANAGED_TOP_LEVEL_KEYS,
     MANAGED_TRAIN_KEYS,
     JobSpec,
@@ -89,6 +91,7 @@ MANAGED_GPU_FIELDS = {
     "max_retries",
     "max_wall_seconds",
 }
+MANAGED_ENVIRONMENT_FIELDS = {"resolved_sha"}
 
 
 def test_public_payload_emits_exactly_the_authorable_keys():
@@ -104,8 +107,6 @@ def test_worker_payload_is_the_public_key_set_plus_the_managed_fields():
 
 
 def test_public_payload_strips_every_managed_gpu_key():
-    from flash.core.spec import MANAGED_GPU_KEYS
-
     public_gpu = set(spec().to_dict()["gpu"])
     assert public_gpu.isdisjoint(MANAGED_GPU_KEYS)
     assert set(spec().to_internal_dict()["gpu"]) >= MANAGED_GPU_KEYS
@@ -323,35 +324,30 @@ def test_ordered_gpu_pin_round_trips_through_the_public_spelling():
     assert internal["type_fallbacks"] == ("A100 PCIe",)
 
 
-def test_public_payload_is_the_worker_payload_minus_the_managed_registries():
-    """The projection's contract, stated as an equation rather than as two parallel serializers.
+def test_registries_match_the_declared_boundary():
+    """The registries must equal this module's own literals, and nothing may leak the other way.
 
-    `to_dict()` is built from `to_internal_dict()`, so the only structural difference between the
-    public and worker contracts is the three MANAGED_*_KEYS sets. If a future edit reintroduces a
-    second `asdict(self)` and the two drift, this fails on the difference rather than at a recovery
-    digest months later.
+    Deliberately NOT `set(worker) - set(public) == MANAGED_TOP_LEVEL_KEYS`: that compares the
+    registry against itself, so dropping a name shrinks both sides at once and the equation still
+    balances while the field leaks publicly. Mutation-verified -- that exact sabotage survived the
+    registry form. The payload difference itself is already pinned by
+    `test_public_payload_emits_exactly_the_authorable_keys` and
+    `test_worker_payload_is_the_public_key_set_plus_the_managed_fields`, so this only has to bind
+    the registries to the same independent literals.
     """
-    public, worker = spec().to_dict(), spec().to_internal_dict()
-    # Compared against the literal key sets this module already declares, NOT against the registries
-    # themselves. `set(worker) - set(public) == MANAGED_TOP_LEVEL_KEYS` reads well but compares the
-    # registry against itself: dropping a name shrinks both sides at once, so the equation balances
-    # while the field leaks publicly. Mutation-verified -- that exact sabotage survived the registry
-    # form of this assertion.
-    assert set(worker) - set(public) == WORKER_ONLY_TOP_LEVEL
-    assert set(worker["train"]) - set(public["train"]) == MANAGED_TRAIN_FIELDS
-    assert set(worker["gpu"]) - set(public["gpu"]) == MANAGED_GPU_FIELDS
-    # and the registries must equal those same independent literals, so a drifting registry and a
-    # drifting serializer cannot cancel out above.
     assert MANAGED_TOP_LEVEL_KEYS == WORKER_ONLY_TOP_LEVEL
     assert MANAGED_TRAIN_KEYS == MANAGED_TRAIN_FIELDS
     assert MANAGED_GPU_KEYS == MANAGED_GPU_FIELDS
-    # nothing travels the other way: the public payload invents no key the worker half lacks.
+    assert MANAGED_ENVIRONMENT_KEYS == MANAGED_ENVIRONMENT_FIELDS
+    public, worker = spec().to_dict(), spec().to_internal_dict()
+    # nothing travels the other way: the public payload invents no key the worker half lacks. this
+    # is what catches an empty `providers` or `type_fallbacks` reaching the public bytes, which
+    # would change every stored digest.
     assert not set(public) - set(worker)
-    assert not set(public["train"]) - set(worker["train"])
-    assert not set(public["gpu"]) - set(worker["gpu"]), (
-        "the public payload emitted a [gpu] key the worker payload does not have; an empty "
-        "`providers` or `type_fallbacks` reaching the public bytes changes every stored digest"
-    )
+    for section, _ in MANAGED_SECTION_KEYS:
+        assert not set(public[section]) - set(worker[section]), (
+            f"the public payload emitted a [{section}] key the worker payload does not have"
+        )
 
 
 def test_every_privately_held_field_is_named_in_a_registry():
@@ -363,15 +359,28 @@ def test_every_privately_held_field_is_named_in_a_registry():
     output and into this one identically. The projection does not change that direction.
 
     What it does change is that the boundary is now ENUMERABLE. A run of `data.pop(...)` statements
-    cannot be asserted against; three frozensets can. This test is the assertion that buys: if a
-    future edit strips a field inline instead of registering it, the strip stops being visible to
-    the registries and this fails.
+    cannot be asserted against; the registries can. Walks EVERY section, not just the top level:
+    `environment.resolved_sha` was stripped inline and named in no registry, and a top-level-only
+    version of this test passed while that was true.
     """
-    registered = MANAGED_TOP_LEVEL_KEYS | {"project"}
+    public, worker = (
+        spec(train={"epochs": 1, "init_from_adapter": "src/step-4"}).to_dict(),
+        spec(train={"epochs": 1, "init_from_adapter": "src/step-4"}).to_internal_dict(),
+    )
+    # `project` is public-only by construction (it has no worker counterpart), and the two warm-start
+    # topology keys are stripped CONDITIONALLY, so no registry can express them.
+    exempt = {"project", "lora_rank", "lora_alpha"}
     unregistered = {
-        name for name in spec().to_internal_dict() if name not in spec().to_dict()
-    } - registered
+        f"(top){name}" for name in set(worker) - set(public) - MANAGED_TOP_LEVEL_KEYS - exempt
+    }
+    for section, managed_keys in MANAGED_SECTION_KEYS:
+        unregistered |= {
+            f"{section}.{name}"
+            for name in set(worker[section]) - set(public[section]) - managed_keys - exempt
+        }
+    # `gpu.type_fallbacks` is a reshape, not a removal: it is folded into the public `gpu.type`.
+    unregistered -= {"gpu.type_fallbacks"}
     assert not unregistered, (
         f"{sorted(unregistered)} are stripped from the public payload but named in no registry, so "
-        "the public contract is defined by statements again rather than by MANAGED_*_KEYS"
+        "the public contract is defined by statements again rather than by the registries"
     )

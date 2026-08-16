@@ -503,6 +503,20 @@ MANAGED_TOP_LEVEL_KEYS = frozenset(
 # revision pin of a warm-start source.
 MANAGED_TRAIN_KEYS = frozenset({"hf_repo", "init_from_adapter_revision"})
 
+# platform-managed [environment] field: the env ref is resolved once and pinned by the control plane.
+# `pip` deliberately stays public -- it is the author's own scorer dependencies, which only they can
+# declare.
+MANAGED_ENVIRONMENT_KEYS = frozenset({"resolved_sha"})
+
+# every managed section, so the public/worker boundary can be walked rather than restated. the two
+# things NOT here are the ones that are not removals: `train.lora_rank`/`lora_alpha` are stripped
+# only for a warm start, and `gpu.type_fallbacks` is respelled into `gpu.type` rather than dropped.
+MANAGED_SECTION_KEYS = (
+    ("train", MANAGED_TRAIN_KEYS),
+    ("gpu", MANAGED_GPU_KEYS),
+    ("environment", MANAGED_ENVIRONMENT_KEYS),
+)
+
 
 @dataclass(frozen=True)
 class WandbSpec:
@@ -606,11 +620,12 @@ class JobSpec:
         not hand its output to a worker or provider path -- those need ``to_internal_dict()``.
 
         Built as a PROJECTION of the worker payload, because that is the actual relationship: the
-        public contract is the worker contract minus the platform-managed fields, and the three
-        MANAGED_*_KEYS sets name that difference exhaustively. This is still a blacklist -- a newly
+        public contract is the worker contract minus the platform-managed fields, which
+        MANAGED_TOP_LEVEL_KEYS and MANAGED_SECTION_KEYS name. This is still a blacklist -- a newly
         added field is public until something strips it, exactly as before -- but the strips are now
         enumerable rather than a run of statements, so a test can assert the boundary instead of
-        trusting that two independent `asdict(self)` bodies were kept in sync by hand.
+        trusting that two independent `asdict(self)` bodies were kept in sync by hand. What the
+        registries deliberately do NOT cover is the two adjustments below that are not removals.
 
         Its bytes are a recovery contract. ``_preparation_digest`` hashes this output as canonical
         JSON, so key PRESENCE is load-bearing even though key order is not: adding or dropping one
@@ -620,33 +635,28 @@ class JobSpec:
         data = self.to_internal_dict()
         for managed in MANAGED_TOP_LEVEL_KEYS:
             data.pop(managed, None)
+        for section, managed_keys in MANAGED_SECTION_KEYS:
+            for managed in managed_keys:
+                data[section].pop(managed, None)
         train = data["train"]
-        for managed in MANAGED_TRAIN_KEYS:
-            train.pop(managed, None)
         if train.get("init_from_adapter"):
             # the source adapter's topology is authoritative for a warm start, so the parser rejects
             # both keys alongside init_from_adapter. the runner writes the inherited rank/alpha onto
             # the public spec, so they must be stripped here or the submit round trip re-validates
-            # a combination the parser refuses.
+            # a combination the parser refuses. conditional, so it cannot be a registry entry.
             train.pop("lora_rank", None)
             train.pop("lora_alpha", None)
-        # runner-assigned disk sizing, shared weight-cache volume, and retry/wall-clock lifecycle.
+        # restore the public list spelling for an ordered pin -- a reshape rather than a removal,
+        # which is the other thing no registry can express. the default stands in for the key the
+        # worker payload omits when there are no fallbacks: unlike `providers`, this one is read
+        # back, so it cannot rely on the omission alone.
         gpu = data["gpu"]
-        for managed in MANAGED_GPU_KEYS:
-            gpu.pop(managed, None)
-        # restore the public list spelling for an ordered pin. the default stands in for the key the
-        # worker payload omits when there are no fallbacks -- unlike `providers` below, this one is
-        # read back, so it cannot rely on the omission alone.
         fallbacks = gpu.pop("type_fallbacks", ())
         if fallbacks:
             gpu["type"] = [gpu["type"], *fallbacks]
-        # an empty `providers` needs no strip here: the worker payload this projects from already
-        # omits it, for the same reason the public contract wants it gone -- an internal default must
-        # not read back as an authored empty list, which the parser rejects as a likely config bug.
-        data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
-        # [environment] pip stays in the payload: it is the author's own scorer dependencies, which
-        # only they can declare. The submit paths append it to worker_pip_for_env, so what travels
-        # here is the extra requirements, not the worker's own.
+        # an empty `providers` needs no strip: the worker payload this projects from already omits
+        # it, for the same reason the public contract wants it gone -- an internal default must not
+        # read back as an authored empty list, which the parser rejects as a likely config bug.
         return data
 
     def to_internal_dict(self) -> dict[str, Any]:
