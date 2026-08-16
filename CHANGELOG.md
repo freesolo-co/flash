@@ -39,6 +39,34 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- An ordered `[gpu] type` list is now priced over every class it declares acceptable, not just the
+  first. Allocation cost-ranks the whole set, so quoting the head alone priced a shape the run may
+  never be given — an authored `["B200", "H100"]` quoted roughly 3x the H100 the allocator would
+  really rent, and the submit-time affordability check runs on that estimate, so a run the
+  organization could afford could be refused before allocation ever got to choose. A single
+  authored class is still a hard pin, and a no-fit rejection now names every acceptable class
+  rather than whichever happened to be written first.
+
+- A provider preference that exhausts every configured provider no longer falls back to quoting
+  hardware this plane cannot rent. The final fallback dropped the restriction and ranked the
+  registered RunPod pool regardless of credentials, so a vast-only plane could quote a B200: the
+  estimate passed affordability and the run was recorded, only for live allocation to fail. The
+  quote now raises against the eligible set, which names the real constraint.
+
+- A GitHub token that is invalid, expired, or missing a scope now fails during preparation instead
+  of after a GPU is rented. Non-rate-limit 401 and 403 responses were left as untyped errors, which
+  the submit-time preflight treats as a transient blip worth deferring, so the run proceeded
+  through affordability and allocation and hit the same permanent credential error on the worker.
+  They are now classified permanent, like 404 and 422. The rate-limit 403 is still transient.
+
+- A slow heartbeat upload no longer stalls every other heartbeat behind it. The throttle clock only
+  advances once a commit lands, so during a slow HuggingFace commit other callers still saw an
+  upload as due and blocked on the upload lock for up to its acquire timeout — 30s, or 120s on a
+  critical stage — which stalled the liveness daemon and delayed leaving the wrapped stage by the
+  same window. A throttled heartbeat now skips while a commit is in flight, since that commit
+  already carries the stage's state. Terminal, error, initial, and forced step commits still queue
+  and land: they carry state no later heartbeat would repair.
+
 - A GRPO or OPD run whose rollout actor exited hard no longer wedges on a paid GPU until the
   wall-time limit. The actor's `os._exit` bypassed verl's own prompt handler, so the prompt
   stayed `running` forever and verl's unbounded replay poll waited on it at ~0% utilization. The
