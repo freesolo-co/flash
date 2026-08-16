@@ -36,7 +36,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from flash.core.catalog import normalize_algorithm, samples_on_policy
 
@@ -331,7 +331,9 @@ class VersionedPersistedSpecEnvelope:
     so ``rewind()`` is a no-op and the digest is taken over today's serialization directly.
     """
 
-    version: int = _PREPARATION_ENVELOPE_VERSION
+    CURRENT_VERSION: ClassVar[int] = _PREPARATION_ENVELOPE_VERSION
+
+    version: int = CURRENT_VERSION
     worker_dropped_keys: Mapping[str, Any] = field(default_factory=dict)
     public_dropped_keys: Mapping[str, Any] = field(default_factory=dict)
     public_omits_lora_alpha: bool = False
@@ -339,17 +341,32 @@ class VersionedPersistedSpecEnvelope:
     public_rollout_batch: dict[str, Any] | None = None
 
     @classmethod
-    def read(cls, raw_worker: object, raw_public: object) -> VersionedPersistedSpecEnvelope:
-        """Read both halves from the bytes they were stored as.
+    def read(
+        cls,
+        snapshot: object,
+        raw_public: object,
+        *,
+        include_worker: bool = True,
+    ) -> VersionedPersistedSpecEnvelope:
+        """Read one persisted preparation envelope and its public half.
 
-        Each half is read from ITS OWN payload and keeps its own answer. They genuinely differ: the
-        public spec is a stripped view, and after a re-persist the worker half is rewritten in the
-        modern shape while ``status.spec`` keeps the legacy one. Sharing one reading would overwrite
-        the stored public value before hashing -- and since the parse DROPS a superseded
-        ``batch_size``, ``_validate_effective_spec`` cannot see it either, so a tampered public value
-        would be erased rather than caught.
+        Historical snapshots predate the explicit version key and are version 1 by definition. A
+        newer version is rejected rather than guessed: the digest cannot reveal which serialization
+        produced it, so an older build has no safe replay strategy for bytes it does not understand.
+
+        The public and worker halves keep independent spelling. After re-persistence the worker half
+        is rewritten in the modern shape while ``status.spec`` stays historical; ``include_worker``
+        is false on that write path so old worker spelling is not replayed onto newly serialized bytes.
         """
+        snapshot = snapshot if isinstance(snapshot, Mapping) else {}
+        version = snapshot.get("version", cls.CURRENT_VERSION)
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise ValueError("persisted preparation envelope version must be a positive integer")
+        if version != cls.CURRENT_VERSION:
+            raise ValueError(f"unsupported persisted preparation envelope version {version}")
+        raw_worker = snapshot.get("worker_spec") if include_worker else None
         return cls(
+            version=version,
             worker_dropped_keys=_dropped_key_subset(raw_worker),
             public_dropped_keys=_dropped_key_subset(raw_public),
             public_omits_lora_alpha=_prepared_before_public_alpha(raw_public),

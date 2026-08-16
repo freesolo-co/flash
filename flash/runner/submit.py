@@ -15,6 +15,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from flash.core.spec import JobSpec
+from flash.core.spec_persistence import VersionedPersistedSpecEnvelope
 from flash.teacher.retry_contract import OPD_RETRY_CONTRACT_VERSION
 
 if TYPE_CHECKING:
@@ -185,6 +186,27 @@ def _reject_managed_volume_removal(snapshot: object, worker_spec: JobSpec) -> No
         raise ValueError("persisted effective preparation drops a non-shared weight-cache volume")
 
 
+def _effective_preparation_snapshot(
+    public_spec: JobSpec,
+    worker_spec: JobSpec,
+    adapter_identity: dict | None,
+    *,
+    persisted: VersionedPersistedSpecEnvelope | None = None,
+) -> dict:
+    """Build the one versioned snapshot shape used by initial and repeat persistence."""
+    persisted = persisted or VersionedPersistedSpecEnvelope()
+    return {
+        "version": persisted.version,
+        "worker_spec": worker_spec.to_internal_dict(),
+        "workload_profile": worker_spec.workload_profile or None,
+        "adapter_identity": adapter_identity,
+        "preparation_digest": _runner()._preparation_digest(
+            public_spec, worker_spec, adapter_identity, persisted=persisted
+        ),
+        "backend": _runner().TRAINER_BACKEND,
+    }
+
+
 def _persist_effective_worker_spec(
     worker_spec: JobSpec, *, estimated_cost_usd: float | None = None
 ) -> bool:
@@ -212,16 +234,12 @@ def _persist_effective_worker_spec(
     # never rewritten, so a legacy run keeps its old spelling for life and every read replays it --
     # hashing without that replay writes a digest the next integrity check cannot reproduce, and the
     # run recovers until its first quote refresh or realloc and fails afterwards.
-    persisted_envelope = _runner().VersionedPersistedSpecEnvelope.read(None, raw_public)
-    effective_preparation = {
-        "worker_spec": worker_spec.to_internal_dict(),
-        "workload_profile": worker_spec.workload_profile or None,
-        "adapter_identity": adapter_identity,
-        "preparation_digest": _runner()._preparation_digest(
-            public_spec, worker_spec, adapter_identity, persisted=persisted_envelope
-        ),
-        "backend": _runner().TRAINER_BACKEND,
-    }
+    persisted_envelope = VersionedPersistedSpecEnvelope.read(
+        snapshot, raw_public, include_worker=False
+    )
+    effective_preparation = _effective_preparation_snapshot(
+        public_spec, worker_spec, adapter_identity, persisted=persisted_envelope
+    )
     fields = {"effective_preparation": effective_preparation}
     if estimated_cost_usd is not None:
         fields["estimated_cost_usd"] = float(estimated_cost_usd)
@@ -271,15 +289,9 @@ def submit_job(
         workload_profile_input_digest=worker_spec.workload_profile_input_digest or None,
         workload_profile=worker_spec.workload_profile or None,
         prompt_budget=prepared.prompt_budget,
-        effective_preparation={
-            "worker_spec": worker_spec.to_internal_dict(),
-            "workload_profile": worker_spec.workload_profile or None,
-            "adapter_identity": prepared.adapter_identity,
-            "preparation_digest": _runner()._preparation_digest(
-                public_spec, worker_spec, prepared.adapter_identity
-            ),
-            "backend": _runner().TRAINER_BACKEND,
-        },
+        effective_preparation=_effective_preparation_snapshot(
+            public_spec, worker_spec, prepared.adapter_identity
+        ),
         # Snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.
