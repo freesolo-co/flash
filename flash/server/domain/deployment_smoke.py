@@ -4,9 +4,10 @@ A deployment is only marked ready after this passes, so everything here runs aga
 output under a hard wall-clock budget. Two of those bounds are the reason this is its own module:
 a user-supplied structured-output regex is evaluated with a timeout, and a user-supplied JSON
 schema is compiled in a spawned process that is reaped whether or not it answers -- a catastrophic
-pattern or a schema that hangs the validator must not wedge the serving route.
+pattern or a schema that hangs the validator must not wedge the serving path.
 
-Split out of `flash.server.routes.serving` to keep that module under the file-size limit.
+The serving backend arrives as a gateway argument, so a caller can smoke against a fake without
+patching a module attribute.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import time
 
 import regex as safe_regex
 from jsonschema import SchemaError, ValidationError
+from jsonschema.validators import validator_for
 from referencing import Registry
 from referencing.exceptions import Unresolvable
 
@@ -32,39 +34,25 @@ from flash.serve.preflight import (
     validate_local_json_schema,
     validate_structured_output_patterns,
 )
-from flash.server import app as _app
+from flash.server.domain.deployment_ports import ServingGateway
 
-
-def _serving():
-    """The route module, imported lazily because it re-exports this one.
-
-    `validator_for` is patched as an attribute of `flash.server.routes.serving` by the schema
-    coverage test, which makes the validator factory raise to prove the spawned worker reports the
-    failure instead of hanging. Binding it by value here would capture the real factory at import
-    time, so the patch would rebind a name this module never reads.
-    """
-    from flash.server.routes import serving
-
-    return serving
-
-
-_SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
+SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
 # hard wall-clock budget for the trusted fixed-prompt generation and validation.
 # it remains below the deployment stale threshold.
-_SMOKE_BUDGET_SECONDS = 600.0
+SMOKE_BUDGET_SECONDS = 600.0
 
 
-def _smoke_timeout_error(budget_s: float) -> ServingError:
+def smoke_timeout_error(budget_s: float) -> ServingError:
     return ServingError(f"deployment_smoke_timeout: bounded smoke exceeded {budget_s:g}s")
 
 
-def _bounded_call(fn, *, deadline: float, budget_s: float):
+def bounded_call(fn, *, deadline: float, budget_s: float):
     """run the trusted smoke call within the remaining global deadline."""
     import threading
 
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise _smoke_timeout_error(budget_s)
+        raise smoke_timeout_error(budget_s)
     result: dict = {}
 
     def _target() -> None:
@@ -77,53 +65,54 @@ def _bounded_call(fn, *, deadline: float, budget_s: float):
     thread.start()
     thread.join(timeout=remaining)
     if thread.is_alive():
-        raise _smoke_timeout_error(budget_s)
+        raise smoke_timeout_error(budget_s)
     if "error" in result:
         raise result["error"]
     return result.get("value")
 
 
-_DIRECT_REGEX_TIMEOUT_SECONDS = 0.05
-_JSON_SCHEMA_TIMEOUT_SECONDS = 3.0
-_JSON_SCHEMA_PROCESS_NAME = "flash-json-schema-validation"
+DIRECT_REGEX_TIMEOUT_SECONDS = 0.05
+JSON_SCHEMA_TIMEOUT_SECONDS = 3.0
+JSON_SCHEMA_PROCESS_NAME = "flash-json-schema-validation"
 
 
-def _bounded_regex_fullmatch(pattern: str, value: str, *, deadline: float, budget_s: float):
+def bounded_regex_fullmatch(pattern: str, value: str, *, deadline: float, budget_s: float):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise _smoke_timeout_error(budget_s)
-    global_deadline_limits = remaining <= _DIRECT_REGEX_TIMEOUT_SECONDS
-    timeout = min(_DIRECT_REGEX_TIMEOUT_SECONDS, remaining)
+        raise smoke_timeout_error(budget_s)
+    global_deadline_limits = remaining <= DIRECT_REGEX_TIMEOUT_SECONDS
+    timeout = min(DIRECT_REGEX_TIMEOUT_SECONDS, remaining)
     try:
         return safe_regex.fullmatch(pattern, value, timeout=timeout)
     except TimeoutError as exc:
         if global_deadline_limits:
-            raise _smoke_timeout_error(budget_s) from exc
+            raise smoke_timeout_error(budget_s) from exc
         raise ServingError(
-            f"structured-output regex evaluation exceeded the {_DIRECT_REGEX_TIMEOUT_SECONDS:.2f}s deadline"
+            f"structured-output regex evaluation exceeded the {DIRECT_REGEX_TIMEOUT_SECONDS:.2f}s deadline"
         ) from exc
 
 
-def _sanitized_schema_error(exc: Exception) -> str:
+def sanitized_schema_error(exc: Exception) -> str:
     message = getattr(exc, "message", str(exc))
     return " ".join(str(message).split())[:500]
 
 
-def _json_schema_validation_worker(connection, instance, schema) -> None:
+def json_schema_validation_worker(connection, instance, schema) -> None:
+    """Validate in a spawned child. `validator_for` is read off this module so a test can make the
+    factory raise and prove the child reports the failure instead of hanging; the real spawn
+    re-imports the module and gets the real factory."""
     try:
-        validator_class = validate_local_json_schema(
-            schema, validator_factory=_serving().validator_for
-        )
+        validator_class = validate_local_json_schema(schema, validator_factory=validator_for)
         registry = Registry(retrieve=reject_external_schema_reference)
         validator_class(schema, registry=registry).validate(instance)
     except (ExternalSchemaReference, Unresolvable) as exc:
-        outcome = ("reference", _sanitized_schema_error(exc))
+        outcome = ("reference", sanitized_schema_error(exc))
     except SchemaError as exc:
-        outcome = ("schema", _sanitized_schema_error(exc))
+        outcome = ("schema", sanitized_schema_error(exc))
     except ValidationError as exc:
-        outcome = ("validation", _sanitized_schema_error(exc))
+        outcome = ("validation", sanitized_schema_error(exc))
     except Exception as exc:
-        outcome = ("error", f"{type(exc).__name__}: {_sanitized_schema_error(exc)}")
+        outcome = ("error", f"{type(exc).__name__}: {sanitized_schema_error(exc)}")
     else:
         outcome = ("ok", "")
     try:
@@ -132,7 +121,7 @@ def _json_schema_validation_worker(connection, instance, schema) -> None:
         connection.close()
 
 
-def _reap_schema_validation_process(process, *, deadline: float) -> None:
+def reap_schema_validation_process(process, *, deadline: float) -> None:
     remaining = max(0.0, deadline - time.monotonic())
     process.join(timeout=min(0.1, remaining))
     if process.is_alive():
@@ -144,19 +133,19 @@ def _reap_schema_validation_process(process, *, deadline: float) -> None:
         process.join()
 
 
-def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: float) -> None:
+def validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: float) -> None:
     now = time.monotonic()
     if deadline <= now:
-        raise _smoke_timeout_error(budget_s)
-    local_deadline = now + _JSON_SCHEMA_TIMEOUT_SECONDS
+        raise smoke_timeout_error(budget_s)
+    local_deadline = now + JSON_SCHEMA_TIMEOUT_SECONDS
     validation_deadline = min(deadline, local_deadline)
     global_deadline_limits = deadline <= local_deadline
     context = multiprocessing.get_context("spawn")
     receive_connection, send_connection = context.Pipe(duplex=False)
     process = context.Process(
-        target=_json_schema_validation_worker,
+        target=json_schema_validation_worker,
         args=(send_connection, instance, schema),
-        name=_JSON_SCHEMA_PROCESS_NAME,
+        name=JSON_SCHEMA_PROCESS_NAME,
         daemon=True,
     )
     outcome: tuple[str, str] | None = None
@@ -166,7 +155,7 @@ def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: 
             process.start()
         except Exception as exc:
             if time.monotonic() >= deadline:
-                raise _smoke_timeout_error(budget_s) from exc
+                raise smoke_timeout_error(budget_s) from exc
             raise ServingError(f"could not start isolated JSON schema validation: {exc}") from exc
         finally:
             send_connection.close()
@@ -181,14 +170,14 @@ def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: 
     finally:
         receive_connection.close()
         if process.pid is not None:
-            _reap_schema_validation_process(process, deadline=deadline)
+            reap_schema_validation_process(process, deadline=deadline)
             process.close()
 
     if outcome is None:
         if timed_out and global_deadline_limits:
-            raise _smoke_timeout_error(budget_s)
+            raise smoke_timeout_error(budget_s)
         raise ServingError(
-            f"JSON schema validation exceeded the {_JSON_SCHEMA_TIMEOUT_SECONDS:.1f}s wall-clock deadline"
+            f"JSON schema validation exceeded the {JSON_SCHEMA_TIMEOUT_SECONDS:.1f}s wall-clock deadline"
         )
     status, detail = outcome
     if status == "ok":
@@ -202,7 +191,7 @@ def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: 
     raise ServingError(f"JSON schema validation failed safely: {detail}")
 
 
-def _strict_json_loads(value: str):
+def strict_json_loads(value: str):
     def reject_constant(constant: str):
         raise ValueError(f"non-finite JSON constant {constant!r} is not allowed")
 
@@ -212,7 +201,7 @@ def _strict_json_loads(value: str):
         raise ServingError(f"structured smoke output is not valid JSON: {exc}") from exc
 
 
-def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> tuple[str, object]:
+def smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> tuple[str, object]:
     choice = (result.get("choices") or [{}])[0]
     content = str((choice.get("message") or {}).get("content") or "")
     finish = choice.get("finish_reason")
@@ -239,7 +228,7 @@ def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> t
     return content, finish
 
 
-def _thinking_tag_is_guaranteed(spec) -> bool:
+def thinking_tag_is_guaranteed(spec) -> bool:
     """Whether the catalog vouches that this model's chat template opens a thinking block.
 
     A curated entry states its ``thinking`` capability, so the tag is required. Only a stale caller
@@ -257,7 +246,7 @@ def _thinking_tag_is_guaranteed(spec) -> bool:
     return isinstance(model, str) and model.strip() in MODELS
 
 
-def _thinking_answer(content: str, *, require_tag: bool = True) -> str:
+def thinking_answer(content: str, *, require_tag: bool = True) -> str:
     """Return the answer a thinking adapter emitted after its reasoning, or reject the smoke.
 
     Stop sequences can end during reasoning while still reporting ``finish_reason=stop``; require an
@@ -282,25 +271,25 @@ def _thinking_answer(content: str, *, require_tag: bool = True) -> str:
     return answer
 
 
-def _validate_structured_smoke(
+def validate_structured_smoke(
     answer: str, constraint: dict, *, deadline: float, budget_s: float
 ) -> None:
     if time.monotonic() >= deadline:
-        raise _smoke_timeout_error(budget_s)
+        raise smoke_timeout_error(budget_s)
     try:
         validate_structured_output_patterns(constraint)
     except ValueError as exc:
         raise ServingError(f"configured structured-output {exc}") from exc
     try:
         if "json" in constraint:
-            _validate_json_schema(
-                _strict_json_loads(answer),
+            validate_json_schema(
+                strict_json_loads(answer),
                 constraint["json"],
                 deadline=deadline,
                 budget_s=budget_s,
             )
         elif constraint.get("json_object") is True:
-            if not isinstance(_strict_json_loads(answer), dict):
+            if not isinstance(strict_json_loads(answer), dict):
                 raise ServingError("structured smoke output is valid JSON but not a JSON object")
         elif "choice" in constraint:
             if answer not in constraint["choice"]:
@@ -309,7 +298,7 @@ def _validate_structured_smoke(
                 )
         elif (
             "regex" in constraint
-            and _bounded_regex_fullmatch(
+            and bounded_regex_fullmatch(
                 str(constraint["regex"]), answer, deadline=deadline, budget_s=budget_s
             )
             is None
@@ -319,7 +308,7 @@ def _validate_structured_smoke(
         raise ServingError(f"configured structured-output regex is invalid: {exc}") from exc
 
 
-def _smoke_request_settings(spec: JobSpec) -> tuple[dict | None, int, list[str] | None]:
+def smoke_request_settings(spec: JobSpec) -> tuple[dict | None, int, list[str] | None]:
     train = getattr(spec, "train", None)
     constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
     max_tokens = 256
@@ -340,8 +329,9 @@ def _smoke_request_settings(spec: JobSpec) -> tuple[dict | None, int, list[str] 
     return constraint, max_tokens, stop_sequences or None
 
 
-def _bounded_smoke_chat(
+def bounded_smoke_chat(
     *,
+    serving: ServingGateway,
     serving_model: str,
     thinking: bool,
     expected_checkpoint: str,
@@ -355,13 +345,13 @@ def _bounded_smoke_chat(
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise _smoke_timeout_error(budget_s)
+            raise smoke_timeout_error(budget_s)
         try:
 
             def _chat_call(timeout_s: float = remaining):
-                return _app.serve_chat(
+                return serving.chat(
                     run_id=serving_model,
-                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
+                    messages=[{"role": "user", "content": SMOKE_PROMPT}],
                     temperature=0.0,
                     max_tokens=max_tokens,
                     thinking=thinking,
@@ -372,11 +362,11 @@ def _bounded_smoke_chat(
                     stop=stop_sequences,
                 )
 
-            return _bounded_call(_chat_call, deadline=deadline, budget_s=budget_s)
+            return bounded_call(_chat_call, deadline=deadline, budget_s=budget_s)
         except RetryableServingUnavailable as exc:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise _smoke_timeout_error(budget_s) from exc
+                raise smoke_timeout_error(budget_s) from exc
             time.sleep(min(exc.retry_after_seconds, remaining))
         except ServingError:
             raise
@@ -386,18 +376,20 @@ def _bounded_smoke_chat(
             raise ServingError(f"{error_context}: {exc}") from exc
 
 
-def _run_deployment_smoke(
+def run_deployment_smoke(
     run_id: str,
     spec: JobSpec,
     *,
+    serving: ServingGateway,
     serving_model: str,
     expected_checkpoint: str,
-    budget_s: float = _SMOKE_BUDGET_SECONDS,
+    budget_s: float = SMOKE_BUDGET_SECONDS,
 ) -> dict:
     started = time.monotonic()
     deadline = started + budget_s
-    constraint, max_tokens, stop_sequences = _smoke_request_settings(spec)
-    result = _bounded_smoke_chat(
+    constraint, max_tokens, stop_sequences = smoke_request_settings(spec)
+    result = bounded_smoke_chat(
+        serving=serving,
         serving_model=serving_model,
         thinking=spec.thinking,
         expected_checkpoint=expected_checkpoint,
@@ -407,21 +399,21 @@ def _run_deployment_smoke(
         deadline=deadline,
         budget_s=budget_s,
     )
-    content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
+    content, finish = smoke_provenance(result, serving_model, expected_checkpoint)
     # truncation is a thinking-budget failure whether or not a grammar is configured: serving
     # returns the reasoning in reasoning_content, so a run cut off mid-thought still arrives with a
     # balanced <think>...</think> and passes the empty-content check carrying a non-answer.
     if spec.thinking and finish == "length":
         raise ServingError("smoke generation was truncated at the maximum token length")
     answer = (
-        _thinking_answer(content, require_tag=_thinking_tag_is_guaranteed(spec))
+        thinking_answer(content, require_tag=thinking_tag_is_guaranteed(spec))
         if spec.thinking
         else content.strip()
     )
     if constraint:
-        _validate_structured_smoke(answer, constraint, deadline=deadline, budget_s=budget_s)
+        validate_structured_smoke(answer, constraint, deadline=deadline, budget_s=budget_s)
     if time.monotonic() > deadline:
-        raise _smoke_timeout_error(budget_s)
+        raise smoke_timeout_error(budget_s)
     return {
         "verified_at": time.time(),
         "verify_kind": "fixed_prompt",
@@ -433,7 +425,7 @@ def _run_deployment_smoke(
     }
 
 
-def _alias_reasoning_content(result: dict, run_id: str, adapter_revision: str) -> str:
+def alias_reasoning_content(result: dict, run_id: str, adapter_revision: str) -> str:
     choices = result.get("choices")
     choice = choices[0] if isinstance(choices, list) and choices else None
     message = choice.get("message") if isinstance(choice, dict) else None
@@ -454,19 +446,21 @@ def _alias_reasoning_content(result: dict, run_id: str, adapter_revision: str) -
     return reasoning
 
 
-def _verify_alias_thinking(
+def verify_alias_thinking(
     run_id: str,
     spec: JobSpec,
     adapter_revision: str,
     expected_checkpoint: str,
     *,
-    budget_s: float = _SMOKE_BUDGET_SECONDS,
+    serving: ServingGateway,
+    budget_s: float = SMOKE_BUDGET_SECONDS,
 ) -> dict:
     """Confirm the freshly activated alias serves the activated revision with reasoning metadata."""
     started = time.monotonic()
     deadline = started + budget_s
-    _, max_tokens, stop_sequences = _smoke_request_settings(spec)
-    result = _bounded_smoke_chat(
+    _, max_tokens, stop_sequences = smoke_request_settings(spec)
+    result = bounded_smoke_chat(
+        serving=serving,
         serving_model=run_id,
         thinking=True,
         expected_checkpoint=expected_checkpoint,
@@ -478,10 +472,10 @@ def _verify_alias_thinking(
         error_context=f"alias thinking verification could not reach {run_id}",
     )
 
-    _smoke_provenance(result, adapter_revision, expected_checkpoint)
-    _alias_reasoning_content(result, run_id, adapter_revision)
+    smoke_provenance(result, adapter_revision, expected_checkpoint)
+    alias_reasoning_content(result, run_id, adapter_revision)
     if time.monotonic() > deadline:
-        raise _smoke_timeout_error(budget_s)
+        raise smoke_timeout_error(budget_s)
     return {
         "alias_thinking_tag": True,
         "alias_thinking_verified_at": time.time(),

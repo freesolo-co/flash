@@ -910,19 +910,19 @@ def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
     # take the CLI default from the parser rather than restating it, so the two cannot drift apart
     # silently: shrinking bare `--wait` must fail here, not in a deploy.
     from flash.cli import _build_parser
-    from flash.server.routes.serving import _DEPLOYMENT_STALE_SECONDS
-    from flash.server.routes.serving_smoke import _SMOKE_BUDGET_SECONDS
+    from flash.server.domain.deployment_smoke import SMOKE_BUDGET_SECONDS
+    from flash.server.domain.deployments import DEPLOYMENT_STALE_SECONDS
 
     cli_default_wait = float(
         _build_parser().parse_args(["models", "deploy", "run-1", "--wait"]).wait
     )
 
-    bounded = d.REVISION_READY_MAX_BUDGET_SECONDS + 2 * _SMOKE_BUDGET_SECONDS
-    assert bounded < _DEPLOYMENT_STALE_SECONDS
+    bounded = d.REVISION_READY_MAX_BUDGET_SECONDS + 2 * SMOKE_BUDGET_SECONDS
+    assert bounded < DEPLOYMENT_STALE_SECONDS
     # and the CLI must not call a still-progressing deploy failed before the plane reaps it.
     assert bounded < cli_default_wait
     # the unbudgeted hub reads, registration, activation and poll latency get a real reserve.
-    reserve = min(_DEPLOYMENT_STALE_SECONDS, cli_default_wait) - bounded
+    reserve = min(DEPLOYMENT_STALE_SECONDS, cli_default_wait) - bounded
     assert reserve >= 300.0
 
 

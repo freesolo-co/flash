@@ -1059,20 +1059,19 @@ def test_standalone_deploy_needs_no_org_while_managed_fails_closed(monkeypatch) 
     deploy impossible; managed mode is where an org-unscoped adapter registration would hand the
     serving backend an unowned revision, so THAT is where the deploy must be refused.
     """
-    pytest.importorskip("fastapi")
-    from fastapi import HTTPException
+    from flash.server.domain.deployment_ports import DeploymentConflict
+    from flash.server.domain.deployments import DeploymentService
 
-    from flash.server.routes import serving
+    require_deploy_org = DeploymentService._require_deploy_org
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
-    serving._require_deploy_org("run-1", None)  # single-tenant: nothing to name, no rejection
+    require_deploy_org("run-1", None)  # single-tenant: nothing to name, no rejection
 
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
-    with pytest.raises(HTTPException) as ei:
-        serving._require_deploy_org("run-1", None)
-    assert ei.value.status_code == 409
+    with pytest.raises(DeploymentConflict) as ei:
+        require_deploy_org("run-1", None)
     assert "owning organization" in str(ei.value.detail)
-    serving._require_deploy_org("run-1", "org-1")  # managed with an org still deploys
+    require_deploy_org("run-1", "org-1")  # managed with an org still deploys
 
 
 def test_standalone_deployment_listing_stays_exact_key_scoped(monkeypatch) -> None:

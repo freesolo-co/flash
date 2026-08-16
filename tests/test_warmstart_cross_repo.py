@@ -278,11 +278,9 @@ class _ReachedArtifactResolution(Exception):
 
 def test_warm_start_inherits_a_legacy_authored_source_revision(monkeypatch):
     """A child inherits an authored source pin without laundering its deploy provenance."""
-    from fastapi import HTTPException
-
     import flash.runner as R
-    import flash.server.routes.serving as serving
     from flash.core.spec import JobSpec
+    from flash.server.domain.deployment_ports import InvalidDeploymentRequest
 
     source = JobSpec.from_dict(
         {
@@ -340,8 +338,11 @@ def test_warm_start_inherits_a_legacy_authored_source_revision(monkeypatch):
         spec=inherited.to_dict(),
         effective_preparation={"worker_spec": inherited.to_internal_dict()},
     )
-    with pytest.raises(HTTPException, match="legacy revision-pinned base model"):
-        serving._validate_deploy_request(
+    from tests._helpers.deployment import build_harness
+
+    harness = build_harness()
+    with pytest.raises(InvalidDeploymentRequest, match="legacy revision-pinned base model"):
+        harness.service._validate_deploy_request(
             inherited.run_id,
             deploy_status,
             JobSpec.from_dict(deploy_status.spec),

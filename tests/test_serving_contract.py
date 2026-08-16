@@ -243,20 +243,21 @@ def test_deployment_roundtrip_dict():
     assert "mode" not in data
 
 
-def test_resolve_deploy_step_rejects_malformed_step_as_400():
-    """A malformed ``step`` must raise HTTPException(400), never a 500. Regression for ``"--5"``:
-    ``str.lstrip("-").isdigit()`` accepted it, then ``int("--5")`` raised an uncaught ValueError.
-    The 400 path raises before any checkpoint lookup, so the spec/app args are unused here."""
-    pytest.importorskip("fastapi")
+def test_resolve_deploy_step_rejects_malformed_step_as_invalid():
+    """A malformed ``step`` must be an invalid-request refusal (400), never a 500. Regression for
+    ``"--5"``: ``str.lstrip("-").isdigit()`` accepted it, then ``int("--5")`` raised an uncaught
+    ValueError. The refusal happens before any checkpoint lookup, so the artifact repository is
+    never consulted."""
+    from flash.server.domain.deployment_ports import InvalidDeploymentRequest
+    from flash.server.domain.deployment_revisions import resolve_deploy_step
 
-    from fastapi import HTTPException
-
-    from flash.server.routes.serving import _resolve_deploy_step
+    class _NoArtifacts:
+        def list_checkpoints(self, spec):
+            raise AssertionError("a malformed step must be refused before any checkpoint lookup")
 
     for bad in ("--5", "40.9", "+5", "5-", "abc", "-", "", "   ", "0x5"):
-        with pytest.raises(HTTPException) as ei:
-            _resolve_deploy_step("flash-7-abcd", object(), bad)
-        assert ei.value.status_code == 400, bad
+        with pytest.raises(InvalidDeploymentRequest):
+            resolve_deploy_step("flash-7-abcd", object(), bad, artifacts=_NoArtifacts())
 
 
 def test_deployment_dict_carries_openai_v1_url(monkeypatch):

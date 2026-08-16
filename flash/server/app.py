@@ -42,22 +42,14 @@ _DEPLOYABLE_STATES = {"done", "deployed"}
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
 _log = logging.getLogger("flash.server")
-_DEPLOYMENT_JOBS_LOCK = threading.Lock()
-_DEPLOYMENT_JOBS: set[threading.Thread] = set()
-_DEPLOYMENT_JOBS_ACCEPTING = True
 
 
-class DeploymentJobStartError(RuntimeError):
-    pass
-
-
-# Symbols re-exported through this module. The route handlers look these up on
+# Symbols re-exported through this module. The deployment adapters look these up on
 # ``flash.server.app`` at call time (``_app.<name>``) so a test that patches ``app.<name>``
 # is honored; listing them here also keeps them from reading as unused imports.
 __all__ = [
     "_DEPLOY_LOCKS",
     "_RECOVERABLE",
-    "DeploymentJobStartError",
     "_charge_retry_loop",
     "_charge_retry_startup",
     "_deploy_lock",
@@ -76,7 +68,6 @@ __all__ = [
     "run_server",
     "serve_chat",
     "serve_chat_stream",
-    "start_deployment_job",
     "submit_job",
     "undeploy_adapter",
 ]
@@ -124,62 +115,6 @@ def _protected_train_endpoint_names() -> set[str]:
 def _known_train_endpoint_names() -> set[str]:
     """Endpoint names for EVERY run this plane has a record of — the reaper's multi-plane scope."""
     return _train_endpoint_names(include_terminal=True)
-
-
-def _open_deployment_jobs() -> None:
-    global _DEPLOYMENT_JOBS_ACCEPTING
-    with _DEPLOYMENT_JOBS_LOCK:
-        _DEPLOYMENT_JOBS_ACCEPTING = True
-
-
-def _run_deployment_job(target, args, kwargs) -> None:
-    try:
-        target(*args, **kwargs)
-    finally:
-        with _DEPLOYMENT_JOBS_LOCK:
-            _DEPLOYMENT_JOBS.discard(threading.current_thread())
-
-
-def _wait_for_deployment_jobs(timeout: float) -> bool:
-    global _DEPLOYMENT_JOBS_ACCEPTING
-    deadline = time.monotonic() + timeout
-    with _DEPLOYMENT_JOBS_LOCK:
-        _DEPLOYMENT_JOBS_ACCEPTING = False
-    while True:
-        with _DEPLOYMENT_JOBS_LOCK:
-            jobs = tuple(_DEPLOYMENT_JOBS)
-        if not jobs:
-            return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        jobs[0].join(remaining)
-
-
-def start_deployment_job(target, *args, **kwargs) -> bool:
-    """Start a deployment lifecycle job.
-
-    Returns True when the job ran synchronously (test mode), False when it was started in a
-    background thread.
-    """
-    if os.environ.get("FLASH_DEPLOY_SYNC") == "1":
-        target(*args, **kwargs)
-        return True
-    thread = threading.Thread(
-        target=_run_deployment_job,
-        args=(target, args, kwargs),
-        daemon=True,
-    )
-    with _DEPLOYMENT_JOBS_LOCK:
-        if not _DEPLOYMENT_JOBS_ACCEPTING:
-            raise DeploymentJobStartError("deployment jobs are shutting down")
-        _DEPLOYMENT_JOBS.add(thread)
-        try:
-            thread.start()
-        except Exception as exc:
-            _DEPLOYMENT_JOBS.discard(thread)
-            raise DeploymentJobStartError(str(exc)) from exc
-    return False
 
 
 def _reap_idle_endpoints_once(min_idle_s: float) -> int:
@@ -310,7 +245,12 @@ def _instance_providers_configured() -> bool:
     return any(name in INSTANCE_PROVIDERS for name in available_providers())
 
 
-def create_app():
+def create_app(deployment_service=None):
+    """Build the control plane.
+
+    ``deployment_service`` is the seam for tests: pass one built over fake collaborators to drive
+    the routes without a real serving backend. Production passes nothing and gets the real one.
+    """
     try:
         from fastapi import FastAPI
 
@@ -318,6 +258,16 @@ def create_app():
     except ImportError as exc:
         raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
     from contextlib import asynccontextmanager
+
+    from flash.server.platform.deployment_adapters import build_deployment_service
+    from flash.server.platform.deployment_jobs import ThreadDeploymentJobRunner
+
+    jobs = ThreadDeploymentJobRunner()
+    service = (
+        deployment_service
+        if deployment_service is not None
+        else build_deployment_service(jobs=jobs)
+    )
 
     @asynccontextmanager
     async def lifespan(app):
@@ -328,15 +278,15 @@ def create_app():
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         db.recover_teacher_request_ledger()
-        _open_deployment_jobs()
+        jobs.open()
         _open_status_reporter()
         recover_runs()
-        serving.recover_deployments()
+        service.recover_deployments()
         # replay one persisted status at a time in the background. synchronous per-item delivery
         # prevents a historical backlog from filling the shared reporter ahead of live updates.
         startup_report_stop = threading.Event()
         startup_report_task = asyncio.create_task(
-            asyncio.to_thread(serving.replay_status_reports, startup_report_stop)
+            asyncio.to_thread(service.replay_status_reports, startup_report_stop)
         )
         # retry completion charges missed by transient failure or a crash after done.
         # run in background so billing timeouts cannot delay startup; backend runId makes it
@@ -394,7 +344,7 @@ def create_app():
                         await task
             shutdown_deadline = time.monotonic() + 15.0
             with contextlib.suppress(Exception):
-                if not await asyncio.to_thread(_wait_for_deployment_jobs, 10.0):
+                if not await asyncio.to_thread(jobs.drain, 10.0):
                     _log.warning("deployment jobs still running at shutdown deadline")
             with contextlib.suppress(Exception):
                 from flash.runner import _shutdown_status_reporter
@@ -403,6 +353,7 @@ def create_app():
                 await asyncio.to_thread(_shutdown_status_reporter, remaining, close=True)
 
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
+    app.state.deployment_service = service
     app.include_router(meta.router)
     app.include_router(envs.router)
     app.include_router(runs.router)

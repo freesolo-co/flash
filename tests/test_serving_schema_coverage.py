@@ -1,12 +1,15 @@
-"""Hermetic branch coverage for isolated structured-output validation."""
+"""Hermetic branch coverage for isolated structured-output validation.
+
+The spawned-process failure paths only: a child that will not start, one that dies without
+answering, and each status it can report. These drive `_Context` fakes rather than a real spawn, so
+they cover branches the real-subprocess tests in `test_deployment_smoke.py` cannot reach.
+"""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
-import flash.server.routes.serving as serving
+import flash.server.domain.deployment_smoke as smoke
 from flash.serve.deploy import ServingError
 
 
@@ -57,88 +60,18 @@ class _Context:
         return self.receive, self.send
 
     def Process(self, **kwargs):
-        assert kwargs["target"] is serving._json_schema_validation_worker
-        assert kwargs["name"] == serving._JSON_SCHEMA_PROCESS_NAME
+        assert kwargs["target"] is smoke.json_schema_validation_worker
+        assert kwargs["name"] == smoke.JSON_SCHEMA_PROCESS_NAME
         assert kwargs["daemon"] is True
         return self.process
-
-
-def test_bounded_regex_rejects_an_expired_global_deadline(monkeypatch) -> None:
-    """An exhausted smoke budget must fail before regex evaluation can start."""
-    monkeypatch.setattr(serving.time, "monotonic", lambda: 10.0)
-    monkeypatch.setattr(
-        serving.safe_regex,
-        "fullmatch",
-        lambda *args, **kwargs: pytest.fail("expired budgets must not evaluate regexes"),
-    )
-
-    with pytest.raises(ServingError, match="deployment_smoke_timeout"):
-        serving._bounded_regex_fullmatch("a", "a", deadline=10.0, budget_s=2.0)
-
-
-def test_bounded_regex_maps_a_global_timeout_to_the_smoke_budget(monkeypatch) -> None:
-    """A regex timeout constrained by the global deadline must retain the global error contract."""
-    monkeypatch.setattr(serving.time, "monotonic", lambda: 10.0)
-
-    def timeout(*args, **kwargs):
-        raise TimeoutError("slow regex")
-
-    monkeypatch.setattr(serving.safe_regex, "fullmatch", timeout)
-    with pytest.raises(ServingError, match="deployment_smoke_timeout"):
-        serving._bounded_regex_fullmatch("(a+)+$", "a!", deadline=10.01, budget_s=1.0)
-
-
-def test_schema_error_sanitization_collapses_and_bounds_untrusted_text() -> None:
-    """Schema diagnostics must be single-line and bounded before reaching users or logs."""
-    exc = SimpleNamespace(message=("  unsafe\n\ttext  " * 100))
-    message = serving._sanitized_schema_error(exc)
-
-    assert "\n" not in message
-    assert "\t" not in message
-    assert len(message) == 500
-    assert message.startswith("unsafe text unsafe text")
-
-
-@pytest.mark.parametrize(
-    ("instance", "schema", "status"),
-    [
-        ({"answer": 4}, {"type": "object", "required": ["answer"]}, "ok"),
-        ({}, {"type": "object", "required": ["answer"]}, "validation"),
-        ({}, {"type": 4}, "schema"),
-        ({}, {"$ref": "https://schemas.invalid/missing.json"}, "reference"),
-    ],
-)
-def test_json_schema_worker_reports_expected_outcomes(instance, schema, status) -> None:
-    """The worker must classify normal schema outcomes and always close its connection."""
-    connection = _Connection()
-
-    serving._json_schema_validation_worker(connection, instance, schema)
-
-    assert connection.closed is True
-    assert len(connection.sent) == 1
-    assert connection.sent[0][0] == status
-
-
-def test_json_schema_worker_safely_classifies_unexpected_failures(monkeypatch) -> None:
-    """Unexpected validator failures must become inert error tuples instead of escaping the worker."""
-    connection = _Connection()
-
-    def boom(_schema):
-        raise RuntimeError("validator exploded")
-
-    monkeypatch.setattr(serving, "validator_for", boom)
-    serving._json_schema_validation_worker(connection, {}, {})
-
-    assert connection.sent == [("error", "RuntimeError: validator exploded")]
-    assert connection.closed is True
 
 
 def _install_context(monkeypatch, *, outcome=None, eof=False, start_error=None):
     receive = _Connection(outcome=outcome, eof=eof)
     process = _Process(start_error=start_error)
     context = _Context(receive, process)
-    monkeypatch.setattr(serving.multiprocessing, "get_context", lambda method: context)
-    monkeypatch.setattr(serving.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(smoke.multiprocessing, "get_context", lambda method: context)
+    monkeypatch.setattr(smoke.time, "monotonic", lambda: 10.0)
     return receive, context.send, process
 
 
@@ -147,7 +80,7 @@ def test_validate_json_schema_reports_process_start_failure(monkeypatch) -> None
     receive, send, process = _install_context(monkeypatch, start_error=RuntimeError("spawn denied"))
 
     with pytest.raises(ServingError, match="could not start isolated JSON schema validation"):
-        serving._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
+        smoke.validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
 
     assert receive.closed is True
     assert send.closed is True
@@ -157,14 +90,14 @@ def test_validate_json_schema_reports_process_start_failure(monkeypatch) -> None
 def test_validate_json_schema_maps_start_failure_after_deadline(monkeypatch) -> None:
     """A spawn failure that consumes the global budget must report the smoke timeout instead."""
     ticks = iter([10.0, 11.0])
-    monkeypatch.setattr(serving.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(smoke.time, "monotonic", lambda: next(ticks))
     receive = _Connection()
     process = _Process(start_error=RuntimeError("late spawn"))
     context = _Context(receive, process)
-    monkeypatch.setattr(serving.multiprocessing, "get_context", lambda method: context)
+    monkeypatch.setattr(smoke.multiprocessing, "get_context", lambda method: context)
 
     with pytest.raises(ServingError, match="deployment_smoke_timeout"):
-        serving._validate_json_schema({}, {}, deadline=10.5, budget_s=0.5)
+        smoke.validate_json_schema({}, {}, deadline=10.5, budget_s=0.5)
 
     assert receive.closed is True
     assert context.send.closed is True
@@ -175,7 +108,7 @@ def test_validate_json_schema_treats_child_eof_as_safe_failure(monkeypatch) -> N
     receive, send, _process = _install_context(monkeypatch, eof=True)
 
     with pytest.raises(ServingError, match="wall-clock deadline"):
-        serving._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
+        smoke.validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
 
     assert receive.closed is True
     assert send.closed is True
@@ -188,6 +121,7 @@ def test_validate_json_schema_treats_child_eof_as_safe_failure(monkeypatch) -> N
         (("schema", "bad schema"), "configured JSON schema is invalid"),
         (("validation", "bad value"), "structured smoke output violates"),
         (("error", "safe detail"), "JSON schema validation failed safely"),
+        (("reference", "unresolvable"), "reference could not be resolved"),
     ],
 )
 def test_validate_json_schema_maps_child_statuses(monkeypatch, outcome, message) -> None:
@@ -195,7 +129,7 @@ def test_validate_json_schema_maps_child_statuses(monkeypatch, outcome, message)
     _install_context(monkeypatch, outcome=outcome)
 
     if message is None:
-        serving._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
+        smoke.validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
     else:
         with pytest.raises(ServingError, match=message):
-            serving._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
+            smoke.validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)

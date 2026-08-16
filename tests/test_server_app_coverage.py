@@ -11,46 +11,10 @@ import pytest
 
 import flash.server.app as app_mod
 
-
-def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> None:
-    """Asynchronous deployment work must run through the daemon wrapper and clear its registry."""
-    calls = []
-    current = {}
-
-    class FakeThread:
-        def __init__(self, *, target, args, daemon):
-            calls.append(("init", target, args, daemon))
-            self.target = target
-            self.args = args
-            current["thread"] = self
-
-        def start(self):
-            calls.append(("start",))
-
-    monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
-    monkeypatch.setattr(app_mod.threading, "Thread", FakeThread)
-    monkeypatch.setattr(app_mod.threading, "current_thread", lambda: current["thread"])
-    app_mod._open_deployment_jobs()
-    observed = []
-
-    def record(value, *, final):
-        observed.append((value, final))
-
-    assert app_mod.start_deployment_job(record, "done", final=True) is False
-    thread = current["thread"]
-    with app_mod._DEPLOYMENT_JOBS_LOCK:
-        assert thread in app_mod._DEPLOYMENT_JOBS
-        assert len(app_mod._DEPLOYMENT_JOBS) == 1
-
-    thread.target(*thread.args)
-
-    assert observed == [("done", True)]
-    assert calls == [
-        ("init", app_mod._run_deployment_job, (record, ("done",), {"final": True}), True),
-        ("start",),
-    ]
-    with app_mod._DEPLOYMENT_JOBS_LOCK:
-        assert not app_mod._DEPLOYMENT_JOBS
+# the deployment job registry moved off this module into ThreadDeploymentJobRunner. its coverage
+# lives in tests/test_deployment_jobs.py: daemon/background execution and argument passthrough in
+# `test_a_job_runs_on_a_daemon_background_thread`, and registry cleanup after the job finishes in
+# `test_a_finished_job_is_dropped_from_the_live_set`.
 
 
 def _run_loop_once(monkeypatch, loop, worker):
