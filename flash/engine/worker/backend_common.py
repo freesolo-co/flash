@@ -14,7 +14,6 @@ import atexit
 import contextlib
 import ctypes
 import os
-import re
 import signal
 import subprocess
 import threading
@@ -477,6 +476,7 @@ def _run_streaming_verl_subprocess(
     env: dict[str, str],
     on_line: Callable[[str], None],
     errors: str | None = None,
+    silence_watchdog: VerlChildSilenceWatchdog | None = None,
 ) -> int:
     """stream a verl subprocess under the shared process-group lifecycle supervisor."""
     adopt_orphaned_descendants()
@@ -490,8 +490,13 @@ def _run_streaming_verl_subprocess(
         bufsize=1,
         start_new_session=True,
     )
-    # start_new_session keeps the group addressable after the leader is reaped.
     process_group_id = proc.pid
+    if silence_watchdog is not None:
+        silence_watchdog.bind(
+            child_alive=lambda: proc.poll() is None,
+            teardown=lambda: kill_process_group(proc, process_group_id=process_group_id),
+        )
+        silence_watchdog.start()
     try:
         with _ChildExitWatchdog(
             proc, process_group_id=process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
@@ -504,6 +509,8 @@ def _run_streaming_verl_subprocess(
         kill_process_group(proc, process_group_id=process_group_id)
         raise
     finally:
+        if silence_watchdog is not None:
+            silence_watchdog.stop()
         if proc.poll() is None:
             try:
                 proc.wait(timeout=_TEARDOWN_GRACE_S)
@@ -536,35 +543,35 @@ def run_verl_training(
     step_pattern: str = r"step:\s*(\d+)",
     heartbeat_interval_s: float = 20.0,
     tail: ChildOutputTail | None = None,
+    silence_watchdog: VerlChildSilenceWatchdog | None = None,
 ) -> int:
     """run a verl trainer subprocess, streaming stdout and surfacing step progress.
 
     returns the process exit code. stdout+stderr are merged and scanned line by line: ``on_line``
     receives every line, ``on_step`` receives each parsed training step, and ``heartbeat`` is called
     at most once per ``heartbeat_interval_s``. callback failures terminate the process group before
-    they are re-raised.
+    they are re-raised. ``silence_watchdog`` tears the group down when a child that reached the fit
+    loop stops producing distinct output while the parent is idle.
     """
-    step_re = re.compile(step_pattern)
     child_tail = tail if tail is not None else ChildOutputTail()
-    last_hb = 0.0
-
-    def handle_line(line: str) -> None:
-        nonlocal last_hb
-        print(line, end="", flush=True)
-        child_tail.record(line)
-        if on_line is not None:
-            on_line(line)
-        match = step_re.search(line)
-        if match and on_step is not None:
-            on_step(int(match.group(1)))
-        if heartbeat is not None:
-            now = time.monotonic()
-            if now - last_hb >= heartbeat_interval_s:
-                heartbeat()
-                last_hb = now
-
-    return_code = _run_streaming_verl_subprocess(cmd, env=env, on_line=handle_line)
+    handle_line = build_verl_line_handler(
+        child_tail,
+        on_step=on_step,
+        on_line=on_line,
+        heartbeat=heartbeat,
+        step_pattern=step_pattern,
+        heartbeat_interval_s=heartbeat_interval_s,
+        silence_watchdog=silence_watchdog,
+    )
+    return_code = _run_streaming_verl_subprocess(
+        cmd,
+        env=env,
+        on_line=handle_line,
+        silence_watchdog=silence_watchdog,
+    )
     raise_for_classified_verl_exit(return_code, child_tail)
+    if silence_watchdog is not None:
+        silence_watchdog.raise_if_failed()
     return return_code
 
 
@@ -579,7 +586,7 @@ class _ChildExitWatchdog:
     """Tears the group down when the direct child exits but a descendant holds the pipe open.
 
     this prevents an EngineCore-held pipe from blocking teardown forever (PR #730). it arms only after
-    child exit, so ordinary trainer silence remains ``ChildTailStaleness``'s responsibility.
+    child exit, so ordinary trainer silence remains ``VerlChildSilenceWatchdog``'s responsibility.
     """
 
     def __init__(self, proc: subprocess.Popen, *, process_group_id: int, grace_s: float) -> None:
@@ -942,7 +949,7 @@ from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
     resolve_checkpoint_actor_dir,
     stage_verl_resume,
     stamp_adapter_dir_provenance,
-    unprocessed_checkpoint_dirs,
+    undiscovered_checkpoint_dirs,
 )
 from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     _VERL_METRIC_FIELDS,
@@ -974,6 +981,8 @@ from flash.engine.worker.verl.diagnostics import (  # noqa: E402,F401
     STALL_TAIL_LINES,
     ChildOutputTail,
     ChildTailStaleness,
+    VerlChildSilenceWatchdog,
+    build_verl_line_handler,
     collect_ray_failure_logs,
     latest_ray_session_dir,
     raise_for_classified_verl_exit,

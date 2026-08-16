@@ -173,6 +173,11 @@ def gdn_packing_contract_available(model_id: str | None = None, revision: str = 
         return False
 
 
+def packing_appends_eos(text: str, tokenizer) -> bool:
+    eos = tokenizer.eos_token or ""
+    return bool(eos and not text.endswith(eos))
+
+
 def _eos_terminated(texts: list[str], tokenizer) -> list[str]:
     """Append EOS (once) to each text.
 
@@ -181,7 +186,7 @@ def _eos_terminated(texts: list[str], tokenizer) -> list[str]:
     answer into the next one.
     """
     eos = tokenizer.eos_token or ""
-    return [t if (eos and t.endswith(eos)) else t + eos for t in texts]
+    return [text + eos if packing_appends_eos(text, tokenizer) else text for text in texts]
 
 
 def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[list[int]]:

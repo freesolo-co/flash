@@ -77,8 +77,13 @@ def _run_console_upload_loop(console: str, interval_s: float, stop_upload, *, up
     prevents a flapping run from turning the poll cadence into the commit cadence.
 
     Before any heartbeat commits, one additional setup snapshot lands before the fixed 3000-second
-    teardown. It does not enter the steady rate: the first committed heartbeat moves the deadline to
-    the normal interval. failed uploads change no upload state, so the next poll retries.
+    teardown. It does not enter the steady rate: the first committed heartbeat promotes the deadline
+    to the normal interval, so a run that commits before 600 seconds never spends that write. the
+    promotion is skipped while ``due`` holds, so it only ever moves a deadline that has not arrived.
+    A 600-second deadline that already expired with nothing committed still spends its snapshot --
+    the startup evidence it exists for -- and a failed upload on that same poll leaves the deadline
+    due, so the next poll retries rather than waiting out the hour. Once promoted the deadline is the
+    hourly interval, so the guard cannot re-fire early and needs no separate first-commit flag.
     """
     poll_s = min(_CONSOLE_UPLOAD_POLL_S, interval_s)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval_s)
@@ -87,14 +92,13 @@ def _run_console_upload_loop(console: str, interval_s: float, stop_upload, *, up
     while not stop_upload.wait(poll_s):
         since += poll_s
         cursor, eof, staged, beats = _console_progress(console, max(cursor, 0))
-        had_committed = ever
         ever = ever or bool(staged)
-        if ever and not had_committed and sent >= 0:
+        due = since >= due_s
+        if ever and not due:
             due_s = interval_s
         made_progress = staged if ever else beats
         armed = armed or bool(made_progress)
         quiet = 0.0 if made_progress else quiet + 1
-        due = since >= due_s
         cap = armed and quiet >= _CONSOLE_UPLOAD_QUIET_POLLS
         wedged = cap and spent < _CONSOLE_UPLOAD_CREDITS and not due
         if eof == sent or not (due or wedged):

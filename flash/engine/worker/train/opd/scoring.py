@@ -26,11 +26,15 @@ def score_rollout(
     teacher,
     thinking_prefill: str,
     text_teacher_batcher,
+    on_scored=None,
 ):
     """Score one completion against the teacher, over the image or text route.
 
     Raises `TeacherError` through to the caller: the bridge distinguishes permanent from transient
     failures and does the no-signal accounting, which is not this module's concern.
+
+    `on_scored` reports a completed teacher request so the parent counts as working while the verl
+    child is silent. The text route reports through the batcher, so only the image route passes it.
     """
     if prompt.image_descriptors:
         from flash.content.multimodal import image_descriptors_to_data_uris
@@ -44,16 +48,25 @@ def score_rollout(
         )
         # only the synthetic thinking prefill continues the trailing assistant turn; an assistant
         # turn from the environment's own history must not absorb the completion.
-        return teacher.score_many_multimodal(
-            [
-                (
-                    teacher_messages,
-                    completion_text,
-                    teacher_images,
-                    bool(thinking_prefill),
-                )
-            ]
-        )[0]
+        items = [
+            (
+                teacher_messages,
+                completion_text,
+                teacher_images,
+                bool(thinking_prefill),
+            )
+        ]
+        # these are PAID requests, so the keyword is chosen by type rather than by catching a
+        # TypeError: a TypeError raised inside the request would otherwise be retried and billed
+        # twice. a test double that lacks the keyword is reported here instead.
+        from flash.engine.worker.teacher.client import TeacherClient
+
+        if isinstance(teacher, TeacherClient):
+            return teacher.score_many_multimodal(items, on_scored=on_scored)[0]
+        scored = teacher.score_many_multimodal(items)[0]
+        if on_scored is not None:
+            on_scored()
+        return scored
     teacher_prompt = _teacher_prompt_text(prompt.teacher_messages, thinking_prefill)
     if text_teacher_batcher is None:
         return teacher.score(teacher_prompt, completion_text)
