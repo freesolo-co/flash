@@ -15,6 +15,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from flash.core.spec import JobSpec
+from flash.core.spec_persistence import VersionedPersistedSpecEnvelope
 from flash.teacher.retry_contract import OPD_RETRY_CONTRACT_VERSION
 
 if TYPE_CHECKING:
@@ -75,19 +76,33 @@ def prepare_job(
             preflight_train_context_within_serving(spec)
         except ValueError as exc:
             raise ServingPreflightError(str(exc)) from exc
-    if spec.gpu.provider or spec.gpu.type:
-        from flash.providers import PROVIDER_NAMES, available_providers
+    if spec.gpu.provider or spec.gpu.providers or spec.gpu.type:
+        from flash.providers import (
+            PROVIDER_NAMES,
+            available_providers,
+            validated_provider_preferences,
+        )
         from flash.providers.base import providers_for
 
         configured = available_providers()
         provider = spec.gpu.provider.strip().lower()
+        providers = validated_provider_preferences(spec.gpu.providers, allow_empty=True)
+        if provider and providers:
+            raise ValueError("gpu.provider and gpu.providers cannot both be set")
         if provider:
             if provider not in PROVIDER_NAMES:
                 raise ValueError(f"unknown gpu.provider {spec.gpu.provider!r}")
             if provider not in configured:
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
-        elif not any(name in configured for name in providers_for(spec.gpu.type)):
-            raise ValueError(f"no configured provider can provision gpu.type {spec.gpu.type!r}")
+            for gpu_type in spec.gpu.acceptable_types:
+                if provider not in providers_for(gpu_type):
+                    raise ValueError(
+                        f"gpu.provider {provider!r} cannot provision gpu.type {gpu_type!r}"
+                    )
+        else:
+            for gpu_type in spec.gpu.acceptable_types:
+                if not any(name in configured for name in providers_for(gpu_type)):
+                    raise ValueError(f"no configured provider can provision gpu.type {gpu_type!r}")
     info = _runner().resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
     if spec.algorithm == "opd" and spec.train.structured_outputs:
         # the generic serving preflight above validates the schema's SHAPE, but the
@@ -113,20 +128,44 @@ def prepare_job(
     owner_org_id = _runner()._context_org_id(billing_context) or _runner()._context_org_id(
         platform_context
     )
-    public_spec, worker_spec, adapter_identity = _runner()._prepare_init_from_adapter(
-        spec,
-        owner_org_id=owner_org_id,
-        owner_key_id=owner_key_id,
-        token=os.environ.get("HF_TOKEN"),
+    public_spec, worker_spec, adapter_identity, warm_start_context = (
+        _runner()._prepare_init_from_adapter(
+            spec,
+            owner_org_id=owner_org_id,
+            owner_key_id=owner_key_id,
+            token=os.environ.get("HF_TOKEN"),
+        )
     )
+    # these read-only gates belong to preparation: every submit path passes here exactly once, and
+    # callers receive the pinned worker spec before quoting, affordability, persistence, or allocation.
+    worker_spec, environment_ref_deferred = _runner().preflight_validate_environment_ref(
+        worker_spec
+    )
+    from flash.content.multimodal import preflight_validate_image_opd
+    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+
+    preflight_validate_image_opd(
+        worker_spec,
+        scan_packaged_environment=not environment_ref_deferred,
+    )
+    preflight_validate_managed_teacher(worker_spec)
     from flash.cost.spec import estimate_for_spec
 
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
+    # derive the rl prompt budget from the same resolved spec the quote is built from, so the
+    # reported budget describes the run that was actually priced and submitted.
+    from flash.engine.plan.prompt_budget import rl_prompt_budget
+
+    prompt_budget = rl_prompt_budget(
+        worker_spec,
+        warm_start_context=warm_start_context,
+    )
     return _runner().PreparedJob(
         public_spec=public_spec,
         worker_spec=worker_spec,
         estimated_cost_usd=estimated_cost_usd,
         adapter_identity=adapter_identity,
+        prompt_budget=prompt_budget,
     )
 
 
@@ -145,6 +184,27 @@ def _reject_managed_volume_removal(snapshot: object, worker_spec: JobSpec) -> No
         return
     if worker_spec.gpu.network_volume != committed:
         raise ValueError("persisted effective preparation drops a non-shared weight-cache volume")
+
+
+def _effective_preparation_snapshot(
+    public_spec: JobSpec,
+    worker_spec: JobSpec,
+    adapter_identity: dict | None,
+    *,
+    persisted: VersionedPersistedSpecEnvelope | None = None,
+) -> dict:
+    """Build the one versioned snapshot shape used by initial and repeat persistence."""
+    persisted = persisted or VersionedPersistedSpecEnvelope()
+    return {
+        "version": persisted.version,
+        "worker_spec": worker_spec.to_internal_dict(),
+        "workload_profile": worker_spec.workload_profile or None,
+        "adapter_identity": adapter_identity,
+        "preparation_digest": _runner()._preparation_digest(
+            public_spec, worker_spec, adapter_identity, persisted=persisted
+        ),
+        "backend": _runner().TRAINER_BACKEND,
+    }
 
 
 def _persist_effective_worker_spec(
@@ -169,29 +229,17 @@ def _persist_effective_worker_spec(
     # later read rehashes with them restored. re-persisting (quote refresh, realloc) has to hash the
     # same way or the digest it writes now is one the next integrity check cannot reproduce.
     raw_public = status.spec if isinstance(status.spec, dict) else {}
-    legacy_public_keys = {
-        k: raw_public[k] for k in _runner()._DROPPED_TOP_LEVEL_KEYS if k in raw_public
-    }
-    # same reason for the rollout optimizer batch: `status.spec` is never rewritten, so a legacy
-    # grpo/opd run keeps the old spelling for life and every read replays it. Hashing without that
-    # replay writes a digest the next integrity check cannot reproduce, so the run recovers until
-    # its first quote refresh or realloc and fails afterwards. Only the public half needs this --
-    # the worker half is rewritten right here, so its stored bytes already match what is hashed.
-    stored_public_rollout_batch = _runner()._stored_rollout_batch_spelling(raw_public)
-    effective_preparation = {
-        "worker_spec": worker_spec.to_internal_dict(),
-        "workload_profile": worker_spec.workload_profile or None,
-        "adapter_identity": adapter_identity,
-        "preparation_digest": _runner()._preparation_digest(
-            public_spec,
-            worker_spec,
-            adapter_identity,
-            legacy_public_keys=legacy_public_keys,
-            legacy_public_alpha=_runner()._prepared_before_public_alpha(raw_public),
-            stored_public_rollout_batch=stored_public_rollout_batch,
-        ),
-        "backend": _runner().TRAINER_BACKEND,
-    }
+    # only the public half is replayed here, so no worker payload is read: the worker half is
+    # rewritten right below, so its stored bytes already match what is hashed. `status.spec` is
+    # never rewritten, so a legacy run keeps its old spelling for life and every read replays it --
+    # hashing without that replay writes a digest the next integrity check cannot reproduce, and the
+    # run recovers until its first quote refresh or realloc and fails afterwards.
+    persisted_envelope = VersionedPersistedSpecEnvelope.read(
+        snapshot, raw_public, include_worker=False
+    )
+    effective_preparation = _effective_preparation_snapshot(
+        public_spec, worker_spec, adapter_identity, persisted=persisted_envelope
+    )
     fields = {"effective_preparation": effective_preparation}
     if estimated_cost_usd is not None:
         fields["estimated_cost_usd"] = float(estimated_cost_usd)
@@ -221,11 +269,6 @@ def submit_job(
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
-    from flash.content.multimodal import preflight_validate_image_opd
-    from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
-
-    preflight_validate_image_opd(worker_spec)
-    preflight_validate_managed_teacher(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     if not dry_run:
@@ -245,15 +288,10 @@ def submit_job(
         platform_context=platform_context,
         workload_profile_input_digest=worker_spec.workload_profile_input_digest or None,
         workload_profile=worker_spec.workload_profile or None,
-        effective_preparation={
-            "worker_spec": worker_spec.to_internal_dict(),
-            "workload_profile": worker_spec.workload_profile or None,
-            "adapter_identity": prepared.adapter_identity,
-            "preparation_digest": _runner()._preparation_digest(
-                public_spec, worker_spec, prepared.adapter_identity
-            ),
-            "backend": _runner().TRAINER_BACKEND,
-        },
+        prompt_budget=prepared.prompt_budget,
+        effective_preparation=_effective_preparation_snapshot(
+            public_spec, worker_spec, prepared.adapter_identity
+        ),
         # Snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.

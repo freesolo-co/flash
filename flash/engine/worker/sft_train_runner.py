@@ -5,6 +5,7 @@ Split out of ``flash.engine.worker.sft_train`` to keep that module under the fil
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -29,18 +30,14 @@ build_sft_overrides = _sft_train.build_sft_overrides
 # taken from the parent like every other name here, so the runner and `sft_train`'s own
 # `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
 liveness_heartbeat = _sft_train.liveness_heartbeat
-render_gdn_varlen_shim = _sft_train.render_gdn_varlen_shim
-render_shim_marker_prologue = _sft_train.render_shim_marker_prologue
-render_wandb_link_shim = _sft_train.render_wandb_link_shim
+render_sitecustomize_bootstrap = _sft_train.render_sitecustomize_bootstrap
 shim_marker_file = _sft_train.shim_marker_file
 verify_applied_shim_markers = _sft_train.verify_applied_shim_markers
-wrap_shim_fragment = _sft_train.wrap_shim_fragment
 SHIM_FRAGMENT_FAILED_EXIT_CODE = _sft_train.SHIM_FRAGMENT_FAILED_EXIT_CODE
 sft_tokens_for_updates = _sft_train.sft_tokens_for_updates
 sft_under_ran = _sft_train.sft_under_ran
 validate_save_steps = _sft_train.validate_save_steps
 _render_sft_dataset_module = _sft_train._render_sft_dataset_module
-_render_sft_sitecustomize = _sft_train._render_sft_sitecustomize
 
 
 @dataclass(frozen=True)
@@ -138,8 +135,8 @@ class _SftProgress:
     train_tokens: int
     loraplus_applied: bool
     wandb_link: dict[str, str | None]
-    # what the child's wrapped sitecustomize fragments must prove applied (see
-    # wrap_shim_fragment); verified at the first optimizer step and again at child exit.
+    # what the child plugin must prove applied; verified at the first optimizer step and again at
+    # child exit.
     shim_markers: str = ""
     expected_shims: tuple[str, ...] = ()
     shims_verified: bool = False
@@ -261,20 +258,30 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     max_length = _sft_train._sft_profile_max_length(realized_profile)
     dropped = realized_profile.dropped_examples
     selected_count = realized_profile.selected_examples
+    retained_count = realized_profile.retained_examples
     sampled_texts = prepared_workload.sampled_texts
     multiturn_targets = prepared_workload.multiturn_targets
     coerced_singleturn_targets = prepared_workload.coerced_singleturn_targets
+    role_aware_multiturn_targets = prepared_workload.role_aware_multiturn_targets
+    fallback_multiturn_targets = prepared_workload.fallback_multiturn_targets
     if dropped:
         print(
             f"[sft] dropped {dropped} rows with no real completion target "
             "(sft_max_len truncated away the whole completion, or it was content-free)"
         )
-    if multiturn_targets:
+    if role_aware_multiturn_targets:
         print(
-            f"[sft] multi-turn SFT: {multiturn_targets}/{selected_count} rows train on a full "
-            "target transcript"
+            f"[sft] multi-turn SFT: {role_aware_multiturn_targets}/{retained_count} rows use "
+            "assistant-body masking; interleaved environment/tool/user observations are masked "
+            "out of the loss"
         )
-    elif getattr(options.env, "multi_turn", False):
+    if fallback_multiturn_targets:
+        print(
+            f"[sft][warn] multi-turn SFT: {fallback_multiturn_targets}/{retained_count} rows use "
+            "completion-only fallback because the rendered transcript was not parseable ChatML; "
+            "interleaved observations are not proven masked"
+        )
+    if not multiturn_targets and getattr(options.env, "multi_turn", False):
         print(
             "[sft][warn] this is a multi-turn environment but no row ships a multi-turn "
             "target completion"
@@ -290,6 +297,10 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
             "WARN: thinking mode is ON but no sampled SFT target contains a <think> trace; "
             "training on non-reasoning targets teaches the model to skip thinking"
         )
+    # the partial case -- the template keeping only the last turn's reasoning and stripping the
+    # rest -- renders a <think>, so the all-or-nothing check above stays quiet for it. it is
+    # reported by `prepare_sft_workload`, which this function already called, so that one warning
+    # reaches both the control-plane estimate and this worker log without being printed twice.
 
     total_tokens_per_epoch = realized_profile.real_tokens_per_epoch
     realized_max_length = realized_profile.realized_max_length
@@ -356,7 +367,11 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     update_horizon = data.profile.authoritative_steps
     validate_save_steps(options.save_at_steps, update_horizon)
     loop_epochs = max(options.epochs, math.ceil(update_horizon / steps_per_epoch))
-    save_freq = reduce(gcd, options.save_at_steps) if options.save_at_steps else options.save_every
+    save_freq = (
+        reduce(gcd, options.save_at_steps)
+        if options.save_at_steps
+        else max(1, min(options.save_every, update_horizon))
+    )
 
     card_vram_gb = float(options.gpu_probe.get("memory_gb") or 0.0)
     raw_capability = options.gpu_probe.get("capability")
@@ -526,40 +541,38 @@ def _write_sft_child_shims(
     seed: int,
     loggers: list[str],
     gdn_reset_arch: str | None,
-) -> tuple[str, tuple[str, ...]]:
-    """Write the child's sitecustomize and dataset module; return its marker file and shim names."""
-    core_source = _render_sft_sitecustomize(
-        seed=seed,
-        loraplus_ratio=_SFT_LORAPLUS_RATIO,
-        save_at_steps=options.save_at_steps,
-        total_steps=model.update_horizon,
-        reentrant_gradient_checkpointing=model.reentrant_gradient_checkpointing,
+) -> tuple[str, tuple[str, ...], str]:
+    """write the SFT plugin bundle, startup bootstrap, and non-secret plugin config."""
+    parent_dir = os.path.dirname(_sft_train.__file__)
+    copies = (
+        ("train/core/child/runtime.py", "flash_verl_runtime.py"),
+        ("train/sft/child/plugin.py", "flash_sft_plugin.py"),
+        ("train/sft/child/entry.py", "flash_sft_entry.py"),
     )
-    # both shims, not either: this one patches DistributedSampler/StatefulDataLoader so the child's
-    # row order matches the profile's byte for byte, and the gdn one patches the model's text
-    # forward to reset linear-attention state at packed example boundaries. different objects,
-    # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
-    core_source = _sft_train._append_exact_sft_dataloader_shim(core_source)
-    # every required fragment is wrapped fail-closed (see wrap_shim_fragment): execsitecustomize
-    # would otherwise swallow a fragment's exception and the child would train unpatched (no
-    # seeding, no exact dataloader order, no lora+, no boundary resets) while looking healthy.
-    # the wandb link shim stays unwrapped: it swallows its own failures by design and a logging
-    # link must not be able to abort paid training.
-    required_fragments = [("sft-core", core_source)]
-    if gdn_reset_arch is not None:
-        required_fragments.append(("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
+    for source, target in copies:
+        shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
     shim_markers = shim_marker_file(shim_dir)
-    # the workdir is wiped per attempt (_resolve_sft_options), so no stale marker can survive here.
-    shim_source = render_shim_marker_prologue(shim_markers) + "".join(
-        wrap_shim_fragment(name, source) for name, source in required_fragments
-    )
-    if "wandb" in loggers:
-        shim_source += render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(shim_source)
+        file.write(render_sitecustomize_bootstrap())
     with open(custom_dataset_path, "w", encoding="utf-8") as file:
         file.write(_render_sft_dataset_module())
-    return shim_markers, tuple(name for name, source in required_fragments if source)
+    plugin_config = json.dumps(
+        {
+            "marker_file": shim_markers,
+            "seed": int(seed),
+            "loraplus_ratio": float(_SFT_LORAPLUS_RATIO),
+            "loraplus_ready_marker": _LORAPLUS_READY_MARKER,
+            "save_at_steps": list(options.save_at_steps),
+            "total_steps": int(model.update_horizon),
+            "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),
+            "gdn_model_type": gdn_reset_arch,
+            "wandb": "wandb" in loggers,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected = ("sft-core",) + (("gdn-varlen",) if gdn_reset_arch else ())
+    return shim_markers, expected, plugin_config
 
 
 def _prepare_sft_child(
@@ -629,7 +642,7 @@ def _prepare_sft_child(
         "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),
     }
     overrides = build_sft_overrides(config)
-    shim_markers, expected_shims = _write_sft_child_shims(
+    shim_markers, expected_shims, plugin_config = _write_sft_child_shims(
         options,
         model,
         shim_dir=shim_dir,
@@ -656,17 +669,17 @@ def _prepare_sft_child(
     # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded
     # watcher re-merges it and re-uploads full state hf already has, holding the resume-upload
     # lock while the first genuinely new checkpoint waits behind it.
-    watcher.processed_steps.update(
-        _sft_train._processed_resume_steps(options.save_at_steps, resume_step)
-    )
+    _sft_train._seed_resume_lifecycle(watcher, options.save_at_steps, resume_step)
     if resume_step >= model.update_horizon:
-        missing = sorted(watcher.required_steps - watcher.processed_steps)
+        missing = watcher.lifecycle.missing_deployables(watcher.required_steps)
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
     child_env = _sft_train._build_verl_child_env(
         shim_dir=shim_dir,
         wandb_enabled="wandb" in loggers,
     )
+    child_env["VERL_USE_EXTERNAL_MODULES"] = "flash_sft_plugin"
+    child_env["FLASH_SFT_PLUGIN_CONFIG"] = plugin_config
     command = [
         capabilities.python_bin,
         "-m",
@@ -677,7 +690,7 @@ def _prepare_sft_child(
         # every rank torchrun starts, so a rank the batch cannot feed is the `batch_size=0` crash.
         f"--nproc-per-node={world_size}",
         "-m",
-        "verl.trainer.sft_trainer",
+        "flash_sft_entry",
         *overrides,
     ]
     return _SftChild(

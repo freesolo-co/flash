@@ -138,12 +138,14 @@ Given the opening prompt, does the model emit the single integer `step_episode` 
 to advance the game? That is a real held-out check of the action format the episode
 depends on, and it is the honest scope of a single-shot evaluation.
 
-To grade a finished transcript instead, set `grades_episodes = True` on the suite.
-`env eval` then plays each case out against the deployed model -- generating, stepping
-the environment, and repeating to `max_episode_turns` -- and scores the resulting
-transcript. Such a suite needs cases the environment can actually advance (the cases
-below carry no `output`, so `step_episode` has no secret to compare against), and each
-case then costs one generation per turn rather than one in total.
+To grade a finished transcript instead, set `grades_episodes = True` on the suite
+and define `score(self, case, response, state)`. `env eval` then plays each case out
+against the deployed model -- generating, stepping the environment, and repeating to
+`max_episode_turns` -- and passes the resulting transcript in `state`; without that
+argument the scorer receives only the episode's final response text. Such a suite
+needs cases the environment can actually advance (the cases below carry no `output`,
+so `step_episode` has no secret to compare against), and each case then costs one
+generation per turn rather than one in total.
 
 Do NOT grade these by calling `environment.reward(response, example)`: with no episode
 state that call scores an empty transcript, so an unrelated answer can score 1.0 and
@@ -288,6 +290,9 @@ class StarterMultiTurnEnv(EnvironmentMultiTurn):
     ) -> EnvironmentStepResult:
         # Advance the world after one assistant action. Return done=True to end the
         # episode, or append an observation message and keep going.
+        # `messages` already ends with this action: messages[-1]["content"] is
+        # `assistant_response`. if you rebuild state by replaying the transcript, replay
+        # `messages[:-1]` and apply `assistant_response` once, or you apply it twice.
         try:
             guess = int(assistant_response.strip().split()[0])
         except (ValueError, IndexError):
@@ -421,8 +426,12 @@ _SELF_HOSTED_GUIDANCE = {
         "commit it to a git repo your plane can read.\n"
         "\n"
         "A managed run names that repo in [environment] id, as\n"
-        "`github:OWNER/REPO@main:environment.py` -- this plane is self-hosted, so publishing\n"
-        "to Freesolo's managed environment hub does not apply."
+        "`github:OWNER/REPO@REF:environment.py` -- this plane is self-hosted, so publishing\n"
+        "to Freesolo's managed environment hub does not apply.\n"
+        "\n"
+        "REF is your repo's actual default branch -- check it rather than assuming `main`, since\n"
+        "it depends on how the repo was created. A ref that does not exist fails with GitHub's\n"
+        '"No commit found for SHA: <ref>".'
     ),
     "EVALUATIONS_GUIDANCE": (
         "Keep this file beside environment.py in the git repo named by [environment] id."
@@ -474,12 +483,19 @@ def _environment_comment(project_id: str, *, can_publish: bool, extra: str = "")
             f"# Environment: this plane is self-hosted, so `{CLI_NAME} env push` does not apply -- it\n"
             "# publishes to Freesolo's managed environment hub. Name a git repo instead:\n"
             "#   github:OWNER/REPO@REF:PATH   (PATH is the file, or the directory holding environment.py)\n"
+            "# REF is your repo's actual default branch -- check it rather than assuming `main`,\n"
+            "# since it depends on how the repo was created. A ref that does not exist fails with\n"
+            "# GitHub's 'No commit found for SHA: <ref>'.\n"
             "# Push this folder to a repo your plane can read, then fill in the id below.\n"
             "# A github: id needs a plane running with FLASH_STANDALONE=1; an identity-backed plane\n"
             "# accepts managed hub ids only. Setup classifies on the API URL and cannot see that\n"
             "# server-side setting, so if submit returns a 400 naming this id, that is the cause.\n"
         )
-        placeholder = 'id = "github:OWNER/REPO@main:environment.py"\n\n'
+        # REF, not `main`: this line is a placeholder to be edited, and every other token in it
+        # (OWNER, REPO) is obviously one. `main` looks like a value that is already correct, so it
+        # survives the edit -- and on a repo whose default branch is anything else, it is silently
+        # wrong, surfacing much later as a pinning error at submit.
+        placeholder = 'id = "github:OWNER/REPO@REF:environment.py"\n\n'
     return f"{head}{extra}[environment]\n{placeholder}"
 
 
@@ -878,7 +894,7 @@ def cmd_env_setup(args) -> int:
     # the non-reasoning scaffold.
     thinking_line = "thinking = true\n" if reasoning else ""
     rl_reasoning_train = (
-        "max_completion_tokens = 2048  # reasoning shares this budget with the answer; raised so it isn't truncated\n"
+        "max_completion_tokens = 2048  # per model turn; reasoning shares it with the answer\n"
         if reasoning
         else ""
     )
@@ -937,6 +953,7 @@ def cmd_env_setup(args) -> int:
         # including the standalone caveat, so the two paths cannot drift apart again.
         print(
             "next: push this folder to a git repo, then set [environment] id = "
-            "github:OWNER/REPO@main:environment.py (needs FLASH_STANDALONE=1 on the plane)"
+            "github:OWNER/REPO@REF:environment.py (REF is the repo's default branch, main or "
+            "master) (needs FLASH_STANDALONE=1 on the plane)"
         )
     return 0

@@ -19,11 +19,16 @@ from collections.abc import Callable
 from flash.engine.worker.backend_common import (
     completed_checkpoint_step,
     stage_verl_resume,
-    unprocessed_checkpoint_dirs,
+    undiscovered_checkpoint_dirs,
 )
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
+from flash.engine.worker.train.core.checkpoint_lifecycle import CheckpointLedger
+from flash.engine.worker.verl.checkpoints import (
+    MergeDiskExhaustedError,
+    MergeDiskHeadroomError,
+    resume_checkpoint_is_loadable,
+)
 
 
 def _rl_train():
@@ -62,19 +67,16 @@ class _VerlResumeUploader:
     ) -> None:
         self.local_dir = local_dir
         self.required_steps = frozenset(required_steps)
-        # seed uploaded resume steps because hf already has them, but do not seed processed required
-        # steps: a prior worker may have uploaded resume state while the gradient gate withheld its
-        # deployable adapter, which this worker must still stage.
-        self.processed_steps: set[int] = (
-            {resume_step} if resume_step and resume_step not in self.required_steps else set()
-        )
-        # tracked separately from processed_steps: a required resume step is left unprocessed so it
-        # can be staged, but its resume state is already on hf and must not be re-uploaded.
-        self.uploaded_steps: set[int] = {resume_step} if resume_step else set()
+        self.lifecycle = CheckpointLedger()
+        self.lifecycle.seed_resumed_step(resume_step, self.required_steps)
+        # attempted, NOT uploaded: a step joins this before the upload call so a permanently failing
+        # upload cannot respin every 0.5s. durability is the ledger's resume_uploaded fact, which is
+        # recorded from the transport's own callback.
+        self._resume_attempted: set[int] = {resume_step} if resume_step else set()
         # required step -> staged adapter directory, populated the sweep a checkpoint appears and
-        # drained by publication once the gradient gate opens. this is what decouples publication
-        # from verl's checkpoint retention.
-        self.staged_steps: dict[int, str] = {}
+        # drained by publication once the gradient gate opens. paths, not lifecycle state: this is
+        # what decouples publication from verl's checkpoint retention.
+        self.staged_adapters: dict[int, str] = {}
         self.export_root = export_root
         self.python_bin = python_bin
         self.model_id = model_id
@@ -87,9 +89,6 @@ class _VerlResumeUploader:
         # servable per-step adapters before the final guard fails. resume uploads remain allowed because
         # they are internal retry state, not servable artifacts.
         self.had_gradient = had_gradient
-        # populated by credit_durable_required_steps() before start(): crediting a required step
-        # needs an hf lookup, which does not belong in a constructor.
-        self.published_steps: set[int] = set()
         self._error: BaseException | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -102,7 +101,7 @@ class _VerlResumeUploader:
         """
         for step in sorted(self.required_steps):
             if step <= int(resume_step) and _rl_train()._deployable_adapter_on_hf(step):
-                self.published_steps.add(step)
+                self.lifecycle.mark_deployable_published(step)
 
     def start(self) -> None:
         self._thread.start()
@@ -121,9 +120,11 @@ class _VerlResumeUploader:
         called only after training finished cleanly: on a crash or cancel the missing steps are a
         symptom of the real failure, and raising here would mask it.
         """
+        if isinstance(self._error, (MergeDiskHeadroomError, MergeDiskExhaustedError)):
+            raise self._error
         if self._error is not None:
             raise RuntimeError("verl resume uploader failed") from self._error
-        missing = sorted(self.required_steps - self.published_steps)
+        missing = self.lifecycle.missing_deployables(self.required_steps)
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
 
@@ -144,8 +145,8 @@ class _VerlResumeUploader:
 
     def _pending(self) -> list[tuple[int, str]]:
         """the completed checkpoint dirs this uploader has not handled yet, oldest first."""
-        return unprocessed_checkpoint_dirs(
-            self.local_dir, self._completed_step(), self.processed_steps
+        return undiscovered_checkpoint_dirs(
+            self.local_dir, self._completed_step(), self.lifecycle.discovered_steps
         )
 
     def _stage_deployable(self, step: int, checkpoint_dir: str) -> str:
@@ -171,7 +172,7 @@ class _VerlResumeUploader:
     def _publish_staged(self, step: int, adapter_dir: str) -> None:
         """make an already-staged adapter durable and servable."""
         _w.publish_deployable_checkpoint(adapter_dir, step, required=True, _provenance_ready=True)
-        self.published_steps.add(step)
+        self.lifecycle.mark_deployable_published(step)
 
     def _publish_ready(self) -> None:
         """publish permitted staged steps oldest first.
@@ -181,9 +182,10 @@ class _VerlResumeUploader:
         """
         if not self._deployable_allowed():
             return
-        for step in sorted(self.staged_steps):
-            if step not in self.published_steps:
-                self._publish_staged(step, self.staged_steps[step])
+        published = self.lifecycle.deployable_published_steps
+        for step in sorted(self.staged_adapters):
+            if step not in published:
+                self._publish_staged(step, self.staged_adapters[step])
 
     def _run(self) -> None:
         # a failed resume upload must not fail the run: the policy is still trained and published at
@@ -205,10 +207,11 @@ class _VerlResumeUploader:
                     # so a step is staged on the sweep that finds it and published whenever it may be.
                     if (
                         step in self.required_steps
-                        and step not in self.published_steps
-                        and step not in self.staged_steps
+                        and step not in self.lifecycle.deployable_published_steps
+                        and step not in self.staged_adapters
                     ):
-                        self.staged_steps[step] = self._stage_deployable(step, path)
+                        self.staged_adapters[step] = self._stage_deployable(step, path)
+                        self.lifecycle.mark_staged(step)
                         # published here, not once the sweep ends: staging a later step can raise,
                         # and the resume upload below can be interrupted by a preemption. either
                         # would leave an already-exported adapter local-only, so each step is made
@@ -217,16 +220,22 @@ class _VerlResumeUploader:
                     # resume uploads are ungated internal retry state and may be the only checkpoints before
                     # gradient evidence appears. mark attempts before upload so a permanent failure cannot
                     # spin every 0.5s, preserving the existing non-fatal upload semantics.
-                    if step not in self.uploaded_steps:
-                        self.uploaded_steps.add(step)
+                    if step not in self._resume_attempted:
+                        self._resume_attempted.add(step)
                         try:
-                            _w.upload_resume_checkpoint(step, path)
+                            _w.upload_resume_checkpoint(
+                                step,
+                                path,
+                                after_upload=lambda step=step: self.lifecycle.mark_resume_uploaded(
+                                    step
+                                ),
+                            )
                         except Exception as error:
                             print(
                                 f"[rl-verl] resume checkpoint upload failed at step {step}: {error}",
                                 flush=True,
                             )
-                    self.processed_steps.add(step)
+                    self.lifecycle.mark_discovered(step)
                 # a step staged while the gate was shut is published by a later sweep, so this runs
                 # every pass and not only when something was staged: the gate opens on the first
                 # varying-reward group, which is usually a sweep that finds no new checkpoint.

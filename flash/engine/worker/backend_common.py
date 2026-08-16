@@ -14,7 +14,6 @@ import atexit
 import contextlib
 import ctypes
 import os
-import re
 import signal
 import subprocess
 import threading
@@ -72,8 +71,11 @@ VERL_VENV_PYTHON = "3.12"
 # to guarantee, but a venv that misses it is left unstamped rather than reused (see below).
 FLA_REQUIREMENT = (
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git"
-    "@f0e213dbd8b5fb90c3c7eca869ac1706d5377139"
+    "@9c8e42e762fce087c27b673af4922795d9edb85e"
 )
+# the flashqla GDN backend lives in a separate wheel that fla 0.5.2 dispatches to; the child's
+# shim binds it on sm90 only (child_io.render_flash_qla_shim).
+FLASH_QLA_REQUIREMENT = "flash-qla==0.1.2"
 CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 
 # the SAME transformers range the main interpreter and Dockerfile.worker's verl-venv layer use.
@@ -107,8 +109,8 @@ VERL_VENV_BUILD_REPAIRS = "libcudart-stub-neutralized-v1"
 # checksum while the mutable release url stays constant must invalidate a venv stamped under the old
 # digest instead of letting it match forever and reuse an install that was never re-verified.
 VERL_VENV_STAMP = (
-    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_INSTALL_SPEC}\n{FLA_REQUIREMENT}\n{CAUSAL_CONV1D_REQUIREMENT}\n"
-    f"{TRANSFORMERS_REQUIREMENT}\n{VERL_VENV_BUILD_REPAIRS}"
+    f"{VERL_REQUIREMENT}\n{FLASH_ATTN_INSTALL_SPEC}\n{FLA_REQUIREMENT}\n{FLASH_QLA_REQUIREMENT}\n"
+    f"{CAUSAL_CONV1D_REQUIREMENT}\n{TRANSFORMERS_REQUIREMENT}\n{VERL_VENV_BUILD_REPAIRS}"
 )
 
 
@@ -468,6 +470,69 @@ def ray_num_cpus(gpu_count: int = 1, *, cap: int = 16) -> int:
     return max(floor, min(affinity, cap))
 
 
+def _run_streaming_verl_subprocess(
+    cmd: list[str],
+    *,
+    env: dict[str, str],
+    on_line: Callable[[str], None],
+    errors: str | None = None,
+    silence_watchdog: VerlChildSilenceWatchdog | None = None,
+) -> int:
+    """stream a verl subprocess under the shared process-group lifecycle supervisor."""
+    adopt_orphaned_descendants()
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors=errors,
+        bufsize=1,
+        start_new_session=True,
+    )
+    process_group_id = proc.pid
+    if silence_watchdog is not None:
+        silence_watchdog.bind(
+            child_alive=lambda: proc.poll() is None,
+            teardown=lambda: kill_process_group(proc, process_group_id=process_group_id),
+        )
+        silence_watchdog.start()
+    try:
+        with _ChildExitWatchdog(
+            proc, process_group_id=process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
+        ) as watchdog:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                with watchdog.handling_line():
+                    on_line(line)
+    except BaseException:
+        kill_process_group(proc, process_group_id=process_group_id)
+        raise
+    finally:
+        if silence_watchdog is not None:
+            silence_watchdog.stop()
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=_TEARDOWN_GRACE_S)
+            except subprocess.TimeoutExpired:
+                kill_process_group(proc, process_group_id=process_group_id)
+        reap_stragglers()
+    if proc.returncode is None:
+        raise RuntimeError(
+            f"verl subprocess {proc.pid} did not exit after teardown; its process group is still "
+            "holding the gpu"
+        )
+    return_code = int(proc.returncode)
+    if watchdog.tore_down and return_code == 0:
+        raise RuntimeError(
+            f"verl subprocess {proc.pid} exited 0 but a descendant held its output pipe open for "
+            f"{_ORPHANED_PIPE_GRACE_S:.0f}s; the process group was torn down to release the gpu"
+        )
+    if return_code != 0:
+        kill_process_group(proc, process_group_id=process_group_id)
+    return return_code
+
+
 def run_verl_training(
     cmd: list[str],
     *,
@@ -478,104 +543,35 @@ def run_verl_training(
     step_pattern: str = r"step:\s*(\d+)",
     heartbeat_interval_s: float = 20.0,
     tail: ChildOutputTail | None = None,
+    silence_watchdog: VerlChildSilenceWatchdog | None = None,
 ) -> int:
     """run a verl trainer subprocess, streaming stdout and surfacing step progress.
 
     returns the process exit code. stdout+stderr are merged and scanned line by line: ``on_line``
     receives every line, ``on_step`` receives each parsed training step, and ``heartbeat`` is called
-    at most once per ``heartbeat_interval_s``. callback failures terminate the child before they are
-    re-raised so a failed required checkpoint upload cannot leave paid training running unattended.
+    at most once per ``heartbeat_interval_s``. callback failures terminate the process group before
+    they are re-raised. ``silence_watchdog`` tears the group down when a child that reached the fit
+    loop stops producing distinct output while the parent is idle.
     """
-    step_re = re.compile(step_pattern)
     child_tail = tail if tail is not None else ChildOutputTail()
-    # before the child exists, so any grandchild it orphans reparents here and can actually be
-    # reaped. this process is not pid 1 -- the runpod handler is -- so without it every wait below
-    # answers ChildProcessError for a zombie nobody will collect.
-    adopt_orphaned_descendants()
-    proc = subprocess.Popen(
+    handle_line = build_verl_line_handler(
+        child_tail,
+        on_step=on_step,
+        on_line=on_line,
+        heartbeat=heartbeat,
+        step_pattern=step_pattern,
+        heartbeat_interval_s=heartbeat_interval_s,
+        silence_watchdog=silence_watchdog,
+    )
+    return_code = _run_streaming_verl_subprocess(
         cmd,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        start_new_session=True,
+        on_line=handle_line,
+        silence_watchdog=silence_watchdog,
     )
-    # start_new_session makes the leader pid the stable group id even after that leader is reaped.
-    process_group_id = proc.pid
-    last_hb = 0.0
-    try:
-        # the child's exit is watched independently of pipe EOF. a grandchild holding the inherited
-        # pipe open after the trainer dies would otherwise keep the loop below running forever, on a
-        # paid gpu, having already lost the process whose output it is waiting for.
-        with _ChildExitWatchdog(
-            proc, process_group_id=process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
-        ) as watchdog:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                # held across the callbacks, not just the arrival: on_step uploads a checkpoint, and
-                # a reader inside one is working, not stuck.
-                with watchdog.handling_line():
-                    print(line, end="", flush=True)
-                    child_tail.record(line)
-                    if on_line is not None:
-                        on_line(line)
-                    m = step_re.search(line)
-                    if m and on_step is not None:
-                        on_step(int(m.group(1)))
-                    if heartbeat is not None:
-                        now = time.monotonic()
-                        if now - last_hb >= heartbeat_interval_s:
-                            heartbeat()
-                            last_hb = now
-    except BaseException:
-        kill_process_group(proc, process_group_id=process_group_id)
-        raise
-    finally:
-        if proc.poll() is None:
-            # BOUNDED. EOF is not the child's exit, so a child that outlives its own stdout would
-            # park the attempt here. one that has not exited within the grace after its stdout closed
-            # is not going to, so tear the group down and let the wait inside that call collect it.
-            try:
-                proc.wait(timeout=_TEARDOWN_GRACE_S)
-            except subprocess.TimeoutExpired:
-                kill_process_group(proc, process_group_id=process_group_id)
-        # every job boundary, not just the failing ones. a straggler an earlier teardown SIGKILLed
-        # but could not drain in time exits shortly after, and `kill_process_group` -- the only
-        # other caller of this -- runs on exceptions alone: a worker whose later jobs all succeed
-        # would hold that zombie for its whole life, as pid 1 with nothing else to reap it.
-        reap_stragglers()
-    collected = proc.returncode
-    if collected is None:
-        # the bounded wait above can end with nothing collected, which the unbounded one it replaced
-        # could not: a group member wedged in uninterruptible io outlives even the SIGKILL inside
-        # teardown. `int(None)` would replace that diagnosis with a TypeError, so name the survivor
-        # instead -- callers already handle a RuntimeError from here.
-        raise RuntimeError(
-            f"verl subprocess {proc.pid} did not exit after teardown; its process group is still "
-            "holding the gpu"
-        )
-    return_code = int(collected)
-    if watchdog.tore_down and return_code == 0:
-        # the child exited 0 but a descendant held the pipe open past the grace, so the group was
-        # killed to release it. reporting success here would upload whatever partial artifacts exist
-        # as a completed run: the trainer's own exit status says nothing about the descendant that
-        # was still running, and that descendant is why the pipe never closed.
-        raise RuntimeError(
-            f"verl subprocess {proc.pid} exited 0 but a descendant held its output pipe open for "
-            f"{_ORPHANED_PIPE_GRACE_S:.0f}s; the process group was torn down to release the gpu"
-        )
-    try:
-        raise_for_classified_verl_exit(return_code, child_tail)
-    except BaseException:
-        kill_process_group(proc, process_group_id=process_group_id)
-        raise
-    if return_code != 0:
-        # a nonzero exit that carried no recognized signature RETURNS from the classifier rather
-        # than raising, so this is the one failing path that reached neither teardown above. the
-        # direct child is gone but its group need not be: a surviving EngineCore keeps its cuda
-        # context, and a reusable worker then hands the next attempt an occupied gpu.
-        kill_process_group(proc, process_group_id=process_group_id)
+    raise_for_classified_verl_exit(return_code, child_tail)
+    if silence_watchdog is not None:
+        silence_watchdog.raise_if_failed()
     return return_code
 
 
@@ -590,7 +586,7 @@ class _ChildExitWatchdog:
     """Tears the group down when the direct child exits but a descendant holds the pipe open.
 
     this prevents an EngineCore-held pipe from blocking teardown forever (PR #730). it arms only after
-    child exit, so ordinary trainer silence remains ``ChildTailStaleness``'s responsibility.
+    child exit, so ordinary trainer silence remains ``VerlChildSilenceWatchdog``'s responsibility.
     """
 
     def __init__(self, proc: subprocess.Popen, *, process_group_id: int, grace_s: float) -> None:
@@ -939,6 +935,7 @@ from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
     resolve_rollout_enforce_eager,
     resolve_verl_loggers,
     resolve_verl_python,
+    rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
     strict_gdn_probe_module,
@@ -953,7 +950,7 @@ from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
     resolve_checkpoint_actor_dir,
     stage_verl_resume,
     stamp_adapter_dir_provenance,
-    unprocessed_checkpoint_dirs,
+    undiscovered_checkpoint_dirs,
 )
 from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     _VERL_METRIC_FIELDS,
@@ -967,15 +964,12 @@ from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     parse_verl_step_metrics,
     parse_wandb_link,
     read_applied_shim_markers,
-    render_gdn_varlen_shim,
-    render_shim_marker_prologue,
+    render_sitecustomize_bootstrap,
     render_tf32_shim,
     render_tilelang_cudart_shim,
-    render_wandb_link_shim,
     shim_marker_file,
     verify_applied_shim_markers,
     verl_step_number,
-    wrap_shim_fragment,
 )
 
 # re-exported so the child-tail and ray-log diagnostics stay reachable as
@@ -988,6 +982,8 @@ from flash.engine.worker.verl.diagnostics import (  # noqa: E402,F401
     STALL_TAIL_LINES,
     ChildOutputTail,
     ChildTailStaleness,
+    VerlChildSilenceWatchdog,
+    build_verl_line_handler,
     collect_ray_failure_logs,
     latest_ray_session_dir,
     raise_for_classified_verl_exit,

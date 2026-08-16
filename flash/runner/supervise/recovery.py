@@ -233,12 +233,15 @@ def _completed_attempt_metrics(
         return None
     from flash.providers._lifecycle.poll import make_say
     from flash.providers._lifecycle.poll_instance import (
-        _METRICS_AFTER_SUCCESS_RETRIES,
-        _METRICS_AFTER_SUCCESS_WAIT_S,
         _TERMINAL_REREAD_RETRIES,
         _TERMINAL_REREAD_WAIT_S,
-        _read_with_retries,
-        decode_terminal_marker,
+    )
+    from flash.providers._lifecycle.terminal_artifacts import (
+        INVALID_MARKER_DETAIL,
+        AttemptIdentity,
+        ProbeBudget,
+        TerminalKind,
+        resolve_terminal_artifacts,
     )
     from flash.providers.artifacts.hf import make_hf_text_reader
 
@@ -249,62 +252,38 @@ def _completed_attempt_metrics(
     )
     metrics_reader = make_hf_text_reader(spec.train.hf_repo, f"{prefix}/metrics.json")
     say = make_say(log)
-    observation_deadline = time.time() + (_TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S)
-    marker_raw = _read_with_retries(
-        lambda: marker_reader(force=True),
-        tries=_TERMINAL_REREAD_RETRIES,
-        wait_s=_TERMINAL_REREAD_WAIT_S,
+    marker_bound = deadline_at + _RECOVERY_MARKER_GRACE_S
+    # ONE observation window for both artifacts. it previously computed a fresh window for the
+    # marker and then another fresh one for metrics, so the real ceiling was their sum and moved
+    # with however long the marker read took.
+    resolution = resolve_terminal_artifacts(
+        AttemptIdentity(run_id=spec.run_id, attempt=attempt, launch_floor=launch_floor),
+        read_marker=lambda: marker_reader(force=True),
+        read_metrics=lambda: metrics_reader(force=True),
+        budget=ProbeBudget(
+            tries=_TERMINAL_REREAD_RETRIES,
+            wait_s=_TERMINAL_REREAD_WAIT_S,
+            cutoff_at=time.time() + _TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S,
+        ),
         say=say,
-        message="recovery deadline reached; waiting for the terminal attempt marker",
-        deadline_at=observation_deadline,
+        marker_deadline_at=marker_bound,
+        marker_wait_message="recovery deadline reached; waiting for the terminal attempt marker",
+        metrics_message="successful recovery marker seen; waiting for metrics.json",
     )
-    if marker_raw is None:
+    if resolution.kind is TerminalKind.SUCCESS:
+        return resolution.metrics
+    if resolution.kind is TerminalKind.UNVERIFIABLE:
+        # name it the way live polling does instead of logging it as silence. it is still not
+        # completed work, so recovery does not adopt it either way.
+        say(f"recovery: {INVALID_MARKER_DETAIL}; not adopting it as completed work")
         return None
-    try:
-        marker = decode_terminal_marker(
-            marker_raw,
-            run_id=spec.run_id,
-            attempt=attempt,
-            launch_floor=launch_floor,
-            deadline_at=deadline_at + _RECOVERY_MARKER_GRACE_S,
-        )
-    except (TypeError, ValueError):
-        return None
-    if not marker["ok"]:
-        return None
-    metrics_observation_deadline = time.time() + (
-        _METRICS_AFTER_SUCCESS_RETRIES * _METRICS_AFTER_SUCCESS_WAIT_S
-    )
-    metrics_raw = _read_with_retries(
-        lambda: metrics_reader(force=True),
-        tries=_METRICS_AFTER_SUCCESS_RETRIES,
-        wait_s=_METRICS_AFTER_SUCCESS_WAIT_S,
-        say=say,
-        message="successful recovery marker seen; waiting for metrics.json",
-        deadline_at=metrics_observation_deadline,
-    )
-    metrics_grace_expired = time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S
-    if metrics_raw is None:
-        if metrics_grace_expired:
-            return None
+    # a success marker landed but its metrics have not. keep reconciling within the grace window
+    # rather than tearing down an attempt that already finished its paid work.
+    if resolution.kind is TerminalKind.PENDING and time.time() < marker_bound:
         raise _CompletedAttemptPending(
             "successful recovery marker is present but metrics.json is not readable yet"
         )
-    try:
-        metrics = json.loads(metrics_raw)
-    except (TypeError, ValueError) as exc:
-        if metrics_grace_expired:
-            return None
-        raise _CompletedAttemptPending(
-            "successful recovery marker is present but metrics.json is not parseable yet"
-        ) from exc
-    if not isinstance(metrics, dict):
-        if metrics_grace_expired:
-            return None
-        raise _CompletedAttemptPending(
-            "successful recovery marker is present but metrics.json is not an object yet"
-        )
-    return metrics
+    return None
 
 
 def _adopt_completed_attempt(
@@ -343,10 +322,10 @@ def _select_candidate(
     Escapes a congested/sick provider cross-provider before walking classes within it, then takes
     the allocator's own ranking.
 
-    That third key is the LIST POSITION, not a re-priced one. ``allocate()`` ranks candidates on
-    the dollars one optimizer STEP costs -- rate x how long that hardware takes -- so a faster card
-    wins whenever it finishes soon enough to pay for itself. Re-sorting here on total $/hr answered
-    a different question and silently overrode it: for Qwen3.5-0.8B OPD the allocator ranks the
+    That third key is the list position, not a re-priced one. ``allocate()`` first applies any
+    authored provider preference, then ranks within one preference rank on the dollars one optimizer
+    step costs, so preserving the list also preserves both policies. Re-sorting here on total $/hr
+    answered a different question and silently overrode it: for Qwen3.5-0.8B OPD the allocator ranks the
     RTX 5090 cheapest per step, while hourly price picks the slower RTX 4090, so the FIRST paid
     attempt ignored the choice the cost model had just made and ran slower for more money.
     Preserving the incoming order keeps one owner of the cost policy. ``min`` returns the FIRST

@@ -20,6 +20,7 @@ from pathlib import Path
 
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.sft_train import (
+    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     _export_checkpoint_adapter,
     _VerlCheckpointWatcher,
 )
@@ -201,6 +202,15 @@ def _raise_verl_failure(
         raise _w.RetriableInfraError("transient teacher bridge failure")
     if return_code == _PERMANENT_TEACHER_EXIT:
         raise RuntimeError("permanent teacher bridge failure")
+    if return_code == SHIM_FRAGMENT_FAILED_EXIT_CODE:
+        # permanent, not retriable infra: the same interpreter fails the same fragment on retry.
+        raise RuntimeError(
+            f"verl OPD subprocess exited with status {return_code}: a required flash runtime "
+            "patch failed to apply in the child interpreter (its traceback names the fragment in "
+            "the flash log). "
+            "the verl/transformers stack at the child python is incompatible with this flash "
+            "version; rebuild the worker image or fix FLASH_VERL_PYTHON rather than retrying."
+        )
     if truncation_window is not None and truncation_window.indicates_completion_cap:
         raise RuntimeError(
             f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "
@@ -281,9 +291,17 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
     def _should_publish(self, step: int) -> bool:
         return True
 
+    def _publishable(self, pending: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        """keep every pending retry state because each checkpoint carries distinct accounting."""
+        return pending
+
     def _publish(self, step: int, checkpoint_dir: str) -> None:
         actor_dir = os.path.join(checkpoint_dir, "actor")
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
+        # claimed before the work: `_pending` filters on the discovered set, so leaving a step
+        # unclaimed while its export or retry-contract staging raises hands it straight back to the
+        # next sweep.
+        self.lifecycle.mark_discovered(step)
         _export_checkpoint_adapter(
             actor_dir,
             adapter_dir,
@@ -301,22 +319,33 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
             adapter_dir=adapter_dir,
             accounting_state=self.accounting_state(step),
         )
+        # the adapter and its retry contract are both on disk; opd keeps the export because
+        # `_stage_retry_contract` above has already copied from it and the resume state references it.
+        self.lifecycle.mark_staged(step)
 
         def publish_required_adapter() -> None:
             if step in self.required_steps:
+                # opd publishes only required steps, and a required publish raises rather than
+                # returning None, so reaching the next line IS the durable fact. sft needs a
+                # returned-subfolder check because its `required` varies per step.
                 _w.publish_deployable_checkpoint(
                     adapter_dir,
                     step,
                     required=True,
                     _provenance_ready=True,
                 )
+                self.lifecycle.mark_deployable_published(step)
 
         uploaded = _w.upload_resume_checkpoint(
-            step, checkpoint_dir, before_upload=publish_required_adapter
+            step,
+            checkpoint_dir,
+            before_upload=publish_required_adapter,
+            # the callback, not the return value: see mark_resume_uploaded's contract.
+            after_upload=lambda: self.lifecycle.mark_resume_uploaded(step),
         )
         if step in self.required_steps and not uploaded:
+            self.lifecycle.mark_failed(step)
             raise RuntimeError(f"required save step {step} full-state checkpoint was not published")
-        self.processed_steps.add(step)
 
 
 def _restore_verl_resume(

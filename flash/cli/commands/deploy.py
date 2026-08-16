@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 
 from flash.cli.ui import render
@@ -41,6 +42,10 @@ _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 # plane introduces are both non-busy and non-servable, so `--wait` must fail closed on them
 # rather than let `deploy --wait && evaluate` proceed against nothing.
 _DEPLOYMENT_READY_STATES = frozenset({"ready", "deployed"})
+# an undeploy whose backend cleanup failed (flash/runner/supervise/transitions.py). local serving
+# authority is revoked, but the alias may still resolve to the old target -- neither servable nor
+# safely assumed idle.
+_REVOCATION_FAILED_STATE = "revocation_failed"
 _DEPLOY_POLL_SECONDS = 5.0
 # `--wait 0` still owes the caller its one read, and a read needs a positive timeout. keep that
 # bound short enough that "check once, do not block" stays true against a stalled plane: a longer
@@ -57,6 +62,14 @@ _DEPLOY_FINAL_READ_FRACTION = 0.9
 # an auth or authorization rejection answers the same way every time; polling through it just
 # spends the whole timeout to arrive at the identical error.
 _PERMANENT_POLL_STATUSES = frozenset({401, 403})
+# the pre-deploy alias read is advisory, so it must not spend the client's default 60s budget
+# deciding whether to print a warning: a stalled read would delay every real deploy behind a
+# line nobody asked for. short enough to stay unnoticed, long enough for a healthy plane.
+# it is spent three ways, because the client's own bounds are per-phase: as a socket timeout it
+# bounds one socket operation, and as a body deadline it bounds the body but is only consulted
+# once headers are parsed. a peer trickling headers just inside the socket timeout escapes both.
+# `_read_within` bounds the total in wall-clock time, which is the one that actually holds.
+_ALIAS_WARNING_READ_SECONDS = 5.0
 
 
 def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> dict:
@@ -189,6 +202,196 @@ def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
     return None
 
 
+def _served_step_label(step: int | None) -> str:
+    """Name a deployment's checkpoint the way the user addressed it: `step-N`, or `final`."""
+    return "final" if step is None else f"step-{step}"
+
+
+def _read_within(budget: float, read):
+    """Run an advisory read, giving up on it entirely once ``budget`` seconds have passed.
+
+    The client's two bounds are both per-phase, not total: `timeout` restarts on every socket
+    operation and the body deadline is only checked once `urlopen` has finished parsing headers.
+    A peer that trickles the status line or headers just inside the socket timeout therefore
+    stalls for timeout x however many pauses it takes -- 12s against a 2s budget, measured -- and
+    the whole point of the bound is that the deploy the user actually asked for is waiting behind
+    it. Only wall-clock time outside the call bounds every phase at once.
+
+    A daemon thread rather than a cancellation: a blocked socket read cannot be interrupted from
+    outside, so the read is abandoned rather than stopped. That is sound only because this result
+    is discardable -- no warning is the documented outcome for a plane that cannot answer, so an
+    overrunning read degrades to silence. Daemon, so a stuck thread cannot keep the interpreter
+    alive after the deploy finishes.
+    """
+    result: list = []
+    worker = threading.Thread(
+        target=lambda: result.append(_read_or_none(read)),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(budget)
+    return result[0] if result else None
+
+
+def _read_or_none(read):
+    """The advisory read's failure contract: a plane that cannot answer produces no warning.
+
+    Deliberately broader than `ApiError`/`ClientError`. The client translates urllib's HTTPError
+    and URLError, and documents that anything else propagates -- so a connection reset or a
+    truncated body mid-read surfaces as the bare `ConnectionResetError` / `IncompleteRead` that
+    urllib raised. Those are exactly the "plane cannot answer" case this exists to absorb, and on
+    the worker thread an escaping one reaches the thread hook and prints a traceback across a
+    deploy that is otherwise proceeding normally: a warning nobody asked for turning into noise
+    on a command that worked.
+    """
+    try:
+        return read()
+    except Exception:
+        # the deploy itself is the authority on whether it can proceed. failing it here -- or
+        # printing a traceback beside it -- would turn a warning nobody asked for into a fault in
+        # the command it decorates. BaseException still propagates, so KeyboardInterrupt is
+        # unaffected.
+        return None
+
+
+def _alias_move_warning(client, base_run_id: str, requested_step: int | None) -> str | None:
+    """Warn when deploying moves the shared `<run_id>` alias off a different checkpoint.
+
+    `deploy` registers under the bare run id whatever step it is given, so deploying a second
+    checkpoint of the same run does not stand up a second endpoint -- it repoints the one alias,
+    and everyone chatting bare `<run_id>` silently changes model. That makes "deploy another
+    checkpoint to compare" a destructive operation on the first, which reads as a serving fault
+    rather than the deploy that caused it.
+
+    Best-effort by construction: the read is advisory, so a plane that cannot answer must not
+    stop the deploy. Returns None when nothing is being displaced -- no deployment, the same
+    checkpoint again, or an unreadable current record.
+    """
+    current = _read_within(
+        _ALIAS_WARNING_READ_SECONDS,
+        # not `deployment_for`: its step filter hides exactly the record this asks about, a
+        # DIFFERENT checkpoint holding the alias.
+        lambda: client.deployed_checkpoint(
+            base_run_id,
+            timeout=_ALIAS_WARNING_READ_SECONDS,
+            body_deadline=_ALIAS_WARNING_READ_SECONDS,
+        ),
+    )
+    if current is None:
+        return None
+    # a `reconciling` record whose activation outcome was never recorded may ALREADY hold the
+    # alias. the plane permits replacing exactly that record rather than rejecting it as busy,
+    # and resolves the authoritative target through `_activation_predecessor` when it does
+    # (flash/server/routes/serving.py). reading it as "not serving" suppressed the warning in
+    # the very case the alias is most likely to move out from under someone.
+    unknown_activation = current.get("activation_outcome_unknown") is True
+    # `revocation_failed` is an undeploy whose BACKEND cleanup failed: local authority is revoked
+    # but the alias may still resolve to the old target, and `_validate_deploy_request` rejects
+    # only the busy set, so a deploy proceeds from here. reading it as "not serving" suppressed
+    # the warning in the case where cleanup already left the alias ambiguous.
+    revocation_failed = str(current.get("state") or "") == _REVOCATION_FAILED_STATE
+    ambiguous = unknown_activation or revocation_failed
+    if str(current.get("state") or "") not in _DEPLOYMENT_READY_STATES and not ambiguous:
+        # nothing is being served off the alias yet, so nothing is lost by moving it.
+        return None
+    cli = _commands().CLI_NAME
+    # `step-N` is not universally available: `ApiClient.chat` gates a step target behind
+    # `_require_chat_step_selector`, which refuses outright on a plane that does not advertise
+    # `chat_step_selector_v1`. the capability cannot be read here without spending a /v1/health on
+    # an advisory warning, and `_chat_step_selector_available` starts False, so a negative reading
+    # cannot tell "unsupported" from "not checked yet". state the condition instead of asserting
+    # the command works, and name the selector that works on every plane.
+    tail = (
+        f"so every client using bare `{base_run_id}` changes model. address a specific "
+        f"checkpoint with `{cli} models chat {base_run_id}/step-N` to compare them, or by "
+        "immutable adapter revision if this control plane does not support step selectors."
+    )
+    if revocation_failed:
+        # same reason as the unknown-activation arm: this record's `checkpoint_step` describes the
+        # deployment whose revocation failed, and whether the backend still answers on the alias
+        # is exactly what could not be determined. hedge rather than name a checkpoint.
+        return (
+            f"{base_run_id} has a deployment whose revocation did not complete, so whether it "
+            f"still serves off that shared model id cannot be determined from here; deploying "
+            f"{_served_step_label(requested_step)} may move it, "
+            f"{tail} run `{cli} models deployments` to see the current state first."
+        )
+    if unknown_activation:
+        # this record's `checkpoint_step` names the INCOMING attempt, not what the alias holds:
+        # the plane resolves the live target from `adapter_alias_target` / `previous_deployment`,
+        # and both are server-side (`public_deployment` strips the predecessor). naming a
+        # checkpoint here would report the wrong one -- worse than naming none -- so say only what
+        # this side can actually stand behind.
+        return (
+            f"{base_run_id} has a deployment whose activation never settled, so the checkpoint "
+            f"it currently serves cannot be determined from here; deploying "
+            f"{_served_step_label(requested_step)} may move that shared model id, "
+            f"{tail} run `{cli} models deployments` to see the current state first."
+        )
+    raw_step = current.get("checkpoint_step")
+    # `int()` does not just reject what it cannot read -- it silently COERCES. `true` becomes 1,
+    # `false` becomes 0, and `1.5` truncates to 1, none of them raising. a step this client cannot
+    # read as an exact whole number is an unreadable record, not checkpoint 1: reading it as a
+    # number either suppresses the warning (deploying step-1 against a `true`) or names a
+    # checkpoint that was never live. bool is checked first because it is a subclass of int.
+    if isinstance(raw_step, bool):
+        return None
+    if isinstance(raw_step, float) and not raw_step.is_integer():
+        return None
+    try:
+        served_step = None if raw_step is None else int(raw_step)
+    except (TypeError, ValueError, OverflowError):
+        # a proxy or older plane can answer 2xx with a step this client cannot read. that is an
+        # unreadable current record like any other, NOT a reason to fail the deploy: leaving the
+        # conversion unguarded let an advisory read traceback out of the command it decorates.
+        # all three arms are reachable from one JSON body: `json.loads` accepts the non-standard
+        # `Infinity`/`NaN` literals, and int() answers those with OverflowError and ValueError
+        # respectively -- so catching only the obvious two still crashed the deploy.
+        return None
+    if served_step == requested_step:
+        return None
+    reach_displaced = ""
+    # the record being displaced carries the one identifier that survives the alias move, so name
+    # it whenever it is there. `step-N` is not a substitute: it is rejected outright on a plane
+    # without `chat_step_selector_v1`, and after this deploy the listing shows only the NEW record
+    # -- `public_deployment` strips `previous_deployment` (flash/serve/urls.py) -- so a revision
+    # not printed here is not recoverable from anywhere afterwards.
+    revision = str(current.get("adapter_revision") or "").strip()
+    if served_step is None:
+        # the displaced checkpoint is the FINAL adapter, and `_parse_chat_target` accepts only a
+        # bare run id, `RUN/step-N`, or a full immutable revision -- there is no `/final`
+        # selector. once the alias moves, `step-N` addresses the incoming checkpoint and the bare
+        # id is the thing that just changed, so the generic advice cannot reach the final adapter
+        # at all. its immutable revision can, and the record being displaced carries one.
+        reach_displaced = (
+            f" the displaced final adapter has no `/final` selector; reach it by its immutable "
+            f"revision `{revision}`."
+            if revision
+            # without a revision on the record there is nothing to hand the user, and deferring
+            # them to a later command would be worse than saying so: `client.deploy` fires as soon
+            # as this prints, and the deployments listing then shows only the NEW record --
+            # `public_deployment` strips `previous_deployment` (flash/serve/urls.py), so the
+            # displaced revision is not in it. promising a selector that the next command cannot
+            # produce is the one outcome worse than admitting there is none.
+            else (
+                " the displaced final adapter has no `/final` selector and this plane did not "
+                "report its immutable revision, so it will not be addressable after this deploy; "
+                "undeploy and redeploy it to serve it again."
+            )
+        )
+    elif revision:
+        # a numbered checkpoint keeps its `step-N` selector, but only on a plane that advertises
+        # `chat_step_selector_v1`; where it does not, the qualified advice above leaves the user
+        # holding no identifier at all. this is that identifier, and this is the last moment it
+        # can be printed.
+        reach_displaced = f" the displaced checkpoint's immutable revision is `{revision}`."
+    return (
+        f"{base_run_id} currently serves {_served_step_label(served_step)}; deploying "
+        f"{_served_step_label(requested_step)} moves that shared model id onto the new "
+        f"checkpoint, {tail}{reach_displaced}"
+    )
+
+
 def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
     """True when the requested revision is not the one now served.
 
@@ -229,8 +432,18 @@ def cmd_deploy(args) -> int:
             file=sys.stderr,
         )
         return 1
-    base_run_id, _step = parsed
+    base_run_id, step = parsed
     client = _commands().client_from_config()
+    # before the POST: after it the alias has already moved, and a warning about a checkpoint that
+    # is no longer served reads as history rather than a decision the reader still has. a dry run
+    # registers nothing, so it displaces nothing and gets no warning.
+    if not args.dry_run:
+        alias_warning = _alias_move_warning(client, base_run_id, step)
+        if alias_warning:
+            print(
+                render.warn(alias_warning) if render.styled() else f"warning: {alias_warning}",
+                file=sys.stderr,
+            )
     dep = client.deploy(args.run_id, dry_run=args.dry_run)
     wait_seconds = getattr(args, "wait", None)
     # a dry run creates no deployment to poll for, so --wait has nothing to observe. test against
@@ -302,6 +515,264 @@ def cmd_deploy(args) -> int:
     return 1 if dep.get("state") == "failed" or waited_but_unservable else 0
 
 
+def _hub_repo_missing_errors() -> tuple[type[BaseException], ...]:
+    """The hub errors that mean "the destination does not exist yet", not "you may not write".
+
+    Imported lazily and tolerantly for the same reason as flash/serve/export.py's `_hub_error_types`:
+    the CLI must stay importable without huggingface_hub. An empty tuple never matches, so a hub too
+    old to export these names fails closed on the strict branch rather than waving an export through.
+    """
+    for module in ("huggingface_hub.errors", "huggingface_hub.utils"):
+        try:
+            return (
+                __import__(module, fromlist=["RepositoryNotFoundError"]).RepositoryNotFoundError,
+            )
+        except (ImportError, AttributeError):
+            continue
+    return ()
+
+
+def _hf_status_code(exc: BaseException) -> int | None:
+    """The HTTP status behind a hub error, or None when the request never got an answer.
+
+    None is the whole point: it separates "the Hub said no" from "the Hub was unreachable", which
+    the preflight must treat differently.
+    """
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hub_repo_gated_errors() -> tuple[type[BaseException], ...]:
+    """Gated-repo errors, which the hub models as a SUBCLASS of "repository not found".
+
+    So they match the missing-repo tuple and have to be subtracted from it. A gated destination
+    exists; it is simply not writable by this token, which is the opposite of creatable.
+    """
+    for module in ("huggingface_hub.errors", "huggingface_hub.utils"):
+        try:
+            return (__import__(module, fromlist=["GatedRepoError"]).GatedRepoError,)
+        except (ImportError, AttributeError):
+            continue
+    return ()
+
+
+def _hf_repo_confirmed_to_exist(api: object, repository: str, token: str) -> bool:
+    """Whether the Hub affirmatively said the destination is already there.
+
+    True only on an affirmative answer. A missing `repo_exists`, an error, or any other non-answer
+    is False, meaning "not confirmed", which leaves the creation rules in charge. That asymmetry is
+    deliberate: bypassing those rules is what lets an export reach a namespace nobody verified, so
+    it must be earned by a real answer rather than granted by the absence of one.
+    """
+    repo_exists = getattr(api, "repo_exists", None)
+    if not callable(repo_exists):
+        return False
+    try:
+        return bool(repo_exists(repository, repo_type="model", token=token))
+    except Exception:
+        return False
+
+
+# sub-500 statuses that describe the request's transport rather than this token's access: request
+# timeout, too-early replay, and rate limiting. 5xx is handled by the range check alongside these.
+_HUB_TRANSIENT_STATUSES = frozenset({408, 425, 429})
+
+
+def _hf_status_is_a_verdict(status: int | None) -> bool:
+    """Whether an HTTP status is the Hub answering the permission question about this token.
+
+    401/403/404 are answers: rejected, forbidden, or no such repo for this token. A missing status
+    (no response at all), 408, 425, 429, and 5xx are not -- they say the Hub was busy, slow or
+    broken, which is a fact about the Hub rather than about the caller's access.
+
+    408 and 425 carry a response, so they reach here rather than the statusless path, but a request
+    timeout and a too-early retry are transport outcomes: nothing about them says this token may not
+    write. Blocking on one would blame the user's permissions for the Hub being slow.
+    """
+    if status is None:
+        return False
+    return status < 500 and status not in _HUB_TRANSIENT_STATUSES
+
+
+def _without_token(text: str, token: str) -> str:
+    """`text` with the token removed, for the warnings that quote a hub exception.
+
+    A local credential rejection quotes what it was handed: httpx raises "Illegal header value
+    b'Bearer <token>'" for a token containing a newline, so interpolating the exception prints the
+    credential to stderr and into any log or pasted bug report. The exception is still worth showing
+    -- it is the only clue to what went wrong -- so redact rather than drop it.
+
+    The escaped renderings have to go too. httpx builds that message from the header BYTES, so a
+    token holding a real newline appears as the two characters `\\` and `n`, which a literal replace
+    of the token never matches -- the redaction silently does nothing in exactly the case it was
+    written for. Each form is removed longest-first so a shorter one cannot bite a piece out of a
+    longer one and leave the rest of the credential in place.
+    """
+    if not token:
+        return text
+    # repr() of the str and of the utf-8 bytes cover the escapings httpx and friends actually emit;
+    # the [1:-1] strips the quotes repr adds so the inner escaped text is what gets matched.
+    forms = {token, repr(token)[1:-1], repr(token.encode())[2:-1]}
+    for form in sorted(forms, key=len, reverse=True):
+        if form:
+            text = text.replace(form, "<redacted>")
+    return text
+
+
+def _hf_hub_version() -> str:
+    """The installed hub version for messages, without importing the package at module scope.
+
+    Falls back to a phrase, not a version-shaped string: this is only reached when the version could
+    not be read, and printing something that looks like a number would name a version nobody has.
+    """
+    try:
+        from huggingface_hub import __version__
+
+        return str(__version__)
+    except Exception:
+        return "(unknown version)"
+
+
+def _hf_identity_and_write_access(repository: str, token: str) -> str | None:
+    """return the token account after verifying the destination namespace when hub is installed."""
+    try:
+        from huggingface_hub import HfApi
+    except ModuleNotFoundError as exc:
+        if exc.name != "huggingface_hub":
+            raise
+        return None
+
+    import inspect
+
+    api = HfApi()
+    try:
+        identity = api.whoami(token=token)
+    except Exception as exc:
+        # a rejected token is the Hub answering, so refuse. a Hub that was unreachable, rate limited
+        # or broken is not an answer: the copy runs on the control plane, not here, so a CLI host
+        # without Hub egress would otherwise be unable to export at all -- while the same command
+        # skips this check entirely when the package is simply absent. degrade to that behaviour
+        # rather than invent a new hard blocker.
+        if not _hf_status_is_a_verdict(_hf_status_code(exc)):
+            print(
+                "warning: could not reach HuggingFace to verify the export namespace "
+                f"({_without_token(str(exc), token)}); proceeding without the check",
+                file=sys.stderr,
+            )
+            return None
+        raise ClientError(
+            "HuggingFace rejected the token before export. Check HF_TOKEN or --api-key and retry."
+        ) from exc
+    account = str(identity.get("name") or identity.get("username") or "").strip()
+    if not account:
+        raise ClientError(
+            "HuggingFace authenticated the token but returned no account name, so Flash could not "
+            "verify the export namespace. Update huggingface-hub or verify the token manually."
+        )
+    print(f"HuggingFace token resolves to account {account}", file=sys.stderr)
+
+    owner = repository.partition("/")[0].strip()
+
+    # the exact repo first: it is the only authoritative answer, and it is the one the export
+    # actually needs. asking the org role first would refuse a `contributor` who can write this
+    # very repo, because a role is a coarser fact than the permission being checked.
+    auth_check = getattr(api, "auth_check", None)
+    exact_probe = callable(auth_check) and "write" in inspect.signature(auth_check).parameters
+    if not exact_probe and _hf_repo_confirmed_to_exist(api, repository, token):
+        # `auth_check(..., write=True)` only exists from huggingface-hub 1.5, and this package still
+        # supports >=1.2, so on 1.2-1.4 there is no exact write probe. the rules below are CREATION
+        # rules and a destination that already exists is not being created, so applying them here
+        # would reject the org `contributor` this ordering was fixed to admit. degrade to a warning,
+        # exactly as this function already does when the Hub is unreachable or the package is absent.
+        # only a CONFIRMED existing repo takes this path. an unanswered lookup keeps the creation
+        # rules, which is what stops an unverified export into someone else's namespace.
+        print(
+            f"warning: huggingface-hub {_hf_hub_version()} cannot check write access to an "
+            f"existing repo; proceeding without verifying {repository}",
+            file=sys.stderr,
+        )
+        return account
+    if exact_probe:
+        try:
+            auth_check(repository, repo_type="model", token=token, write=True)
+            return account
+        except Exception as exc:
+            # a destination that is not there yet cannot be checked directly, so fall through to the
+            # creation rules below. GatedRepoError SUBCLASSES RepositoryNotFoundError, so it must be
+            # excluded first: a gated repo exists and this token may not write it, and reading it as
+            # "absent" would hand it to the weaker create-permission paths.
+            missing = _hub_repo_missing_errors()
+            absent = bool(missing) and isinstance(exc, missing)
+            if absent and isinstance(exc, _hub_repo_gated_errors()):
+                absent = False
+            if not absent and not _hf_status_is_a_verdict(_hf_status_code(exc)):
+                # no verdict about this token: a timeout or DNS failure (no status at all), a 429,
+                # or a 5xx. reporting any of those as "cannot write" blames the user's permissions
+                # for a transport fault, and the upload runs on the control plane anyway. warn and
+                # proceed, exactly as the whoami path above already does for the same class of
+                # failure. 401/403/404 DO answer the question and still fall through to the error.
+                print(
+                    f"warning: could not verify write access to {repository} "
+                    f"({_without_token(str(exc), token)}); proceeding without the check",
+                    file=sys.stderr,
+                )
+                return account
+            if not absent:
+                raise ClientError(
+                    f"HuggingFace token resolves to account {account}, but it cannot write to "
+                    f"{repository}. Grant this token write access to that model repo or set HF_TOKEN "
+                    "to a token that can write there."
+                ) from exc
+
+    # only reached for a destination that does not exist yet, so the question is now whether this
+    # token may CREATE it in that namespace. that is what the org role legitimately answers.
+    org_role = ""
+    for org in identity.get("orgs") or ():
+        if not isinstance(org, dict) or str(org.get("name") or "").casefold() != owner.casefold():
+            continue
+        org_role = str(org.get("role") or org.get("roleInOrg") or "").lower()
+        break
+    if owner.casefold() != account.casefold() and org_role not in {"write", "admin"}:
+        raise ClientError(
+            f"HuggingFace token resolves to account {account}, which cannot create "
+            f"{repository} in the namespace {owner}. Use --repository {account}/<repo>, choose an "
+            "org where this account has write access, or set HF_TOKEN to the intended account."
+        )
+
+    access_token = (identity.get("auth") or {}).get("accessToken") or {}
+    token_role = str(access_token.get("role") or "").lower()
+    if token_role == "write":
+        return account
+    if token_role != "fineGrained".lower():
+        raise ClientError(
+            f"HuggingFace token resolves to account {account}, but Flash could not verify write "
+            f"scope for the new destination {repository}. Use a write token for that namespace, "
+            "or create the repo first so Flash can check its exact write permission."
+        )
+
+    permissions = set(access_token.get("fineGrained", {}).get("global") or ())
+    for scope in access_token.get("fineGrained", {}).get("scoped") or ():
+        if not isinstance(scope, dict):
+            continue
+        entity = scope.get("entity") or {}
+        entity_name = str(entity.get("name") or entity.get("id") or "")
+        # only a scope naming the destination counts. crediting every user-typed scope would accept
+        # a token whose write grant covers some unrelated repo of its own, which is the silent
+        # wrong-namespace export this preflight exists to stop.
+        if entity_name.casefold() in {owner.casefold(), repository.casefold()}:
+            permissions.update(scope.get("permissions") or ())
+    if not ({"repo.write", "repo.content.write"} & permissions):
+        raise ClientError(
+            f"HuggingFace token resolves to account {account}, but its fine-grained scopes do not "
+            f"verify write access for {repository}. Add repository-content write access for that "
+            "namespace or use a write token."
+        )
+    return account
+
+
 def cmd_export(args) -> int:
     from flash.client.runtime_secrets import resolve_hf_token
 
@@ -311,9 +782,16 @@ def cmd_export(args) -> int:
             "no HuggingFace token: pass `--api-key <hf_...>`, or set HF_TOKEN "
             "(export it in your shell or put it in a local .env / .env.local)"
         )
+    if args.api_key:
+        print(
+            "warning: --api-key is visible in process listings; prefer HF_TOKEN or a local "
+            ".env / .env.local",
+            file=sys.stderr,
+        )
+    _hf_identity_and_write_access(args.repository, hf_token)
     client = _commands().client_from_config()
     progress = (
-        f"exporting adapter {args.adapter_id} to {args.repository} — "
+        f"exporting adapter {args.adapter_id} to {args.repository}; "
         "downloading then re-uploading; this can take a minute..."
     )
     print(render.note(progress) if render.styled() else progress, file=sys.stderr)

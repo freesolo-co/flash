@@ -21,20 +21,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker import opd_train, rl_train, score_batcher
+from flash.engine.worker import backend_common, opd_train, rl_train, score_batcher
 from flash.engine.worker.opd_train import (
     _OPD_PARQUET_WRITE_BATCH_ROWS,
     _BridgePrompt,
     _build_opd_child_env,
+    _build_opd_plugin_config,
     _failure_accounting_metadata,
     _OpdProgressState,
     _OpdVerlCheckpointWatcher,
-    _processed_resume_steps,
     _processor_expanded_prompt_ids,
     _prompt_pool_fingerprint,
     _raise_verl_failure,
-    _render_opd_sitecustomize,
     _restore_verl_resume,
+    _seed_resume_lifecycle,
     _stage_retry_contract,
     _TeacherAlignmentBridge,
     _TextTeacherBatcher,
@@ -45,8 +45,15 @@ from flash.engine.worker.opd_train import (
     build_opd_overrides,
     encode_shifted_group_metadata,
 )
+from flash.engine.worker.opd_train_runner import _prepare_prompt_messages
 from flash.engine.worker.teacher.client import TeacherScore
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
+from flash.engine.worker.train.core.child.glue import (
+    multi_modal_image_count,
+    validate_structured_messages,
+)
+from flash.engine.worker.train.core.child.runtime import install_checkpoint_handler_filter
+from flash.engine.worker.train.opd.child import plugin as opd_plugin
 from flash.engine.worker.train.opd.child.plugin import (
     FlashTeacherBridgeError,
     _AllNoSignalBatch,
@@ -54,7 +61,6 @@ from flash.engine.worker.train.opd.child.plugin import (
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
     _init_transfer_queue,
-    _multi_modal_image_count,
     _post_json,
     _raw_prompt_has_image_block,
     _require_structured_runtime_versions,
@@ -70,7 +76,17 @@ from flash.engine.worker.train.opd.child.structured import (
     canonical_structured_spec,
 )
 from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
+from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import OPD_RESUME_STATE_VERSION
+
+
+@pytest.fixture(autouse=True)
+def _configure_opd_child_attempt_limit(monkeypatch):
+    monkeypatch.setitem(
+        opd_plugin._PLUGIN_CONFIG,
+        "no_signal_attempts",
+        OPD_NO_SIGNAL_ATTEMPTS,
+    )
 
 
 def _reference_groupwise_reverse_kl(sp_t, groups, kl_coef=1.0):
@@ -441,6 +457,28 @@ def test_all_no_signal_rollout_dispatches_bounded_usable_replacement():
     assert prepared == [True, True]
     assert resamples == [True, True]
     assert abandoned == []
+
+
+def test_changed_plugin_attempt_limit_controls_child_resampling(monkeypatch):
+    attempts = []
+    monkeypatch.setitem(opd_plugin._PLUGIN_CONFIG, "no_signal_attempts", 4)
+
+    def run_attempt(attempt_ordinal):
+        attempts.append(attempt_ordinal)
+        if attempt_ordinal < 3:
+            raise _AllNoSignalBatch(attempt_ordinal)
+        return "usable"
+
+    result = _run_with_no_signal_replacements(
+        run_attempt,
+        lambda _batch: None,
+        lambda: None,
+        lambda: None,
+        lambda: None,
+    )
+
+    assert result == "usable"
+    assert attempts == [0, 1, 2, 3]
 
 
 def test_shifted_group_metadata_uses_verl_prediction_layout():
@@ -838,6 +876,167 @@ def test_processor_expanded_prompt_ids_enforce_visual_token_budget(tmp_path):
     assert len(prompt_ids) > 3
     assert processor.rendered[0]["content"][0]["image"].size == (2, 2)
     assert [image.size for image in processor.images] == [(2, 2)]
+
+
+_IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n1c"
+    "AAAAASUVORK5CYII="
+)
+_OTHER_IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLs"
+    "AAAAAElFTkSuQmCC"
+)
+
+
+def test_parent_preparation_normalizes_real_image_blocks_before_transcript_validation():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "image_url", "image_url": {"url": _IMAGE_DATA_URI}},
+                {"type": "text", "text": "b"},
+            ],
+        }
+    ]
+
+    student_messages, descriptors = _prepare_prompt_messages(
+        {}, messages, multi_turn=True, package_root=None
+    )
+
+    assert student_messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "image"},
+                {"type": "text", "text": "b"},
+            ],
+        }
+    ]
+    assert len(descriptors) == 1
+    assert messages[0]["content"][1]["type"] == "image_url"
+
+
+def test_parent_preparation_attaches_top_level_image_without_flattening_text():
+    student_messages, descriptors = _prepare_prompt_messages(
+        {"image": _IMAGE_DATA_URI},
+        [{"role": "user", "content": "describe"}],
+        multi_turn=True,
+        package_root=None,
+    )
+
+    assert student_messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image"},
+            ],
+        }
+    ]
+    assert len(descriptors) == 1
+
+
+def test_parent_preparation_orders_image_normalization_before_block_validation(monkeypatch):
+    from flash.content import multimodal
+
+    calls = []
+    normalized_messages = [
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "q"}]}
+    ]
+
+    def normalize(_example, _messages, _package_root):
+        calls.append("normalize")
+        return SimpleNamespace(messages=normalized_messages, descriptors=["descriptor"])
+
+    def validate(messages, **kwargs):
+        calls.append(("validate", messages, kwargs))
+        assert kwargs["allow_content_blocks"] is True
+        return [{"role": "user", "content": "q"}]
+
+    monkeypatch.setattr(multimodal, "normalize_prompt_images", normalize)
+    monkeypatch.setattr(opd_train, "validate_transcript_messages", validate)
+
+    result = _prepare_prompt_messages(
+        {"image": _IMAGE_DATA_URI},
+        [{"role": "user", "content": "q"}],
+        multi_turn=True,
+        package_root=None,
+    )
+
+    assert calls == [
+        "normalize",
+        (
+            "validate",
+            normalized_messages,
+            {
+                "source": "environment initial prompt",
+                "allow_content_blocks": True,
+            },
+        ),
+    ]
+    assert result == (normalized_messages, ("descriptor",))
+
+
+@pytest.mark.parametrize(
+    ("messages", "match"),
+    [
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": _IMAGE_DATA_URI}],
+                    "tool_calls": [],
+                }
+            ],
+            "unsupported transcript metadata",
+        ),
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": _IMAGE_DATA_URI},
+                        {"type": "text"},
+                    ],
+                }
+            ],
+            "malformed text block",
+        ),
+    ],
+)
+def test_parent_preparation_rejects_unsupported_image_prompt_shapes(messages, match):
+    with pytest.raises(ValueError, match=match):
+        _prepare_prompt_messages({}, messages, multi_turn=True, package_root=None)
+
+
+def test_parent_preparation_keeps_text_only_messages_exact():
+    messages = [{"role": "system", "content": "rules"}, {"role": "user", "content": "q"}]
+
+    prepared, descriptors = _prepare_prompt_messages(
+        {}, messages, multi_turn=True, package_root=None
+    )
+
+    assert json.dumps(prepared, separators=(",", ":")) == json.dumps(
+        messages, separators=(",", ":")
+    )
+    assert descriptors == ()
+
+
+def test_structured_prompt_canonicalization_rejects_unsupported_block_fields():
+    with pytest.raises(ValueError, match=r"unsupported fields.*detail"):
+        validate_structured_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": "ref", "detail": "high"}],
+                }
+            ],
+            source="initial prompt",
+        )
 
 
 class _BridgeTokenizer:
@@ -2532,7 +2731,11 @@ def test_an_unusable_opd_turn_is_never_shown_to_the_environment():
     env = _RecordingEnv()
     bridge = _multiturn_bridge(env)
     bridge.start_multiturn(
-        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+        index=0,
+        session_id="s1",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
     )
 
     response = bridge.step_multiturn(
@@ -2562,7 +2765,11 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
     env = _RecordingEnv()
     bridge = _multiturn_bridge(env)
     bridge.start_multiturn(
-        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+        index=0,
+        session_id="s1",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
     )
 
     response = bridge.step_multiturn(
@@ -2646,6 +2853,57 @@ def test_multimodal_bridge_scores_frozen_images_through_structured_teacher_messa
     assert encoded["teacher_logprobs"] == [0.0, -0.4, 0.0, 0.0]
     assert bridge.teacher_input_tokens == 91
     assert bridge.teacher_output_tokens == 1
+
+
+def test_multimodal_scoring_counts_as_parent_work(monkeypatch):
+    """an image rollout must report teacher progress the same way the text route does.
+
+    the verl child prints nothing while the parent waits on the teacher, so a route that scores
+    without reporting is indistinguishable from a wedged child and the silence watchdog would tear
+    down a healthy image run.
+    """
+    from flash.content import multimodal
+    from flash.engine.worker.teacher.client import TeacherClient
+
+    monkeypatch.setattr(
+        multimodal,
+        "image_descriptors_to_data_uris",
+        lambda descriptors, package_root: ["data:image/png;base64,x"],
+    )
+
+    class Teacher(TeacherClient):
+        def __init__(self):
+            pass
+
+        def _score_one_multimodal(self, *_args):
+            return _teacher_score(
+                [TeacherToken(text="A", logprob=-0.4, start=0, end=1)],
+                input_tokens=91,
+            )
+
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[{"role": "user", "content": [{"type": "image"}]}],
+                teacher_messages=[{"role": "user", "content": "<|media_pad|>question"}],
+                prompt_ids=(10, 11),
+                image_descriptors=("frozen-descriptor",),
+                package_root="/package",
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=Teacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+
+    assert bridge.parent_work.snapshot().completed == 0
+
+    bridge.score(0, 2, [10, 11, 65, 99], image_count=1)
+
+    assert bridge.parent_work.snapshot().completed == 1
 
 
 def test_bridge_rejects_parent_child_image_count_mismatch_before_scoring():
@@ -2784,32 +3042,50 @@ def test_resume_restores_bridge_counters_and_extends_full_curves():
 
 
 def _progress_bridge_snapshot(*, samples_seen: int, truncated_rollouts: int):
+    # the real bridge owns a parent-work gauge the child callbacks read for liveness, so the stub
+    # carries one too rather than a namespace the callbacks cannot query.
+    from flash.engine.worker.verl.parent_work import ParentWorkGauge
+
     return SimpleNamespace(
+        parent_work=ParentWorkGauge(),
         accounting_snapshot=lambda: {
             "aligned_sequences": 0,
             "coverage_sum": 0.0,
             "samples_seen": samples_seen,
             "truncated_rollouts": truncated_rollouts,
-        }
+        },
     )
 
 
-def test_opd_progress_truncation_rate_is_per_step_not_cumulative():
+def _applied_shim_markers(tmp_path) -> str:
+    """a marker file recording the guard as applied, as a child with a working shim leaves it.
+
+    the callbacks verify it on the first step line, so tests that drive steps need the real
+    thing rather than a stub: a bare path would fail them for the reason the check exists.
+    """
+    marker = Path(opd_train.shim_marker_file(str(tmp_path)))
+    marker.write_text("lora-rollout-guard\n", encoding="utf-8")
+    return str(marker)
+
+
+def test_opd_progress_truncation_metrics_are_per_step_not_cumulative():
     progress = _OpdProgressState()
 
-    first = progress.record_step(
+    first_rate, first_discarded = progress.record_step(
         1,
         0.8,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
-    second = progress.record_step(
+    second_rate, second_discarded = progress.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=3),
     )
 
-    assert first == pytest.approx(0.75)
-    assert second == 0.0
+    assert first_rate == pytest.approx(0.75)
+    assert first_discarded == 3
+    assert second_rate == 0.0
+    assert second_discarded == 0
 
 
 def test_opd_progress_truncation_rate_zero_delta_does_not_reuse_history():
@@ -2820,28 +3096,30 @@ def test_opd_progress_truncation_rate_zero_delta_does_not_reuse_history():
         0.8,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
-    second = progress.record_step(
+    second_rate, second_discarded = progress.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
     )
 
-    assert second == 0.0
+    assert second_rate == 0.0
+    assert second_discarded == 0
 
 
 def test_opd_progress_truncation_rate_handles_zero_rollouts():
     progress = _OpdProgressState()
 
-    rate = progress.record_step(
+    rate, discarded = progress.record_step(
         1,
         0.8,
         _progress_bridge_snapshot(samples_seen=0, truncated_rollouts=0),
     )
 
     assert rate == 0.0
+    assert discarded == 0
 
 
-def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
+def test_opd_progress_step_metrics_stay_out_of_the_persisted_resume_state(tmp_path):
     """checkpoint_state is spread verbatim into opd_state.json, whose schema is fail-closed.
 
     a per-step display value is meaningless on resume and no consumer reads it back: the CLI
@@ -2854,12 +3132,13 @@ def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
     # fail-closed schema, so a partial snapshot would fail before reaching the assertion below.
     full = _resume_accounting(step=1)
     progress = _OpdProgressState()
-    rate = progress.record_step(
+    rate, discarded = progress.record_step(
         1,
         0.8,
         SimpleNamespace(accounting_snapshot=lambda: dict(full)),
     )
     assert rate == pytest.approx(0.375)
+    assert discarded == 3
 
     checkpoint = tmp_path / "checkpoint"
     adapter = tmp_path / "adapter"
@@ -2883,6 +3162,7 @@ def test_opd_progress_rate_stays_out_of_the_persisted_resume_state(tmp_path):
 
     state = json.loads((checkpoint / "opd_state.json").read_text())
     assert "truncation_rate" not in state
+    assert "discarded_rollouts" not in state
 
 
 def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
@@ -2892,7 +3172,7 @@ def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
         0.8,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=0),
     )
-    high_rate = high.record_step(
+    high_rate, high_discarded = high.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=12, truncated_rollouts=8),
@@ -2903,13 +3183,16 @@ def test_opd_progress_truncation_rate_clamps_split_inflight_snapshots():
         0.8,
         _progress_bridge_snapshot(samples_seen=8, truncated_rollouts=4),
     )
-    low_rate = low.record_step(
+    low_rate, low_discarded = low.record_step(
         2,
         0.4,
         _progress_bridge_snapshot(samples_seen=12, truncated_rollouts=2),
     )
 
     assert [high_rate, low_rate] == pytest.approx([1.0, 0.0])
+    # the count is bounded by the step's own sample delta (8 -> 12 is 4 samples), so a split
+    # snapshot reporting 8 truncations cannot attribute more discards than the step drew.
+    assert [high_discarded, low_discarded] == [4, 0]
 
 
 def test_opd_failure_accounting_defaults_optional_no_signal_counter():
@@ -2997,46 +3280,168 @@ def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(monkeyp
         accounting_state=lambda _step: _resume_accounting(3),
     )
 
-    watcher.processed_steps.update(_processed_resume_steps((3,), 3))
+    _seed_resume_lifecycle(watcher, (3,), 3)
     published = []
 
     def publish(step, path):
         published.append((step, path))
-        watcher.processed_steps.add(step)
+        watcher.lifecycle.mark_discovered(step)
+        watcher.lifecycle.mark_deployable_published(step)
 
     watcher._publish = publish
     watcher.start()
     watcher.stop(require_complete=True)
 
     assert published == [(3, str(checkpoint_dir))]
-    assert watcher.processed_steps == {3}
-    assert _processed_resume_steps((4,), 3) == {3}
+    assert watcher.lifecycle.discovered_steps == {3}
+
+    # a non-required resume step is claimed outright, because nothing is owed for it.
+    other = _OpdVerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(4,),
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=2,
+        group_size=3,
+        accounting_state=lambda _step: _resume_accounting(3),
+    )
+    _seed_resume_lifecycle(other, (4,), 3)
+    assert other.lifecycle.discovered_steps == {3}
+    assert other.lifecycle.facts(3).resume_uploaded
 
 
-def test_the_watcher_marks_every_step_processed_but_publishes_only_required_ones():
-    # the two facts that make the final-publish guard below wrong. processed_steps.add(step) is
-    # unconditional, while the deployable publish is gated on `step in self.required_steps`, so a
-    # default run (save_at_steps empty -> required_steps empty) processes its last step without ever
-    # publishing a deployable for it.
-    source = inspect.getsource(_OpdVerlCheckpointWatcher)
-    publish_gate = "if step in self.required_steps:"
-    assert publish_gate in source
-    assert "self.processed_steps.add(step)" in source
-    # the unconditional mark must not sit inside the required-only publish branch.
-    assert source.index(publish_gate) < source.index("self.processed_steps.add(step)")
+def test_the_watcher_claims_every_step_but_publishes_only_required_ones(monkeypatch, tmp_path):
+    """a default opd run claims its steps without ever owing a deployable for them.
+
+    asserted by running the watcher rather than by grepping its source: a source check passes on a
+    comment and cannot fail when the logic moves. with save_at_steps empty, required_steps is empty,
+    so every step must be discovered and none may be published.
+    """
+    import flash.engine.worker as worker
+
+    local_dir = tmp_path / "checkpoints"
+    checkpoint_dir = local_dir / "global_step_2"
+    (checkpoint_dir / "actor").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("2")
+
+    from flash.engine.worker.train.opd import failures as opd_failures
+
+    published: list[int] = []
+    # patched where the watcher resolves them, not on opd_train: `_publish` calls the names bound
+    # into this module, so patching the re-export would leave the real merger running.
+    monkeypatch.setattr(opd_failures, "_export_checkpoint_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_failures, "_stage_retry_contract", lambda *a, **k: None)
+    monkeypatch.setattr(
+        worker,
+        "publish_deployable_checkpoint",
+        lambda adapter, step, **kwargs: published.append(step) or "sub",
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, path, **kwargs: (kwargs["before_upload"](), kwargs["after_upload"](), True)[2],
+    )
+
+    watcher = _OpdVerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=2,
+        group_size=3,
+        accounting_state=lambda _step: _resume_accounting(2),
+    )
+    watcher._publish(2, str(checkpoint_dir))
+
+    assert published == []
+    assert watcher.lifecycle.discovered_steps == {2}
+    assert watcher.lifecycle.facts(2).resume_uploaded
+    assert not watcher.lifecycle.facts(2).deployable_published
 
 
-def test_the_final_deployable_publish_is_not_suppressed_by_the_processed_marker():
+def test_an_opd_backlog_stages_a_retry_contract_for_every_step(monkeypatch, tmp_path):
+    """opd must never coalesce: each checkpoint carries its own accounting and retry contract.
+
+    the sft watcher it inherits from drops all but the newest of an optional backlog, which for opd
+    would discard resume points whose teacher accounting is not recoverable from any other step.
+    driven through a real three-step backlog rather than asserted on `_publishable` alone, so the
+    contract staging and the upload are both counted.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker.train.opd import failures as opd_failures
+
+    local_dir = tmp_path / "checkpoints"
+    for step in (1, 2, 3):
+        (local_dir / f"global_step_{step}" / "actor").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("3")
+
+    staged: list[int] = []
+    uploaded: list[int] = []
+    monkeypatch.setattr(opd_failures, "_export_checkpoint_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(
+        opd_failures,
+        "_stage_retry_contract",
+        lambda checkpoint_dir, **kwargs: staged.append(kwargs["step"]),
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, path, **kwargs: (
+            uploaded.append(step),
+            kwargs["before_upload"](),
+            kwargs["after_upload"](),
+            True,
+        )[3],
+    )
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda *a, **kw: pytest.fail("no required steps")
+    )
+
+    watcher = _OpdVerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=2,
+        group_size=3,
+        accounting_state=lambda _step: _resume_accounting(1),
+    )
+    watcher._stop.set()
+    watcher._run()
+
+    assert watcher._error is None
+    assert staged == [1, 2, 3], f"opd coalesced a retry contract away: {staged}"
+    assert uploaded == [1, 2, 3], f"opd lost a resume point: {uploaded}"
+    assert watcher.lifecycle.discovered_steps == {1, 2, 3}
+    assert all(watcher.lifecycle.facts(step).resume_uploaded for step in (1, 2, 3))
+    # no exact saves were requested, so nothing is owed a servable adapter.
+    assert watcher.lifecycle.deployable_published_steps == set()
+
+
+def test_the_final_deployable_publish_is_not_suppressed_by_the_watcher_lifecycle():
     # final_save_due applies only when save_at_steps is empty, while the watcher publishes only
-    # requested steps. the paths are disjoint, so processed_steps cannot suppress the final publish.
+    # requested steps. the paths are disjoint, so the watcher's ledger cannot suppress the final
+    # publish -- and above all it must not be consulted for it.
     source = inspect.getsource(opd_train.run_opd_train)
     assert "final_save_due(final_step, knobs.save_at_steps)" in source
-    assert "final_step not in watcher.processed_steps" not in source
+    assert "watcher.lifecycle" not in source
 
 
 def test_final_save_due_and_the_watcher_publish_set_never_overlap():
     # the invariant the fix above rests on, asserted rather than assumed: if these two could ever be
-    # true for the same step, dropping the processed_steps clause would double-publish.
+    # true for the same step, dropping the watcher-ledger clause would double-publish.
     from flash.engine.plan.steps import final_save_due
 
     for save_at_steps in ((), (1,), (4,), (2, 4), (1, 2, 3, 4)):
@@ -4255,6 +4660,7 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
     bridge = _text_bridge(teacher)
     monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
     bridge._sessions["session-1"] = {
+        "index": 0,
         "turns": [
             {
                 "prompt_ids": [10, 11],
@@ -4277,6 +4683,109 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
     assert [_teacher_logsum(turn) for turn in result["turns"]] == [
         -float(index) for index in range(1, turns + 1)
     ]
+
+
+def test_image_multiturn_teacher_scores_structured_histories_in_one_ordered_batch(monkeypatch):
+    from flash.content import multimodal
+
+    descriptor_calls = []
+    captured = []
+
+    def data_uris(descriptors, package_root):
+        descriptor_calls.append((descriptors, package_root))
+        return ["data:image/png;base64,frozen"]
+
+    class Teacher:
+        def score_many_multimodal(self, items):
+            captured.extend(items)
+            return [
+                _teacher_score(
+                    [TeacherToken(text="AB", logprob=-float(index), start=0, end=2)],
+                    input_tokens=10 + index,
+                )
+                for index, _item in enumerate(items, start=1)
+            ]
+
+    monkeypatch.setattr(multimodal, "image_descriptors_to_data_uris", data_uris)
+    prompt = _BridgePrompt(
+        student_messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a"},
+                    {"type": "image"},
+                    {"type": "text", "text": "b"},
+                ],
+            }
+        ],
+        teacher_messages=[{"role": "user", "content": "a<|media_pad|>b"}],
+        prompt_ids=(10, 11),
+        image_descriptors=("descriptor",),
+        package_root="/package",
+    )
+    bridge = _TeacherAlignmentBridge(
+        prompts=[prompt],
+        tokenizer=_BridgeTokenizer(),
+        teacher=Teacher(),
+        thinking_prefill="<think>\n",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+    monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
+    first_history = list(prompt.student_messages)
+    second_history = [
+        *first_history,
+        {"role": "assistant", "content": "prior"},
+        {"role": "user", "content": "next"},
+    ]
+    bridge._sessions["image-session"] = {
+        "index": 0,
+        "turns": [
+            {
+                "prompt_ids": [10, 11],
+                "response_ids": [65, 66],
+                "completion_text": "AB",
+                "context_messages": history,
+                "truncated": False,
+                "skip_reason": "",
+            }
+            for history in (first_history, second_history)
+        ],
+        "score_cache": None,
+        "score_lock": threading.Lock(),
+        "lease_deadline": time.monotonic() + 60,
+    }
+
+    result = bridge.score_multiturn("image-session")
+
+    assert descriptor_calls == [(("descriptor",), "/package")]
+    assert captured == [
+        (
+            [
+                {"role": "user", "content": "a<|media_pad|>b"},
+                {"role": "assistant", "content": "<think>\n"},
+            ],
+            "AB",
+            ["data:image/png;base64,frozen"],
+            True,
+        ),
+        (
+            [
+                {"role": "user", "content": "a<|media_pad|>b"},
+                {"role": "assistant", "content": "prior"},
+                {"role": "user", "content": "next"},
+                {"role": "assistant", "content": "<think>\n"},
+            ],
+            "AB",
+            ["data:image/png;base64,frozen"],
+            True,
+        ),
+    ]
+    assert [_teacher_logsum(turn) for turn in result["turns"]] == [-1.0, -2.0]
+    assert bridge.teacher_input_tokens == 23
+    assert bridge.teacher_output_tokens == 2
+    assert bridge.parent_work.snapshot().completed == 2
 
 
 def test_multiturn_transient_bridge_failure_latches_terminal_cause():
@@ -5251,10 +5760,15 @@ def test_no_signal_failure_does_not_blame_cap_without_dominant_truncation():
     assert str(parent_error.value) == "verl OPD subprocess exited with status 1"
 
 
-def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
+def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler(
+    monkeypatch, tmp_path
+):
     from contextlib import nullcontext
 
     import flash.engine.worker.opd_train_runner as opd_runner
+
+    watcher_failure = {"enabled": False}
+    sampler_stops = []
 
     class ProgressState:
         def __init__(self, _resume_state):
@@ -5275,12 +5789,15 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
 
         def stop(self, *, require_complete):
             assert require_complete is True
+            if watcher_failure["enabled"]:
+                raise RuntimeError("watcher cleanup failed")
 
     class GpuSampler:
         def start(self):
             return self
 
         def stop_gb(self):
+            sampler_stops.append(True)
             return 0.0
 
     callbacks = SimpleNamespace(
@@ -5289,6 +5806,7 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
         child_heartbeat=lambda: None,
         liveness_fields=dict,
         child_tail=None,
+        silence_watchdog=None,
         wandb_link={"wandb_url": None, "wandb_id": None},
     )
     reconciled = []
@@ -5320,23 +5838,33 @@ def test_opd_child_success_skips_failure_accounting_snapshot(monkeypatch):
     )
     monkeypatch.setattr(opd_runner, "_validate_checkpoint_progress", lambda *_args: None)
 
-    result = opd_runner._run_child(
-        SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
-        object(),
-        SimpleNamespace(update_horizon=1, local_dir="/unused"),
-        SimpleNamespace(
-            resume_state=None,
-            resume_step=0,
-            python_bin="python",
-            entry_path="entry.py",
-            bridge=object(),
-        ),
-        {},
-        (),
-    )
+    def run_child():
+        return opd_runner._run_child(
+            SimpleNamespace(knobs=SimpleNamespace(max_completion=1536, save_at_steps=(1,))),
+            object(),
+            SimpleNamespace(update_horizon=1, local_dir="/unused", shim_dir=str(tmp_path)),
+            SimpleNamespace(
+                resume_state=None,
+                resume_step=0,
+                python_bin="python",
+                entry_path="entry.py",
+                bridge=object(),
+                gdn_reset_arch=None,
+            ),
+            {},
+            (),
+        )
+
+    result = run_child()
 
     assert reconciled == [None]
     assert result.final_accounting["loss_curve"] == [0.5]
+    assert sampler_stops == [True]
+
+    watcher_failure["enabled"] = True
+    with pytest.raises(RuntimeError, match="watcher cleanup failed"):
+        run_child()
+    assert sampler_stops == [True, True]
 
 
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
@@ -5388,6 +5916,91 @@ def _config(**overrides):
     return config
 
 
+def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
+    from flash.engine.worker import opd_train_runner as runner
+
+    knobs = SimpleNamespace(
+        save_at_steps=save_at_steps,
+        save_every=save_every,
+        group_size=2,
+        stop_sequences=(),
+    )
+    request = SimpleNamespace(
+        knobs=knobs,
+        model_id="Qwen/Qwen3.5-4B",
+        model_revision="revision",
+        spec=SimpleNamespace(
+            gpu=SimpleNamespace(count=1),
+            wandb=SimpleNamespace(project=None),
+        ),
+        structured_outputs=None,
+        env=None,
+        multi_turn=False,
+        max_turns=0,
+    )
+    prompt_state = SimpleNamespace(
+        prompts=[],
+        tokenizer=object(),
+        teacher=object(),
+        thinking_prefill="",
+    )
+    workload = SimpleNamespace(
+        prompts_per_step=64,
+        update_horizon=horizon,
+        local_dir="/checkpoints",
+        prompt_pool_fingerprint="fingerprint",
+    )
+    monkeypatch.setattr(runner._opd_train, "_cached_model_path", lambda *_args: "/model")
+    monkeypatch.setattr(runner._opd_train, "resolve_verl_loggers", lambda _caps: ["console"])
+    monkeypatch.setattr(runner._opd_train._w, "wandb_run_name", lambda: "opd-test")
+    monkeypatch.setattr(runner, "_write_child_shims", lambda *_args: ("entry.py", "reward.py"))
+    monkeypatch.setattr(
+        runner._opd_train, "_restore_verl_resume", lambda *_args, **_kwargs: (0, None)
+    )
+
+    class Bridge:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(runner._opd_train, "_TeacherAlignmentBridge", Bridge)
+    return runner._materialize_child_files(
+        request,
+        prompt_state,
+        workload,
+        "/python",
+        {},
+        None,
+        (),
+    ).save_freq
+
+
+def test_opd_save_freq_clamps_to_a_short_derived_horizon(monkeypatch):
+    from flash.engine.plan.steps import on_policy_steps
+
+    horizon = on_policy_steps(epochs=1, prompt_count=800, prompts_per_step=64)
+    assert horizon == 13
+    save_freq = _materialized_opd_save_freq(
+        monkeypatch, save_at_steps=(), save_every=20, horizon=horizon
+    )
+    assert save_freq == 13
+    assert horizon % save_freq == 0
+
+
+def test_opd_save_freq_preserves_long_run_interval_and_exact_step_gcd(monkeypatch):
+    assert (
+        _materialized_opd_save_freq(monkeypatch, save_at_steps=(), save_every=15, horizon=100) == 15
+    )
+    assert (
+        _materialized_opd_save_freq(
+            monkeypatch, save_at_steps=(10, 25, 100), save_every=15, horizon=100
+        )
+        == 5
+    )
+
+
 def test_sitecustomize_saves_only_exact_required_steps(monkeypatch):
     saved = []
 
@@ -5408,8 +6021,7 @@ def test_sitecustomize_saves_only_exact_required_steps(monkeypatch):
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    source = _render_opd_sitecustomize(save_at_steps=(3, 7), total_steps=7)
-    exec(compile(source, "sitecustomize.py", "exec"), {})
+    install_checkpoint_handler_filter((3, 7), 7)
     handler = FakeCheckpointHandler()
 
     results = [handler.save_checkpoint(step) for step in range(1, 8)]
@@ -5529,6 +6141,75 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
     )
     assert overrides["actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size"] == "1"
     assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == str(gpu_count)
+
+
+def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
+    """The gate must size off `request.spec`, never the process-global JOB_SPEC.
+
+    `opd_train` resolves its spec as `spec or _w.JOB_SPEC`, so a caller that passes one gets a run
+    whose hardware is NOT what JOB_SPEC describes. Sizing the gate off the global there would let it
+    enable ZeRO-2 against a card the run never landed on -- the allocator/worker divergence the gate
+    exists to prevent. Pinned with the two disagreeing so reading the wrong one cannot pass.
+    """
+    from flash.engine.worker import opd_train as _opd_train
+    from flash.engine.worker import opd_train_runner as _runner
+
+    # the global says a card with room to spare; the passed spec says a card without it.
+    monkeypatch.setattr(
+        _opd_train._w,
+        "JOB_SPEC",
+        SimpleNamespace(gpu=SimpleNamespace(type="B200"), train=SimpleNamespace()),
+        raising=False,
+    )
+
+    def _build(spec):
+        return _runner._build_base_config(
+            request=SimpleNamespace(
+                multi_turn=False,
+                structured_outputs=None,
+                model_id="Qwen/Qwen3.5-4B",
+                model_revision="",
+                spec=spec,
+                knobs=SimpleNamespace(
+                    max_completion=512,
+                    learning_rate=1e-5,
+                    group_size=2,
+                    kl_coef=0.5,
+                    temperature=1.0,
+                    top_p=1.0,
+                ),
+            ),
+            prompt_state=SimpleNamespace(max_model_len=1536, prompt_budget=1024),
+            workload=SimpleNamespace(
+                prompts_per_step=8,
+                update_horizon=10,
+                local_dir="/w/checkpoints",
+                train_file="/w/train.parquet",
+                val_file="/w/val.parquet",
+                lora_rank=32,
+                lora_alpha=64,
+                target_modules="all-linear",
+                warmstart_adapter=None,
+            ),
+            runtime=SimpleNamespace(
+                model_path="/models/student",
+                gpu_count=2,
+                save_freq=20,
+                project_name="flash",
+                experiment_name="opd-test",
+                reward_path="/w/shim/flash_opd_reward.py",
+                bridge=SimpleNamespace(url="http://127.0.0.1:1234", token="token"),
+            ),
+            eos_token_ids=(151645,),
+        )
+
+    # a spec whose card cannot hold the retained copy must stay on zero-3 even though the global
+    # would have admitted it. reading JOB_SPEC here returns the B200 answer and fails.
+    tight = SimpleNamespace(gpu=SimpleNamespace(type="RTX 4090"), train=SimpleNamespace())
+    assert _build(tight)["reshard_after_forward"] is True
+
+    # and with no spec at all the gate falls closed rather than silently reaching for the global.
+    assert _build(None)["reshard_after_forward"] is True
 
 
 def test_rl_width_never_exceeds_the_sequences_one_step_holds():
@@ -5660,27 +6341,9 @@ def test_opd_pins_the_blackwell_attention_backends_like_grpo_does():
     ), on
 
 
-def test_opd_disables_the_vllm_multimodal_processor_cache():
-    """Image OPD does not run without this, and the failure it produces names neither images nor
-    the cache.
-
-    vLLM splits the mm processor cache across two processes: the frontend SENDER replaces an image
-    it has seen before with just its hash, and the engine-core RECEIVER is supposed to still hold
-    the item. OPD's rollout lifecycle clears the receiver on every sleep/pause without clearing the
-    sender, so the sender keeps sending hashes for items the receiver dropped and each request dies
-    on `assert mm_item is not None`. That kills requests, not the run, so what surfaces is empty
-    rollouts and then an IndexError on a zero-length reward tensor.
-
-    Asserted on the parsed VALUE rather than substring presence, because the two ways this
-    regresses are both silent: a nonzero size re-enables the cache, and the pre-0.13 flag name is
-    rejected by vLLM's arg parser at startup, long after the GPU is paid for.
-    """
-    emitted = build_opd_overrides(_config())
-    overrides = dict(value.split("=", 1) for value in emitted)
-    assert overrides["+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb"] == "0"
-    # `disable_mm_preprocessor_cache` was REMOVED in vllm 0.13.0. it reads like the right knob and
-    # still appears in older verl examples, so pin it out rather than trusting review to catch it.
-    assert not any("disable_mm_preprocessor_cache" in override for override in emitted)
+def test_opd_unconditionally_disables_the_vllm_multimodal_processor_cache():
+    overrides = build_opd_overrides(_config())
+    assert set(backend_common.rollout_mm_processor_cache_overrides()) <= set(overrides)
 
 
 def test_both_ray_rollouts_pin_blackwell_attention_from_the_same_resolver():
@@ -6013,7 +6676,7 @@ def test_child_teacher_bridge_payload_sends_boundary_and_image_count_without_pix
         "image_count": 2,
     }
     assert pixel_marker not in json.dumps(payload)
-    assert _multi_modal_image_count(None) == 0
+    assert multi_modal_image_count(None) == 0
 
 
 def test_image_token_suppression_is_gated_on_structured_image_blocks():
@@ -6031,6 +6694,39 @@ def test_image_token_suppression_is_gated_on_structured_image_blocks():
         convert_tokens_to_ids=lambda token: 42 if token == "<|image_pad|>" else None
     )
     assert _resolve_image_token_id(SimpleNamespace(), fallback) == 42
+
+
+def test_opd_plugin_config_is_serialized_with_the_child_environment(tmp_path):
+    plugin_config = _build_opd_plugin_config(
+        shim_dir=str(tmp_path),
+        save_at_steps=(3, 7),
+        total_steps=9,
+        gdn_model_type="qwen3_5",
+        loggers=["console", "wandb"],
+    )
+    assert json.loads(plugin_config) == {
+        "marker_file": str(tmp_path / "applied_shims.txt"),
+        "no_signal_attempts": OPD_NO_SIGNAL_ATTEMPTS,
+        "save_at_steps": [3, 7],
+        "total_steps": 9,
+        "gdn_model_type": "qwen3_5",
+        "wandb": True,
+    }
+
+    child = _build_opd_child_env(
+        shim_dir=str(tmp_path),
+        wandb_enabled=True,
+        bridge_url="http://127.0.0.1:4444",
+        bridge_token="bridge-token",
+        seed=42,
+        stop_sequences=(),
+        eos_token_ids=frozenset({1}),
+        structured_outputs=None,
+        model_vocab_size=248320,
+        thinking=False,
+        plugin_config=plugin_config,
+    )
+    assert child["FLASH_OPD_PLUGIN_CONFIG"] == plugin_config
 
 
 def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypatch, tmp_path):
@@ -6552,7 +7248,7 @@ def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints()
     )
 
 
-def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
+def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
     import flash.engine.worker.opd_train_runner as opd_runner
 
     emitted = []
@@ -6566,6 +7262,8 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
+        _applied_shim_markers(tmp_path),
+        ("lora-rollout-guard",),
     )
 
     callbacks.on_line("step:1 - actor/distillation/loss:0.5")
@@ -6574,12 +7272,17 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch):
     assert emitted == [
         (
             "opd_step",
-            {"step": 1, "loss": 0.5, "truncation_rate": pytest.approx(0.75)},
+            {
+                "step": 1,
+                "loss": 0.5,
+                "truncation_rate": pytest.approx(0.75),
+                "discarded_rollouts": 3,
+            },
         )
     ]
 
 
-def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
+def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch, tmp_path):
     import flash.engine.worker.opd_train_runner as opd_runner
 
     emitted = []
@@ -6593,6 +7296,8 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
+        _applied_shim_markers(tmp_path),
+        ("lora-rollout-guard",),
     )
 
     callbacks.on_line("step:1 - actor/distillation/loss:0.5")
@@ -6603,9 +7308,10 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch):
     assert emitted[1][0] == "opd_step"
     assert emitted[1][1]["step"] == 2
     assert "truncation_rate" not in emitted[1][1]
+    assert "discarded_rollouts" not in emitted[1][1]
 
 
-def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch):
+def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch, tmp_path):
     """the step-match guard must not silently disable the rate in production.
 
     on_line gates on verl_step_number, on_step on backend_common's own step_pattern. the two
@@ -6629,6 +7335,8 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
+        _applied_shim_markers(tmp_path),
+        ("lora-rollout-guard",),
     )
 
     # the step number reaching on_step is the one backend_common parses, not a hand-picked int.
@@ -6642,6 +7350,7 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
 
     assert [payload["step"] for _, payload in emitted] == [1, 2]
     assert all("truncation_rate" in payload for _, payload in emitted)
+    assert [payload["discarded_rollouts"] for _, payload in emitted] == [3, 0]
 
 
 def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
@@ -7079,3 +7788,519 @@ def test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction():
     # rather than a second gradient path, so moving it changes the objective, not just the value.
     assert "flat_student.detach()" in source
     assert source.count(".detach()") == 1
+
+
+def test_opd_sitecustomize_is_only_the_startup_bootstrap(tmp_path, monkeypatch):
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    monkeypatch.setattr(opd_runner.shutil, "copy2", lambda *_args: None)
+
+    opd_runner._write_child_shims(
+        SimpleNamespace(knobs=SimpleNamespace(save_at_steps=(3,))),
+        SimpleNamespace(shim_dir=str(shim_dir), update_horizon=3),
+        None,
+        [],
+    )
+
+    source = (shim_dir / "sitecustomize.py").read_text()
+    compile(source, "sitecustomize.py", "exec")
+    assert "tilelang libcudart" in source
+    assert "tf32" in source.lower()
+    assert "import verl" not in source
+    assert "lora rollout" not in source
+
+
+@pytest.mark.parametrize(
+    ("save_at_steps", "expects_core"),
+    [((3,), True), ((), False)],
+)
+def test_opd_child_records_the_core_marker_only_when_a_save_schedule_was_authored(
+    tmp_path, monkeypatch, save_at_steps, expects_core
+):
+    """the child installs opd-core only for a nonempty schedule, so the parent must match.
+
+    exact-save filtering is the entire meaning of that marker. an empty schedule keeps every save,
+    so installing the wrapper would import verl to build a pass-through, and the parent expecting
+    the marker afterwards would tear down a healthy run at its first step.
+    """
+    from flash.engine.worker.train.opd.child import runtime as opd_child
+
+    marker_file = tmp_path / "applied_shims.txt"
+    armed = []
+    monkeypatch.setattr(
+        opd_child.runtime,
+        "install_deferred_lora_rollout_guard",
+        lambda marker: armed.append("lora-rollout-guard"),
+    )
+    monkeypatch.setattr(
+        opd_child.runtime,
+        "install_checkpoint_handler_filter",
+        lambda steps, total: armed.append(("checkpoint", tuple(steps), total)),
+    )
+
+    opd_child.install(
+        {
+            "marker_file": str(marker_file),
+            "save_at_steps": list(save_at_steps),
+            "total_steps": 10,
+            "wandb": False,
+        }
+    )
+
+    recorded = marker_file.read_text().splitlines() if marker_file.exists() else []
+    assert ("opd-core" in recorded) is expects_core
+    assert (("checkpoint", save_at_steps, 10) in armed) is expects_core
+    # the rollout guard is required regardless of the checkpoint schedule.
+    assert "lora-rollout-guard" in armed
+
+
+def test_opd_stops_an_unguarded_child_at_its_first_step(tmp_path):
+    """a child whose sitecustomize was skipped serves every rollout from the base model.
+
+    the marker is checked at the first step boundary and the raise tears the child down there, so
+    the failure costs one step instead of the whole gpu and teacher budget.
+    """
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    callbacks = opd_runner._build_child_callbacks(
+        SimpleNamespace(raise_if_failed=lambda: None),
+        _OpdProgressState(),
+        _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
+        0,
+        opd_train.shim_marker_file(str(tmp_path)),  # no marker: the plugin never applied
+        ("opd-core", "lora-rollout-guard"),
+    )
+
+    # output before the first step is not a verdict: fragments still print while later ones apply.
+    callbacks.on_line("(TaskRunner pid=3125) loading checkpoint\n")
+
+    with pytest.raises(RuntimeError, match=r"never proved.*lora-rollout-guard"):
+        callbacks.on_line("step:1 - actor/distillation/loss:0.5")
+
+
+def test_opd_names_the_failed_fragment_when_the_child_exits_fail_closed():
+    """wrapping a fragment made exit 97 reachable from opd, so opd has to explain it.
+
+    the wrapped guard hard-exits the child rather than train unpatched. without this branch the
+    run surfaces as a bare "exited with status 97", which reads as an unclassified crash and
+    invites a retry that fails identically on the same interpreter.
+    """
+    from flash.engine.worker import backend_common
+
+    with pytest.raises(
+        RuntimeError, match="required flash runtime patch failed to apply"
+    ) as excinfo:
+        _raise_verl_failure(backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, None)
+
+    # permanent: retrying re-runs the same incompatible verl/transformers stack.
+    assert not isinstance(excinfo.value, opd_train._w.RetriableInfraError)
+
+
+def _drive_opd_multi_turn_episode(
+    *,
+    monkeypatch,
+    turns,
+    env_replies,
+    raw_prompt,
+    multi_modal_data=None,
+):
+    """Run the real OPD child loop end to end against a stub bridge, returning what it produced.
+
+    The loop is the thing under test: it decides whether the frozen media reaches each `generate`
+    call and each turn's actor output. Driving `_opd_run_turns` by hand, or asserting on the module
+    source, would restate that decision instead of exercising it -- and the media gap this covers
+    survived precisely because nothing ever ran this loop.
+    """
+    import asyncio
+
+    from flash.engine.worker.train.opd.child import bridge as _child_bridge
+    from flash.engine.worker.train.opd.child import multiturn as opd_multiturn
+
+    # teacher attachment builds torch tensors, which the offline env has no torch for. it runs
+    # strictly AFTER every generate call and every turn output, so stubbing it leaves the media
+    # path these tests measure fully exercised.
+    monkeypatch.setattr(opd_multiturn, "_attach_teacher_rows", lambda outputs, payload: None)
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_URL", "http://bridge.invalid")
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", "token")
+    monkeypatch.setenv("FLASH_OPD_SEED", "7")
+    monkeypatch.setenv("FLASH_OPD_MAX_TURNS", str(len(turns)))
+    monkeypatch.setenv("FLASH_OPD_MAX_MODEL_LEN", "4096")
+    monkeypatch.setenv(
+        "FLASH_OPD_ENV_CAPABILITIES",
+        json.dumps(["new_rollout_state", "record_model_turn", "env_reply", "rollout_done"]),
+    )
+
+    posted: dict[str, list] = {"start": [], "step": [], "score": [], "close": []}
+    replies = list(env_replies)
+    outputs: list[dict] = []
+
+    def post_json(url, token, path, payload):
+        posted[path.rsplit("/", 1)[-1]].append(payload)
+        if path.endswith("/start"):
+            return {"max_turns": len(turns)}
+        if path.endswith("/step"):
+            reply = replies.pop(0)
+            return {"messages": reply["messages"], "terminal": reply["terminal"]}
+        if path.endswith("/score"):
+            # one scored row per EMITTED turn: the loop rejects any other count, and the emitted
+            # count is what it decided, not what this stub assumed.
+            return {
+                "turns": [
+                    {
+                        "teacher_ids": [0] * (len(out["prompt_ids"]) + len(out["response_ids"])),
+                        "teacher_logprobs": [0.0]
+                        * (len(out["prompt_ids"]) + len(out["response_ids"])),
+                    }
+                    for out in outputs
+                ]
+            }
+        return {}
+
+    class _Tokenizer:
+        """one codepoint per token, so a turn's ids are readable straight off its text."""
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(chr(int(i)) for i in ids if int(i) != 99)
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [ord(c) for c in text]}
+
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "".join(str(m.get("content") or "") for m in messages)
+
+    class _Base:
+        """mirrors the parts of verl's AgentLoopBase the OPD loop actually calls."""
+
+        def __init__(self):
+            self.tokenizer = _Tokenizer()
+            self.rollout_config = SimpleNamespace(response_length=256)
+            self.server_manager = self
+            self._sent = list(turns)
+            # every generate call's media, so a test can prove the pixels ride along on turn 2+.
+            self.generate_media = []
+            self.generate_mm_kwargs = []
+
+        def _get_mm_processor_kwargs(self, audio_data=None):
+            return {"flash_probe": True}
+
+        async def process_multi_modal_info(self, messages):
+            return dict(multi_modal_data or {})
+
+        async def apply_chat_template(self, messages, **kwargs):
+            return [1, 2, 3]
+
+        async def generate(
+            self,
+            *,
+            request_id,
+            prompt_ids,
+            sampling_params,
+            image_data=None,
+            video_data=None,
+            audio_data=None,
+            mm_processor_kwargs=None,
+        ):
+            self.generate_media.append(image_data)
+            self.generate_mm_kwargs.append(mm_processor_kwargs)
+            text, stop_reason = self._sent.pop(0)
+            return SimpleNamespace(
+                token_ids=[ord(c) for c in text],
+                log_probs=[0.0] * len(text),
+                num_preempted=0,
+                stop_reason=stop_reason,
+                extra_fields={},
+            )
+
+    def hard_exit(code):
+        # the loop converts every failure into a bare exit code, discarding the exception. re-raise
+        # the live one so a broken driver reports its own cause instead of an opaque "exited 86".
+        raise AssertionError(f"OPD child loop hard-exited with {code}") from sys.exc_info()[1]
+
+    loop_class = opd_multiturn.build_flash_multi_turn_agent_loop(
+        register=lambda name: lambda cls: cls,
+        agent_loop_base=_Base,
+        agent_loop_output=lambda **kwargs: outputs.append(kwargs) or SimpleNamespace(**kwargs),
+        post_json=post_json,
+        score_failure_handler=lambda error: None,
+        # the real classifier, not a stub: this drive asserts a HEALTHY episode, so a stub that
+        # swallowed a fatal error would let the media assertions below run against a loop that had
+        # actually failed. the real one raises through hard_exit and names the cause.
+        fatal_rollout_exit_code=_child_bridge._fatal_rollout_exit_code,
+        mark_prompt_failure=lambda **kwargs: None,
+        deterministic_seed=lambda *parts: 1234,
+        process_exit=hard_exit,
+    )
+
+    driven = {}
+
+    async def _go():
+        instance = loop_class()
+        # the loop offloads the bridge's blocking posts onto this executor, so it has to be the
+        # one actually running the coroutine.
+        instance.loop = asyncio.get_running_loop()
+        driven["instance"] = instance
+        await instance.run(
+            {},
+            raw_prompt=raw_prompt,
+            index=0,
+            global_steps=0,
+            session_id=0,
+        )
+
+    asyncio.run(_go())
+    return driven["instance"], outputs, posted
+
+
+# "completed" under the per-turn cap is what makes a turn TERMINATED rather than truncated; a
+# truncated first turn would end the episode after one turn and never test the resend at all.
+_TWO_COMPLETED_TURNS = [("A", "completed"), ("B", "completed")]
+_TWO_TURN_REPLIES = [
+    {"messages": [{"role": "user", "content": "and now?"}], "terminal": False},
+    {"messages": [], "terminal": True},
+]
+# the shape verl's RLHFDataset actually hands the child for an image row: it splits the parquet
+# string on the `<image>` placeholder and substitutes a block (rl_dataset.py `_build_messages`).
+# a string prompt would enter the loop through a door a real image row cannot use, and would pass
+# even while the transcript validator rejected every genuine image episode before generation.
+_IMAGE_BLOCK_PROMPT = [
+    {
+        "role": "user",
+        "content": [{"type": "image", "image": "ref"}, {"type": "text", "text": "describe"}],
+    }
+]
+_TEXT_PROMPT = [{"role": "user", "content": "describe"}]
+
+
+_PIXELS = ["pixels"]
+
+
+@pytest.mark.parametrize(
+    ("raw_prompt", "multi_modal_data", "expected_media", "expected_image_count"),
+    [
+        pytest.param(_IMAGE_BLOCK_PROMPT, {"images": _PIXELS}, _PIXELS, 1, id="image"),
+        # the text control is not decoration: it pins the ABSENCE as None rather than {}, which verl
+        # would read as a multimodal row and push down the multimodal collate path.
+        pytest.param(_TEXT_PROMPT, None, None, 0, id="text-only"),
+    ],
+)
+def test_a_multi_turn_opd_episode_carries_its_frozen_media_on_every_turn(
+    monkeypatch, raw_prompt, multi_modal_data, expected_media, expected_image_count
+):
+    """The pixels ride along on turn 2+, not just the opening turn.
+
+    Each OPD turn re-sends the whole accumulated prefix, and that prefix still holds the episode's
+    image placeholder tokens. A `generate` call without the media leaves the engine with
+    placeholders it cannot expand: the rollout either dies on a feature/placeholder mismatch or
+    silently conditions on no image at all. The OPD child previously passed media on NO turn.
+
+    Both rows run the same assertions because the contract is the same one: whatever the episode
+    froze is what every turn sends. Only the frozen value differs, so a regression that hardcodes
+    either answer fails the other row.
+    """
+    instance, outputs, posted = _drive_opd_multi_turn_episode(
+        monkeypatch=monkeypatch,
+        turns=_TWO_COMPLETED_TURNS,
+        env_replies=_TWO_TURN_REPLIES,
+        raw_prompt=raw_prompt,
+        multi_modal_data=multi_modal_data,
+    )
+
+    assert instance.generate_media == [expected_media] * 2, (
+        "every turn must carry the frozen media, not just the first"
+    )
+    # the actor re-tokenizes each turn's prompt, so each turn's OUTPUT needs the media too.
+    assert [out["multi_modal_data"] for out in outputs] == [multi_modal_data] * 2
+    assert [out["mm_processor_kwargs"] for out in outputs] == [{"flash_probe": True}] * 2
+    assert instance.generate_mm_kwargs == [{"flash_probe": True}] * 2
+    # the bridge authenticates both the decoded count and canonical block placement.
+    assert posted["start"][0]["image_count"] == expected_image_count
+    assert posted["start"][0]["raw_prompt"] == (
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": "describe"}],
+            }
+        ]
+        if expected_image_count
+        else _TEXT_PROMPT
+    )
+
+
+class _StructuredImageEnv(_RecordingEnv):
+    def __init__(self, initial_messages):
+        super().__init__()
+        self.initial_messages = initial_messages
+        self.reply_contexts = []
+
+    def new_rollout_state(self, _example):
+        return {"messages": self.initial_messages, "prompt": None}
+
+    def env_reply(self, messages, _state):
+        self.reply_contexts.append(messages)
+        return [{"role": "user", "content": "next"}]
+
+
+def _image_prompt(image_source=_IMAGE_DATA_URI, *, image_first: bool = False):
+    image = {"type": "image", "image": image_source}
+    content = (
+        [image, {"type": "text", "text": "ab"}]
+        if image_first
+        else [{"type": "text", "text": "a"}, image, {"type": "text", "text": "b"}]
+    )
+    return [{"role": "user", "content": content}]
+
+
+def _structured_image_bridge(env, initial_messages):
+    from flash.content.multimodal import image_teacher_prompt_messages, normalize_prompt_images
+
+    normalized = normalize_prompt_images({}, initial_messages, None)
+    bridge = _multiturn_bridge(env)
+    bridge.prompts[0] = _BridgePrompt(
+        student_messages=normalized.messages,
+        teacher_messages=image_teacher_prompt_messages(
+            normalized.messages, len(normalized.descriptors)
+        ),
+        prompt_ids=(10, 11),
+        image_descriptors=tuple(normalized.descriptors),
+        package_root=None,
+        example={},
+    )
+    return bridge, normalized
+
+
+def test_multiturn_start_authenticates_parquet_text_block_canonicalization():
+    frozen = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+                {"type": "image", "image": _IMAGE_DATA_URI},
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
+    reconstructed = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "ab"},
+                {"type": "image", "image": _IMAGE_DATA_URI},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
+    env = _StructuredImageEnv(reconstructed)
+    bridge, _normalized = _structured_image_bridge(env, frozen)
+
+    bridge.start_multiturn(
+        index=0,
+        session_id="canonical",
+        prompt_ids=[10, 11],
+        raw_prompt=reconstructed,
+        image_count=1,
+    )
+
+    assert bridge._sessions["canonical"]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "ab"},
+                {"type": "image"},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
+
+
+def test_multiturn_start_rejects_rehydrated_media_placement_drift_at_same_count():
+    frozen = _image_prompt()
+    drifted = _image_prompt(image_first=True)
+    env = _StructuredImageEnv(drifted)
+    bridge, normalized = _structured_image_bridge(env, frozen)
+
+    with pytest.raises(ValueError, match="changed after prompt freezing"):
+        bridge.start_multiturn(
+            index=0,
+            session_id="placement-drift",
+            prompt_ids=[10, 11],
+            raw_prompt=normalized.messages,
+            image_count=1,
+        )
+
+
+def test_multiturn_start_rejects_same_structure_with_different_fresh_descriptor():
+    from flash.content.multimodal import normalize_prompt_images
+
+    frozen = _image_prompt()
+    changed_source = _image_prompt(_OTHER_IMAGE_DATA_URI)
+    env = _StructuredImageEnv(changed_source)
+    bridge, normalized = _structured_image_bridge(env, frozen)
+    fresh = normalize_prompt_images({}, changed_source, None)
+    assert fresh.messages == normalized.messages
+    assert len(fresh.descriptors) == len(normalized.descriptors) == 1
+    assert fresh.descriptors != normalized.descriptors
+
+    with pytest.raises(ValueError, match="changed after prompt freezing"):
+        bridge.start_multiturn(
+            index=0,
+            session_id="descriptor-drift",
+            prompt_ids=[10, 11],
+            raw_prompt=normalized.messages,
+            image_count=1,
+        )
+
+
+def test_valid_image_prompt_reaches_environment_with_media_placement_intact():
+    initial = _image_prompt()
+    env = _StructuredImageEnv(initial)
+    bridge, normalized = _structured_image_bridge(env, initial)
+
+    started = bridge.start_multiturn(
+        index=0,
+        session_id="valid",
+        prompt_ids=[10, 11],
+        raw_prompt=normalized.messages,
+        image_count=1,
+    )
+    bridge.step_multiturn(
+        {
+            "session_id": "valid",
+            "turn_ordinal": 0,
+            "accepted_prefix": [10, 11],
+            "raw_response_ids": [65],
+            "response_ids": [65],
+            "completion_text": "A",
+            "termination": "stop",
+            "stop_reason": "stop",
+            "max_tokens": 8,
+            "truncated": False,
+            "skip_reason": "",
+        }
+    )
+
+    assert started["max_turns"] >= 1
+    assert bridge._sessions["valid"]["messages"][0] == normalized.messages[0]
+    assert env.reply_contexts[0][0] == normalized.messages[0]
+    assert env.reply_contexts[0][1] == {"role": "assistant", "content": "A"}
+
+
+def test_text_only_multiturn_start_keeps_flat_transcript_state():
+    env = _RecordingEnv()
+    bridge = _multiturn_bridge(env)
+
+    bridge.start_multiturn(
+        index=0,
+        session_id="text",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
+    )
+
+    assert bridge._sessions["text"]["messages"] == [{"role": "user", "content": "q"}]

@@ -1,16 +1,44 @@
-"""Structured job specification shared by CLI/API/runner and GPU workers."""
+"""Structured job specification shared by CLI/API/runner and GPU workers.
+
+One `JobSpec` value is read through four different contracts, and the serializers below are how
+they are told apart:
+
+- authored configuration -- what a user writes. validated by `flash.schema.spec_from_dict`, NOT by
+  `JobSpec.from_dict`; the two are not interchangeable.
+- public representation -- `to_dict()`, deliberately lossy: it strips every platform-managed field
+  so the result re-validates through the authored parser.
+- persisted recovery record -- `from_dict()`, tolerant of historical spellings. its decoding rules
+  live in `flash.core.spec_persistence`.
+- resolved worker payload -- `to_internal_dict()` / `to_json()`, complete, including every managed
+  and resolved field the GPU worker needs.
+
+`flash/runner/preparation.py::_preparation_digest` hashes the canonical JSON of `to_dict()` and
+`to_internal_dict()`, so the BYTES those two emit are a recovery contract, not an implementation
+detail. See their docstrings before changing either.
+"""
 
 from __future__ import annotations
 
 import json
-import logging
 import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 from uuid import UUID
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
-from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm, samples_on_policy
+from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
+from flash.core.spec_persistence import (
+    DROPPED_TOP_LEVEL_KEYS,
+    REMOVED_PERSISTED_TRAIN_KEYS,
+    announce_dropped_keys,
+    migrated_optimizer_batch,
+    opt_float,
+    opt_int,
+    str_tuple,
+    validated_persisted_providers,
+    validated_section,
+    volume_gb,
+)
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
@@ -43,15 +71,6 @@ def _coerce_credit_assignment(value: Any) -> CreditAssignment:
             if normalized == mode:
                 return mode
     raise ValueError(f"credit_assignment must be one of {CREDIT_ASSIGNMENTS}; got {value!r}")
-
-
-def _str_tuple(value: Any) -> tuple[str, ...]:
-    """Normalize a string-or-list knob to a tuple of strings; a bare string is one element, not iterated."""
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        return (value,) if value else ()
-    return tuple(s for s in (str(x) for x in value) if s)
 
 
 def coerce_bool(value: Any) -> bool:
@@ -90,18 +109,6 @@ def _coerce_wandb(value: Any) -> WandbSpec:
     return WandbSpec(project=_label(value.get("project")), run_name=_label(value.get("run_name")))
 
 
-def _volume_gb(value: Any, default: int = 100) -> int:
-    """Parse volume size in GB; non-positive / non-numeric / missing values return default."""
-    if isinstance(value, bool):
-        # bool is an int subclass; reject to avoid int(True)==1 becoming a 1 GB volume.
-        return default
-    try:
-        gb = int(value)
-    except (TypeError, ValueError):
-        return default
-    return gb if gb > 0 else default
-
-
 def _validated_gpu_type(value: Any, *, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string")
@@ -118,53 +125,77 @@ def _validated_gpu_type(value: Any, *, field_name: str) -> str:
     return canonical
 
 
-def _opt_int(value: Any) -> int | None:
-    """Parse optional int; rejects bools (bool is int subclass — int(True)==1 is a footgun)."""
+def _validated_gpu_type_fallbacks(value: Any, *, head: str) -> tuple[str, ...]:
+    """Canonicalize and deduplicate fallback classes in authored order."""
     if value is None:
-        return None
-    if isinstance(value, bool):
-        raise TypeError(f"expected a number, got bool {value!r}")
-    return int(value)
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise TypeError("gpu.type_fallbacks must be a list of strings")
+    seen = {head} if head else set()
+    fallbacks: list[str] = []
+    for entry in value:
+        canonical = _validated_gpu_type(entry, field_name="gpu.type_fallbacks entry")
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        fallbacks.append(canonical)
+    return tuple(fallbacks)
 
 
-def _opt_float(value: Any) -> float | None:
-    """Parse optional float; rejects bools (mirrors _opt_int)."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise TypeError(f"expected a number, got bool {value!r}")
-    return float(value)
+def _parse_persisted_gpu_types(gpu: dict) -> tuple[str, tuple[str, ...]]:
+    """Read either public list form or internal head-plus-fallback form."""
+    gpu_type_raw = gpu.get("type", "")
+    extra_types: tuple = ()
+    if isinstance(gpu_type_raw, (list, tuple)):
+        authored = list(gpu_type_raw)
+        if not authored:
+            raise ValueError("gpu.type list must name at least one gpu")
+        gpu_type_raw, extra_types = authored[0], tuple(authored[1:])
+        if "type_fallbacks" in gpu:
+            raise ValueError("gpu.type list and gpu.type_fallbacks cannot both be set")
+    if not isinstance(gpu_type_raw, str):
+        raise TypeError("gpu.type must be a string")
+    gpu_type = (
+        _validated_gpu_type(gpu_type_raw, field_name="gpu.type") if gpu_type_raw.strip() else ""
+    )
+    return gpu_type, _validated_gpu_type_fallbacks(
+        extra_types or gpu.get("type_fallbacks", ()), head=gpu_type
+    )
 
 
-def _migrated_optimizer_batch(train: dict, algorithm: str) -> tuple[int | None, int | None]:
-    """``(batch_size, prompts_per_step)`` with the pre-1.1.43 rollout spelling migrated.
+def persisted_gpu_types(spec: Any) -> tuple[str, ...]:
+    """Read acceptable GPU classes from a raw persisted spec without raising."""
+    if not isinstance(spec, dict):
+        return ()
+    gpu = spec.get("gpu")
+    raw = gpu.get("type") if isinstance(gpu, dict) else None
+    if isinstance(raw, str):
+        raw = (raw,)
+    elif not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(dict.fromkeys(entry for entry in raw if isinstance(entry, str) and entry))
 
-    grpo/opd authored the optimizer batch as ``batch_size`` until it was split into
-    ``prompts_per_step``. The schema rejects the old name on SUBMISSION, but `from_dict` also
-    reparses PERSISTED specs, and the deployed release (1.1.40) has no ``prompts_per_step`` at all
-    -- so every rollout run in flight across this upgrade carries only the old key. The workers read
-    ``prompts_per_step`` alone, so without this a recovered run silently resumes on the recipe
-    default: 64 instead of an authored 32 on grpo, which OOMs a card rented for 32, and 8 on opd.
 
-    The old key is MOVED, not copied, and is dropped whenever the new one is present. Leaving it
-    populated would re-emit both names from ``to_dict()``, and a spec carrying both is rejected by
-    the schema -- breaking the resubmit that recovery and ``flash runs get`` perform, and leaving
-    `vram.py::_optimizer_batch_value` (which takes the larger of the two) free to size a card off
-    the stale value that ranking ignores. That applies to a payload written mid-upgrade carrying
-    BOTH spellings too: ``prompts_per_step`` wins, so the superseded key has to go with it.
+def persisted_gpu_head(spec: Any) -> str:
+    """First acceptable class from a raw persisted spec, or an empty string."""
+    types = persisted_gpu_types(spec)
+    return types[0] if types else ""
 
-    A non-positive legacy value is discarded rather than migrated: ``minimum=1`` would have
-    rejected it at submission, and carrying it forward only fails later on a rented GPU. It is
-    discarded from BOTH names for the same round-trip reason -- retaining it under the old one
-    would re-emit a key the schema rejects for this algorithm.
-    """
-    batch_size = _opt_int(train.get("batch_size"))
-    prompts_per_step = _opt_int(train.get("prompts_per_step"))
-    if not samples_on_policy(algorithm):
-        return batch_size, prompts_per_step
-    if prompts_per_step is not None:
-        return None, prompts_per_step
-    return None, batch_size if batch_size is not None and batch_size >= 1 else None
+
+def attributed_gpu_type(status: Any) -> str:
+    """GPU class actually selected for a raw run status, or its authored head."""
+
+    def field(name: str) -> Any:
+        return status.get(name) if isinstance(status, dict) else getattr(status, name, None)
+
+    remote = field("remote")
+    allocated = remote.get("allocated_gpu") if isinstance(remote, dict) else None
+    if isinstance(allocated, str) and allocated:
+        return allocated
+    preparation = field("effective_preparation")
+    worker_spec = preparation.get("worker_spec") if isinstance(preparation, dict) else None
+    selected = persisted_gpu_head(worker_spec)
+    return selected or persisted_gpu_head(field("spec"))
 
 
 _MAX_GPU_COUNT = 8
@@ -297,12 +328,6 @@ class EnvironmentSpec:
     resolved_sha: str = ""
 
 
-# internal persisted-record compatibility only, never public config parsing. #968 removed
-# advantage_clip, but already-provisioned strict records still carry the unused key and otherwise fail
-# attach/recovery. do not generalize this allowlist: removed ``seeds`` must still raise (#536).
-REMOVED_PERSISTED_TRAIN_KEYS = frozenset({"advantage_clip"})
-
-
 @dataclass(frozen=True)
 class TrainSpec:
     epochs: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -364,6 +389,12 @@ class TrainSpec:
         save_at_steps = parse_positive_int_tuple(self.save_at_steps, name="train.save_at_steps")
         object.__setattr__(self, "max_steps", max_steps)
         object.__setattr__(self, "save_at_steps", save_at_steps)
+        # a nonpositive interval is not a cadence. the public schema already rejects one, but a
+        # persisted or internally built spec reaches this dataclass directly, so canonicalize it to
+        # the unset sentinel every save_freq site already resolves to its algorithm default. leaving
+        # it signed would make the horizon clamp read it as an interval of one and checkpoint every
+        # single step.
+        object.__setattr__(self, "save_every", parse_max_steps(self.save_every))
         effective_max_steps = max_steps or 0
         if save_at_steps and effective_max_steps <= 0:
             raise ValueError("train.save_at_steps requires positive train.max_steps")
@@ -373,7 +404,7 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
-    # empty selects managed auto-allocation; a set value hard-pins that validated gpu class.
+    # empty selects managed allocation; acceptable types compete on cost.
     type: str = ""
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
@@ -382,13 +413,39 @@ class GpuSpec:
     network_volume: str | None = None
     network_volume_gb: int = 100
     provider: str = ""
+    providers: tuple[str, ...] = ()
     # number of cards of `type` a single training worker occupies (1..8). count > 1 provisions a
     # multi-gpu pod; the training loop shards across them in the sft/opd multi-gpu paths.
     count: int = 1
+    # authored alternatives after the concrete head class.
+    type_fallbacks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # coerce/validate here so every path (from_dict and direct construction) is guarded.
+        from flash.providers import validated_provider_preferences
+
+        providers = validated_provider_preferences(
+            self.providers, allow_empty=isinstance(self.providers, tuple)
+        )
+        if self.provider and providers:
+            raise ValueError("gpu.provider and gpu.providers cannot both be set")
+        if not isinstance(self.type, str):
+            raise TypeError("gpu.type must be a string")
+        gpu_type = (
+            _validated_gpu_type(self.type, field_name="gpu.type") if self.type.strip() else ""
+        )
+        fallbacks = _validated_gpu_type_fallbacks(self.type_fallbacks, head=gpu_type)
+        if fallbacks and not gpu_type:
+            raise ValueError("gpu.type_fallbacks requires gpu.type")
+        object.__setattr__(self, "type", gpu_type)
+        object.__setattr__(self, "type_fallbacks", fallbacks)
+        object.__setattr__(self, "providers", providers)
         object.__setattr__(self, "count", _gpu_count(self.count))
+
+    @property
+    def acceptable_types(self) -> tuple[str, ...]:
+        """Classes allocation may rent, in authored order."""
+        return (self.type, *self.type_fallbacks) if self.type else ()
 
 
 # platform-managed [gpu] fields: the runner assigns disk sizing, the shared weight-cache volume, and
@@ -400,54 +457,57 @@ MANAGED_GPU_KEYS = frozenset(
     {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
 )
 
-# Removed public top-level fields that a PERSISTED record can still carry. Stored run records are
-# never rewritten, and effective_preparation.worker_spec is written with to_internal_dict() (asdict),
-# which emitted every field including the defaulted ones -- so every record written before a field
-# was dropped still names it. This registry also drives historical public-digest replay for
-# model_revision, which remains an internal field. Without it a still-running job can lose its
-# recovery, deploy, and serving paths after the upgrade.
+# the other two halves of the same boundary. together with the managed gpu registry they name every field
+# that separates the worker contract from the public one -- which is the whole difference between
+# them, and is why `to_dict` can be a projection of `to_internal_dict` rather than a second
+# serializer. they were bare `data.pop(...)` calls, so the boundary existed only as a sequence of
+# statements: nothing could enumerate it, and a field added to one serializer but not the other was
+# invisible until a submit round trip or a recovery digest failed.
 #
-# Ignored on READ only. Most keys here no longer exist as JobSpec fields; model_revision remains an
-# internal runner field, but the public schema rejects it and to_dict omits it. Keeping it in this set
-# lets digest recovery identify the historical public key without weakening JobSpec.from_dict.
-_DROPPED_TOP_LEVEL_KEYS = frozenset(
-    {"model_policy", "model_revision", "worker_env", "workload_profile_kind"}
+# order is irrelevant (the payload is canonicalized with sort_keys), but presence is a recovery
+# contract: `_preparation_digest` hashes the public payload, so moving a name in or out of this set
+# invalidates the stored digest of every warm-start and workload-profile run in flight.
+#
+# not reused by `_validate_effective_spec`, which keeps its own near-identical list. the difference
+# is one name -- `model_revision` -- and it is deliberate there: the validator excludes it only
+# conditionally, so a historical authored pin stays structurally compared between the two halves.
+# substituting this set would widen that exclusion to every run and drop a real integrity check.
+MANAGED_TOP_LEVEL_KEYS = frozenset(
+    {
+        # server-assigned identity -- never authored in a config.
+        "run_id",
+        # runner-managed, and no longer part of the public config or status spec. internal round
+        # trips keep the value and marker through to_internal_dict(). historical public specs that
+        # emitted these are replayed only while verifying a stored preparation digest, from the
+        # exact persisted bytes.
+        "model_revision",
+        "model_revision_auto",
+        # the provenance marker only. gpu.count=1 stays in the public [gpu] object for digest
+        # stability; internal round trips carry the marker verbatim.
+        "gpu_count_auto",
+        "workload_profile",
+        "workload_profile_input_digest",
+        "workload_profile_producer_version",
+    }
 )
 
-# Tolerating a dropped key keeps a pre-upgrade run's recovery path, but the values behind it stop
-# being applied -- so a run that authored them now trains on managed defaults instead of what was
-# submitted. That is announced rather than silent. Only user-authorable keys qualify: model_policy
-# was platform-managed (to_dict popped it), so its loss cannot change what a submitted config asked
-# for. The values are deliberately NOT forwarded -- doing so would reinstate the override table this
-# removal exists to close, and would deliver it without the validation the deleted parser performed.
-_ANNOUNCED_DROPPED_KEYS = frozenset({"worker_env"})
+# platform-managed [train] fields: the control-plane-assigned artifact repo and the resolve-once
+# revision pin of a warm-start source.
+MANAGED_TRAIN_KEYS = frozenset({"hf_repo", "init_from_adapter_revision"})
 
+# platform-managed [environment] field: the env ref is resolved once and pinned by the control plane.
+# `pip` deliberately stays public -- it is the author's own scorer dependencies, which only they can
+# declare.
+MANAGED_ENVIRONMENT_KEYS = frozenset({"resolved_sha"})
 
-def _announce_dropped_keys(data: dict[str, Any]) -> None:
-    """Log the removed user-authored keys a persisted record still carries and no longer applies.
-
-    Only announced when the payload names the run. A public spec is ``to_dict()`` output, which pops
-    the server-assigned run_id, and the same stored run is read through both shapes -- so warning
-    without an id would emit an unactionable "run <unknown>" line and duplicate the identified one
-    the worker-spec read already produced. Every provisioned run records an internal worker spec
-    (asdict, run_id included), and that is the read this fires on.
-    """
-    run_id = str(data.get("run_id") or "").strip()
-    if not run_id:
-        return
-    for key in sorted(_ANNOUNCED_DROPPED_KEYS):
-        value = data.get(key)
-        if not value:
-            continue
-        names = ", ".join(sorted(str(k) for k in value)) if isinstance(value, dict) else str(value)
-        logging.getLogger("flash.spec").warning(
-            "run %s was submitted with [%s] (%s); that table was removed and its values are NOT "
-            "applied -- this run uses managed defaults instead. resubmit without it if the run "
-            "depends on those values.",
-            run_id,
-            key,
-            names,
-        )
+# every managed section, so the public/worker boundary can be walked rather than restated. the two
+# things not here are the ones that are not removals: `train.lora_rank`/`lora_alpha` are stripped
+# only for a warm start, and `gpu.type_fallbacks` is respelled into `gpu.type` rather than dropped.
+MANAGED_SECTION_KEYS = (
+    ("train", MANAGED_TRAIN_KEYS),
+    ("gpu", MANAGED_GPU_KEYS),
+    ("environment", MANAGED_ENVIRONMENT_KEYS),
+)
 
 
 @dataclass(frozen=True)
@@ -546,58 +606,94 @@ class JobSpec:
 
         omit platform-managed fields because the control plane/runner assigns them and the public
         parser rejects them. internal callers use ``to_internal_dict()``.
+
+        This is the PUBLIC contract and it is deliberately lossy: what it drops is what the authored
+        parser would reject, so the result re-validates through ``flash.schema.spec_from_dict``. Do
+        not hand its output to a worker or provider path -- those need ``to_internal_dict()``.
+
+        Built as a PROJECTION of the worker payload, because that is the actual relationship: the
+        public contract is the worker contract minus the platform-managed fields, which
+        MANAGED_TOP_LEVEL_KEYS and MANAGED_SECTION_KEYS name. This is still a blacklist -- a newly
+        added field is public until something strips it, exactly as before -- but the strips are now
+        enumerable rather than a run of statements, so a test can assert the boundary instead of
+        trusting that two independent `asdict(self)` bodies were kept in sync by hand. What the
+        registries deliberately do NOT cover is the two adjustments below that are not removals.
+
+        Its bytes are a recovery contract. ``_preparation_digest`` hashes this output as canonical
+        JSON, so key PRESENCE is load-bearing even though key order is not: adding or dropping one
+        key here invalidates the stored digest of every warm-start and workload-profile run in
+        flight, which fails integrity validation on recovery.
         """
-        data = asdict(self)
-        # server-assigned identity — never authored in a config.
-        data.pop("run_id", None)
-        # model_revision is runner-managed and no longer part of the public config or status spec.
-        # Internal round trips keep the value and marker through to_internal_dict(). Historical public
-        # specs that emitted this key are replayed only while verifying their stored preparation
-        # digest, using the exact value from the persisted bytes.
-        data.pop("model_revision", None)
-        data.pop("model_revision_auto", None)
-        # keep gpu.count=1 in the public gpu object for preparation-digest stability. only the
-        # platform-managed provenance marker is stripped; internal round trips carry it verbatim.
-        data.pop("gpu_count_auto", None)
-        data.pop("workload_profile_input_digest", None)
-        data.pop("workload_profile_producer_version", None)
-        data.pop("workload_profile", None)
+        data = self.to_internal_dict()
+        for managed in MANAGED_TOP_LEVEL_KEYS:
+            data.pop(managed, None)
+        for section, managed_keys in MANAGED_SECTION_KEYS:
+            for managed in managed_keys:
+                data[section].pop(managed, None)
         train = data["train"]
-        train.pop("init_from_adapter_revision", None)
-        train.pop("hf_repo", None)  # control-plane-assigned artifact repo
         if train.get("init_from_adapter"):
             # the source adapter's topology is authoritative for a warm start, so the parser rejects
             # both keys alongside init_from_adapter. the runner writes the inherited rank/alpha onto
             # the public spec, so they must be stripped here or the submit round trip re-validates
-            # a combination the parser refuses.
+            # a combination the parser refuses. conditional, so it cannot be a registry entry.
             train.pop("lora_rank", None)
             train.pop("lora_alpha", None)
-        # runner-assigned disk sizing, shared weight-cache volume, and retry/wall-clock lifecycle.
+        # restore the public list spelling for an ordered pin -- a reshape rather than a removal,
+        # which is the other thing no registry can express. the default stands in for the key the
+        # worker payload omits when there are no fallbacks: unlike `providers`, this one is read
+        # back, so it cannot rely on the omission alone.
         gpu = data["gpu"]
-        for managed in MANAGED_GPU_KEYS:
-            gpu.pop(managed, None)
-        data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
-        # [environment] pip stays in the payload: it is the author's own scorer dependencies, which
-        # only they can declare. The submit paths append it to worker_pip_for_env, so what travels
-        # here is the extra requirements, not the worker's own.
+        fallbacks = gpu.pop("type_fallbacks", ())
+        if fallbacks:
+            gpu["type"] = [gpu["type"], *fallbacks]
+        # an empty `providers` needs no strip: the worker payload this projects from already omits
+        # it, for the same reason the public contract wants it gone -- an internal default must not
+        # read back as an authored empty list, which the parser rejects as a likely config bug.
         return data
 
     def to_internal_dict(self) -> dict[str, Any]:
-        """Return the complete control-plane and worker representation."""
-        return asdict(self)
+        """Return the complete control-plane and worker representation.
+
+        This is the RESOLVED WORKER contract: every managed and resolved field the GPU worker needs,
+        including the ones ``to_dict()`` strips. It is what gets persisted as
+        ``effective_preparation.worker_spec`` and what ``to_json()`` ships to a provider. The
+        authored parser rejects this shape, so it must never be offered as a public payload.
+
+        Its bytes are a recovery contract for the same reason as ``to_dict()`` -- and note the two
+        empty-value pops below are part of it: an omitted empty field and an explicit empty one hash
+        differently, so removing either pop would break existing digests.
+        """
+        data = asdict(self)
+        # missing and unset are the same internal state. omitting the empty value preserves that state
+        # without serializing it into an explicit empty preference, which every parser rejects.
+        if not data["gpu"].get("providers"):
+            data["gpu"].pop("providers", None)
+        # omit an empty field to preserve existing preparation digests.
+        if not data["gpu"].get("type_fallbacks"):
+            data["gpu"].pop("type_fallbacks", None)
+        return data
 
     def to_json(self) -> str:
         return json.dumps(self.to_internal_dict(), sort_keys=True)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
+        """Decode a PERSISTED or internal job spec. This is not the authored-config parser.
+
+        Authored configuration goes through ``flash.schema.spec_from_dict``, which is strict because
+        an unknown key there is a typo the author can still fix. This one reads bytes that were
+        already written -- by an older Flash, for a run that may still be training -- so it tolerates
+        the historical spellings registered in ``flash.core.spec_persistence``. The two are NOT
+        interchangeable: decoding a user's config here would silently accept platform-managed fields
+        that the public parser exists to reject.
+        """
         if not isinstance(data, dict):
             raise TypeError("job spec must be an object")
         allowed_top_level = {item.name for item in fields(cls)}
-        unknown_top_level = sorted(set(data) - allowed_top_level - _DROPPED_TOP_LEVEL_KEYS)
+        unknown_top_level = sorted(set(data) - allowed_top_level - DROPPED_TOP_LEVEL_KEYS)
         if unknown_top_level:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
-        _announce_dropped_keys(data)
+        announce_dropped_keys(data)
         env = data.get("environment") or {}
         # Reject stale payloads carrying a local `path`; worker only runs published env ids.
         if isinstance(env, dict) and env.get("path"):
@@ -605,45 +701,15 @@ class JobSpec:
                 "local environment paths are no longer supported; the worker only runs "
                 "published Freesolo environment ids"
             )
-        train = data.get("train", {})
-        if train is None:
-            train = {}
-        if not isinstance(train, dict):
-            raise TypeError("train must be an object")
-        train = {
-            key: value for key, value in train.items() if key not in REMOVED_PERSISTED_TRAIN_KEYS
-        }
-        unknown_train = sorted(set(train) - {item.name for item in fields(TrainSpec)})
-        if unknown_train:
-            raise ValueError(f"train has unknown key(s): {', '.join(unknown_train)}")
-        gpu = data.get("gpu")
-        if gpu is None:
-            gpu = {}
-        if not isinstance(gpu, dict):
-            raise TypeError("gpu must be an object")
-        unknown_gpu = sorted(set(gpu) - {item.name for item in fields(GpuSpec)})
-        if unknown_gpu:
-            raise ValueError(f"gpu has unknown key(s): {', '.join(unknown_gpu)}")
-        gpu_type_raw = gpu.get("type", "")
-        if not isinstance(gpu_type_raw, str):
-            raise TypeError("gpu.type must be a string")
-        gpu_type = (
-            _validated_gpu_type(gpu_type_raw, field_name="gpu.type") if gpu_type_raw.strip() else ""
+        train = validated_section(
+            data,
+            "train",
+            {item.name for item in fields(TrainSpec)},
+            removed=REMOVED_PERSISTED_TRAIN_KEYS,
         )
-        provider = gpu.get("provider", "")
-        if not isinstance(provider, str):
-            raise TypeError("gpu.provider must be a string")
-        provider = provider.strip().lower()
-        if provider or gpu_type:
-            from flash.providers import PROVIDER_NAMES
-            from flash.providers.base import providers_for
-
-            if provider and provider not in PROVIDER_NAMES:
-                raise ValueError(f"unknown gpu.provider {provider!r}")
-            if gpu_type and provider and provider not in providers_for(gpu_type):
-                raise ValueError(
-                    f"gpu.provider {provider!r} cannot provision gpu.type {gpu_type!r}"
-                )
+        gpu = validated_section(data, "gpu", {item.name for item in fields(GpuSpec)})
+        gpu_type, gpu_type_fallbacks = _parse_persisted_gpu_types(gpu)
+        provider, providers = validated_persisted_providers(gpu, gpu_type, gpu_type_fallbacks)
         project_raw = data.get("project", "")
         if not isinstance(project_raw, str):
             raise TypeError("project must be a string")
@@ -651,7 +717,7 @@ class JobSpec:
         algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
         # one reading of the optimizer batch for both keys: the rollout spelling changed in 1.1.43
         # and a persisted spec can still carry the old one.
-        batch_size, prompts_per_step = _migrated_optimizer_batch(train, algorithm)
+        batch_size, prompts_per_step = migrated_optimizer_batch(train, algorithm)
         return cls(
             model=data.get("model", cls.model),
             model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
@@ -660,11 +726,11 @@ class JobSpec:
                 id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
-                secrets=_str_tuple(env.get("secrets")),
+                secrets=str_tuple(env.get("secrets")),
                 resolved_sha=str(env.get("resolved_sha") or ""),
             ),
             train=TrainSpec(
-                epochs=_opt_int(train.get("epochs")),
+                epochs=opt_int(train.get("epochs")),
                 lora_rank=int(train.get("lora_rank", 32)),
                 # round-trip a stored alpha (authored value, internal carrier, or a warm-start's
                 # inherited parent alpha); fall back to 2 x rank when absent.
@@ -676,28 +742,29 @@ class JobSpec:
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
                 init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
-                learning_rate=_opt_float(train.get("learning_rate")),
+                learning_rate=opt_float(train.get("learning_rate")),
                 batch_size=batch_size,
                 prompts_per_step=prompts_per_step,
-                max_context_tokens=_opt_int(train.get("max_context_tokens")),
-                save_every=_opt_int(train.get("save_every")),
+                max_context_tokens=opt_int(train.get("max_context_tokens")),
+                save_every=opt_int(train.get("save_every")),
                 max_steps=parse_max_steps(train.get("max_steps")),
                 save_at_steps=train.get("save_at_steps"),
-                max_examples=_opt_int(train.get("max_examples")),
-                group_size=_opt_int(train.get("group_size")),
-                temperature=_opt_float(train.get("temperature")),
-                max_completion_tokens=_opt_int(train.get("max_completion_tokens")),
-                kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
-                entropy_quantile=_opt_float(train.get("entropy_quantile")),
-                thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
+                max_examples=opt_int(train.get("max_examples")),
+                group_size=opt_int(train.get("group_size")),
+                temperature=opt_float(train.get("temperature")),
+                max_completion_tokens=opt_int(train.get("max_completion_tokens")),
+                kl_penalty_coef=opt_float(train.get("kl_penalty_coef")),
+                entropy_quantile=opt_float(train.get("entropy_quantile")),
+                thinking_length_penalty_coef=opt_float(train.get("thinking_length_penalty_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
-                stop_sequences=_str_tuple(train.get("stop_sequences")),
+                stop_sequences=str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
                 credit_assignment=_coerce_credit_assignment(train.get("credit_assignment")),
             ),
             gpu=GpuSpec(
                 type=gpu_type,
                 provider=provider,
+                providers=providers,
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 5)),
@@ -705,8 +772,9 @@ class JobSpec:
                 # survives the to_dict()->from_dict() hops in _with_model_disk / _spec_with_gpu /
                 # _assign_managed_hf_repo before deploy.
                 network_volume=gpu.get("network_volume"),
-                network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
+                network_volume_gb=volume_gb(gpu.get("network_volume_gb")),
                 count=gpu.get("count", 1),
+                type_fallbacks=gpu_type_fallbacks,
             ),
             run_id=data.get("run_id", "local"),
             thinking=coerce_bool(data.get("thinking", False)),

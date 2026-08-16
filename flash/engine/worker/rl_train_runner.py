@@ -5,8 +5,8 @@ Split out of ``flash.engine.worker.rl_train`` to keep that module under the file
 
 from __future__ import annotations
 
+import json
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -23,14 +23,11 @@ from flash.engine.worker.backend_common import (
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
-    render_shim_marker_prologue,
-    render_tf32_shim,
-    render_tilelang_cudart_shim,
-    render_wandb_link_shim,
+    render_sitecustomize_bootstrap,
     shim_marker_file,
     verify_applied_shim_markers,
     verl_device_capability,
-    wrap_shim_fragment,
+    verl_step_number,
 )
 from flash.engine.worker.io.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
@@ -39,28 +36,16 @@ from flash.engine.worker.io.heartbeat import (
 )
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.train.core.step_timing import StepTiming
+from flash.engine.worker.train.rl.child.plugin import required_patch_names
 from flash.engine.worker.train.rl.multi_turn import (
     MultiTurnBridge,
-    copy_multi_turn_child_modules,
+    copy_grpo_child_modules,
     multi_turn_child_env,
     start_reward_server,
 )
-from flash.engine.worker.train.rl.shims import (
-    render_entropy_quantile_shim,
-    render_exact_save_steps_shim,
-    render_image_pad_ban_shim,
-    render_kl_ref_adapter_shim,
-    render_per_turn_credit_shim,
-    render_reentrant_checkpointing_shim,
-    render_reward_module,
-    render_stop_sequences_shim,
-    render_structured_outputs_shim,
-)
-from flash.engine.worker.train.rl.single_turn import (
-    _log_reward_profile,
-    score_single_turn,
-    score_single_turn_batch,
-)
+from flash.engine.worker.train.rl.reward_module import render_reward_module
+from flash.engine.worker.train.rl.single_turn import score_single_turn, score_single_turn_batch
 
 
 def _rl_train():
@@ -78,16 +63,16 @@ class _StepMetricState:
     loss_curve: list[float] = field(default_factory=list)
     adv_spread_history: list[float] = field(default_factory=list)
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
-    step_line_times: list[float] = field(default_factory=list)
     metrics_last: list[dict] = field(default_factory=list)
+    step_timing: StepTiming = field(default_factory=StepTiming)
     sent_first_metrics: bool = False
+    sent_first_timing: bool = False
 
 
 @dataclass
 class _RewardRuntime:
     observability: RewardObservabilityBuffer
     wandb_link: dict[str, str | None]
-    reward_profile: object
     multi_turn_bridge: object
     server: object
     reward_url: str
@@ -179,6 +164,12 @@ def _prepare_rl_files(inp, prompts):
     shim_markers = shim_marker_file(shim_dir)
     if os.path.exists(shim_markers):
         os.remove(shim_markers)
+    # where each rank records the gpu uuid it opened, so a collision is caught before nccl init.
+    # removed for the same reason as the marker file: a stale one from a prior attempt would show
+    # ranks claiming devices this attempt never touched, and read as a collision that is not there.
+    rank_device_claims = os.path.join(shim_dir, "rank_device_claims.txt")
+    if os.path.exists(rank_device_claims):
+        os.remove(rank_device_claims)
     return {
         "rollout_examples": rollout_examples,
         "message_prompts": message_prompts,
@@ -191,75 +182,46 @@ def _prepare_rl_files(inp, prompts):
         "shim_dir": shim_dir,
         "shim_py": os.path.join(shim_dir, "sitecustomize.py"),
         "shim_markers": shim_markers,
+        "rank_device_claims": rank_device_claims,
+        "plugin_config_path": os.path.join(shim_dir, "flash_grpo_plugin_config.json"),
     }
 
 
-def _write_rl_shim(inp, files) -> list[str]:
-    """write the child sitecustomize; return the marker names it must prove applied.
+def _write_rl_shim(inp, files) -> None:
+    """write the minimal startup bootstrap and copy the complete GRPO plugin bundle."""
+    with open(files["shim_py"], "w", encoding="utf-8") as file:
+        file.write(render_sitecustomize_bootstrap())
+    copy_grpo_child_modules(files["shim_dir"])
 
-    every correctness-critical fragment is wrapped fail-closed (see wrap_shim_fragment): cpython's
-    execsitecustomize would otherwise swallow a fragment's exception and let the child train
-    unpatched, with every fragment after the failing one silently skipped too.
-    """
-    # one sitecustomize holds every patch: python imports it once, so a second file would never be
-    # loaded. each feature renderer returns "" when its feature is off; the tf32 fragment is
-    # unconditional, so this source is never empty.
-    required_fragments = [
-        (
-            "reentrant-checkpointing",
-            render_reentrant_checkpointing_shim(
-                inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"])
-            ),
-        ),
-        ("entropy-quantile", render_entropy_quantile_shim(inp["entropy_quantile"])),
-        ("per-turn-credit", render_per_turn_credit_shim(inp["per_turn_credit"])),
-        ("stop-sequences", render_stop_sequences_shim(inp["stop_sequences"])),
-        ("image-pad-ban", render_image_pad_ban_shim(inp["image_pad_token_id"])),
-        ("structured-outputs", render_structured_outputs_shim(inp["structured_outputs"])),
-        ("exact-save-steps", render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"])),
-        (
-            "kl-ref-adapter",
-            render_kl_ref_adapter_shim(
-                bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0
-            ),
-        ),
-    ]
-    shim_source = "".join(
-        part
-        for part in (
-            # first: torch's matmul flags are process-wide state, and reading them back is how the
-            # rest of the child sees the choice. nothing below depends on it, but a later fragment
-            # that raised would otherwise cost the whole run its tensor-core throughput. tf32, the
-            # tilelang cudart repoint and the wandb link stay unwrapped on purpose: all three
-            # swallow their own failures by design and none may abort a paid run.
-            render_tf32_shim(),
-            # before anything that can import vllm -- so above the wrapped fragments too. the
-            # fragment repoints tilelang's libcudart stub on disk, and vllm's CuMemAllocator binds
-            # libcudart the first time a sleeping engine is built. after the stub is already mapped
-            # into this process there is nothing left to fix.
-            render_tilelang_cudart_shim(),
-            render_shim_marker_prologue(files["shim_markers"]),
-            *(wrap_shim_fragment(name, source) for name, source in required_fragments),
-            # gated on the key rather than the resolved logger list: that list needs python_bin,
-            # which is resolved after this file is written. the shim is inert either way -- it only
-            # fires when verl actually calls wandb.init, which requires wandb in the logger list.
-            render_wandb_link_shim() if os.environ.get("WANDB_API_KEY") else "",
-        )
-        if part
-    )
-    with open(files["shim_py"], "w") as f:
-        f.write(shim_source)
 
-    # multi-turn: copy the child-side agent loop next to the shim so the verl interpreter can
-    # import it (see copy_multi_turn_child_modules for why it is a copy and not an import).
-    if inp["multi_turn"]:
-        copy_multi_turn_child_modules(files["shim_dir"])
-    return [name for name, source in required_fragments if source]
+def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) -> None:
+    """serialize the final GRPO plugin configuration after capability resolution."""
+    config = {
+        "marker_file": files["shim_markers"],
+        "dp_cards": int(inp["dp_cards"]),
+        "reentrant_checkpointing": bool(inp["reentrant_checkpointing"]),
+        "multimodal": bool(inp["multimodal"]),
+        "entropy_quantile": inp["entropy_quantile"],
+        "per_turn_credit": bool(inp["per_turn_credit"]),
+        "stop_sequences": list(inp["stop_sequences"]),
+        "image_pad_token_id": inp["image_pad_token_id"],
+        "structured_outputs": inp["structured_outputs"],
+        "save_at_steps": list(inp["save_at_steps"]),
+        "total_steps": int(inp["steps"]),
+        "kl_ref_adapter": bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0,
+        "multi_turn": bool(inp["multi_turn"]),
+        "gdn_model_type": gdn_reset_arch,
+        "wandb": "wandb" in loggers,
+    }
+    expected = required_patch_names(config)
+    with open(files["plugin_config_path"], "w", encoding="utf-8") as handle:
+        json.dump(config, handle, sort_keys=True, separators=(",", ":"))
+    files["expected_shims"] = expected
 
 
 def _prepare_rl_runtime(inp, env, tok, prompts):
     files = _prepare_rl_files(inp, prompts)
-    files["expected_shims"] = _write_rl_shim(inp, files)
+    _write_rl_shim(inp, files)
     return files, _start_reward_runtime(inp, env, tok, prompts, files)
 
 
@@ -277,14 +239,15 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
     def _score_batch(requests: list[tuple[int, str]]) -> list[float]:
         # grade the whole batch before touching the observability lock. the env's scorer may block on
         # judge i/o, while record is intentionally a short per-result critical section.
-        scored = score_single_turn_batch(
-            env,
-            [(solution_str, rollout_examples[int(index)]) for index, solution_str in requests],
-            tok=tok,
-            thinking=bool(_w.THINKING),
-            prompt_opened_thinking=inp["prompt_opened_thinking"],
-            think_penalty=inp["think_penalty"],
-        )
+        with observability.parent_work.busy():
+            scored = score_single_turn_batch(
+                env,
+                [(solution_str, rollout_examples[int(index)]) for index, solution_str in requests],
+                tok=tok,
+                thinking=bool(_w.THINKING),
+                prompt_opened_thinking=inp["prompt_opened_thinking"],
+                think_penalty=inp["think_penalty"],
+            )
         results = []
         for (index, solution_str), (score, breakdowns) in zip(requests, scored, strict=True):
             observability.record(message_prompts[int(index)], solution_str, score, breakdowns)
@@ -292,34 +255,19 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
         return results
 
     def _score_for_profile(index: int, solution_str: str) -> float:
-        """score for profiling without training observability side effects.
+        """score one bridge request without training observability side effects."""
+        with observability.parent_work.busy():
+            return score_single_turn(
+                env,
+                solution_str,
+                rollout_examples[int(index)],
+                tok=tok,
+                thinking=bool(_w.THINKING),
+                prompt_opened_thinking=inp["prompt_opened_thinking"],
+                think_penalty=inp["think_penalty"],
+                raise_on_error=True,
+            )
 
-        do not seed rollout buffers. errors propagate so a broken grader is not measured as fast.
-        """
-        return score_single_turn(
-            env,
-            solution_str,
-            rollout_examples[int(index)],
-            tok=tok,
-            thinking=bool(_w.THINKING),
-            prompt_opened_thinking=inp["prompt_opened_thinking"],
-            think_penalty=inp["think_penalty"],
-            raise_on_error=True,
-        )
-
-    # the profiler times the single-turn grading path (env.reward / env.scores_breakdown on one
-    # completion). a multi-turn env scores a terminal episode instead, so that timing would neither
-    # describe nor even validly reach its reward path.
-    reward_profile = (
-        None
-        if inp["multi_turn"]
-        else _log_reward_profile(
-            env,
-            _score_for_profile,
-            rollout_examples,
-            int(inp["prompts_per_step"]) * int(inp["group_size"]),
-        )
-    )
     multi_turn_bridge = (
         MultiTurnBridge(
             env,
@@ -329,6 +277,7 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
             max_turns=int(inp["max_turns"]),
             per_turn_credit=bool(inp["per_turn_credit"]),
             on_episode_scored=observability.record,
+            parent_work=observability.parent_work,
         )
         if inp["multi_turn"]
         else None
@@ -344,7 +293,6 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
         observability=observability,
         # filled from the child's marker line; stays empty when wandb is off.
         wandb_link={},
-        reward_profile=reward_profile,
         multi_turn_bridge=multi_turn_bridge,
         server=server,
         reward_url=reward_url,
@@ -419,26 +367,30 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
     env_for_verl = parent._build_verl_child_env(
         shim_dir=files["shim_dir"], wandb_enabled="wandb" in loggers
     )
+    env_for_verl["VERL_USE_EXTERNAL_MODULES"] = "flash_grpo_plugin"
+    env_for_verl["FLASH_GRPO_PLUGIN_CONFIG_PATH"] = files["plugin_config_path"]
     env_for_verl["FLASH_VERL_REWARD_URL"] = reward_url
+    # where each rank records the gpu it opened. ray fans this env to every actor, which is what
+    # makes the file a rendezvous point: the deferred plugin check compares ranks before a process
+    # group exists.
+    env_for_verl["FLASH_RANK_DEVICE_CLAIMS"] = files["rank_device_claims"]
     # the model is prefetched above; keep the subprocess off hf's rate-limited api.
     env_for_verl["HF_HUB_OFFLINE"] = "1"
     env_for_verl["TRANSFORMERS_OFFLINE"] = "1"
     env_for_verl["HF_HUB_DISABLE_XET"] = "1"
     if inp["multi_turn"]:
-        # the plugin named here and the loop it builds live in shim_dir, so PYTHONPATH must
-        # carry it -- see below.
         env_for_verl.update(
             multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
         )
-    # python imports sitecustomize automatically at startup, so the shim patches verl before
-    # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
-    # install itself, and ray workers inherit this env so every actor gets the same patch.
-    # multi-turn needs the same entry for its copied-in agent loop modules. unconditional: the
-    # shim always carries at least the tf32 fragment, so a skipped entry would silently drop it.
-    env_for_verl["PYTHONPATH"] = os.pathsep.join(
-        item for item in (files["shim_dir"], os.environ.get("PYTHONPATH", "")) if item
-    )
     return env_for_verl
+
+
+def _step_timing_fields(inp, state: _StepMetricState) -> dict:
+    return state.step_timing.heartbeat_fields(
+        current_step=state.progress["step"],
+        total_steps=int(inp["steps"]),
+        remaining_wall_s=_w._remaining_worker_wall_seconds(),
+    )
 
 
 def _ingest_step_metrics(
@@ -447,10 +399,9 @@ def _ingest_step_metrics(
     state: _StepMetricState,
     _reward_observability: Callable[[], dict],
 ) -> None:
-    sent_first_metrics = state.sent_first_metrics
     step_metrics = parse_verl_step_metrics(line)
     if step_metrics is not None:
-        state.step_line_times.append(time.time())
+        state.step_timing.record_duration(parse_verl_metric(line, "timing_s/step"))
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]
@@ -458,19 +409,25 @@ def _ingest_step_metrics(
         # the worker's error path reads this global, so a run that dies mid-training
         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
         LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
-        # rl_train_start arms a 900s throttle, so force the first backlog through like
-        # heartbeat.py force_first_samples and retry until committed. later emissions remain
-        # throttled to protect the hf commit cap.
-        if not sent_first_metrics:
-            sent_first_metrics = _w.heartbeat(
+        heartbeat_fields = _reward_observability()
+        has_step_timing = "step_duration_s" in heartbeat_fields
+        # rl_train_start arms a 900s throttle, so force until both the first backlog and the first
+        # usable timing payload commit. the backlog commit also arms the force floor, so mark the first
+        # timing attempt for the wrapper's dedicated floor bypass until that upload succeeds.
+        if not state.sent_first_metrics or (has_step_timing and not state.sent_first_timing):
+            heartbeat_committed = _w.heartbeat(
                 "rl_step",
                 force=True,
+                first_timing=has_step_timing and not state.sent_first_timing,
                 step=step_metrics["step"],
                 metrics_last=list(state.metrics_last),
-                **_reward_observability(),
+                **heartbeat_fields,
                 gpu=gpu_diagnostics(include_torch=False),
             )
-            state.sent_first_metrics = sent_first_metrics
+            if heartbeat_committed:
+                state.sent_first_metrics = True
+                if has_step_timing:
+                    state.sent_first_timing = True
         # per-step series for train_meta observability parity. these live on the same
         # line as everything else: verl's only console metric sink is LocalLogger,
         # which always prints "step:N - ..." (verl/utils/logger/aggregate_logger.py),
@@ -508,15 +465,24 @@ def _execute_rl_child(
     # every wait answers ChildProcessError for a zombie nobody will collect.
     adopt_orphaned_descendants()
     proc = subprocess.Popen(
-        [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
+        [python_bin, "-m", "flash_grpo_entry", *overrides],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         env=env_for_verl,
         start_new_session=True,
     )
-    child_stream = _rl_train()._GrpoSubprocessStream(proc)
-    step_re = re.compile(r"step:\s*(\d+)")
+    child_tail = _rl_train().ChildOutputTail()
+    silence_watchdog = _rl_train().VerlChildSilenceWatchdog(
+        child_tail,
+        baseline_step=int((files or {}).get("resume_step", 0)),
+        parent_work=reward_runtime.observability.parent_work,
+    )
+    child_stream = _rl_train()._GrpoSubprocessStream(
+        proc,
+        tail=child_tail,
+        silence_watchdog=silence_watchdog,
+    )
     progress, last_dump_step = state.progress, state.last_dump_step
     shim_markers = (files or {}).get("shim_markers")
     expected_shims = (files or {}).get("expected_shims", ())
@@ -527,9 +493,10 @@ def _execute_rl_child(
             link = parse_wandb_link(line)
             if link is not None:
                 reward_runtime.wandb_link.update(link)
-            m = step_re.search(line)
-            if m:
-                progress["step"] = int(m.group(1))
+            step_number = verl_step_number(line)
+            if step_number is not None:
+                progress["step"] = step_number
+                silence_watchdog.observe_step(step_number)
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
                 # flash patch at all, so fail now rather than after the whole run is paid for. not

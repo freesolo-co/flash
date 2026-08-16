@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from math import ceil
 from typing import Any
 
 ALGORITHMS = ("sft", "grpo", "opd")
@@ -148,6 +149,9 @@ class ModelInfo:
     mamba_block_size: int = 0
     # grouped (in_features, out_features, count) for peft all-linear on the full loaded model.
     lora_target_shapes: tuple[tuple[int, int, int], ...] = ()
+    # fused routed experts stacked on the lora rank axis for target_parameters. zero means no
+    # catalog-backed stacked allowance; ordinary and unknown target parameters carry exactly r.
+    lora_expert_count: int = 0
 
     @property
     def is_moe(self) -> bool:
@@ -174,6 +178,7 @@ class ModelInfo:
             "linear_value_head_dim",
             "linear_conv_kernel_dim",
             "lora_target_shapes",
+            "lora_expert_count",
         ):
             data.pop(key, None)
         serving = data["serving"]
@@ -500,6 +505,7 @@ MODELS: dict[str, ModelInfo] = {
             (4608, 2048, 1),
             (4608, 4608, 1),
         ),
+        lora_expert_count=256,
         vocab_size=248_320,
         algos=ALGORITHMS,
         min_vram_gb=141,
@@ -569,6 +575,14 @@ def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
     return int(info.serving.max_lora_rank)
 
 
+def lora_expert_count(model: str | ModelInfo | None) -> int | None:
+    """Return the exact fused-expert stack size for LoRA target parameters, when cataloged."""
+    info = _model_info_for_serving(model)
+    if info is None or info.lora_expert_count <= 0:
+        return None
+    return int(info.lora_expert_count)
+
+
 def serving_context_cap(model: str | ModelInfo | None) -> int | None:
     """Return the model's served ``max_model_len``, or None without a local serving entry.
 
@@ -609,6 +623,10 @@ def resolve_vocab_size(model_id: str, revision: str = "") -> int:
     return vocab_size_for(model_id)
 
 
+def _with_merge_disk_floor(info: ModelInfo) -> ModelInfo:
+    return replace(info, min_disk_gb=max(info.min_disk_gb, ceil(info.params_b * 2) + 64))
+
+
 def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> ModelInfo:
     """Resolve a curated model, validated for ``algorithm``; anything uncataloged is rejected.
 
@@ -630,9 +648,8 @@ def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> Mo
             params_b=params_b,
             params=f"{params_b:.1f}B",
             vocab_size=vocab_size,
-            min_disk_gb=max(info.min_disk_gb, int(params_b * 2) + 64),
         )
-    return info
+    return _with_merge_disk_floor(info)
 
 
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
@@ -647,4 +664,4 @@ def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
 
 
 def public_model_rows() -> list[dict[str, Any]]:
-    return [m.to_dict() for m in list_models()]
+    return [_with_merge_disk_floor(model).to_dict() for model in list_models()]

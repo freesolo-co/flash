@@ -9,35 +9,57 @@ Split out of `flash.engine.worker.backend_common` to keep that module under the 
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import shutil
 import subprocess
 
+from flash.adapters.fused_experts import (
+    has_complete_fused_expert_tensors,
+    lora_target_parameters,
+    normalize_verl_fused_expert_export,
+    validate_fused_expert_adapter_config,
+)
+from flash.engine.worker.model.lora import _read_adapter_tensor_metadata
+
 
 class MergeDiskHeadroomError(RuntimeError):
     """the merged model this export must write does not fit beside the checkpoint it reads."""
 
 
+class MergeDiskExhaustedError(RuntimeError):
+    """the merge started with room and then ran the disk out partway through writing its output."""
+
+
+# a genuine short write leaves almost no free space; keep the fallback absolute so a normal partial
+# merge is not misclassified merely because its output is large.
+_MERGE_DISK_EXHAUSTED_FREE_BYTES = 64 * 1024 * 1024
+
+# quota exhaustion can leave the underlying filesystem reporting free space, so preserve both errno
+# and text forms emitted by torch and safetensors.
+_DISK_EXHAUSTED_ERRNOS = (errno.ENOSPC, errno.EDQUOT)
+_DISK_EXHAUSTED_MARKERS = (
+    "no space left on device",
+    "errno 28",
+    "os error 28",
+    "disk quota exceeded",
+    "errno 122",
+    "os error 122",
+)
+_SHORT_WRITE_MARKERS = ("unexpected pos",)
+
+# disk size is platform-managed, so checkpoint frequency is the reachable remedy.
+_FEWER_CHECKPOINTS_ADVICE = (
+    "publish fewer checkpoints: raise train.save_every (save_every == the run's total steps "
+    "publishes only the final adapter), or drop entries from train.save_at_steps if the run sets "
+    "them -- exact steps override save_every and are always published."
+)
+
+
 def _model_shard_bytes(path: str) -> int:
-    """total size of the fsdp model shards directly in `path`.
-
-    only `model_world_size_*_rank_*.pt` is measured, because only those files become merge output:
-    `_load_and_merge_state_dicts` loads exactly those names, and the merged dict is what
-    `save_pretrained` writes back out. the `optim_*` and `extra_state_*` files sitting beside them
-    are read by resume, never by the merger, so including them would inflate the requirement by the
-    whole optimizer state -- ~7.6 GB of adam moments on a 35b rank-32 run -- and refuse merges that
-    would have fit.
-
-    a flat scan, not a walk, because the merger's read is flat: it opens
-    `Path(local_dir) / f"model_world_size_{W}_rank_{r}.pt"` per rank and never recurses. walking
-    would add up nested files it will never read, which is the same over-estimate in a new form.
-
-    shares `_FSDP_SHARD_RE` with `checkpoint_world_size` rather than matching the name a second way:
-    one definition of what a shard filename is, so a future change to verl's layout cannot leave the
-    two disagreeing about which files a merge reads.
-    """
+    """total size of the top-level fsdp model shards the merger reads."""
     try:
         names = os.listdir(path)
     except OSError:
@@ -54,37 +76,12 @@ def _model_shard_bytes(path: str) -> int:
 
 
 def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
-    """Fail before `verl.model_merger` runs if its output cannot fit on the container disk.
-
-    `model_merger merge` does NOT write only the small lora adapter. `save_hf_model_and_tokenizer`
-    materializes the full base model and calls `model.save_pretrained(target_dir, state_dict=...)`
-    (verl `model_merger/base_model_merger.py`), so exporting one 35b checkpoint writes ~70 GB into
-    `<adapter>_merge` beside the ~60 GB checkpoint it is reading. That is the single largest
-    transient on the disk, and it recurs on EVERY publish, not just at finalization.
-
-    Without this guard the merger dies partway through `save_pretrained` with ENOSPC, and the run
-    fails after training has already succeeded. Checking first turns a silent late disk death into
-    an actionable error naming the shortfall, while the checkpoint is still intact and resumable.
-
-    The requirement is derived from what the merger actually moves rather than from the checkpoint's
-    total size: it loads the `model_world_size_*_rank_*.pt` shards, casts every tensor to bf16, and
-    writes that same state back out as base model plus adapter (`fsdp_model_merger.py`,
-    `base_model_merger.py`). Shard bytes in, shard bytes out. Sizing the whole directory instead
-    would add the `optim_*` and `extra_state_*` files, which resume reads and the merger never
-    materializes -- on a 35b rank-32 run that is ~7.6 GB of adam moments, enough to refuse a merge
-    that had room.
-
-    The two error directions are not symmetric, which is why no safety margin is added on top.
-    Underestimating leaves the merger to hit ENOSPC exactly as it does today, so the guard is merely
-    absent. Overestimating fails a run that would have completed, which is a regression this guard
-    would have introduced. When in doubt, let the merge proceed.
-    """
+    """fail before the merger when its full-bf16 output cannot fit beside its input shards."""
     need = _model_shard_bytes(ckpt_actor_dir)
     if need <= 0:
         return
-    try:
-        free = shutil.disk_usage(os.path.dirname(merge_out.rstrip("/")) or ".").free
-    except OSError:
+    free = _free_bytes(merge_out)
+    if free is None:
         # an unreadable mount is not evidence of exhaustion; let the merger run and report for real.
         return
     if free >= need:
@@ -92,8 +89,97 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
     raise MergeDiskHeadroomError(
         f"cannot export the adapter: merging {ckpt_actor_dir} needs about "
         f"{need / 1e9:.1f} GB beside it but only {free / 1e9:.1f} GB is free. "
-        "raise [gpu] disk_gb, or save fewer checkpoints with a larger save_every."
+        + _FEWER_CHECKPOINTS_ADVICE
     )
+
+
+def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
+    """stream merger output and prefer direct disk evidence over a short-write marker."""
+    from flash.engine.worker import backend_common
+
+    disk_line = ""
+    short_write_line = ""
+
+    def handle_line(line: str) -> None:
+        nonlocal disk_line, short_write_line
+        print(line, end="", flush=True)
+        lowered = line.lower()
+        if not disk_line and any(marker in lowered for marker in _DISK_EXHAUSTED_MARKERS):
+            disk_line = line.strip()
+        elif not short_write_line and any(marker in lowered for marker in _SHORT_WRITE_MARKERS):
+            short_write_line = line.strip()
+
+    merger_env = {**env, "PYTHONUNBUFFERED": "1"}
+    return_code = backend_common._run_streaming_verl_subprocess(
+        cmd, env=merger_env, on_line=handle_line, errors="replace"
+    )
+    if return_code != 0:
+        raise subprocess.CalledProcessError(
+            return_code, cmd, output=disk_line or short_write_line or None
+        )
+
+
+def _free_bytes(path: str) -> int | None:
+    """free bytes on the filesystem holding ``path``, or none when it cannot be read."""
+    try:
+        return shutil.disk_usage(os.path.dirname(path.rstrip("/")) or ".").free
+    except OSError:
+        return None
+
+
+def _error_chain_matches(
+    error: BaseException, *, errnos: tuple[int, ...] = (), markers: tuple[str, ...] = ()
+) -> bool:
+    """whether an error chain contains any requested errno or text marker."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno in errnos:
+            return True
+        for evidence in (
+            current,
+            getattr(current, "output", None),
+            getattr(current, "stderr", None),
+        ):
+            if isinstance(evidence, bytes):
+                evidence = evidence.decode("utf-8", "replace")
+            if evidence is not None and any(marker in str(evidence).lower() for marker in markers):
+                return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _disk_exhausted_error(error: BaseException) -> bool:
+    """whether an error chain contains direct volume or quota exhaustion evidence."""
+    return _error_chain_matches(
+        error, errnos=_DISK_EXHAUSTED_ERRNOS, markers=_DISK_EXHAUSTED_MARKERS
+    )
+
+
+def raise_for_merge_disk_exhaustion(
+    error: BaseException, ckpt_actor_dir: str, merge_out: str, *, merger_succeeded: bool = False
+) -> None:
+    """classify direct disk evidence or a low-space short write before cleanup."""
+    direct_evidence = _disk_exhausted_error(error)
+    if not direct_evidence and isinstance(error, OSError):
+        return
+    if merger_succeeded and not direct_evidence:
+        return
+    short_write_evidence = _error_chain_matches(error, markers=_SHORT_WRITE_MARKERS)
+    if not direct_evidence and not short_write_evidence:
+        return
+    free = _free_bytes(merge_out)
+    if not direct_evidence and (free is None or free > _MERGE_DISK_EXHAUSTED_FREE_BYTES):
+        return
+    free_text = "unknown" if free is None else f"{free / 1e9:.2f} GB"
+    raise MergeDiskExhaustedError(
+        f"ran out of disk while merging {ckpt_actor_dir} into {merge_out}: "
+        f"{free_text} free on that filesystem. publishing a checkpoint materializes the FULL base "
+        "model beside the checkpoint it reads, so a small lora adapter still needs room for a whole "
+        "model copy. the underlying error is a short write, not a corrupt checkpoint. "
+        + _FEWER_CHECKPOINTS_ADVICE
+    ) from error
 
 
 def resolve_checkpoint_actor_dir(step_dir: str) -> str:
@@ -147,13 +233,17 @@ def completed_checkpoint_step(local_dir: str) -> int:
         return 0
 
 
-def unprocessed_checkpoint_dirs(
-    local_dir: str, completed_step: int, processed_steps: set[int]
+def undiscovered_checkpoint_dirs(
+    local_dir: str, completed_step: int, discovered_steps: set[int]
 ) -> list[tuple[int, str]]:
-    """``(step, dir)`` for every completed ``global_step_N`` not yet in ``processed_steps``, ascending.
+    """``(step, dir)`` for every completed ``global_step_N`` not yet in ``discovered_steps``, ascending.
 
     Bounded by ``completed_step`` so a directory verl is still writing is never handed to a
-    publisher, and by ``processed_steps`` so each checkpoint is published exactly once.
+    publisher, and by ``discovered_steps`` so each checkpoint is handed over exactly once.
+
+    Discovery only. A returned step is one nobody has claimed yet; a filtered step was claimed, which
+    covers publishing it, intentionally skipping it, coalescing it away and crediting it from a
+    previous attempt. Callers must read durability from the lifecycle ledger, never from this filter.
     """
     found: list[tuple[int, str]] = []
     try:
@@ -166,7 +256,7 @@ def unprocessed_checkpoint_dirs(
             continue
         step = int(match.group(1))
         path = os.path.join(local_dir, name)
-        if step <= completed_step and step not in processed_steps and os.path.isdir(path):
+        if step <= completed_step and step not in discovered_steps and os.path.isdir(path):
             found.append((step, path))
     return sorted(found)
 
@@ -302,12 +392,10 @@ def export_peft_adapter(
     merge_env["HF_HUB_OFFLINE"] = "1"
     merge_env["TRANSFORMERS_OFFLINE"] = "1"
     merge_env["HF_HUB_DISABLE_XET"] = "1"
-    # the merge tree is this function's to clean up for its whole lifetime, not just on success.
-    # it holds the full merged model -- the largest transient on the disk -- so leaving it behind
-    # when the merger dies or writes an unexpected layout would strand tens of gb on the exact
-    # disk this guard exists to protect, and the next save would inherit less room than this one.
+    # after a successful merge, low free space is expected and cannot classify placement failures.
+    merger_succeeded = False
     try:
-        subprocess.run(
+        _run_merger(
             [
                 python_bin,
                 "-m",
@@ -320,21 +408,25 @@ def export_peft_adapter(
                 "--target_dir",
                 merge_out,
             ],
-            check=True,
-            env=merge_env,
+            merge_env,
         )
+        merger_succeeded = True
         lora_dir = os.path.join(merge_out, "lora_adapter")
         if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):
             raise RuntimeError(
                 f"verl model_merger did not produce a peft adapter at {lora_dir} (no adapter_config.json); "
                 "the merger output layout must be adjusted for this verl version."
             )
-        # rename rather than copy: every caller builds `out_adapter_dir` and `merge_out` as siblings
-        # in one run workdir, so the two are on one filesystem and `os.replace` is a metadata
-        # operation that moves no bytes. copying would hold a second copy of the adapter beside the
-        # still-undeleted merge tree, a peak this function's own headroom check does not budget for.
+        # move within the shared filesystem so placement does not create another adapter copy.
         for name in os.listdir(lora_dir):
             os.replace(os.path.join(lora_dir, name), os.path.join(out_adapter_dir, name))
+    except Exception as error:
+        # classify before cleanup frees the merge tree and its low-space evidence.
+        # cancellation remains a base exception and is never relabelled as disk exhaustion.
+        raise_for_merge_disk_exhaustion(
+            error, ckpt_actor_dir, merge_out, merger_succeeded=merger_succeeded
+        )
+        raise
     finally:
         shutil.rmtree(merge_out, ignore_errors=True)
 
@@ -344,6 +436,10 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
 
     dir-based analogue of the in-memory peft-model provenance stamp: same validation + fields,
     applied to the json verl produced. raises if the adapter already names a different base.
+
+    also normalizes fused-expert targeting at the exporter boundary. this is the one call every
+    export path (sft and rl, final publish and per-step staging) already funnels through, so every
+    published adapter carries the current loadable config shape.
     """
     cfg_path = os.path.join(adapter_dir, "adapter_config.json")
     with open(cfg_path) as f:
@@ -358,5 +454,14 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
         raise RuntimeError("adapter base revision does not match the validated target commit")
     cfg["base_model_name_or_path"] = model_id
     cfg["revision"] = model_revision or None
+    normalize_verl_fused_expert_export(cfg, model_id)
+    validate_fused_expert_adapter_config(cfg, model_id)
+    if lora_target_parameters(model_id):
+        tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
+        if not has_complete_fused_expert_tensors(tensors, cfg, model_id):
+            raise RuntimeError(
+                f"exported adapter for {model_id} does not contain complete fused expert LoRA "
+                "weights; refusing to stamp it as warm-start compatible"
+            )
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)

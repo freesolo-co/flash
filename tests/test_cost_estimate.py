@@ -85,7 +85,6 @@ def test_runconfig_preserves_old_positional_constructor():
         None,
         8,
         False,
-        None,
         "",
         3600,
         "runpod",
@@ -106,17 +105,21 @@ def test_runconfig_preserves_old_positional_constructor():
     assert config.opd_multi_turn is False
     assert config.opd_max_turns is None
 
-    # the 16 args above stop short of the opd fields, so they cannot catch a field INSERTED among
+    # the 15 args above stop short of the opd fields, so they cannot catch a field INSERTED among
     # the later ones -- the shift only rebinds from that position on. pin the order itself, which is
     # what the positional contract actually is.
     import dataclasses
 
     order = [f.name for f in dataclasses.fields(RunConfig)]
     assert order.index("opd_multi_turn") < order.index("opd_max_turns")
-    assert order.index("opd_max_turns") < order.index("measured_completion_tokens")
+    assert order.index("opd_max_turns") < order.index("sft_retained_examples")
     # anything added later must be APPENDED, never slotted beside a related field: an old positional
-    # caller would silently bind its opd flag to the newcomer rather than fail.
-    assert order[-1] == "sft_retained_examples", (
+    # caller would silently bind its opd flag to the newcomer rather than fail. asserted as a
+    # PREFIX rather than an exact tail so the guard keeps failing on an insertion while a correctly
+    # appended field does not have to edit it -- the previous exact-tail form failed either way,
+    # which makes the failure uninformative about which mistake was made.
+    appended_so_far = ["sft_retained_examples", "providers", "gpu_type_fallbacks"]
+    assert order[-len(appended_so_far) :] == appended_so_far, (
         "a new RunConfig field must be appended; inserting one shifts every later parameter and "
         "silently reinterprets old positional calls as different quantities"
     )

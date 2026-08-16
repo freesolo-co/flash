@@ -81,6 +81,10 @@ def test_styled_path_is_themed_but_lossless(monkeypatch, fake_client, capsys) ->
     assert "cost_usd" in out
     assert '"state": "done"' in out
 
+    assert cli.main(["runs", "status", "flash-1", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["state"] == "done"
+
 
 def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
     # Provider metadata may exist in API payloads for lifecycle/accounting, but human CLI summaries
@@ -347,6 +351,9 @@ def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setattr(runtime_secrets, "resolve_hf_token", lambda *a, **k: "hf_x")
+    monkeypatch.setattr(
+        "flash.cli.commands.deploy._hf_identity_and_write_access", lambda *_: "acme"
+    )
     monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _ExportClient())
 
     # default export (no --public) is private; the card must say so, not "public"
@@ -664,6 +671,176 @@ def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
     assert is_current({"remote": {"attempt": 2}}, {"attempt": 1}) is False
 
 
+def test_progress_age_always_adds_to_heartbeat_age(monkeypatch):
+    from flash.cli.ui import heartbeat as heartbeat_ui
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 5000.0)
+
+    base = {
+        "run_id": "flash-1",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+    }
+    heartbeat = {
+        "stage": "rl_step",
+        "step": 14,
+        "ts": 1990.0,
+        "progress_age_s": 20.0,
+    }
+
+    real_out = render.run_status(dict(base, last_heartbeat=heartbeat))
+    liveness_out = render.run_status(dict(base, last_heartbeat={**heartbeat, "liveness": True}))
+    stale_progress_out = render.run_status(
+        dict(base, last_heartbeat={**heartbeat, "progress_age_s": 1200.0})
+    )
+
+    for out in (real_out, liveness_out):
+        assert "last known progress can be as old as 3030.0s" in out
+    assert "last known progress can be as old as 4210.0s" in stale_progress_out
+
+    for out in (real_out, liveness_out, stale_progress_out):
+        assert "upload throttling no longer explains the gap" in out
+        assert "this signal does not show recent progress" in out
+        assert "proves recent worker-side progress" not in out
+        assert "advances normally" not in out
+
+
+def test_fresh_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch):
+    from flash.cli.ui import heartbeat
+
+    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    obj = {
+        "state": "running",
+        "last_heartbeat": {
+            "stage": "rl_step",
+            "step": 14,
+            "ts": 1990.0,
+            "liveness": True,
+            "progress_age_s": 1800.0,
+        },
+    }
+
+    pairs = heartbeat._heartbeat_pairs(obj)
+    assert ("worker", "rl_step · step 14 · alive ping") in pairs
+    assert ("heartbeat", "10s ago") in pairs
+    progress = dict(pairs)["progress"]
+    assert "last known progress can be as old as 1810.0s" in progress
+    assert "upload throttling no longer explains the gap" in progress
+    assert heartbeat._QUIET_HEARTBEAT_HINT not in progress
+    assert len([label for label, _ in pairs if label == "progress"]) == 1
+
+
+def test_fresh_opd_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch):
+    from flash.cli.ui import heartbeat
+
+    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    obj = {
+        "state": "running",
+        "last_heartbeat": {
+            "stage": "opd_step",
+            "step": 1,
+            "ts": 1990.0,
+            "liveness": True,
+            "progress_age_s": 1800.0,
+        },
+    }
+
+    pairs = heartbeat._heartbeat_pairs(obj)
+    assert ("worker", "opd_step · step 1 · alive ping") in pairs
+    assert ("heartbeat", "10s ago") in pairs
+    progress = dict(pairs)["progress"]
+    assert "last known progress can be as old as 1810.0s" in progress
+    assert "upload throttling no longer explains the gap" in progress
+
+
+def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
+    from flash.cli.ui import heartbeat
+
+    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    base = {
+        "state": "running",
+        "remote": {"attempt": 2},
+    }
+    old_worker = {
+        "stage": "rl_step",
+        "step": 14,
+        "attempt": 2,
+        "ts": 1400.0,
+    }
+
+    def progress(hb: dict) -> str:
+        return dict(heartbeat._heartbeat_pairs(dict(base, last_heartbeat=hb)))["progress"]
+
+    old_hint = progress(old_worker)
+    assert progress({**old_worker, "progress_age_s": 220.0}) == old_hint
+    assert progress({**old_worker, "progress_age_s": 20.0, "liveness": True}) == old_hint
+
+
+@pytest.mark.parametrize(
+    "bad_progress_age", [10**400, float("inf"), float("nan"), -1.0, True, "bad"]
+)
+def test_invalid_progress_age_falls_back_to_legacy_hint(monkeypatch, bad_progress_age):
+    from flash.cli.ui import heartbeat
+
+    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    base = {
+        "state": "running",
+        "remote": {"attempt": 2},
+    }
+    heartbeat_base = {
+        "stage": "rl_step",
+        "step": 14,
+        "attempt": 2,
+        "ts": 800.0,
+    }
+
+    legacy = dict(heartbeat._heartbeat_pairs({**base, "last_heartbeat": heartbeat_base}))[
+        "progress"
+    ]
+    invalid = dict(
+        heartbeat._heartbeat_pairs(
+            {
+                **base,
+                "last_heartbeat": {**heartbeat_base, "progress_age_s": bad_progress_age},
+            }
+        )
+    )["progress"]
+    assert invalid == legacy
+
+
+def test_missing_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
+    from flash.cli.ui import heartbeat
+
+    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    obj = {
+        "state": "running",
+        "remote": {"attempt": 2},
+        "last_heartbeat": {
+            "stage": "rl_step",
+            "step": 14,
+            "attempt": 2,
+            "ts": 800.0,
+        },
+    }
+
+    assert heartbeat._heartbeat_pairs(obj) == [
+        ("worker", "rl_step · step 14"),
+        ("heartbeat", "20m ago"),
+        (
+            "progress",
+            (
+                "the step above is the last one UPLOADED, not necessarily the one training is on; "
+                "a throttled worker can hold it for many minutes while the trainer advances "
+                "normally. uploads are held up to 15 min, so compare the age above against that "
+                "(and your [wandb] run, if configured) before treating this as a stall"
+            ),
+        ),
+    ]
+
+
 def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     """A frozen step on a throttled worker must not read as a stalled trainer (AS-018/AS-019).
 
@@ -731,9 +908,9 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     )
     assert "last one UPLOADED" not in render.run_status(step_zero)
 
-    # opd_step force-commits at the 60s floor, so an old one is a real stall, not reporting lag.
+    # opd_step uses the same upload throttle, so its uploaded step can lag behind training too.
     opd = dict(base, last_heartbeat={"stage": "opd_step", "step": 4, "ts": _time.time() - 1200})
-    assert "last one UPLOADED" not in render.run_status(opd)
+    assert "last one UPLOADED" in render.run_status(opd)
 
     # a heartbeat from a superseded attempt describes a dead worker, not throttled progress.
     superseded = dict(

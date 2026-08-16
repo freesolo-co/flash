@@ -55,20 +55,67 @@ def test_urlopen_raises_typed_error_on_rate_limit_403(monkeypatch):
         _urlopen(urllib.request.Request("https://api.github.com/x"))
 
 
-def test_urlopen_non_rate_limit_403_stays_plain_runtime_error(monkeypatch):
-    # A 403 that is NOT a rate limit (auth failure, repo not found) must stay a plain RuntimeError
-    # (non-retriable) so the run fails fast instead of looping on a fresh worker forever.
-    from flash.envs.loader import GitHubRateLimitError, _urlopen
+@pytest.mark.parametrize("code", [401, 403])
+def test_urlopen_treats_credential_failure_as_permanent(monkeypatch, code):
+    # a 401, or a 403 that is not a rate limit, is a token this plane cannot fix by waiting. it must
+    # be non-retriable (so the run does not loop on a fresh worker) AND typed permanent, so the
+    # submit-time preflight fails closed instead of deferring the same error past gpu allocation.
+    from flash.envs.loader import GitHubPermanentError, GitHubRateLimitError, _urlopen
 
     _patch_no_sleep(monkeypatch)
     monkeypatch.setattr(
         urllib.request,
         "urlopen",
-        lambda *a, **k: (_ for _ in ()).throw(_http_error(403, '{"message": "Bad credentials"}')),
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(code, '{"message": "Bad credentials"}')),
     )
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(GitHubPermanentError) as exc:
         _urlopen(urllib.request.Request("https://api.github.com/x"))
     assert not isinstance(exc.value, GitHubRateLimitError)
+
+
+def test_urlopen_rate_limit_403_stays_transient_not_permanent(monkeypatch):
+    # the rate-limit 403 is claimed before the credential branch: it is a quota to wait out, not a
+    # bad token, so widening the permanent set must not swallow it.
+    from flash.envs.loader import GitHubPermanentError, GitHubRateLimitError, _urlopen
+
+    _patch_no_sleep(monkeypatch)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            _http_error(403, '{"message": "API rate limit exceeded"}')
+        ),
+    )
+    with pytest.raises(GitHubRateLimitError) as exc:
+        _urlopen(urllib.request.Request("https://api.github.com/x"))
+    assert not isinstance(exc.value, GitHubPermanentError)
+
+
+@pytest.mark.parametrize("code", [404, 422])
+def test_urlopen_raises_permanent_error_on_settled_github_answer(monkeypatch, code):
+    from flash.envs.loader import GitHubPermanentError, _urlopen
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(code, '{"message": "Not Found"}')),
+    )
+
+    with pytest.raises(GitHubPermanentError, match=rf"\({code}\)"):
+        _urlopen(urllib.request.Request("https://api.github.com/x"), max_rate_limit_retries=0)
+
+
+def test_urlopen_raises_unavailable_error_on_server_failure(monkeypatch):
+    from flash.envs.loader import GitHubUnavailableError, _urlopen
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(503, "service unavailable")),
+    )
+
+    with pytest.raises(GitHubUnavailableError, match="503"):
+        _urlopen(urllib.request.Request("https://api.github.com/x"), max_rate_limit_retries=0)
 
 
 def test_urlopen_success_returns_bytes(monkeypatch):
@@ -254,6 +301,15 @@ def test_background_submit_defers_env_sha_off_creation_path(monkeypatch, tmp_pat
 
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", fake_resolve)
     monkeypatch.setattr(runner, "_run_job", fake_run_job)
+    # the submit-time 404 gate resolves the ref too, and this spec names a placeholder repo that
+    # really does 404. its subject is WHICH THREAD pins, so stub the gate out rather than let a live
+    # GitHub lookup decide whether the test runs. pass the spec through unpinned: the gate returns
+    # what it resolved, and returning a pinned spec here would answer the question under test.
+    monkeypatch.setattr(
+        runner,
+        "preflight_validate_environment_ref",
+        lambda spec: (spec, False),
+    )
 
     spec = JobSpec(
         run_id="flash-bg-resolve",

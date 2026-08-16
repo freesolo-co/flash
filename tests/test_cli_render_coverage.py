@@ -292,6 +292,25 @@ def test_deployments_table_formats_verified_at_as_utc(styled_plain) -> None:
     assert "1700000000" not in out
 
 
+def test_deployments_table_surfaces_base_url_and_handles_missing_value(styled_plain) -> None:
+    out = render.deployments_table(
+        [
+            {
+                "run_id": "r1",
+                "deployment": {
+                    "state": "ready",
+                    "openai_base_url": "https://serve.example/v1",
+                },
+            },
+            {"run_id": "r2", "deployment": {"state": "ready"}},
+        ]
+    )
+    assert "OPENAI BASE URL" in out
+    assert "https://serve.example/v1" in out
+    assert "r2" in out
+    assert "-" in out
+
+
 def test_run_status_shows_realized_cost_and_artifacts(styled_plain) -> None:
     obj = {
         "run_id": "flash-1",
@@ -578,3 +597,33 @@ def test_runs_table_marks_live_rows_with_a_tilde(styled_plain) -> None:
     assert "~$2.5000" in out  # live: the quote, flagged
     assert "$1.2500" in out  # settled: the real charge
     assert "~$1.2500" not in out
+
+
+def test_runs_table_renders_an_ordered_gpu_pin_that_has_not_allocated_yet(styled_plain) -> None:
+    """An unallocated ordered pin renders as a label without breaking the table."""
+    out = render.runs_table(
+        [
+            {
+                "run_id": "flash-ordered",
+                "state": "provisioning",
+                "updated_at": 2,
+                "spec": {
+                    "model": "m",
+                    "algorithm": "sft",
+                    "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
+                },
+                "remote": {},
+            },
+            {
+                "run_id": "flash-other",
+                "state": "done",
+                "updated_at": 1,
+                "spec": {"model": "m", "algorithm": "sft", "gpu": {"type": "H200"}},
+                "cost_usd": 1.25,
+            },
+        ]
+    )
+    assert "A100 PCIe | A100 SXM" in out
+    # the unrelated run is still listed, which is what the crash used to prevent.
+    assert "flash-other" in out
+    assert "H200" in out

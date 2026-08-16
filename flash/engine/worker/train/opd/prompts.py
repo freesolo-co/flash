@@ -14,7 +14,7 @@ import hashlib
 import json
 from typing import TYPE_CHECKING
 
-from flash.engine.profiling.sft_workload import _multimodal_messages_with_images
+from flash.content.multimodal import messages_with_decoded_images
 from flash.engine.worker.train.opd.gkd import _trim_trailing_stop
 
 if TYPE_CHECKING:  # the prompt record, for annotations only -- it lives in the orchestrator
@@ -69,7 +69,7 @@ def _processor_expanded_prompt_ids(
     from flash.content.multimodal import decode_image_descriptors
 
     images = decode_image_descriptors(list(image_descriptors), package_root)
-    prepared = _multimodal_messages_with_images(messages, images)
+    prepared = messages_with_decoded_images(messages, images)
     raw_prompt = processor.apply_chat_template(
         prepared,
         tokenize=False,

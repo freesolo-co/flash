@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +136,9 @@ class FreesoloEnvironment(BaseEnvironment):
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None
+        # cached dataset rows own the task that prompt preparation mutates. single-turn scoring
+        # reuses it directly; multi-turn rollouts clone its prepared episode state per sibling.
+        self._row_tasks: dict[int, Any] = {}
         # whether this run samples <think> blocks. the worker sets it from the JobSpec once the
         # env is loaded; off by default so a CLI-side load (flash env test) grades raw text, which
         # is what an echo/replay harness feeds it.
@@ -169,6 +173,10 @@ class FreesoloEnvironment(BaseEnvironment):
         return cap
 
     def _task_example(self, example: dict):
+        """Return a cached dataset row's stable task, or a fresh task for any other row."""
+        task = self._row_tasks.get(id(example))
+        if task is not None:
+            return task
         return self._task_example_from_record(self._canonical_record(example))
 
     def _with_system_prompt(self, messages: list[dict]) -> list[dict]:
@@ -260,6 +268,7 @@ class FreesoloEnvironment(BaseEnvironment):
                     f"not the packaged file {self._source} ({file_rows} rows)"
                 )
         records = []
+        row_tasks: dict[int, Any] = {}
         for example in examples:
             raw = dict(getattr(example, "record", {}) or {})
             if _CANONICAL_INPUT_KEY not in raw and getattr(example, "input", None) is not None:
@@ -274,7 +283,10 @@ class FreesoloEnvironment(BaseEnvironment):
                 raw["id"] = example_id
             record = self._canonical_record(raw)
             records.append(record)
+            # single-turn prompt and scoring hooks share the row-owned task.
+            row_tasks[id(record)] = self._task_example_from_record(record)
         self._dataset_cache = records
+        self._row_tasks = row_tasks
         return records
 
     def prompt_messages(self, example: dict) -> list[dict]:
@@ -415,10 +427,18 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def _grouped_results(self, items, *, task_of, payload_of, scorer, method: str) -> list:
         """Group rollouts that share an example and scatter full reward results in input order."""
-        groups: dict[str, dict] = {}
-        order: list[str] = []
+        groups: dict[tuple[str, int | None], dict] = {}
+        order: list[tuple[str, int | None]] = []
         for i, (ex, st) in enumerate(items):
-            key = json.dumps(ex, sort_keys=True, default=str)
+            # only the FIRST member's task is passed to the scorer, so members must agree on it.
+            # sibling rollouts of one row carry their own session task that each episode mutated
+            # (`new_rollout_state`), and those are not interchangeable: grouping them on the row
+            # value alone would score every sibling against whichever session happened to be first.
+            session_task = st.get("task")
+            key = (
+                json.dumps(ex, sort_keys=True, default=str),
+                None if session_task is None else id(session_task),
+            )
             grp = groups.get(key)
             if grp is None:
                 grp = groups[key] = {"task": task_of(ex, st), "idxs": [], "payloads": []}
@@ -427,7 +447,7 @@ class FreesoloEnvironment(BaseEnvironment):
             grp["payloads"].append(payload_of(st))
         out: list = [None] * len(items)
 
-        def score_group(key: str) -> tuple[str, list]:
+        def score_group(key: tuple[str, int | None]) -> tuple[tuple[str, int | None], list]:
             grp = groups[key]
             rewards = scorer(grp["task"], grp["payloads"])
             if len(rewards) != len(grp["payloads"]):
@@ -543,14 +563,24 @@ class FreesoloEnvironment(BaseEnvironment):
     def tools(self) -> list:
         return []
 
-    def new_rollout_state(self, example: dict) -> dict:
-        task = self._task_example(example)
-        prompt = self._with_system_prompt(self._env.start_episode(task, self._contract_text))
+    def new_rollout_state(self, example: dict, prepared_prompt: list[dict] | None = None) -> dict:
+        if prepared_prompt is None:
+            record = deepcopy(self._canonical_record(example))
+            task = self._task_example_from_record(record)
+            prompt = self._with_system_prompt(self._env.start_episode(task, self._contract_text))
+        else:
+            prepared_task = self._row_tasks.get(id(example))
+            if prepared_task is None:
+                raise RuntimeError("prepared Freesolo rollout requires its dataset row task")
+            task = deepcopy(prepared_task)
+            prompt = deepcopy(prepared_prompt)
         try:
             episode_turns: int | None = int(self._env.max_episode_turns(task))
         except Exception:
             episode_turns = None
-        messages = [dict(message) for message in prompt]
+        messages = (
+            [dict(message) for message in prompt] if prepared_prompt is None else deepcopy(prompt)
+        )
         return {
             "task": task,
             "prompt": prompt,
@@ -635,13 +665,16 @@ class FreesoloEnvironment(BaseEnvironment):
         state["turn"] = int(state.get("turn", 0)) + 1
         if step.metadata:
             state.setdefault("step_metadata", []).append(step.metadata)
-        replies = [dict(message) for message in step.messages]
-        state.setdefault("messages", []).extend(replies)
-        for message in replies:
+        replies = [deepcopy(dict(message)) for message in step.messages]
+        scored_replies = deepcopy(replies)
+        state.setdefault("messages", []).extend(scored_replies)
+        for message in scored_replies:
+            # score_episode receives a structural copy of the environment's raw chat content. the
+            # parent bridge flattens only the separate child-bound reply returned below.
             state.setdefault("turns", []).append(
                 self._EnvironmentTurn(
                     role=str(message.get("role", "")),
-                    content=str(message.get("content", "")),
+                    content=deepcopy(message.get("content", "")),
                 )
             )
         return replies

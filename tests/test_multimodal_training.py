@@ -369,7 +369,7 @@ def test_sft_rejects_image_completion_when_prompt_is_text_only():
     ]
 
     with pytest.raises(ValueError, match="image-bearing SFT completions are not supported"):
-        _reject_image_completion(completion)
+        _reject_image_completion(completion, image_bearing=False)
 
 
 def test_sft_mixed_text_completion_shapes_are_arrow_safe():
@@ -598,8 +598,8 @@ def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
     resolver = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert "image_pad_token_id = resolve_image_pad_token_id(processor, tok)" in resolver
 
-    entry = inspect.getsource(rl_train._write_rl_shim)
-    assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in entry
+    entry = inspect.getsource(rl_train._write_rl_plugin_config)
+    assert '"image_pad_token_id": inp["image_pad_token_id"]' in entry
 
 
 def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path):
@@ -637,7 +637,7 @@ def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path
         mm.preflight_validate_image_opd(unsupported)
 
 
-def test_image_opd_preflight_rejects_multi_turn_with_a_vision_teacher():
+def test_image_opd_preflight_keeps_inline_validation_when_packaged_scan_is_deferred():
     spec = SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
@@ -662,7 +662,7 @@ def test_image_opd_preflight_rejects_multi_turn_with_a_vision_teacher():
     )
 
     with pytest.raises(ValueError, match="multi-turn image-bearing opd is not supported"):
-        mm.preflight_validate_image_opd(spec)
+        mm.preflight_validate_image_opd(spec, scan_packaged_environment=False)
 
 
 def test_image_opd_preflight_allows_max_turns_on_a_single_turn_env():
@@ -755,42 +755,6 @@ def test_image_opd_submit_preflight_rejects_text_teacher_before_state_mutation(
 
     with pytest.raises(ValueError, match="selected teacher 'kimi-k3' cannot see images"):
         runner.submit_job(spec, background=background)
-    with pytest.raises(FileNotFoundError):
-        runner.get_status(spec.run_id)
-
-
-def test_image_opd_submit_preflight_preserves_unsupported_model_precedence(monkeypatch, tmp_path):
-    from flash import runner
-    from flash.core.spec import JobSpec
-
-    algorithm = "opd"
-    model = "meta-llama/Llama-3.2-1B"
-    message = "does not support image-bearing"
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-
-    def fail(*args, **kwargs):
-        raise AssertionError("rejected submit must not mutate warm-start state or reach providers")
-
-    monkeypatch.setattr(runner, "_mark_warmstart_source", fail)
-    monkeypatch.setattr(runner, "_run_job", fail)
-    monkeypatch.setattr(runner, "_run_job_background", fail)
-    monkeypatch.setattr(runner.threading, "Thread", fail)
-    params = {"records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}]}
-    spec = JobSpec.from_dict(
-        {
-            "run_id": f"image-{algorithm}-reject-{model.rsplit('/', 1)[-1]}",
-            "model": model,
-            "algorithm": algorithm,
-            "environment": {"id": "local", "params": params},
-            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k3"},
-        }
-    )
-    prepared = runner.PreparedJob(public_spec=spec, worker_spec=spec, estimated_cost_usd=0.0)
-
-    with pytest.raises(ValueError, match=message):
-        runner.submit_job(spec, prepared_job=prepared)
     with pytest.raises(FileNotFoundError):
         runner.get_status(spec.run_id)
 

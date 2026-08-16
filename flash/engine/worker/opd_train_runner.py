@@ -10,99 +10,27 @@ import os
 import random
 import shutil
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
-from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
-
-
-@dataclass(frozen=True)
-class _OpdRequest:
-    spec: Any
-    env: Any
-    multi_turn: bool
-    max_turns: int
-    knobs: Any
-    model_id: str
-    model_revision: str
-    structured_outputs: Any = None
-    model_vocab_size: int | None = None
-
-
-@dataclass(frozen=True)
-class _PromptState:
-    teacher: Any
-    tokenizer: Any
-    thinking_prefill: str
-    max_model_len: int
-    prompt_budget: int
-    prompts: list[Any]
-    dropped_long: int
-
-
-@dataclass(frozen=True)
-class _WorkloadState:
-    prompts_per_step: int
-    update_horizon: int
-    prompt_pool_fingerprint: str
-    workdir: str
-    shim_dir: str
-    local_dir: str
-    export_root: str
-    mutation_failure_path: str
-    score_delivery_failure_path: str
-    abandonment_failure_path: str
-    resample_failure_path: str
-    cycle_commit_failure_path: str
-    train_file: str
-    val_file: str
-    lora_rank: int
-    lora_alpha: int
-    target_modules: Any
-    warmstart_adapter: str | None
-
-
-@dataclass(frozen=True)
-class _RuntimeState:
-    python_bin: str
-    model_path: str
-    gpu_count: int
-    save_freq: int
-    loggers: list[str]
-    project_name: str
-    experiment_name: str
-    gdn_reset_arch: str | None
-    entry_path: str
-    reward_path: str
-    resume_step: int
-    resume_state: dict[str, Any] | None
-    bridge: Any
-
-
-@dataclass(frozen=True)
-class _ChildCallbacks:
-    on_line: Any
-    on_step: Any
-    child_heartbeat: Any
-    liveness_fields: Any
-    progress: dict[str, Any]
-    wandb_link: dict[str, str | None]
-    child_tail: Any
-
-
-@dataclass(frozen=True)
-class _ChildResult:
-    final_accounting: dict[str, Any]
-    actor_dir: str
-    final_step: int
-    train_wall: float
-    peak_gpu_gb: float
-    train_started_at: float
-    wandb_url: str | None
-    wandb_id: str | None
+from flash.engine.worker.train.opd.reporting import (
+    _build_train_note_sections as _build_train_note_sections,
+)
+from flash.engine.worker.train.opd.state import (
+    _ChildCallbacks,
+    _ChildResult,
+    _OpdRequest,
+    _PromptState,
+    _RuntimeState,
+    _WorkloadState,
+)
+from flash.engine.worker.verl.child_io import LORA_ROLLOUT_GUARD_SHIM
+from flash.engine.worker.verl.parallelism import (
+    ULYSSES_SEQUENCE_PARALLEL_SIZE,
+    resolve_reshard_after_forward,
+)
 
 
 def _prepare_request(spec: Any) -> _OpdRequest:
@@ -196,6 +124,31 @@ def _validate_teacher_transport() -> tuple[str, str]:
     return capability, control_panel_url
 
 
+def _prepare_prompt_messages(
+    example: dict,
+    messages: list[dict],
+    *,
+    multi_turn: bool,
+    package_root: str | None,
+) -> tuple[list[dict], tuple[str, ...]]:
+    from flash.content.multimodal import normalize_prompt_images, record_has_images
+
+    if record_has_images(example, messages):
+        normalized = normalize_prompt_images(example, messages, package_root)
+        if multi_turn:
+            _opd_train.validate_transcript_messages(
+                normalized.messages,
+                source="environment initial prompt",
+                allow_content_blocks=True,
+            )
+        return normalized.messages, tuple(normalized.descriptors)
+    if multi_turn:
+        messages = _opd_train.validate_transcript_messages(
+            messages, source="environment initial prompt"
+        )
+    return messages, ()
+
+
 def _prepare_prompts(
     request: _OpdRequest,
     prompt_rows: list[tuple[Any, Any]],
@@ -203,11 +156,7 @@ def _prepare_prompts(
     capability: str,
     control_panel_url: str,
 ) -> _PromptState:
-    from flash.content.multimodal import (
-        image_teacher_prompt_messages,
-        normalize_prompt_images,
-        record_has_images,
-    )
+    from flash.content.multimodal import image_teacher_prompt_messages
     from flash.engine.worker.teacher.client import TeacherClient
 
     teacher = TeacherClient(capability, control_panel_url, request.knobs.teacher_model)
@@ -226,8 +175,12 @@ def _prepare_prompts(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     thinking_prefill = _opd_train._thinking_prefill_text(tokenizer)
-    requested_len = request.knobs.max_length or (
-        _opd_train.RECIPE.opd.max_prompt_len + request.knobs.max_completion
+    from flash.engine.plan.vram import opd_rollout_seq_len
+
+    requested_len = opd_rollout_seq_len(
+        request.knobs.max_length,
+        request.knobs.max_completion,
+        bool(_opd_train._w.THINKING),
     )
     # clamp to the architecture BEFORE deriving the prompt budget, so every downstream length agrees.
     # clamping only the engine would admit prompts sized against the unclamped budget and then fail
@@ -255,15 +208,14 @@ def _prepare_prompts(
     with _opd_train.liveness_heartbeat("opd_image_prep", progress=lambda: prepped[0]):
         for example, messages in prompt_rows:
             prepped[0] += 1
-            if request.multi_turn:
-                messages = _opd_train.validate_transcript_messages(
-                    messages, source="environment initial prompt"
-                )
-            if record_has_images(example, messages):
+            student_messages, image_descriptors = _prepare_prompt_messages(
+                example,
+                messages,
+                multi_turn=request.multi_turn,
+                package_root=package_root,
+            )
+            if image_descriptors:
                 assert processor is not None
-                normalized = normalize_prompt_images(example, messages, package_root)
-                student_messages = normalized.messages
-                image_descriptors = tuple(normalized.descriptors)
                 teacher_messages = image_teacher_prompt_messages(
                     student_messages, len(image_descriptors)
                 )
@@ -275,9 +227,7 @@ def _prepare_prompts(
                     enable_thinking=bool(_opd_train._w.THINKING),
                 )
             else:
-                student_messages = messages
-                teacher_messages = messages
-                image_descriptors = ()
+                teacher_messages = student_messages
                 if processor is not None:
                     # mixed job: the verl child tokenizes EVERY row through the multimodal dataset
                     # path (the processor), so text-only rows must freeze via the same path or the
@@ -292,7 +242,7 @@ def _prepare_prompts(
                 else:
                     prompt_ids = _opd_train._normalize_prompt_ids(
                         tokenizer.apply_chat_template(
-                            messages,
+                            student_messages,
                             tokenize=True,
                             add_generation_prompt=True,
                             enable_thinking=_opd_train._w.THINKING,
@@ -437,12 +387,12 @@ def _materialize_child_files(
         int(getattr(request.spec.gpu, "count", 1) or 1),
         workload.prompts_per_step * knobs.group_size,
     )
-    save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else knobs.save_every
+    default_save_freq = max(1, min(knobs.save_every, workload.update_horizon))
+    save_freq = math.gcd(*knobs.save_at_steps) if knobs.save_at_steps else default_save_freq
     # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
     loggers = _opd_train.resolve_verl_loggers(caps)
-    project_name = (
-        request.spec.wandb.project if request.spec and request.spec.wandb else None
-    ) or "flash"
+    wandb = request.spec.wandb if request.spec else None
+    project_name = wandb.project if wandb and wandb.project else "flash"
     experiment_name = _opd_train._w.wandb_run_name()
     entry_path, reward_path = _write_child_shims(
         request,
@@ -500,34 +450,38 @@ def _write_child_shims(
     shim_dir = workload.shim_dir
     parent_dir = os.path.dirname(_opd_train.__file__)
     copies = (
+        ("train/core/child/runtime.py", "flash_verl_runtime.py"),
+        ("train/core/child/glue.py", "flash_multiturn_glue.py"),
+        ("train/opd/child/runtime.py", "flash_opd_runtime.py"),
         ("train/opd/child/plugin.py", "flash_opd_plugin.py"),
-        # the plugin imports this by its flat name at child-import time, so it has to land next to it.
         ("train/opd/child/bridge.py", "flash_opd_bridge.py"),
         ("train/opd/child/structured.py", "flash_opd_structured.py"),
         ("train/opd/child/multiturn.py", "flash_opd_multiturn.py"),
-        ("train/core/child/glue.py", "flash_multiturn_glue.py"),
+        ("train/opd/child/entry.py", "flash_opd_entry.py"),
+        ("train/opd/child/replay_guard.py", "flash_opd_replay_guard.py"),
+        ("../../_internal/diagnostics.py", "flash_child_diagnostics.py"),
     )
     for source, target in copies:
         shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
     entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
-    with open(entry_path, "w", encoding="utf-8") as file:
-        file.write("import verl\nfrom flash_opd_plugin import main\nmain()\n")
     # use a zero custom reward: verl still runs scoring when use_task_rewards=false, and its default
     # registry has no flash_opd entry (reward_loop.py:146-155).
     reward_path = os.path.join(shim_dir, "flash_opd_reward.py")
     with open(reward_path, "w", encoding="utf-8") as file:
         file.write(_opd_train._OPD_ZERO_REWARD_SOURCE)
-    opd_shim_source = _opd_train._render_opd_sitecustomize(
-        save_at_steps=request.knobs.save_at_steps,
-        total_steps=workload.update_horizon,
-    )
-    if gdn_reset_arch is not None:
-        opd_shim_source += _opd_train.render_gdn_varlen_shim(gdn_reset_arch)
-    if "wandb" in loggers:
-        opd_shim_source += _opd_train.render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(opd_shim_source)
+        file.write(_opd_train.render_sitecustomize_bootstrap())
     return entry_path, reward_path
+
+
+def _spec_gpu_type(spec: Any) -> str:
+    """The card class the run landed on, from the spec the caller passed.
+
+    Absent spec or absent gpu table answers "", which the zero-2 gate reads as "unknown hardware"
+    and falls closed to zero-3 on. Guessing a card here would price the gate off hardware the run
+    may not have.
+    """
+    return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
 
 
 def _build_base_config(
@@ -557,6 +511,22 @@ def _build_base_config(
         "n_gpus_per_node": runtime.gpu_count,
         # opd shards by DATA -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why.
         "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
+        # zero-2 vs zero-3, decided by the allocator's own fit model so the worker cannot spend
+        # memory the shape was not admitted with. the spec carries the SELECTED class and count
+        # (`_spec_with_gpu`), so this asks about the hardware the run actually landed on.
+        # read it off `request.spec` like every other spec lookup here: the caller may pass a spec
+        # that is NOT the process-global JOB_SPEC (`opd_train.py`: `spec or _w.JOB_SPEC`), and
+        # sizing the gate off different hardware than the run uses is the exact allocator/worker
+        # divergence this gate exists to prevent.
+        "reshard_after_forward": resolve_reshard_after_forward(
+            model_id=request.model_id,
+            algorithm="opd",
+            gpu_type=_spec_gpu_type(getattr(request, "spec", None)),
+            n_gpus=int(runtime.gpu_count),
+            train=getattr(getattr(request, "spec", None), "train", None),
+            thinking=bool(_opd_train._w.THINKING),
+            model_revision=str(getattr(request, "model_revision", "") or ""),
+        ),
         "seed": _opd_train._w.backend_seed(_opd_train._w.SEED),
         "project_name": runtime.project_name,
         "experiment_name": runtime.experiment_name,
@@ -585,16 +555,21 @@ def _build_child_callbacks(
     progress_state: Any,
     bridge: Any,
     resume_step: int,
+    shim_markers: str,
+    expected_shims: tuple[str, ...],
 ) -> _ChildCallbacks:
     progress = {
         "step": resume_step,
         "loss": None,
         "truncation_rate": None,
+        "discarded_rollouts": None,
         "truncation_step": None,
     }
     wandb_link: dict[str, str | None] = {}
+    shims_verified = False
 
     def on_line(line: str) -> None:
+        nonlocal shims_verified
         watcher.raise_if_failed()
         link = _opd_train.parse_wandb_link(line)
         if link is not None:
@@ -602,6 +577,16 @@ def _build_child_callbacks(
         step_number = _opd_train.verl_step_number(line)
         if step_number is None:
             return
+        # the first step line is the training-start boundary: sitecustomize import is long finished
+        # by then, so a marker still missing means this child never ran ours at all -- a shadowing
+        # sitecustomize or a dropped PYTHONPATH entry -- and every rollout it has already served
+        # could have come from the base model. raising here kills the child (run_verl_training
+        # tears the process group down on a callback failure), which costs one step instead of the
+        # whole gpu and teacher budget. not on the first output line: fragments print while later
+        # ones are still applying.
+        if not shims_verified:
+            _opd_train.verify_applied_shim_markers(shim_markers, expected_shims)
+            shims_verified = True
         # use parse_verl_metric because numpy 2 pprint emits np.float64(...); float() would drop
         # every step and leave a trained run with an empty loss curve.
         loss = _opd_train.parse_verl_metric(line, "actor/distillation/loss")
@@ -613,7 +598,10 @@ def _build_child_callbacks(
             # when NO step ever produced a distillation loss.
             return
         progress["loss"] = loss
-        progress["truncation_rate"] = progress_state.record_step(step_number, loss, bridge)
+        (
+            progress["truncation_rate"],
+            progress["discarded_rollouts"],
+        ) = progress_state.record_step(step_number, loss, bridge)
         progress["truncation_step"] = step_number
 
     def on_step(step: int) -> None:
@@ -623,15 +611,21 @@ def _build_child_callbacks(
             payload["loss"] = progress["loss"]
         if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
             payload["truncation_rate"] = progress["truncation_rate"]
+            payload["discarded_rollouts"] = progress["discarded_rollouts"]
         _opd_train._w.heartbeat("opd_step", **payload)
 
     def child_heartbeat() -> None:
         _opd_train._w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
 
     child_tail = _opd_train.ChildOutputTail()
-    # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside
+    # one instance for the whole run: it measures silence across ticks, so it cannot live inside
     # the per-tick callback.
     tail_staleness = _opd_train.ChildTailStaleness()
+    silence_watchdog = _opd_train.VerlChildSilenceWatchdog(
+        child_tail,
+        baseline_step=resume_step,
+        parent_work=bridge.parent_work,
+    )
 
     def liveness_fields() -> dict[str, object]:
         return _opd_train.stall_tail_fields(
@@ -646,6 +640,7 @@ def _build_child_callbacks(
         progress,
         wandb_link,
         child_tail,
+        silence_watchdog,
     )
 
 
@@ -660,7 +655,22 @@ def _run_child(
     overrides = _opd_train.build_opd_overrides(config)
     progress_state = _opd_train._OpdProgressState(runtime.resume_state)
     watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state)
-    callbacks = _build_child_callbacks(watcher, progress_state, runtime.bridge, runtime.resume_step)
+    shim_markers = _opd_train.shim_marker_file(workload.shim_dir)
+    # the child installs opd-core only for a nonempty schedule, because exact-save
+    # filtering is the entire meaning of that marker.
+    expected_shims = (
+        (("opd-core",) if request.knobs.save_at_steps else ())
+        + (LORA_ROLLOUT_GUARD_SHIM,)
+        + (("gdn-varlen",) if runtime.gdn_reset_arch else ())
+    )
+    callbacks = _build_child_callbacks(
+        watcher,
+        progress_state,
+        runtime.bridge,
+        runtime.resume_step,
+        shim_markers,
+        expected_shims,
+    )
     child_env = _build_child_env(request, prompt_state, workload, runtime, eos_token_ids)
     command = [runtime.python_bin, runtime.entry_path, *overrides]
     gpu_sampler = _opd_train._NvidiaSmiPeakSampler().start()
@@ -676,6 +686,7 @@ def _run_child(
                 progress=lambda: int(callbacks.progress["step"] or 0),
                 progress_step=True,
                 fields=callbacks.liveness_fields,
+                sample_off_thread=True,
             ):
                 return_code = _opd_train.run_verl_training(
                     command,
@@ -684,11 +695,16 @@ def _run_child(
                     on_line=callbacks.on_line,
                     heartbeat=callbacks.child_heartbeat,
                     tail=callbacks.child_tail,
+                    silence_watchdog=callbacks.silence_watchdog,
                 )
                 training_completed = return_code == 0
     finally:
-        watcher.stop(require_complete=training_completed)
-    peak_gpu_gb = gpu_sampler.stop_gb()
+        try:
+            watcher.stop(require_complete=training_completed)
+        finally:
+            # the sampler polls nvidia-smi on a thread of its own. stop it even when either the
+            # child callback or watcher cleanup raises, because this worker outlives the run.
+            peak_gpu_gb = gpu_sampler.stop_gb()
     truncation_window = None
     if return_code != 0:
         truncation_window = progress_state.truncation_window(
@@ -736,9 +752,7 @@ def _build_checkpoint_watcher(
         group_size=request.knobs.group_size,
         accounting_state=progress_state.checkpoint_state,
     )
-    watcher.processed_steps.update(
-        _opd_train._processed_resume_steps(request.knobs.save_at_steps, runtime.resume_step)
-    )
+    _opd_train._seed_resume_lifecycle(watcher, request.knobs.save_at_steps, runtime.resume_step)
     return watcher
 
 
@@ -769,6 +783,13 @@ def _build_child_env(
         abandonment_failure_path=workload.abandonment_failure_path,
         resample_failure_path=workload.resample_failure_path,
         cycle_commit_failure_path=workload.cycle_commit_failure_path,
+        plugin_config=_opd_train._build_opd_plugin_config(
+            shim_dir=workload.shim_dir,
+            save_at_steps=request.knobs.save_at_steps,
+            total_steps=workload.update_horizon,
+            gdn_model_type=runtime.gdn_reset_arch,
+            loggers=runtime.loggers,
+        ),
     )
 
 
@@ -858,80 +879,3 @@ def _export_and_upload_adapter(
     )
     _opd_train._w.hf_upload_folder(adapter_dir, "adapter", required=True)
     return adapter_dir
-
-
-def _build_train_note_sections(
-    request: _OpdRequest,
-    prompt_state: _PromptState,
-    workload: _WorkloadState,
-    runtime: _RuntimeState,
-    result: _ChildResult,
-    download_seconds: float,
-) -> tuple[
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, Any],
-    tuple[dict[str, Any], dict[str, Any]],
-]:
-    final_accounting = result.final_accounting
-    knobs = request.knobs
-    initial = {
-        "epochs": knobs.epochs,
-        "retained_prompts": len(prompt_state.prompts),
-        "dropped_long_prompts": prompt_state.dropped_long,
-        "method": "gkd",
-        "init_from_adapter": request.spec.train.init_from_adapter or None,
-        "teacher_model": knobs.teacher_model,
-        "download_seconds": download_seconds,
-        "thinking": _opd_train._w.THINKING,
-        "loss_curve": final_accounting["loss_curve"],
-        "mean_coverage": (
-            float(final_accounting["coverage_sum"]) / int(final_accounting["aligned_sequences"])
-            if final_accounting["aligned_sequences"]
-            else 0.0
-        ),
-    }
-    accounting = {
-        "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
-        "forced_tokens": int(final_accounting["forced_tokens"]),
-        "dropped_forced_groups": int(final_accounting["dropped_forced_groups"]),
-        "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
-        "teacher_output_tokens": int(final_accounting["teacher_output_tokens"]),
-        "aligned_sequences": int(final_accounting["aligned_sequences"]),
-        "empty_alignments": int(final_accounting["empty_alignments"]),
-        "teacher_ok": int(final_accounting["teacher_ok"]),
-    }
-    training = {
-        "temperature": knobs.temperature,
-        "group_size": knobs.group_size,
-        "prompts_per_step": workload.prompts_per_step,
-        "max_completion_len": knobs.max_completion,
-        "multi_turn": request.multi_turn,
-        "max_turns": request.max_turns if request.multi_turn else None,
-        "episodes": int(final_accounting["episodes_seen"]) if request.multi_turn else None,
-        "mean_turns_per_episode": (
-            int(final_accounting["mt_turn_records"]) / int(final_accounting["episodes_seen"])
-            if request.multi_turn and final_accounting["episodes_seen"]
-            else None
-        ),
-    }
-    backend = (
-        {
-            "rollout_backend": "verl_vllm",
-            "verl_version": "0.8.0",
-            "verl_backend": "fsdp",
-            # report the EXECUTED width, not the allocation: the card count here would claim a
-            # sequence-parallel run that did not happen. token-balanced batching makes every
-            # allocated rank a dp rank, so unlike sft the executed dp width IS the card count.
-            "ulysses_sequence_parallel_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
-            "data_parallel_size": runtime.gpu_count,
-        },
-        {
-            "peak_gpu_gb": result.peak_gpu_gb,
-            "warm_started": bool(workload.warmstart_adapter),
-            "resumed": bool(runtime.resume_step),
-            "wandb_project": runtime.project_name if "wandb" in runtime.loggers else None,
-            "wandb_run_name": runtime.experiment_name if "wandb" in runtime.loggers else None,
-        },
-    )
-    return initial, accounting, training, backend

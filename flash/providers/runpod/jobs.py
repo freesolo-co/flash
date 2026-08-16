@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio  # noqa: F401
-import base64
 import contextlib
 import json
 import math
@@ -12,6 +11,7 @@ from dataclasses import dataclass
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
+from flash.core.spec import gpu_count_of
 from flash.providers._lifecycle.deadline import (
     deadline_kwargs,
     require_create_allowance,
@@ -38,12 +38,9 @@ from flash.providers.runpod.serverless import (  # noqa: F401
     DEFAULT_EXECUTION_TIMEOUT_MS,
     FLASH_SDK_LOCK,
     WORKER_IMAGE,
-    WORKER_SYSTEM_DEPS,
     _patch_runpod_backoff,
-    _train_body,
     isolate_flash_state,
     min_cuda_for,
-    resolve_worker_deps,
     worker_image_for_gpu,
 )
 from flash.providers.runpod.serverless import (
@@ -63,8 +60,8 @@ __all__ = [
     "JobHandle",
     "PollResult",
     "apply_disk_gb",
-    "build_function_input",
     "capacity_escalation_note",
+    "capacity_grace_multiplier",
     "decode_output",
     "deploy_train_endpoint",
     "grow_weight_cache_volumes",
@@ -85,6 +82,28 @@ __all__ = [
 # on_last_gpu (runner/lifecycle.py) is also true when the infra retry budget is exhausted.
 LAST_GPU_CAPACITY_GRACE_S = 900.0
 
+# multi-card shapes are rarer than single cards, so a grace sized for 1x expires on a 4x wait that
+# was merely slow rather than starved. expiring it does not find capacity faster: the supervisor
+# tears the endpoint down and re-requests THE SAME class (`_select_candidate` re-picks the only
+# fitting shape once nothing is untried), so the run pays a fresh cold start to rejoin the same
+# queue it just left. observed: 3-5 attempts and ~55 min of queueing per arm before a single
+# optimizer step, with the multi-GPU arms churning most. scale the wait with the card count
+# instead, so scarcity is waited out on one queue position rather than re-requested.
+CAPACITY_GRACE_PER_GPU_CAP = 4
+
+
+def capacity_grace_multiplier(gpu_count: int) -> int:
+    """Scarcity multiplier on the capacity grace for a ``gpu_count``-card shape.
+
+    Linear in the card count and capped: a 4x shape waits 4x as long as a 1x one, and anything
+    wider than the cap waits the cap rather than growing without bound. Single-card runs multiply
+    by 1, so their timing is exactly what it was.
+    """
+    if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
+        return 1
+    return min(gpu_count, CAPACITY_GRACE_PER_GPU_CAP)
+
+
 # how long ONE "a worker is coming up" health reading keeps suppressing the capacity timer. probes
 # run every 90s, so this absorbs a couple of missed or failed probes and no more: if health stops
 # being readable entirely, the capacity timer re-arms rather than waiting out the run on an
@@ -97,9 +116,12 @@ PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
 TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
 
 
-def stall_kwargs(on_last_gpu: bool = False) -> dict:
-    """poll_job stall-window kwargs. queue/throttled grace is ~5 min normally, ~15 min on last GPU (nowhere left to walk)."""
-    grace = LAST_GPU_CAPACITY_GRACE_S if on_last_gpu else 300.0
+def stall_kwargs(on_last_gpu: bool = False, gpu_count: int = 1) -> dict:
+    """poll_job stall-window kwargs. queue/throttled grace is ~5 min normally, ~15 min on last GPU
+    (nowhere left to walk), then scaled by the card count because multi-card shapes are scarcer."""
+    grace = (LAST_GPU_CAPACITY_GRACE_S if on_last_gpu else 300.0) * capacity_grace_multiplier(
+        gpu_count
+    )
     return {
         "stall_after_s": 1500.0,
         "setup_grace_s": 3000.0,
@@ -189,24 +211,6 @@ def _is_balance_error(exc: Exception) -> bool:
     return "account balance" in str(exc).lower()
 
 
-def build_function_input(payload: dict) -> dict:
-    """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`."""
-    if WORKER_IMAGE:
-        return payload
-    from runpod_flash.runtime.serialization import serialize_args
-    from runpod_flash.stubs.live_serverless import get_function_source
-
-    source, _src_hash = get_function_source(_train_body)
-    return {
-        "function_name": "_train_body",
-        "function_code": source,
-        "args": serialize_args((payload,)),
-        "accelerate_downloads": True,
-        "dependencies": resolve_worker_deps(),
-        "system_dependencies": WORKER_SYSTEM_DEPS,
-    }
-
-
 def _safe_failure_text(value: object, limit: int = FAILURE_TEXT_LIMIT) -> str:
     """Redact credentials out of one part of a user-visible RunPod failure detail.
 
@@ -221,7 +225,7 @@ def _safe_failure_text(value: object, limit: int = FAILURE_TEXT_LIMIT) -> str:
 
 
 def decode_output(output) -> dict:
-    """Decode a queue-job output into the worker's metrics dict (handles live-function and baked-image shapes)."""
+    """Decode a queue-job output into the worker's metrics dict."""
     if isinstance(output, str):
         try:
             output = json.loads(output)
@@ -231,20 +235,6 @@ def decode_output(output) -> dict:
             ) from exc
     if not isinstance(output, dict):
         raise RuntimeError(f"unexpected job output type: {type(output)}")
-    if "success" in output or "result" in output:
-        if output.get("success") and output.get("result") is not None:
-            import cloudpickle
-
-            result = cloudpickle.loads(base64.b64decode(output["result"]))
-            if not isinstance(result, dict):
-                raise RuntimeError(f"flash job returned no metrics: {result!r}")
-            return result
-        err = output.get("error") or "unknown worker error"
-        stdout_tail = _safe_failure_text(output.get("stdout") or "")
-        raise RuntimeError(
-            f"Remote execution failed: {_safe_failure_text(err)}\n"
-            f"--- worker stdout tail ---\n{stdout_tail}"
-        )
     if output.get("error"):
         stdout_tail = _safe_failure_text(output.get("stdout") or "")
         msg = f"Remote execution failed: {_safe_failure_text(output['error'])}"
@@ -365,7 +355,7 @@ def submit_run(
         submitted_ts = time.time()
         job_id = runpod_api.submit_job(
             endpoint_id,
-            build_function_input(payload),
+            payload,
             key_fingerprint=key_fingerprint,
             **deadline_kwargs(runpod_api.submit_job, deadline_at),
         )
@@ -440,7 +430,9 @@ def submit_run(
         current_attempt=attempt_id,
         **deadline_kwargs(poll_job, deadline_at),
         on_last_gpu=on_last_gpu,
-        **stall_kwargs(on_last_gpu=on_last_gpu),
+        # the count actually rented for this attempt, which allocation may have resolved to fewer
+        # cards than the spec's ceiling named -- so read the effective spec, not the run's request.
+        **stall_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
     )
 
 

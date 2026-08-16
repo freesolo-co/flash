@@ -20,6 +20,12 @@ from uuid import uuid4
 
 _ALLOWED_MESSAGE_KEYS = frozenset({"role", "content"})
 _PROBE_PREFIX = "flash-env-glue-probe"
+# the media block types verl's own dataset parser substitutes for a placeholder, and the exact set
+# it then extracts (rl_dataset.py `_build_messages`: `<image>`/`<video>`/`<audio>` become blocks of
+# the matching type, and `_process_multi_modal_info` returns images, videos, audios). duplicated
+# here as literals rather than imported from flash.content.multimodal because this module is copied
+# into the verl child, where flash is not importable -- see the module docstring.
+_MEDIA_BLOCK_TYPES = frozenset({"image", "video", "audio"})
 
 
 def normalize_token_ids(value) -> list[int]:
@@ -39,8 +45,120 @@ def normalize_token_ids(value) -> list[int]:
     return [int(token_id.item() if hasattr(token_id, "item") else token_id) for token_id in value]
 
 
-def validate_transcript_messages(messages: list[dict], *, source: str) -> list[dict]:
-    """require the exact role/content transcript shape the child rollout loops can represent."""
+def content_block_text(content, *, source: str, position: int) -> str:
+    """flatten one openai-style content block list to the text the transcript represents.
+
+    an image-bearing prompt does NOT reach the child as a string. verl's RLHFDataset rewrites the
+    parquet's string content into blocks -- it splits on the `<image>` placeholder and replaces that
+    segment with an image block (rl_dataset.py `_build_messages`) -- so `raw_prompt` arrives as
+    [{"type": "image", ...}, {"type": "text", "text": ...}] for exactly the multimodal rows flash
+    writes. validating that shape as text-only would reject every image episode at turn one.
+
+    the media blocks are dropped rather than rendered here: they are carried separately, as decoded
+    pixels in `multi_modal_data`, and the prompt ids come from the chat template applied to the
+    ORIGINAL block list. this text view exists for the transcript and the inter-turn glue, which are
+    token-level text operations. a block whose type is neither text nor known media is an error
+    rather than a silent drop -- it would mean the model saw something this transcript cannot show.
+    """
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            raise ValueError(
+                f"{source} message {position} has a content block that is not an object"
+            )
+        block_type = block.get("type")
+        if block_type in _MEDIA_BLOCK_TYPES:
+            continue
+        if block_type != "text":
+            raise ValueError(
+                f"{source} message {position} has an unsupported content block type "
+                f"{block_type!r}; a multi-turn transcript can represent text and media blocks only"
+            )
+        text = block.get("text")
+        if not isinstance(text, str):
+            raise ValueError(f"{source} message {position} has a text block without text")
+        parts.append(text)
+    return "".join(parts)
+
+
+def validate_structured_messages(messages: list[dict], *, source: str) -> list[dict]:
+    """validate and canonicalize role/content messages without dropping media placement."""
+    if not isinstance(messages, list):
+        raise ValueError(f"{source} messages must be a list")
+    normalized: list[dict[str, Any]] = []
+    for position, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ValueError(f"{source} message {position} must be an object")
+        extras = sorted(
+            key
+            for key, value in message.items()
+            if key not in _ALLOWED_MESSAGE_KEYS and value is not None
+        )
+        if extras:
+            raise ValueError(
+                f"{source} message {position} carries unsupported transcript metadata {extras}; "
+                "tool names, call ids, tool calls, and other message fields cannot be represented "
+                "in a role/content multi-turn transcript"
+            )
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError(f"{source} message {position} has an invalid role")
+        if isinstance(content, str):
+            normalized.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            raise ValueError(
+                f"{source} message {position} content must be text or content blocks for multi-turn"
+            )
+        blocks: list[dict[str, Any]] = []
+        for block_index, block in enumerate(content):
+            if not isinstance(block, dict):
+                raise ValueError(
+                    f"{source} message {position} has a content block that is not an object"
+                )
+            block_type = block.get("type")
+            allowed_keys = (
+                {"type", block_type} if block_type in _MEDIA_BLOCK_TYPES else {"type", "text"}
+            )
+            extras = sorted(
+                key for key, value in block.items() if key not in allowed_keys and value is not None
+            )
+            if extras:
+                raise ValueError(
+                    f"{source} message {position} content block {block_index} carries unsupported "
+                    f"fields {extras}"
+                )
+            if block_type in _MEDIA_BLOCK_TYPES:
+                blocks.append({"type": block_type})
+            elif block_type == "text" and isinstance(block.get("text"), str):
+                text = block["text"]
+                if not text:
+                    continue
+                if blocks and blocks[-1].get("type") == "text":
+                    blocks[-1]["text"] += text
+                else:
+                    blocks.append({"type": "text", "text": text})
+            else:
+                raise ValueError(
+                    f"{source} message {position} has an unsupported content block at index "
+                    f"{block_index}"
+                )
+        normalized.append({"role": role, "content": blocks})
+    return normalized
+
+
+def validate_transcript_messages(
+    messages: list[dict], *, source: str, allow_content_blocks: bool = False
+) -> list[dict]:
+    """require the exact role/content transcript shape the child rollout loops can represent.
+
+    ``allow_content_blocks`` flattens openai-style block lists to their text instead of rejecting
+    them. it is OFF by default and opted into only by a caller that has already extracted the media
+    out of the ORIGINAL blocks, because dropping to text is lossless only once the pixels are held
+    somewhere else. a caller that has not done that extraction must keep raising: silently training
+    on a caption whose image was discarded is the failure this default exists to prevent.
+    """
     if not isinstance(messages, list):
         raise ValueError(f"{source} messages must be a list")
     normalized = []
@@ -62,7 +180,11 @@ def validate_transcript_messages(messages: list[dict], *, source: str) -> list[d
         content = message.get("content")
         if not isinstance(role, str) or not role.strip():
             raise ValueError(f"{source} message {position} has an invalid role")
-        if not isinstance(content, str):
+        if allow_content_blocks and isinstance(content, list):
+            # a multimodal prompt arrives as content BLOCKS, not a string; flatten to the text this
+            # transcript can represent. the media rides separately as decoded pixels.
+            content = content_block_text(content, source=source, position=position)
+        elif not isinstance(content, str):
             raise ValueError(f"{source} message {position} content must be text for multi-turn")
         normalized.append({"role": role, "content": content})
     return normalized
@@ -259,3 +381,94 @@ async def run_executor_call(loop, callback):
         with contextlib.suppress(Exception):
             await asyncio.shield(task)
         raise
+
+
+def multi_modal_image_count(multi_modal_data) -> int:
+    """how many images a verl multimodal payload carries.
+
+    single-turn and multi-turn both report this count to the bridge, which compares it against the
+    frozen parent prompt. two counters would let the two paths disagree about the same payload, so
+    this is the one definition: verl carries "image" (singular) for a single-image row and "images"
+    for a list, and a bare non-sequence value under either key is one image.
+    """
+    if not multi_modal_data:
+        return 0
+    if not isinstance(multi_modal_data, dict):
+        raise TypeError("verl multimodal data must be a mapping")
+    images = multi_modal_data.get("images")
+    if images is None:
+        images = multi_modal_data.get("image")
+    if images is None:
+        return 0
+    if not isinstance(images, (list, tuple)):
+        return 1
+    try:
+        return len(images)
+    except TypeError as error:
+        raise TypeError("verl multimodal images must be a sized collection") from error
+
+
+class EpisodePrompt:
+    """the tokenized initial prompt plus the decoded media every generate call must carry.
+
+    an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. both
+    apply_chat_template and every generate call need the decoded media alongside the ids, or the
+    engine sees placeholders it cannot expand and the rollout either dies on a feature/placeholder
+    mismatch or conditions on nothing. text-only prompts yield {}.
+
+    the media is frozen at episode start and resent unchanged on every turn. later environment
+    replies never add to it: a mid-episode image would change the placeholder/pixel correspondence
+    the prompt ids were built against, which is why both loops reject one upstream.
+    """
+
+    __slots__ = (
+        "audios",
+        "images",
+        "mm_processor_kwargs",
+        "multi_modal_data",
+        "prompt_ids",
+        "structured_messages",
+        "videos",
+    )
+
+    def __init__(self, multi_modal_data, mm_processor_kwargs, prompt_ids, structured_messages):
+        self.multi_modal_data = multi_modal_data
+        self.mm_processor_kwargs = mm_processor_kwargs
+        self.prompt_ids = prompt_ids
+        self.structured_messages = structured_messages
+        self.images = multi_modal_data.get("images")
+        self.videos = multi_modal_data.get("videos")
+        self.audios = multi_modal_data.get("audios")
+
+    def image_count(self) -> int:
+        """how many images the engine actually decoded for this prompt.
+
+        the bridge authenticates this against the frozen parent prompt, so it counts what the child
+        will condition on rather than what the transcript appears to mention. it must agree with the
+        count the single-turn path reports, hence the shared counter rather than a second one.
+        """
+        return multi_modal_image_count(self.multi_modal_data)
+
+
+async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
+    """extract media and ids before building the canonical structured prompt view.
+
+    order matters: an image prompt arrives as content blocks, so the media and block-rendered ids
+    must be captured before structured validation. the canonical view preserves media placement for
+    bridge authentication and rejects unsupported blocks and message metadata before rollout.
+    """
+    messages = [dict(message) for message in raw_prompt]
+    multi_modal_data = await loop_self.process_multi_modal_info(messages)
+    images = multi_modal_data.get("images")
+    videos = multi_modal_data.get("videos")
+    audios = multi_modal_data.get("audios")
+    mm_processor_kwargs = loop_self._get_mm_processor_kwargs(audios)
+    prompt_ids = await loop_self.apply_chat_template(
+        messages,
+        images=images,
+        videos=videos,
+        audios=audios,
+        mm_processor_kwargs=mm_processor_kwargs,
+    )
+    structured = validate_structured_messages(messages, source="initial prompt")
+    return EpisodePrompt(multi_modal_data, mm_processor_kwargs, prompt_ids, structured)

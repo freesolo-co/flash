@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import importlib
 import inspect
+import io
 import json
 import math
 import os
@@ -31,7 +33,10 @@ import flash.engine.worker as W
 from flash.engine.worker import backend_common, rl_train, sft_train
 from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
-from flash.engine.worker.train.rl import shims as verl_shims
+from flash.engine.worker.train.core.child import runtime as child_runtime
+from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
+from flash.engine.worker.train.rl.child import patches as verl_patches
+from flash.engine.worker.train.rl.child import plugin as grpo_plugin
 
 
 # ------------------------------- dispatch -------------------------------
@@ -281,7 +286,8 @@ def test_grpo_classified_exit_drains_group_after_leader_is_reaped(tmp_path, monk
 def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
     source = inspect.getsource(rl_train._execute_rl_child)
 
-    assert "child_stream = _rl_train()._GrpoSubprocessStream(proc)" in source
+    assert "child_stream = _rl_train()._GrpoSubprocessStream(" in source
+    assert "silence_watchdog=silence_watchdog" in source
     assert "for line in child_stream" in source
     assert "return child_stream.wait_and_classify()" in source
 
@@ -314,6 +320,557 @@ def test_build_verl_dataset_rows_length_mismatch_raises():
 
 def _image_placeholder_count(row) -> int:
     return sum(str(m["content"]).count("<image>") for m in row["prompt"])
+
+
+def _module_scope_imports(source: str) -> set[str]:
+    """top-level packages imported at MODULE scope by ``source`` (nested defs excluded)."""
+    names = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            names.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Try):
+            # the unwrapped tf32 fragment is a bare try/except at module scope; look inside it.
+            for inner in node.body:
+                if isinstance(inner, ast.Import):
+                    names.update(alias.name.split(".")[0] for alias in inner.names)
+                elif isinstance(inner, ast.ImportFrom) and inner.module and inner.level == 0:
+                    names.add(inner.module.split(".")[0])
+    return names
+
+
+def test_no_grpo_plugin_module_imports_cuda_sensitive_packages_at_module_scope():
+    """the regression barrier for the multi-gpu rank-to-device collapse.
+
+    verl loads its external plugin before ray narrows each actor's CUDA visibility. Importing torch,
+    verl, or vllm from plugin module scope can initialize cuda against the full device list and leave
+    every rank on device zero. Installers may import those packages only after the deferred target has
+    completed its real import under the actor's pinned environment.
+    """
+    sources = {
+        "runtime": inspect.getsource(child_runtime),
+        "patches": inspect.getsource(verl_patches),
+        "plugin": inspect.getsource(grpo_plugin),
+    }
+    offenders = {
+        name: sorted(_module_scope_imports(source) & {"torch", "verl", "vllm"})
+        for name, source in sources.items()
+    }
+    assert {name: imports for name, imports in offenders.items() if imports} == {}
+
+
+def _clear_deferred_target(target: str) -> None:
+    sys.modules.pop(target, None)
+    finder = child_runtime._DEFERRED_FINDER
+    finder.pending.pop(target, None)
+    finder.active_targets.discard(target)
+    # the shared finder stays installed while any other target is still armed.
+    if not finder.pending:
+        finder.uninstall()
+
+
+def test_a_deferred_fragment_records_its_marker_only_once_the_patch_applies(tmp_path, monkeypatch):
+    """the marker must mean patched, not merely queued."""
+    target = "flash_marker_probe"
+    markers = tmp_path / "applied_shims.txt"
+    (tmp_path / f"{target}.py").write_text("PATCHED = False\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_deferred_target(target)
+
+    try:
+        child_runtime._arm_deferred(
+            name="probe-fragment",
+            marker_file=str(markers),
+            target=target,
+            patch=lambda module: setattr(module, "PATCHED", True),
+            required=True,
+        )
+        assert backend_common.read_applied_shim_markers(str(markers)) == set()
+        with pytest.raises(RuntimeError, match="never proved these required runtime patches"):
+            backend_common.verify_applied_shim_markers(str(markers), ["probe-fragment"])
+
+        imported = importlib.import_module(target)
+
+        assert imported.PATCHED is True
+        assert backend_common.read_applied_shim_markers(str(markers)) == {"probe-fragment"}
+        backend_common.verify_applied_shim_markers(str(markers), ["probe-fragment"])
+        assert markers.read_text().count("probe-fragment") == 1
+    finally:
+        _clear_deferred_target(target)
+
+
+def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path):
+    """the external plugin may queue required patches but must not execute them while verl imports."""
+    config = {
+        "marker_file": str(tmp_path / "markers"),
+        "dp_cards": 2,
+        "reentrant_checkpointing": True,
+        "multimodal": True,
+        "entropy_quantile": 0.2,
+        "per_turn_credit": True,
+        "stop_sequences": ["</answer>"],
+        "image_pad_token_id": 151655,
+        "structured_outputs": {"json": {"type": "object"}},
+        "save_at_steps": [3],
+        "total_steps": 10,
+        "kl_ref_adapter": True,
+        "multi_turn": True,
+        "gdn_model_type": None,
+        "wandb": False,
+    }
+    registered = []
+
+    def register(name, marker_file, target, installer, *args, **kwargs):
+        registered.append((name, marker_file, target, installer, args, kwargs))
+
+    monkeypatch.setattr(child_runtime, "load_plugin_config_file", lambda _name: config)
+    monkeypatch.setattr(child_runtime, "install_deferred_required", register)
+    monkeypatch.setattr(child_runtime, "install_deferred_lora_rollout_guard", lambda _path: None)
+
+    grpo_plugin.install()
+
+    assert [entry[0] for entry in registered] == [
+        "rank-device-assert",
+        "reentrant-checkpointing",
+        "entropy-quantile",
+        "per-turn-credit",
+        "stop-sequences",
+        "image-pad-ban",
+        "structured-outputs",
+        "exact-save-steps",
+        "kl-ref-adapter",
+        "multi-turn-loop",
+    ]
+    assert registered[0][2] == "verl.single_controller.base.worker"
+    assert [entry[2] for entry in registered[4:7]] == [
+        "verl.experimental.agent_loop.agent_loop",
+        "verl.experimental.agent_loop.agent_loop",
+        "verl.experimental.agent_loop.agent_loop",
+    ]
+    assert not Path(config["marker_file"]).exists()
+
+
+def test_parent_and_child_share_required_patch_registry_and_preserve_zero_entropy(
+    monkeypatch, tmp_path
+):
+    config = {
+        "marker_file": str(tmp_path / "markers"),
+        "dp_cards": 2,
+        "reentrant_checkpointing": False,
+        "multimodal": False,
+        "entropy_quantile": 0.0,
+        "per_turn_credit": False,
+        "stop_sequences": [],
+        "image_pad_token_id": None,
+        "structured_outputs": None,
+        "save_at_steps": [],
+        "total_steps": 10,
+        "kl_ref_adapter": False,
+        "multi_turn": True,
+        "gdn_model_type": "qwen3_5",
+        "wandb": False,
+    }
+    installed = []
+
+    def deferred(name, _marker_file, _target, _installer, *args, **_kwargs):
+        installed.append(name)
+        if name == "entropy-quantile":
+            assert args == (0.0,)
+
+    monkeypatch.setattr(child_runtime, "load_plugin_config_file", lambda _name: config)
+    monkeypatch.setattr(child_runtime, "install_deferred_required", deferred)
+    monkeypatch.setattr(
+        child_runtime,
+        "install_deferred_lora_rollout_guard",
+        lambda _marker_file: installed.append(child_runtime.LORA_ROLLOUT_GUARD_SHIM),
+    )
+    monkeypatch.setattr(
+        child_runtime,
+        "install_deferred_gdn",
+        lambda model_type, _marker_file: installed.append(
+            "gdn-varlen" if model_type == "qwen3_5" else "wrong-gdn"
+        ),
+    )
+
+    grpo_plugin.install()
+
+    expected = grpo_plugin.required_patch_names(config)
+    assert installed == expected
+    assert expected == [
+        "rank-device-assert",
+        "entropy-quantile",
+        "multi-turn-loop",
+        "lora-rollout-guard",
+        "gdn-varlen",
+    ]
+
+
+def _install_entropy_test_modules(monkeypatch, observed):
+    class FakeTensor:
+        def __init__(self, values):
+            self.values = np.asarray(values)
+
+        def bool(self):
+            return FakeTensor(self.values.astype(bool))
+
+        def float(self):
+            return FakeTensor(self.values.astype(float))
+
+        def reshape(self, *shape):
+            return FakeTensor(self.values.reshape(*shape))
+
+        def numel(self):
+            return self.values.size
+
+        def clone(self):
+            return FakeTensor(self.values.copy())
+
+        def tolist(self):
+            return self.values.tolist()
+
+        def __getitem__(self, index):
+            if isinstance(index, FakeTensor):
+                index = index.values
+            return FakeTensor(self.values[index])
+
+        def __mul__(self, other):
+            values = other.values if isinstance(other, FakeTensor) else other
+            return FakeTensor(self.values * values)
+
+        def __ge__(self, other):
+            return FakeTensor(self.values >= other)
+
+        def __and__(self, other):
+            return FakeTensor(self.values & other.values)
+
+    distributed = types.ModuleType("torch.distributed")
+    distributed.is_available = lambda: False
+    distributed.is_initialized = lambda: False
+    distributed.get_world_size = lambda: 1
+    torch = types.ModuleType("torch")
+    torch.__path__ = []
+    torch.distributed = distributed
+    torch.bool = bool
+    torch.tensor = lambda values: FakeTensor(values)
+    torch.zeros_like = lambda tensor, dtype=None: FakeTensor(
+        np.zeros_like(tensor.values, dtype=bool)
+    )
+    torch.quantile = lambda tensor, threshold: float(np.quantile(tensor.values, threshold))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.distributed", distributed)
+    losses = types.ModuleType("verl.workers.utils.losses")
+
+    def get_policy_loss_fn(_loss_mode):
+        def policy_loss(*_args, **kwargs):
+            observed["policy_mask"] = kwargs["response_mask"].clone()
+            return "policy"
+
+        return policy_loss
+
+    def ppo_loss(_config, _model_output, data, _dp_group=None):
+        observed["other_term_mask"] = data["response_mask"].clone()
+        return losses.get_policy_loss_fn("vanilla")(response_mask=data["response_mask"])
+
+    losses.get_policy_loss_fn = get_policy_loss_fn
+    losses.ppo_loss = ppo_loss
+    padding = types.ModuleType("verl.workers.utils.padding")
+    padding.no_padding_2_padding = lambda entropy, _data: entropy
+    utils = types.ModuleType("verl.workers.utils")
+    utils.losses = losses
+    modules = {
+        "verl": types.ModuleType("verl"),
+        "verl.workers": types.ModuleType("verl.workers"),
+        "verl.workers.utils": utils,
+        "verl.workers.utils.losses": losses,
+        "verl.workers.utils.padding": padding,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+    return torch, losses
+
+
+@pytest.mark.parametrize(
+    ("authored_quantile", "expected_threshold"),
+    [(0.2, 0.8), (0.0, 1.0)],
+)
+def test_entropy_installer_masks_only_policy_loss_and_preserves_authored_threshold(
+    monkeypatch, authored_quantile, expected_threshold
+):
+    observed = {}
+    torch, losses = _install_entropy_test_modules(monkeypatch, observed)
+    real_quantile = torch.quantile
+    thresholds = []
+
+    def quantile(values, threshold):
+        thresholds.append(float(threshold))
+        return real_quantile(values, threshold)
+
+    monkeypatch.setattr(torch, "quantile", quantile)
+    verl_patches.install_entropy_quantile(authored_quantile)
+    installed = losses.ppo_loss
+    response_mask = torch.tensor([[True, True, True, True]])
+    entropy = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+
+    assert losses.ppo_loss(None, {"entropy": entropy}, {"response_mask": response_mask}) == "policy"
+    assert thresholds == pytest.approx([expected_threshold])
+    assert observed["policy_mask"].tolist() == [[False, False, False, True]]
+    assert observed["other_term_mask"].tolist() == [[True, True, True, True]]
+    assert response_mask.tolist() == [[True, True, True, True]]
+
+    verl_patches.install_entropy_quantile(authored_quantile)
+    assert losses.ppo_loss is installed
+
+
+def test_exact_save_installer_keeps_authored_and_final_steps_and_is_idempotent(
+    monkeypatch,
+):
+    calls = []
+
+    class RayPPOTrainer:
+        def __init__(self):
+            self.global_steps = 0
+
+        def _save_checkpoint(self):
+            calls.append(self.global_steps)
+            return self.global_steps
+
+    ray_trainer = types.ModuleType("verl.trainer.ppo.ray_trainer")
+    ray_trainer.RayPPOTrainer = RayPPOTrainer
+    ppo = types.ModuleType("verl.trainer.ppo")
+    ppo.ray_trainer = ray_trainer
+    modules = {
+        "verl": types.ModuleType("verl"),
+        "verl.trainer": types.ModuleType("verl.trainer"),
+        "verl.trainer.ppo": ppo,
+        "verl.trainer.ppo.ray_trainer": ray_trainer,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    config = {"save_at_steps": (), "total_steps": 20}
+    assert "exact-save-steps" not in grpo_plugin.required_patch_names(config)
+    verl_patches.install_exact_save_steps((7, 13), 20)
+    installed = RayPPOTrainer._save_checkpoint
+    trainer = RayPPOTrainer()
+    for step in (1, 7, 10, 13, 20):
+        trainer.global_steps = step
+        trainer._save_checkpoint()
+
+    assert calls == [7, 13, 20]
+    verl_patches.install_exact_save_steps((7, 13), 20)
+    assert RayPPOTrainer._save_checkpoint is installed
+
+
+def test_the_deferred_registry_runs_patches_at_the_targets_real_import(tmp_path, monkeypatch):
+    """callbacks sharing one target run in registration order after the module finishes importing."""
+    target = "flash_defer_probe"
+    marker_file = str(tmp_path / "markers")
+    (tmp_path / f"{target}.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    fired = []
+    _clear_deferred_target(target)
+
+    try:
+        for name in ("first", "second"):
+            child_runtime._arm_deferred(
+                name=name,
+                marker_file=marker_file,
+                target=target,
+                patch=lambda module, patch_name=name: fired.append((patch_name, module.VALUE)),
+                required=True,
+            )
+        assert fired == []
+
+        importlib.import_module(target)
+
+        assert fired == [("first", "imported"), ("second", "imported")]
+        assert Path(marker_file).read_text().splitlines() == ["first", "second"]
+        assert target not in child_runtime._DEFERRED_FINDER.pending
+        assert child_runtime._DEFERRED_FINDER not in sys.meta_path
+    finally:
+        _clear_deferred_target(target)
+
+
+def test_a_deferred_patch_registered_after_its_target_is_imported_applies_immediately(
+    monkeypatch, tmp_path
+):
+    # ordering must not decide whether a patch happens. an imported target cannot be intercepted.
+    target = "flash_defer_present"
+    module = types.ModuleType(target)
+    fired = []
+    monkeypatch.setitem(sys.modules, target, module)
+
+    child_runtime._arm_deferred(
+        name="present",
+        marker_file=str(tmp_path / "markers"),
+        target=target,
+        patch=lambda imported: fired.append(imported),
+        required=True,
+    )
+
+    assert fired == [module]
+
+
+def test_a_deferred_body_that_raises_hard_exits_and_cannot_be_retried_around(tmp_path):
+    """a required deferred installer kills the child before an importer can retry unpatched."""
+    target = "flash_defer_boom"
+    (tmp_path / f"{target}.py").write_text("VALUE = 1\n")
+    rl_train.copy_grpo_child_modules(str(tmp_path))
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(tmp_path)!r})\n"
+        "import flash_verl_runtime as runtime\n"
+        "def boom():\n"
+        "    raise RuntimeError('fragment could not apply')\n"
+        f"runtime.install_deferred_required('boom-fragment', {str(tmp_path / 'markers')!r}, "
+        f"{target!r}, boom)\n"
+        "try:\n"
+        f"    import {target}\n"
+        "except BaseException:\n"
+        "    pass\n"
+        f"import {target} as retried\n"
+        "print('REACHED_RETRY', retried.VALUE)\n"
+    )
+
+    done = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=120)
+
+    assert done.returncode == backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, done.stdout
+    assert "REACHED_RETRY" not in done.stdout
+    assert "boom-fragment" in done.stderr
+
+
+def test_the_rank_device_assert_is_inert_on_a_single_card_run(monkeypatch):
+    # one rank cannot collide with itself, so the installer must return before importing torch/verl.
+    imported = []
+    original_import = __import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"torch", "verl"}:
+            imported.append(name)
+            raise AssertionError(f"single-card rank check imported {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", guarded_import)
+    verl_patches.install_rank_device_assert(0)
+    verl_patches.install_rank_device_assert(1)
+    assert imported == []
+
+
+def test_the_rank_device_assert_compares_uuids_after_verls_own_init():
+    """the check runs after verl pins the worker and compares physical uuids, not ordinals."""
+    source = inspect.getsource(verl_patches.install_rank_device_assert)
+    installer = ast.parse(source).body[0]
+    wrapper = next(
+        node
+        for node in ast.walk(installer)
+        if isinstance(node, ast.FunctionDef) and node.name == "init"
+    )
+
+    def statement_calling(name: str) -> int:
+        for index, node in enumerate(wrapper.body):
+            if any(
+                isinstance(inner, ast.Call) and getattr(inner.func, "id", "") == name
+                for inner in ast.walk(node)
+            ):
+                return index
+        raise AssertionError(f"{name} is not called in rank-device init wrapper")
+
+    assert statement_calling("original_init") < statement_calling("check")
+    assert "get_device_properties" in source
+    assert "uuid" in source
+    assert "raise RuntimeError(" in source
+
+
+def _run_rank_device_check(tmp_path, monkeypatch, bindings, *, env_rank=None):
+    """run the installer once per rank against fake torch and verl modules sharing one claims file."""
+    claims = tmp_path / "rank_device_claims.txt"
+    monkeypatch.setenv("FLASH_RANK_DEVICE_CLAIMS", str(claims))
+    results = []
+    for rank, ordinal, uuid in bindings:
+        torch_stub = types.ModuleType("torch")
+        torch_stub.cuda = SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda ordinal=ordinal: ordinal,
+            get_device_properties=lambda _o, uuid=uuid: SimpleNamespace(uuid=uuid),
+        )
+
+        class _Worker:
+            def __init__(self, rank=rank):
+                # verl's Worker.__init__ stores the rank on the instance before it returns, so the
+                # wrapper that runs after it can read the same value verl will use downstream.
+                self._rank = rank
+
+        worker_module = types.ModuleType("verl.single_controller.base.worker")
+        worker_module.Worker = _Worker
+        base = types.ModuleType("verl.single_controller.base")
+        base.worker = worker_module
+        for name, module in {
+            "torch": torch_stub,
+            "verl": types.ModuleType("verl"),
+            "verl.single_controller": types.ModuleType("verl.single_controller"),
+            "verl.single_controller.base": base,
+            "verl.single_controller.base.worker": worker_module,
+        }.items():
+            monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setenv("RANK", str(rank if env_rank is None else env_rank))
+        monkeypatch.setenv("LOCAL_RANK", str(rank))
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(ordinal))
+        verl_patches.install_rank_device_assert(len(bindings))
+        try:
+            _Worker()
+            results.append(None)
+        except RuntimeError as exc:
+            results.append(str(exc))
+    return results
+
+
+def test_the_rank_device_assert_passes_when_every_rank_opened_its_own_card(tmp_path, monkeypatch):
+    # the healthy multi-card shape: distinct uuids, so nothing is refused. both ranks report
+    # ordinal 0 because ray gave each actor its own CUDA_VISIBLE_DEVICES -- which is exactly why
+    # ordinals cannot be the thing compared.
+    errors = _run_rank_device_check(tmp_path, monkeypatch, [(0, 0, "GPU-aaaa"), (1, 0, "GPU-bbbb")])
+    assert errors == [None, None]
+
+
+def test_the_rank_device_assert_refuses_when_two_ranks_land_on_one_card(tmp_path, monkeypatch):
+    # the failure that killed 7/7 multi-gpu runs. the second rank finds rank 0's uuid already
+    # claimed and refuses, minutes before nccl would abort with a pci id and no rank mapping.
+    errors = _run_rank_device_check(tmp_path, monkeypatch, [(0, 0, "GPU-same"), (1, 0, "GPU-same")])
+    assert errors[0] is None
+    assert errors[1] is not None
+    # the message has to carry the mapping: naming the colliding ranks is the entire diagnostic
+    # value over the nccl abort it front-runs.
+    assert "GPU-same" in errors[1]
+    assert "[0, 1]" in errors[1]
+
+
+def test_the_rank_device_assert_reads_the_rank_verl_resolved_not_the_environment(
+    tmp_path, monkeypatch
+):
+    # the claims file is keyed by rank, so a rank that every actor agrees on collapses the set to
+    # one entry and the collision stops being visible. pin the source: RANK is held at 0 for both
+    # actors while the workers carry 0 and 1, and the check must still refuse.
+    errors = _run_rank_device_check(
+        tmp_path,
+        monkeypatch,
+        [(0, 0, "GPU-same"), (1, 0, "GPU-same")],
+        env_rank=0,
+    )
+    assert errors[0] is None
+    assert errors[1] is not None
+    assert "[0, 1]" in errors[1]
+
+
+def test_the_rank_device_assert_has_no_rank_zero_default_to_fall_back_on():
+    # a getenv("RANK", "0") would make an unset RANK report every actor as rank 0, which is the one
+    # value that turns this check into a no-op. verl reads os.environ["RANK"] unconditionally in the
+    # same __init__, so an absent RANK is already fatal there -- this keeps it fatal here too.
+    source = inspect.getsource(verl_patches.install_rank_device_assert)
+    assert 'environ.get("RANK"' not in source
+    assert 'environ["RANK"]' in source
 
 
 def test_multimodal_rows_match_verl_placeholder_assertion():
@@ -910,6 +1467,17 @@ def test_multimodal_overrides_hand_verl_the_images_column():
     assert "data.dataloader_num_workers=0" in o
 
 
+def test_shared_rollout_cache_override_uses_the_current_vllm_key():
+    assert backend_common.rollout_mm_processor_cache_overrides() == [
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0"
+    ]
+
+
+def test_grpo_unconditionally_disables_the_vllm_multimodal_processor_cache():
+    overrides = rl_train.build_verl_overrides(_overrides_cfg())
+    assert set(backend_common.rollout_mm_processor_cache_overrides()) <= set(overrides)
+
+
 def test_text_overrides_omit_every_multimodal_key():
     # the control: these keys must be absent, not merely false. data.image_key=images on a text job
     # points verl at a column the parquet does not have.
@@ -1337,9 +1905,9 @@ def _save_steps_inputs(monkeypatch, *, save_at_steps=None, save_every=None, max_
 
 
 def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
-    # verl only saves when global_step % save_freq == 0, so it cannot hit an arbitrary set directly.
-    # the gcd is the largest interval every required step divides, so verl writes a superset of the
-    # checkpoints and the uploader publishes deployables at exactly the requested ones.
+    # periodic saves land only when global_step % save_freq == 0, so they cannot hit an arbitrary set
+    # directly. the gcd is the largest interval every required step divides, so verl writes a superset
+    # of the checkpoints and the uploader publishes deployables at exactly the requested ones.
     inp = _save_steps_inputs(monkeypatch, save_at_steps=(10, 25, 100))
     assert inp["save_freq"] == 5
     assert inp["save_at_steps"] == (10, 25, 100)
@@ -1348,10 +1916,22 @@ def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
 
 
 def test_save_freq_falls_back_to_save_every_without_exact_steps(monkeypatch):
-    # no exact steps: periodic saves are preserved on the customer's own interval.
+    # a long run preserves the customer's interval, so the clamp never increases normal frequency.
     inp = _save_steps_inputs(monkeypatch, save_every=15)
+    assert inp["steps"] == 100
     assert inp["save_freq"] == 15
     assert inp["save_at_steps"] == ()
+
+
+def test_short_derived_horizon_clamps_save_freq_to_the_final_step(monkeypatch):
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(example_count=800),
+        train={"max_examples": 800, "epochs": 1, "prompts_per_step": 64},
+    )
+    assert inp["steps"] == 13
+    assert inp["save_freq"] == 13
+    assert inp["steps"] % inp["save_freq"] == 0
 
 
 def test_save_steps_reach_the_horizon_they_were_validated_against(monkeypatch):
@@ -1441,7 +2021,7 @@ def test_resume_credits_required_steps_already_durable_on_hf(tmp_path, monkeypat
     # step 10 is verified on hf, so it is credited. step 15 is below the resume point but its
     # adapter never landed, so it stays uncredited and completeness still catches it. step 25 is
     # ahead of the resume point and is this run's job to publish.
-    assert uploader.published_steps == {10}
+    assert uploader.lifecycle.deployable_published_steps == {10}
     with pytest.raises(RuntimeError, match=r"not durably published: \[15, 25\]"):
         uploader.raise_if_incomplete()
 
@@ -1454,7 +2034,7 @@ def test_resume_step_is_not_credited_without_a_durable_adapter(tmp_path, monkeyp
     uploader = rl_train._VerlResumeUploader(str(tmp_path), resume_step=10, required_steps=(10,))
     uploader.credit_durable_required_steps(10)
 
-    assert uploader.published_steps == set()
+    assert uploader.lifecycle.deployable_published_steps == set()
 
 
 def test_checkpoint_retention_outlives_the_export_when_exact_saves_are_set(monkeypatch):
@@ -1660,18 +2240,30 @@ def test_verl_uses_canonical_heartbeat_stage_contracts():
 
 
 # ------------------------------- reward module render -------------------------------
+def _rendered_reward_namespace(url_env="FLASH_VERL_REWARD_URL"):
+    previous = sys.modules.get("flash_grpo_multiturn")
+    sys.modules["flash_grpo_multiturn"] = grpo_multiturn
+    try:
+        namespace: dict = {}
+        exec(compile(rl_train.render_reward_module(url_env), "<reward>", "exec"), namespace)
+        return namespace
+    finally:
+        if previous is None:
+            sys.modules.pop("flash_grpo_multiturn", None)
+        else:
+            sys.modules["flash_grpo_multiturn"] = previous
+
+
 def test_render_reward_module_is_valid_and_defines_compute_score():
     src = rl_train.render_reward_module()
-    ns: dict = {}
-    exec(compile(src, "<reward>", "exec"), ns)  # compiles + defines, no network call made
+    ns = _rendered_reward_namespace()
     assert callable(ns["compute_score"])
-    # no flash import leaks into the verl-side shim.
-    assert "import flash" not in src
+    assert "from flash_grpo_multiturn import post_json" in src
+    assert "urllib" not in src
 
 
 def test_render_reward_module_missing_index_raises():
-    ns: dict = {}
-    exec(compile(rl_train.render_reward_module(), "<reward>", "exec"), ns)
+    ns = _rendered_reward_namespace()
     with pytest.raises(RuntimeError, match="no example index"):
         ns["compute_score"]("flash_env", "answer", "unused", extra_info={})
 
@@ -1683,12 +2275,9 @@ def test_render_reward_module_missing_index_raises():
 )
 def test_render_reward_module_rejects_invalid_index(monkeypatch, index):
     monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", "http://unused")
-    ns: dict = {}
-    exec(
-        compile(rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"), ns
-    )
+    ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
     monkeypatch.setattr(
-        ns["urllib"].request,
+        grpo_multiturn.urllib.request,
         "urlopen",
         lambda *args, **kwargs: pytest.fail("invalid index must not reach the reward server"),
     )
@@ -1706,13 +2295,7 @@ def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
     )
     try:
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
-        ns: dict = {}
-        exec(
-            compile(
-                rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL"), "<reward>", "exec"
-            ),
-            ns,
-        )
+        ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
         assert (
             ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": index}) == 3.0
         )
@@ -1731,16 +2314,15 @@ def test_a_slow_env_call_is_not_cut_off_by_a_client_deadline(monkeypatch):
         lambda idx, solution: waited.append(idx) or 7.0, example_count=2
     )
     try:
-        ns: dict = {}
-        exec(compile(rl_train.render_reward_module("TEST_URL"), "<reward>", "exec"), ns)
-        real_urlopen = ns["urllib"].request.urlopen
+        ns = _rendered_reward_namespace("TEST_URL")
+        real_urlopen = grpo_multiturn.urllib.request.urlopen
         seen = []
 
         def urlopen_recording_deadline(req, *args, **kwargs):
             seen.append((args, kwargs))
             return real_urlopen(req)
 
-        monkeypatch.setattr(ns["urllib"].request, "urlopen", urlopen_recording_deadline)
+        monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", urlopen_recording_deadline)
         ns["_URL"] = url
         assert ns["compute_score"]("env", "answer", "unused", extra_info={"index": 0}) == 7.0
         assert waited == [0]
@@ -1769,8 +2351,7 @@ def test_concurrent_scorers_are_serialized_for_the_env():
 
     server, url = rl_train.start_reward_server(score, example_count=8)
     try:
-        ns: dict = {}
-        exec(compile(rl_train.render_reward_module("TEST_URL"), "<reward>", "exec"), ns)
+        ns = _rendered_reward_namespace("TEST_URL")
         ns["_URL"] = url
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(
@@ -2220,16 +2801,16 @@ def test_reward_server_rejects_out_of_range_index_before_lookup(index):
 
 
 def test_reward_bridge_lookup_failure_raises(monkeypatch):
+    # the index is IN range, so the scorer's own IndexError is the ENV failing, not a bad request:
+    # it is reported as a server fault carrying the cause rather than as a malformed-payload 400.
     def missing_example(idx, solution_str):
         raise IndexError(idx)
 
     server, url = rl_train.start_reward_server(missing_example, example_count=100)
     try:
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
-        ns: dict = {}
-        src = rl_train.render_reward_module("TEST_FLASH_VERL_REWARD_URL")
-        exec(compile(src, "<reward>", "exec"), ns)
-        with pytest.raises(RuntimeError, match="reward bridge request failed"):
+        ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
+        with pytest.raises(RuntimeError, match=r"could not serve the request .*IndexError: 99"):
             ns["compute_score"](
                 "flash_env",
                 "answer",
@@ -2238,6 +2819,274 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
             )
     finally:
         server.shutdown()
+
+
+def test_reward_server_reports_thread_exhaustion_as_a_server_fault():
+    """Thread exhaustion is 503 WITH its cause, not 400.
+
+    Under rollout concurrency the scoring thread pool can fail to start a thread; the handler used
+    to answer 400 for that, which asserts the caller sent something wrong. Here score_episode
+    cannot produce a 400 at all (it returns a well-formed result carrying `error`), so a 400 sent
+    every reader to the one component provably not at fault.
+    """
+
+    def exhausted(index, solution_str):
+        raise RuntimeError("can't start new thread")
+
+    server, url = rl_train.start_reward_server(exhausted, example_count=4)
+    try:
+        body = json.dumps({"index": 0, "solution_str": "answer"}).encode()
+        req = urllib.request.Request(
+            url + "/score", data=body, headers={"Content-Type": "application/json"}
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 503, "a resource fault must not be reported as a bad request"
+        # the cause has to survive to the client: naming the failing resource is the whole point.
+        assert "can't start new thread" in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "env_error",
+    [IndexError("list index out of range"), KeyError("grader internal lookup failed")],
+)
+def test_an_env_raising_indexerror_or_keyerror_is_a_server_fault_not_a_bad_request(env_error):
+    """Classifying by exception TYPE reintroduces the bug one layer down.
+
+    The bridge rejects a bad index with IndexError and an unknown session with KeyError, so a tuple
+    of those types around the ROUTE CALL also catches the same types raised by a user env deep
+    inside its own scoring -- reporting a valid request as malformed. ScoreBatcher re-raises a GRPO
+    batch error into every waiter as-is, so one env KeyError would 400 every request in the batch.
+    """
+
+    def failing_env_scorer(index, solution_str):
+        raise env_error
+
+    server, url = rl_train.start_reward_server(failing_env_scorer, example_count=4)
+    try:
+        req = urllib.request.Request(
+            url + "/score",
+            data=json.dumps({"index": 0, "solution_str": "x"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 503, (
+            "the request was valid and the ENV failed; blaming the caller is the original bug"
+        )
+        assert type(env_error).__name__ in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"index": 1e309, "solution_str": "x"}, "not an integer"),  # json inf -> int() overflows
+        ([], "must be a json object"),  # valid json, invalid request object
+        ({"solution_str": "x"}, "missing required field"),
+    ],
+)
+def test_a_malformed_request_shape_is_a_client_error_not_a_server_fault(payload, expected):
+    """A body this bridge cannot read is the caller's fault, so it must not read as unavailable."""
+    server, url = rl_train.start_reward_server(lambda i, s: 1.0, example_count=4)
+    try:
+        req = urllib.request.Request(
+            url + "/score",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 400
+        body = exc_info.value.read().decode()
+        assert expected in body
+        # the private class name is not something a caller can act on.
+        assert "_Bad" not in body, "an internal exception class leaked into the client message"
+    finally:
+        server.shutdown()
+
+
+def test_the_generated_single_turn_reward_module_surfaces_the_bridges_cause(monkeypatch):
+    """The REAL single-turn caller must not drop the detail the server now supplies.
+
+    `HTTPError` is a `URLError` subclass, so a single `except URLError` catches it first and never
+    reads the body -- leaving "HTTP Error 503: Service Unavailable", which names no cause. Asserting
+    on the server response alone would pass while the user-visible path stayed detail-free.
+    """
+
+    def exhausted(index, solution_str):
+        raise RuntimeError("can't start new thread")
+
+    server, url = rl_train.start_reward_server(exhausted, example_count=4)
+    try:
+        monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
+        ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
+        with pytest.raises(RuntimeError) as exc_info:
+            ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": 0})
+        message = str(exc_info.value)
+        assert "can't start new thread" in message, "the cause never reached the training loop"
+        assert "could not serve" in message
+    finally:
+        server.shutdown()
+
+
+def test_an_unrepresentable_env_reply_is_rejected_rather_than_reported_as_a_fault():
+    """A refused reply block is permanent, so it must reach the user as 400, not 503.
+
+    The reply validators raise on a block this transcript cannot carry. A bare ValueError there
+    falls to the handler's catch-all and answers 503, which the child prints as
+    ``could not serve`` -- telling the reader the bridge had a capacity problem when the actual fix
+    is to change what ``step_episode`` returns. Retrying produces the identical block forever, so
+    this asserts the status the 400/503 split promises rather than only the raise.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(
+            replies=[{"role": "user", "content": [{"type": "image_url", "image_url": "x"}]}],
+            done_after=99,
+        ),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=4,
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        _post("/multiturn/start", {"index": 0, "session_id": "a"}).close()
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _post("/multiturn/step", {"session_id": "a", "completion_text": "answer"})
+        assert exc_info.value.code == 400, (
+            "an env reply this transcript cannot carry is permanent, not a capacity fault"
+        )
+        assert "image block" in exc_info.value.read().decode()
+    finally:
+        server.shutdown()
+        bridge.shutdown()
+
+
+def test_reward_server_still_rejects_a_malformed_request_as_a_client_error():
+    """The 5xx split must not turn genuine client errors into server faults.
+
+    A non-integer index and an unknown session id are the caller's fault at any capacity, so both
+    stay 400 -- otherwise the new status would tell a caller to retry a request that can never work.
+    A no-regression guard, not evidence of the split: these were 400 under the old catch-all too.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=2,
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+    try:
+        for path, payload in (
+            ("/score", {"index": "not-an-int", "solution_str": "x"}),
+            ("/multiturn/step", {"session_id": "nope", "completion_text": "x"}),
+        ):
+            req = urllib.request.Request(
+                url + path,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                urllib.request.urlopen(req, timeout=10)
+            assert exc_info.value.code == 400, f"{path} is a client error at any capacity"
+    finally:
+        server.shutdown()
+        bridge.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "expected_fault"),
+    [
+        (503, "RuntimeError: can't start new thread", "could not serve"),
+        (400, "IndexError: index 9 is outside [0, 4)", "rejected"),
+    ],
+)
+def test_the_child_surfaces_the_bridges_error_text_not_just_the_status(
+    monkeypatch, status, detail, expected_fault
+):
+    """`suppress(Exception)` around the raise swallowed the detail-bearing error itself.
+
+    The bridge puts its real cause in the response body, the child decoded it, built the
+    RuntimeError naming it -- and the suppress ate that raise, so the generic "returned HTTP 400"
+    was the ONLY message that could ever escape. The cause must reach the user, and a 5xx must not
+    read as a rejected request.
+    """
+    from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
+
+    def raise_http_error(*_a, **_k):
+        payload = json.dumps({"error": detail}).encode()
+        raise urllib.error.HTTPError(
+            "http://bridge/multiturn/score", status, "err", {}, io.BytesIO(payload)
+        )
+
+    monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(RuntimeError) as exc_info:
+        grpo_multiturn.post_json("http://bridge", "/multiturn/score", {})
+    message = str(exc_info.value)
+    assert detail in message, "the bridge's own cause never reached the caller"
+    assert expected_fault in message
+
+
+def test_the_child_names_the_status_when_the_body_carries_no_detail(monkeypatch):
+    """An undecodable body must still produce a message naming what happened."""
+
+    def raise_http_error(*_a, **_k):
+        raise urllib.error.HTTPError(
+            "http://bridge/multiturn/score", 503, "err", {}, io.BytesIO(b"not json")
+        )
+
+    monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(RuntimeError, match=r"could not serve .*HTTP 503 with no error detail"):
+        grpo_multiturn.post_json("http://bridge", "/multiturn/score", {})
+
+
+def test_shared_transport_preserves_reward_specific_network_and_decode_errors(monkeypatch):
+    def raise_url_error(*_args, **_kwargs):
+        raise urllib.error.URLError("bridge down")
+
+    monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", raise_url_error)
+    with pytest.raises(
+        RuntimeError,
+        match=r"flash reward bridge request failed: <urlopen error bridge down>",
+    ):
+        grpo_multiturn.post_json("http://bridge", "/score", {}, error_style="reward")
+
+    class InvalidResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"not-json"
+
+    monkeypatch.setattr(
+        grpo_multiturn.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: InvalidResponse(),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="flash reward bridge returned an invalid response",
+    ):
+        grpo_multiturn.post_json("http://bridge", "/score", {}, error_style="reward")
 
 
 def test_reward_server_scorer_can_capture_samples():
@@ -2265,102 +3114,6 @@ def test_reward_server_scorer_can_capture_samples():
         server.shutdown()
 
 
-def test_reentrant_checkpointing_shim_is_emitted_only_for_models_that_need_it():
-    # verl hardcodes use_reentrant=False and offers no knob. a dense non-GDN model is fine on that
-    # default and must not get a patch on its import path; a GDN/MoE model dies on the FIRST
-    # backward without one, so for those the shim is what makes the run possible at all.
-    assert rl_train.render_reentrant_checkpointing_shim(False) == ""
-    source = rl_train.render_reentrant_checkpointing_shim(True)
-    assert source
-    assert '{"use_reentrant": True}' in source
-    # must patch the class GRPO's actor actually builds through: FSDPEngineWithLMHead inherits
-    # _build_module from FSDPEngine, so patching the base covers the actor.
-    assert "FSDPEngine as _FlashReentrantEngine" in source
-    assert "_FlashReentrantEngine._build_module = _flash_reentrant_build_module" in source
-
-
-def test_the_reentrant_shim_is_wired_for_gdn_and_moe_models_and_not_for_dense_ones():
-    # the flag has to be resolved from the model id, not left to verl. grpo_use_reentrant is the
-    # same helper the sft verl path and the retired trl path both keyed on.
-    resolved = inspect.getsource(rl_train._resolve_grpo_inputs)
-    assert '"reentrant_checkpointing": bool(_w.grpo_use_reentrant(model_id))' in resolved
-    written = inspect.getsource(rl_train._write_rl_shim)
-    assert (
-        "render_reentrant_checkpointing_shim( "
-        'inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"]) )'
-        in " ".join(written.split())
-    )
-    # the curated GDN hybrids and the MoE need it; an uncataloged dense model does not.
-    assert W.grpo_use_reentrant("Qwen/Qwen3.5-4B") is True
-    assert W.grpo_use_reentrant("Qwen/Qwen3.6-35B-A3B") is True
-    assert W.grpo_use_reentrant("meta-llama/Llama-3.1-8B") is False
-
-
-def test_the_reentrant_shim_installs_vision_input_grads_only_for_multimodal_runs():
-    # reentrant recompute drops backward when checkpointed inputs require no grad.
-    # mark vision patch embeddings as requiring grad or visual modules silently train on nothing.
-    text_only = rl_train.render_reentrant_checkpointing_shim(True)
-    assert "_flash_install_vision_input_grads" not in text_only, (
-        "a text-only run pays for a vision hook that can never match"
-    )
-    multimodal = rl_train.render_reentrant_checkpointing_shim(True, multimodal=True)
-    # compile FIRST. an earlier version asserted only that the call text appeared, which the
-    # helper's own `def _flash_install_vision_input_grads(module):` line satisfies on its own --
-    # so the assertion held while the call site was emitted at the wrong indent and the rendered
-    # sitecustomize was a SyntaxError. this shim is exec'd in verl's child, where a syntax error
-    # is a silent no-op rather than a test failure, so compiling here is the only real gate.
-    compile(multimodal, "sitecustomize.py", "exec")
-    assert "visual.patch_embed" in multimodal
-    # the call has to land INSIDE the checkpointing branch: dedented one level it would run for
-    # every module verl builds, including engines whose checkpointing verl deliberately left off.
-    assert "\n        _flash_install_vision_input_grads(module)\n" in multimodal
-    # the flag is independent of the shim: a multimodal run on a model that does not need reentrant
-    # checkpointing gets no shim at all, and therefore no hook.
-    assert rl_train.render_reentrant_checkpointing_shim(False, multimodal=True) == ""
-
-
-def test_the_reentrant_shim_enables_language_side_input_grads_before_checkpointing():
-    """GRAD-001: every rl run is lora, so lora freezes the embeddings and nothing entering the
-    first checkpointed decoder layer requires grad. reentrant recompute then drops the backward
-    for the whole segment -- where every lora parameter lives -- and the run reports success while
-    training nothing. the vision hook only ever covered the patch embeddings on multimodal runs;
-    text-only runs had no hook at all."""
-    calls = []
-
-    class FakeModule:
-        def enable_input_require_grads(self):
-            calls.append("require_grads")
-
-        def gradient_checkpointing_enable(self, **kwargs):
-            calls.append(("gc_enable", kwargs))
-
-    class FakeEngine:
-        def __init__(self, checkpointing):
-            self.model_config = SimpleNamespace(enable_gradient_checkpointing=checkpointing)
-
-        def _build_module(self):
-            return FakeModule()
-
-    source = rl_train.render_reentrant_checkpointing_shim(True)
-    start = source.index("def _flash_reentrant_build_module")
-    end = source.index("_FlashReentrantEngine._build_module = _flash_reentrant_build_module")
-    namespace = {"_flash_reentrant_original_build_module": FakeEngine._build_module}
-    exec(compile(source[start:end], "sitecustomize.py", "exec"), namespace)
-    build = namespace["_flash_reentrant_build_module"]
-
-    build(FakeEngine(checkpointing=True))
-    # order matters: enabling checkpointing first captures the graph before any input requires
-    # grad, so asserting mere presence would pass on a broken shim.
-    assert calls[0] == "require_grads"
-    assert calls[1] == ("gc_enable", {"gradient_checkpointing_kwargs": {"use_reentrant": True}})
-
-    # the guard is load-bearing: when verl left checkpointing OFF, touching the module at all
-    # would turn on a feature verl deliberately declined and change the memory profile.
-    calls.clear()
-    build(FakeEngine(checkpointing=False))
-    assert calls == []
-
-
 @contextlib.contextmanager
 def _vision_hook_installer(torch_module):
     """yield the rendered vision helper with a stand-in torch visible to it.
@@ -2369,15 +3122,10 @@ def _vision_hook_installer(torch_module):
     for the duration of the call rather than just the exec -- which is also the property that lets
     the real shim run inside verl's child, where torch is imported long after sitecustomize.
     """
-    source = rl_train.render_reentrant_checkpointing_shim(True, multimodal=True)
-    helper_start = source.index("def _flash_install_vision_input_grads")
-    helper_end = source.index("def _flash_reentrant_build_module")
-    namespace: dict = {}
-    exec(source[helper_start:helper_end], namespace)
     saved = sys.modules.get("torch")
     sys.modules["torch"] = torch_module
     try:
-        yield namespace["_flash_install_vision_input_grads"]
+        yield verl_patches._install_vision_input_grads
     finally:
         if saved is None:
             sys.modules.pop("torch", None)
@@ -2522,7 +3270,7 @@ def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alon
         for name in parents:
             sys.modules.setdefault(name, types.ModuleType(name))
         sys.modules[module_stub.__name__] = module_stub
-        exec(rl_train.render_reentrant_checkpointing_shim(True), {})
+        verl_patches.install_reentrant_checkpointing(multimodal=False)
         # checkpointing on -> the flag is put back to reentrant, and the lora-frozen embeddings
         # get input grads so the checkpointed segment actually produces a backward (GRAD-001)
         engine = _Engine(True)
@@ -2542,39 +3290,6 @@ def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alon
                 sys.modules[name] = value
 
 
-def test_entropy_quantile_shim_is_emitted_only_when_masking_is_requested():
-    # 1.0 (and unset) means "keep every token", which is verl's own behavior -- emitting a shim then
-    # would patch the loss to do nothing. only a real quantile may put a patch on the import path.
-    assert rl_train.render_entropy_quantile_shim(None) == ""
-    assert rl_train.render_entropy_quantile_shim(1.0) == ""
-    source = rl_train.render_entropy_quantile_shim(0.2)
-    assert source
-    # trl thresholds at 1 - top_entropy_quantile: keeping the top 20% means cutting at the 0.8
-    # quantile. carrying the flash value through unconverted would keep the BOTTOM 20% instead.
-    assert "_flash_entropy_threshold_q = 0.8" in source
-    assert verl_shims._ENTROPY_QUANTILE_MARKER in source
-
-
-def test_entropy_quantile_shim_refuses_to_wrap_itself_twice():
-    # double-wrapping would take the top quantile OF the top quantile: with 0.2 that trains on ~4%
-    # of tokens instead of 20%, and nothing in the logs would show it. verified numerically against
-    # verl's real ppo_loss -- without this guard the loss drifted from -0.0428 to -0.0251.
-    source = rl_train.render_entropy_quantile_shim(0.2)
-    assert '_flash_entropy_masked", False)' in source
-    assert "_flash_entropy_masked_ppo_loss._flash_entropy_masked = True" in source
-
-
-def test_entropy_quantile_shim_masks_only_the_policy_gradient_term():
-    # trl multiplies per_token_loss by the entropy mask and THEN adds the kl term, so kl and the
-    # entropy bonus stay on the full response mask. masking inside ppo_loss itself would shrink all
-    # three. the shim therefore wraps get_policy_loss_fn, not the aggregation.
-    source = rl_train.render_entropy_quantile_shim(0.2)
-    assert "_flash_losses.get_policy_loss_fn = _flash_masked_policy_loss_fn" in source
-    assert 'kwargs["response_mask"] = _flash_high_entropy_mask' in source
-    # equivalence also needs a mask-independent denominator, which is why flash pins this mode.
-    assert _overrides_cfg()["loss_agg_mode"] == "seq-mean-token-sum-norm"
-
-
 def test_entropy_quantile_overrides_enable_verl_entropy_and_stay_off_by_default():
     # the shim reads model_output["entropy"], which verl only populates when calculate_entropy is
     # set. flash's recipe has entropy_coeff 0, so nothing else would turn it on.
@@ -2592,47 +3307,6 @@ def test_resolve_grpo_inputs_no_longer_rejects_entropy_quantile():
     source = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert "is not yet supported" not in source.split("entropy_quantile")[1].split("\n\n")[0]
     assert '"entropy_quantile": entropy_quantile' in source
-
-
-def test_stop_sequences_shim_is_emitted_only_when_stop_strings_are_requested():
-    assert rl_train.render_stop_sequences_shim(()) == ""
-    source = rl_train.render_stop_sequences_shim(("</answer>", "\n\nQ:"))
-    assert source
-    # the exact list must survive into the child verbatim, escaping included -- a mangled delimiter
-    # would silently never fire and the run would look normal.
-    assert "_flash_stop_sequences = ['</answer>', '\\n\\nQ:']" in source
-    assert verl_shims._STOP_SEQUENCES_MARKER in source
-
-
-def test_stop_sequences_shim_patches_the_per_sample_params_not_the_config():
-    # _run_agent_loop receives the per-sample dict AFTER verl applies its validate/greedy overrides,
-    # so patching there keeps stop strings on eval rollouts too -- matching trl, where the stop list
-    # lives in generation_kwargs and is not swapped out for validation.
-    source = rl_train.render_stop_sequences_shim(("</answer>",))
-    assert "AgentLoopWorker._run_agent_loop" in source
-    assert 'params["stop"] = list(_flash_stop_sequences)' in source
-    # the dict is copied before mutation: verl reuses sample_sampling_params across the batch.
-    assert "params = dict(sampling_params)" in source
-
-
-def test_stop_sequences_shim_refuses_to_wrap_itself_twice():
-    source = rl_train.render_stop_sequences_shim(("</answer>",))
-    assert '_flash_stop_patched", False)' in source
-
-
-def test_image_pad_ban_shim_is_emitted_only_on_a_multimodal_job():
-    # a text run has no image-pad token to ban, and injecting a logit_bias key into every rollout's
-    # sampling params would change sampling on jobs that never asked for it.
-    assert rl_train.render_image_pad_ban_shim(None) == ""
-    source = rl_train.render_image_pad_ban_shim(151655)
-    assert source
-    assert "151655" in source
-    assert verl_shims._IMAGE_PAD_BAN_MARKER in source
-    # -100.0 matches the bias trl applies through generation_kwargs (rl.py), so the two backends
-    # suppress the token equally hard rather than one of them merely discouraging it.
-    assert "logit_bias[_flash_image_pad_token_id] = -100.0" in source
-    # same reason as the stop shim: verl reuses the params dict across the batch.
-    assert "params = dict(sampling_params)" in source
 
 
 def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
@@ -2663,13 +3337,11 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
         "verl.experimental.agent_loop": package,
         "verl.experimental.agent_loop.agent_loop": agent_loop_module,
     }
-    source = rl_train.render_stop_sequences_shim(
-        ("</answer>",)
-    ) + rl_train.render_image_pad_ban_shim(151655)
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(source, "sitecustomize.py", "exec"), {})
+        verl_patches.install_stop_sequences(("</answer>",))
+        verl_patches.install_image_pad_ban(151655)
         asyncio.run(_AgentLoopWorker()._run_agent_loop({"temperature": 1.0}))
     finally:
         for name in stubs:
@@ -2728,15 +3400,12 @@ def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
         "vllm": vllm_module,
         "vllm.sampling_params": sampling_params_module,
     }
-    source = (
-        rl_train.render_stop_sequences_shim(("</answer>",))
-        + rl_train.render_image_pad_ban_shim(151655)
-        + rl_train.render_structured_outputs_shim({"json": {"type": "object"}})
-    )
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(source, "sitecustomize.py", "exec"), {})
+        verl_patches.install_stop_sequences(("</answer>",))
+        verl_patches.install_image_pad_ban(151655)
+        verl_patches.install_structured_outputs({"json": {"type": "object"}})
         # called exactly as verl calls it (agent_loop.py:583): two positionals plus keywords.
         asyncio.run(
             _AgentLoopWorker()._run_agent_loop(
@@ -2760,15 +3429,6 @@ def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
     assert constraint.kwargs == {"json": {"type": "object"}}
 
 
-def test_image_pad_ban_shim_is_composed_into_the_sitecustomize(monkeypatch):
-    source = inspect.getsource(rl_train._write_rl_shim)
-    assert 'render_image_pad_ban_shim(inp["image_pad_token_id"])' in source
-    combined = rl_train.render_stop_sequences_shim(
-        ("</answer>",)
-    ) + rl_train.render_image_pad_ban_shim(151655)
-    compile(combined, "sitecustomize.py", "exec")
-
-
 def test_stop_sequences_gate_off_truncated_completion_masking():
     # main couples these: stop-string rollouts do not end on EOS, so masking truncated completions
     # would wrongly drop every one of them. the verl resolver must inherit that coupling, not
@@ -2777,82 +3437,6 @@ def test_stop_sequences_gate_off_truncated_completion_masking():
     assert "_w.grpo_mask_truncated_completions(_t)" in source
     assert not W.grpo_mask_truncated_completions(SimpleNamespace(stop_sequences=("</answer>",)))
     assert W.grpo_mask_truncated_completions(SimpleNamespace(stop_sequences=()))
-
-
-def test_all_shims_compose_into_one_sitecustomize():
-    # python imports sitecustomize once, so a second file would never load. the renderers must
-    # concatenate into a single source rather than each owning a file.
-    source = inspect.getsource(rl_train._write_rl_shim)
-    assert 'render_entropy_quantile_shim(inp["entropy_quantile"])' in source
-    assert 'render_stop_sequences_shim(inp["stop_sequences"])' in source
-    assert 'render_structured_outputs_shim(inp["structured_outputs"])' in source
-    assert 'render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"])' in source
-    combined = (
-        rl_train.render_entropy_quantile_shim(0.2)
-        + rl_train.render_stop_sequences_shim(("</answer>",))
-        + rl_train.render_structured_outputs_shim({"json": {"type": "object"}})
-        + rl_train.render_exact_save_steps_shim((7, 13), 20)
-    )
-    compile(combined, "sitecustomize.py", "exec")
-
-
-def test_exact_save_steps_shim_is_emitted_only_when_exact_saves_are_requested():
-    # without exact saves verl's own save_every cadence is already what flash wants, so there is
-    # nothing to suppress and the shim must stay out of the child's import path.
-    assert rl_train.render_exact_save_steps_shim((), 20) == ""
-    source = rl_train.render_exact_save_steps_shim((7, 13), 20)
-    assert source
-    assert verl_shims._EXACT_SAVE_STEPS_MARKER in source
-
-
-def test_exact_save_steps_shim_keeps_required_steps_and_the_final_step():
-    # the gcd of the required steps makes verl save a SUPERSET (gcd(7,13) == 1 is a full-state dump
-    # every step). the shim drops the writes flash never asked for -- but losing a required step
-    # fails the run, and losing the final step leaves the final publish with no source checkpoint.
-    source = rl_train.render_exact_save_steps_shim((7, 13), 20)
-    assert "_flash_required_save_steps = frozenset((7, 13))" in source
-    assert "_flash_total_steps = 20" in source
-    assert "if step not in _flash_required_save_steps and step != _flash_total_steps:" in source
-    # it reads the step off the instance: verl's _save_checkpoint takes no step argument.
-    assert "step = int(self.global_steps)" in source
-
-
-def test_exact_save_steps_shim_refuses_to_wrap_itself_twice():
-    source = rl_train.render_exact_save_steps_shim((7,), 20)
-    assert '"_flash_save_patched", False' in source
-    assert "_flash_save_patched = True" in source
-
-
-def test_structured_outputs_shim_is_emitted_only_when_a_constraint_is_requested():
-    assert rl_train.render_structured_outputs_shim(None) == ""
-    assert rl_train.render_structured_outputs_shim({}) == ""
-    spec = {"json": {"type": "object", "properties": {"a": {"type": "string"}}}}
-    source = rl_train.render_structured_outputs_shim(spec)
-    assert source
-    assert repr(spec) in source
-    assert verl_shims._STRUCTURED_OUTPUTS_MARKER in source
-
-
-def test_structured_outputs_shim_wraps_the_spec_rather_than_passing_a_raw_dict():
-    # the whole point: vllm ACCEPTS a raw dict, passes _verify_args, and then stores a plain dict
-    # with no .json attribute -- constraining nothing, silently. trl wraps it in its colocate path,
-    # which is why flash's trl path hands over a plain dict; on verl nothing wraps it, so the shim
-    # must, or the run trains unconstrained and looks completely normal.
-    source = rl_train.render_structured_outputs_shim({"json": {"type": "object"}})
-    assert "StructuredOutputsParams as _FlashStructuredOutputsParams" in source
-    assert (
-        'params["structured_outputs"] = _FlashStructuredOutputsParams(**_flash_structured_outputs)'
-        in source
-    )
-    # built per request, not once: vllm resolves the backend on first use and caches it on the
-    # instance, so a shared object would leak that resolution across requests.
-    assert "params = dict(sampling_params)" in source
-
-
-def test_structured_outputs_shim_refuses_to_wrap_itself_twice():
-    source = rl_train.render_structured_outputs_shim({"json": {"type": "object"}})
-    assert '"_flash_so_patched", False' in source
-    assert "_flash_so_patched = True" in source
 
 
 def _load_kl_ref_engine():
@@ -2888,33 +3472,11 @@ def _load_kl_ref_engine():
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        source = rl_train.render_kl_ref_adapter_shim(True)
-        exec(compile(source, "sitecustomize.py", "exec"), {})
+        verl_patches.install_kl_ref_adapter()
     finally:
         for name in stubs:
             sys.modules.pop(name, None)
     return impl.FSDPEngine
-
-
-def test_kl_ref_adapter_shim_is_emitted_only_for_a_warm_start():
-    # a fresh-start run has no sft adapter to anchor to, so verl's bare-base reference is already
-    # what flash wants and the patch must stay out of the child's import path.
-    assert rl_train.render_kl_ref_adapter_shim(False) == ""
-    source = rl_train.render_kl_ref_adapter_shim(True)
-    assert source
-    assert verl_shims._KL_REF_ADAPTER_MARKER in source
-
-
-def test_kl_ref_adapter_shim_is_wired_only_when_warm_start_and_kl_are_both_on():
-    # with kl off no reference logprob is ever consumed, so patching disable_adapter would add a
-    # failure mode and buy nothing. both conditions have to gate the renderer, not just warm start.
-    source = inspect.getsource(rl_train._write_rl_shim)
-    assert "render_kl_ref_adapter_shim(" in source
-    assert 'bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0' in source
-    combined = rl_train.render_exact_save_steps_shim(
-        (7, 13), 20
-    ) + rl_train.render_kl_ref_adapter_shim(True)
-    compile(combined, "sitecustomize.py", "exec")
 
 
 def test_kl_ref_adapter_shim_anchors_the_reference_to_the_warm_start_adapter():
@@ -3212,7 +3774,7 @@ def test_resume_uploader_never_fails_the_run_on_an_upload_error(tmp_path):
         uploader.stop()  # must not raise
     finally:
         mod._w.upload_resume_checkpoint = original
-    assert 2 in uploader.processed_steps
+    assert 2 in uploader.lifecycle.discovered_steps
 
 
 def test_grpo_gradient_check_rejects_a_run_whose_rewards_never_varied():
@@ -3377,7 +3939,7 @@ def _patch_stage_and_publish(monkeypatch, staged: list[int], published: list[int
         "_publish_staged",
         lambda self, step, adapter_dir: (
             published.append(int(step)),
-            self.published_steps.add(step),
+            self.lifecycle.mark_deployable_published(step),
         )[0],
     )
 
@@ -3429,6 +3991,85 @@ def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path
     finally:
         uploader.stop()
     uploader.raise_if_incomplete()
+
+
+def test_a_gate_already_open_publishes_the_deployable_before_the_resume_upload(
+    tmp_path, monkeypatch
+):
+    """the opposite publication order to the withheld case above, and equally legitimate.
+
+    with gradient evidence already present, a required step is staged and published on the sweep
+    that finds it, BEFORE its resume upload runs. the withheld case reaches the same two facts in
+    the other order. the lifecycle records them independently precisely so neither ordering has to
+    be called the canonical one.
+    """
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    order: list[str] = []
+    staged: list[int] = []
+    published: list[int] = []
+    monkeypatch.setattr(
+        rl_train._w,
+        "upload_resume_checkpoint",
+        lambda step, path, **k: (order.append("resume"), k["after_upload"]())[0],
+        raising=False,
+    )
+    _patch_stage_and_publish(monkeypatch, staged, published)
+    _write_step(local_dir, 3)
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir), resume_step=0, required_steps=(3,), had_gradient=lambda: True
+    )
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not published:
+            time.sleep(0.05)
+    finally:
+        uploader.stop()
+
+    assert published == [3]
+    assert order.index("resume") == len(order) - 1, "the resume upload must not precede the publish"
+    facts = uploader.lifecycle.facts(3)
+    assert facts.staged
+    assert facts.deployable_published
+    assert facts.resume_uploaded
+    uploader.raise_if_incomplete()
+
+
+def test_a_failed_resume_upload_is_not_recorded_as_durable_and_stays_non_fatal(
+    tmp_path, monkeypatch
+):
+    """a resume upload that raises leaves resume_uploaded unset without failing the run.
+
+    grpo treats resume state as internal retry scaffolding: losing it costs restart distance, not
+    the policy. the attempt is still recorded so a permanently failing upload cannot respin every
+    0.5s, which is why "attempted" and "uploaded" have to be two different things.
+    """
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    attempts: list[int] = []
+
+    def exploding_upload(step, path, **kwargs):
+        attempts.append(int(step))
+        raise RuntimeError("hub is down")
+
+    monkeypatch.setattr(rl_train._w, "upload_resume_checkpoint", exploding_upload, raising=False)
+    _patch_stage_and_publish(monkeypatch, [], [])
+    _write_step(local_dir, 2)
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=())
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not attempts:
+            time.sleep(0.05)
+        time.sleep(1.0)  # several sweeps: the failed upload must not be retried on each one
+    finally:
+        uploader.stop()
+
+    assert attempts == [2], f"a permanently failing upload respun: {attempts}"
+    assert not uploader.lifecycle.facts(2).resume_uploaded
+    assert uploader.lifecycle.facts(2).discovered
+    uploader.raise_if_incomplete()  # non-fatal: no required save was owed
 
 
 def test_a_permanently_withheld_step_fails_the_run_and_does_not_hang_stop(tmp_path, monkeypatch):
@@ -3490,7 +4131,7 @@ def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_ti
 
 def test_resumed_required_step_can_still_publish_its_withheld_deployable(tmp_path, monkeypatch):
     # a previous worker resume-uploads a required checkpoint while withholding its adapter behind the
-    # gradient gate, so the step is durable as resume state but NOT published. seeding processed_steps
+    # gradient gate, so the step is durable as resume state but NOT published. seeding the lifecycle
     # with resume_step would hide it from _pending forever, and completeness would then fail a run on
     # the one step this worker is both able and allowed to publish.
     local_dir = tmp_path / "ckpt"
@@ -3605,7 +4246,7 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
         "_publish_staged",
         lambda self, step, adapter_dir: (
             published.append(int(step)),
-            self.published_steps.add(step),
+            self.lifecycle.mark_deployable_published(step),
         )[0],
     )
     for step in (1, 2, 3, 4):
@@ -3662,7 +4303,7 @@ def test_staging_failure_does_not_strand_an_earlier_publishable_step(tmp_path, m
         "_publish_staged",
         lambda self, step, adapter_dir: (
             published.append(int(step)),
-            self.published_steps.add(step),
+            self.lifecycle.mark_deployable_published(step),
         )[0],
     )
     for step in (1, 2):
@@ -3845,7 +4486,7 @@ def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
 # each test pins one rejection message so deleting a guard cannot pass via another raise.
 
 
-def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
+def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None, example_count=8):
     """a minimal single-turn text env, optionally flipped to a shape verl grpo handles differently.
 
     ``image_uri`` must be a source the normalizer accepts offline (a data uri): a remote https url
@@ -3862,11 +4503,11 @@ def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None):
             self.max_turns = 3 if multi_turn else 0
 
         def dataset(self):
-            return [{"index": i} for i in range(8)]
+            return [{"index": i} for i in range(example_count)]
 
         # the four calls the multi-turn bridge drives an env through. defined unconditionally so a
         # test can delete one and assert the capability gate catches it.
-        def new_rollout_state(self, ex):
+        def new_rollout_state(self, ex, prepared_prompt):
             return {}
 
         def record_model_turn(self, state, text):
@@ -4127,8 +4768,8 @@ def test_text_env_resolves_without_building_a_processor(monkeypatch):
 def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
     # verl's kl reference is the bare base whenever lora is active, so warm-start + kl used to be
     # refused: the penalty would drag the policy away from the sft adapter the run was told to
-    # continue. render_kl_ref_adapter_shim anchors the reference to that adapter instead, so the
-    # combination now resolves. the kl coefficient arrives through grpo_overrides, so it must go
+    # continue. the deferred kl-reference plugin patch anchors the reference to that adapter instead,
+    # so the combination now resolves. the kl coefficient arrives through grpo_overrides, so it must go
     # through the helper rather than being patched separately.
     import flash.engine.worker.model.adapter as _adapter_mod
 
@@ -4239,19 +4880,10 @@ def test_multi_turn_child_env_carries_every_variable_the_loop_reads():
     )
 
 
-def test_multi_turn_child_env_registers_the_plugin_with_verl():
-    # the agent-loop override names `flash_grpo_multi_turn`, but the name only exists once verl
-    # imports the plugin -- which happens ONLY through this variable (import_external_libs). without
-    # it the child dies at rollout build with an unregistered-loop error, having already paid for
-    # engine startup.
-    emitted = rl_train.multi_turn_child_env(
-        _multi_turn_inp(), reward_url="http://127.0.0.1:9/", thinking=False
-    )
-    assert emitted["VERL_USE_EXTERNAL_MODULES"] == "flash_grpo_plugin"
-    # the module name must match the file actually copied in, or the import fails at child startup.
-    # assert on the FLAT name the child imports, not the source path: the source moves with the
-    # package layout, the flat name is the contract with VERL_USE_EXTERNAL_MODULES.
-    assert "flash_grpo_plugin.py" in {flat for _, flat in rl_train.MULTI_TURN_CHILD_MODULES}
+def test_grpo_child_environment_registers_exactly_one_plugin():
+    source = inspect.getsource(rl_train._build_rl_child_env)
+    assert 'env_for_verl["VERL_USE_EXTERNAL_MODULES"] = "flash_grpo_plugin"' in source
+    assert "flash_grpo_plugin.py" in {flat for _, flat in rl_train.GRPO_CHILD_MODULES}
 
 
 def test_multi_turn_child_env_serializes_values_the_child_can_parse_back():
@@ -4281,9 +4913,9 @@ def test_multi_turn_child_modules_are_copied_under_the_names_they_import_each_ot
     # each module falls back to a flat `flash_`-prefixed import of the next one. copying a file
     # under the wrong name leaves that fallback unresolvable, and the child's ImportError arrives
     # inside verl's plugin loader where it reads as a verl problem.
-    written = rl_train.copy_multi_turn_child_modules(str(tmp_path))
+    written = rl_train.copy_grpo_child_modules(str(tmp_path))
     names = {os.path.basename(path) for path in written}
-    assert names == {name for _, name in rl_train.MULTI_TURN_CHILD_MODULES}
+    assert names == {name for _, name in rl_train.GRPO_CHILD_MODULES}
     imported = set()
     for path in written:
         source = Path(path).read_text()
@@ -4291,76 +4923,37 @@ def test_multi_turn_child_modules_are_copied_under_the_names_they_import_each_ot
         # every copy must parse standalone in the child interpreter.
         ast.parse(source)
         imported |= set(re.findall(r"from (flash_[a-z_]+) import", source))
-    # the fallback import targets must be exactly the names copied in.
+    imported |= set(re.findall(r"from (flash_[a-z_]+) import", rl_train.render_reward_module()))
+    # every flat import target, including the generated reward module's transport, must be copied.
     assert imported <= {name.removesuffix(".py") for name in names}
 
 
-def test_multi_turn_child_modules_do_not_import_flash(tmp_path):
-    # flash is NOT importable in the verl interpreter (incompatible torch/vllm pins). each module
-    # keeps an in-tree `from flash...` fallback for the parent's own lint and tests, so the rule is
-    # that no flash import may be reachable without the flat one failing first -- i.e. every one of
-    # them sits in an except ImportError handler.
-    for path in rl_train.copy_multi_turn_child_modules(str(tmp_path)):
-        tree = ast.parse(Path(path).read_text())
-        guarded = {
-            id(node)
-            for tries in ast.walk(tree)
-            if isinstance(tries, ast.Try)
-            for handler in tries.handlers
-            for node in ast.walk(handler)
-        }
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("flash."):
-                assert id(node) in guarded, (
-                    f"{os.path.basename(path)} imports {node.module} outside an ImportError "
-                    "fallback; the child interpreter cannot import flash"
-                )
+def test_grpo_child_modules_do_not_fall_back_to_flash_in_the_isolated_child(tmp_path):
+    for path in rl_train.copy_grpo_child_modules(str(tmp_path)):
+        source = Path(path).read_text()
+        assert "except ImportError" not in source or "from flash." not in source
+        ast.parse(source)
 
 
-def test_the_run_body_always_puts_the_shim_dir_on_the_child_path():
-    # the copies above are useless unless shim_dir is importable. the condition used to be
-    # `if shim_source:` -- true only when some OTHER feature wanted a sitecustomize patch, so a
-    # plain multi-turn job copied three modules the child could never import. source-level because
-    # the assignment sits inside run_rl_train, past the subprocess launch.
-    src = inspect.getsource(rl_train._build_rl_child_env)
-    # the assignment must remain unconditional because the tf32 fragment applies to every run.
-    # inspect the ast so only enclosing guards count.
-    tree = ast.parse(textwrap.dedent(src))
+def test_the_shared_builder_is_the_sole_owner_of_the_grpo_child_path(monkeypatch, tmp_path):
+    sentinel_path = "shared-builder-pythonpath"
+    calls = []
 
-    def _assigns_pythonpath(node):
-        return any(
-            isinstance(sub, ast.Subscript)
-            and isinstance(sub.slice, ast.Constant)
-            and sub.slice.value == "PYTHONPATH"
-            for target in getattr(node, "targets", [])
-            for sub in ast.walk(target)
-        )
+    def build_child_env(*, shim_dir, wandb_enabled):
+        calls.append((shim_dir, wandb_enabled))
+        return {"PYTHONPATH": sentinel_path}
 
-    def _guards(node, stack):
-        if isinstance(node, ast.Assign) and _assigns_pythonpath(node):
-            found.append(list(stack))
-        if isinstance(node, ast.If):
-            for sub in node.body:
-                _guards(sub, [*stack, ast.unparse(node.test)])
-            for sub in node.orelse:
-                _guards(sub, [*stack, f"not ({ast.unparse(node.test)})"])
-            return
-        for child in ast.iter_child_nodes(node):
-            _guards(child, stack)
+    monkeypatch.setattr(rl_train, "_build_verl_child_env", build_child_env)
+    files = {
+        "shim_dir": str(tmp_path),
+        "rank_device_claims": str(tmp_path / "rank_device_claims.txt"),
+        "plugin_config_path": str(tmp_path / "flash_grpo_plugin_config.json"),
+    }
+    child = rl_train._build_rl_child_env({"multi_turn": False}, files, [], "http://127.0.0.1:9/")
 
-    found: list[list[str]] = []
-    _guards(tree, [])
-    assert found, "run_rl_train no longer assigns env_for_verl['PYTHONPATH']"
-    for stack in found:
-        assert not stack, (
-            "PYTHONPATH is conditionally extended again; a multi-turn job (or the tf32 fragment) "
-            f"can miss shim_dir. enclosing conditions were: {stack!r}"
-        )
-    shim_src = inspect.getsource(rl_train._write_rl_shim)
-    assert (
-        'if inp["multi_turn"]:\n        copy_multi_turn_child_modules(files["shim_dir"])'
-        in shim_src
-    )
+    assert calls == [(str(tmp_path), False)]
+    assert child["PYTHONPATH"] == sentinel_path
+    assert child["FLASH_GRPO_PLUGIN_CONFIG_PATH"] == files["plugin_config_path"]
 
 
 # ---------------------- multi-turn per-turn generation cap ----------------------
@@ -4464,14 +5057,15 @@ class _BridgeEnv:
         self.recorded: list[str] = []
         self.scored: list[dict] = []
 
-    def new_rollout_state(self, example):
-        # `messages` starts as a COPY of `prompt` and turns are appended onto it, matching
+    def new_rollout_state(self, example, prepared_prompt):
+        # `messages` starts as a copy of `prompt` and turns are appended onto it, matching
         # flash.envs.adapter.new_rollout_state. anything reading the transcript has to account
         # for that seeding rather than treating `messages` as turns-only.
+        prompt = [dict(message) for message in prepared_prompt]
         state: dict = {
             "example": example,
-            "prompt": list(self.prompt),
-            "messages": [dict(message) for message in self.prompt],
+            "prompt": prompt,
+            "messages": [dict(message) for message in prompt],
         }
         if self.max_episode_turns is not None:
             state["max_episode_turns"] = self.max_episode_turns
@@ -4540,37 +5134,122 @@ def test_bridge_start_lets_a_per_example_budget_lower_the_cap_but_never_raise_it
     ) == {"max_turns": 1}
 
 
-def test_bridge_start_adopts_the_datasets_prompt_over_a_second_start_episode():
-    # `new_rollout_state` calls `start_episode` a SECOND time; dataset preparation already called
-    # it to build the prompt the child generates against. an env that randomizes per episode hands
-    # back a DIFFERENT opening here, and the run would then score a response generated for prompt A
-    # against a reward computed for prompt B. the env below returns a fresh secret every call, the
-    # way a randomized env does.
-    class _RandomizingEnv(_BridgeEnv):
+def test_bridge_start_passes_the_index_aligned_prepared_prompt_into_state_creation():
+    class _RecordingEnv(_BridgeEnv):
         def __init__(self):
             super().__init__()
-            self.calls = 0
+            self.starts = []
 
-        def new_rollout_state(self, example):
-            self.calls += 1
-            return {
-                "example": example,
-                "prompt": [{"role": "user", "content": f"secret-{self.calls}"}],
-                "messages": [{"role": "user", "content": f"secret-{self.calls}"}],
-            }
+        def new_rollout_state(self, example, prepared_prompt):
+            self.starts.append((example, prepared_prompt))
+            return super().new_rollout_state(example, prepared_prompt)
 
-    env = _RandomizingEnv()
-    dataset_prompt = [{"role": "user", "content": "secret-0"}]
-    bridge = _bridge(env, examples=[{"index": 0}], env_prompts=[dataset_prompt])
+    env = _RecordingEnv()
+    example = {"index": 0}
+    prepared_prompt = [{"role": "user", "content": "prepared"}]
+    bridge = _bridge(env, examples=[example], env_prompts=[prepared_prompt])
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "answer"})
-    bridge.score({"session_id": "a", "turn_count": 1})
 
-    scored = env.scored[0]
-    assert scored["prompt"] == dataset_prompt, (
-        "the episode was scored against a prompt the model never saw"
+    assert env.starts == [(example, prepared_prompt)]
+    state = bridge._sessions["a"]["state"]
+    assert state["prompt"] == prepared_prompt
+    assert state["messages"] == prepared_prompt
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "image", "image_url": "x"}],
+        [{"type": "image_url", "image_url": "x"}],
+        [{"type": "input_image", "image_url": "x"}],
+        [
+            {"type": "text", "text": "what changed?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ],
+    ],
+    ids=["image", "image-url", "input-image", "mixed-text-image"],
+)
+def test_bridge_refuses_every_image_reply_shape(content):
+    # every image spelling and a mixed text/image reply must fail rather than reach the child as text.
+    env = _BridgeEnv(
+        replies=[{"role": "user", "content": content}],
+        done_after=99,
     )
-    assert scored["messages"][0] == dataset_prompt[0]
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="image block"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+@pytest.mark.parametrize("block_type", ["video", "audio", "tool_use", "input_file"])
+def test_bridge_refuses_a_non_text_reply_block_instead_of_dropping_it(block_type):
+    # the flattener keeps `type == "text"` and joins it, so any other block contributes NOTHING and
+    # disappears. that is the stringified-image defect wearing a different type: the env meant the
+    # model to see something, the model never saw it, and the run still looks healthy.
+    env = _BridgeEnv(
+        replies=[
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "look"}, {"type": block_type, "data": "x"}],
+            }
+        ],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="unsupported type"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+def test_bridge_refuses_a_malformed_text_block_rather_than_flattening_it_to_nothing():
+    # a text block with no string text flattens to "", so the turn silently loses its content.
+    env = _BridgeEnv(
+        replies=[{"role": "user", "content": [{"type": "text", "text": None}]}],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="missing its text"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+def test_bridge_refuses_a_non_object_reply_block():
+    env = _BridgeEnv(replies=[{"role": "user", "content": ["plain string"]}], done_after=99)
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="must be an object"):
+        bridge.step({"session_id": "a", "completion_text": "answer"})
+
+
+def test_bridge_flattens_a_text_only_block_reply_instead_of_stringifying_it():
+    # text blocks ARE representable, so they must not become a repr either: an env that returns
+    # openai-style text blocks would otherwise train the model on "[{'type': 'text', ...}]".
+    env = _BridgeEnv(
+        replies=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": " second"},
+                ],
+            }
+        ],
+        done_after=99,
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    step = bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert step["messages"] == [{"role": "user", "content": "first second"}]
+
+
+def test_bridge_still_passes_a_plain_string_reply_through_unchanged():
+    # the control: the ordinary text path is what every existing multi-turn env uses, and it must be
+    # untouched by the block handling above.
+    env = _BridgeEnv(replies=[{"role": "user", "content": "next"}], done_after=99)
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    step = bridge.step({"session_id": "a", "completion_text": "answer"})
+    assert step["messages"] == [{"role": "user", "content": "next"}]
 
 
 def test_bridge_rejects_prompts_that_do_not_align_with_its_examples():
@@ -4638,6 +5317,57 @@ def test_bridge_step_stops_before_asking_a_finished_env_for_a_reply():
     }
 
 
+class _SignOffEnv(_BridgeEnv):
+    """an env whose ``env_reply`` ENDS the episode, the way the adapter's does when ``step_episode``
+    returns ``done=True``: ``rollout_done`` is false at the bridge's check BEFORE the reply and true
+    at the one after. that ordering is what puts a final sign-off message on the terminal path;
+    a plain ``done_after=1`` stops at the earlier check and never calls ``env_reply`` at all."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._signed_off = False
+        self.last_state: dict = {}
+
+    def env_reply(self, messages, state):
+        self._signed_off = True
+        self.last_state = state
+        return super().env_reply(messages, state)
+
+    def rollout_done(self, state, max_turns):
+        return self._signed_off or super().rollout_done(state, max_turns)
+
+
+def test_bridge_step_does_not_validate_a_terminal_reply_the_child_never_reads():
+    # an env that signs off with a final image (or any non-text block) alongside done=True used to
+    # take the reply-block guard and 400 the episode -- losing a completed rollout's reward over a
+    # message that was never going to be shown to the model. the child breaks on `terminal` BEFORE
+    # it reads `messages`, and env_reply has already recorded the reply into the scored state.
+    env = _SignOffEnv(
+        done_after=9,
+        replies=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}],
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    out = bridge.step({"session_id": "a", "completion_text": "first"})
+    assert out == {"terminal": True, "messages": []}
+    # the sign-off still reached the state the reward path reads; it was skipped, not dropped.
+    # _BridgeEnv.env_reply extends the same `state["messages"]` the adapter's does.
+    assert env.replies[0] in env.last_state["messages"]
+
+
+def test_bridge_step_still_refuses_a_non_terminal_image_reply():
+    # the terminal exemption above must not weaken the live path: a mid-episode image still cannot
+    # reach the engine, so it stays a loud failure rather than a silently dropped turn.
+    env = _BridgeEnv(
+        done_after=9,
+        replies=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}],
+    )
+    bridge = _bridge(env)
+    bridge.start({"index": 0, "session_id": "a"})
+    with pytest.raises(ValueError, match="image block"):
+        bridge.step({"session_id": "a", "completion_text": "first"})
+
+
 def test_bridge_step_on_an_unknown_session_raises_rather_than_scoring_a_blank_episode():
     with pytest.raises(KeyError, match="unknown multi-turn session"):
         _bridge(_BridgeEnv()).step({"session_id": "ghost", "completion_text": "x"})
@@ -4673,6 +5403,27 @@ def test_bridge_score_converts_a_non_finite_episode_to_zero():
         bridge.start({"index": 0, "session_id": "a"})
         bridge.step({"session_id": "a", "completion_text": "answer"})
         assert bridge.score({"session_id": "a", "turn_count": 1}) == {"score": 0.0}
+
+
+def test_per_turn_credit_without_turn_rewards_warns_once_and_keeps_fallback(capsys):
+    env = _BridgeEnv(episode=0.75)
+    bridge = _bridge(env, per_turn_credit=True)
+    for index, session_id in enumerate(("a", "b")):
+        bridge.start({"index": index, "session_id": session_id})
+        bridge.step({"session_id": session_id, "completion_text": "answer"})
+        assert bridge.score({"session_id": session_id, "turn_count": 1}) == {
+            "score": 0.75,
+            "turns": None,
+        }
+
+    out = capsys.readouterr().out
+    warning = "per-turn credit was requested"
+    assert out.count(warning) == 1
+    # the fallback the shim actually applies is per group, not per run
+    # (test_per_turn_credit_shim_leaves_other_groups_on_episode_credit), so a warning claiming the
+    # run switched schemes would misreport which credit assignment trained the model.
+    assert "rollout group" in out
+    assert "this run falls back" not in out
 
 
 def test_bridge_hands_each_scored_episode_to_the_sample_recorder():
@@ -5143,7 +5894,8 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
         "# index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order. "
         'env_prompts=[p["env_prompt"] for p in prompts], max_turns=int(inp["max_turns"]), '
         'per_turn_credit=bool(inp["per_turn_credit"]), '
-        "on_episode_scored=observability.record, )" in src
+        "on_episode_scored=observability.record, "
+        "parent_work=observability.parent_work, )" in src
     )
     assert 'if inp["multi_turn"] else None' in src
 
@@ -5192,301 +5944,6 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
     assert f"data.max_response_length={inp['max_response_len']}" in rl_train.build_verl_overrides(
         cfg
     )
-
-
-# ---------------------- measured reward latency in train_meta ----------------------
-def _resolved_inputs_for_notes(monkeypatch):
-    """A resolved single-turn input dict, offline.
-
-    Mirrors the resolver fixture above: _resolve_grpo_inputs needs a loaded env, a spec and
-    a tokenizer, none of which exist in a unit test.
-    """
-    from flash.core.spec import JobSpec
-    from flash.engine.worker.runtime.pkg_proxy import W
-
-    class _Env:
-        multi_turn = False
-        is_tool_env = False
-
-        def dataset(self):
-            return [{"index": i} for i in range(33)]
-
-        def prompt_messages(self, ex):
-            return [{"role": "user", "content": f"question {ex['index']}"}]
-
-    class _Tokenizer:
-        pad_token = None
-        eos_token = "<eos>"
-
-        def apply_chat_template(self, messages, **kwargs):
-            return messages[0]["content"]
-
-        def __call__(self, text, **kwargs):
-            return SimpleNamespace(input_ids=[1])
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "grpo",
-            "train": {"prompts_per_step": 16, "epochs": 2},
-        }
-    )
-    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
-    monkeypatch.setattr(W, "SEED", 42, raising=False)
-    monkeypatch.setattr(W, "THINKING", False, raising=False)
-    monkeypatch.setattr(W, "require_active_env", lambda: _Env(), raising=False)
-    monkeypatch.setattr(W, "grpo_overrides", dict, raising=False)
-    monkeypatch.setattr(W, "grpo_mask_truncated_completions", lambda train: False, raising=False)
-    monkeypatch.setattr(W, "load_tokenizer", lambda *args, **kwargs: _Tokenizer(), raising=False)
-    monkeypatch.setattr(rl_train, "seed_training_rngs", lambda seed: None)
-    monkeypatch.setattr(rl_train, "model_max_position_embeddings", lambda *a, **k: 40960)
-    return rl_train._resolve_grpo_inputs()
-
-
-def _profile(seconds: float, *, trustworthy: bool = True):
-    """A RewardProfile shaped like the profiler's real output."""
-    from flash.engine.profiling.reward_profile import RewardProfile
-
-    return RewardProfile(
-        seconds_per_completion=seconds,
-        samples=0 if not trustworthy else 3,
-        degenerate=False,
-        failures=0,
-    )
-
-
-def test_train_notes_record_the_measured_grading_latency(monkeypatch):
-    """The measurement has to outlive the log line to be usable by anything downstream.
-
-    A latency that only reaches stdout cannot price a run or place one: the cost model would keep
-    using its single 1.0s average for an env just measured at 0.02s.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=5,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(0.25),
-        step_intervals=[10.0],
-    )
-    assert notes["reward_seconds_per_completion"] == 0.25
-
-
-def test_train_notes_omit_an_untrustworthy_profile(monkeypatch):
-    """A profile that measured nothing must record None, not a number.
-
-    RewardProfile.trustworthy is False when no sample graded successfully; writing its 0.0 into
-    train_meta would read downstream as a genuinely instant grader.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=5,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(0.0, trustworthy=False),
-        step_intervals=[10.0],
-    )
-    assert notes["reward_seconds_per_completion"] is None
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_train_notes_report_idle_fraction_from_the_runs_own_step_wall(monkeypatch):
-    """The idle share is computed from measured wall time, not from the cost model's estimate.
-
-    Deriving it from the modelled step would report the estimator's own opinion back to it, which
-    is exactly the number an operator would want to CHECK against reality.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    # a step wall of 10s, of which grading accounts for 8s -> 80% idle.
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 10,
-    )
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_train_notes_do_not_publish_the_serial_idle_projection_when_batching(monkeypatch):
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(8.0 / completions),
-        step_intervals=[10.0] * 10,
-        reward_bridge_batching=True,
-    )
-
-    assert notes["reward_bridge_batching"] is True
-    assert notes["reward_seconds_per_completion"] == 8.0 / completions
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_idle_fraction_is_none_when_grading_exceeds_the_measured_step(monkeypatch):
-    """Grading that fills the whole step leaves no gpu-bound remainder to divide.
-
-    The profile and the observed wall disagree here (a warm-up latency that no longer holds, or a
-    step wall dominated by something else), and neither can arbitrate, so the honest record is no
-    reading rather than a fabricated 100%.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        # 20s of grading inside a 10s measured step
-        reward_profile=_profile(20.0 / completions),
-        step_intervals=[10.0] * 10,
-    )
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_idle_fraction_ignores_steps_this_worker_did_not_run(monkeypatch):
-    """A resumed run must divide by ITS steps, not by the checkpoint's absolute step number.
-
-    steps_run comes from the checkpoint directory and counts every step the run has ever taken;
-    the wall clock only ever covers this session. A worker resuming at 90 and training to 100
-    walled ten steps, and charging those seconds against a hundred understates each step by 10x --
-    which inflates the idle share toward 100% and would route the run to a co-location tier it
-    cannot sustain. Feeding the measured intervals removes the term entirely.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        # the checkpoint says 100 steps; this worker observed ten, each a real 10s step.
-        steps_run=100,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 10,
-    )
-    # unchanged from the fresh-run case above: resume does not move the reading.
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_idle_fraction_is_unmoved_by_one_slow_step(monkeypatch):
-    """A checkpoint save lands inside a single step interval and must not set the verdict.
-
-    Every save-step gap carries an upload that the other steps never pay. Averaging lets one such
-    step drag the whole reading -- here a 200s outlier among 10s steps would report ~28s/step and
-    flip an 80% idle run to 29%. The median needs MOST steps to be slow before it moves.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    latency = 8.0 / completions
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=10,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(latency),
-        step_intervals=[10.0] * 9 + [200.0],
-    )
-    assert notes["reward_gpu_idle_fraction"] == pytest.approx(0.8, abs=0.01)
-
-
-def test_idle_fraction_is_none_when_no_step_was_timed(monkeypatch):
-    """A run that never emitted two step lines has no measured step to divide by.
-
-    One step line yields zero intervals by design (the span before it is engine startup), and a
-    run that died in its first step yields none at all. Both must record no reading rather than
-    fall back to a modelled step, which is the number this metric exists to check.
-    """
-    inp = _resolved_inputs_for_notes(monkeypatch)
-    completions = inp["prompts_per_step"] * inp["group_size"]
-    notes = rl_train._build_verl_train_notes(
-        inp,
-        steps_run=1,
-        retained_prompts=len(inp["prompts"]),
-        reward_history=[],
-        loss_curve=[],
-        reward_profile=_profile(8.0 / completions),
-        step_intervals=[],
-    )
-    assert notes["reward_gpu_idle_fraction"] is None
-
-
-def test_step_intervals_exclude_the_span_before_the_first_step():
-    """Engine init, weight load and cudagraph capture precede the first step line.
-
-    That span is setup, paid once, and often larger than a step. Counting it as a step would
-    inflate the step wall and understate the idle share on exactly the short runs where the
-    startup cost dominates. N step lines bound N-1 steps, never N.
-    """
-    assert rl_train._step_intervals([100.0, 110.0, 122.0]) == [10.0, 12.0]
-    # a single step line bounds no whole step: nothing is known about what came before it or after.
-    assert rl_train._step_intervals([100.0]) == []
-    assert rl_train._step_intervals([]) == []
-
-
-def test_the_profile_hook_returns_its_reading_to_the_caller():
-    """_log_reward_profile must RETURN the profile, not only print it.
-
-    Asserted against the real hook rather than a fixture: the wiring under test is that the run
-    body can capture what the profiler measured.
-    """
-
-    class Env:
-        def sft_completion(self, example):
-            return [{"role": "assistant", "content": "an answer worth grading"}]
-
-    profile = rl_train._log_reward_profile(
-        Env(), lambda index, completion: 1.0, [{"id": i} for i in range(4)], 32
-    )
-    assert profile is not None
-    assert profile.trustworthy
-
-
-def test_the_run_body_passes_the_measured_profile_into_train_meta():
-    """The captured profile must actually reach the notes builder.
-
-    Source-level, because reaching this line in a live run needs a gpu. Without it the hook could
-    return a profile that the run body drops on the floor, and every other test here would still
-    pass while train_meta always recorded None.
-    """
-    reward_src = inspect.getsource(rl_train._start_reward_runtime)
-    entry_src = inspect.getsource(rl_train.run_rl_train)
-    metadata_src = inspect.getsource(rl_train._write_terminal_metadata)
-    assert "_log_reward_profile(" in reward_src, "the hook is never called"
-    assert "reward_profile = " in reward_src, "the hook's reading is discarded"
-    assert "reward_runtime=reward_runtime" in entry_src, "the reading never reaches train_meta"
-    assert "reward_profile=reward_runtime.reward_profile" in metadata_src, (
-        "the reading never reaches train_meta"
-    )
-    assert 'reward_bridge_batching=not inp["multi_turn"]' in metadata_src
-
-
-def test_the_reward_profiler_is_skipped_on_multi_turn():
-    """The profiler times the SINGLE-TURN grading path, which a multi-turn env does not have.
-
-    Source-level for the same reason as above. Running it on a multi-turn env would call
-    env.reward/scores_breakdown on one completion -- a call that env's contract does not define --
-    and record the resulting number as if it described the episode reward path.
-    """
-    src = inspect.getsource(rl_train._start_reward_runtime)
-    profile_call = src[src.index("reward_profile = ") : src.index("multi_turn_bridge = ")]
-    assert 'if inp["multi_turn"]' in profile_call, "the profiler is not gated off multi-turn"
-    assert "None" in profile_call, "multi-turn must record no profile rather than a wrong one"
 
 
 # ---------------- reward observability: the buffer and the heartbeat drain ----------------
@@ -6134,10 +6591,11 @@ def test_the_first_sample_bearing_heartbeat_is_forced():
     # drops a second payload at an already-committed step. without force, the first heartbeat
     # carrying samples is exactly the one most likely to be suppressed.
     src = inspect.getsource(rl_train._ingest_step_metrics)
-    forced = src[src.index("if not sent_first_metrics:") :]
+    forced = src[src.index("if not state.sent_first_metrics or") :]
     forced = forced[: forced.index("gpu=gpu_diagnostics")]
+    assert "heartbeat_fields = _reward_observability()" in src
     assert "force=True" in forced
-    assert "**_reward_observability()" in forced
+    assert "**heartbeat_fields" in forced
 
 
 def test_the_liveness_fields_hook_carries_reward_observability():
@@ -6166,7 +6624,7 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     # sealed on the new-step branch, and BEFORE the preview reads the published rows so the logged
     # sample and the heartbeat describe the same generation.
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = int(m.group(1))') :]
+    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = step_number') :]
     assert 'reward_runtime.observability.close_generation(progress["step"])' in stdout_loop
     assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
         'samp = reward_runtime.observability.latest_for_step(progress["step"])'
@@ -6287,23 +6745,13 @@ def _run_per_turn_shim(rows, uids, episode_advantages, response_mask=None):
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(rl_train.render_per_turn_credit_shim(True), "sitecustomize.py", "exec"), {})
+        verl_patches.install_per_turn_credit()
         # call the module global by name, exactly as ray_trainer.fit does at its call site.
         out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
     finally:
         for name in stubs:
             sys.modules.pop(name, None)
     return out.batch["advantages"]
-
-
-def test_per_turn_credit_shim_is_emitted_only_when_per_turn_credit_is_requested():
-    # the default path must put nothing on the child's import path: this shim replaces the
-    # advantage computation itself, so emitting it unconditionally would put every episode-credit
-    # run through a rewrite it never asked for.
-    assert rl_train.render_per_turn_credit_shim(False) == ""
-    source = rl_train.render_per_turn_credit_shim(True)
-    assert source
-    assert "_flash_pt_ray_trainer.compute_advantage = _flash_pt_compute_advantage" in source
 
 
 def test_per_turn_credit_shim_centres_each_turn_against_its_group_sibling():
@@ -6461,7 +6909,7 @@ def test_per_turn_credit_shim_passes_through_a_batch_without_per_turn_metadata()
     for name, module in stubs.items():
         sys.modules[name] = module
     try:
-        exec(compile(rl_train.render_per_turn_credit_shim(True), "sitecustomize.py", "exec"), {})
+        verl_patches.install_per_turn_credit()
         out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
     finally:
         for name in stubs:
@@ -6475,9 +6923,9 @@ def test_per_turn_credit_is_resolved_only_for_multi_turn_and_reaches_the_bridge(
     source = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert "not supported for multi-turn environments" not in source
     assert '"per_turn_credit": per_turn_credit' in source
-    shim_source = inspect.getsource(rl_train._write_rl_shim)
+    plugin_source = inspect.getsource(rl_train._write_rl_plugin_config)
     reward_source = inspect.getsource(rl_train._start_reward_runtime)
-    assert 'render_per_turn_credit_shim(inp["per_turn_credit"])' in shim_source
+    assert '"per_turn_credit": bool(inp["per_turn_credit"])' in plugin_source
     assert 'per_turn_credit=bool(inp["per_turn_credit"])' in reward_source
 
 
@@ -6487,8 +6935,8 @@ def test_multi_turn_bridge_returns_turns_only_under_per_turn_credit():
     class _Env:
         max_turns = 2
 
-        def new_rollout_state(self, example):
-            return {"prompt": [], "messages": []}
+        def new_rollout_state(self, example, prepared_prompt):
+            return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
         def rollout_rewards_many(self, items):
             from flash.envs.base import RolloutReward
@@ -6513,8 +6961,8 @@ def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
     class _Env:
         max_turns = 2
 
-        def new_rollout_state(self, example):
-            return {"prompt": [], "messages": []}
+        def new_rollout_state(self, example, prepared_prompt):
+            return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
         def rollout_rewards_many(self, items):
             from flash.envs.base import RolloutReward
@@ -6536,6 +6984,7 @@ def _drive_multi_turn_episode(
     monkeypatch=None,
     multi_modal_data=None,
     return_instance=False,
+    raw_prompt=None,
 ):
     """run the real child loop end to end against a real bridge, returning its agent loop output.
 
@@ -6590,6 +7039,11 @@ def _drive_multi_turn_episode(
             return {}
 
         async def process_multi_modal_info(self, messages):
+            # verl extracts media from the message CONTENT BLOCKS (rl_dataset.process_multi_modal_info
+            # keys off `item["type"] in {"image", "video"}`), so record what shape this was handed:
+            # a loop that flattened the prompt to text before extracting would arrive here with
+            # nothing left to find, and the images would be silently gone.
+            self.mm_info_contents = [message.get("content") for message in messages]
             return dict(multi_modal_data or {})
 
         async def apply_chat_template(self, messages, **kwargs):
@@ -6636,7 +7090,13 @@ def _drive_multi_turn_episode(
         # one actually running the coroutine.
         instance.loop = asyncio.get_running_loop()
         driven["instance"] = instance
-        await instance.run({}, raw_prompt=[{"role": "user", "content": "go"}], index=0)
+        await instance.run(
+            {},
+            raw_prompt=(
+                raw_prompt if raw_prompt is not None else [{"role": "user", "content": "go"}]
+            ),
+            index=0,
+        )
 
     asyncio.run(_go())
     if return_instance:
@@ -6652,8 +7112,8 @@ class _SpanEnv:
     def __init__(self):
         self.recorded: list[str] = []
 
-    def new_rollout_state(self, example):
-        return {"prompt": [], "messages": []}
+    def new_rollout_state(self, example, prepared_prompt):
+        return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
     def record_model_turn(self, state, text):
         self.recorded.append(text)
@@ -6669,6 +7129,38 @@ class _SpanEnv:
         from flash.envs.base import RolloutReward
 
         return [RolloutReward(episode=1.0, turns=tuple(0.5 for _ in self.recorded)) for _ in items]
+
+
+def test_an_image_prompt_reaches_media_extraction_and_the_rollout(monkeypatch):
+    # verl rewrites the parquet prompt into blocks before the child loop. media extraction must see
+    # those blocks before the model-facing transcript is flattened, and the decoded pixels must stay
+    # attached to the emitted episode for training.
+    env = _SpanEnv()
+    out, instance = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed")],
+        env=env,
+        monkeypatch=monkeypatch,
+        max_turns=1,
+        multi_modal_data={"images": ["PIXELS"]},
+        return_instance=True,
+        raw_prompt=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "/tmp/x.png"},
+                    {"type": "text", "text": "\nDescribe this image."},
+                ],
+            }
+        ],
+    )
+
+    assert out["multi_modal_data"] == {"images": ["PIXELS"]}
+    assert env.recorded == ["ab"]
+    contents = instance.mm_info_contents
+    assert isinstance(contents[0], list), (
+        "media extraction was handed flattened text; the images are already gone by this point"
+    )
+    assert {"type": "image", "image": "/tmp/x.png"} in contents[0]
 
 
 def test_a_truncated_final_turn_still_earns_per_turn_credit_for_the_turns_before_it(monkeypatch):
@@ -6867,16 +7359,18 @@ def _shim_files(tmp_path):
         "shim_dir": str(tmp_path),
         "shim_py": str(tmp_path / "sitecustomize.py"),
         "shim_markers": str(tmp_path / "applied_shims.txt"),
+        "rank_device_claims": str(tmp_path / "rank_device_claims.txt"),
+        "plugin_config_path": str(tmp_path / "flash_grpo_plugin_config.json"),
         "multi_turn": False,
     }
 
 
-def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_set(
-    tmp_path, monkeypatch
-):
-    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_path):
     files = _shim_files(tmp_path)
     inp = {
+        # one card: the rank/device assertion renders empty, so it owes no marker here. the
+        # multi-card case is pinned by the test below.
+        "dp_cards": 1,
         "reentrant_checkpointing": True,
         "multimodal": False,
         "entropy_quantile": 0.2,
@@ -6890,35 +7384,67 @@ def test_write_rl_shim_wraps_required_fragments_and_returns_the_expected_marker_
         "kl_coef": 0.04,
         "multi_turn": False,
     }
-    expected = rl_train._write_rl_shim(inp, files)
-    # exactly the enabled features, in composition order; off features owe no marker.
-    assert expected == [
+    rl_train._write_rl_shim(inp, files)
+    rl_train._write_rl_plugin_config(inp, files, gdn_reset_arch=None, loggers=[])
+
+    assert files["expected_shims"] == [
         "reentrant-checkpointing",
         "entropy-quantile",
         "stop-sequences",
         "exact-save-steps",
         "kl-ref-adapter",
+        "lora-rollout-guard",
     ]
     source = Path(files["shim_py"]).read_text()
-    # the wrap indents whole fragments into try blocks; a syntax slip would turn the child's
-    # entire patch set into a silent no-op, so compiling is the only real gate.
     compile(source, "sitecustomize.py", "exec")
-    for name in expected:
-        assert f"_flash_record_applied_shim({name!r})" in source
-    assert "per-turn-credit" not in source
-    # tf32 stays first and unwrapped: it swallows its own failures by design and a later fragment
-    # that raised must not be able to cost the run its tensor-core throughput.
-    assert source.index("tf32") < source.index("_FLASH_SHIM_MARKER_FILE")
-    assert f"_flash_shim_os._exit({backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
+    assert "tilelang libcudart" in source
+    assert "import verl" not in source
+    assert (tmp_path / "flash_grpo_plugin.py").is_file()
+    assert (tmp_path / "flash_grpo_patches.py").is_file()
+    assert (tmp_path / "flash_verl_runtime.py").is_file()
+    config = json.loads(Path(files["plugin_config_path"]).read_text())
+    assert files["expected_shims"] == grpo_plugin.required_patch_names(config)
+    assert config["gdn_model_type"] is None
+    assert config["kl_ref_adapter"] is True
 
 
-def test_the_gdn_varlen_append_is_wrapped_and_extends_the_expected_marker_set():
-    # the gdn shim is appended after python_bin resolution, so it must join the same fail-closed
-    # contract as the fragments _write_rl_shim composed: an unpatched gdn child trains across
-    # packed example boundaries, which is the silent failure the wrapper closes.
-    src = inspect.getsource(rl_train._configure_rl_child)
-    assert 'wrap_shim_fragment("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch))' in src
-    assert 'files["expected_shims"].append("gdn-varlen")' in src
+def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_cards(tmp_path):
+    files = _shim_files(tmp_path)
+    inp = {
+        "dp_cards": 2,
+        "reentrant_checkpointing": True,
+        "multimodal": False,
+        "entropy_quantile": None,
+        "per_turn_credit": False,
+        "stop_sequences": (),
+        "image_pad_token_id": None,
+        "structured_outputs": None,
+        "save_at_steps": (),
+        "steps": 20,
+        "warmstart_adapter": None,
+        "kl_coef": 0.0,
+        "multi_turn": False,
+    }
+    rl_train._write_rl_plugin_config(inp, files, gdn_reset_arch=None, loggers=[])
+
+    assert files["expected_shims"] == [
+        "rank-device-assert",
+        "reentrant-checkpointing",
+        "lora-rollout-guard",
+    ]
+    config = json.loads(Path(files["plugin_config_path"]).read_text())
+    assert config["dp_cards"] == 2
+
+
+def test_gdn_model_type_is_serialized_only_after_capability_resolution():
+    configure_source = inspect.getsource(rl_train._configure_rl_child)
+    config_source = inspect.getsource(rl_train._write_rl_plugin_config)
+    registry_source = inspect.getsource(grpo_plugin.required_patch_specs)
+    assert "require_gdn_boundary_resets(caps, gdn_module)" in configure_source
+    assert "_write_rl_plugin_config(" in configure_source
+    assert '"gdn_model_type": gdn_reset_arch' in config_source
+    assert '"gdn-varlen"' in registry_source
+    assert "bool(model_type)" in registry_source
 
 
 def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
@@ -6926,7 +7452,7 @@ def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
     provably finished (fragments print while later ones are still applying, so the first OUTPUT
     line would race the file). a missing marker there means the child trains unpatched."""
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
-    step_at = stdout_loop.index('progress["step"] = int(m.group(1))')
+    step_at = stdout_loop.index("step_number = verl_step_number(line)")
     verify_at = stdout_loop.index("verify_applied_shim_markers(shim_markers, expected_shims)")
     assert step_at < verify_at < stdout_loop.index("close_generation")
     # and the entry point wires the files dict (marker path + expected set) into both the loop

@@ -11,7 +11,6 @@ import asyncio
 import functools
 import hashlib
 import importlib.metadata
-import importlib.util
 import json
 import os
 from collections.abc import Callable
@@ -20,12 +19,15 @@ from typing import Any
 
 from packaging.version import Version
 
-from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
+PLUGIN_LOADED_EXTERNALLY = __name__ == "flash_opd_plugin"
+_PLUGIN_CONFIG: dict[str, Any] = {}
 
-try:
+if PLUGIN_LOADED_EXTERNALLY:
+    from flash_multiturn_glue import multi_modal_image_count
     from flash_opd_multiturn import build_flash_multi_turn_agent_loop
     from flash_opd_structured import StructuredOutputReplay, canonical_structured_spec
-except ImportError:
+else:
+    from flash.engine.worker.train.core.child.glue import multi_modal_image_count
     from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
     from flash.engine.worker.train.opd.child.structured import (
         StructuredOutputReplay,
@@ -193,9 +195,14 @@ def _run_with_no_signal_replacements(
     record_resample,
     record_abandoned,
     *,
-    max_attempts: int = OPD_NO_SIGNAL_ATTEMPTS,
+    max_attempts: int | None = None,
 ):
     """retry an all-no-signal rollout with a fresh bounded dispatch."""
+    if max_attempts is None:
+        try:
+            max_attempts = int(_PLUGIN_CONFIG["no_signal_attempts"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("flash OPD no-signal attempt limit is not configured") from error
     if max_attempts <= 0:
         raise ValueError("flash OPD no-signal attempt limit must be positive")
     for attempt_ordinal in range(max_attempts):
@@ -227,26 +234,6 @@ def _run_with_no_signal_replacements(
     raise AssertionError("unreachable no-signal replacement state")
 
 
-def _multi_modal_image_count(multi_modal_data) -> int:
-    if not multi_modal_data:
-        return 0
-    if not isinstance(multi_modal_data, dict):
-        raise TypeError("verl multimodal data must be a mapping")
-    # verl's rollout carries the payload under "image" (singular) for single-image rows and
-    # "images" for lists; count whichever is present.
-    images = multi_modal_data.get("images")
-    if images is None:
-        images = multi_modal_data.get("image")
-    if images is None:
-        return 0
-    if not isinstance(images, (list, tuple)):
-        return 1
-    try:
-        return len(images)
-    except TypeError as error:
-        raise TypeError("verl multimodal images must be a sized collection") from error
-
-
 def _bridge_score_payload(
     index: int,
     prompt_ids: list[int],
@@ -260,7 +247,7 @@ def _bridge_score_payload(
         "index": int(index),
         "prompt_length": len(prompt_ids),
         "sequence_ids": prompt_ids + response_ids,
-        "image_count": _multi_modal_image_count(multi_modal_data),
+        "image_count": multi_modal_image_count(multi_modal_data),
     }
     if forced is not None:
         payload["forced"] = list(forced)
@@ -730,6 +717,7 @@ def _build_flash_task_runner(FlashPPOTrainer, tq):
                     resource_pool_manager=self.resource_pool_manager,
                 )
                 trainer.init_workers()
+                install_bounded_replay_buffer_sample(trainer)
                 trainer.fit()
             finally:
                 if trainer:
@@ -762,6 +750,13 @@ def _install_verl_extensions() -> None:
         from transfer_queue import KVBatchMeta
     except ImportError:
         from verl.utils.transferqueue_utils import KVBatchMeta, tq
+
+    def mark_prompt_failure(uid, partition_id, global_steps, status) -> None:
+        tq.kv_put(
+            key=uid,
+            partition_id=partition_id,
+            tag={"global_steps": global_steps, "status": status},
+        )
 
     from verl.experimental.agent_loop.agent_loop import (
         AgentLoopBase,
@@ -872,7 +867,9 @@ def _install_verl_extensions() -> None:
         agent_loop_base=AgentLoopBase,
         agent_loop_output=AgentLoopOutput,
         post_json=_post_json,
-        score_failure_handler=_exit_for_score_failure,
+        score_failure_handler=_defer_score_failure,
+        fatal_rollout_exit_code=_fatal_rollout_exit_code,
+        mark_prompt_failure=mark_prompt_failure,
         deterministic_seed=deterministic_rollout_seed,
         permanent_teacher_exit=_PERMANENT_TEACHER_EXIT,
         transient_teacher_exit=_TRANSIENT_TEACHER_EXIT,
@@ -909,12 +906,14 @@ def main() -> None:
 # path reading an unbound global. the child then dies with `NameError: _post_json`, and since the
 # loss decorator has already registered by that point the retry reports "flash_groupwise_reverse_kl
 # is already registered" instead, which points at the wrong problem entirely.
-try:
+if PLUGIN_LOADED_EXTERNALLY:
     from flash_opd_bridge import (
         FlashTeacherBridgeError,
         _coordinate_first_mutation_notice,
+        _defer_score_failure,
         _exit_for_score_failure,
         _fallback_classification,
+        _fatal_rollout_exit_code,
         _mutation_distributed,
         _post_json,
         _post_no_signal_abandoned,
@@ -932,12 +931,14 @@ try:
         _write_resample_failure_fallback,
         _write_score_delivery_failure_fallback,
     )
-except ImportError:
+else:
     from flash.engine.worker.train.opd.child.bridge import (  # noqa: F401
         FlashTeacherBridgeError,
         _coordinate_first_mutation_notice,
+        _defer_score_failure,
         _exit_for_score_failure,
         _fallback_classification,
+        _fatal_rollout_exit_code,
         _mutation_distributed,
         _post_json,
         _post_no_signal_abandoned,
@@ -956,9 +957,24 @@ except ImportError:
         _write_score_delivery_failure_fallback,
     )
 
+
+if PLUGIN_LOADED_EXTERNALLY:
+    from flash_opd_replay_guard import install_bounded_replay_buffer_sample
+else:
+    from flash.engine.worker.train.opd.child.replay_guard import (
+        install_bounded_replay_buffer_sample,
+    )
+
+
+if PLUGIN_LOADED_EXTERNALLY:
+    import flash_opd_runtime
+    import flash_verl_runtime
+
+    _PLUGIN_CONFIG.update(flash_verl_runtime.load_plugin_config("FLASH_OPD_PLUGIN_CONFIG"))
+    flash_opd_runtime.install(_PLUGIN_CONFIG)
 
 if os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS"):
     _require_structured_runtime_versions()
 
-if importlib.util.find_spec("verl") is not None:
+if PLUGIN_LOADED_EXTERNALLY:
     _install_verl_extensions()

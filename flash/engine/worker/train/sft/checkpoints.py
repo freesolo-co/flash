@@ -19,10 +19,12 @@ from flash.engine.worker.backend_common import (
     export_peft_adapter,
     resolve_checkpoint_actor_dir,
     stamp_adapter_dir_provenance,
-    unprocessed_checkpoint_dirs,
+    undiscovered_checkpoint_dirs,
 )
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.train.core.checkpoint_lifecycle import CheckpointLedger
+from flash.engine.worker.verl.checkpoints import MergeDiskExhaustedError, MergeDiskHeadroomError
 
 
 def _sft_train():
@@ -104,7 +106,7 @@ class _VerlCheckpointWatcher:
         self.model_id = model_id
         self.model_revision = model_revision
         self.required_steps = frozenset(required_steps)
-        self.processed_steps: set[int] = set()
+        self.lifecycle = CheckpointLedger()
         self._error: BaseException | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -113,6 +115,8 @@ class _VerlCheckpointWatcher:
         self._thread.start()
 
     def raise_if_failed(self) -> None:
+        if isinstance(self._error, (MergeDiskHeadroomError, MergeDiskExhaustedError)):
+            raise self._error
         if self._error is not None:
             raise RuntimeError("verl checkpoint watcher failed") from self._error
 
@@ -125,7 +129,11 @@ class _VerlCheckpointWatcher:
         join_while_draining(self._thread, "verl checkpoint watcher")
         self.raise_if_failed()
         if require_complete:
-            missing = sorted(self.required_steps - self.processed_steps)
+            # the published adapters, not the steps this watcher handled: a required save is owed a
+            # servable artifact, and handling a step covers outcomes that never produce one. the
+            # boolean from upload_resume_checkpoint cannot stand in for it either -- it is also True
+            # when there is no artifact repository, which returns before the publish callback runs.
+            missing = self.lifecycle.missing_deployables(self.required_steps)
             if missing:
                 raise RuntimeError(f"required saves were not durably published: {missing}")
 
@@ -134,12 +142,29 @@ class _VerlCheckpointWatcher:
 
     def _pending(self) -> list[tuple[int, str]]:
         """the completed checkpoint dirs this uploader has not handled yet, oldest first."""
-        return unprocessed_checkpoint_dirs(
-            self.local_dir, self._completed_step(), self.processed_steps
+        return undiscovered_checkpoint_dirs(
+            self.local_dir, self._completed_step(), self.lifecycle.discovered_steps
         )
 
     def _should_publish(self, step: int) -> bool:
         return not self.required_steps or step in self.required_steps
+
+    def _publishable(self, pending: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        """coalesce only an optional multi-checkpoint backlog to its newest save."""
+        if self.required_steps or len(pending) <= 1:
+            return pending
+        superseded = pending[:-1]
+        # discovered only: these are claimed so the next sweep skips them, and deliberately gain no
+        # durability fact. nothing was published for them, and the ledger has to say so.
+        for step, _ in superseded:
+            self.lifecycle.mark_discovered(step)
+        print(
+            f"[ckpt] publishing step {pending[-1][0]} and skipping superseded periodic "
+            f"checkpoint(s) {', '.join(str(step) for step, _ in superseded)}: the publisher is "
+            "behind training, and each export writes a full model copy to the same disk",
+            flush=True,
+        )
+        return pending[-1:]
 
     def _staged_source(self, step: int, checkpoint_dir: str) -> str:
         """hardlink a completed checkpoint before verl retention can prune it.
@@ -166,7 +191,7 @@ class _VerlCheckpointWatcher:
 
     def _publish(self, step: int, checkpoint_dir: str) -> None:
         if not self._should_publish(step):
-            self.processed_steps.add(step)
+            self.lifecycle.mark_discovered(step)
             return
         staged_dir = self._staged_source(step, checkpoint_dir)
         try:
@@ -182,22 +207,32 @@ class _VerlCheckpointWatcher:
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
 
         def publish_adapter() -> None:
-            _w.publish_deployable_checkpoint(
+            published = _w.publish_deployable_checkpoint(
                 adapter_dir,
                 step,
                 required=step in self.required_steps,
                 _provenance_ready=True,
             )
+            # gate on the returned subfolder, not on reaching this line: an optional publish returns
+            # None for a failed upload and for a directory with no adapter in it, raising only when
+            # the save is required. crediting those would report an artifact that was never written.
+            if published:
+                self.lifecycle.mark_deployable_published(step)
+
+        # claimed before the work, not after it: `_pending` filters on the discovered set, so a step
+        # left unclaimed while its export raises is handed straight back on the next sweep. the
+        # watcher thread dies on that exception anyway, and the retry would race its own teardown.
+        self.lifecycle.mark_discovered(step)
 
         # the try opens before the export, so a run that dies partway through writing the adapter
         # still frees the partial directory. nothing in the sft path reads the export again --
-        # `step` joins `processed_steps` below, `_pending` filters on that set, and no sweep or
-        # finalization walks `export_root` -- so an adapter kept past this call has no reader and
-        # would just accumulate one directory per save.
+        # `step` is discovered above, `_pending` filters on that, and no sweep or finalization walks
+        # `export_root` -- so an adapter kept past this call has no reader and would just accumulate
+        # one directory per save.
         #
         # not safe in the two sibling watchers, which keep their exports for a real later reader:
-        # the rl uploader republishes from `staged_steps` on subsequent sweeps, and the opd watcher
-        # hands `adapter_dir` to `_stage_retry_contract`. sft is done with it inside this call.
+        # the rl uploader republishes from its staged adapters on subsequent sweeps, and the opd
+        # watcher hands `adapter_dir` to `_stage_retry_contract`. sft is done with it inside this call.
         try:
             _sft_train()._export_checkpoint_adapter(
                 actor_dir,
@@ -206,21 +241,24 @@ class _VerlCheckpointWatcher:
                 model_revision=self.model_revision,
                 python_bin=self.python_bin,
             )
+            self.lifecycle.mark_staged(step)
             uploaded = _w.upload_resume_checkpoint(
                 step,
                 checkpoint_dir,
                 before_upload=publish_adapter,
+                # the callback, not the return value: see mark_resume_uploaded's contract.
+                after_upload=lambda: self.lifecycle.mark_resume_uploaded(step),
             )
         finally:
             shutil.rmtree(adapter_dir, ignore_errors=True)
         if step in self.required_steps and not uploaded:
+            self.lifecycle.mark_failed(step)
             raise RuntimeError(f"required save step {step} full-state checkpoint was not published")
-        self.processed_steps.add(step)
 
     def _run(self) -> None:
         try:
             while True:
-                for step, checkpoint_dir in self._pending():
+                for step, checkpoint_dir in self._publishable(self._pending()):
                     self._publish(step, checkpoint_dir)
                 # re-read rather than reusing the sweep above: verl advances the tracker right up to
                 # the moment the child exits, so a step can become visible during that sweep.

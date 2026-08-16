@@ -17,7 +17,6 @@ from flash.core.spec import (
     JobSpec,
     require_matching_seed,
 )
-from flash.envs.base import FREESOLO_WORKER_SPEC
 from flash.providers.artifacts.hf import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
@@ -29,50 +28,6 @@ from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 logger = get_logger("flash.providers.runpod.train")
 
 
-# vllm 0.19.1: first vllm compatible with transformers 5.x; vllm>=0.20 pins torch 2.11
-# (CUDA-13 wheels) which reports no GPU on 12.8/12.9 drivers common on 4090/5090 hosts.
-WORKER_DEPS = [
-    "torch==2.10.0",
-    "transformers>=5.6,<5.13",
-    "tokenizers>=0.22",
-    "tiktoken>=0.12",
-    "peft>=0.19",
-    "vllm==0.19.1",
-    # FlashInfer: vLLM's Blackwell-native attention backend. vllm 0.19.1 pins flashinfer-python==0.6.6
-    # but treats it as an OPTIONAL extra (the plain `vllm` install does not pull it), so a consumer-
-    # Blackwell (sm120) / B200 rollout would silently fall back to a PTX-fragile default attention
-    # without it. Pin the matching 0.6.6 so the worker image carries the FLASHINFER attention backend
-    # (resolve_blackwell_attention_backends picks FLASHINFER when it imports). No-op elsewhere.
-    "flashinfer-python==0.6.6",
-    "bitsandbytes>=0.49",
-    # resolve_verl_python shells out to `uv` to provision the isolated verl interpreter whenever
-    # FLASH_VERL_PYTHON is unset. sft and opd are verl-only, so on the no-image path that call is
-    # unconditional and a missing `uv` fails the run with FileNotFoundError before training.
-    "uv>=0.5",
-    "datasets>=4.7,<6",
-    # >=0.2.54: includes robust JSONL loading and corrected package metadata.
-    FREESOLO_WORKER_SPEC,
-    # >=1.2.0: built-in RateLimit-header-aware 429 retry for HF downloads (base-model pulls) and
-    # paginated Hub API calls. Must match Dockerfile.worker's floor (the baked image is the default
-    # run path; this list only installs on the no-image/live-function path) -- see
-    # tests/test_kernel_fingerprint.py::test_huggingface_hub_floor_is_in_lockstep.
-    "huggingface_hub>=1.2.0",
-    "accelerate>=1.4",
-    # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
-    "wandb>=0.17",
-    # fla from git: PyPI wheel is a broken stub missing fla.modules. SHA-pinned for reproducibility;
-    # keep in lockstep with Dockerfile.worker. fla kept on ALL arches — worker ensures tilelang
-    # backend on sm90 before model import (fla #640: chunk_bwd miscompute with Triton>=3.4 on Hopper)
-    # and OPTS OUT of tilelang on sm100 (B200) where tilelang's chunk_bwd_dqkwg miscomputes grads
-    # (worker _force_fla_triton_gdn_on_sm100; upstream default-gates tilelang to Hopper since fla #975).
-    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
-    # tilelang version-pinned with the worker image and flash/engine/worker/perf/__init__.py runtime reinstall.
-    "tilelang==0.1.11",
-    "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
-    # causal_conv1d NOT pip-listed: CUDA extension compiled in Dockerfile.worker with TORCH_CUDA_ARCH_LIST.
-]
-WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
-
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 
 # MUST mirror the bake matrix in .github/workflows/bake-kernel-cache.yml. Unlisted arches fall
@@ -80,20 +35,15 @@ WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100"})
 
 
-def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
+def worker_image_for_gpu(friendly_gpu: str | None) -> str:
     """Return the worker Docker image for a GPU class (per-SM kernel-cache tag or base)."""
-    if friendly_gpu and allow_default:
+    if friendly_gpu:
         info = get_gpu_info(friendly_gpu)
         # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
         # cold-start JIT). Unbaked arches fall through to the base image to avoid a 404 docker pull.
         if info.sm in BAKED_PER_SM_ARCHES:
             return f"{WORKER_IMAGE}-{info.sm}"
-    return WORKER_IMAGE if allow_default else None
-
-
-def resolve_worker_deps() -> list[str]:
-    """Return the pinned worker dependency list."""
-    return list(WORKER_DEPS)
+    return WORKER_IMAGE
 
 
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h cap

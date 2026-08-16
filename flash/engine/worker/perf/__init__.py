@@ -5,7 +5,7 @@ The fla/tilelang/cudart fixup group stays IN THIS MODULE on purpose: tests monke
 through the patched module globals. Do NOT move this group into a submodule.
 
 NOTE: ``tests/test_worker_stack.py`` reads THIS file as TEXT to assert the fla SHA /
-TILELANG_PIN stay in lockstep with WORKER_DEPS / Dockerfile.worker.
+TILELANG_PIN stay in lockstep with Dockerfile.worker.
 """
 
 from __future__ import annotations
@@ -24,8 +24,12 @@ from flash.engine.worker.perf.diagnostics import (
     gpu_diagnostics,
 )
 from flash.engine.worker.perf.lifecycle import (
+    DirtyGpuError,
     RetriableInfraError,
+    free_vram_gb,
     is_cuda_oom,
+    preflight_free_vram,
+    total_vram_gb,
     wait_for_gpu,
 )
 from flash.engine.worker.perf.liger import (
@@ -311,7 +315,7 @@ def _ensure_fla_fastpath_on_hopper() -> None:
             return False
         return rc == 0
 
-    # 0.1.12 double-registers the TVM-FFI runtime -> `import tilelang` aborts; keep in lockstep with WORKER_DEPS / Dockerfile.
+    # 0.1.12 double-registers the TVM-FFI runtime -> `import tilelang` aborts; keep in lockstep with Dockerfile.worker.
     TVM_FFI_PIN = "0.1.11"
     TILELANG_PIN = "0.1.11"
 
@@ -330,11 +334,11 @@ def _ensure_fla_fastpath_on_hopper() -> None:
         fla_ok = True
         if not (_have("fla") and _have("fla.modules")):
             _remove_fla_from_disk()
-            # Pinned commit — keep in lockstep with WORKER_DEPS / Dockerfile.worker.
+            # Pinned commit — keep in lockstep with Dockerfile.worker.
             fla_ok = _pip(
                 "--no-deps",
                 "git+https://github.com/fla-org/flash-linear-attention.git"
-                "@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
+                "@9c8e42e762fce087c27b673af4922795d9edb85e",
             )
         importlib.invalidate_caches()
         tvm_ffi_ver = _ver("apache-tvm-ffi")
@@ -378,6 +382,7 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 
 
 __all__ = [
+    "DirtyGpuError",
     "RetriableInfraError",
     "_clean_diag",
     "_ensure_fla_fastpath_on_hopper",
@@ -393,9 +398,12 @@ __all__ = [
     "_remove_fla_from_disk",
     "_restrict_fla_gdn_autotune_on_blackwell",
     "_round_gb_from_mib",
+    "free_vram_gb",
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "grpo_use_reentrant",
     "is_cuda_oom",
+    "preflight_free_vram",
+    "total_vram_gb",
     "wait_for_gpu",
 ]

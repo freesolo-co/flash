@@ -17,6 +17,7 @@ import time
 import traceback
 
 from flash._internal.diagnostics import sanitize_diagnostic
+from flash.adapters.fused_experts import lora_target_parameters
 from flash.core.spec import FIXED_SEED, load_job_spec_from_env
 from flash.engine.result.accounting import RunMetrics
 from flash.engine.worker.backend_common import collect_ray_failure_logs
@@ -56,9 +57,8 @@ from flash.engine.worker.io.wandb_log import (
 )
 from flash.engine.worker.model.adapter import (
     _download_adapter,
-    lora_target_parameters,
     make_lora,
-    validate_lora_target_parameters,
+    validate_warmstart_adapter,
 )
 from flash.engine.worker.model.decoding import (
     graded_text,
@@ -80,6 +80,7 @@ from flash.engine.worker.perf import (
     grad_checkpointing_on,
     grpo_use_reentrant,
     is_cuda_oom,
+    preflight_free_vram,
     wait_for_gpu,
 )
 from flash.engine.worker.runtime.kernel_warmup import _current_cuda_sm, load_mega_cache
@@ -220,6 +221,24 @@ def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
     return {"retriable": retriable, "oom": (not retriable and is_cuda_oom(exc))}
 
 
+def _preflight_free_vram_for_spec() -> None:
+    """Reject a card that arrived already occupied by another tenant.
+
+    Nothing about the spec is read. An earlier draft re-derived the run's requirement here and
+    compared free bytes against it, which is a second sizing model competing with the allocator's
+    and wrong in both directions -- see ``preflight_free_vram``. Occupancy needs no requirement, so
+    it runs on any shape without reimplementing ``combined_vram_gb``'s non-linear multi-card fit.
+
+    It samples device 0 only. On a multi-card node that leaves a tenant sitting on device 3 alone
+    undetected, which is a gap and not a false alarm -- device 0 occupancy is still evidence of a
+    shared host.
+
+    Must stay the first CUDA-adjacent call in boot: the reading is only trustworthy while this
+    process has no context of its own, and ``_force_fla_triton_gdn_on_sm100`` below creates one.
+    """
+    preflight_free_vram()
+
+
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
@@ -325,6 +344,17 @@ def _run_worker_mode() -> None:
     # monkeypatch are interpreter-local and must not be treated as child configuration. the tilelang
     # libcudart repoint is NOT here: it is interpreter-local too, and the interpreter that needs it is
     # the verl child, so it ships as a sitecustomize fragment (verl.child_io).
+    # FIRST, and specifically before `_force_fla_triton_gdn_on_sm100`: that reads
+    # `get_device_capability`, which initializes CUDA in this process, and from that moment the
+    # driver's "used" includes our own context with no sound way to subtract it -- the occupancy
+    # check declines to run rather than guess (see `preflight_free_vram`), so calling it later means
+    # never calling it at all. This is also before `_ensure_fla_fastpath_on_hopper`, whose repair
+    # path runs pip installs with 600s timeouts: a card handed over with a co-tenant's ~18GB still
+    # resident fails the run either way, and the only question is whether that happens now or after
+    # dependency repair, the model download and FSDP init have spent paid GPU on the same
+    # conclusion. NVML answers without a context, so nothing here dirties the reading for the code
+    # below.
+    _preflight_free_vram_for_spec()
     # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
     _force_fla_triton_gdn_on_sm100()
     _ensure_fla_fastpath_on_hopper()
@@ -473,7 +503,7 @@ __all__ = [
     "think_token_count",
     "thinking_text",
     "upload_resume_checkpoint",
-    "validate_lora_target_parameters",
+    "validate_warmstart_adapter",
     "wait_for_gpu",
     "wandb_run_name",
     "write_base_model_provenance",

@@ -17,21 +17,23 @@ import urllib.request
 from typing import Any
 from uuid import uuid4
 
-try:  # inside the verl child, copied in beside this file
+if __name__ == "flash_grpo_multiturn":
     from flash_multiturn_glue import (
         EnvGlueTokenizer,
         dedup_seam_terminator,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         turn_is_unusable,
         validate_transcript_messages,
     )
-except ImportError:  # in-tree (tests, lint)
+else:
     from flash.engine.worker.train.core.child.glue import (
         EnvGlueTokenizer,
         dedup_seam_terminator,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         turn_is_unusable,
@@ -45,13 +47,14 @@ except ImportError:  # in-tree (tests, lint)
 _NEXT_TURN_SLACK = 8
 
 
-def post_json(url: str, path: str, payload: dict) -> dict:
-    """post one json request to the parent's multi-turn bridge and return the decoded reply.
+def post_json(url: str, path: str, payload: dict, *, error_style: str = "multi-turn") -> dict:
+    """post one json request to a parent bridge and return the decoded reply.
 
-    Every failure raises because continuing would train on environment state that never completed.
-    Use no request deadline: lock queueing is batch-size dependent; the stall watchdog in
-    ``flash/providers/_lifecycle/poll.py`` bounds genuine wedges.
+    Every failure raises because continuing would train on state that never completed. Use no request
+    deadline: lock queueing is batch-size dependent; the stall watchdog bounds genuine wedges.
     """
+    if error_style not in {"multi-turn", "reward"}:
+        raise ValueError(f"unknown flash bridge error style: {error_style}")
     request = urllib.request.Request(
         url.rstrip("/") + path,
         data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
@@ -62,19 +65,46 @@ def post_json(url: str, path: str, payload: dict) -> dict:
         with urllib.request.urlopen(request) as response:
             body = response.read()
     except urllib.error.HTTPError as error:
+        # decode inside the guard, raise outside it: suppressing the raise itself drops the bridge's
+        # detail and leaves only a bare status code.
+        detail = None
         with contextlib.suppress(Exception):
-            detail = json.loads(error.read().decode("utf-8"))["error"]
-            raise RuntimeError(f"flash multi-turn bridge rejected {path}: {detail}") from error
+            detail = str(json.loads(error.read().decode("utf-8"))["error"])
+        fault = "could not serve" if error.code >= 500 else "rejected"
+        if error_style == "reward":
+            if detail:
+                raise RuntimeError(
+                    f"flash reward bridge {fault} the request (HTTP {error.code}): {detail}"
+                ) from error
+            raise RuntimeError(
+                f"flash reward bridge {fault} the request: HTTP {error.code} with no error detail"
+            ) from error
+        if detail:
+            raise RuntimeError(
+                f"flash multi-turn bridge {fault} {path} (HTTP {error.code}): {detail}"
+            ) from error
         raise RuntimeError(
-            f"flash multi-turn bridge returned HTTP {error.code} for {path}"
+            f"flash multi-turn bridge {fault} {path}: HTTP {error.code} with no error detail"
         ) from error
     except (OSError, http.client.HTTPException) as error:
+        if error_style == "reward":
+            raise RuntimeError(f"flash reward bridge request failed: {error}") from error
         raise RuntimeError(
             f"flash multi-turn bridge transport failed on {path}: {type(error).__name__}"
         ) from error
+    except Exception as error:
+        if error_style == "reward":
+            raise RuntimeError(
+                f"flash reward bridge returned an invalid response: {error}"
+            ) from error
+        raise
     try:
         return json.loads(body.decode("utf-8"))
     except (TypeError, ValueError) as error:
+        if error_style == "reward":
+            raise RuntimeError(
+                f"flash reward bridge returned an invalid response: {error}"
+            ) from error
         raise RuntimeError(f"flash multi-turn bridge returned malformed json for {path}") from error
 
 
@@ -107,8 +137,9 @@ class _EpisodeTranscript:
         """the largest completion this turn may request under all three binding budgets.
 
         the configured per-turn cap, the engine's remaining context, and the response tensor's
-        remaining width. the first is what the user asked for and the other two are what the episode
-        can still hold, so one turn never spends the whole transcript.
+        remaining width. the first applies fresh to each model turn. response_capacity is the
+        whole-episode tensor width, widened by the parent for multi-turn, and the other two terms
+        bound what the accumulated episode can still hold.
         """
         return min(
             max_completion_tokens,
@@ -159,41 +190,6 @@ class _EpisodeTranscript:
             # response_mask is what keeps these positions out of the loss.
             self.response_logprobs.extend([0.0] * len(glue_ids))
         self.prefix_ids.extend(glue_ids)
-
-
-class _EpisodePrompt:
-    """the tokenized initial prompt plus the decoded media every generate call must carry.
-
-    an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. both
-    apply_chat_template and every generate call need the decoded media alongside the ids, or the
-    engine sees placeholders it cannot expand and the rollout either dies on a feature/placeholder
-    mismatch or conditions on nothing. text-only prompts yield {}.
-    """
-
-    def __init__(self, multi_modal_data, mm_processor_kwargs, prompt_ids):
-        self.multi_modal_data = multi_modal_data
-        self.mm_processor_kwargs = mm_processor_kwargs
-        self.prompt_ids = prompt_ids
-        self.images = multi_modal_data.get("images")
-        self.videos = multi_modal_data.get("videos")
-        self.audios = multi_modal_data.get("audios")
-
-
-async def _prepare_episode_prompt(loop_self, raw_prompt) -> _EpisodePrompt:
-    """decode the prompt's media and apply the chat template, in that order."""
-    multi_modal_data = await loop_self.process_multi_modal_info(raw_prompt)
-    images = multi_modal_data.get("images")
-    videos = multi_modal_data.get("videos")
-    audios = multi_modal_data.get("audios")
-    mm_processor_kwargs = loop_self._get_mm_processor_kwargs(audios)
-    prompt_ids = await loop_self.apply_chat_template(
-        raw_prompt,
-        images=images,
-        videos=videos,
-        audios=audios,
-        mm_processor_kwargs=mm_processor_kwargs,
-    )
-    return _EpisodePrompt(multi_modal_data, mm_processor_kwargs, prompt_ids)
 
 
 class _EpisodeSettings:
@@ -301,10 +297,7 @@ async def _grpo_run(
     agent_loop_output,
     **kwargs,
 ):
-    raw_prompt = validate_transcript_messages(
-        [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
-    )
-    prompt = await _prepare_episode_prompt(self, raw_prompt)
+    prompt = await prepare_episode_prompt(self, kwargs["raw_prompt"])
     prompt_ids = prompt.prompt_ids
     mm_processor_kwargs = prompt.mm_processor_kwargs
     settings = _EpisodeSettings()

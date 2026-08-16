@@ -3,11 +3,11 @@ cross-process cancel, and attach (CPU-only; all network mocked)."""
 
 from __future__ import annotations
 
-import base64
 import io
 import re
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +15,17 @@ import pytest
 from tests._helpers.runner import provisioned_status
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+
+
+def _live_clock_handle(jobs):
+    """A handle for a test that runs on the REAL clock rather than a faked one.
+
+    The poll loop measures its stall window from the persisted launch, so the fixed 1.0 default
+    below describes a job launched in 1970: fine for a test that also fakes `jobs.time.time` onto a
+    synthetic timeline, instantly "wedged" for one that does not. Tests asserting on the status
+    machine rather than on timing use this so their launch sits on the same clock they run against.
+    """
+    return _runpod_handle(jobs, started_ts=time.time())
 
 
 def _runpod_handle(
@@ -94,13 +105,10 @@ def test_job_handle_roundtrip_and_rejects_legacy_shapes():
 
 
 def test_decode_output_success():
-    import cloudpickle
-
     from flash.providers.runpod.jobs import decode_output
 
     metrics = {"trained_eval_acc": 0.9, "cost_usd": 0.5}
-    out = {"success": True, "result": base64.b64encode(cloudpickle.dumps(metrics)).decode()}
-    assert decode_output(out) == metrics
+    assert decode_output(metrics) == metrics
 
 
 def test_decode_output_error_includes_stdout_tail():
@@ -179,8 +187,6 @@ def test_decode_output_tail_is_sanitized_before_the_bound(monkeypatch):
 # poll_job state machine (mocked runpod_api)
 # ---------------------------------------------------------------------------
 def _poll(monkeypatch, statuses, heartbeats=None, stall_after_s=10.0):
-    import cloudpickle
-
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
@@ -190,11 +196,8 @@ def _poll(monkeypatch, statuses, heartbeats=None, stall_after_s=10.0):
     hb_iter = iter(heartbeats) if heartbeats is not None else None
 
     reader = (lambda force=False: next(hb_iter, None)) if hb_iter is not None else None
-    h = _runpod_handle(jobs)
-    ok_payload = {
-        "success": True,
-        "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
-    }
+    h = _live_clock_handle(jobs)
+    ok_payload = {"acc": 1.0}
     return jobs.poll_job(
         h,
         interval_s=0,
@@ -204,12 +207,7 @@ def _poll(monkeypatch, statuses, heartbeats=None, stall_after_s=10.0):
 
 
 def test_poll_job_completes(monkeypatch):
-    import cloudpickle
-
-    ok = {
-        "success": True,
-        "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
-    }
+    ok = {"acc": 1.0}
     res, _ = _poll(
         monkeypatch,
         [
@@ -249,7 +247,7 @@ def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
         return heartbeat
 
     res = jobs.poll_job(
-        _runpod_handle(jobs),
+        _live_clock_handle(jobs),
         interval_s=0,
         heartbeat_reader=read_heartbeat,
     )
@@ -328,7 +326,7 @@ def test_poll_job_failure_detail_redacts_secrets_in_provider_error_and_stdout(mo
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
 
     res = jobs.poll_job(
-        _runpod_handle(jobs),
+        _live_clock_handle(jobs),
         interval_s=0,
         heartbeat_reader=lambda force=False: None,
     )
@@ -359,7 +357,7 @@ def test_poll_job_failure_surfaces_forced_heartbeat(monkeypatch):
     }
 
     res = jobs.poll_job(
-        _runpod_handle(jobs),
+        _live_clock_handle(jobs),
         interval_s=0,
         heartbeat_reader=lambda force=False: hb,
         log=log,
@@ -397,7 +395,7 @@ def test_poll_job_failure_appends_worker_artifacts(monkeypatch):
         )
 
     res = jobs.poll_job(
-        _runpod_handle(jobs),
+        _live_clock_handle(jobs),
         interval_s=0,
         heartbeat_reader=lambda force=False: None,
         failure_detail_reader=failure_detail_reader,
@@ -437,7 +435,7 @@ def test_poll_job_platform_preempt_does_not_read_worker_artifacts(monkeypatch):
         raise AssertionError("platform terminations should not read worker artifacts")
 
     res = jobs.poll_job(
-        _runpod_handle(jobs),
+        _live_clock_handle(jobs),
         interval_s=0,
         heartbeat_reader=lambda force=False: None,
         failure_detail_reader=failure_detail_reader,
@@ -451,12 +449,17 @@ def _poll_failed_with_heartbeat(monkeypatch, hb):
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    hb = {"ts": 2.0, "attempt": 0, **hb}
+    # The heartbeat has to sit on the same timeline as the launch: `worker_flagged_retriable` only
+    # honours a heartbeat stamped at or after the launch it claims to describe, so a fixed ts=2.0
+    # against a real-clock launch is a 1970 artifact that is correctly ignored, and the retriable
+    # flag under test would never be read at all.
+    launch_ts = time.time()
+    hb = {"ts": launch_ts + 1.0, "attempt": 0, **hb}
     seq = iter([{"status": "IN_PROGRESS"}, {"status": "FAILED", "error": "boom"}])
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: next(seq))
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
     return jobs.poll_job(
-        _runpod_handle(jobs),
+        _runpod_handle(jobs, started_ts=launch_ts),
         interval_s=0,
         heartbeat_reader=lambda force=False: hb,
         stall_after_s=10.0,
@@ -514,10 +517,17 @@ def test_poll_job_completed_decode_error_consults_worker_flags(monkeypatch):
     monkeypatch.setattr(
         runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "COMPLETED", "output": bad}
     )
+    # the heartbeat shares the launch's timeline: a retriable flag stamped before launch is stale
+    # evidence and is correctly ignored, which would make this assert on the wrong reason.
+    launch_ts = time.time()
     res = jobs.poll_job(
-        _runpod_handle(jobs),
+        _runpod_handle(jobs, started_ts=launch_ts),
         interval_s=0,
-        heartbeat_reader=lambda force=False: {"retriable": True, "attempt": 0, "ts": 2.0},
+        heartbeat_reader=lambda force=False: {
+            "retriable": True,
+            "attempt": 0,
+            "ts": launch_ts + 1.0,
+        },
         failure_detail_reader=lambda force=False: "--- error_sft.txt ---\nCUDA out of memory",
     )
     assert res.failure == "job_preempted"
@@ -617,7 +627,7 @@ def test_no_capacity_detail_never_predicts_the_retry_disposition(monkeypatch):
     assert "next-best" not in res.detail
 
 
-def _queued_forever(monkeypatch, health, *, step=20.0):
+def _queued_forever(monkeypatch, health, *, step=20.0, queue_grace_s=900.0, log=None):
     """Poll a permanently queued job with controlled endpoint health.
 
     The clock step preserves the 90-second probe cadence and 300-second worker-coming-up TTL.
@@ -634,11 +644,157 @@ def _queued_forever(monkeypatch, health, *, step=20.0):
     monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
     return jobs.poll_job(
         _runpod_handle(jobs),
+        log=log,
         interval_s=0,
         heartbeat_reader=lambda: None,
         setup_grace_s=3000.0,
-        queue_grace_s=900.0,
+        queue_grace_s=queue_grace_s,
     )
+
+
+def test_empty_workers_log_elapsed_capacity_grace_before_no_capacity(monkeypatch):
+    from itertools import pairwise
+
+    logs = io.StringIO()
+    res = _queued_forever(
+        monkeypatch,
+        lambda eid, _fp, **_kw: {"workers": {}},
+        queue_grace_s=700.0,
+        log=logs,
+    )
+
+    assert not res.ok
+    assert res.failure == "no_capacity"
+    assert "no RunPod capacity" in res.detail
+    capacity_lines = [line for line in logs.getvalue().splitlines() if "capacity grace" in line]
+    elapsed_values = []
+    for line in capacity_lines:
+        match = re.search(r"; waited (\d+)s of 700s capacity grace$", line)
+        assert match
+        elapsed_values.append(int(match.group(1)))
+    assert len(elapsed_values) >= 2
+    assert all(later > earlier for earlier, later in pairwise(elapsed_values))
+
+
+def test_unbounded_capacity_grace_keeps_throttled_worker_failure(monkeypatch):
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    statuses = iter(
+        [
+            *itertools.repeat({"status": "IN_QUEUE"}, 8),
+            {"status": "FAILED", "error": "throttled timer was skipped"},
+        ]
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: next(statuses))
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: {"workers": {"throttled": 1}},
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    logs = io.StringIO()
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        log=logs,
+        interval_s=0,
+        heartbeat_reader=lambda **_kw: None,
+        setup_grace_s=100000.0,
+        unhealthy_grace_s=100000.0,
+        throttled_grace_s=300.0,
+        queue_grace_s=float("inf"),
+    )
+
+    assert res.failure == "no_capacity"
+    assert "worker stuck THROTTLED" in res.detail
+    capacity_lines = [line for line in logs.getvalue().splitlines() if "capacity grace" in line]
+    assert capacity_lines
+    assert all("of unbounded capacity grace" in line for line in capacity_lines)
+
+
+def test_four_card_last_gpu_log_names_only_scaled_capacity_grace(monkeypatch):
+    from flash.providers.runpod import jobs
+
+    logs = io.StringIO()
+    grace = jobs.stall_kwargs(on_last_gpu=True, gpu_count=4)["queue_grace_s"]
+    res = _queued_forever(
+        monkeypatch,
+        lambda eid, _fp, **_kw: {"workers": {}},
+        queue_grace_s=grace,
+        log=logs,
+    )
+
+    assert res.failure == "no_capacity"
+    capacity_output = "\n".join(
+        line for line in logs.getvalue().splitlines() if "capacity grace" in line
+    )
+    assert "of 3600s capacity grace" in capacity_output
+    assert "pinned" not in capacity_output.lower()
+    assert "escalation" not in capacity_output.lower()
+    assert "retry" not in capacity_output.lower()
+
+
+@pytest.mark.parametrize(
+    "workers",
+    [
+        {"initializing": 1},
+        {"ready": 1, "unhealthy": 1},
+    ],
+)
+def test_allocated_worker_log_suppresses_capacity_grace(monkeypatch, workers):
+    logs = io.StringIO()
+    res = _queued_forever(
+        monkeypatch,
+        lambda eid, _fp, **_kw: {"workers": workers},
+        log=logs,
+    )
+
+    assert res.failure == "stalled"
+    queued_lines = [line for line in logs.getvalue().splitlines() if "queued; workers:" in line]
+    assert queued_lines
+    assert all("capacity grace" not in line for line in queued_lines)
+
+
+def test_unhealthy_worker_log_suppresses_capacity_grace(monkeypatch):
+    logs = io.StringIO()
+    res = _queued_forever(
+        monkeypatch,
+        lambda eid, _fp, **_kw: {"workers": {"unhealthy": 1}},
+        log=logs,
+    )
+
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "worker stuck unhealthy" in res.detail
+    queued_lines = [line for line in logs.getvalue().splitlines() if "queued; workers:" in line]
+    assert queued_lines
+    assert all("capacity grace" not in line for line in queued_lines)
+
+
+@pytest.mark.parametrize("granted_workers", [{"initializing": 1}, {"ready": 1}])
+def test_empty_health_after_worker_grant_suppresses_capacity_grace(monkeypatch, granted_workers):
+    logs = io.StringIO()
+    probes = {"count": 0}
+
+    def health(eid, _fp, **_kw):
+        probes["count"] += 1
+        return {"workers": granted_workers if probes["count"] == 1 else {}}
+
+    res = _queued_forever(monkeypatch, health, queue_grace_s=5000.0, log=logs)
+
+    assert probes["count"] >= 2
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "setup (pre-training)" in res.detail
+    queued_lines = [line for line in logs.getvalue().splitlines() if "queued; workers:" in line]
+    assert queued_lines
+    assert any("workers: {}" in line for line in queued_lines)
+    assert all("capacity grace" not in line for line in queued_lines)
 
 
 def test_slow_image_pull_is_not_reported_as_missing_capacity(monkeypatch):
@@ -753,6 +909,605 @@ def test_capacity_grace_scales_with_gpu_walk_position():
     assert sig.parameters["setup_grace_s"].default >= 1800.0
 
 
+def test_capacity_grace_scales_with_the_card_count():
+    # Multi-card shapes are scarcer than single cards, so a grace sized for 1x expires on a 4x wait
+    # that was merely slow rather than starved -- and expiring it does not find capacity faster:
+    # the supervisor tears the endpoint down and re-requests the SAME class, paying a fresh cold
+    # start to rejoin the queue it just left. Observed as 3-5 attempts and ~55 min of queueing per
+    # arm before a single optimizer step, worst on the multi-GPU arms.
+    from flash.providers.runpod import jobs
+
+    single = jobs.stall_kwargs(on_last_gpu=True, gpu_count=1)
+    assert single["queue_grace_s"] == 900.0
+
+    for count in (2, 4):
+        scaled = jobs.stall_kwargs(on_last_gpu=True, gpu_count=count)
+        assert scaled["queue_grace_s"] == 900.0 * count, count
+        assert scaled["throttled_grace_s"] == 900.0 * count, count
+        # only the capacity backstops move: a placed worker's cold start is governed by the setup
+        # grace, which has nothing to do with how scarce the shape was to obtain.
+        assert scaled["setup_grace_s"] == single["setup_grace_s"], count
+        assert scaled["stall_after_s"] == single["stall_after_s"], count
+
+    # the smaller mid-walk budget scales too -- scarcity is a property of the shape, not of where
+    # the walk has reached.
+    assert jobs.stall_kwargs(gpu_count=4)["queue_grace_s"] == 300.0 * 4
+
+    # bounded, so a hypothetical very wide shape cannot wait without limit. The run's absolute wall
+    # deadline is checked every poll iteration regardless, so the cap is a second bound, not the only one.
+    assert jobs.stall_kwargs(on_last_gpu=True, gpu_count=8)["queue_grace_s"] == (
+        900.0 * jobs.CAPACITY_GRACE_PER_GPU_CAP
+    )
+
+
+def _queued_forever_scaled(monkeypatch, *, gpu_count, heartbeat_reader, workers=None):
+    """Drive the REAL poll loop against a job that never leaves IN_QUEUE, on a scaled grace."""
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fp, **_kw: {"workers": workers or {}},
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=20.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    return jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=heartbeat_reader,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=gpu_count),
+    )
+
+
+@pytest.mark.parametrize("heartbeat_reader", [lambda: None, None])
+def test_the_scaled_capacity_grace_is_actually_reached_not_preempted_by_the_stall_timer(
+    monkeypatch, heartbeat_reader
+):
+    # The scaled grace is only real if the poll loop actually waits it out. `_classify_stall` runs
+    # on the SAME iteration as the capacity check with its own independent limits (setup_grace_s
+    # 3000, stall_after_s 1500), so a 4-card grace of 3600s was cut short at ~3000s -- and, worse,
+    # reported as "stalled" rather than "no_capacity".
+    #
+    # The label is not cosmetic. The supervisor's weight-cache fallback fires only on
+    # `no_capacity`/`poll_error`, so a mislabelled capacity failure ALSO stops a cached run from
+    # dropping its datacenter-restricting volume and retrying on the unrestricted all-DC pool. It
+    # is the whole failure the scaling exists to avoid, with the wait merely renamed.
+    #
+    # Parametrized over both heartbeat-reader states because they select different stall limits
+    # (3000 vs 1500) and both preempted 3600s.
+    res = _queued_forever_scaled(monkeypatch, gpu_count=4, heartbeat_reader=heartbeat_reader)
+    assert res.failure == "no_capacity", res.detail
+    waited = int(res.detail.split("IN_QUEUE for ")[1].split("s ")[0])
+    assert waited > 3600, f"gave up at {waited}s, before the 3600s the 4-card shape was granted"
+
+
+def _queued_until_worker_granted(monkeypatch, *, gpu_count, grant_at, workers=None):
+    """Poll a job that sits IN_QUEUE with no worker until ``grant_at``, then reports one placed."""
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    clock_now = {"t": 0.0}
+
+    def health(_eid, _fp, **_kw):
+        granted = workers if workers is not None else {"initializing": 1}
+        return {"workers": granted if clock_now["t"] >= grant_at else {}}
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=20.0)
+
+    def tick():
+        clock_now["t"] = next(ticks)
+        return clock_now["t"]
+
+    monkeypatch.setattr(jobs.time, "time", tick)
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=10_000_000.0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=gpu_count),
+    )
+    return res, clock_now["t"]
+
+
+def test_a_late_granted_worker_gets_a_full_setup_window_not_the_queues_leftovers(monkeypatch):
+    # Deferring the stall timer while IN_QUEUE leaves `last_progress` anchored at queue entry for
+    # the whole capacity wait. So a worker granted LATE -- at 3200s of a 4-card shape's 3600s
+    # grace -- was measured against a 3000s setup limit its QUEUE wait had already spent, and was
+    # torn down as "stalled" on the very poll that found it. That discards a GPU RunPod had just
+    # granted and re-requests the same class: exactly the churn this PR exists to remove, arriving
+    # by a different route.
+    grant_at = 3200.0
+    res, ended_at = _queued_until_worker_granted(monkeypatch, gpu_count=4, grant_at=grant_at)
+    assert res.failure == "stalled"
+    # Measure from the GRANT on the absolute clock, not from the failure's reported "no worker
+    # progress for Ns" figure. That figure is computed from whatever `last_progress` holds, so it
+    # reads ~3000s in BOTH the fixed and unfixed cases and cannot tell them apart -- a test
+    # asserting on it passes against the broken code. What distinguishes them is WHEN the run died:
+    # on the grant (~3200s) or a full cold start after it (~6200s).
+    granted_for = ended_at - grant_at
+    assert granted_for >= 3000.0, (
+        f"the placed worker was torn down {granted_for:.0f}s after RunPod granted it (needs the "
+        "full 3000s setup window); the setup baseline was not restarted on placement"
+    )
+
+
+def test_a_worker_that_stays_placed_does_not_renew_its_setup_budget_forever(monkeypatch):
+    # Guardrail on the SHAPE of the re-anchoring, not a regression of past behavior (it passes
+    # against the pre-fix code too, which never rolled the baseline forward at all). It pins the
+    # roll-forward to the queued exemption: rolling `last_progress` on every poll that still
+    # reports a worker -- the obvious wrong way to write this -- would mean a wedged image pull
+    # never reaches the setup grace at all, holding a paid box until the run's wall deadline.
+    res, ended_at = _queued_until_worker_granted(monkeypatch, gpu_count=4, grant_at=0.0)
+    assert res.failure == "stalled"
+    assert "limit 3000s" in res.detail, res.detail
+    assert ended_at < 2 * 3000.0, (
+        f"a continuously-placed worker ran to {ended_at}s; the setup baseline is being renewed on "
+        "every sighting instead of only on placement"
+    )
+
+
+def test_an_unhealthy_worker_counts_as_a_grant(monkeypatch):
+    # An `unhealthy` worker is an ALLOCATED box whose image failed to start, so it proves the grant
+    # exactly as a healthy one does -- `preload_runpod._has_worker` counts it for the same reason.
+    # The latch checked only `usable or recovering`, so health flickering between `{"unhealthy": 1}`
+    # and empty never recorded it: each empty snapshot reset the unhealthy timer, the job stayed
+    # exempt as never-granted, and the broken box was finally misreported as `no_capacity` (which
+    # can trip the weight-cache drop on a run whose capacity was fine all along).
+    #
+    # Pristine `dev` reports `stalled` here, so this is a regression to avoid, not a change.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    flip = {"n": 0}
+
+    def health(_eid, _fp, **_kw):
+        flip["n"] += 1
+        return {"workers": {"unhealthy": 1} if flip["n"] % 2 == 0 else {}}
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=500_000.0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", (
+        f"a flickering unhealthy worker reported {res.failure!r}; an allocated-but-broken box is "
+        f"not absent capacity ({res.detail})"
+    )
+
+
+def test_one_flaky_job_status_does_not_prove_a_worker_grant(monkeypatch):
+    # The grant latch must be an allowlist of statuses that PROVE the job left the queue, never
+    # `!= "IN_QUEUE"` -- that shape also matches None and any unrecognized string, so a single flaky
+    # job_status response would permanently "prove" a grant on a job RunPod never scheduled. The
+    # queued-wait exemption would then drop, and a genuine capacity wait would die as `stalled`
+    # instead of `no_capacity`, losing the weight-cache fallback that only `no_capacity` triggers.
+    #
+    # `flash/providers/artifacts/preload_runpod.py` hit this first; its comment warns against
+    # exactly this pattern.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    reads = {"n": 0}
+
+    def job_status(_eid, _jid, **_kw):
+        reads["n"] += 1
+        # never granted -- except one garbled reading partway through.
+        if reads["n"] == 3:
+            return {"status": "SOMETHING_WEIRD"}
+        return {"status": "IN_QUEUE"}
+
+    monkeypatch.setattr(runpod_api, "job_status", job_status)
+    monkeypatch.setattr(
+        runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: {"workers": {}}
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=500_000.0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "no_capacity", (
+        f"a never-granted job reported {res.failure!r} after one unrecognized status; only an "
+        f"allowlisted status may prove a grant ({res.detail})"
+    )
+
+
+def test_a_current_attempt_heartbeat_proves_a_grant_on_the_reattach_path(monkeypatch):
+    # Reattach starts with `ever_saw_worker` false and, if RunPod already requeued the job before
+    # recovery attached, never gets to observe the earlier IN_PROGRESS. With health also unreadable
+    # the job looked never-granted: exempt from the stall check forever, then reported `no_capacity`
+    # despite a heartbeat for THIS attempt proving a worker ran and wrote it.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+
+    def dead_health(_eid, _fp, **_kw):
+        raise RuntimeError("health endpoint unavailable")
+
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", dead_health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    # one setup heartbeat for the current attempt (attempt 0), then silence: the worker ran, wrote
+    # it, and was taken away. `stage` non-None with a None step keeps this pre-training, so the
+    # setup grace (not the training limit) is the one that must bound the wait.
+    beats = iter([{"stage": "setup", "step": None, "ts": 100.0, "attempt": 0}])
+
+    def heartbeat_reader():
+        return next(beats, None)
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=heartbeat_reader,
+        deadline_at=500_000.0,
+        current_attempt=0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", (
+        f"a job with a current-attempt heartbeat reported {res.failure!r}; the heartbeat proves a "
+        f"worker ran, so this is a lost worker, not absent capacity ({res.detail})"
+    )
+
+
+def test_a_liveness_ping_for_this_attempt_proves_a_grant(monkeypatch):
+    # `ever_saw_worker` was latched below `surface_heartbeat`'s `stage is None` return, which drops
+    # liveness pings -- and liveness pings are most of what setup publishes (`sft_model_load`,
+    # `*_data_loading`, `*_configuring`). So a reattached job whose worker was pinging through model
+    # load, with health unreadable, still looked never-granted: exempt from the stall check, then
+    # reported `no_capacity` (which can trip the supervisor's weight-cache drop) for a GPU it plainly
+    # had. A ping must not advance the stall CLOCK -- that is what the `stage is None` return is for,
+    # and it still happens -- but it is proof a worker ran.
+    #
+    # This PR's scaled grace makes it worse than `dev`, not merely equal: `dev` mislabels at 1200s,
+    # a 4-card shape here waited 4200s for the same wrong answer.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+
+    def dead_health(_eid, _fp, **_kw):
+        raise RuntimeError("health endpoint unavailable")
+
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", dead_health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    # one liveness ping for the current attempt, then silence: a real setup stage, `liveness` set,
+    # so `surface_heartbeat` returns stage None exactly as it does in production.
+    beats = iter([{"stage": "sft_model_load", "ts": 100.0, "attempt": 0, "liveness": True}])
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: next(beats, None),
+        deadline_at=500_000.0,
+        current_attempt=0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", (
+        f"a job whose worker sent a liveness ping for THIS attempt reported {res.failure!r}; the "
+        f"ping proves a worker ran, so this is a lost worker, not absent capacity ({res.detail})"
+    )
+    assert "limit 3000s" in res.detail, res.detail
+
+
+def test_a_stale_attempt_liveness_ping_does_not_prove_a_grant(monkeypatch):
+    # The grant latch moved above the `stage is None` return, so it now sees liveness pings. It must
+    # stay BELOW the attempt guard: a previous attempt's worker ran on an allocation this attempt no
+    # longer holds, so its ping says nothing about whether this one was ever granted a GPU.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
+
+    def dead_health(_eid, _fp, **_kw):
+        raise RuntimeError("health endpoint unavailable")
+
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", dead_health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    beats = iter([{"stage": "sft_model_load", "ts": 100.0, "attempt": 3, "liveness": True}])
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: next(beats, None),
+        deadline_at=500_000.0,
+        current_attempt=0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "no_capacity", (
+        f"a ping from attempt 3 was treated as proof that attempt 0 held a GPU (got "
+        f"{res.failure!r}); only a heartbeat for the CURRENT attempt proves this grant ({res.detail})"
+    )
+
+
+def test_a_requeued_job_that_already_ran_is_not_reported_as_no_capacity(monkeypatch):
+    # `ever_saw_worker` was latched only from endpoint-health snapshots, which go quiet whenever the
+    # health endpoint is unreachable (`_probe_worker_coming_up_at` swallows the error, and the
+    # periodic health block ends in a bare except). RunPod can requeue a job that already ran, so
+    # with health dead the requeued job looked never-granted: it skipped the setup-stall check
+    # forever and was finally reported `no_capacity` for a worker it demonstrably had -- and
+    # `no_capacity` can trip the supervisor's weight-cache drop.
+    #
+    # An IN_PROGRESS observation is itself proof of a grant, independent of health. Pristine `dev`
+    # reports `stalled` here, so this is a regression to avoid, not a behavior change.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    now = {"t": 0.0}
+
+    # count STATUS READS rather than keying on the clock: one loop iteration consumes several
+    # time.time() calls, so a wall-clock window can be stepped straight over without ever being
+    # observed (an earlier version of this test did exactly that and passed against broken code).
+    reads = {"n": 0}
+
+    def job_status(_eid, _jid, **_kw):
+        # queued, then RUNNING (the grant), then requeued by RunPod and never scheduled again.
+        reads["n"] += 1
+        if reads["n"] <= 2:
+            return {"status": "IN_QUEUE"}
+        if reads["n"] <= 4:
+            return {"status": "IN_PROGRESS"}
+        return {"status": "IN_QUEUE"}
+
+    def dead_health(_eid, _fp, **_kw):
+        raise RuntimeError("health endpoint unavailable")
+
+    monkeypatch.setattr(runpod_api, "job_status", job_status)
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", dead_health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    ticks = itertools.count(start=0, step=120.0)
+
+    def tick():
+        now["t"] = next(ticks)
+        return now["t"]
+
+    monkeypatch.setattr(jobs.time, "time", tick)
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=500_000.0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", (
+        f"a job that reached IN_PROGRESS and was requeued reported {res.failure!r}; leaving the "
+        f"queue proves a grant even when health reads fail ({res.detail})"
+    )
+    assert "limit 3000s" in res.detail, res.detail
+
+
+def test_a_worker_granted_then_lost_is_stalled_not_reported_as_no_capacity(monkeypatch):
+    # A worker granted once and then gone from health (permanent gap, job still IN_QUEUE) must stay
+    # with the SETUP timer. Exempting the stall check on `worker_coming_up_at` alone did not: that
+    # is a TTL'd sighting, so the gap re-entered the exemption forever, the stall check never ran,
+    # and the queue timer -- rearmed by the same gap -- ran to the scaled capacity grace and
+    # reported `no_capacity` for a GPU RunPod HAD granted.
+    #
+    # Both halves are wrong and the label is the worse one: `no_capacity` can trip the supervisor's
+    # weight-cache drop on a run that never had a capacity problem. Pristine `dev` reports `stalled`
+    # here, so this is a regression this PR must not introduce, not a behavior change.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    now = {"t": 0.0}
+
+    def health(_eid, _fp, **_kw):
+        # placed for the first stretch, then health never reports it again.
+        return {"workers": {"initializing": 1} if now["t"] <= 600.0 else {}}
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # 120s steps so every poll clears the 90s health-probe throttle.
+    ticks = itertools.count(start=0, step=120.0)
+
+    def tick():
+        now["t"] = next(ticks)
+        return now["t"]
+
+    monkeypatch.setattr(jobs.time, "time", tick)
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=500_000.0,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", (
+        f"a granted-then-lost worker was reported as {res.failure!r}; past the first grant the "
+        f"setup timer owns the wait, not the capacity timer ({res.detail})"
+    )
+    assert "limit 3000s" in res.detail, res.detail
+
+
+def test_flapping_health_cannot_rearm_the_cold_start_budget_forever(monkeypatch):
+    # The queued-wait stall exemption keys on `worker_coming_up_at`, which is a TTL'd SIGHTING and
+    # therefore goes false again on any health gap. So endpoint health that alternates between a
+    # placed worker and an empty snapshot re-entered the exemption on every gap and rolled
+    # `last_progress` forward each time, while the placed polls in between disarmed the queue timer
+    # -- neither timer could ever fire, and a wedged PAID worker ran to the run's outer wall
+    # deadline. Latching the first grant bounds it at the setup grace instead.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    flip = {"n": 0}
+
+    def health(_eid, _fp, **_kw):
+        flip["n"] += 1
+        return {"workers": {"initializing": 1} if flip["n"] % 2 == 0 else {}}
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # 120s steps so every poll clears the 90s health-probe throttle and actually re-reads health.
+    ticks = itertools.count(start=0, step=120.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(ticks))
+
+    wall = 200_000.0
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        deadline_at=wall,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled", res.detail
+    # the wall deadline is the backstop, never the intended bound -- reaching it means both timers
+    # were held off for the run's entire lifetime while a granted worker sat wedged and billing.
+    assert "wall deadline" not in res.detail, (
+        "flapping health held off both timers to the wall deadline; the first-grant latch is not "
+        f"bounding the cold start ({res.detail})"
+    )
+    assert "limit 3000s" in res.detail, res.detail
+
+
+def test_a_worker_that_is_coming_up_still_gets_the_unscaled_setup_grace(monkeypatch):
+    # The capacity timer is suppressed once RunPod grants a worker, so from there the wait is a
+    # cold start, not starvation -- and a cold start's budget has nothing to do with how scarce the
+    # shape was to obtain. Deferring the stall timer for a PLACED worker would let a wide shape sit
+    # through a wedged image pull for the full scaled grace instead of the setup grace.
+    res = _queued_forever_scaled(
+        monkeypatch,
+        gpu_count=4,
+        heartbeat_reader=lambda: None,
+        workers={"initializing": 1},
+    )
+    assert res.failure == "stalled"
+    assert "limit 3000s" in res.detail, res.detail
+
+
+def test_a_job_outside_the_queue_still_stalls_on_its_own_limit(monkeypatch):
+    # The queue deferral must be scoped to IN_QUEUE-with-no-worker. A running job that stops making
+    # progress is genuinely stalled and must still be caught on the unscaled limit; disabling the
+    # stall timer generally would let a wedged trainer burn the whole run deadline.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(
+        runpod_api, "endpoint_health_for_fingerprint", lambda eid, _fp, **_kw: {"workers": {}}
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=20.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        **jobs.stall_kwargs(on_last_gpu=True, gpu_count=4),
+    )
+    assert res.failure == "stalled"
+    assert "limit 3000s" in res.detail, res.detail
+
+
+def test_single_card_capacity_grace_is_unchanged_by_the_scaling():
+    # The whole change must be invisible to 1x runs, which are the overwhelming majority: an
+    # absent, unusable, or explicitly-single count all multiply by exactly 1. A default that
+    # silently scaled would lengthen every single-card run's failover.
+    from flash.providers.runpod import jobs
+
+    baseline = jobs.stall_kwargs(on_last_gpu=True)
+    assert baseline["queue_grace_s"] == 900.0
+    for count in (1, 0, -3, None, True):
+        # bool is not a card count: `True` would otherwise multiply by 1 by accident of int
+        # subclassing rather than by rejection.
+        assert jobs.stall_kwargs(on_last_gpu=True, gpu_count=count) == baseline, count
+
+
+def test_reattach_poll_reproduces_the_multi_card_capacity_grace(monkeypatch):
+    # A run adopted after a control-plane restart must wait on the same budget its submission used.
+    # The count is read from the persisted EFFECTIVE worker spec (which submission stamped with the
+    # count allocation resolved), not from the handle: _build_attach_context pops
+    # `allocated_gpu_count` off the remote before the handle ever reaches the provider, so sourcing
+    # it there would silently read 1 and halve a 2x run's grace on every recovery.
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import PROVIDER
+    from flash.providers.runpod import jobs as jobs
+
+    captured: dict = {}
+
+    def fake_poll_job(handle, **kw):
+        captured.update(kw)
+        return jobs.PollResult(True, metrics={})
+
+    monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
+
+    spec = JobSpec(
+        run_id="reattach-multi",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="grpo",
+        train=TrainSpec(epochs=1, max_examples=1, hf_repo=""),
+        gpu=GpuSpec(type="B200", count=2),
+    )
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "j",
+            "started_ts": 1.0,
+            "on_last_gpu": True,
+            "attempt": 1,
+        }
+    )
+    PROVIDER.poll(handle, spec, spec.seed)
+    assert captured["queue_grace_s"] == 1800.0
+    assert captured["throttled_grace_s"] == 1800.0
+
+
 def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.base import JobHandle
@@ -815,7 +1570,6 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
     monkeypatch.setattr(
         jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name", _RUNPOD_FINGERPRINT)
     )
-    monkeypatch.setattr(jobs, "build_function_input", lambda payload: payload)
     monkeypatch.setattr(
         runpod_api,
         "submit_job",
@@ -834,6 +1588,45 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
     ).ok
     assert submitted["endpoint_id"] == "ep"
     assert submitted["payload"]["code_prefix"] == pinned_prefix
+
+
+def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkeypatch):
+    # The submitting process must apply the scaled budget too, not just a recovering one -- this is
+    # the path that burned the queue time in the first place. The count is read off the effective
+    # spec this attempt is launching, which allocation may have resolved to FEWER cards than the
+    # run's ceiling named, so the wait matches what was actually rented.
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name", _RUNPOD_FINGERPRINT)
+    )
+    monkeypatch.setattr(runpod_api, "submit_job", lambda *_a, **_kw: "job-1")
+    monkeypatch.setattr(
+        jobs,
+        "poll_job",
+        lambda *a, **kw: captured.update(kw) or jobs.PollResult(True, metrics={}),
+    )
+
+    def _submit(count):
+        captured.clear()
+        spec = JobSpec(
+            run_id="scaled-grace",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(epochs=1, hf_repo="org/repo"),
+            gpu=GpuSpec(type="H200", count=count),
+        )
+        assert jobs.submit_run(
+            spec, seed=spec.seed, on_last_gpu=True, deadline_at=10_000_000_000.0
+        ).ok
+        return captured["queue_grace_s"]
+
+    assert _submit(4) == 3600.0
+    # and a single-card run on the identical path is untouched.
+    assert _submit(1) == 900.0
 
 
 def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deletion(monkeypatch):
@@ -1070,12 +1863,10 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     # A job that leaves IN_QUEUE (a worker picks it up) must clear the queue timer: the later
     # IN_PROGRESS/COMPLETED path is governed by the heartbeat/setup windows, never by queue_grace_s.
-    import cloudpickle
-
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    ok = {"success": True, "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode()}
+    ok = {"acc": 1.0}
     # A few IN_QUEUE polls, THEN IN_PROGRESS (a worker picked it up), then COMPLETED — exercising the
     # actual leave-the-queue transition the queue timer must clear on. Real wall-clock (no fake clock)
     # so elapsed stays far under queue_grace_s; the timer clears on leaving IN_QUEUE and never
@@ -1094,7 +1885,7 @@ def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
         "endpoint_health_for_fingerprint",
         lambda eid, _fingerprint, **_kw: {"workers": {"ready": 1, "running": 1}},
     )
-    h = _runpod_handle(jobs)
+    h = _live_clock_handle(jobs)
     res = jobs.poll_job(h, interval_s=0, heartbeat_reader=lambda: None, queue_grace_s=900.0)
     assert res.ok
 
@@ -1104,14 +1895,11 @@ def test_poll_job_throttled_timer_resets_on_leaving_queue(monkeypatch):
     # IN_PROGRESS spell: if RunPod re-queues the job (still throttled), the throttled grace must be
     # measured from the re-queue, not the original arm. Otherwise the first re-queue probe fires
     # no_capacity instantly, defeating throttled_grace_s. Clock advances one tick per job_status poll.
-    import base64
-
-    import cloudpickle
 
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    ok = {"success": True, "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode()}
+    ok = {"acc": 1.0}
     statuses = iter(
         [
             {"status": "IN_QUEUE"},  # arm throttled_timer (~t=100)
@@ -1455,6 +2243,176 @@ def test_poll_job_stale_late_heartbeat_does_not_reset_progress(monkeypatch):
     assert fresh_run > none_run, "a genuinely newer heartbeat does reset progress (stalls later)"
 
 
+@pytest.mark.parametrize(
+    ("last_hb_attempt", "last_hb_ts"),
+    [(-1, 0.0), (0, 50.0)],
+    ids=["first-current-attempt-heartbeat", "later-current-attempt-heartbeat"],
+)
+def test_older_heartbeat_cannot_regress_status_progress_anchor(
+    monkeypatch, last_hb_attempt, last_hb_ts
+):
+    # a queue exemption or status transition can advance the shared progress anchor beyond the
+    # worker timestamp. a heartbeat that becomes visible later may still advance heartbeat-specific
+    # bookkeeping, but neither credit branch may move the stall anchor backward.
+    from flash.providers.runpod import jobs
+
+    job_execution = sys.modules["flash.providers.runpod.job_execution"]
+    heartbeat_key = ("boot", None, 100.0, 0)
+    monkeypatch.setattr(
+        job_execution,
+        "surface_heartbeat",
+        lambda _reader, _last_key, _say: (heartbeat_key, "boot"),
+    )
+    monkeypatch.setattr(jobs.time, "time", lambda: 600.0)
+    context = SimpleNamespace(
+        heartbeat_reader=lambda: None,
+        say=lambda _message: None,
+        current_attempt=0,
+        launch_ts=1.0,
+    )
+    state = SimpleNamespace(
+        last_hb_key=None,
+        last_hb_ts=last_hb_ts,
+        last_hb_attempt=last_hb_attempt,
+        last_progress=500.0,
+        seen_training_hb=False,
+        ever_saw_worker=True,
+    )
+
+    job_execution._update_heartbeat(context, state)
+
+    assert state.last_progress == 500.0
+
+
+def _stall_clock_at_giveup(
+    monkeypatch, *, started_ts, heartbeats=(), step_s=100.0, clock_at=5000.0
+):
+    """Poll an ALREADY-PLACED job and return the absolute fake-clock time it gave up at.
+
+    IN_PROGRESS from the first read, so the queued-capacity exemption never applies and the value
+    seeded into ``last_progress`` is the only thing anchoring the stall window. ``clock_at`` is where
+    this poll's wall clock starts; a ``started_ts`` well below it is a launch in the past, i.e. a
+    delayed reattach. The handle rejects a non-positive launch, so the clock starts high rather than
+    the launch going negative.
+    """
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    state = {"t": clock_at}
+
+    def _time():
+        state["t"] += step_s
+        return state["t"]
+
+    monkeypatch.setattr(jobs.time, "time", _time)
+    hbs = iter(list(heartbeats))
+    res = jobs.poll_job(
+        _runpod_handle(jobs, started_ts=started_ts),
+        interval_s=0,
+        heartbeat_reader=lambda: next(hbs, None),
+        stall_after_s=150.0,
+        setup_grace_s=600.0,
+    )
+    assert res.failure == "stalled", res
+    return state["t"]
+
+
+def test_a_reattached_wedged_worker_is_measured_from_launch_not_from_this_polls_start(monkeypatch):
+    # A reattach has been BILLING since launch, so the stall window has to be measured from the
+    # persisted launch timestamp. Seeding it from `time.time()` at poll start meant every reattach
+    # handed a worker that was already wedged a complete fresh setup window, and a supervisor that
+    # reattaches repeatedly could keep a dead worker on a paid GPU until the run's wall deadline.
+    #
+    # The job is IN_PROGRESS from the first read, so the queued-capacity exemption -- which re-anchors
+    # `last_progress` on every pre-grant poll, and is what made the wrong seed survivable for a job
+    # queued from the start -- never fires here. This is the placed-at-attach case where the seed is
+    # the only anchor.
+    #
+    # Assert on the absolute clock at give-up, not on the "no worker progress for Ns" figure in the
+    # detail: that figure is derived from `last_progress` and reads ~the same either way, so it
+    # cannot tell the fixed and broken code apart.
+    # attached at launch: the setup grace has not been spent, so the full window remains.
+    at_launch = _stall_clock_at_giveup(monkeypatch, started_ts=5000.0)
+    # same wedge, but launched 5000s before this poll attached: that grace is already gone.
+    long_after_launch = _stall_clock_at_giveup(monkeypatch, started_ts=1.0)
+    assert long_after_launch < at_launch, (
+        f"a worker wedged since a launch 5000s ago was torn down at {long_after_launch}s, no sooner "
+        f"than one attached at launch ({at_launch}s); the stall clock anchors on poll start, not launch"
+    )
+
+
+def test_a_heartbeat_written_before_the_reattach_buys_no_fresh_stall_window(monkeypatch):
+    # Crediting progress at READ time means a heartbeat written long ago and surfaced now pays out a
+    # full fresh window, so a worker that stopped producing heartbeats before we attached looks alive
+    # for one more grace period. Credit the heartbeat's OWN ts (clamped to [launch, now]) instead:
+    # it describes when the worker made progress, not when we got around to looking.
+    #
+    # Both runs see exactly ONE staged heartbeat, so the only difference is its timestamp.
+    stale = _stall_clock_at_giveup(
+        monkeypatch,
+        started_ts=5000.0,
+        heartbeats=[{"stage": "train", "step": 1, "ts": 5001.0, "attempt": 0}],
+    )
+    current = _stall_clock_at_giveup(
+        monkeypatch,
+        started_ts=5000.0,
+        heartbeats=[{"stage": "train", "step": 1, "ts": 5400.0, "attempt": 0}],
+    )
+    assert stale < current, (
+        f"a heartbeat stamped at launch (ts=5001.0) held the run to {stale}s, as long as one stamped "
+        f"at ts=5400.0 ({current}s); progress is credited at read time, not at the heartbeat's own ts"
+    )
+
+
+def test_a_heartbeat_from_a_prior_attempt_buys_this_attempt_no_progress(monkeypatch):
+    # A retry reuses the same heartbeat path, so a leftover heartbeat from attempt 0 is still
+    # readable while attempt 1 is running. Crediting it would let the PREVIOUS attempt's work stand
+    # as proof that THIS one is progressing. The attempt identity has to gate the credit, not just
+    # the OOM flags.
+    #
+    # Both runs are attempt 1 and see exactly one heartbeat; only its `attempt` field differs. The
+    # own-attempt run gives up SOONER, which is the tell: its heartbeat is a training heartbeat, so
+    # it both moves the clock and tightens the window from setup grace to the stall limit. The
+    # prior-attempt heartbeat must do neither, leaving the wider setup window running from launch.
+    # Asserting "stale lasts longer" therefore proves the heartbeat was ignored end to end; the
+    # reverse ordering would mean prior-attempt evidence had been credited.
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    def _giveup_with(hb_attempt):
+        monkeypatch.setattr(
+            runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"}
+        )
+        monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+        state = {"t": 5000.0}
+
+        def _time():
+            state["t"] += 100.0
+            return state["t"]
+
+        monkeypatch.setattr(jobs.time, "time", _time)
+        hbs = iter([{"stage": "train", "step": 1, "ts": 5400.0, "attempt": hb_attempt}])
+        res = jobs.poll_job(
+            _runpod_handle(jobs, attempt=1, started_ts=5000.0),
+            interval_s=0,
+            heartbeat_reader=lambda: next(hbs, None),
+            stall_after_s=150.0,
+            setup_grace_s=600.0,
+            current_attempt=1,
+        )
+        assert res.failure == "stalled", res
+        return state["t"]
+
+    stale_attempt = _giveup_with(0)
+    this_attempt = _giveup_with(1)
+    assert stale_attempt > this_attempt, (
+        f"attempt 1 given only a stale attempt=0 heartbeat behaved identically to one given its "
+        f"own ({stale_attempt}s vs {this_attempt}s); prior-attempt evidence is being credited"
+    )
+
+
 def test_poll_job_gapfill_step0_does_not_tighten(monkeypatch):
     # The train-liveness gap-filler emits rl_step/sft_step at step=0 throughout the silent FIRST step
     # (a cold vLLM rollout can run many minutes before global_step ticks to 1). That step=0 ping is a
@@ -1607,10 +2565,7 @@ def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
 def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
     # A brief unhealthy blip during cold start that then yields a usable worker must NOT trip the
     # fast-fail (it resets once a usable/initializing worker appears) — only a STUCK unhealthy does.
-    import base64
     import itertools
-
-    import cloudpickle
 
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
@@ -1622,10 +2577,7 @@ def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
             {"status": "IN_PROGRESS"},
             {
                 "status": "COMPLETED",
-                "output": {
-                    "success": True,
-                    "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
-                },
+                "output": {"acc": 1.0},
             },
         ]
     )
@@ -1698,10 +2650,7 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
 def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
     # A brief throttle during cold start that then yields a usable worker must NOT trip the
     # fast-fail (it resets once a usable worker appears) — only a STUCK throttle does.
-    import base64
     import itertools
-
-    import cloudpickle
 
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
@@ -1713,10 +2662,7 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
             {"status": "IN_PROGRESS"},
             {
                 "status": "COMPLETED",
-                "output": {
-                    "success": True,
-                    "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
-                },
+                "output": {"acc": 1.0},
             },
         ]
     )
@@ -1800,6 +2746,32 @@ def test_failure_detail_reader_preserves_full_worker_artifacts(monkeypatch):
     assert "CONSOLE-END" in detail
 
 
+def test_failure_detail_reader_reads_only_the_current_attempt_console(monkeypatch):
+    from flash.providers.artifacts import hf as _hf_artifacts
+
+    requested: list[str] = []
+
+    def fake_reader(_hf_repo, path_in_repo, _min_interval_s):
+        requested.append(path_in_repo)
+        return lambda force=False: (
+            "last live bytes" if path_in_repo.endswith("console_sft_attempt2.txt") else None
+        )
+
+    monkeypatch.setattr(_hf_artifacts, "make_hf_text_reader", fake_reader)
+    reader = _hf_artifacts.make_hf_failure_detail_reader(
+        "org/repo", "sft/run-1/seed0", "sft", attempt=2
+    )
+
+    detail = reader(force=True)
+
+    assert requested[-2:] == [
+        "sft/run-1/seed0/console_sft.txt",
+        "sft/run-1/seed0/console_sft_attempt2.txt",
+    ]
+    assert "--- console_sft_attempt2.txt ---" in detail
+    assert "last live bytes" in detail
+
+
 def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
     # Without a heartbeat_reader we can't tell setup from training, so the larger
     # setup_grace must NOT silently slow stall detection — stay on stall_after_s.
@@ -1824,15 +2796,10 @@ def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
 
 
 def test_poll_job_tolerates_transient_api_errors(monkeypatch):
-    import cloudpickle
-
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    ok = {
-        "success": True,
-        "result": base64.b64encode(cloudpickle.dumps({"acc": 0.7})).decode(),
-    }
+    ok = {"acc": 0.7}
     calls = {"n": 0}
 
     def flaky(eid, jid, **_kw):
@@ -5311,7 +6278,7 @@ def _patch_deploy_deps(monkeypatch, jobs, *, set_key: bool = True):
     monkeypatch.setattr(jobs, "endpoint_name", lambda g, s: f"flash-{g}-test")
     monkeypatch.setattr(jobs, "min_cuda_for", lambda g: "12.8")
     monkeypatch.setattr(jobs, "WORKER_IMAGE", "fake-image")
-    monkeypatch.setattr(jobs, "worker_image_for_gpu", lambda g, allow_default=True: "fake-image")
+    monkeypatch.setattr(jobs, "worker_image_for_gpu", lambda g: "fake-image")
     monkeypatch.setattr(jobs, "DEFAULT_EXECUTION_TIMEOUT_MS", 3600000)
     monkeypatch.setattr(jobs, "apply_disk_gb", lambda c, d: None)
     monkeypatch.setattr(jobs, "time", type("T", (), {"sleep": staticmethod(lambda s: None)})())
@@ -5877,7 +6844,7 @@ def test_runpod_completed_metrics_probes_after_expired_recovery_grace(monkeypatc
 
     monkeypatch.setattr(runpod_api, "job_status", completed_status)
     metrics = lifecycle._runpod_completed_metrics(
-        _runpod_handle(jobs),
+        _live_clock_handle(jobs),
         deadline_at=now - lifecycle._RECOVERY_MARKER_GRACE_S - 1.0,
     )
 
@@ -5905,7 +6872,7 @@ def test_runpod_completed_metrics_caps_probe_deadline_when_wall_deadline_far_fut
 
     monkeypatch.setattr(runpod_api, "job_status", completed_status)
     metrics = lifecycle._runpod_completed_metrics(
-        _runpod_handle(jobs),
+        _live_clock_handle(jobs),
         deadline_at=now + 7_200.0,  # wall deadline hours in the future
     )
 

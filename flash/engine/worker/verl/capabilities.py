@@ -19,6 +19,7 @@ import subprocess
 from flash.engine.worker.backend_common import (
     CAUSAL_CONV1D_REQUIREMENT,
     FLA_REQUIREMENT,
+    FLASH_QLA_REQUIREMENT,
     TRANSFORMERS_REQUIREMENT,
     VERL_REQUIREMENT_NAME,
     VERL_REQUIREMENT_URL,
@@ -481,6 +482,10 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 # apache-tvm-ffi is pinned to 0.1.11 because 0.1.12
                 # double-registers TVM-FFI and aborts `import tilelang`.
                 FLA_REQUIREMENT,
+                # the flashqla GDN backend fla 0.5.2 dispatches to. same lockstep requirement:
+                # the shim binds it in THIS interpreter, so a wheel present only in the worker's
+                # env would leave the child on the old kernel while the marker still printed.
+                FLASH_QLA_REQUIREMENT,
                 "tilelang==0.1.11",
                 "apache-tvm-ffi==0.1.11",
             ],
@@ -751,6 +756,16 @@ def rollout_resident_overrides(sleep_unsupported: bool) -> list[str]:
         "actor_rollout_ref.rollout.free_cache_engine=false",
         "+actor_rollout_ref.rollout.enable_sleep_mode=false",
     ]
+
+
+def rollout_mm_processor_cache_overrides() -> list[str]:
+    """disable vllm's split multimodal processor cache for every verl rollout.
+
+    verl sleep resets the engine-side receiver without resynchronizing the frontend sender, so a
+    repeated image can become a hash-only request for an item the receiver no longer holds. zero is
+    vllm's disable value for both halves and is inert when a rollout has no multimodal items.
+    """
+    return ["+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0"]
 
 
 def trainer_dtype_overrides() -> list[str]:

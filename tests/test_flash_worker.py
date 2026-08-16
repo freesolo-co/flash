@@ -475,22 +475,36 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
 
-def test_runpod_backoff_no_overflow_on_long_runs():
-    """DEFECT: runpod_flash computed base*(2**attempt) then clamped, so a long poll loop
-    overflowed (~80 min in) and killed a healthy job. The patch caps the exponent first."""
+def test_runpod_backoff_preserves_strategies_cap_jitter_and_idempotence(monkeypatch):
     pytest.importorskip("runpod_flash")
     from flash.providers.runpod.serverless import _patch_runpod_backoff
 
     _patch_runpod_backoff()
+    from runpod_flash.core.resources import serverless
     from runpod_flash.core.utils import backoff
 
-    # Pre-patch this raised OverflowError; now it must return a clamped, finite delay.
-    delay = backoff.get_backoff_delay(5000, max_seconds=5)
-    assert delay <= 5 * 1.2 + 1e-9
-    # the serverless module's imported reference is patched too (that's the real call site)
-    from runpod_flash.core.resources import serverless
+    patched = backoff.get_backoff_delay
+    assert serverless.get_backoff_delay is patched
+    _patch_runpod_backoff()
+    assert backoff.get_backoff_delay is patched
+    assert serverless.get_backoff_delay is patched
 
-    assert serverless.get_backoff_delay(100000, max_seconds=5) <= 5 * 1.2 + 1e-9
+    jitter_bounds: list[tuple[float, float]] = []
+
+    def _uniform(low: float, high: float) -> float:
+        jitter_bounds.append((low, high))
+        return high
+
+    monkeypatch.setattr("random.uniform", _uniform)
+    strategy = backoff.BackoffStrategy
+    assert patched(5000, max_seconds=5, jitter=0) == 5
+    assert patched(3, base=0.5, max_seconds=10, jitter=0, strategy=strategy.LINEAR) == 2
+    assert patched(2, base=0.5, max_seconds=10, jitter=0, strategy=strategy.LOGARITHMIC) == 1
+    assert patched(1000, base=0.5, max_seconds=3, jitter=0, strategy=strategy.LINEAR) == 3
+    assert patched(1, base=1, max_seconds=10, jitter=0.2) == pytest.approx(2.4)
+    assert jitter_bounds[-1] == (0.8, 1.2)
+    with pytest.raises(ValueError, match="Unsupported backoff strategy"):
+        patched(1, strategy=object())
 
 
 def test_error_artifact_name_is_per_phase_and_attempt():
@@ -547,28 +561,63 @@ def test_worker_and_control_plane_agree_on_the_error_artifact_name():
             plane_name("sft", invalid)
 
 
+def _unresolved_source_globals(source: str) -> set[str]:
+    import builtins
+    import symtable
+
+    root = symtable.symtable(source, "<source>", "exec")
+    builtin_names = set(dir(builtins))
+    unresolved: set[str] = set()
+
+    def _visit(table) -> None:
+        if table.get_type() == "function":
+            unresolved.update(
+                symbol.get_name()
+                for symbol in table.get_symbols()
+                if symbol.is_referenced()
+                and symbol.is_global()
+                and symbol.get_name() not in builtin_names
+            )
+        for child in table.get_children():
+            _visit(child)
+
+    _visit(root)
+    return unresolved
+
+
 def test_train_body_imports_every_name_it_uses():
-    """Flash ships only _train_body's source to the worker, where module-level
-    imports are out of scope, so every stdlib/3p name it references must be
-    imported inside the function body (else NameError before training)."""
-    import ast
+    """the source-shipped handler must resolve without module globals."""
     import inspect
 
     from flash.providers.runpod import serverless as train
 
-    tree = ast.parse(inspect.getsource(train._train_body))
-    fn = tree.body[0]
-    imported = {
-        alias.asname or alias.name.split(".")[0]
-        for node in ast.walk(fn)
-        if isinstance(node, (ast.Import, ast.ImportFrom))
-        for alias in node.names
-    }
-    # Names that must be locally imported (regression: contextlib was missing; threading is used by
-    # the always-on console uploader).
-    for name in ("contextlib", "json", "os", "subprocess", "sys", "threading"):
-        assert name in imported, f"_train_body uses {name!r} without a local import"
-    assert "_CONSOLE_UPLOAD_INTERVAL_S" not in inspect.getsource(train._train_body)
+    source = inspect.getsource(train._train_body)
+    assert _unresolved_source_globals(source) == set()
+    assert "_CONSOLE_UPLOAD_INTERVAL_S" not in source
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        pytest.param(
+            "def outer():\n    def sibling():\n        value = 1\n    def reader():\n        return value\n",
+            {"value"},
+            id="sibling-local-fails",
+        ),
+        pytest.param(
+            "def outer():\n    value = 1\n    def reader():\n        return value\n",
+            set(),
+            id="enclosing-local-succeeds",
+        ),
+        pytest.param(
+            "def outer(items):\n    return len(items)\n",
+            set(),
+            id="builtin-succeeds",
+        ),
+    ],
+)
+def test_source_global_check_sensitivity(source, expected):
+    assert _unresolved_source_globals(source) == expected
 
 
 def test_train_body_has_no_prime_install_path():
@@ -825,19 +874,20 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     The previous version of this test read run_sft's source. That body was trl's and is deleted:
     run_sft now delegates to run_sft_train. Rather than drop the coverage, assert against the module
-    that really runs. Three of the old assertions are intentionally NOT reproduced -- kernel
-    installation, LoRA+ B-matrix ratio plumbing, and the chunked_nll loss_type -- because they were
-    properties of trl's SFTTrainer call, and verl owns its own loss and kernel path.
+    that really runs. Two of the old assertions are intentionally NOT reproduced -- kernel
+    installation and the chunked_nll loss_type -- because they were properties of trl's SFTTrainer
+    call, and verl owns its own loss and kernel path.
 
-    the optimizations now live in two modules rather than one. dataset preprocessing moved to
+    the optimizations now live in three modules rather than one. dataset preprocessing moved to
     flash.engine.profiling.sft_workload so estimate construction and training share one implementation,
-    and the sizing/memory choices stayed with the trainer that makes them. each assertion reads the
-    module that actually owns its behaviour: pointing them all at one module would let a symbol
-    disappear from the other and still pass.
+    image-row tokenization lives in flash.engine.profiling.sft_image_rows, sizing and memory choices
+    stayed with the trainer and hydra config, and LoRA+ grouping moved to the external child plugin.
+    each assertion reads the module that actually owns its behaviour: pointing them all at one module
+    would let a symbol disappear from another and still pass.
     """
     import inspect
 
-    from flash.engine.profiling import sft_workload
+    from flash.engine.profiling import sft_image_rows, sft_workload
     from flash.engine.worker import sft_train
     from flash.engine.worker.entry import sft
 
@@ -845,16 +895,19 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "run_sft_train()" in inspect.getsource(sft.run_sft)
 
     workload_src = inspect.getsource(sft_workload)
+    image_rows_src = inspect.getsource(sft_image_rows)
     # completion-only supervision survives, as verl's loss_mask rather than trl's completion_mask.
     assert "_pretokenize_completion_only(" in workload_src
-    assert "completion_mask_from_ids(" in workload_src
+    assert "completion_mask_from_ids(" in image_rows_src
     assert '"loss_mask": tokenized["completion_mask"]' in workload_src
 
     # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
     # this guard spans both modules. keep these in step when sft_train is split further.
     from flash.engine.worker.train.sft import config as sft_config
+    from flash.engine.worker.train.sft.child import plugin as sft_plugin
 
     train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
+    plugin_src = inspect.getsource(sft_plugin)
     # revision-aware vocab resolution: the worker must size the realized batch through the SAME
     # resolver the cost quote priced with, else a revision-pinned run drifts from its quote.
     assert "resolve_vocab_size(" in train_src
@@ -864,8 +917,8 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     # gradient checkpointing, with the MoE/GDN reentrant rule shared with grpo.
     assert "grad_checkpointing_on(" in train_src
     assert "grpo_use_reentrant(" in train_src
-    # LoRA+ survives (verl builds the optimizer itself, but flash still supplies the grouping).
-    assert "create_loraplus_optimizer" in train_src
+    # LoRA+ survives in the external child plugin that owns verl's optimizer grouping.
+    assert "create_loraplus_optimizer" in plugin_src
 
 
 @pytest.mark.parametrize(
@@ -898,6 +951,17 @@ def test_train_body_uploads_console_on_missing_metrics(
     from flash.providers.runpod.serverless import endpoints
 
     code_prefix = "code/0123456789abcdef0123456789abcdef/flash"
+    run_code = tmp_path / "runcode"
+    late_marker = tmp_path / "late-live-attempted"
+    real_join = os.path.join
+
+    def mapped_join(*parts):
+        joined = real_join(*parts)
+        if joined == "/runcode" or joined.startswith("/runcode/"):
+            return str(run_code) + joined.removeprefix("/runcode")
+        return joined
+
+    monkeypatch.setattr(os.path, "join", mapped_join)
     list_calls = []
     download_calls = []
     monkeypatch.setattr(
@@ -919,11 +983,17 @@ def test_train_body_uploads_console_on_missing_metrics(
             return [
                 types.SimpleNamespace(path=f"{code_prefix}/__init__.py", size=0),
                 types.SimpleNamespace(path=f"{code_prefix}/engine/worker.py", size=10),
+                types.SimpleNamespace(
+                    path=f"{code_prefix}/providers/_lifecycle/bootstrap_console.py", size=10
+                ),
+                types.SimpleNamespace(path=f"{code_prefix}/adapters/artifacts.py", size=10),
                 types.SimpleNamespace(path=f"{code_prefix}/engine", tree_id="folder"),
             ]
 
         def upload_file(self, **kw):
             uploads.append(kw)
+            if str(kw.get("path_in_repo", "")).endswith("/console_sft.txt"):
+                time.sleep(0.05)
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
@@ -938,14 +1008,34 @@ def test_train_body_uploads_console_on_missing_metrics(
 
     def fake_hf_hub_download(*, filename, local_dir, **kw):
         download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
-        return os.path.join(local_dir, filename)
+        target = run_code / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if filename.endswith("bootstrap_console.py"):
+            target.write_text(
+                "import threading, time\n"
+                "def _run_console_upload_loop(console, interval, stop, *, upload):\n"
+                "    upload()\n"
+                "    def late():\n"
+                "        stop.wait(); time.sleep(0.01); upload()\n"
+                f"        open({str(late_marker)!r}, 'w').write('1')\n"
+                "    threading.Thread(target=late, daemon=True).start()\n"
+                "    stop.wait()\n"
+            )
+        elif filename.endswith("artifacts.py"):
+            target.write_text(
+                "def attempt_scoped_artifact_name(kind, phase, attempt):\n"
+                "    return f'exact_{kind}_{phase}_attempt{attempt}.txt'\n"
+            )
+        else:
+            target.write_text("")
+        return str(target)
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
 
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
-            assert k["cwd"] == "/runcode/code/0123456789abcdef0123456789abcdef"
+            assert k["cwd"] == str(run_code / "code/0123456789abcdef0123456789abcdef")
             self.stdout = iter(console_lines)
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
@@ -960,7 +1050,7 @@ def test_train_body_uploads_console_on_missing_metrics(
         "seed": 0,
         "hf_repo": "owner/runs",
         "job_spec_json": job_spec,
-        "env": {"HF_TOKEN": "tok", "PYTHONPATH": ""},
+        "env": {"HF_TOKEN": "tok", "PYTHONPATH": "", "ATTEMPT": "7"},
         "code_prefix": code_prefix,
         **_run_deadline_fields(),
     }
@@ -969,15 +1059,15 @@ def test_train_body_uploads_console_on_missing_metrics(
         with pytest.raises(RuntimeError, match=r"produced no /tmp/metrics\.json"):
             endpoints._train_body(input_data)
 
-        # The fix: the console for the crashed phase is uploaded so the failure is root-causable.
-        console_uploads = [
-            u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")
+        paths = [upload["path_in_repo"] for upload in uploads]
+        assert paths == [
+            "sft/flash-test-run/exact_console_sft_attempt7.txt",
+            "sft/flash-test-run/console_sft.txt",
         ]
-        assert console_uploads, (
-            f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
+        assert late_marker.exists(), (
+            "the late live callback must run after terminal teardown begins"
         )
-        assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
-        with open(console_uploads[0]["path_or_fileobj"], encoding="utf-8") as f:
+        with open(uploads[-1]["path_or_fileobj"], encoding="utf-8") as f:
             uploaded_console = f.read()
         if terminated:
             assert not uploaded_console.startswith("worker booting\n")
@@ -998,11 +1088,19 @@ def test_train_body_uploads_console_on_missing_metrics(
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",
             f"{code_prefix}/engine/worker.py",
+            f"{code_prefix}/providers/_lifecycle/bootstrap_console.py",
+            f"{code_prefix}/adapters/artifacts.py",
         ]
     finally:
-        # _train_body writes the hardcoded /tmp/console_sft.txt(.tail); remove them so this test
-        # doesn't leak state across tests (flaky under isolated/parallel runners).
-        for _p in ("/tmp/console_sft.txt", "/tmp/console_sft.txt.tail"):
+        # _train_body writes hardcoded console paths; remove them for parallel runs.
+        import shutil
+
+        shutil.rmtree(run_code, ignore_errors=True)
+        for _p in (
+            "/tmp/console_sft.txt",
+            "/tmp/console_sft.txt.live.tail",
+            "/tmp/console_sft.txt.final.tail",
+        ):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(_p)
 
@@ -1033,15 +1131,67 @@ def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
 
 def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
     import flash.engine.worker as worker
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers._lifecycle import bootstrap as instance_bootstrap
     from flash.providers.runpod.serverless import endpoints
 
     assert endpoints._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
-    assert _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
+    assert instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
     steady_state_commits_per_hour = (
         3600.0 / worker._HB_MIN_INTERVAL_S + 3600.0 / endpoints._CONSOLE_UPLOAD_INTERVAL_S
     )
     assert steady_state_commits_per_hour <= 5.0
+
+
+def test_first_console_snapshot_precedes_stall_teardown():
+    import importlib
+    import inspect
+
+    from flash.providers._lifecycle import bootstrap_console
+
+    importlib.import_module("flash.providers.runpod.jobs")
+    poll_job = importlib.import_module("flash.providers.runpod.job_execution").poll_job
+    defaults = inspect.signature(poll_job).parameters
+    training_stall_s = defaults["stall_after_s"].default
+    setup_grace_s = defaults["setup_grace_s"].default
+
+    # the serverless handler loads this exact module rather than shipping its own copy, so these
+    # constants have one home and both providers are bound by the same margin.
+    assert training_stall_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    assert setup_grace_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    assert training_stall_s > 2 * bootstrap_console._CONSOLE_UPLOAD_POLL_S
+
+
+def test_console_heartbeat_stays_flat_so_the_scanner_can_match_on_substrings(tmp_path):
+    """the console scanner matches marker keys as raw substrings, which is only sound because the
+    producer compacts every nested field away first.
+
+    a nested ``{"pending": ...}`` anywhere in the line would read as an uncommitted beat and make a
+    healthy run look wedged. that cannot happen while the producer replaces list values with counts,
+    so this pins the producer side of that contract rather than the scanner's.
+    """
+    import json
+
+    from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
+    from flash.providers._lifecycle import bootstrap_console
+
+    snapshot = _console_heartbeat_snapshot(
+        {
+            "stage": "rl_step",
+            "step": 3,
+            "sampled_completions": [{"completion": "x" * 100_000, "pending": True}],
+            "metrics_last": [{"throttled": True}],
+        }
+    )
+    assert '"samples_count": 1' in snapshot
+    assert '"metrics_last_count": 1' in snapshot
+    assert "sampled_completions" not in snapshot
+    assert "metrics_last" not in snapshot.replace('"metrics_last_count"', "")
+    # no nested container survives, so no marker substring can come from anything but a real marker.
+    assert not any(isinstance(value, (dict, list)) for value in json.loads(snapshot).values())
+
+    console = tmp_path / "console_large_managed_heartbeat.txt"
+    console.write_bytes(f"HEARTBEAT {snapshot}\n".encode())
+    assert bootstrap_console._console_progress(str(console), 0)[2:] == (1, 1)
 
 
 def test_min_cuda_for_uses_the_gpu_class_floor():

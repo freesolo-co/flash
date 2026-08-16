@@ -9,23 +9,25 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
-import itertools
 import math
 import os
-import statistics
 
+from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
-from flash.engine.profiling.sft_workload import _multimodal_messages_with_images
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
+    rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
     trainer_dtype_overrides,
 )
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.sft_train import _hydra_val, _verl_image_message_content
-from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
+from flash.engine.worker.verl.parallelism import (
+    ULYSSES_SEQUENCE_PARALLEL_SIZE,
+    resolve_reshard_after_forward,
+)
 
 # the data_source every flash-generated row carries. verl routes scoring by this key, so it must
 # match what the reward shim registers under.
@@ -124,7 +126,7 @@ def _processor_expanded_prompt(
     from flash.content.multimodal import decode_image_descriptors
 
     images = decode_image_descriptors(list(image_descriptors), package_root)
-    prepared = _multimodal_messages_with_images(messages, images)
+    prepared = messages_with_decoded_images(messages, images)
     rendered = processor.apply_chat_template(
         prepared, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
     )
@@ -287,6 +289,13 @@ def _actor_overrides(cfg: dict) -> list[str]:
         # shard by DATA, not by sequence -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why. ref inherits
         # this via dp_ref.yaml, and use_remove_padding is required either way.
         f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={ULYSSES_SEQUENCE_PARALLEL_SIZE}",
+        # zero-2 vs zero-3. NOT decided here: `zero2_enabled` is the allocator's own gate, and the
+        # value is resolved once in `build_verl_cfg` so the shape this run was admitted on is the
+        # shape it trains under. the ref policy needs no matching key -- lora makes verl reuse the
+        # actor module with the adapter disabled (`ref_in_actor`), so there is no second copy.
+        # absent -> True, verl's own default: a cfg built without the gate must render the
+        # lower-memory strategy, never fall into zero-2 by omission.
+        f"actor_rollout_ref.actor.fsdp_config.reshard_after_forward={_hydra_val(bool(cfg.get('reshard_after_forward', True)))}",
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the opd driver.
         *trainer_dtype_overrides(),
     ]
@@ -324,6 +333,7 @@ def _rollout_overrides(cfg: dict) -> list[str]:
         ),
         # safetensors load format is required for lora rollout on vllm.
         "actor_rollout_ref.rollout.load_format=safetensors",
+        *rollout_mm_processor_cache_overrides(),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
         # sleep_unsupported). shared with the opd driver, which runs the same verl sleep path.
         *rollout_resident_overrides(bool(cfg.get("sleep_unsupported"))),
@@ -565,6 +575,9 @@ def _build_verl_training_cfg(
     experiment_name: str,
     gpu_type: str = "",
     n_gpus: int = 1,
+    # the authored [train] table, used only to size the zero-2 gate against the same knobs the
+    # allocator sized the shape with. absent -> the gate falls closed to verl's zero-3 default.
+    train_spec=None,
     # NOT named fused_ce_backend: that is the imported resolver, and a parameter of the same name
     # would shadow it inside this function so a later `fused_ce_backend(caps)` call silently
     # returned a string. required, since every caller resolves it from the capability probe.
@@ -619,6 +632,19 @@ def _build_verl_training_cfg(
             fp8_kv=fp8_kv,
             sleep_unsupported=sleep_unsupported,
         ),
+        # `train` is the AUTHORED spec table, never `inp`: the sizer reads `max_context_tokens` /
+        # `max_completion_tokens`, which `inp` carries under resolved names (`engine_len`), so
+        # passing `inp` would size the gate against recipe defaults and answer a different question
+        # than the allocator asked.
+        "reshard_after_forward": resolve_reshard_after_forward(
+            model_id=inp["model_id"],
+            algorithm="grpo",
+            gpu_type=gpu_type,
+            n_gpus=n_gpus,
+            train=train_spec,
+            thinking=thinking,
+            model_revision=str(inp.get("model_revision") or ""),
+        ),
         "n_gpus": n_gpus,
         "loggers": loggers,
         "fp8_kv": fp8_kv,
@@ -638,47 +664,6 @@ def _build_verl_training_cfg(
     }
 
 
-def _step_intervals(step_line_times: list[float]) -> list[float]:
-    """measure step walls from consecutive metric arrival times.
-
-    n lines bound n-1 steps; startup before the first and partial work after the last are excluded.
-    """
-    return [
-        later - earlier for earlier, later in itertools.pairwise(step_line_times) if later > earlier
-    ]
-
-
-def _measured_idle_fraction(
-    reward_profile,
-    *,
-    completions_per_step: int,
-    step_intervals: list[float],
-) -> float | None:
-    """measure the gpu's grading-idle share from this run's own timings.
-
-    combine profiled grading latency with the median gap between consecutive step metric lines.
-    ``train_wall / steps_run`` is invalid because it includes startup/upload and mixes session wall
-    with an absolute resumed step count. the median resists checkpoint and lazy-compilation outliers.
-
-    return none when the profile or completed-step evidence is missing, or grading consumes the
-    entire measured step and leaves no trustworthy gpu-bound remainder.
-    """
-    if reward_profile is None or not reward_profile.trustworthy:
-        return None
-    completions = max(0, int(completions_per_step))
-    intervals = [float(gap) for gap in step_intervals if gap > 0]
-    if completions <= 0 or not intervals:
-        return None
-    step_wall = statistics.median(intervals)
-    reward_s = reward_profile.seconds_per_completion * completions
-    gpu_seconds = step_wall - reward_s
-    if gpu_seconds <= 0:
-        return None
-    from flash.engine.profiling.reward_profile import gpu_idle_fraction
-
-    return gpu_idle_fraction(reward_profile.seconds_per_completion, completions, gpu_seconds)
-
-
 def _build_verl_train_notes(
     inp: dict,
     *,
@@ -694,8 +679,6 @@ def _build_verl_train_notes(
     wandb_run_name: str | None = None,
     wandb_url: str | None = None,
     wandb_id: str | None = None,
-    reward_profile=None,
-    step_intervals: list[float] | None = None,
     reward_bridge_batching: bool = False,
     gdn_boundary_resets: bool | None = None,
 ) -> dict:
@@ -753,24 +736,7 @@ def _build_verl_train_notes(
         # wandb.run, verl from the child marker (see backend_common.render_wandb_link_shim).
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
-        # scalar grader latency remains useful after batching, but multiplying it by every completion
-        # no longer measures the reward wall. publish no idle fraction until the batch-aware estimator
-        # has a measured batch denominator rather than presenting the old serial projection as fact.
         "reward_bridge_batching": bool(reward_bridge_batching),
-        "reward_seconds_per_completion": (
-            reward_profile.seconds_per_completion
-            if reward_profile is not None and reward_profile.trustworthy
-            else None
-        ),
-        "reward_gpu_idle_fraction": (
-            None
-            if reward_bridge_batching
-            else _measured_idle_fraction(
-                reward_profile,
-                completions_per_step=inp["prompts_per_step"] * inp["group_size"],
-                step_intervals=step_intervals or [],
-            )
-        ),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],

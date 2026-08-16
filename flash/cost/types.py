@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from flash.core.catalog import normalize_algorithm, optimizer_batch_key, samples_on_policy
 from flash.core.spec import parse_positive_int_tuple
 from flash.engine.plan.recipe import RECIPE
-from flash.providers import PROVIDER_NAMES
+from flash.providers import PROVIDER_NAMES, validated_provider_preferences
 from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
 
 
@@ -27,8 +27,6 @@ class RunConfig:
     group_size: int | None = None  # GRPO completions per prompt (G)
     lora_rank: int | None = None
     thinking: bool = False
-    # GRPO only: seconds to score one completion. None -> the single average grader latency.
-    reward_seconds_per_completion: float | None = None
     # opd only: the canonical friendly teacher alias from [train].teacher_model.
     # prices the teacher-api estimate; an empty value resolves to the default glm 5.2 teacher (an
     # omitted [train].teacher_model).
@@ -54,11 +52,6 @@ class RunConfig:
     sft_packed_blocks: int | None = None
     opd_multi_turn: bool = False
     opd_max_turns: int | None = None
-    # use measured mean rollout tokens for pricing but retain completion_len/seq_len caps for gpu
-    # sizing. conflating them either overbills expected generation or provisions for the mean and ooms
-    # on the tail; sft uses the same split through train_tokens.
-    measured_completion_tokens: float | None = None
-    measured_prompt_tokens: float | None = None
     # rows the trainer iterates (profile `retained_examples`), which is what verl's sampler shards.
     # NOT derivable from sft_packed_blocks: that is ceil(rows / examples_per_update), so a packed
     # profile with 10 rows and a batch of 8 reports 2 blocks and reconstructs as 16.
@@ -66,6 +59,14 @@ class RunConfig:
     # (see `test_runconfig_preserves_old_positional_constructor`), so inserting here would shift
     # every later field and silently rebind an old caller's opd flag to this one.
     sft_retained_examples: int | None = None
+    # appended for the same positional-constructor reason as sft_retained_examples above.
+    providers: tuple[str, ...] = ()
+    # the remaining classes an ordered `[gpu] type` list accepts, after gpu_type takes the head.
+    # allocation cost-ranks the whole acceptable set, so quoting the head alone prices a shape the
+    # run may never be given: an authored ["B200", "H100"] is quoted on B200 while allocate() would
+    # rent the cheaper H100, and the affordability precheck runs on that inflated estimate.
+    # appended for the same positional-constructor reason as the two fields above.
+    gpu_type_fallbacks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -77,6 +78,12 @@ class RunConfig:
                 f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
             )
         object.__setattr__(self, "provider", prov)
+        providers = validated_provider_preferences(
+            self.providers, allow_empty=isinstance(self.providers, tuple)
+        )
+        if prov != "auto" and providers:
+            raise ValueError("provider and providers cannot both be set")
+        object.__setattr__(self, "providers", providers)
         exact = ""
         if self.gpu_type:
             exact = canonical_gpu(self.gpu_type)
@@ -86,6 +93,24 @@ class RunConfig:
             if prov != "auto" and prov not in providers_for(exact):
                 raise ValueError(f"provider {prov!r} cannot provision gpu_type {exact!r}")
         object.__setattr__(self, "gpu_type", exact)
+        # canonicalized and validated exactly like the head above, so a quote cannot rank a class the
+        # spec layer would have rejected. deduped against the head and each other because the
+        # ranking loop would otherwise price the same class twice.
+        fallbacks: list[str] = []
+        for entry in self.gpu_type_fallbacks or ():
+            if not isinstance(entry, str):
+                raise TypeError("gpu_type_fallbacks entries must be strings")
+            name = canonical_gpu(entry)
+            info = GPU_INFO.get(name)
+            if info is None or not info.validated:
+                raise ValueError(
+                    f"gpu_type_fallbacks entry {name!r} must name an active validated GPU class"
+                )
+            if name != exact and name not in fallbacks:
+                fallbacks.append(name)
+        if fallbacks and not exact:
+            raise ValueError("gpu_type_fallbacks requires gpu_type")
+        object.__setattr__(self, "gpu_type_fallbacks", tuple(fallbacks))
         if not isinstance(self.model_revision, str):
             raise TypeError("model_revision must be a string")
         object.__setattr__(self, "model_revision", self.model_revision.strip())

@@ -29,6 +29,7 @@ import pytest
 from flash.engine.worker import backend_common as vc
 from flash.engine.worker import rl_train
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
+from flash.engine.worker.train.core.child import runtime as child_runtime
 
 # several tests below drive real subprocesses that import flash from a checkout, not from the venv.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -812,164 +813,6 @@ def test_the_probe_skips_the_gdn_question_for_a_non_hybrid():
     assert caps["gdn_boundary_resets"] is None  # ...but was never entered, so it stays unasked
 
 
-def test_the_shim_patches_the_moe_arch_not_the_dense_one():
-    # patch the architecture supplied by the gate. hardcoding `qwen3_5` leaves the separate
-    # `qwen3_5_moe` forward unpatched and silently contaminates packed GDN boundaries.
-    moe = vc.render_gdn_varlen_shim("qwen3_5_moe")
-    ast.parse(moe)
-    assert "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe" in moe
-    assert "modeling_qwen3_5.py" not in moe.replace("modeling_qwen3_5_moe", "")
-    # and it must not name a class: TextModel is found by suffix, so Qwen3_5MoeTextModel and
-    # Qwen3_5TextModel both resolve without the renderer knowing either name.
-    assert "Qwen3_5TextModel" not in moe
-    assert "Qwen3_5MoeTextModel" not in moe
-    dense = vc.render_gdn_varlen_shim("qwen3_5")
-    ast.parse(dense)
-    assert "transformers.models.qwen3_5.modeling_qwen3_5" in dense
-    assert dense != moe
-
-
-def test_the_shim_imports_nothing_heavy_at_interpreter_startup():
-    # THE multi-card bug: sitecustomize runs at interpreter startup, and ray starts each actor's
-    # interpreter BEFORE narrowing that actor's CUDA_VISIBLE_DEVICES to its own card. importing the
-    # modeling module here transitively calls transformers' is_flash_linear_attention_available /
-    # is_causal_conv1d_available -> torch.cuda.is_available(), initializing cuda against every gpu.
-    # a later env-only change cannot rebuild that device map, so every rank keeps device 0 and nccl
-    # aborts with "Duplicate GPU detected". assert on the executed shim, not on its source text.
-    # record import ATTEMPTS rather than sys.modules: python swallows a sitecustomize traceback, so
-    # on a machine without torch the eager version this replaced fails silently and leaves sys.modules
-    # exactly as empty as a correct lazy shim would. the attempt is the observable that separates them.
-    shim = vc.render_gdn_varlen_shim("qwen3_5")
-    with tempfile.TemporaryDirectory() as shim_dir:
-        recorder = textwrap.dedent(
-            """
-            import sys
-            _flash_seen = []
-
-            class _Recorder:
-                def find_spec(self, fullname, path=None, target=None):
-                    _flash_seen.append(fullname)
-                    return None
-
-            sys.meta_path.insert(0, _Recorder())
-            """
-        )
-        # write the record from an atexit hook so it survives even when the shim raises: python
-        # swallows a sitecustomize traceback, and a lost record must not masquerade as a pass.
-        tail = textwrap.dedent(
-            """
-
-            import atexit as _flash_atexit
-            import json as _flash_json
-
-            def _flash_dump(_path=__file__ + ".seen"):
-                with open(_path, "w") as _fh:
-                    _fh.write(_flash_json.dumps(_flash_seen))
-
-            _flash_atexit.register(_flash_dump)
-            """
-        )
-        site = pathlib.Path(shim_dir, "sitecustomize.py")
-        # the recorder and the dump bracket the shim: the dump registration has to run even if the
-        # shim body raises, so it goes FIRST and the shim body last.
-        site.write_text(recorder + tail + shim)
-        out = subprocess.run(
-            [sys.executable, "-c", ""],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env={**os.environ, "PYTHONPATH": shim_dir},
-        )
-        assert out.returncode == 0, out.stderr
-        attempted = json.loads(pathlib.Path(str(site) + ".seen").read_text())
-    # the shim itself may import stdlib; what it must never reach for is the cuda-initializing stack.
-    assert not [name for name in attempted if name.split(".")[0] in {"torch", "transformers"}], (
-        f"gdn shim imported the cuda stack at interpreter startup: {attempted}"
-    )
-
-
-def test_the_shim_patches_the_module_the_caller_actually_receives():
-    # patching from find_spec would run against a half-built module the real import then replaces:
-    # the marker still prints while the caller's class stays unpatched. drive the rendered shim
-    # against a stand-in module so the assertion needs no transformers install.
-    # the patch pulls transformers' packing helpers, which import torch at module scope.
-    pytest.importorskip("torch", reason="the gdn patch imports transformers' torch-backed helpers")
-    pytest.importorskip("transformers", reason="the patch imports transformers' packing helpers")
-    shim = vc.render_gdn_varlen_shim("qwen3_5")
-    namespace: dict = {}
-    # executing the shim arms its meta_path finder against THIS interpreter, so restore the list
-    # afterwards: leaving it installed would patch the real modeling module for whichever later
-    # test imports it first, which is an order-dependent failure rather than an honest one.
-    saved_meta_path = sys.meta_path[:]
-    try:
-        # the shim is our own render, not external input
-        exec(compile(shim, "<gdn-shim>", "exec"), namespace)
-    finally:
-        sys.meta_path[:] = saved_meta_path
-    patch = namespace["_flash_patch_gdn_varlen"]
-
-    class Stand:
-        def forward(self, *args, **kwargs):
-            return kwargs
-
-    module = SimpleNamespace(StandTextModel=Stand)
-    patch(module)
-    assert getattr(Stand.forward, "_flash_gdn_varlen_patched", False) is True
-    once = Stand.forward
-    patch(module)  # a second import must not double-wrap
-    assert Stand.forward is once
-    # fail closed: the gate promised a TextModel, so a module without one must refuse to start
-    # rather than train packed examples through an unpatched forward.
-    with pytest.raises(StopIteration):
-        patch(SimpleNamespace())
-
-
-def test_the_armed_finder_patches_the_module_on_a_real_import(tmp_path, monkeypatch):
-    # the test above calls the patch directly, so the finder and the loader that carry it are the
-    # one part of the fix nothing exercises: if the delegation loop stopped resolving the target,
-    # or wrapped a spec whose loader never ran, every other assertion here still passes while the
-    # shim silently patches nothing. drive a genuine `import` through the armed finder instead.
-    # stand-in modules keep this off transformers, so it runs wherever the suite runs.
-    import importlib
-
-    root = tmp_path / "site"
-    package = root / "transformers" / "models" / "qwen3_5"
-    package.mkdir(parents=True)
-    for parent in (root / "transformers", root / "transformers" / "models", package):
-        (parent / "__init__.py").write_text("")
-    (package / "modeling_qwen3_5.py").write_text(
-        "class Qwen3TextModel:\n    def forward(self, *args, **kwargs):\n        return kwargs\n"
-    )
-    # the patch imports these two names at patch time; supply them so no torch install is needed.
-    (root / "transformers" / "modeling_flash_attention_utils.py").write_text(
-        "def _is_packed_sequence(*args, **kwargs):\n    return False\n\n\n"
-        "def prepare_fa_kwargs_from_position_ids(*args, **kwargs):\n"
-        "    return ((None, None), (None, None))\n"
-    )
-    monkeypatch.syspath_prepend(str(root))
-    # snapshot the whole `transformers` subtree rather than deleting the keys that happen to exist
-    # now: the import below CREATES stand-in entries, and a rollback that only restores pre-existing
-    # keys leaves an empty stub `transformers` package shadowing the real one for every later test.
-    saved_modules = {n: m for n, m in sys.modules.items() if n.split(".")[0] == "transformers"}
-    saved_meta_path = sys.meta_path[:]
-    try:
-        for name in saved_modules:
-            del sys.modules[name]
-        # the shim is our own render, not external input
-        exec(compile(vc.render_gdn_varlen_shim("qwen3_5"), "<gdn-shim>", "exec"), {})
-        assert type(sys.meta_path[0]).__name__ == "_FlashGdnFinder", "the shim must arm its finder"
-        module = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
-        assert getattr(module.Qwen3TextModel.forward, "_flash_gdn_varlen_patched", False) is True
-        # and it must step back off meta_path once it has fired: leaving it armed would re-wrap
-        # every later import of the same name for the rest of the process.
-        assert not [f for f in sys.meta_path if type(f).__name__ == "_FlashGdnFinder"]
-    finally:
-        sys.meta_path[:] = saved_meta_path
-        for name in [n for n in sys.modules if n.split(".")[0] == "transformers"]:
-            del sys.modules[name]
-        sys.modules.update(saved_modules)
-
-
 def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
     # derive model_type from the child module so the gate and shim cannot disagree. patch the module
     # object because test cleanup may replace the parent package and break dotted monkeypatch
@@ -981,7 +824,7 @@ def test_the_gate_hands_the_shim_the_arch_it_verified(monkeypatch):
     assert gdn_module == "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe"
     arch = vc.gdn_reset_arch_from_caps({"gdn_boundary_resets": True}, gdn_module)
     assert arch == "qwen3_5_moe"
-    assert f"modeling_{arch}" in vc.render_gdn_varlen_shim(arch)
+    assert arch == "qwen3_5_moe"
 
 
 def test_the_verified_arch_round_trips_for_the_dense_module_too(monkeypatch):
@@ -3281,13 +3124,13 @@ def test_without_the_claim_the_orphan_reparents_past_this_process():
 
 
 @_needs_process_teardown
-def test_the_claim_is_made_before_the_trainer_is_spawned():
+def test_the_claim_is_made_before_each_verl_process_is_spawned():
     """Order matters: the kernel only reparents to a process that was ALREADY a subreaper.
 
     Claiming after the child exists leaves any grandchild it has already orphaned parented
     elsewhere, so the fix would work only for the second job onward on a reused worker.
     """
-    for fn in (vc.run_verl_training, rl_train._execute_rl_child):
+    for fn in (vc._run_streaming_verl_subprocess, rl_train._execute_rl_child):
         src = " ".join(inspect.getsource(fn).split())
         assert "adopt_orphaned_descendants()" in src, f"{fn.__name__} never claims its orphans"
         assert src.index("adopt_orphaned_descendants()") < src.index("subprocess.Popen("), (
@@ -4035,75 +3878,25 @@ def test_the_tf32_fragment_never_aborts_a_paid_run():
 
 
 @pytest.mark.parametrize("backend", ["grpo", "opd", "sft"])
-def test_every_verl_backend_enables_tf32_in_the_child(backend, monkeypatch):
-    """the model runs in the verl CHILD, and torch's tf32 flags are per-process state.
+def test_every_verl_backend_enables_tf32_in_the_child(backend):
+    source = vc.render_sitecustomize_bootstrap()
 
-    Execute each rendered sitecustomize fragment; setting flags in the Flash parent or merely
-    rendering unreachable code does not affect training.
-    """
-    from flash.engine.worker import opd_train, sft_train
-
-    if backend == "grpo":
-        # grpo assembles shim_source inside run_rl_train, past the subprocess launch, so there is no
-        # renderer to call. rebuild the join from the ast instead: calling render_tf32_shim() here
-        # would test the renderer this test already covers and stay green if run_rl_train stopped
-        # joining it in -- the exact regression, with grpo back on fp32 matmuls.
-        assign = next(
-            node
-            for node in ast.walk(
-                ast.parse(textwrap.dedent(inspect.getsource(rl_train._write_rl_shim)))
-            )
-            if isinstance(node, ast.Assign)
-            and any(getattr(t, "id", "") == "shim_source" for t in node.targets)
-        )
-        rendered = [
-            ast.unparse(node.func)
-            for node in ast.walk(assign.value)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        ]
-        assert "render_tf32_shim" in rendered, (
-            "run_rl_train no longer joins render_tf32_shim() into shim_source; the grpo child gets "
-            f"no tf32 fragment and trains fp32. joined renderers were: {rendered!r}"
-        )
-        # and the fragment must be unconditional -- a renderer that returns "" for some config
-        # would drop it. `part for part in (...) if part` filters empties, so an inert render is
-        # indistinguishable from an absent one at runtime.
-        source = vc.render_tf32_shim()
-        assert source.strip(), "render_tf32_shim() returned nothing to join"
-    elif backend == "opd":
-        source = opd_train._render_opd_sitecustomize(save_at_steps=(3,), total_steps=3)
-    else:
-        source = sft_train._render_sft_sitecustomize(
-            seed=1,
-            loraplus_ratio=16.0,
-            save_at_steps=(3,),
-            total_steps=3,
-            reentrant_gradient_checkpointing=False,
-        )
-
-    # the fragment sits above each backend's verl imports on purpose, so stop the exec once the
-    # flags are set: the rest of the shim needs a real verl/transformers stack this test has not.
-    # BaseException, not Exception -- the fragment swallows Exception by design, so an ordinary
-    # subclass would be caught by the very code under test and the exec would run on into verl.
-    class _Stop(BaseException):
+    class Stop(BaseException):
         pass
 
-    # trip on the LAST of the three flags, so reaching it proves all three ran.
-    class _StopOnCudnn:
+    class StopOnCudnn:
         allow_tf32 = False
 
         def __setattr__(self, name, value):
             object.__setattr__(self, name, value)
-            raise _Stop
+            raise Stop
 
     fake = _tf32_off_torch()
-    fake.backends.cudnn = _StopOnCudnn()
-    with mock.patch.dict(sys.modules, {"torch": fake}), contextlib.suppress(_Stop):
+    fake.backends.cudnn = StopOnCudnn()
+    with mock.patch.dict(sys.modules, {"torch": fake}), contextlib.suppress(Stop):
         exec(compile(source, "sitecustomize.py", "exec"), {})
 
-    assert fake._precision_calls == ["high"], (
-        f"{backend}'s child shim never reached the tf32 fragment; its trainer runs fp32 matmuls"
-    )
+    assert fake._precision_calls == ["high"], backend
     assert fake.backends.cuda.matmul.allow_tf32 is True
     assert fake.backends.cudnn.allow_tf32 is True
 
@@ -4437,63 +4230,15 @@ def test_a_stale_swap_link_does_not_block_the_repoint(tmp_path):
 
 @pytest.mark.parametrize("backend", ["grpo", "opd", "sft"])
 def test_every_verl_backend_repoints_the_stub_in_its_child(backend, tmp_path):
-    """The stub lives in the interpreter that builds the vLLM engine, and all three backends launch
-    that interpreter. Execute each backend's rendered sitecustomize and assert the symlink landed --
-    rendering unreachable code, or fixing it in the Flash parent, does not help the trainer.
-    """
-    from flash.engine.worker import opd_train, sft_train
-
-    if backend == "grpo":
-        # grpo assembles shim_source inside _write_rl_shim, past the subprocess launch, so there is
-        # no renderer to call. rebuild the join from the ast: calling the renderer here would test
-        # the renderer the tests above already cover and stay green if _write_rl_shim stopped
-        # joining it in -- the exact regression, with 5 of 6 models back to a dead engine init.
-        assign = next(
-            node
-            for node in ast.walk(
-                ast.parse(textwrap.dedent(inspect.getsource(rl_train._write_rl_shim)))
-            )
-            if isinstance(node, ast.Assign)
-            and any(getattr(t, "id", "") == "shim_source" for t in node.targets)
-        )
-        rendered = [
-            ast.unparse(node.func)
-            for node in ast.walk(assign.value)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        ]
-        assert "render_tilelang_cudart_shim" in rendered, (
-            "_write_rl_shim no longer joins render_tilelang_cudart_shim() into shim_source; the "
-            f"grpo child keeps tilelang's stub and dies at engine init. joined: {rendered!r}"
-        )
-        source = vc.render_tilelang_cudart_shim()
-        # unconditional: `part for part in (...) if part` filters empties, so a renderer that
-        # returned "" for some config would be indistinguishable from an absent one at runtime.
-        assert source.strip(), "render_tilelang_cudart_shim() returned nothing to join"
-    elif backend == "opd":
-        source = opd_train._render_opd_sitecustomize(save_at_steps=(3,), total_steps=3)
-    else:
-        source = sft_train._render_sft_sitecustomize(
-            seed=1,
-            loraplus_ratio=16.0,
-            save_at_steps=(3,),
-            total_steps=3,
-            reentrant_gradient_checkpointing=False,
-        )
-
+    source = vc.render_sitecustomize_bootstrap()
     _pkg, stub = _fake_child_tilelang(tmp_path)
     real = tmp_path / "libcudart.so.12"
     real.write_bytes(b"REAL-CUDART")
 
-    # the fragment sits ABOVE each backend's verl imports on purpose; this test has no real
-    # verl/transformers stack, so the exec is expected to die once it reaches them. that the symlink
-    # already landed by then is the assertion -- and it is only true while the ordering holds.
     result = _run_cudart_fragment(source, tmp_path, real=str(real))
 
     assert "FRAGMENT_DLOPENED_THE_STUB" not in (result.stdout + result.stderr)
-    assert stub.is_symlink(), (
-        f"{backend}'s child shim never reached the cudart fragment before importing verl; its "
-        "trainer keeps tilelang's stub and a sleeping vLLM engine aborts init"
-    )
+    assert stub.is_symlink(), backend
     assert os.path.realpath(stub) == os.path.realpath(str(real))
 
 
@@ -4732,75 +4477,6 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
 # ---------------------- fail-closed sitecustomize fragments (child_io) ----------------------
 
 
-def _compose_wrapped_sitecustomize(tmp_path, *fragments):
-    """write a sitecustomize from the real prologue + wrapper; return (shim_dir, marker_file)."""
-    shim_dir = tmp_path / "shim"
-    shim_dir.mkdir(exist_ok=True)
-    marker_file = vc.shim_marker_file(str(shim_dir))
-    source = vc.render_shim_marker_prologue(marker_file)
-    for name, fragment in fragments:
-        source += vc.wrap_shim_fragment(name, fragment)
-    (shim_dir / "sitecustomize.py").write_text(source)
-    return shim_dir, marker_file
-
-
-def _run_child_with_sitecustomize(shim_dir):
-    """launch a real interpreter through the production mechanism: PYTHONPATH -> sitecustomize."""
-    env = dict(os.environ, PYTHONPATH=str(shim_dir))
-    return subprocess.run(
-        [sys.executable, "-c", "print('trained-unpatched')"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=120,
-    )
-
-
-def test_execsitecustomize_swallows_an_unwrapped_fragment_failure(tmp_path):
-    """the defect the wrapper closes: cpython catches every Exception a sitecustomize import
-    raises, prints a note, and starts the interpreter anyway, so an unwrapped failing fragment
-    silently disables itself and everything after it, and the child trains unpatched."""
-    shim_dir = tmp_path / "shim"
-    shim_dir.mkdir()
-    (shim_dir / "sitecustomize.py").write_text(
-        "raise RuntimeError('transformers drift moved a private symbol')\n"
-    )
-    result = _run_child_with_sitecustomize(shim_dir)
-    assert result.returncode == 0
-    assert "trained-unpatched" in result.stdout
-
-
-def test_a_failing_wrapped_fragment_hard_exits_the_child_with_the_shim_code(tmp_path):
-    """the wrapped form of the scenario above: os._exit bypasses execsitecustomize's swallow, the
-    child never trains, and the failure is attributed to the fragment by name."""
-    shim_dir, marker_file = _compose_wrapped_sitecustomize(
-        tmp_path,
-        ("good-fragment", "\n_flash_good = 1\n"),
-        ("boom-fragment", "\nraise RuntimeError('transformers drift moved a private symbol')\n"),
-        ("after-fragment", "\n_flash_after = 1\n"),
-    )
-    result = _run_child_with_sitecustomize(shim_dir)
-    assert result.returncode == vc.SHIM_FRAGMENT_FAILED_EXIT_CODE
-    assert "trained-unpatched" not in result.stdout
-    # attributed: the fragment names itself and the underlying traceback survives.
-    assert "boom-fragment" in result.stderr
-    assert "transformers drift moved a private symbol" in result.stderr
-    # the fragments before the failure recorded themselves; nothing after it could.
-    assert vc.read_applied_shim_markers(marker_file) == {"good-fragment"}
-
-
-def test_wrapped_fragments_record_their_markers_and_leave_the_child_running(tmp_path):
-    shim_dir, marker_file = _compose_wrapped_sitecustomize(
-        tmp_path,
-        ("good-fragment", "\n_flash_good = 1\n"),
-        ("second-fragment", "\n_flash_second = 2\n"),
-    )
-    result = _run_child_with_sitecustomize(shim_dir)
-    assert result.returncode == 0
-    assert "trained-unpatched" in result.stdout
-    assert vc.read_applied_shim_markers(marker_file) == {"good-fragment", "second-fragment"}
-
-
 def test_verify_applied_shim_markers_raises_only_on_missing_names(tmp_path):
     marker_file = tmp_path / "applied_shims.txt"
     marker_file.write_text("entropy-quantile\nkl-ref-adapter\n")
@@ -4814,31 +4490,188 @@ def test_verify_applied_shim_markers_raises_only_on_missing_names(tmp_path):
         vc.verify_applied_shim_markers(str(tmp_path / "missing.txt"), ["entropy-quantile"])
 
 
-def test_wrapping_the_real_rendered_fragments_stays_valid_python(tmp_path):
-    """the wrapper indents whole rendered fragments into a try block; a syntax slip there turns
-    every child patch into a silent no-op, so compiling the composed file is the real gate."""
-    from flash.engine.worker.train.rl import shims as rl_shims
+def _lora_rollout_server_module(loaded, *, lora_as_adapter=True):
+    """a stub shaped like the pinned verl module the guard patches.
 
-    _shim_dir, marker_file = _compose_wrapped_sitecustomize(tmp_path)
-    source = vc.render_shim_marker_prologue(marker_file)
-    for name, fragment in (
-        (
-            "reentrant-checkpointing",
-            rl_shims.render_reentrant_checkpointing_shim(True, multimodal=True),
-        ),
-        ("entropy-quantile", rl_shims.render_entropy_quantile_shim(0.2)),
-        ("per-turn-credit", rl_shims.render_per_turn_credit_shim(True)),
-        ("stop-sequences", rl_shims.render_stop_sequences_shim(("</answer>",))),
-        ("image-pad-ban", rl_shims.render_image_pad_ban_shim(151655)),
-        (
-            "structured-outputs",
-            rl_shims.render_structured_outputs_shim({"json": {"type": "object"}}),
-        ),
-        ("exact-save-steps", rl_shims.render_exact_save_steps_shim((7, 13), 20)),
-        ("kl-ref-adapter", rl_shims.render_kl_ref_adapter_shim(True)),
-        ("gdn-varlen", vc.render_gdn_varlen_shim("qwen3_5")),
+    at freesolo-co/verl@32d6200d, ``vLLMHttpServer.generate`` is an async method whose first
+    positional argument is ``prompt_ids`` and which carries several keyword-only extras, and
+    ``VLLM_LORA_INT_ID`` is a module-level constant the guard reads back rather than hardcoding.
+    """
+    import types as _types
+
+    module = _types.ModuleType("verl.workers.rollout.vllm_rollout.vllm_async_server")
+    module.VLLM_LORA_INT_ID = 123
+
+    class _Engine:
+        def __init__(self, ids):
+            self._ids = set(ids)
+            self.calls = 0
+
+        async def list_loras(self):
+            self.calls += 1
+            return set(self._ids)
+
+        def generate(self, *args, **kwargs):
+            return ("generated", kwargs.get("lora_request"))
+
+    # name matched to verl's own class: the shim looks it up by this exact attribute.
+    class vLLMHttpServer:  # noqa: N801
+        # set to force the request verl hands the engine, independently of what list_loras says.
+        lora_request_override = "unset"
+
+        def __init__(self):
+            self.lora_as_adapter = lora_as_adapter
+            self.engine = _Engine(loaded)
+
+        async def generate(
+            self,
+            prompt_ids,
+            sampling_params,
+            request_id,
+            image_data=None,
+            priority=0,
+            **kwargs,
+        ):
+            # verl's own body at vllm_async_server.py:524-538: it decides lora_request from its
+            # own lookup and hands it to the engine. reproducing that here is what makes these
+            # tests able to fail -- a stub that never consults list_loras cannot catch a guard
+            # that checks a different value than the one generation actually uses.
+            lora_request = None
+            if self.lora_as_adapter and module.VLLM_LORA_INT_ID in await self.engine.list_loras():
+                lora_request = f"lora:{module.VLLM_LORA_INT_ID}"
+            if self.lora_request_override != "unset":
+                lora_request = self.lora_request_override
+            self.engine.generate(
+                prompt=list(prompt_ids),
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+                priority=priority,
+            )
+            return ("generated", list(prompt_ids), request_id, priority)
+
+    module.vLLMHttpServer = vLLMHttpServer
+    return module
+
+
+def _install_lora_rollout_module(module, monkeypatch):
+    import sys as _sys
+
+    for name in (
+        "verl",
+        "verl.workers",
+        "verl.workers.rollout",
+        "verl.workers.rollout.vllm_rollout",
     ):
-        source += vc.wrap_shim_fragment(name, fragment)
-    compile(source, "sitecustomize.py", "exec")
-    # and the empty fragment stays empty: a feature that is off has nothing to prove.
-    assert vc.wrap_shim_fragment("off-feature", "") == ""
+        stub = type(_sys)(name)
+        stub.__path__ = []
+        monkeypatch.setitem(_sys.modules, name, stub)
+    monkeypatch.setitem(_sys.modules, module.__name__, module)
+
+
+def _apply_lora_rollout_guard(module, monkeypatch):
+    """exec the fragment against an already-imported module, the way a ray actor re-import hits it."""
+    _install_lora_rollout_module(module, monkeypatch)
+    child_runtime._patch_lora_rollout(module)
+
+
+def test_the_lora_rollout_guard_refuses_to_generate_from_the_base_model(monkeypatch):
+    """the defect this guard exists for: verl leaves ``lora_request`` None when the adapter is not
+    in the engine's loaded set and generates from the base model anyway -- no raise, no counter.
+    an opd run then distils a policy it never rolled out, and the loss curve looks fine."""
+    import asyncio
+
+    module = _lora_rollout_server_module(set())
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="refusing to roll out from the base model"):
+        asyncio.run(module.vLLMHttpServer().generate([1, 2, 3], {}, "req-1"))
+
+
+def test_the_lora_rollout_guard_names_the_adapter_in_the_failure(monkeypatch):
+    """the message has to be actionable from the child log alone: which adapter was expected."""
+    import asyncio
+
+    module = _lora_rollout_server_module({7, 9})
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-1"))
+    assert "123" in str(excinfo.value)
+
+
+def test_the_lora_rollout_guard_fails_a_base_model_call_its_own_lookup_would_clear(monkeypatch):
+    """the guard must gate on the request verl actually built, not on a second lookup of its own.
+
+    here ``list_loras`` reports the adapter loaded, but generation still reaches the engine with
+    ``lora_request=None`` -- verl's own lookup disagreed, or the request was built before the
+    adapter landed. a guard that re-queries ``list_loras`` and delegates sees a healthy engine and
+    waves this through, which is exactly the base-model rollout it was written to stop. only a
+    guard reading the outgoing request catches it.
+    """
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+    server = module.vLLMHttpServer()
+    # verl's decision, not the engine's inventory, is what reaches generation.
+    server.lora_request_override = None
+
+    with pytest.raises(RuntimeError, match="refusing to roll out from the base model"):
+        asyncio.run(server.generate([1], {}, "req-no-lora-request"))
+
+
+def test_the_lora_rollout_guard_adds_no_engine_round_trip_per_rollout(monkeypatch):
+    """``list_loras`` is an awaited zeromq utility rpc, not a local read. checking it a second time
+    would double the adapter-list control-plane traffic on every grpo/opd rollout request."""
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+    server = module.vLLMHttpServer()
+
+    asyncio.run(server.generate([1], {}, "req-a"))
+    asyncio.run(server.generate([2], {}, "req-b"))
+
+    # exactly verl's own one lookup per request, with nothing added by the guard.
+    assert server.engine.calls == 2
+
+
+def test_the_lora_rollout_guard_passes_the_call_through_once_the_adapter_is_loaded(monkeypatch):
+    """the guard must preserve verl's healthy-path arguments and return value."""
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    result = asyncio.run(
+        module.vLLMHttpServer().generate([1, 2], {}, "req-9", image_data=None, priority=3)
+    )
+
+    assert result == ("generated", [1, 2], "req-9", 3)
+
+
+def test_the_lora_rollout_guard_stays_out_of_a_merged_lora_rollout(monkeypatch):
+    """``lora_as_adapter`` is false when the adapter is merged into the base weights, and such a
+    rollout legitimately carries no LoRARequest. mirroring verl's own condition keeps the guard
+    from failing a run that is behaving correctly."""
+    import asyncio
+
+    module = _lora_rollout_server_module(set(), lora_as_adapter=False)
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    assert asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-2"))[0] == "generated"
+
+
+def test_the_lora_rollout_guard_does_not_wrap_itself_twice(monkeypatch):
+    """every ray actor imports the same sitecustomize; stacking wrappers would add a
+    ``list_loras`` round trip per layer to every request."""
+    import asyncio
+
+    module = _lora_rollout_server_module({123})
+    _apply_lora_rollout_guard(module, monkeypatch)
+    first = module.vLLMHttpServer.generate
+    _apply_lora_rollout_guard(module, monkeypatch)
+
+    assert module.vLLMHttpServer.generate is first
+    assert asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-3"))[0] == "generated"

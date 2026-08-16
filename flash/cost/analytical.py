@@ -17,7 +17,6 @@ from flash.cost.facts import (
     gpu_vram_gb,
     has_nvlink,
     model_quant,
-    reward_seconds_per_completion,
     teacher_seconds_per_completion,
     teacher_token_cost_usd,
     total_params_b,
@@ -47,9 +46,7 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # small-model overhead that peak-FLOPs scaling misses. this aggregate will drift with hardware,
 # verl, and engine changes.
 #
-# this floor and the deleted per-completion reward wall are coupled: the wall's fictitious 1.0
-# s/completion had been cancelling this missing overhead, so removing it WITHOUT this term scores
-# 49.8x geometric bias. do not drop one without re-fitting the other.
+# grading cost is already inside this fitted step floor and is deliberately not modelled separately.
 STEP_FLOOR_BASE_SECONDS = 62.7
 STEP_FLOOR_SECONDS_PER_COMPLETION = 0.805
 
@@ -90,6 +87,49 @@ def step_floor_seconds(gpu: str, completions: int) -> float:
 # by matched multi-card measurements.
 STEP_FLOOR_SHARDED_FRACTION = 0.799
 
+# --- sft training-side startup block + per-step floor -------------------------------------------
+# the flops term alone quoted sft at 28.6x UNDER the realized train wall (geometric, 17 measured
+# runpod arms, 0/17 inside the 0.70-1.43x band). it is the same structural gap the rollout floor
+# above closed for grpo, and it is NOT the cold start in `setup_seconds`: `setup_seconds` and
+# `train_wall` are DISJOINT intervals in the worker (sft_train.py stamps setup before launching the
+# training subprocess, and train_wall wraps `run_verl_training` plus the upload drain), so verl
+# startup, model load, lora wrap and fsdp init sit INSIDE the billed train wall and were priced at
+# zero.
+#
+# the block scales with model size -- measured median implied block 82s at 0.8B against 248s at 4B --
+# so a size-blind constant cannot cover both: at the same in-band count it leaves a 3.75x worst arm
+# and log-sd 0.50, against 2.13x and 0.32 for the size-scaled form below.
+#
+# fitted over 17 arms (2 cards, 2 model sizes, step counts 2/32/64/128/256, including the replicate
+# groups) and selected by holding out an ENTIRE step-count class at a time, the same methodology
+# that chose the rollout floor: a random holdout cannot test whether a form extrapolates to a shape
+# it never saw. least squares lands at (58.3, 44.3, 0.948); the shipped triple is the rounded
+# neighbour that survives holdout best. scored: 28.596x -> 1.013x geometric, 0/17 -> 14/17 in band,
+# worst arm 1135x -> 2.13x, and it holds under a model holdout in both directions (0.8B 1.005x,
+# 4B 1.033x), so the size term is not an artifact of the size that dominates the sample.
+#
+# KNOWN RESIDUAL, and the reason this is not tuned further: the same config on a different runpod
+# HOST CLASS (nvidia driver build) spans 1.56x-1.88x, while replicates within one build agree to
+# 1.01x-1.03x. the quote cannot observe which build it will be handed, so roughly half the remaining
+# per-arm error is hardware the estimator has no input for. re-fitting below that resolution would
+# be fitting the confounder. evidence: /home/azureuser/benchmark/cost-calib-20260801/ISSUES.md.
+SFT_STARTUP_BASE_SECONDS = 60.0
+SFT_STARTUP_SECONDS_PER_PARAM_B = 40.0
+SFT_STEP_FLOOR_SECONDS = 0.8
+
+
+def sft_overhead_seconds(config: RunConfig, steps: int) -> float:
+    """Training-wall seconds an sft run pays outside its flops term.
+
+    A one-time startup block that grows with checkpoint size, plus a per-step floor. Neither is
+    divided by card count: the block is model load and framework init that every rank pays, and the
+    per-step floor is dominated by the same non-shardable publish/sync work as the rollout floor.
+    """
+    n = config.normalized()
+    params_b = total_params_b(n.model_id, n.model_revision)
+    block = SFT_STARTUP_BASE_SECONDS + SFT_STARTUP_SECONDS_PER_PARAM_B * params_b
+    return block + SFT_STEP_FLOOR_SECONDS * max(0, steps)
+
 
 def _step_floor_seconds_for(config: RunConfig, gpu: str) -> float:
     """Step-floor seconds ``config`` pays on ``gpu``; 0 for sft, which runs no rollout."""
@@ -114,10 +154,6 @@ MOE_STEP_OVERHEAD_S = 2.0  # routing/dispatch/kernel-launch overhead an MoE pays
 # + vLLM cudagraph capture for rollout methods). MoE-only; the prior model omitted it entirely.
 COMPILE_MOE_SFT_S = 35.0
 COMPILE_MOE_ROLLOUT_S = 48.0  # GRPO / OPD (adds vLLM cudagraph capture)
-
-# single-turn grpo scoring is serial under the global env lock in worker/rl_train.py, protecting
-# non-thread-safe scorers. reward latency is therefore fixed wall time, not gpu work. multi-turn
-# concurrency is unknown to this offline quote, so serial scoring is the conservative default.
 
 # cold-start seconds are empirically calibrated from a fresh worker. model load dominates short
 # jobs: MODEL_LOAD_BASE_S covers fixed deserialize/init work; download scales with checkpoint size.
@@ -167,38 +203,7 @@ def _opd_step_shape(n: RunConfig) -> tuple[int, float]:
     config. completions = batch x group; each is billed over the FULL prompt+completion length
     (not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
     completions = n.batch_size * n.group_size
-    return completions, completions * _sequence_tokens(n)
-
-
-def _sequence_tokens(n: RunConfig) -> float:
-    """Return measured prompt plus completion tokens, or the context cap.
-
-    ``n.seq_len`` is capacity, not work. Prompt and completion must be measured together to avoid
-    pricing a short completion against a full-context prompt.
-    """
-    if n.measured_completion_tokens is None or n.measured_prompt_tokens is None:
-        return float(n.seq_len)
-    measured = n.measured_prompt_tokens + n.measured_completion_tokens
-    # the ceiling still binds: a measured mean above it would mean the profile and the run
-    # disagree about the engine's context, and the engine wins.
-    return min(float(n.seq_len), measured)
-
-
-def _completion_tokens(n: RunConfig) -> float:
-    """Tokens ONE rollout generates, measured when a profile exists, else the declared cap."""
-    if n.measured_completion_tokens is None:
-        return float(n.completion_len)
-    return min(float(n.completion_len), n.measured_completion_tokens)
-
-
-def _describe_rollout_tokens(n: RunConfig) -> str:
-    """Describe whether rollout length is measured or cap-based.
-
-    The two can differ several-fold, so the note must not present a measured mean as the cap.
-    """
-    if n.measured_completion_tokens is None:
-        return f"{n.completion_len} tok"
-    return f"{_completion_tokens(n):.0f} tok measured (cap {n.completion_len})"
+    return completions, completions * float(n.seq_len)
 
 
 def required_save_overhead_seconds(config: RunConfig) -> float:
@@ -332,8 +337,8 @@ def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int, provider: 
 def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     """Return ``(gpu-bound, gpu-independent)`` seconds for one optimizer step.
 
-    Remote scoring and reward grading stay fixed across cards; hardware ranking shards only the
-    gpu-bound half. ``seconds_per_step`` is their sum.
+    Remote OPD scoring stays fixed across cards; hardware ranking shards only the gpu-bound half.
+    ``seconds_per_step`` is their sum.
     """
     n = config.normalized()
     peak = effective_train_tflops(gpu) * 1e12  # FLOP/s (realized training throughput; see facts)
@@ -382,23 +387,16 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * sft_mfu), overhead
 
-    # GRPO step = rollout (G completions/prompt) + serial reward grading + policy/ref update.
+    # GRPO step = rollout (G completions/prompt) + policy/ref update. grading is represented in
+    # the fitted step floor rather than modelled as a separate wall.
     completions = n.batch_size * n.group_size
-    # measured realized generation when a rollout profile exists, else max_completion_tokens. this
-    # count feeds BOTH terms below, so quoting the cap multiplies its error through the two largest
-    # parts of a grpo step.
-    gen_tokens = completions * _completion_tokens(n)
+    gen_tokens = completions * float(n.completion_len)
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * update_mfu)
-    latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
-    # every completion is scored, one at a time (see the serial-scoring note above).
-    reward_s = completions * latency
-    # old_log_prob, weight sync, and checkpointing are gpu work without a flops term. only the
-    # STEP_FLOOR_SHARDED_FRACTION part shards; grpo/opd callers must use sharded_step_seconds().
+    # old_log_prob, weight sync, checkpointing, and grading are covered by the fitted floor. only
+    # the STEP_FLOOR_SHARDED_FRACTION part shards; callers must use sharded_step_seconds().
     floor_s = step_floor_seconds(gpu, completions)
-    # reward grading runs off-gpu, so like the opd teacher it is fixed wall time no card choice
-    # changes. a grpo step dominated by it is latency-bound, not compute-bound.
-    return gen_s + update_s + floor_s, overhead + reward_s
+    return gen_s + update_s + floor_s, overhead
 
 
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
@@ -560,12 +558,65 @@ def _quote_gpu_ceiling(
     )
 
 
+def _offline_preferred_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
+    """quote the first structurally usable preference, then cost-rank unnamed fallbacks."""
+    from dataclasses import replace
+
+    from flash.providers import PROVIDER_NAMES, available_providers
+
+    # quote only what this plane can actually rent. `allocate()` starts from the configured set, so
+    # a preference naming a provider this plane cannot provision is ignored there -- quoting it
+    # anyway prices a shape the run will never get, and the affordability check runs on that
+    # estimate, so a balance sufficient for the real allocation can be refused.
+    configured = available_providers()
+    # an unconfigured plane (no credentials anywhere) has nothing to filter against; fall back to the
+    # registered set so the quote keeps its historical structural answer instead of going empty.
+    eligible = configured or PROVIDER_NAMES
+    for provider in config.providers:
+        if provider not in eligible:
+            continue
+        try:
+            return _offline_gpu_shape(replace(config, provider=provider, providers=()))
+        except ValueError:
+            # a soft preference that cannot carry this shape contributes no candidate. keep walking
+            # instead of turning its authored position into a hard pin.
+            continue
+    unnamed = tuple(name for name in eligible if name not in config.providers)
+    fallback_quotes = []
+    for provider in unnamed:
+        try:
+            fallback_quotes.append(
+                _offline_gpu_shape(replace(config, provider=provider, providers=()))
+            )
+        except ValueError:
+            continue
+    if fallback_quotes:
+        return min(
+            fallback_quotes,
+            key=lambda quote: (
+                quote[4] * quote[2] * sharded_step_seconds(config, quote[0], quote[2], quote[3])
+            ),
+        )
+    # every eligible provider has now been tried and none has a structural fit. dropping the
+    # restriction here to reach the unpinned `provider="auto"` diagnostic would rank the registered
+    # runpod pool regardless of credentials, quoting a shape this plane cannot rent -- the same
+    # defect the eligibility filter above exists to prevent, reintroduced at the last step. that
+    # quote would then pass affordability and only fail once live allocation runs, after the run is
+    # recorded. re-raise the eligible set's own failure instead, which names the real constraint.
+    if eligible:
+        return _offline_gpu_shape(replace(config, provider=eligible[0], providers=()))
+    # no provider is registered at all (an empty registry): keep the historical unpinned answer.
+    return _offline_gpu_shape(replace(config, providers=()))
+
+
 def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     """Return an offline structural GPU quote.
 
     Preparation must not consume live-capacity failures before run creation. Rank rentable shapes
     offline, then replace the quote with the selected live candidate before provisioning.
     """
+    if config.providers:
+        return _offline_preferred_gpu_shape(config)
     # Fail closed on a model that cannot be sized at all. Curated entries answer from the catalog
     # with no network call; a PINNED revision still resolves that commit's real geometry, so the
     # revision has to be passed or the check sizes a different set of weights than the worker loads.
@@ -586,11 +637,18 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
         providers_for,
         rentable_gpu_counts,
     )
-    from flash.providers.fit_errors import vram_fit_error_message, vram_knob_advice
 
     provider = config.provider if config.provider != "auto" else "auto"
     if config.gpu_type:
-        names = (canonical_gpu(config.gpu_type),)
+        # rank every class the author declared acceptable, not just the head. `allocate()` cost-ranks
+        # the whole ordered set, so quoting the head alone prices a shape the run may never be given
+        # -- an authored ["B200", "H100"] quotes 3x the H100 the allocator would actually rent, and
+        # the submit-time affordability precheck refuses an affordable run on that inflated number.
+        names = tuple(
+            dict.fromkeys(
+                canonical_gpu(name) for name in (config.gpu_type, *config.gpu_type_fallbacks)
+            )
+        )
     elif provider == "auto":
         # `auto` ranks the RunPod pool: it is the default substrate, and the allocator only reaches a
         # lambda-only class after the cheaper runpod classes exhaust, so quoting one here would name
@@ -657,41 +715,77 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
                 )
             )
     if not ranked:
-        # a pinned class is blocked by the class itself, so name it -- the pool-wide message would
-        # report the widest validated shape, which is not hardware this quote was ever allowed to
-        # use. `_wider_shape_remedy` searches only `names`, already narrowed to the pin, so the
-        # `--gpus N` clause it appends can never name a shape the pin forbids. an unpinned run
-        # falls through to the pool-wide message, which reports the count that would fit.
-        remedy = _wider_shape_remedy(config, need, names)
-        if config.gpu_type:
-            info = GPU_INFO[canonical_gpu(config.gpu_type)]
-            raise ValueError(
-                f"exact GPU {info.name!r} cannot fit this run: it requires at least {need} GB"
-                + (
-                    remedy
-                    or _catalog_check_remedy(config, need, names)
-                    or f". {vram_knob_advice(config.method).capitalize()}."
-                )
-            )
-        raise ValueError(
-            vram_fit_error_message(
-                config.method,
-                need,
-                requested_gpu_count=ceiling,
-                effective_gpu_count=safe_gpu_count,
-                max_gpu_count=auto_cap,
-                gpu_names=names,
-                providers=None if provider == "auto" else (provider,),
-                # same rule the ranking loop rejected shapes with, so the advice cannot name a
-                # width the retry will not launch on.
-                executed_width=lambda count: executed_gpu_count(config, count),
-                # an offline quote does not know the configured fleet, so it cannot claim that
-                # dropping a provider pin would make a wider shape purchasable.
-                widenable_without_pin=None,
-            )
+        _raise_no_fitting_shape(
+            config,
+            need,
+            names,
+            provider=provider,
+            ceiling=ceiling,
+            safe_gpu_count=safe_gpu_count,
+            auto_cap=auto_cap,
         )
     _cost, count, _combined, _per_card, gpu, hourly = min(ranked)
     return gpu, need, count, provider, hourly
+
+
+def _raise_no_fitting_shape(
+    config: RunConfig,
+    need: float,
+    names: tuple[str, ...],
+    *,
+    provider: str,
+    ceiling: int | None,
+    safe_gpu_count: int,
+    auto_cap: int,
+) -> None:
+    """Reject a run no rentable shape fits, naming what the quote was allowed to rank."""
+    from flash.providers.base import GPU_INFO, canonical_gpu
+    from flash.providers.fit_errors import vram_fit_error_message, vram_knob_advice
+
+    # a pinned class is blocked by the class itself, so name it -- the pool-wide message would
+    # report the widest validated shape, which is not hardware this quote was ever allowed to
+    # use. `_wider_shape_remedy` searches only `names`, already narrowed to the pin, so the
+    # `--gpus N` clause it appends can never name a shape the pin forbids. an unpinned run
+    # falls through to the pool-wide message, which reports the count that would fit.
+    remedy = _wider_shape_remedy(config, need, names)
+    if config.gpu_type:
+        # name every acceptable class, not just the head: with fallbacks authored, reporting the
+        # head alone tells the user to fix a class that may not be the one that failed, and
+        # hides that the whole declared set was ranked and rejected.
+        declared = tuple(
+            GPU_INFO[canonical_gpu(name)].name
+            for name in (config.gpu_type, *config.gpu_type_fallbacks)
+        )
+        label = (
+            repr(declared[0])
+            if len(declared) == 1
+            else "none of " + ", ".join(repr(name) for name in declared)
+        )
+        raise ValueError(
+            f"exact GPU {label} cannot fit this run: it requires at least {need} GB"
+            + (
+                remedy
+                or _catalog_check_remedy(config, need, names)
+                or f". {vram_knob_advice(config.method).capitalize()}."
+            )
+        )
+    raise ValueError(
+        vram_fit_error_message(
+            config.method,
+            need,
+            requested_gpu_count=ceiling,
+            effective_gpu_count=safe_gpu_count,
+            max_gpu_count=auto_cap,
+            gpu_names=names,
+            providers=None if provider == "auto" else (provider,),
+            # same rule the ranking loop rejected shapes with, so the advice cannot name a
+            # width the retry will not launch on.
+            executed_width=lambda count: executed_gpu_count(config, count),
+            # an offline quote does not know the configured fleet, so it cannot claim that
+            # dropping a provider pin would make a wider shape purchasable.
+            widenable_without_pin=None,
+        )
+    )
 
 
 def _allocation_quote_shape(config: RunConfig, allocation) -> tuple[str, int, int, str, float]:
@@ -734,18 +828,15 @@ def _notes(
         teacher_name = resolve_teacher(n.teacher_model).display_name
         notes.append(
             f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {_describe_rollout_tokens(n)} + {teacher_name} teacher scoring "
+            f"@ {n.completion_len} tok + {teacher_name} teacher scoring "
             f"({tsec:.2f}s/request, {OPD_TEACHER_SCORING_CONCURRENCY} concurrent) + policy "
             "update (no local reference forward)"
         )
     elif n.is_grpo:
         comps = n.batch_size * n.group_size
-        rsec = reward_seconds_per_completion(n.reward_seconds_per_completion)
         notes.append(
             f"GRPO step = vLLM rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {_describe_rollout_tokens(n)} + reward ({rsec:.2f}s/completion"
-            + (f", env {n.environment}" if n.environment else "")
-            + ") + policy+reference update"
+            f"@ {n.completion_len} tok + policy+reference update"
         )
     elif n.train_tokens is not None:
         profile_shape = (
@@ -817,12 +908,16 @@ def estimate_cost(
     # training GPU time, so it belongs in the (billed) train term, not setup. Required saves are also
     # synchronous fixed overhead; neither is divided by the number of cards.
     compile_s = compile_seconds(config, gpu)
-    raw_train = compile_s + config.steps * sps + required_save_s
+    # sft pays a startup block and per-step floor inside its BILLED train wall that the flops term
+    # does not model (see sft_overhead_seconds); grpo/opd carry the equivalent in their step floor.
+    sft_overhead_s = sft_overhead_seconds(config, config.steps) if config.method == "sft" else 0.0
+    raw_train = compile_s + config.steps * sps + required_save_s + sft_overhead_s
     if not config.is_grpo and config.train_tokens is not None:
         raw_train = (
             compile_s
             + sft_seconds_for_tokens(config, gpu, config.train_tokens) / speedup
             + required_save_s
+            + sft_overhead_s
         )
     sps = raw_train / config.steps
 

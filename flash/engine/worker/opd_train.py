@@ -20,6 +20,7 @@ from flash.engine.profiling.sft_workload import (  # noqa: F401
 from flash.engine.worker.backend_common import (  # noqa: F401
     ChildOutputTail,
     ChildTailStaleness,
+    VerlChildSilenceWatchdog,
     clamp_engine_len,
     fused_ce_backend,
     gdn_probe_module,
@@ -28,8 +29,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     parse_verl_metric,
     parse_wandb_link,
     probe_verl_capabilities,
-    render_gdn_varlen_shim,
-    render_wandb_link_shim,
+    render_sitecustomize_bootstrap,
     require_gdn_boundary_resets,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
@@ -37,7 +37,9 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     resolve_verl_python,
     rollout_sleep_unsupported,
     run_verl_training,
+    shim_marker_file,
     stall_tail_fields,
+    verify_applied_shim_markers,
     verl_device_capability,
     verl_step_number,
 )
@@ -53,7 +55,7 @@ from flash.engine.worker.sft_train import (  # noqa: F401
     _export_checkpoint_adapter,
     _NvidiaSmiPeakSampler,
     _probe_gpu_in_subprocess,
-    _processed_resume_steps,
+    _seed_resume_lifecycle,
     _verl_image_message_content,
     _warmstart_adapter_path,
 )
@@ -125,7 +127,9 @@ class _OpdProgressState:
             elapsed = max(0.0, time.time() - self._train_started_at)
         return self.base_train_wall_seconds + elapsed
 
-    def record_step(self, step: int, loss: float, bridge: _TeacherAlignmentBridge) -> float:
+    def record_step(
+        self, step: int, loss: float, bridge: _TeacherAlignmentBridge
+    ) -> tuple[float, int]:
         with self._condition:
             expected_step = len(self.loss_curve) + 1
             if step != expected_step:
@@ -157,10 +161,20 @@ class _OpdProgressState:
             truncation_rate = (
                 min(1.0, max(0.0, d_truncated / d_samples_seen)) if d_samples_seen > 0 else 0.0
             )
-            # the rate is returned for the heartbeat and deliberately kept OUT of the snapshot:
-            # this dict is spread verbatim into the persisted opd_state.json resume contract, whose
-            # schema is fail-closed and holds cumulative counters. a per-step display value has no
-            # meaning on resume and nothing reads it back.
+            # bound by this step's own sample delta for the same reason the rate clamps to 1.0: an
+            # in-flight snapshot can read truncated_rollouts and samples_seen from different steps,
+            # and an unbounded count would report more discards than the step drew.
+            #
+            # the clamp bounds the magnitude; it does NOT establish ownership. these are deltas of
+            # counters the bridge advances asynchronously, so when stdout parsing lags a wave, a
+            # truncation raised by the next step can still be attributed here (and the next step
+            # then reads zero). the same asynchrony has always applied to truncation_rate. read
+            # both as a rolling indicator of truncation pressure, not an exact per-step ledger.
+            discarded_rollouts = max(0, min(d_truncated, d_samples_seen))
+            # the per-step values are returned for the heartbeat and deliberately kept OUT of the
+            # snapshot: this dict is spread verbatim into the persisted opd_state.json resume
+            # contract, whose schema is fail-closed and holds cumulative counters. per-step display
+            # values have no meaning on resume and nothing reads them back.
             snapshot.update(
                 {
                     "train_wall_seconds": self._train_wall_seconds(),
@@ -170,7 +184,7 @@ class _OpdProgressState:
             )
             self._step_states[step] = snapshot
             self._condition.notify_all()
-            return truncation_rate
+            return truncation_rate, discarded_rollouts
 
     def truncation_window(
         self,
@@ -357,7 +371,8 @@ def run_opd_train(spec=None) -> None:
             "opd_finalizing", progress=lambda: final_step, progress_step=True, keepalive=True
         ):
             adapter_dir = _export_and_upload_adapter(request, workload, runtime, result)
-            # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher and final-save paths are disjoint, so processed_steps must not suppress it.
+            # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher
+            # and final-save paths are disjoint, so the watcher's lifecycle must not suppress it.
             if final_save_due(final_step, knobs.save_at_steps):
                 _w.publish_deployable_checkpoint(adapter_dir, final_step, _provenance_ready=True)
         setup_seconds = _report_training_complete(result, started_at)
@@ -468,8 +483,8 @@ from flash.engine.worker.train.opd.failures import (  # noqa: E402,F401
 from flash.engine.worker.train.opd.overrides import (  # noqa: E402,F401
     _OPD_PARQUET_WRITE_BATCH_ROWS,
     _build_opd_child_env,
+    _build_opd_plugin_config,
     _opd_multimodal_parquet_features,
-    _render_opd_sitecustomize,
     _write_opd_parquet,
     build_opd_overrides,
 )

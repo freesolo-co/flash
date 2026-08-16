@@ -11,6 +11,12 @@ from dataclasses import dataclass, field, replace
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
 from flash.runner.supervise import lifecycle as _lifecycle
+from flash.runner.supervise.retry_decision import (
+    _EXHAUSTED_CAPACITY_ACTION,
+    _capacity_exhausted,
+    _capacity_refusal_key,
+    _retry_target,
+)
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 
@@ -36,6 +42,11 @@ class _SubmitContext:
     # grow only when an attempt actually provisioned a class and lost it to infra.
     failed_providers: set[str] = field(default_factory=set)
     tried_classes: set[tuple[str, str, int]] = field(default_factory=set)
+    # how many times each shape has refused capacity, so a second refusal of the SAME one is a
+    # repeat rather than a first look. counted per shape, not collected as a set of names: over
+    # several classes a set says "everything has refused" while one of them has been asked once.
+    # only capacity failures land here -- a stall or a preemption says nothing about rentability.
+    capacity_refusals: dict[tuple[str, str, int], int] = field(default_factory=dict)
     oom_vram_floor: float = 0.0
     last_detail: str | None = None
     # sticky: once dropped stays dropped so all remaining attempts run on the unrestricted all-dc pool.
@@ -316,6 +327,34 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     )
 
 
+def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
+    """Write the line that says everything above belongs to a previous attempt.
+
+    The run log is one append-only file for the whole run, so a retry's output lands directly after
+    the dead attempt's traceback with nothing in between. `flash runs log` tails that file, so while
+    a replacement worker is booting the tail still ends in the OOM stack that caused the retry --
+    an operator checking a run that is currently fine reads a failure. The status line already
+    carries `attempt=` and `(prev attempt)`, but those come from the heartbeat and describe the run,
+    not the bytes; nothing marked the bytes themselves.
+
+    Written for attempt > 0 only. Attempt 0 has nothing above it to disown, and a header on every
+    single-attempt run would be noise on the common path.
+
+    The line names only where attempt N BEGINS. Saying "everything above is attempt N-1" is false
+    from the second retry on: above attempt 2 sit attempts 0 and 1, and the log is also written by
+    the poller and the billing retry path, so no single attempt owns the preceding bytes anyway. A
+    boundary the reader can trust is worth more than an attribution that is right once.
+    """
+    if attempt <= 0:
+        return
+    with contextlib.suppress(Exception):
+        print(
+            f"---- attempt {attempt} starts here; everything above it is from earlier attempts ----",
+            file=ctx.log,
+            flush=True,
+        )
+
+
 def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOutcome:
     from flash.runner import (
         _reserve_attempt,
@@ -346,6 +385,7 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
         expected_next_attempt=expected_next_attempt,
     )
     ctx.current_attempt = attempt
+    _mark_attempt_boundary(ctx, attempt)
     attempt_runtime_secrets = dict(ctx.runtime_secrets or {})
     attempt_runtime_secrets.pop(OPD_RESUME_REVISION_ENV, None)
     if opd_resume_revision is not None:
@@ -364,7 +404,7 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
 
 def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
     from flash.providers.allocator import allocate
-    from flash.providers.base import PollResult, UnsupportedGpuError
+    from flash.providers.base import CapacityUnavailableError, PollResult, UnsupportedGpuError
     from flash.runner import _load_run_deadline_at, get_status
 
     # a cancel can land after _run_training's pre-submit check but while
@@ -401,16 +441,25 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
                 max(0.0, _load_run_deadline_at(ctx.spec.run_id) - _lifecycle.time.time()),
             ),
             provider=getattr(prepared.attempt_spec.gpu, "provider", ""),
+            providers=getattr(prepared.attempt_spec.gpu, "providers", ()),
+            # `attempt_spec` is rebuilt from `ctx.spec` every attempt, so this is the authored pin
+            # rather than the class a previous attempt allocated -- which is what lets every retry
+            # re-search the whole acceptable set instead of narrowing to whichever class was tried
+            # first. `_spec_with_gpu` stamps the chosen class onto the submitted spec, downstream of
+            # here; the fallbacks ride along on it so a recovered run keeps its failover.
             gpu_type=getattr(prepared.attempt_spec.gpu, "type", ""),
+            gpu_type_fallbacks=getattr(prepared.attempt_spec.gpu, "type_fallbacks", ()),
             model_revision=prepared.attempt_spec.model_revision,
             # an authored gpu.count is a hard ceiling. the digest-stable integer 1 on an unpinned
             # spec is only a placeholder, so the marker must reach allocation as none or auto-sizing
             # silently collapses back to one card after the preparation round trips.
             max_gpu_count=prepared.attempt_spec.authored_gpu_count,
         )
+    except UnsupportedGpuError:
+        raise  # config-shaped: no gpu anywhere can run this job
+    except CapacityUnavailableError as exc:
+        return None, PollResult(False, failure="no_capacity", detail=str(exc))
     except Exception as exc:
-        if isinstance(exc, UnsupportedGpuError):
-            raise  # config-shaped: no gpu anywhere can run this job
         return None, PollResult(
             False,
             failure="poll_error",
@@ -769,96 +818,6 @@ def _return_success_metrics(ctx: _SubmitContext, outcome: _AttemptOutcome) -> di
     return metrics
 
 
-def _retry_target(
-    ctx: _SubmitContext,
-    outcome: _AttemptOutcome,
-    *,
-    will_retry: bool,
-    first_cache_drop: bool,
-) -> str:
-    # name the class the retry will actually land on. on_last_gpu only says no further class
-    # escalation follows -- it does not mean this class is reused: with several fitting classes
-    # the picker clamps back to the cheapest already-tried one (a100 pcie, a100 sxm, then a100
-    # pcie again). so re-run the picker against the sets this failure is about to update.
-    #
-    # projected off the current candidate list, which the next attempt rebuilds by calling
-    # allocate() again. lambda/vast rebuild from live capacity and pricing, so the named class
-    # can disappear or lose to a newly available one -- word it as the expected target, not a
-    # guarantee. a cache-drop retry projects too: it leaves both sets untouched and so reuses
-    # this class cold, which is exactly the escalation the generic line failed to describe.
-    projected = None
-    if (
-        will_retry
-        and ctx.oom_vram_floor <= 0
-        and outcome.chosen is not None
-        and not outcome.quote_refresh_failed
-    ):
-        projected = _lifecycle._projected_retry_class(
-            outcome.candidates,
-            ctx.failed_providers,
-            ctx.tried_classes,
-            outcome.chosen,
-            cache_drop=first_cache_drop,
-        )
-    if projected is None:
-        return "retrying (resume from last checkpoint)"
-    same = (projected.provider, projected.gpu) == (
-        outcome.chosen.provider,
-        outcome.chosen.gpu,
-    )
-    # derived from the sets after this failure's bookkeeping, not from the flag. a
-    # cache-drop retry deliberately leaves tried_classes untouched and reuses this class
-    # cold, so the projected class is still untried and reading current_on_last_gpu there
-    # printed "retry on h100 again, no untried gpu class fits" -- naming the untried class
-    # in the same clause that denies one exists. on_last_gpu is also true when the infra
-    # retry budget runs out with classes still untried, which is not exhaustion either.
-    retry_tried = (
-        ctx.tried_classes
-        if first_cache_drop
-        else ctx.tried_classes | {_lifecycle._shape_key(outcome.chosen)}
-    )
-    exhausted = all(
-        _lifecycle._shape_key(candidate) in retry_tried for candidate in outcome.candidates
-    )
-    no_escalation = ", no untried GPU class fits this run" if exhausted else ""
-    # a projected provider this run has ALREADY marked failed is not a failover, it is a clamp back
-    # onto the pool that is failing. `_select_candidate` sorts on `provider in failed_providers`
-    # first, so once every candidate's provider has failed that key is True for all of them and the
-    # escape degrades to the plain cheapest-first order. the line then reads like recovery while the
-    # run loops on the same substrate, which is what made a 46-attempt loop look like progress.
-    # naming it is the difference between "waiting" and "unpin gpu.provider / add another provider".
-    retry_failed_providers = (
-        ctx.failed_providers
-        if first_cache_drop
-        else ctx.failed_providers | {outcome.chosen.provider}
-    )
-    # what landing on a failed provider actually proves is that no UNFAILED one is left, not that
-    # this is the only provider with a fitting class. with fitting candidates on two providers that
-    # have both failed, sort key 1 is True for either, so "no other provider offers a fitting class"
-    # would deny a provider sitting right there in the list. read the list instead of inferring from
-    # the sort, and distinguish the two cases: another failed provider is still somewhere to go
-    # (unpin, or wait for it to recover), whereas a single-provider candidate list is not.
-    other_providers = {candidate.provider for candidate in outcome.candidates} - {
-        projected.provider
-    }
-    no_escape = (
-        (
-            ", which this run has already lost an attempt on -- every provider offering a fitting "
-            f"class ({', '.join(sorted(other_providers | {projected.provider}))}) has now failed"
-            if other_providers
-            else ", which this run has already lost an attempt on -- no other provider offers a "
-            "fitting class"
-        )
-        if projected.provider in retry_failed_providers
-        else ""
-    )
-    return (
-        f"expecting to retry on {projected.gpu} @ {projected.provider}"
-        f"{' again' if same else ''}{no_escalation}{no_escape} (resume from last checkpoint; "
-        "reallocated against live capacity, so the class may change)"
-    )
-
-
 def _handle_failure(
     ctx: _SubmitContext,
     prepared: _PreparedAttempt,
@@ -878,6 +837,11 @@ def _handle_failure(
         return _FailureDecision(ctx.return_completed_runpod_metrics(completed_metrics), False)
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
+    if outcome.chosen is not None and result.failure in ("stalled", "job_preempted", "oom"):
+        # these outcomes happen after the class admitted the run, so an older no-capacity refusal no
+        # longer describes the current market. poll_error stays ambiguous because submit and lookup
+        # failures can happen before any capacity was granted.
+        ctx.capacity_refusals.pop(_lifecycle._shape_key(outcome.chosen), None)
     oom_shaped = result.failure == "oom"
     if oom_shaped and outcome.chosen is not None:
         # same measure the filter compares against, see _candidate_usable_vram_gb
@@ -901,6 +865,20 @@ def _handle_failure(
         result.failure,
         cache_drop=first_cache_drop,
     )
+    capacity_exhausted = will_retry and _capacity_exhausted(
+        ctx, outcome, first_cache_drop=first_cache_drop
+    )
+    if capacity_exhausted:
+        will_retry = False
+    # after the check, which asks whether this shape had refused BEFORE this attempt.
+    #
+    # in-memory and per-process on purpose: _build_context starts this empty every time, so a run
+    # resumed after a control-plane restart gets a fresh pair of looks at the market rather than
+    # inheriting a verdict from minutes ago. capacity is exactly the thing that changes in between.
+    if result.failure == "no_capacity":
+        refused_key = _capacity_refusal_key(ctx, outcome)
+        if refused_key is not None:
+            ctx.capacity_refusals[refused_key] = ctx.capacity_refusals.get(refused_key, 0) + 1
     retry_target = _retry_target(
         ctx,
         outcome,
@@ -912,6 +890,8 @@ def _handle_failure(
         if (will_retry and oom_mode)
         else retry_target
         if will_retry
+        else _EXHAUSTED_CAPACITY_ACTION
+        if capacity_exhausted
         else "not retrying"
     )
     print(
@@ -924,6 +904,13 @@ def _handle_failure(
         return _FailureDecision(None, False)
     if first_cache_drop:
         ctx.drop_weight_cache = True
+        # dropping the cache WIDENS the search: the weight-cache volume pins the run to the region
+        # holding those weights, so every refusal so far answered "any capacity for this class in
+        # that one region?" -- a narrower question than the cacheless retry is about to ask. Keeping
+        # the tally would let one region's shortage plus a single blip in the unrestricted pool
+        # reach two and stop the run, having heard the wider market refuse only once. Clear it so
+        # the widened search gets its own pair of looks.
+        ctx.capacity_refusals.clear()
         ctx.retry_budget.record_retry(result.failure, cache_drop=True)
     else:
         ctx.retry_budget.record_retry(result.failure, cache_drop=False)

@@ -1,11 +1,8 @@
-"""Child-side shims the verl subprocess installs, and the stdout lines it reports back.
+"""startup shims and stdout parsing for isolated verl children.
 
-Two halves of one conversation with the verl child. The `render_*_shim` functions emit
-sitecustomize source that the child executes -- tf32 matmul, the w&b link report, the GDN varlen
-patch -- and the `parse_*` functions read what those shims print back out of the child's stdout,
-turning it into the per-step metrics `flash runs log -f` renders.
-
-Split out of `flash.engine.worker.backend_common` to keep that module under the file-size limit.
+Only TF32 and TileLang libcudart repair run from sitecustomize. Verl-resident patches are installed
+by copied algorithm plugins through VERL_USE_EXTERNAL_MODULES. Parent-side marker and metric parsing
+remain here because they consume child files and stdout without importing verl.
 """
 
 from __future__ import annotations
@@ -193,277 +190,30 @@ except Exception as _flash_cudart_exc:
 """
 
 
-# --------------------------- w&b run link (all three verl backends) ---------------------------
-# verl calls wandb.init INSIDE the training subprocess, so the flash parent's
-# wandb.run is always None and anything read up here would be a silent no-op. the url is not
-# derivable up here
-# either: it needs entity/project/runs/<wandb-generated-id>, and flash only knows the project and
-# its own run NAME. so the child reports it back over the marker channel the parent already scans.
-FLASH_WANDB_LINK_MARKER = "FLASH_WANDB_LINK"
+def render_sitecustomize_bootstrap() -> str:
+    """render the minimal process-start bootstrap shared by all verl children."""
+    return render_tf32_shim() + render_tilelang_cudart_shim()
+
+
+from flash.engine.worker.train.core.child.runtime import (  # noqa: E402,F401
+    FLASH_GDN_VARLEN_MARKER,
+    FLASH_LORA_ROLLOUT_MARKER,
+    FLASH_WANDB_LINK_MARKER,
+    LORA_ROLLOUT_GUARD_SHIM,
+    SHIM_FRAGMENT_FAILED_EXIT_CODE,
+)
 
 _WANDB_LINK_RE = re.compile(rf"{FLASH_WANDB_LINK_MARKER}\s+(\{{.*\}})\s*$")
-
-
-def render_wandb_link_shim() -> str:
-    """child-side sitecustomize fragment that reports the live w&b run's url and id.
-
-    wraps wandb.init rather than reading wandb.run at import time: sitecustomize runs long before
-    verl's tracking module initializes the run, so anything read here would always be None. never
-    raises. wandb is optional and a logging link must not be able to abort paid training, so every
-    failure path leaves the run unlinked instead of dead.
-    """
-    return f"""
-# --- flash: report the w&b run link to the parent (see backend_common.render_wandb_link_shim) ---
-try:
-    import json as _flash_wandb_json
-
-    import wandb as _flash_wandb
-
-    _flash_wandb_init = _flash_wandb.init
-
-    def _flash_wandb_init_reporting(*args, **kwargs):
-        _run = _flash_wandb_init(*args, **kwargs)
-        try:
-            _url = getattr(_run, "url", None)
-            _id = getattr(_run, "id", None)
-            if _url:
-                print(
-                    "{FLASH_WANDB_LINK_MARKER} "
-                    + _flash_wandb_json.dumps({{"wandb_url": _url, "wandb_id": _id}}),
-                    flush=True,
-                )
-        except Exception:
-            pass
-        return _run
-
-    _flash_wandb.init = _flash_wandb_init_reporting
-except Exception:
-    pass
-"""
-
-
-FLASH_GDN_VARLEN_MARKER = "[flash-verl] gdn packed-boundary resets active"
-
-
-# Why the shim below defers every import to the moment the child imports the modeling module.
-#
-# sitecustomize runs at INTERPRETER STARTUP, and ray starts each actor's interpreter before it
-# narrows that actor's CUDA_VISIBLE_DEVICES to its own card -- so an import here runs while the
-# process still sees every gpu. importing the modeling module transitively calls transformers'
-# is_flash_linear_attention_available / is_causal_conv1d_available, both of which call
-# torch.cuda.is_available(), and fla queries device capability at import. that initializes cuda
-# against the FULL device list, and a later env-only change cannot rebuild the device map, so every
-# rank keeps device 0 and nccl aborts with "Duplicate GPU detected". a meta_path finder carries no
-# import cost and fires after ray has pinned the actor.
-#
-# the finder patches from exec_module, never find_spec: find_spec runs against a half-built module
-# that the real import then replaces, which leaves the caller's class unpatched while the marker
-# still prints.
-def render_gdn_varlen_shim(model_type: str) -> str:
-    """child-side sitecustomize fragment that resets GDN state at packed example boundaries.
-
-    patch the checkpoint's exact ``model_type`` because ``qwen3_5`` and ``qwen3_5_moe`` use different
-    modules; model names are not authoritative. patch the text-model forward so one derivation reaches
-    every GDN layer, and use transformers' own boundary helper to match attention segmentation.
-
-    keep padded input inert, preserve explicit kwargs, and fail closed because silent boundary
-    contamination is worse than refusing to start.
-    """
-    return f'''
-# --- flash: reset gdn state at packed example boundaries (backend_common.render_gdn_varlen_shim) ---
-import sys as _flash_gdn_sys
-
-_FLASH_GDN_TARGET = "transformers.models.{model_type}.modeling_{model_type}"
-
-
-def _flash_gdn_seq_idx(position_ids, cu_seq_lens):
-    """per-token example ordinal, int32 (1, total_nnz) -- what causal_conv1d_fn wants."""
-    import torch as _flash_gdn_torch
-
-    lengths = cu_seq_lens.diff()
-    return (
-        _flash_gdn_torch.repeat_interleave(
-            _flash_gdn_torch.arange(
-                lengths.numel(), device=position_ids.device, dtype=_flash_gdn_torch.int32
-            ),
-            lengths.to(_flash_gdn_torch.int64),
-        )
-        .unsqueeze(0)
-        .contiguous()
-    )
-
-
-def _flash_patch_gdn_varlen(modeling):
-    # raises if absent, deliberately: this shim is only rendered once the gate says resets are
-    # honored, so a missing TextModel means the gate and the model disagree -- refuse rather than
-    # train packed with an unpatched forward.
-    text_model = next(
-        c
-        for n, c in vars(modeling).items()
-        if isinstance(c, type) and n.endswith("TextModel")
-    )
-    if getattr(text_model.forward, "_flash_gdn_varlen_patched", False):
-        return
-    # imported here, not at module scope: these pull in torch and transformers' cuda probes.
-    from transformers.modeling_flash_attention_utils import (
-        _is_packed_sequence as _flash_gdn_is_packed,
-        prepare_fa_kwargs_from_position_ids as _flash_gdn_prepare_fa_kwargs,
-    )
-
-    original = text_model.forward
-
-    def forward(self, *args, **kwargs):
-        # only derive what the caller did not supply, and only for a genuinely packed batch.
-        if kwargs.get("cu_seq_lens_q") is None and kwargs.get("seq_idx") is None:
-            position_ids = kwargs.get("position_ids")
-            # the model reshapes position_ids to 4-way mrope internally; the text row is what the
-            # boundaries live on. a 3d (4, batch, seq) tensor indexes to it, 2d is already it.
-            text_position_ids = position_ids
-            if text_position_ids is not None and text_position_ids.ndim == 3:
-                text_position_ids = text_position_ids[0]
-            if text_position_ids is not None and text_position_ids.ndim == 2:
-                if _flash_gdn_is_packed(text_position_ids, text_position_ids.shape[0]):
-                    (cu_seq_lens_q, cu_seq_lens_k), (max_q, max_k) = (
-                        _flash_gdn_prepare_fa_kwargs(text_position_ids)
-                    )
-                    kwargs["cu_seq_lens_q"] = cu_seq_lens_q
-                    kwargs["cu_seq_lens_k"] = cu_seq_lens_k
-                    kwargs["max_length_q"] = max_q
-                    kwargs["max_length_k"] = max_k
-                    kwargs["seq_idx"] = _flash_gdn_seq_idx(text_position_ids, cu_seq_lens_q)
-        return original(self, *args, **kwargs)
-
-    forward._flash_gdn_varlen_patched = True
-    text_model.forward = forward
-    print({FLASH_GDN_VARLEN_MARKER!r}, "{model_type}", flush=True)
-
-
-class _FlashGdnLoader:
-    """wrap the real loader so the patch lands once the module is fully executed.
-
-    ``exec_module`` returning means the module object the importer will hand the caller is
-    finished, so patching here is the first safe moment. patching from ``find_spec`` instead
-    would run against a half-built module that the real import then replaces, leaving the
-    caller's class unpatched while the marker still printed.
-    """
-
-    def __init__(self, inner):
-        self._inner = inner
-
-    def create_module(self, spec):
-        return self._inner.create_module(spec)
-
-    def exec_module(self, module):
-        self._inner.exec_module(module)
-        _flash_gdn_uninstall()
-        _flash_patch_gdn_varlen(module)
-
-    def __getattr__(self, name):  # keep the rest of the loader protocol intact
-        return getattr(self._inner, name)
-
-
-class _FlashGdnFinder:
-    """intercept the first import of the modeling module, then get out of the way.
-
-    delegating to the finders AFTER this one resolves the real spec without importing anything,
-    so nothing here touches torch or cuda; only the loader is wrapped.
-    """
-
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname != _FLASH_GDN_TARGET:
-            return None
-        rest = [f for f in _flash_gdn_sys.meta_path if not isinstance(f, _FlashGdnFinder)]
-        for finder in rest:
-            find = getattr(finder, "find_spec", None)
-            if find is None:
-                continue
-            spec = find(fullname, path, target)
-            if spec is not None and spec.loader is not None:
-                spec.loader = _FlashGdnLoader(spec.loader)
-                return spec
-        return None
-
-
-def _flash_gdn_uninstall():
-    _flash_gdn_sys.meta_path[:] = [
-        f for f in _flash_gdn_sys.meta_path if not isinstance(f, _FlashGdnFinder)
-    ]
-
-
-# already imported (a parent process may have loaded it): patch now, there is no import left to
-# intercept. otherwise arm the finder and let the child's own import trigger it.
-_flash_gdn_loaded = _flash_gdn_sys.modules.get(_FLASH_GDN_TARGET)
-if _flash_gdn_loaded is not None:
-    _flash_patch_gdn_varlen(_flash_gdn_loaded)
-else:
-    _flash_gdn_sys.meta_path.insert(0, _FlashGdnFinder())
-'''
-
-
-# --------------------------- fail-closed fragment wrapping (sft + grpo sitecustomize) ---------
-# cpython's site.execsitecustomize catches every Exception raised while sitecustomize imports,
-# prints a two-line note, and starts the interpreter anyway, so a failing fragment silently
-# disables itself AND every fragment concatenated after it, and the child trains unpatched.
-# wrapping gives every required fragment two guarantees: an exception hard-exits the child with
-# this code (os._exit cannot be swallowed by execsitecustomize), and successful application
-# appends the fragment's name to a marker file the parent verifies before trusting the run.
-SHIM_FRAGMENT_FAILED_EXIT_CODE = 97
 SHIM_MARKER_FILENAME = "applied_shims.txt"
 
 
 def shim_marker_file(shim_dir: str) -> str:
-    """the marker file the wrapped fragments in ``shim_dir``'s sitecustomize append to."""
+    """return the copied plugins' shared applied-patch marker file."""
     return os.path.join(shim_dir, SHIM_MARKER_FILENAME)
 
 
-def render_shim_marker_prologue(marker_file: str) -> str:
-    """sitecustomize prologue defining the recorder every wrapped fragment reports through."""
-    return f"""
-# --- flash: record each applied runtime patch (see child_io.wrap_shim_fragment) ---
-_FLASH_SHIM_MARKER_FILE = {marker_file!r}
-
-
-def _flash_record_applied_shim(name):
-    # append-mode: torchrun ranks and ray actors import this same sitecustomize concurrently,
-    # and short O_APPEND writes keep each line intact. the parent reads the file as a set.
-    with open(_FLASH_SHIM_MARKER_FILE, "a") as _flash_shim_handle:
-        _flash_shim_handle.write(name + "\\n")
-"""
-
-
-def wrap_shim_fragment(name: str, source: str) -> str:
-    """wrap one required sitecustomize fragment so it fails closed and proves it applied.
-
-    "" stays "": a feature that is off has nothing to prove. requires the prologue above earlier
-    in the same sitecustomize. optional fragments (tf32, the wandb link) stay unwrapped, since they
-    swallow their own failures by design and must never be able to kill a paid run.
-    """
-    if not source:
-        return ""
-    return f"""
-# --- flash required fragment: {name} (fails closed; see child_io.wrap_shim_fragment) ---
-try:
-{textwrap.indent(source, "    ")}
-    _flash_record_applied_shim({name!r})
-except BaseException:
-    import os as _flash_shim_os
-    import sys as _flash_shim_sys
-    import traceback as _flash_shim_traceback
-
-    _flash_shim_traceback.print_exc()
-    print(
-        "[flash-verl] required shim fragment {name} failed to apply; "
-        "exiting {SHIM_FRAGMENT_FAILED_EXIT_CODE} rather than training unpatched",
-        file=_flash_shim_sys.stderr,
-        flush=True,
-    )
-    _flash_shim_sys.stderr.flush()
-    _flash_shim_os._exit({SHIM_FRAGMENT_FAILED_EXIT_CODE})
-"""
-
-
 def read_applied_shim_markers(marker_file: str) -> set[str]:
-    """the fragment names the child recorded as applied; empty when it recorded none."""
+    """return the patch names the child recorded as applied."""
     try:
         with open(marker_file, encoding="utf-8") as handle:
             return {line.strip() for line in handle if line.strip()}
@@ -472,21 +222,14 @@ def read_applied_shim_markers(marker_file: str) -> set[str]:
 
 
 def verify_applied_shim_markers(marker_file: str, expected) -> None:
-    """raise unless every expected fragment proved it applied in the child.
-
-    the wrapped fragments hard-exit the child on failure, so the only way a marker goes missing
-    is the sitecustomize never running at all (a shadowing sitecustomize on a foreign
-    FLASH_VERL_PYTHON, or a lost PYTHONPATH entry). that child is training with NO flash patch
-    (seeding, kl anchoring, save gating, boundary resets), so the attempt must fail. permanent
-    rather than retriable by design: the same interpreter reproduces the same skip on retry.
-    """
+    """raise unless every expected copied-plugin patch proved it applied."""
     missing = sorted(set(expected) - read_applied_shim_markers(marker_file))
     if missing:
         raise RuntimeError(
             f"the verl child never proved these required runtime patches applied: {missing}. "
-            "its sitecustomize did not run (a shadowing sitecustomize or a dropped PYTHONPATH "
-            "entry on a foreign FLASH_VERL_PYTHON can cause this); refusing to train unpatched. "
-            "this is permanent for this interpreter, not a retriable infra fault."
+            "its configured external module did not load or a deferred target was never patched; "
+            "refusing to train unpatched. this is permanent for this interpreter, not a retriable "
+            "infra fault."
         )
 
 

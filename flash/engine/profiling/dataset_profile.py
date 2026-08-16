@@ -333,18 +333,15 @@ def profile_packaged_sft_dataset(
         package_root=base_dir,
         contract_text=_contract_text(base_dir, params),
     )
-    from flash.content.multimodal import record_has_images
-
-    if any(record_has_images(row, raw_environment.prompt_messages(row)) for row in rows):
-        raise PackagedDatasetUnavailable(
-            "image-bearing SFT datasets cannot be profiled on the torch-free control plane. "
-            "Use text-only SFT records."
-        )
     return prepare_sft_workload(
         spec,
         raw_environment,
         tokenizer_loader=tokenizer_loader,
         producer_version=producer_version,
+        # no torch here, so no VL processor: image rows are counted arithmetically from the
+        # published vision geometry rather than tokenized through the processor. see
+        # flash/engine/profiling/image_tokens.py.
+        require_processor=False,
         allow_packing=True,
         packing_support=packing_support,
         source_examples=source_examples,
