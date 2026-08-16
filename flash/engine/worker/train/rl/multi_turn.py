@@ -222,13 +222,7 @@ class MultiTurnBridge:
             reaped = self._reap_abandoned_sessions()
             if session_id in self._sessions:
                 raise _BadSession(f"duplicate multi-turn session {session_id}")
-            state = self._env_call("new_rollout_state", example)
-            # new_rollout_state calls start_episode again after dataset preparation. adopt the dataset's
-            # prompt so randomized envs do not generate for episode a and score episode b; keep the
-            # remaining state created by the env.
-            env_prompt = [dict(message) for message in self._env_prompts[index]]
-            state["prompt"] = env_prompt
-            state["messages"] = [dict(message) for message in env_prompt]
+            state = self._env_call("new_rollout_state", example, self._env_prompts[index])
             self._sessions[session_id] = {
                 "example": example,
                 "state": state,
