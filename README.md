@@ -33,10 +33,10 @@ point of use; install it with `pip install freesolo`.
 
 Two components stay Freesolo-operated and are **not** in this repository:
 
-| Component             | Where it lives                                        | Self-hosted equivalent                                                      |
-| --------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------- |
-| Multi-tenant identity | `api.freesolo.co` — verifies keys, owns projects/orgs | `FLASH_STANDALONE=1` runs single-tenant on your own key                     |
-| Multi-LoRA serving    | `serve.freesolo.co` — `flash/serve/` is a thin client | `flash serve setup` deploys an equivalent backend to your own Modal account |
+| Component                 | Where it lives                                                                     | Self-hosted equivalent                                                   |
+| ------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Multi-tenant identity     | `api.freesolo.co`; verifies keys and owns projects/orgs                            | `FLASH_STANDALONE=1` runs single-tenant on your own key                  |
+| Hosted Multi-LoRA serving | `serve.freesolo.co`; `flash/serve/` owns the client, shared runtime, and generator | `flash serve setup` deploys a single-model backend to your Modal account |
 
 So there are three ways to use Flash: against the **hosted service**, **self-hosted** against
 your own GPU accounts, or as **training and provider code to read and modify**. The training

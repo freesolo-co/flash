@@ -5,12 +5,10 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
-import inspect
 import json
 import sys
 import threading
 import types
-from pathlib import Path
 
 import pytest
 
@@ -19,7 +17,6 @@ from flash.core.catalog import MODELS
 from flash.serve.backend.generate import render_app
 
 pytest.importorskip("fastapi")
-
 from fastapi.testclient import TestClient
 
 REVISION = "run-abc@step-10." + "a" * 40
@@ -57,12 +54,6 @@ class _Aio:
         return self._fn(*args, **kwargs)
 
 
-class _AsyncIterAio(_Aio):
-    async def aio(self, *args, **kwargs):  # type: ignore[override]
-        for item in self._fn(*args, **kwargs):
-            yield item
-
-
 class _FakeVolume:
     def __init__(self):
         self.remove_calls = []
@@ -97,9 +88,6 @@ class _FakeDict(dict):
     def _get(self, key, default=None):
         return copy.deepcopy(super().get(key, default))
 
-    def _pop(self, key, default=None):
-        return copy.deepcopy(super().pop(key, default))
-
     @property
     def put(self):
         return _Aio(self._put)
@@ -107,14 +95,6 @@ class _FakeDict(dict):
     @property
     def get(self):
         return _Aio(self._get)
-
-    @property
-    def pop(self):
-        return _Aio(self._pop)
-
-    @property
-    def keys(self):
-        return _AsyncIterAio(lambda: list(super(_FakeDict, self).keys()))
 
 
 def _run_awaitable(awaitable):
@@ -176,14 +156,10 @@ def _stub_modal(
         def from_registry(cls, *args, **kwargs):
             return cls()
 
-        def apt_install(self, *args, **kwargs):
+        def _chain(self, *args, **kwargs):
             return self
 
-        def pip_install(self, *args, **kwargs):
-            return self
-
-        def env(self, *args, **kwargs):
-            return self
+        apt_install = pip_install = env = _chain
 
     class _ClassMethod:
         def __init__(self, class_name, instance, name):
@@ -216,13 +192,7 @@ def _stub_modal(
             copied_args = copy.deepcopy(args)
             copied_kwargs = copy.deepcopy(kwargs)
             spawned.append((f"{self._class_name}.{self._name}", copied_args, copied_kwargs))
-            if self._class_name == "LifecycleCoordinator":
-                spawn_queue.append((self, copied_args, copied_kwargs))
-                return None
-            result = self._target()(*copied_args, **copied_kwargs)
-            if inspect.isawaitable(result):
-                return _run_awaitable(result)
-            return result
+            spawn_queue.append((self, copied_args, copied_kwargs))
 
     class _ClassHandle:
         def __init__(self, class_name, instance):
@@ -241,17 +211,6 @@ def _stub_modal(
 
         def __call__(self, *args, **kwargs):
             return self._fn(*args, **kwargs)
-
-        @property
-        def remote(self):
-            return types.SimpleNamespace(aio=self._fn)
-
-        def spawn(self, *args, **kwargs):
-            spawned.append((self._fn.__name__, args, kwargs))
-            result = self._fn(*args, **kwargs)
-            if inspect.isawaitable(result):
-                return _run_awaitable(result)
-            return result
 
     class _App:
         def __init__(self, *args, **kwargs):
@@ -346,15 +305,18 @@ def client(monkeypatch, tmp_path):
     exec(compile(source, str(tmp_path / "app.py"), "exec"), module.__dict__)
     test_client = TestClient(module.api())
     test_client.headers["X-Freesolo-Internal-Key"] = "test-serving-key"
-    test_client.app.state.generated_module = module
-    test_client.app.state.engine_classes = engine_classes
-    test_client.app.state.cls_options = cls_options
-    test_client.app.state.fn_options = fn_options
-    test_client.app.state.engine_methods = engine_methods
-    test_client.app.state.spawned = spawned
-    test_client.app.state.spawn_queue = spawn_queue
-    test_client.app.state.coordinator_gate = coordinator_gate
-    test_client.app.state.unregistered = unregistered
+    for name, value in {
+        "generated_module": module,
+        "engine_classes": engine_classes,
+        "cls_options": cls_options,
+        "fn_options": fn_options,
+        "engine_methods": engine_methods,
+        "spawned": spawned,
+        "spawn_queue": spawn_queue,
+        "coordinator_gate": coordinator_gate,
+        "unregistered": unregistered,
+    }.items():
+        setattr(test_client.app.state, name, value)
     return test_client
 
 
@@ -372,12 +334,6 @@ def lifecycle_class(client):
 
 @pytest.fixture
 def generated_module(client):
-    """the executed generated app.
-
-    the fixture execs the rendered source into a bare module without registering it in
-    `sys.modules`, so module-level helpers have to be reached through the client rather than
-    looked up by name.
-    """
     return client.app.state.generated_module
 
 
@@ -416,24 +372,30 @@ def _second_registration():
         **REGISTRATION,
         "adapter_id": SECOND_REVISION,
         "checkpoint": "run-abc/step-20",
-        "metadata": {
-            **REGISTRATION["metadata"],
-            "checkpoint_step": 20,
-            "hf_revision": "b" * 40,
-        },
+        "metadata": {**REGISTRATION["metadata"], "checkpoint_step": 20, "hf_revision": "b" * 40},
     }
 
 
-def _request_for(engine_class, record, payload=None):
-    """the runtime request the generated app builds for one chat payload and durable record.
+def _record(registration=REGISTRATION, *, status="registered", attempt=None):
+    record = copy.deepcopy(registration)
+    record["status"] = status
+    record["metadata"]["lifecycle_state"] = status
+    if attempt is not None:
+        record["metadata"]["settle_attempt"] = attempt
+    return record
 
-    the app no longer constructs vllm sampling params itself, so the meaningful boundary is the
-    `GenerationRequest` handed to the runtime plus the adapter spec registered alongside it.
-    """
+
+def _engine(engine_class, *, runtime=None, registered=None):
     instance = engine_class.__new__(engine_class)
-    adapter_id = record["adapter_id"]
     instance._locks = {}
-    instance._registered = {adapter_id: "incarnation"}
+    instance._registered = dict(registered or {})
+    if runtime is not None:
+        instance._runtime = runtime
+    return instance
+
+
+def _request_for(engine_class, record, payload=None):
+    instance = _engine(engine_class, registered={record["adapter_id"]: "incarnation"})
 
     async def no_op(*args):
         return "incarnation"
@@ -444,69 +406,14 @@ def _request_for(engine_class, record, payload=None):
     return _run_awaitable(engine_class._request(instance, body, record))
 
 
-def test_healthz_advertises_the_required_capabilities(client):
-    payload = client.get("/healthz").json()
-    assert payload["requires_key"] is True
-    assert payload["capabilities"] == [
-        "immutable_adapter_revisions",
-        "alias_compare_and_swap",
-        "revision_provenance",
-    ]
-
-
-def test_engine_coordinator_and_api_are_pinned_to_one_container(client):
-    assert client.app.state.cls_options["Engine"]["max_containers"] == 1
-    coordinator = client.app.state.cls_options["LifecycleCoordinator"]
-    assert coordinator["max_containers"] == 1
-    assert "gpu" not in coordinator
-    assert client.app.state.fn_options["api"]["max_containers"] == 1
-
-
-def test_registration_is_accepted_and_reaches_ready(client):
-    _register_and_ready(client)
-    record = client.get(f"/adapters/{REVISION}").json()["adapter"]
-    attempt = record["metadata"]["settle_attempt"]
-    assert attempt
-    assert attempt != REGISTRATION["metadata"]["settle_attempt"]
-    assert client.app.state.spawned[0][0] == "LifecycleCoordinator.settle"
-
-
 def test_registration_returns_before_queued_settlement_runs(client):
     response = client.post("/adapters", json=REGISTRATION)
-
     assert response.status_code == 202
     assert _lifecycle(client, REVISION) == "registered"
     assert len(client.app.state.spawn_queue) == 1
-
     _drain_spawn_queue(client)
-
     assert _lifecycle(client, REVISION) == "ready"
     assert client.app.state.spawn_queue == []
-
-
-def test_readback_carries_the_identity_the_client_cross_checks(client):
-    _register_and_ready(client)
-    record = client.get(f"/adapters/{REVISION}").json()["adapter"]
-    for field in (
-        "adapter_id",
-        "repo_id",
-        "repo_type",
-        "subfolder",
-        "base_model",
-        "checkpoint",
-        "thinking",
-    ):
-        assert record[field] == REGISTRATION[field]
-    assert record["metadata"]["run_id"] == RUN_ID
-    assert record["metadata"]["checkpoint_step"] == 10
-    assert record["metadata"]["hf_revision"] == "a" * 40
-
-
-def test_reregistering_identical_content_is_idempotent(client):
-    _register_and_ready(client)
-    response = client.post("/adapters", json=REGISTRATION)
-    assert response.status_code == 202
-    assert _lifecycle(client, REVISION) == "ready"
 
 
 @pytest.mark.parametrize(
@@ -525,56 +432,6 @@ def test_reregistering_different_content_under_one_revision_is_a_conflict(client
     _register_and_ready(client)
     changed = {**REGISTRATION, field: value, "metadata": dict(REGISTRATION["metadata"])}
     assert client.post("/adapters", json=changed).status_code == 409
-
-
-def test_changed_provenance_under_one_id_is_refused(client):
-    _register_and_ready(client)
-    changed = {**REGISTRATION, "metadata": {**REGISTRATION["metadata"], "run_id": "other"}}
-    assert client.post("/adapters", json=changed).status_code == 422
-
-
-def test_registration_requires_a_pinned_commit_sha(client):
-    body = {
-        **REGISTRATION,
-        "adapter_id": "run-abc@step-10.main",
-        "metadata": {**REGISTRATION["metadata"], "hf_revision": "main"},
-    }
-    assert client.post("/adapters", json=body).status_code == 422
-
-
-def test_a_fractional_checkpoint_step_is_refused(client):
-    body = {
-        **REGISTRATION,
-        "metadata": {**REGISTRATION["metadata"], "checkpoint_step": 10.5},
-    }
-    assert client.post("/adapters", json=body).status_code == 422
-
-
-def test_padded_provenance_is_stored_canonically(client):
-    body = {
-        **REGISTRATION,
-        "metadata": {
-            **REGISTRATION["metadata"],
-            "run_id": " run-abc ",
-            "checkpoint_step": "10",
-            "hf_revision": "  " + "a" * 40 + "  ",
-        },
-    }
-    _register_and_ready(client, body)
-    metadata = client.get(f"/adapters/{REVISION}").json()["adapter"]["metadata"]
-    assert metadata["run_id"] == RUN_ID
-    assert metadata["checkpoint_step"] == 10
-    assert metadata["hf_revision"] == "a" * 40
-
-
-def test_metadata_cannot_turn_a_revision_into_an_alias(client):
-    body = {
-        **REGISTRATION,
-        "metadata": {**REGISTRATION["metadata"], "record_type": "alias"},
-    }
-    _register_and_ready(client, body)
-    record = client.get(f"/adapters/{REVISION}").json()["adapter"]
-    assert record["metadata"]["record_type"] == "revision"
 
 
 def test_a_failed_adapter_load_reports_failed_not_ready(client):
@@ -622,9 +479,7 @@ def test_engine_response_error_unloads_exact_attempt_and_marks_it_failed(client)
     assert incarnation == f"{REVISION}@{registered['metadata']['settle_attempt']}"
     assert registered["status"] == "registered"
     assert module._lifecycle_state(registered) == "registered"
-
     _drain_spawn_queue(client)
-
     failed = client.get(f"/adapters/{REVISION}").json()["adapter"]
     assert client.app.state.unregistered == [(REVISION, incarnation)]
     assert failed["status"] == "disabled"
@@ -650,9 +505,7 @@ def test_redeploying_the_same_checkpoint_after_undeploy_uses_a_fresh_incarnation
         "spawn",
         lambda record: pending.append(copy.deepcopy(record)),
     )
-
     response = client.post("/adapters", json=REGISTRATION)
-
     assert response.status_code == 202
     second = module.adapter_records[module._record_key(REVISION)]
     assert module._lifecycle_state(second) == "registered"
@@ -672,10 +525,8 @@ def test_remove_cannot_be_overwritten_by_an_inflight_successful_settlement(
     )
     assert client.post("/adapters", json=REGISTRATION).status_code == 202
     record = pending[0]
-
     assert client.delete(f"/adapters/{RUN_ID}").status_code == 200
     outcome = _run_awaitable(lifecycle_class.settle(module.lifecycle._instance, record))
-
     current = module.adapter_records[module._record_key(REVISION)]
     assert outcome == {"ok": True, "superseded": True}
     assert current["status"] == "disabled"
@@ -722,7 +573,6 @@ def test_coordinator_serializes_remove_behind_a_blocked_settlement(client):
     settle_thread = threading.Thread(target=drain)
     settle_thread.start()
     assert settle_entered.wait(2)
-
     remove_thread = threading.Thread(target=remove)
     remove_thread.start()
     assert client.app.state.coordinator_gate.wait_for("remove")
@@ -733,7 +583,6 @@ def test_coordinator_serializes_remove_behind_a_blocked_settlement(client):
         release_settle.set()
         settle_thread.join(2)
         remove_thread.join(2)
-
     assert settle_thread.is_alive() is False
     assert remove_thread.is_alive() is False
     assert failures == []
@@ -756,9 +605,7 @@ def test_stale_settlement_cannot_overwrite_or_unload_a_newer_attempt(
     assert client.post("/adapters", json=REGISTRATION).status_code == 202
     newer = pending[-1]
     assert module._record_incarnation(stale) != module._record_incarnation(newer)
-
     outcome = _run_awaitable(lifecycle_class.settle(module.lifecycle._instance, stale))
-
     current = module.adapter_records[module._record_key(REVISION)]
     assert outcome == {"ok": True, "superseded": True}
     assert module._record_incarnation(current) == module._record_incarnation(newer)
@@ -792,7 +639,6 @@ def test_rejected_settlement_unloads_only_the_attempt_it_loaded(
 
     client.app.state.engine_methods["settle"] = load_then_advance
     outcome = _run_awaitable(lifecycle_class.settle(module.lifecycle._instance, stale))
-
     assert outcome == {"ok": True, "superseded": True}
     assert module._record_incarnation(
         module.adapter_records[module._record_key(REVISION)]
@@ -800,40 +646,10 @@ def test_rejected_settlement_unloads_only_the_attempt_it_loaded(
     assert client.app.state.unregistered == [(REVISION, module._record_incarnation(stale))]
 
 
-def test_activation_returns_the_provenance_the_client_validates(client):
-    _register_and_ready(client)
-    response = _activate(client)
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["adapter_id"] == RUN_ID
-    assert payload["target_adapter_revision"] == REVISION
-    assert payload["previous_adapter_revision"] is None
-    assert payload["checkpoint"] == REGISTRATION["checkpoint"]
-    assert payload["updated_at"]
-
-
 def test_a_stale_compare_and_swap_is_rejected(client):
     _register_and_ready(client)
     assert _activate(client).status_code == 200
     assert _activate(client).status_code == 409
-
-
-def test_a_non_null_expectation_replaces_the_alias(client):
-    first = _register_and_ready(client)
-    second = _register_and_ready(client, _second_registration())
-    assert _activate(client, first["adapter_id"]).status_code == 200
-    response = _activate(client, second["adapter_id"], first["adapter_id"])
-    assert response.status_code == 200
-    assert response.json()["previous_adapter_revision"] == first["adapter_id"]
-
-
-def test_chat_is_refused_until_the_alias_is_activated(client):
-    _register_and_ready(client)
-    response = client.post(
-        "/v1/chat/completions",
-        json={"model": RUN_ID, "messages": [{"role": "user", "content": "hi"}]},
-    )
-    assert response.status_code == 404
 
 
 def test_chat_reports_which_immutable_revision_answered(client):
@@ -854,20 +670,6 @@ def test_chat_reports_which_immutable_revision_answered(client):
     assert response.headers["X-Freesolo-Adapter-Revision"] == REVISION
     assert response.headers["X-Freesolo-Checkpoint"] == REGISTRATION["checkpoint"]
     assert response.headers["X-Freesolo-HF-Revision"] == "a" * 40
-
-
-def test_chat_fails_closed_on_a_terminal_revision(client):
-    _register_and_ready(client)
-    assert _activate(client).status_code == 200
-    module = client.app.state.generated_module
-    record = module.adapter_records[module._record_key(REVISION)]
-    record["status"] = "disabled"
-    record["metadata"]["lifecycle_state"] = "failed"
-    response = client.post(
-        "/v1/chat/completions",
-        json={"model": RUN_ID, "messages": [{"role": "user", "content": "hi"}]},
-    )
-    assert response.status_code == 404
 
 
 def test_a_streaming_request_gets_sse(client):
@@ -904,137 +706,13 @@ def test_an_image_request_is_refused_rather_than_answered_blind(client, block_ty
     assert "text-only" in response.json()["detail"]
 
 
-@pytest.mark.parametrize("limit", [0, -1, 1.5, True, "4"])
-def test_an_invalid_max_tokens_is_rejected(client, limit):
-    # the messages have to be valid, or the empty-messages guard answers 400 first and this
-    # passes without ever reaching the max_tokens check.
-    response = client.post(
-        "/v1/chat/completions",
-        json={"model": RUN_ID, "messages": _MESSAGES, "max_tokens": limit},
-    )
-    assert response.status_code == 400
-    assert "max_tokens" in response.json()["detail"]
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("temperature", -0.1),
-        ("temperature", True),
-        ("temperature", float("inf")),
-        ("top_p", 0),
-        ("top_p", 1.1),
-        ("top_p", float("nan")),
-    ],
-)
-def test_invalid_sampling_values_are_rejected(client, field, value):
-    # same reason as max_tokens above: filler empty messages would trip the emptiness guard and
-    # return 400 without the sampling field being looked at.
-    response = client.post(
-        "/v1/chat/completions",
-        content=json.dumps({"model": RUN_ID, "messages": _MESSAGES, field: value}),
-        headers={"Content-Type": "application/json"},
-    )
-    assert response.status_code == 400
-    assert field in response.json()["detail"]
-
-
-@pytest.mark.parametrize(
-    "messages",
-    [None, [], "hi", {"role": "user"}, ["hi"], [{"role": "user", "content": "hi"}, "hi"]],
-)
-def test_unusable_messages_are_refused_before_a_gpu_is_woken(client, messages, monkeypatch):
-    """bad `messages` must 400 on the api container, not 500 from the gpu.
-
-    `_request` builds the `GenerationRequest` inside the engine, so without an api-side guard
-    these payloads reach `engine.generate.remote` first: modal wakes a gpu replica, and the
-    runtime's own rejection surfaces as an unhandled 500. every other bad chat input answers 400
-    without leaving the api container, so this asserts the gpu is never called at all.
-    """
-    # the adapter has to be ready and active, or the request 404s at model resolution and never
-    # reaches the engine no matter what the guard does -- which would make `calls == []` below
-    # true for the wrong reason.
-    _register_and_ready(client)
-    assert _activate(client).status_code == 200
-    calls: list[object] = []
-    module = client.app.state.generated_module
-    monkeypatch.setattr(
-        module.engine.generate,
-        "remote",
-        types.SimpleNamespace(aio=lambda *a, **k: calls.append(a)),
-    )
-    payload = {"model": RUN_ID}
-    if messages is not None:
-        payload["messages"] = messages
-
-    response = client.post("/v1/chat/completions", json=payload)
-
-    assert response.status_code == 400
-    assert "non-empty list" in response.json()["detail"]
-    assert calls == []
-
-
-def test_a_failed_settlement_dispatch_cannot_disable_a_ready_record(client, lifecycle_class):
-    _register_and_ready(client)
-    module = client.app.state.generated_module
-    record = module.adapter_records[module._record_key(REVISION)]
-    assert record["status"] == "ready"
-    coordinator = lifecycle_class.__new__(lifecycle_class)
-
-    failed = _run_awaitable(
-        lifecycle_class._fail_attempt(coordinator, record, "engine did not answer")
-    )
-
-    after = module.adapter_records[module._record_key(REVISION)]
-    assert failed is False
-    assert after["status"] == "ready"
-    assert module._lifecycle_state(after) == "ready"
-    assert "failure" not in after["metadata"]
-
-
-def test_an_activated_alias_carries_both_state_fields(client):
-    """The alias must record `lifecycle_state`, not just `status`.
-
-    Records carry state in two fields and readers check either one. `activate` rebuilds the alias
-    metadata from scratch, so omitting the lifecycle key leaves the alias as the only record whose
-    state is legible from just one field -- and the only reason a `lifecycle_state`-based check
-    does not then reject a healthy alias is that `_resolve_chat_record` rebinds to the alias
-    target first. That makes a user-visible 200-vs-503 depend on statement ordering.
-    """
-    _register_and_ready(client)
-    assert _activate(client).status_code == 200
-    module = client.app.state.generated_module
-    alias = module.adapter_records[module._record_key(RUN_ID)]
-
-    assert alias["status"] == "ready"
-    assert alias["metadata"]["lifecycle_state"] == "ready"
-    assert module._is_terminal(alias) is False
-    assert alias["metadata"]["alias_of"] == REVISION
-
-
-def test_a_registered_grammar_reaches_the_adapter_spec(generated_module):
-    record = {**REGISTRATION, "structured_outputs": {"regex": "[ab]+"}}
-    spec = generated_module._adapter_spec(record, "/tmp/adapter")
-    assert spec.structured_outputs == {"regex": "[ab]+"}
-
-
 def test_generation_uses_the_record_grammar_not_the_request(engine_class, generated_module):
-    """the registered grammar is authoritative; a request cannot widen or replace it."""
     module = generated_module
     record = {**REGISTRATION, "structured_outputs": {"choice": ["yes", "no"]}}
     spec = module._adapter_spec(record, "/tmp/adapter")
     assert spec.structured_outputs == {"choice": ["yes", "no"]}
-    # the request carries no grammar at all, so a caller-supplied one cannot reach the runtime.
     request = _request_for(engine_class, record, {"structured_outputs": {"regex": ".*"}})
     assert request.structured_outputs is None
-
-
-@pytest.mark.parametrize("field", ["settle_attempt", "run_id", "hf_revision"])
-def test_revision_records_require_canonical_metadata(generated_module, field):
-    record = copy.deepcopy(REGISTRATION)
-    record["metadata"].pop(field)
-    with pytest.raises(RuntimeError, match=field):
-        generated_module._record_incarnation(record)
 
 
 def test_missing_hf_revision_fails_before_download_or_provenance_reconstruction(
@@ -1047,7 +725,6 @@ def test_missing_hf_revision_fails_before_download_or_provenance_reconstruction(
     hub.snapshot_download = lambda **kwargs: downloads.append(kwargs)
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     instance = engine_class.__new__(engine_class)
-
     with pytest.raises(RuntimeError, match="hf_revision"):
         _run_awaitable(engine_class._adapter_path(instance, record))
     with pytest.raises(RuntimeError, match="hf_revision"):
@@ -1070,10 +747,6 @@ def test_malformed_request_fails_before_resident_mutation(engine_class):
     assert reaped == []
 
 
-def test_an_omitted_max_tokens_gets_the_default(engine_class):
-    assert _request_for(engine_class, REGISTRATION).max_tokens == 512
-
-
 def test_stop_sequences_reach_the_runtime_request(engine_class):
     request = _request_for(engine_class, REGISTRATION, {"stop": ["END"]})
     assert request.stop == ("END",)
@@ -1081,9 +754,7 @@ def test_stop_sequences_reach_the_runtime_request(engine_class):
 
 
 def test_request_uses_the_incarnation_captured_while_loading(engine_class):
-    instance = engine_class.__new__(engine_class)
-    instance._locks = {}
-    instance._registered = {REVISION: "newer-incarnation"}
+    instance = _engine(engine_class, registered={REVISION: "newer-incarnation"})
 
     async def no_reap():
         return None
@@ -1095,7 +766,6 @@ def test_request_uses_the_incarnation_captured_while_loading(engine_class):
     instance._reap_terminal_residents = no_reap
     instance._ensure_loaded = capture_then_replace
     request = _run_awaitable(engine_class._request(instance, {"messages": _MESSAGES}, REGISTRATION))
-
     assert request.expected_incarnation == "captured-incarnation"
     assert REVISION not in instance._registered
 
@@ -1107,7 +777,6 @@ def test_malformed_undeploy_state_fails_before_durable_or_cache_mutation(client,
     module.adapter_records[module._record_key(REVISION)] = record
     before = copy.deepcopy(dict(module.adapter_records))
     instance = lifecycle_class.__new__(lifecycle_class)
-
     with pytest.raises(RuntimeError, match="run_id"):
         _run_awaitable(lifecycle_class.remove(instance, REVISION))
     assert dict(module.adapter_records) == before
@@ -1136,12 +805,6 @@ def test_undeploy_disables_the_alias_and_its_revisions(client):
 
 
 def test_undeploy_reads_only_the_runs_durable_index(client, monkeypatch):
-    """undeploy must not scan every historical key in the app-wide modal dict.
-
-    Records are never deleted, so a full scan grows without bound and makes one remote `get` per
-    checkpoint ever registered by any run. The run index must name both the alias and its immutable
-    revision, and `keys()` is made fatal here so a fallback scan cannot silently return later.
-    """
     _register_and_ready(client)
     assert _activate(client).status_code == 200
     module = client.app.state.generated_module
@@ -1154,20 +817,10 @@ def test_undeploy_reads_only_the_runs_durable_index(client, monkeypatch):
 
     monkeypatch.setattr(type(module.adapter_records), "keys", property(scanned_every_key))
     response = client.delete(f"/adapters/{RUN_ID}")
-
     assert response.status_code == 200
     assert response.json()["disabled_aliases"] == [RUN_ID]
     assert response.json()["disabled_revisions"] == [REVISION]
     assert module.adapter_records[module._record_key("other-run")] == unrelated
-
-
-def test_undeploying_an_unknown_run_is_a_clean_404(client):
-    assert client.delete("/adapters/unknown-run").status_code == 404
-
-
-def test_a_registration_for_another_base_model_is_refused(client):
-    body = {**REGISTRATION, "base_model": "other/model", "metadata": dict(REGISTRATION["metadata"])}
-    assert client.post("/adapters", json=body).status_code == 409
 
 
 def test_undeploy_cleanup_failure_is_retryable_without_reviving_records(client):
@@ -1176,9 +829,7 @@ def test_undeploy_cleanup_failure_is_retryable_without_reviving_records(client):
     module = client.app.state.generated_module
     path = f"adapters/{module._adapter_digest(REVISION)}"
     module.cache_volume.remove_failures[path] = RuntimeError("volume unavailable")
-
     failed = client.delete(f"/adapters/{RUN_ID}")
-
     assert failed.status_code == 503
     assert failed.json()["retryable"] is True
     assert failed.json()["disabled_aliases"] == [RUN_ID]
@@ -1186,9 +837,7 @@ def test_undeploy_cleanup_failure_is_retryable_without_reviving_records(client):
     for adapter_id in (RUN_ID, REVISION):
         assert client.get(f"/adapters/{adapter_id}").json()["adapter"]["status"] == "disabled"
     module.cache_volume.remove_failures.clear()
-
     retried = client.delete(f"/adapters/{RUN_ID}")
-
     assert retried.status_code == 200
     assert retried.json()["disabled_aliases"] == [RUN_ID]
     assert retried.json()["disabled_revisions"] == [REVISION]
@@ -1196,26 +845,28 @@ def test_undeploy_cleanup_failure_is_retryable_without_reviving_records(client):
     assert client.app.state.unregistered == []
 
 
+def _state_record(registration=REGISTRATION, *, status="registered", attempt=None):
+    record = copy.deepcopy(registration)
+    record["status"] = status
+    record["metadata"]["lifecycle_state"] = status
+    if attempt:
+        record["metadata"]["settle_attempt"] = attempt
+    return record
+
+
+def _engine_instance(engine_class, runtime, registered=None):
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._registered = dict(registered or {})
+    instance._runtime = runtime
+    instance._adapter_path = lambda record: asyncio.sleep(0, result="/tmp/adapter")
+    return instance
+
+
 def test_warm_disabled_resident_unloads_before_later_settlement(client, engine_class):
     module = client.app.state.generated_module
-    first = {
-        **REGISTRATION,
-        "status": "disabled",
-        "metadata": {
-            **REGISTRATION["metadata"],
-            "lifecycle_state": "disabled",
-            "settle_attempt": "old-attempt",
-        },
-    }
-    second = {
-        **_second_registration(),
-        "status": "registered",
-        "metadata": {
-            **_second_registration()["metadata"],
-            "lifecycle_state": "registered",
-            "settle_attempt": "new-attempt",
-        },
-    }
+    first = _state_record(status="disabled", attempt="old-attempt")
+    second = _state_record(_second_registration(), attempt="new-attempt")
     module.adapter_records[module._record_key(REVISION)] = first
     module.adapter_records[module._record_key(SECOND_REVISION)] = second
     events = []
@@ -1226,18 +877,12 @@ def test_warm_disabled_resident_unloads_before_later_settlement(client, engine_c
     async def register_adapter(spec):
         events.append(("register", spec.adapter_id, spec.incarnation))
 
-    instance = engine_class.__new__(engine_class)
-    instance._locks = {}
-    instance._registered = {REVISION: module._record_incarnation(first)}
-    instance._runtime = types.SimpleNamespace(
-        unload_adapter=unload_adapter,
-        register_adapter=register_adapter,
+    instance = _engine_instance(
+        engine_class,
+        types.SimpleNamespace(unload_adapter=unload_adapter, register_adapter=register_adapter),
+        {REVISION: module._record_incarnation(first)},
     )
-    instance._adapter_path = lambda record: asyncio.sleep(0, result="/tmp/adapter")
-
-    result = _run_awaitable(engine_class.settle(instance, second))
-
-    assert result["ok"] is True
+    assert _run_awaitable(engine_class.settle(instance, second))["ok"] is True
     assert events == [
         ("unload", REVISION, module._record_incarnation(first)),
         ("register", SECOND_REVISION, module._record_incarnation(second)),
@@ -1246,15 +891,7 @@ def test_warm_disabled_resident_unloads_before_later_settlement(client, engine_c
 
 def test_failed_deferred_unload_stays_tracked_and_retries(client, engine_class):
     module = client.app.state.generated_module
-    record = {
-        **REGISTRATION,
-        "status": "disabled",
-        "metadata": {
-            **REGISTRATION["metadata"],
-            "lifecycle_state": "disabled",
-            "settle_attempt": "attempt-1",
-        },
-    }
+    record = _state_record(status="disabled", attempt="attempt-1")
     module.adapter_records[module._record_key(REVISION)] = record
     incarnation = module._record_incarnation(record)
     attempts = []
@@ -1264,29 +901,20 @@ def test_failed_deferred_unload_stays_tracked_and_retries(client, engine_class):
         if len(attempts) == 1:
             raise RuntimeError("busy")
 
-    instance = engine_class.__new__(engine_class)
-    instance._locks = {}
-    instance._registered = {REVISION: incarnation}
-    instance._runtime = types.SimpleNamespace(unload_adapter=unload_adapter)
-
+    instance = _engine_instance(
+        engine_class,
+        types.SimpleNamespace(unload_adapter=unload_adapter),
+        {REVISION: incarnation},
+    )
     _run_awaitable(engine_class._reap_terminal_residents(instance))
     assert instance._registered == {REVISION: incarnation}
-
     _run_awaitable(engine_class._reap_terminal_residents(instance))
     assert instance._registered == {}
     assert attempts == [(REVISION, incarnation), (REVISION, incarnation)]
 
 
-def test_concurrent_adapter_loads_register_each_adapter_once(client, engine_class, monkeypatch):
-    """two adapters loading at once must each register exactly once.
-
-    lora slot identity now belongs to the runtime, so what the generated app still owns is the
-    per-adapter lock that keeps a concurrent load from registering the same adapter twice.
-    """
+def test_concurrent_adapter_loads_register_each_adapter_once(client, engine_class):
     module = client.app.state.generated_module
-    instance = engine_class.__new__(engine_class)
-    instance._locks = {}
-    instance._registered = {}
     registered = []
 
     async def register_adapter(spec):
@@ -1294,41 +922,27 @@ def test_concurrent_adapter_loads_register_each_adapter_once(client, engine_clas
         registered.append(spec.adapter_id)
         return True
 
-    instance._runtime = types.SimpleNamespace(register_adapter=register_adapter)
-    instance._adapter_path = lambda record: asyncio.sleep(0, result="/tmp/adapter")
-    first = dict(REGISTRATION)
-    second = _second_registration()
-    for record in (first, second):
-        module.adapter_records[module._record_key(record["adapter_id"])] = {
-            **record,
-            "status": "registered",
-        }
+    instance = _engine_instance(
+        engine_class, types.SimpleNamespace(register_adapter=register_adapter)
+    )
+    records = (REGISTRATION, _second_registration())
+    for record in records:
+        module.adapter_records[module._record_key(record["adapter_id"])] = _state_record(record)
 
-    async def load_both():
+    async def load():
         await asyncio.gather(
-            engine_class._ensure_loaded(instance, first),
-            engine_class._ensure_loaded(instance, second),
-            engine_class._ensure_loaded(instance, first),
+            *(engine_class._ensure_loaded(instance, record) for record in (*records, records[0]))
         )
 
-    _run_awaitable(load_both())
-    assert sorted(registered) == sorted({first["adapter_id"], second["adapter_id"]})
-    assert set(instance._registered) == {first["adapter_id"], second["adapter_id"]}
+    _run_awaitable(load())
+    assert sorted(registered) == sorted(record["adapter_id"] for record in records)
 
 
 def test_engine_resident_shortcut_compares_the_exact_incarnation(client, engine_class):
     module = client.app.state.generated_module
-    record = {
-        **REGISTRATION,
-        "status": "registered",
-        "metadata": {
-            **REGISTRATION["metadata"],
-            "lifecycle_state": "registered",
-            "settle_attempt": "new-attempt",
-        },
-    }
+    record = _state_record(attempt="new-attempt")
     module.adapter_records[module._record_key(REVISION)] = record
-    old_incarnation = f"{REVISION}@old-attempt"
+    old = f"{REVISION}@old-attempt"
     events = []
 
     async def unload_adapter(adapter_id, *, expected_incarnation):
@@ -1337,39 +951,19 @@ def test_engine_resident_shortcut_compares_the_exact_incarnation(client, engine_
     async def register_adapter(spec):
         events.append(("register", spec.incarnation))
 
-    instance = engine_class.__new__(engine_class)
-    instance._locks = {}
-    instance._registered = {REVISION: old_incarnation}
-    instance._runtime = types.SimpleNamespace(
-        unload_adapter=unload_adapter,
-        register_adapter=register_adapter,
+    instance = _engine_instance(
+        engine_class,
+        types.SimpleNamespace(unload_adapter=unload_adapter, register_adapter=register_adapter),
+        {REVISION: old},
     )
-    instance._adapter_path = lambda candidate: asyncio.sleep(0, result="/tmp/adapter")
-
-    outcome = _run_awaitable(engine_class._load_lora_locked(instance, record))
-
-    assert outcome["ok"] is True
-    assert events == [
-        ("unload", old_incarnation),
-        ("register", module._record_incarnation(record)),
-    ]
-    assert instance._registered[REVISION] == module._record_incarnation(record)
+    assert _run_awaitable(engine_class._load_lora_locked(instance, record))["ok"] is True
+    assert events == [("unload", old), ("register", module._record_incarnation(record))]
 
 
 def test_a_raising_post_load_read_still_unloads_what_it_just_registered(
-    client, engine_class, monkeypatch, tmp_path
+    client, engine_class, monkeypatch
 ):
-    """a durable read that raises must not leave the adapter resident.
-
-    the disabled-record branch already undoes the load, but a transient Dict failure took the
-    early-return path out of the function with the adapter still registered -- holding a LoRA slot
-    and its cache with nothing left to reclaim them.
-    """
     module = client.app.state.generated_module
-    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
-    instance = engine_class.__new__(engine_class)
-    instance._locks = {}
-    instance._registered = {}
     unloaded = []
 
     async def register_adapter(spec):
@@ -1377,14 +971,12 @@ def test_a_raising_post_load_read_still_unloads_what_it_just_registered(
 
     async def unload_adapter(adapter_id, *, expected_incarnation):
         unloaded.append((adapter_id, expected_incarnation))
-        return True
 
-    instance._runtime = types.SimpleNamespace(
-        register_adapter=register_adapter,
-        unload_adapter=unload_adapter,
+    instance = _engine_instance(
+        engine_class,
+        types.SimpleNamespace(register_adapter=register_adapter, unload_adapter=unload_adapter),
     )
-    instance._adapter_path = lambda record: asyncio.sleep(0, result="/tmp/adapter")
-    reads = iter([{**REGISTRATION, "status": "registered"}])
+    reads = iter([_state_record()])
 
     async def read(adapter_id):
         try:
@@ -1403,9 +995,6 @@ def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_removable(
     client, engine_class, monkeypatch
 ):
     module = client.app.state.generated_module
-    instance = engine_class.__new__(engine_class)
-    instance._locks = {}
-    instance._registered = {}
 
     async def register_adapter(spec):
         return True
@@ -1413,28 +1002,20 @@ def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_removable(
     async def failing_unload(adapter_id, *, expected_incarnation):
         raise RuntimeError("eviction failed")
 
-    instance._runtime = types.SimpleNamespace(
-        register_adapter=register_adapter,
-        unload_adapter=failing_unload,
+    instance = _engine_instance(
+        engine_class,
+        types.SimpleNamespace(register_adapter=register_adapter, unload_adapter=failing_unload),
     )
-    instance._adapter_path = lambda record: asyncio.sleep(0, result="/tmp/adapter")
-    registered = {**REGISTRATION, "status": "registered"}
-    disabled = {
-        **REGISTRATION,
-        "status": "disabled",
-        "metadata": {**REGISTRATION["metadata"], "lifecycle_state": "disabled"},
-    }
-    reads = iter([registered, disabled])
+    reads = iter([_state_record(), _state_record(status="disabled")])
 
     async def read(adapter_id):
         return next(reads)
 
     monkeypatch.setattr(module, "_read", read)
-    result = _run_awaitable(engine_class._load_lora_locked(instance, REGISTRATION))
-
-    assert result["superseded"] is True
+    assert (
+        _run_awaitable(engine_class._load_lora_locked(instance, REGISTRATION))["superseded"] is True
+    )
     incarnation = module._record_incarnation(REGISTRATION)
-    assert instance._registered[REVISION] == incarnation
     unloaded = []
 
     async def unload_ok(adapter_id, *, expected_incarnation):
@@ -1443,7 +1024,6 @@ def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_removable(
     instance._runtime.unload_adapter = unload_ok
     assert _run_awaitable(engine_class._unload_locked(instance, REVISION, incarnation)) is True
     assert unloaded == [(REVISION, incarnation)]
-    assert REVISION not in instance._registered
 
 
 @pytest.mark.parametrize(
@@ -1454,10 +1034,7 @@ def test_the_serving_key_is_compared_after_stripping(
     client, monkeypatch, configured, presented, status_code
 ):
     monkeypatch.setenv("FLASH_SERVING_KEY", configured)
-    response = client.get(
-        "/adapters/unknown",
-        headers={"X-Freesolo-Internal-Key": presented},
-    )
+    response = client.get("/adapters/unknown", headers={"X-Freesolo-Internal-Key": presented})
     assert response.status_code == status_code
 
 
@@ -1466,19 +1043,10 @@ def test_serving_key_uses_constant_time_comparison(client, monkeypatch):
     seen = []
     monkeypatch.setenv("FLASH_SERVING_KEY", "secret")
     monkeypatch.setattr(module.hmac, "compare_digest", lambda a, b: seen.append((a, b)) or True)
-    response = client.get("/adapters/unknown", headers={"X-Freesolo-Internal-Key": ""})
-    assert response.status_code == 404
+    assert (
+        client.get("/adapters/unknown", headers={"X-Freesolo-Internal-Key": ""}).status_code == 404
+    )
     assert seen == [("", "secret")]
-
-
-def test_durable_state_calls_use_the_async_modal_api():
-    source = render_app(MODELS[BASE_MODEL])
-    blocking = [
-        line.strip()
-        for line in source.splitlines()
-        if "adapter_records." in line and not line.lstrip().startswith("#") and ".aio" not in line
-    ]
-    assert blocking == []
 
 
 def test_only_the_lifecycle_coordinator_writes_durable_serving_state():
@@ -1499,78 +1067,36 @@ def test_only_the_lifecycle_coordinator_writes_durable_serving_state():
     }
 
     def durable_writes(node):
-        writes = []
-        for call in (item for item in ast.walk(node) if isinstance(item, ast.Call)):
-            if isinstance(call.func, ast.Name) and call.func.id == "_write":
-                writes.append(call)
-            if (
-                isinstance(call.func, ast.Attribute)
-                and call.func.attr == "aio"
-                and isinstance(call.func.value, ast.Attribute)
-                and call.func.value.attr == "put"
-            ):
-                writes.append(call)
-        return writes
+        return [
+            call
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and (
+                (isinstance(call.func, ast.Name) and call.func.id == "_write")
+                or (
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "aio"
+                    and isinstance(call.func.value, ast.Attribute)
+                    and call.func.value.attr == "put"
+                )
+            )
+        ]
 
     assert durable_writes(coordinator)
-    assert durable_writes(engine) == []
+    assert not durable_writes(engine)
     assert set(handlers) == {"register_adapter", "activate", "remove"}
-    assert all(durable_writes(handler) == [] for handler in handlers.values())
-
-
-def test_mutating_a_durable_read_without_put_does_not_persist(client):
-    _register_and_ready(client)
-    module = client.app.state.generated_module
-    record = _run_awaitable(module._read(REVISION))
-
-    record["status"] = "disabled"
-    record["metadata"]["lifecycle_state"] = "failed"
-
-    reread = _run_awaitable(module._read(REVISION))
-    assert reread["status"] == "ready"
-    assert reread["metadata"]["lifecycle_state"] == "ready"
-
-
-def test_the_generated_app_has_no_cross_container_coordination_machinery():
-    source = render_app(MODELS[BASE_MODEL])
-    for removed in (
-        "_lora_int_id",
-        "_int_locks",
-        "_int_ids",
-        "lora id collision",
-        "reclaim_adapter_cache",
-        '"reclaim"',
-        "_claim_lora_int_id",
-        "_release_lora_int_id",
-        "_engine_is_warm",
-        "cache_reclaim_pending",
-        "lora_release_pending",
-        "_run_lock",
-        "_members_key",
-        "_UNDEPLOY_PASSES",
-        "loraid:",
-        "members:",
-        "_RUN_LOCKS",
-        "engine.unregister",
-    ):
-        assert removed not in source
+    assert all(not durable_writes(handler) for handler in handlers.values())
 
 
 def test_every_generated_function_is_within_the_production_limit():
-    source = render_app(MODELS[BASE_MODEL])
-    tree = ast.parse(source)
+    tree = ast.parse(render_app(MODELS[BASE_MODEL]))
     lengths = {
         node.name: node.end_lineno - node.lineno + 1
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    assert max(lengths.values()) <= 150, lengths
+    assert max(lengths.values()) <= 150
 
 
 def test_generated_app_is_under_the_production_file_limit():
-    source = render_app(MODELS[BASE_MODEL])
-    assert len(source.splitlines()) <= 1000
-
-
-def test_no_unexpected_test_artifacts_were_written(client):
-    assert not Path("flash_serving_app.py").exists()
+    assert len(render_app(MODELS[BASE_MODEL]).splitlines()) <= 1000

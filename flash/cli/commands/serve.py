@@ -1,10 +1,4 @@
-"""`flash serve`: stand up a serving backend you own, on your own Modal account.
-
-`flash models deploy` / `chat` / `undeploy` talk to a serving backend over HTTP. On the hosted
-plane that backend is Freesolo's; a self-hosted plane has none, so those commands dead-end. These
-commands generate one from the catalog's validated serving config, deploy it to the user's Modal
-account, and print the environment variable that connects the two.
-"""
+"""Generate, inspect, and stop a self-hosted Modal serving backend."""
 
 from __future__ import annotations
 
@@ -27,10 +21,7 @@ from flash.serve.probe import probe_serving_key, redacted_error, request_json
 
 DEFAULT_APP_FILE = "flash_serving_app.py"
 SECRET_NAME = "flash-serving"
-# The console script that runs the control plane (pyproject `[project.scripts]`). Deploy, chat and
-# undeploy are its routes, so it -- not this CLI -- is what has to see the serving variables.
 SERVER_NAME = "flash-server"
-# Modal prints the deployed web endpoint on stdout; this is the prefix we look for.
 _URL_MARKER = "https://"
 
 
@@ -52,11 +43,6 @@ def _modal_cli() -> str | None:
 
 
 def _modal_is_authenticated() -> bool:
-    """Whether the local modal CLI has credentials.
-
-    Checked before generating anything: finding out at `modal deploy` time means the user has
-    already been told the app was written and is about to be deployed.
-    """
     try:
         done = subprocess.run(
             ["modal", "profile", "current"],
@@ -97,28 +83,20 @@ def _confirm(prompt: str) -> bool:
 
 
 def cmd_serve_setup(args) -> int:
-    """Generate a Modal serving app for a model and, with consent, deploy it."""
     info = _require_model(args.model)
     serving = getattr(info, "serving", None)
     if serving is None or not isinstance(serving.gpu, str) or not serving.gpu.strip():
         return _err(f"{info.id} has no validated serving GPU in the flash catalog")
     gpu = serving.gpu
-
     destination = Path(getattr(args, "output", None) or DEFAULT_APP_FILE).resolve()
     dry_run = bool(getattr(args, "dry_run", False))
-    # Before writing anything. The instructions below end with "re-run this command", and a file
-    # written on the way out is exactly what makes that re-run fail with FileExistsError. `--dry-run`
-    # deploys nothing, so it does not need Modal at all.
     if not dry_run and (_modal_cli() is None or not _modal_is_authenticated()):
         print(_setup_instructions(), file=sys.stderr)
         return 1
-
     try:
         write_app(
             info,
             destination,
-            # `is None`, not `or`: 0 must reach validation and be rejected rather than silently
-            # rewritten to the default.
             scaledown_window=(
                 DEFAULT_SCALEDOWN_WINDOW
                 if getattr(args, "scaledown_window", None) is None
@@ -131,27 +109,17 @@ def cmd_serve_setup(args) -> int:
         return _err(str(exc))
     except ValueError as exc:
         return _err(str(exc))
-    # Every other filesystem refusal: --output naming an existing directory, an unwritable parent,
-    # a read-only volume, no space. These reach the top-level handler otherwise, which re-raises on
-    # the non-styled path, so an ordinary permissions problem prints a traceback instead of the
-    # `error:` line every other failure in this command produces. Listed after FileExistsError,
-    # which is an OSError subclass and keeps its own more specific message.
     except OSError as exc:
         return _err(f"could not write {destination}: {exc}")
     print(f"wrote {destination}")
     print(f"  model  {info.id}")
     print(f"  gpu    {gpu}")
-
     if dry_run:
-        # Quoted, because this line is meant to be COPIED into a shell. `--output` accepts any
-        # writable path, and one containing a space splits into two arguments when pasted -- so the
-        # instruction for deploying the file we just wrote fails to deploy it.
         print(
             f"\ndry run: not deploying. deploy it yourself with:\n"
             f"  modal deploy {shlex.quote(str(destination))}"
         )
         return 0
-
     if not getattr(args, "yes", False):
         prompt = (
             f"deploy {destination.name} to Modal now? "
@@ -163,12 +131,10 @@ def cmd_serve_setup(args) -> int:
                 file=sys.stderr,
             )
             return 1
-
     return _deploy(destination)
 
 
 def _deploy(app_file: Path) -> int:
-    """Run `modal deploy` and surface the URL flash needs."""
     try:
         done = subprocess.run(
             ["modal", "deploy", str(app_file)],
@@ -198,14 +164,6 @@ def _deploy(app_file: Path) -> int:
 
 
 def _control_plane_instructions(url: str) -> str:
-    """Where the serving variables have to be set.
-
-    `models deploy`/`chat`/`undeploy` are CONTROL PLANE operations: the CLI calls the server, and
-    the server's routes are what read FREESOLO_SERVING_URL and contact the backend. Exporting it
-    in the shell that ran `serve setup` reaches the CLI and not the server, so following that
-    instruction leaves every deploy failing on an unset serving URL -- with a setup transcript
-    that looked complete.
-    """
     return (
         f"Set these in the environment of your {SERVER_NAME} process -- not just this shell. "
         f"{SERVER_NAME} reads its process environment, so an already-running server needs a "
@@ -218,11 +176,6 @@ def _control_plane_instructions(url: str) -> str:
 
 
 def _deployed_url(output: str) -> str:
-    """The web endpoint URL from modal's deploy output.
-
-    Modal prints several URLs (the dashboard app page among them); the serving endpoint is the
-    one on modal.run, so match on that rather than taking the first link.
-    """
     for token in output.replace(",", " ").split():
         candidate = token.strip().rstrip(".)>\"'")
         if candidate.startswith(_URL_MARKER) and ".modal.run" in candidate:
@@ -231,7 +184,6 @@ def _deployed_url(output: str) -> str:
 
 
 def cmd_serve_status(args) -> int:
-    """Check the configured serving backend and report what it supports."""
     from flash.serve.errors import ServingError
     from flash.serve.urls import displayable_url, internal_key_header, serving_base_url
 
@@ -258,7 +210,6 @@ def cmd_serve_status(args) -> int:
         if exc.code == "non_object":
             return _err(f"serving backend at {shown} returned a non-object /healthz payload")
         return _err(f"serving backend at {shown} did not return capabilities as a list of strings")
-
     print(f"serving:      {shown}")
     print(f"base models:  {', '.join(health.base_models) or '-'}")
     print(f"capabilities: {', '.join(health.capabilities) or '-'}")
@@ -280,7 +231,6 @@ def cmd_serve_status(args) -> int:
 
 
 def _verify_serving_key(base: str, shown: str, headers: dict[str, str]) -> int:
-    """Exercise the configured key and explicitly dispatch the probe's HTTP status."""
     try:
         result = probe_serving_key(base, headers)
     except Exception as exc:
@@ -289,7 +239,6 @@ def _verify_serving_key(base: str, shown: str, headers: dict[str, str]) -> int:
             file=sys.stderr,
         )
         return 1
-
     code = result.status_code
     if code in (401, 403):
         print(
@@ -328,7 +277,6 @@ def _verify_serving_key(base: str, shown: str, headers: dict[str, str]) -> int:
 
 
 def cmd_serve_teardown(args) -> int:
-    """Stop the Modal app so it holds no resources."""
     info = _require_model(args.model)
     app = app_name_for(info.id)
     if _modal_cli() is None:

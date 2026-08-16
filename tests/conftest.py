@@ -1,5 +1,4 @@
 """Offline-by-default test harness.
-
 Autouse fixtures stub production network boundaries; later test patches still win. Freesolo auth
 is not stubbed globally because client tests use a real loopback server.
 """
@@ -12,22 +11,10 @@ import shlex
 
 import pytest
 
-# A revision-shaped value that names no commit. 40 hex chars because that is the grammar flash's
-# immutable adapter ids are built from -- which is exactly why it is REJECTED rather than used as a
-# default: it satisfies the id grammar while being unresolvable to download.
 PLACEHOLDER_HF_REVISION = "0" * 40
 
 
 def _positive_finite_seconds(raw: str) -> float:
-    """A readiness budget `_wait_ready` can actually reach the end of.
-
-    `type=float` accepts `nan` and `inf`, and neither produces a bounded run. Every comparison
-    against a NaN deadline is false, so the loop never sees it expire AND its sleep bound collapses
-    to zero -- the suite spins on a backend stuck at `registered` instead of failing. An infinite
-    deadline hangs the same way, more obviously. Zero and negatives are refused too: they make the
-    budget expire before the first poll, so the suite reports a timeout no backend could have
-    avoided.
-    """
     try:
         value = float(raw)
     except ValueError:
@@ -42,13 +29,6 @@ def _positive_finite_seconds(raw: str) -> float:
 
 
 def pytest_addoption(parser):
-    """Register the serving-conformance flags.
-
-    Here rather than in `tests/serving_conformance/conftest.py` because pytest only calls this hook
-    on INITIAL conftests -- the ones on the invocation's own path. Registered in the subdirectory,
-    `--serving-url` is an unrecognized-argument ERROR for every invocation that does not name that
-    directory explicitly, including a bare `pytest`.
-    """
     group = parser.getgroup("serving conformance")
     group.addoption(
         "--serving-url",
@@ -77,24 +57,12 @@ def pytest_addoption(parser):
     )
     group.addoption(
         "--conformance-repo-type",
-        # None, NOT "dataset". `_option` reads the flag first and falls back to the environment
-        # only when the flag is falsy, so a nonempty argparse default wins unconditionally and
-        # makes FLASH_CONFORMANCE_REPO_TYPE inert -- an operator who exports `model` still
-        # registers the artifact as a dataset, and it fails to load on a model repo. The default
-        # is applied in the fixture instead, after the environment has had its turn.
         default=None,
         help="repo_type sent at registration (default: dataset, matching flash)",
     )
     group.addoption(
         "--conformance-ready-timeout",
         type=_positive_finite_seconds,
-        # The CLIENT's budget, not a generous one. A suite that waits longer certifies a backend
-        # `flash models deploy` cannot actually drive, and one that waits less fails a backend the
-        # client would have accepted. The client's budget is not a constant: it scales with base
-        # model size, so the default is left unset here and derived per-model from
-        # `revision_ready_budget_seconds` at the point the base model is known. Raising it is a
-        # deliberate act (a first cold start pulling weights can exceed it), which is what the flag
-        # is for -- but the DEFAULT has to be the contract the client enforces.
         default=None,
         help=(
             "seconds to wait for a revision to reach ready "
@@ -501,7 +469,6 @@ def _child_subreaper_does_not_leak_between_tests():
 
 @pytest.fixture(autouse=True)
 def _fast_serving_readback(monkeypatch):
-    """Zero the deploy read-back backoff so verification polls don't slow the suite."""
     import flash.serve.deploy as _deploy
 
     monkeypatch.setattr(_deploy, "READBACK_DELAY_SECONDS", 0.0)

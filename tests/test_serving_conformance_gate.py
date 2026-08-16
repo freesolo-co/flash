@@ -1,5 +1,4 @@
 """The conformance suite's opt-in gate.
-
 The suite itself only runs against a live backend, so nothing in the offline run exercises the
 decision it makes about incomplete input. That decision is the whole reason a conformance run can
 be trusted: a green exit has to mean the contract was checked, not that the checks were skipped.
@@ -15,10 +14,7 @@ from tests.conftest import PLACEHOLDER_HF_REVISION
 from tests.serving_conformance import conftest as gate
 
 _ADAPTER_SOURCE = gate.adapter_source._get_wrapped_function()
-# `pytest.fail` raises Failed, which derives from BaseException -- `pytest.raises(Exception)` does
-# NOT catch it, and the test would report the very failure it is asserting on.
 _FAILED = pytest.fail.Exception
-
 _COMPLETE = {
     "--conformance-repo": "acme/artifacts",
     "--conformance-subfolder": "sft/run-abc/adapter",
@@ -29,11 +25,6 @@ _COMPLETE = {
 
 
 def _request(options: dict, monkeypatch) -> types.SimpleNamespace:
-    """A pytest request whose options are `options` and whose environment is empty.
-
-    The environment is cleared because the fixture falls back to `FLASH_CONFORMANCE_*` variables,
-    and a developer who has them exported would otherwise see a different answer than CI.
-    """
     for name in (
         "FLASH_CONFORMANCE_REPO",
         "FLASH_CONFORMANCE_SUBFOLDER",
@@ -49,17 +40,7 @@ def _request(options: dict, monkeypatch) -> types.SimpleNamespace:
 
 @pytest.mark.parametrize("missing", sorted(set(_COMPLETE) - {"--conformance-repo-type"}))
 def test_an_incomplete_conformance_run_fails_rather_than_skipping(missing, monkeypatch):
-    """`--serving-url` was passed, so a missing adapter is an error, not a reason to skip.
-
-    Skipped, the run still exits 0 having checked only /healthz and the 404s -- nothing of
-    registration, readiness, activation, chat, or teardown. That green exit is worse than no run at
-    all, because it is reported as the contract passing.
-    """
     options = {flag: value for flag, value in _COMPLETE.items() if flag != missing}
-    # Caught as BaseException and classified by hand, NOT with `pytest.raises(_FAILED)`. Both
-    # `pytest.fail` and `pytest.skip` raise BaseException subclasses, so a `raises(Failed)` here
-    # would let the Skipped propagate and SKIP this test -- exit 0, regression invisible, which is
-    # the same false-green this test exists to prevent.
     try:
         _ADAPTER_SOURCE(_request(options, monkeypatch))
     except BaseException as exc:  # classified below, never swallowed
@@ -74,11 +55,6 @@ def test_an_incomplete_conformance_run_fails_rather_than_skipping(missing, monke
 
 
 def test_a_placeholder_commit_is_refused(monkeypatch):
-    """The placeholder satisfies the revision-id grammar, so only an explicit check catches it.
-
-    Left in, registration fails minutes later on the GPU as an unresolvable commit rather than here
-    as the missing argument it is.
-    """
     options = {**_COMPLETE, "--conformance-hf-revision": PLACEHOLDER_HF_REVISION}
     try:
         _ADAPTER_SOURCE(_request(options, monkeypatch))
@@ -92,7 +68,6 @@ def test_a_placeholder_commit_is_refused(monkeypatch):
 
 
 def test_a_complete_invocation_is_accepted(monkeypatch):
-    """The guard above must not reject a run that supplied everything."""
     source = _ADAPTER_SOURCE(_request(dict(_COMPLETE), monkeypatch))
     assert source["repo_id"] == "acme/artifacts"
     assert source["hf_revision"] == _COMPLETE["--conformance-hf-revision"]
@@ -103,13 +78,6 @@ _READY_TIMEOUT = gate.ready_timeout._get_wrapped_function()
 
 
 def test_the_readiness_default_tracks_the_clients_own_budget(monkeypatch):
-    """The default must be the budget `flash models deploy` actually enforces, not a constant.
-
-    That budget scales with base-model size, so a fixed default is wrong in both directions: too
-    small fails a backend the client would have driven to ready, too large certifies one the client
-    abandons. Asserting against `revision_ready_budget_seconds` rather than a literal is what keeps
-    the two from drifting -- a hardcoded number here would still pass if the client's budget moved.
-    """
     from flash.serve.deploy import revision_ready_budget_seconds
 
     for base_model in ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-35B-A3B"):
@@ -119,6 +87,5 @@ def test_the_readiness_default_tracks_the_clients_own_budget(monkeypatch):
 
 
 def test_an_explicit_readiness_override_still_wins(monkeypatch):
-    # a first cold start pulling weights can exceed the client budget, which is what the flag is for.
     request = _request({"--conformance-ready-timeout": 42.0}, monkeypatch)
     assert _READY_TIMEOUT(request, {"base_model": "Qwen/Qwen3.5-4B"}) == 42.0

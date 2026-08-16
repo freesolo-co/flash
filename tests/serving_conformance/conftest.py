@@ -1,9 +1,7 @@
 """Opt-in gate and shared client for the serving conformance suite.
-
 The suite runs `docs/serving-contract.md` against a REAL backend, so it is skipped entirely unless
 `--serving-url` names one. That keeps it free in the offline run while making one command the
 answer to "does my backend work with flash".
-
 It WRITES: registering, activating, and deleting adapters are real state changes. Point it at a
 backend you own.
 """
@@ -19,11 +17,6 @@ import pytest
 from tests.conftest import PLACEHOLDER_HF_REVISION
 
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
-
-# `pytest_addoption` for these flags lives in `tests/conftest.py`, not here: pytest only calls that
-# hook on INITIAL conftests, so registering it in this subdirectory makes `--serving-url` an
-# unrecognized-argument error for every invocation that does not name this directory explicitly
-# (including a bare `pytest`, which resolves testpaths to `tests`).
 
 
 def _option(request, name: str, env: str, default: str | None = None) -> str | None:
@@ -41,20 +34,14 @@ def serving_url(request) -> str:
 
 @pytest.fixture(scope="session")
 def internal_key() -> str:
-    """The key every request carries. Absent is legitimate: a local backend may not require one."""
     return (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
 
 
 @pytest.fixture(scope="session")
 def adapter_source(request) -> dict:
-    """The real artifact to register. Every field has to be right or the backend cannot load it."""
     repo_id = _option(request, "--conformance-repo", "FLASH_CONFORMANCE_REPO")
     subfolder = _option(request, "--conformance-subfolder", "FLASH_CONFORMANCE_SUBFOLDER")
     base_model = _option(request, "--conformance-base-model", "FLASH_CONFORMANCE_BASE_MODEL")
-    # Required, not defaulted. It is the commit the backend downloads AND the suffix of the
-    # revision id, so the placeholder shape satisfies the grammar while naming a commit that does
-    # not exist -- registration would fail minutes later, on the GPU, as an unresolvable revision
-    # rather than as the missing argument it actually is.
     hf_revision = _option(request, "--conformance-hf-revision", "FLASH_CONFORMANCE_HF_REVISION")
     missing = [
         flag
@@ -67,11 +54,6 @@ def adapter_source(request) -> dict:
         if not value
     ]
     if missing:
-        # Fail, do not skip. `--serving-url` was passed, so the suite is explicitly ON, and skipping
-        # here leaves only /healthz and the 404 checks running -- a green exit that proves none of
-        # registration, readiness, activation, chat, or teardown. The shorter command in
-        # docs/serving-contract.md lands exactly here, so the skip made the documented invocation
-        # silently vacuous.
         pytest.fail(
             f"serving conformance needs a real adapter to register; missing {missing}. "
             f"Without one the suite can only check /healthz, which does not prove the contract. "
@@ -95,12 +77,6 @@ def adapter_source(request) -> dict:
 
 @pytest.fixture(scope="session")
 def ready_timeout(request, adapter_source) -> float:
-    """How long a revision may take to reach ready, matching what the shipped client allows.
-
-    The client's budget scales with base-model size, so a fixed default would certify the wrong
-    thing in both directions: too small fails a backend `flash models deploy` would have driven,
-    too large passes one it would abandon. An explicit `--conformance-ready-timeout` still wins.
-    """
     from flash.serve.deploy import revision_ready_budget_seconds
 
     override = request.config.getoption("--conformance-ready-timeout")
@@ -110,12 +86,6 @@ def ready_timeout(request, adapter_source) -> float:
 
 
 def _require_httpx() -> None:
-    """FAILS rather than skips.
-
-    Reaching a client fixture means the suite was explicitly enabled with --serving-url, and a skip
-    there is a false green: pytest exits 0 having checked not one endpoint, which reads as "the
-    backend conforms". The whole point of this suite is that its green means something.
-    """
     try:
         import httpx  # noqa: F401
     except ImportError as exc:
@@ -126,16 +96,6 @@ def _require_httpx() -> None:
 
 
 def _build_client(serving_url, internal_key):
-    """One client shape for the whole suite, so no caller can drift from the shipped one.
-
-    Factored out rather than inlined in the `http` fixture because the concurrency test cannot use
-    that fixture: it is session-scoped and shared, and driving one client from two threads would
-    test httpx's connection pool as much as the backend's locking. Building its own was correct;
-    building a DIFFERENT one was not -- a bare client has neither `follow_redirects` nor the
-    key-stripping hook, so it failed a Modal backend on the 303 the real client follows, and would
-    have carried the plane credential across an off-origin redirect the fixture is careful to
-    strip.
-    """
     import httpx
 
     headers = {"X-Freesolo-Internal-Key": internal_key} if internal_key else {}
@@ -146,24 +106,11 @@ def _build_client(serving_url, internal_key):
     target = _origin(httpx.URL(serving_url))
 
     def _strip_key_off_origin(request) -> None:
-        # The same hook the shipped client installs, for the same reason: httpx strips only
-        # `Authorization` and `Cookie` across an origin change, so the plane credential rides a
-        # custom header straight to whatever host a redirect names. Following redirects without
-        # this would make the suite leak the key that a real deploy would not.
         if "X-Freesolo-Internal-Key" not in request.headers:
             return
         if _origin(request.url) != target:
             del request.headers["X-Freesolo-Internal-Key"]
 
-    # follow_redirects mirrors `_new_serving_client`. Modal answers a slow registration, chat, or
-    # delete with a 303 to a same-origin async-result poll url, and the shipped client follows it;
-    # a suite that does not would see the bare 303 and fail a backend that `flash models deploy`
-    # drives successfully -- the suite rejecting behavior the client handles.
-    # 60s, matching `_serving_request`'s hard `min(60.0, ...)` clamp rather than exceeding it.
-    # Registration, activation and deletion all go through that clamp in the shipped client, so a
-    # 120s default here accepts a backend that handles `POST /adapters` synchronously for 90s --
-    # which a real deploy abandons at 60s, and whose recovery read then sees 404. Readiness polling
-    # passes its own explicit per-request timeout, so this default does not bound that.
     return httpx.Client(
         base_url=serving_url,
         headers=headers,
@@ -174,32 +121,16 @@ def _build_client(serving_url, internal_key):
     )
 
 
-# What the shipped chat clients allow per request. `flash/serve/deploy.py` bounds a non-streaming
-# completion with `30 * 60.0` and the streaming path with the same budget, while every control-plane
-# call goes through `_serving_request`'s hard `min(60.0, ...)` clamp. The suite's session client
-# carries the 60s cap, which is right for register/activate/delete and wrong for generation: a first
-# completion after a scale-to-zero cold start routinely takes minutes, and a 60s bound here failed a
-# backend that `flash models chat` waits out successfully.
 CHAT_REQUEST_TIMEOUT_SECONDS = 30 * 60.0
 
 
 @pytest.fixture(scope="session")
 def chat_timeout():
-    """The per-request timeout every conformance chat call must use.
-
-    Separate from the session client's default on purpose: keeping the 60s cap for control-plane
-    requests is what makes the suite reject a backend the client would abandon, so this widens only
-    the generation calls rather than the client as a whole.
-    """
     return CHAT_REQUEST_TIMEOUT_SECONDS
 
 
 @pytest.fixture(scope="session")
 def serving_client_factory(serving_url, internal_key):
-    """Build a fresh client with the suite's shipped-client shape.
-
-    For the concurrency test, which needs one client per thread rather than the shared session one.
-    """
     _require_httpx()
 
     def _factory():
@@ -210,7 +141,6 @@ def serving_client_factory(serving_url, internal_key):
 
 @pytest.fixture(scope="session")
 def http(serving_url, internal_key):
-    """A client bound to the target, carrying the internal key exactly as flash sends it."""
     _require_httpx()
     with _build_client(serving_url, internal_key) as client:
         yield client
@@ -218,10 +148,4 @@ def http(serving_url, internal_key):
 
 @pytest.fixture
 def run_id() -> str:
-    """A fresh run id per test.
-
-    Aliases and revisions are permanent records on the target, so reusing one id across tests would
-    make each run depend on the leftovers of the last. The suffix keeps it inside flash's run-id
-    grammar while staying unique.
-    """
     return f"conformance-{uuid.uuid4().hex[:12]}"

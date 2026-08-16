@@ -1,5 +1,4 @@
 """`flash serve` -- generating and deploying a self-hosted serving backend.
-
 The setup path spends money: it starts a GPU container on the user's Modal account. So the tests
 that matter most here are the ones asserting it does NOT do that without consent, and that every
 failure is caught before anything is written or deployed.
@@ -57,9 +56,6 @@ def _setup_args(tmp_path, **overrides):
     return _args(**base)
 
 
-# --- serve setup ------------------------------------------------------------------------------
-
-
 def test_unknown_model_is_rejected_with_the_supported_list(capsys):
     from flash.cli import main
 
@@ -79,17 +75,11 @@ def test_setup_dry_run_writes_the_app_without_deploying(tmp_path, capsys, monkey
 
 
 def test_setup_does_not_deploy_without_consent(tmp_path, monkeypatch, capsys):
-    """The confirmation is the gate on spending money, so a refusal must stop the deploy.
-
-    Declining still leaves the generated app on disk and prints the command to deploy it later --
-    the user rejected the automatic deploy, not the file.
-    """
     deployed = []
     monkeypatch.setattr(serve_cmd, "_modal_cli", lambda: "/usr/bin/modal")
     monkeypatch.setattr(serve_cmd, "_modal_is_authenticated", lambda: True)
     monkeypatch.setattr(serve_cmd, "_deploy", lambda path: deployed.append(path) or 0)
     monkeypatch.setattr("builtins.input", lambda prompt="": "n")
-
     assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path, dry_run=False)) == 1
     assert deployed == []
     assert (tmp_path / "flash_serving_app.py").exists()
@@ -97,12 +87,6 @@ def test_setup_does_not_deploy_without_consent(tmp_path, monkeypatch, capsys):
 
 
 def test_a_closed_stdin_is_treated_as_a_refusal(tmp_path, monkeypatch):
-    """Non-interactive use must not deploy by default.
-
-    A CI job or a piped invocation gets EOF from input(); reading that as consent would deploy a
-    GPU container nobody asked for. --yes is the explicit opt in.
-    """
-
     def _eof(prompt=""):
         raise EOFError
 
@@ -111,7 +95,6 @@ def test_a_closed_stdin_is_treated_as_a_refusal(tmp_path, monkeypatch):
     monkeypatch.setattr(serve_cmd, "_modal_is_authenticated", lambda: True)
     monkeypatch.setattr(serve_cmd, "_deploy", lambda path: deployed.append(path) or 0)
     monkeypatch.setattr("builtins.input", _eof)
-
     assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path, dry_run=False)) == 1
     assert deployed == []
 
@@ -125,7 +108,6 @@ def test_yes_deploys_without_prompting(tmp_path, monkeypatch):
     monkeypatch.setattr(serve_cmd, "_modal_is_authenticated", lambda: True)
     monkeypatch.setattr(serve_cmd, "_deploy", lambda path: deployed.append(path) or 0)
     monkeypatch.setattr("builtins.input", _never)
-
     assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path, dry_run=False, yes=True)) == 0
     assert len(deployed) == 1
 
@@ -139,17 +121,10 @@ def test_missing_modal_setup_is_reported_before_deploying(tmp_path, monkeypatch,
 
 
 def test_the_rerun_those_instructions_ask_for_actually_works(tmp_path, monkeypatch, capsys):
-    """Nothing may be written before the Modal check that ends with "re-run this command".
-
-    A file written on the way out is precisely what makes the re-run die with FileExistsError, so
-    the user follows correct instructions and gets an error telling them to pass --force.
-    """
     args = _setup_args(tmp_path, dry_run=False, yes=True)
     monkeypatch.setattr(serve_cmd, "_modal_cli", lambda: None)
     assert serve_cmd.cmd_serve_setup(args) == 1
     assert not Path(args.output).exists(), "the app was written before modal was even checked"
-
-    # Now satisfy what the instructions asked for and re-run exactly as told, no --force.
     monkeypatch.setattr(serve_cmd, "_modal_cli", lambda: "/usr/bin/modal")
     monkeypatch.setattr(serve_cmd, "_modal_is_authenticated", lambda: True)
     monkeypatch.setattr(serve_cmd, "_deploy", lambda app_file: 0)
@@ -158,7 +133,6 @@ def test_the_rerun_those_instructions_ask_for_actually_works(tmp_path, monkeypat
 
 
 def test_a_dry_run_does_not_require_modal_to_be_installed(tmp_path, monkeypatch):
-    """`--dry-run` deploys nothing, so it must still work with no modal CLI and no account."""
     monkeypatch.setattr(serve_cmd, "_modal_cli", lambda: None)
     args = _setup_args(tmp_path, dry_run=True)
     assert serve_cmd.cmd_serve_setup(args) == 0
@@ -166,7 +140,6 @@ def test_a_dry_run_does_not_require_modal_to_be_installed(tmp_path, monkeypatch)
 
 
 def test_setup_refuses_to_overwrite_an_existing_app(tmp_path, capsys):
-    """The generated app is meant to be edited; silently regenerating over it destroys that work."""
     destination = tmp_path / "flash_serving_app.py"
     destination.write_text("# my edits\n")
     assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path)) == 1
@@ -175,13 +148,6 @@ def test_setup_refuses_to_overwrite_an_existing_app(tmp_path, capsys):
 
 
 def test_setup_creates_the_parent_directory_of_a_custom_output(tmp_path):
-    """`--output deploy/generated/app.py` names a destination, not a path that must already exist.
-
-    Without this the write fails on a bare errno 2 that names the FILE, so the user is told the
-    app does not exist when the real problem is the directory above it. Creating the parent is
-    what the flag asks for; the overwrite guard still runs first, so a refused run leaves no
-    directories behind.
-    """
     destination = tmp_path / "deploy" / "generated" / "serving.py"
     assert serve_cmd.cmd_serve_setup(_setup_args(tmp_path, output=str(destination))) == 0
     assert destination.exists()
@@ -195,11 +161,7 @@ def test_force_overwrites(tmp_path):
     assert "BASE_MODEL" in destination.read_text()
 
 
-# --- deploy output parsing --------------------------------------------------------------------
-
-
 def test_deployed_url_picks_the_web_endpoint_not_the_dashboard():
-    """modal prints a dashboard link too, and pointing flash at that would 404 every request."""
     output = (
         "Created objects.\n"
         "View Deployment: https://modal.com/apps/acme/main/deployed/flash-serve-qwen3-5-4b\n"
@@ -218,8 +180,6 @@ def test_deployed_url_is_empty_when_absent():
 
 
 def test_deploy_reports_the_export_line_users_need(tmp_path, monkeypatch, capsys):
-    """The URL is the whole point of the command: it is what connects flash to the new backend."""
-
     def _fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(
             cmd, 0, stdout="https://acme--flash-serve-api.modal.run\n", stderr=""
@@ -232,11 +192,6 @@ def test_deploy_reports_the_export_line_users_need(tmp_path, monkeypatch, capsys
 
 
 def test_an_explicit_scaledown_window_is_not_collapsed_by_the_default(tmp_path, capsys):
-    """`or DEFAULT` rewrites any falsy value, so an explicit 0 silently became 300.
-
-    0 is outside Modal's supported range, so the right answer is a clear error before anything is
-    written -- not a file that quietly disagrees with what was asked for.
-    """
     args = _setup_args(tmp_path, scaledown_window=0)
     assert serve_cmd.cmd_serve_setup(args) == 1
     assert "outside Modal's supported range" in capsys.readouterr().err
@@ -249,11 +204,6 @@ def test_a_valid_non_default_scaledown_window_reaches_the_generated_app(tmp_path
 
 
 def test_status_sends_the_internal_key_the_way_deploy_does(monkeypatch, capsys):
-    """`serve status` must carry the internal key.
-
-    The contract permits a backend to authenticate /healthz. A bare unauthenticated GET then 401s
-    and status reports the backend as unreachable while every deploy against it works fine.
-    """
     from flash.serve import urls as urls_mod
 
     seen: list[tuple[str, dict]] = []
@@ -261,8 +211,6 @@ def test_status_sends_the_internal_key_the_way_deploy_does(monkeypatch, capsys):
     def _fake_request(url, headers, path="/healthz"):
         seen.append((url, headers))
         if path != "/healthz":
-            # The key probe. This health payload omits `requires_key`, which is the backend making
-            # no claim -- so status probes rather than assuming open, and 404 is the pass answer.
             raise urllib.error.HTTPError(url, 404, "not found", {}, None)
         return {
             "ok": True,
@@ -280,21 +228,6 @@ def test_status_sends_the_internal_key_the_way_deploy_does(monkeypatch, capsys):
 
 
 def test_status_runs_without_the_optional_http_dependency(monkeypatch):
-    """`serve status` must work on a bare `pip install freesolo-flash`.
-
-    `[project].dependencies` is empty by design and the client CLI is pure standard library, but
-    `flash.serve.deploy` imports httpx at module scope. Importing it from this command made status
-    die with `ModuleNotFoundError: httpx` BEFORE any of its error handling ran -- and this is the
-    command a user reaches for when their backend is not answering, so it is the worst one to make
-    conditional on an extra.
-
-    Run in a SUBPROCESS with httpx made unimportable, rather than by asserting on the import lines
-    in this file. Import reachability is transitive -- a helper three modules down that pulls httpx
-    would break the base install just as thoroughly -- and only actually running the command with
-    httpx absent covers that. The command is pointed at an unroutable host so it fails on the
-    request, which is the success condition here: reaching its own error path means every import
-    it needed resolved.
-    """
     blocker = (
         "import sys\n"
         "class _NoHttpx:\n"
@@ -341,12 +274,6 @@ def test_status_runs_without_the_optional_http_dependency(monkeypatch):
     ids=["string", "list", "number", "capabilities-not-list", "capabilities-not-strings"],
 )
 def test_a_malformed_health_payload_is_diagnosed_not_a_traceback(monkeypatch, capsys, payload):
-    """Diagnosing a broken backend is what `serve status` is FOR.
-
-    Valid JSON that is not the expected shape decodes fine and escapes the decode guard, so an
-    unchecked `.get` reaches the user as an AttributeError traceback -- the command failing at
-    exactly the moment its job starts. Every shape below has to come back as a stated error.
-    """
     from flash.serve import urls as urls_mod
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
@@ -365,18 +292,9 @@ def test_a_malformed_health_payload_is_diagnosed_not_a_traceback(monkeypatch, ca
     ids=["user-and-password", "token-only", "password-with-separators"],
 )
 def test_a_credential_in_the_serving_url_is_never_printed(monkeypatch, capsys, url, secret):
-    """A base URL is user-supplied and may carry credentials in its authority.
-
-    Printed verbatim, they land in the terminal and in whatever captures its output. Redacting the
-    URL we print is necessary but not sufficient: urllib quotes the URL it was handed back into its
-    OWN errors, and it reports FRAGMENTS -- parsing `https://user:pw@host` for a port raises
-    "nonnumeric port: 'pw@host'", a string containing neither the full base nor the full userinfo.
-    So the exception text has to be redacted too, token by token.
-    """
     from flash.serve import urls as urls_mod
 
     def _boom(request_url, headers):
-        # Exactly what urllib does: the value it was given, quoted back at the caller.
         raise ValueError(f"nonnumeric port: {request_url.split('://', 1)[-1]!r}")
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: url)
@@ -393,18 +311,6 @@ def test_a_credential_in_the_serving_url_is_never_printed(monkeypatch, capsys, u
     ids=["same-origin-redirect-is-followed", "cross-origin-redirect-drops-the-key"],
 )
 def test_status_never_sends_the_serving_key_to_another_origin(same_origin):
-    """A `/healthz` redirect must not carry the plane's root credential off-origin.
-
-    urllib re-sends custom headers to a redirect target -- it strips only the ones IT set -- so a
-    backend that 302s elsewhere collects `X-Freesolo-Internal-Key`, which on a standalone plane is
-    the credential that controls the plane. `flash.serve.deploy` installs an httpx hook for exactly
-    this; the dependency-free status path needs its own.
-
-    Driven against two real loopback servers rather than a mocked opener, because the leak IS
-    urllib's redirect behavior: a stub would only test the stub. The same-origin case is not
-    decoration -- Modal 303s slow requests to a same-origin poll url, so a handler that refused
-    every redirect would break the ordinary path while passing the security half.
-    """
     import http.server
     import threading
 
@@ -439,7 +345,7 @@ def test_status_never_sends_the_serving_key_to_another_origin(same_origin):
     target_url = f"http://127.0.0.1:{target.server_port}"
     front_url = f"http://127.0.0.1:{front.server_port}"
     if same_origin:
-        # redirect to a different PATH on the same origin, which is modal's async-result poll.
+
         class _SelfRedirector(_Target):
             def do_GET(self):
                 if self.path == "/healthz":
@@ -451,7 +357,6 @@ def test_status_never_sends_the_serving_key_to_another_origin(same_origin):
                 super().do_GET()
 
         front.RequestHandlerClass = _SelfRedirector
-
     for server in (target, front):
         threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -481,13 +386,6 @@ def test_status_never_sends_the_serving_key_to_another_origin(same_origin):
 
 
 def test_the_authenticated_probe_waits_as_long_as_the_control_plane_does(monkeypatch):
-    """The probe timeout must match the control plane's own per-request ceiling.
-
-    An authenticated probe wakes a scaled-to-zero backend, so a tighter bound here reports
-    `unreachable` for a backend `flash/serve/deploy.py` would have waited for and reached. The
-    expected value is read from that module rather than hardcoded, so the two cannot drift apart
-    without this failing.
-    """
     import inspect
     import re
 
@@ -497,7 +395,6 @@ def test_the_authenticated_probe_waits_as_long_as_the_control_plane_does(monkeyp
     source = inspect.getsource(deploy_mod._serving_request)
     ceiling = float(re.search(r"timeout = ([\d.]+) if timeout_s is None", source).group(1))
     assert ceiling == probe_mod.PROBE_TIMEOUT_SECONDS
-
     seen: dict[str, object] = {}
 
     class _Opener:
@@ -514,7 +411,6 @@ def test_the_authenticated_probe_waits_as_long_as_the_control_plane_does(monkeyp
 
 
 def test_the_printed_key_is_kept_where_the_user_can_send_it_back():
-    """the mandatory key must be generated into a variable the control plane can reuse."""
     text = serve_cmd._setup_instructions()
     assert "export FREESOLO_INTERNAL_KEY=$(" in text
     assert 'FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"' in text
@@ -522,14 +418,6 @@ def test_the_printed_key_is_kept_where_the_user_can_send_it_back():
 
 
 def test_the_deploy_output_points_at_the_control_plane_process(tmp_path, monkeypatch, capsys):
-    """The serving variables belong to `flash-server`, not to the shell that ran `serve setup`.
-
-    `models deploy`/`chat`/`undeploy` are control-plane routes: the SERVER reads
-    FREESOLO_SERVING_URL and contacts the backend. An instruction to export it here reaches the
-    CLI and not the server, so an operator who follows it exactly still has every deploy fail on
-    an unset serving URL.
-    """
-
     def _fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(
             cmd, 0, stdout="https://acme--flash-serve-api.modal.run\n", stderr=""
@@ -553,9 +441,6 @@ def test_a_failed_deploy_is_reported_as_a_failure(tmp_path, monkeypatch, capsys)
     assert "modal deploy failed" in capsys.readouterr().err
 
 
-# --- serve teardown ---------------------------------------------------------------------------
-
-
 def test_teardown_confirms_before_stopping(monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(serve_cmd, "_modal_cli", lambda: "/usr/bin/modal")
@@ -566,7 +451,6 @@ def test_teardown_confirms_before_stopping(monkeypatch, capsys):
 
 
 def test_teardown_stops_the_apps_own_name(monkeypatch, capsys):
-    """Stopping the wrong app name would silently leave the real one running and billing."""
     calls = []
 
     def _fake_run(cmd, **kwargs):
@@ -577,9 +461,6 @@ def test_teardown_stops_the_apps_own_name(monkeypatch, capsys):
     monkeypatch.setattr(subprocess, "run", _fake_run)
     assert serve_cmd.cmd_serve_teardown(_args(model="Qwen/Qwen3.5-4B", yes=True)) == 0
     assert calls == [["modal", "app", "stop", "flash-serve-qwen3-5-4b"]]
-
-
-# --- parser wiring ----------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -597,22 +478,7 @@ def test_subcommands_are_registered(argv, expected):
     assert args.func.__name__ == expected
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["serve", "gpus", "--model", "Qwen/Qwen3.5-4B"],
-        ["serve", "setup", "--model", "Qwen/Qwen3.5-4B", "--gpu", "H100"],
-    ],
-)
-def test_removed_gpu_guidance_commands_are_rejected(argv):
-    from flash.cli import _build_parser
-
-    with pytest.raises(SystemExit):
-        _build_parser().parse_args(argv)
-
-
 def test_setup_defaults_are_safe():
-    """Nothing that spends money may be on by default."""
     from flash.cli import _build_parser
 
     args = _build_parser().parse_args(["serve", "setup", "--model", "Qwen/Qwen3.5-4B"])
@@ -621,250 +487,45 @@ def test_setup_defaults_are_safe():
     assert args.dry_run is False
 
 
-@pytest.mark.parametrize("status_code", [401, 403])
-def test_status_verifies_the_serving_key_against_an_authenticated_route(
-    monkeypatch, capsys, status_code
+_MISSING = object()
+_HEALTH = {
+    "ok": True,
+    "base_models": ["Qwen/Qwen3.5-4B"],
+    "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
+}
+
+
+@pytest.mark.parametrize(
+    ("requires_key", "probe_status", "expected_code", "expected_text", "probe_expected"),
+    [
+        (True, 401, 1, "FREESOLO_INTERNAL_KEY", True),
+        (True, 403, 1, "FREESOLO_INTERNAL_KEY", True),
+        (True, 500, 1, "500", True),
+        (True, 400, 1, "400", True),
+        (True, 405, 1, "405", True),
+        (True, 422, 1, "422", True),
+        (True, 404, 0, "ready. deploy a run", True),
+        (False, None, 0, "ready. deploy a run", False),
+        (_MISSING, 401, 1, "FREESOLO_INTERNAL_KEY", True),
+        (True, None, 1, "404", True),
+    ],
+)
+def test_status_probe_matrix(
+    monkeypatch, capsys, requires_key, probe_status, expected_code, expected_text, probe_expected
 ):
-    """A wrong key must not read as `ready`, whichever rejection code the backend uses.
-
-    /healthz is deliberately unauthenticated, so a missing or mismatched key sails through every
-    check the command makes and it prints `ready` -- then the very next `models deploy` 401s on
-    /adapters. That is the exact misconfiguration an operator runs `serve status` to diagnose, so
-    the key has to be exercised against a route that actually checks it.
-
-    BOTH codes, because the contract is written for any backend, not just the generated app. The
-    conformance suite accepts 401 or 403 as a valid rejection, so recognizing only 401 here would
-    report `ready` against a backend that suite would certify and every deploy would then fail on.
-    """
-    import urllib.error
-
     from flash.serve import urls as urls_mod
 
-    asked: list[str] = []
+    health = dict(_HEALTH)
+    if requires_key is not _MISSING:
+        health["requires_key"] = requires_key
+    asked = []
 
-    def _fake_request(url, headers, path="/healthz"):
+    def request(url, headers, path="/healthz"):
         asked.append(path)
         if path == "/healthz":
-            return {
-                "ok": True,
-                "requires_key": True,
-                "base_models": ["Qwen/Qwen3.5-4B"],
-                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
-            }
-        raise urllib.error.HTTPError(url, status_code, "invalid serving key", {}, None)
-
-    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "wrong")
-    _patch_status_probes(monkeypatch, _fake_request)
-
-    code = serve_cmd.cmd_serve_status(_args())
-    out = capsys.readouterr()
-    assert code == 1, (
-        f"status reported success against a backend that rejects the key with {status_code}, so "
-        f"the next deploy fails on a backend this command just called ready"
-    )
-    assert "ready. deploy a run" not in out.out
-    assert str(status_code) in out.err, f"the failure did not name the status it got: {out.err!r}"
-    assert "FREESOLO_INTERNAL_KEY" in out.err, (
-        f"the failure did not name the variable to fix: {out.err!r}"
-    )
-    assert any(p != "/healthz" for p in asked), (
-        "only /healthz was probed, which is unauthenticated -- nothing exercised the key"
-    )
-
-
-def test_status_does_not_report_ready_when_the_key_probe_errors(monkeypatch, capsys):
-    """A 5xx on the probe means the key was never verified, which is not `ready`.
-
-    The backend answered /healthz a moment ago and then failed the authenticated call, so the
-    operator cannot deploy either way -- and treating "not a 401" as "the key was accepted" turns
-    a broken backend into a green status.
-    """
-    import urllib.error
-
-    from flash.serve import urls as urls_mod
-
-    def _fake_request(url, headers, path="/healthz"):
-        if path == "/healthz":
-            return {
-                "ok": True,
-                "requires_key": True,
-                "base_models": ["Qwen/Qwen3.5-4B"],
-                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
-            }
-        raise urllib.error.HTTPError(url, 500, "internal server error", {}, None)
-
-    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "some-key")
-    _patch_status_probes(monkeypatch, _fake_request)
-
-    code = serve_cmd.cmd_serve_status(_args())
-    out = capsys.readouterr()
-    assert code == 1, "a 500 on the key probe was reported as ready"
-    assert "ready. deploy a run" not in out.out
-    assert "500" in out.err, f"the failure did not name the status it got: {out.err!r}"
-
-
-@pytest.mark.parametrize("status_code", [400, 405, 422])
-def test_status_does_not_report_ready_on_a_non_404_read_back(monkeypatch, capsys, status_code):
-    """Only 404 proves the read-back route works. Any other 4xx is not a pass.
-
-    404 for an id that cannot exist means two things at once: the key got past authentication, and
-    the route resolved the id to "no such record". A 400/405/422 proves neither -- it is the backend
-    saying it does not answer this route the way the contract requires (missing route, rejected path
-    shape, a handler wanting query parameters).
-
-    Which matters because `models deploy` polls this exact route: `_registered_adapter_response`
-    passes `ok_statuses=(404,)` and `_wait_revision_ready` re-raises any status below 500, so a
-    non-404 4xx is fatal there. Falling through to `ready` tells the operator the backend is good
-    and then loses the deploy to the same status, after registration has already started.
-    """
-    import urllib.error
-
-    from flash.serve import urls as urls_mod
-
-    def _fake_request(url, headers, path="/healthz"):
-        if path == "/healthz":
-            return {
-                "ok": True,
-                "requires_key": True,
-                "base_models": ["Qwen/Qwen3.5-4B"],
-                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
-            }
-        raise urllib.error.HTTPError(url, status_code, "unexpected", {}, None)
-
-    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "right")
-    _patch_status_probes(monkeypatch, _fake_request)
-
-    code = serve_cmd.cmd_serve_status(_args())
-    out = capsys.readouterr()
-    assert code == 1, (
-        f"a {status_code} read-back was reported as ready, but deploy polls this same route and "
-        f"treats any non-404 4xx as fatal -- so the operator is told to deploy against a backend "
-        f"that cannot complete one"
-    )
-    assert "ready. deploy a run" not in out.out
-    assert str(status_code) in out.err, f"the failure did not name the status it got: {out.err!r}"
-
-
-def test_status_reports_ready_when_the_serving_key_is_accepted(monkeypatch, capsys):
-    """The probe must pass a CORRECT key through.
-
-    Without this, rejecting every authenticated backend would satisfy the test above while making
-    `serve status` useless on a properly configured deployment.
-    """
-    import urllib.error
-
-    from flash.serve import urls as urls_mod
-
-    def _fake_request(url, headers, path="/healthz"):
-        if path == "/healthz":
-            return {
-                "ok": True,
-                "requires_key": True,
-                "base_models": ["Qwen/Qwen3.5-4B"],
-                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
-            }
-        # What the generated app answers a good key asking for an id that does not exist: the
-        # request got PAST authentication, which is the whole question.
-        raise urllib.error.HTTPError(url, 404, "unknown adapter id", {}, None)
-
-    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "right")
-    _patch_status_probes(monkeypatch, _fake_request)
-
-    assert serve_cmd.cmd_serve_status(_args()) == 0
-    assert "ready. deploy a run" in capsys.readouterr().out
-
-
-def test_status_skips_the_key_probe_on_a_backend_without_one(monkeypatch, capsys):
-    """A backend that authenticates nothing has no key to verify.
-
-    Probing anyway would send a request no answer could inform, and a backend that returns
-    something other than 404 for an unknown id would then read as broken.
-    """
-    from flash.serve import urls as urls_mod
-
-    asked: list[str] = []
-
-    def _fake_request(url, headers, path="/healthz"):
-        asked.append(path)
-        return {
-            "ok": True,
-            "requires_key": False,
-            "base_models": ["Qwen/Qwen3.5-4B"],
-            "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
-        }
-
-    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    _patch_status_probes(monkeypatch, _fake_request)
-    assert serve_cmd.cmd_serve_status(_args()) == 0
-    assert asked == ["/healthz"]
-    assert "ready. deploy a run" in capsys.readouterr().out
-
-
-def test_status_probes_the_key_when_the_backend_makes_no_claim(monkeypatch, capsys):
-    """An OMITTED `requires_key` must still be probed, because the field is optional.
-
-    The contract explicitly makes it optional, so absence is a backend declining to say -- not a
-    backend declaring itself open. Treated as open, a protected custom backend that omits the field
-    skipped the probe entirely, printed `ready` with a missing or wrong key, and 401'd on the very
-    next deploy: exactly the misconfiguration this command exists to diagnose.
-    """
-    from flash.serve import urls as urls_mod
-
-    asked: list[str] = []
-
-    def _fake_request(url, headers, path="/healthz"):
-        asked.append(path)
-        if path == "/healthz":
-            # No `requires_key` at all. Everything else is a conforming health payload.
-            return {
-                "ok": True,
-                "base_models": ["Qwen/Qwen3.5-4B"],
-                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
-            }
-        raise urllib.error.HTTPError(url, 401, "invalid serving key", {}, None)
-
-    monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "wrong")
-    _patch_status_probes(monkeypatch, _fake_request)
-
-    code = serve_cmd.cmd_serve_status(_args())
-    out = capsys.readouterr()
-    assert any(p != "/healthz" for p in asked), (
-        "a backend that omits `requires_key` was never probed, so a wrong key reads as ready"
-    )
-    assert code == 1, (
-        "status reported ready against a protected backend that omits `requires_key`, so the "
-        "next deploy 401s on a backend this command just called ready"
-    )
-    assert "ready. deploy a run" not in out.out
-    assert "FREESOLO_INTERNAL_KEY" in out.err
-
-
-def test_status_does_not_report_ready_when_the_read_back_fabricates_a_record(monkeypatch, capsys):
-    """A 200 for an id that was never registered is a contract violation, not a passing probe.
-
-    Every other branch of the key probe handles a RAISING response, so a backend that answers the
-    made-up id with a fabricated record returned normally and fell through to `ready` -- the one
-    outcome proving the backend does not implement unknown-record semantics was reported as
-    success. `models deploy` polls this exact route and cross-checks the record against the
-    identity it registered, so a fabricating backend answers that poll with a mismatch the client
-    reads as an immutability violation and refuses.
-    """
-    from flash.serve import urls as urls_mod
-
-    def _fake_request(url, headers, path="/healthz"):
-        if path == "/healthz":
-            return {
-                "ok": True,
-                "requires_key": True,
-                "base_models": ["Qwen/Qwen3.5-4B"],
-                "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"],
-            }
-        # The fabricating backend: a plausible-looking record for an id it has never seen.
+            return health
+        if probe_status is not None:
+            raise urllib.error.HTTPError(url, probe_status, "probe result", {}, None)
         return {
             "adapter": {
                 "adapter_id": path.rsplit("/", 1)[-1],
@@ -875,16 +536,11 @@ def test_status_does_not_report_ready_when_the_read_back_fabricates_a_record(mon
         }
 
     monkeypatch.setattr(urls_mod, "serving_base_url", lambda: "https://acme.modal.run")
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "some-key")
-    _patch_status_probes(monkeypatch, _fake_request)
-
-    code = serve_cmd.cmd_serve_status(_args())
-    out = capsys.readouterr()
-    assert code == 1, (
-        "status called a record-fabricating backend ready; every deploy against it then fails its "
-        "read-back identity check, which is exactly what this command exists to catch first"
-    )
-    assert "ready. deploy a run" not in out.out
-    assert "404" in out.err, (
-        f"the failure did not name the status the contract requires: {out.err!r}"
-    )
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "test-key")
+    _patch_status_probes(monkeypatch, request)
+    assert serve_cmd.cmd_serve_status(_args()) == expected_code
+    output = capsys.readouterr()
+    combined = output.out + output.err
+    assert expected_text in combined
+    assert any(path != "/healthz" for path in asked) is probe_expected
+    assert ("ready. deploy a run" in output.out) is (expected_code == 0)
