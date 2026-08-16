@@ -233,13 +233,17 @@ def completed_checkpoint_step(local_dir: str) -> int:
         return 0
 
 
-def unprocessed_checkpoint_dirs(
-    local_dir: str, completed_step: int, processed_steps: set[int]
+def undiscovered_checkpoint_dirs(
+    local_dir: str, completed_step: int, discovered_steps: set[int]
 ) -> list[tuple[int, str]]:
-    """``(step, dir)`` for every completed ``global_step_N`` not yet in ``processed_steps``, ascending.
+    """``(step, dir)`` for every completed ``global_step_N`` not yet in ``discovered_steps``, ascending.
 
     Bounded by ``completed_step`` so a directory verl is still writing is never handed to a
-    publisher, and by ``processed_steps`` so each checkpoint is published exactly once.
+    publisher, and by ``discovered_steps`` so each checkpoint is handed over exactly once.
+
+    Discovery only. A returned step is one nobody has claimed yet; a filtered step was claimed, which
+    covers publishing it, intentionally skipping it, coalescing it away and crediting it from a
+    previous attempt. Callers must read durability from the lifecycle ledger, never from this filter.
     """
     found: list[tuple[int, str]] = []
     try:
@@ -252,7 +256,7 @@ def unprocessed_checkpoint_dirs(
             continue
         step = int(match.group(1))
         path = os.path.join(local_dir, name)
-        if step <= completed_step and step not in processed_steps and os.path.isdir(path):
+        if step <= completed_step and step not in discovered_steps and os.path.isdir(path):
             found.append((step, path))
     return sorted(found)
 

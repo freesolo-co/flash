@@ -942,7 +942,7 @@ from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
     resolve_checkpoint_actor_dir,
     stage_verl_resume,
     stamp_adapter_dir_provenance,
-    unprocessed_checkpoint_dirs,
+    undiscovered_checkpoint_dirs,
 )
 from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     _VERL_METRIC_FIELDS,
