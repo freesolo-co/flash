@@ -10,6 +10,9 @@ import http.client
 import io
 import itertools
 import json
+import os
+import re
+import subprocess
 import time
 import urllib.error
 
@@ -123,20 +126,32 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
     # payload travels base64-encoded inside a quoted heredoc, byte-exact
     b64 = script.split("FLASH_PAYLOAD_EOF")[1].strip()
     assert json.loads(base64.b64decode(b64)) == payload
-    # the shared instance bootstrap is embedded and run as the container command, with every
-    # imported sibling next to it.
-    assert "FLASH_BOOTSTRAP_EOF" in script
-    assert "/root/flash/bootstrap.py" in script
-    assert "/root/flash/bootstrap_secrets.py" in script
-    assert "/root/flash/bootstrap_console.py" in script
-    # it is genuinely the shared module (a distinctive line only that file has)
+    # the SHARED instance bootstrap travels as a VERIFIED capsule and is run as the container
+    # command. Vast and Lambda ship the same profile, so both get the same members.
+    from flash.providers._lifecycle.instance import _instance_capsule
+    from flash.runtime_capsule import read_capsule, sha256_bytes
+
+    capsule_b64, capsule_sha256 = _instance_capsule()
+    archive = base64.b64decode(capsule_b64)
+    assert capsule_sha256 in script
+    assert sha256_bytes(archive) == capsule_sha256
+    assert "sha256sum -c" in script
+    assert "/root/flash/capsule.pyz bootstrap" in script
+    # it is genuinely the shared module (a distinctive line only that file has), asserted against
+    # the SHIPPED member rather than the launch text: the capsule is compressed, so the marker no
+    # longer appears verbatim in the script and a substring check there would be vacuous.
     from pathlib import Path
 
     import flash.providers._lifecycle.bootstrap as ib
 
+    _manifest, contents = read_capsule(archive)
     shared_src = Path(ib.__file__).read_text()
     assert "RetriableBootstrapError" in shared_src  # sanity: distinctive marker exists
-    assert "RetriableBootstrapError" in script  # ...and it was shipped
+    assert contents["bootstrap.py"].decode() == shared_src  # ...and it was shipped, byte for byte
+    # every sibling the bootstrap imports as a bare module rides along; a missing one is a
+    # ModuleNotFoundError on a box that is already rented and billing.
+    for sibling in ("bootstrap_secrets.py", "bootstrap_console.py", "bootstrap_pip.py"):
+        assert sibling in contents, sibling
     # the operator's Vast key NEVER ships to the box; the worker HF token rides inside the base64
     # payload's env (like RunPod), never interpolated raw into the shell.
     assert "vk-supersecret" not in script
@@ -149,39 +164,39 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
 
 
 def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch):
-    """the heredoc terminators must start on their own line (a bootstrap
-    source without a trailing newline would otherwise swallow the rest of the script), and the
-    python-interpreter resolution must fall back past python3 to python with a clear diagnostic."""
+    """every heredoc terminator must start on its own line (embedded content without a trailing
+    newline would otherwise swallow the rest of the script), and the python-interpreter resolution
+    must fall back past python3 to python with a clear diagnostic."""
     from flash.providers.vast.jobs import builders
 
     monkeypatch.setenv("VAST_API_KEY", "vk")
     monkeypatch.setenv("HF_TOKEN", "hf")
     script = builders.build_onstart(_build_payload(builders, _spec(), seed=0, attempt=1))
-    # Each closing terminator is preceded by a newline (own line), regardless of payload/src content.
-    for term in (
-        "FLASH_PAYLOAD_EOF",
-        "FLASH_BOOTSTRAP_EOF",
-        "FLASH_BOOTSTRAP_SECRETS_EOF",
-        "FLASH_BOOTSTRAP_CONSOLE_EOF",
-        "FLASH_BOOTSTRAP_PIP_EOF",
-    ):
+    # Derived from the script's own OPENING terminators rather than a hardcoded list, so a heredoc
+    # added later is covered here instead of truncating a launch script in production.
+    opened = set(re.findall(r"<<'(FLASH_\w+)'", script))
+    assert opened, "expected the onstart to embed at least one heredoc"
+    for term in sorted(opened):
         assert f"\n{term}\n" in script, f"{term} terminator must be on its own line"
 
 
-def test_onstart_ships_every_bare_sibling_the_bootstrap_imports(monkeypatch):
-    """Vast must write EVERY sibling module bootstrap.py imports when run as a bare script.
+def test_capsule_ships_every_bare_sibling_the_bootstrap_imports(monkeypatch):
+    """The capsule must carry EVERY sibling module bootstrap.py imports when run as a bare script.
 
-    The bare-script imports are unconditional (``__package__`` is empty off-package), so a sibling
-    the onstart forgets is not a degraded install: the bootstrap dies with ModuleNotFoundError
-    before any work starts, on a box already rented and billing, on every run.
+    The bare-script imports are unconditional (``__package__`` is empty off-package, which is how
+    the capsule runs it), so a sibling the profile forgets is not a degraded install: the bootstrap
+    dies with ModuleNotFoundError before any work starts, on a box already rented and billing, on
+    every run.
 
     Derived from the bootstrap's own ``else:`` branch rather than a hardcoded list, so adding a
-    fourth shipped module fails here instead of in production.
+    fourth imported module fails here instead of in production.
     """
     import ast
     from pathlib import Path
 
+    from flash.providers._lifecycle.instance import INSTANCE_BOOTSTRAP_PROFILE, _instance_capsule
     from flash.providers.vast.jobs import builders
+    from flash.runtime_capsule import get_profile, read_capsule
 
     lifecycle = Path(builders.__file__).parent.parent.parent / "_lifecycle"
     tree = ast.parse((lifecycle / "bootstrap.py").read_text())
@@ -200,13 +215,19 @@ def test_onstart_ships_every_bare_sibling_the_bootstrap_imports(monkeypatch):
             required.add(node.module)
     assert required, "expected bootstrap.py to import at least one bare sibling"
 
+    capsule_b64, _sha = _instance_capsule()
+    _manifest, contents = read_capsule(base64.b64decode(capsule_b64))
+    for module in sorted(required):
+        assert f"{module}.py" in contents, (
+            f"bootstrap.py imports {module} as a bare sibling but the capsule never ships it"
+        )
+    # the entrypoint the launch scripts invoke is the bootstrap itself, so the imports above are the
+    # ones that actually run.
+    assert get_profile(INSTANCE_BOOTSTRAP_PROFILE).entrypoint == "bootstrap.py"
+
     monkeypatch.setenv("VAST_API_KEY", "vk")
     monkeypatch.setenv("HF_TOKEN", "hf")
     script = builders.build_onstart(_build_payload(builders, _spec(), seed=0, attempt=1))
-    for module in sorted(required):
-        assert f"/root/flash/{module}.py" in script, (
-            f"bootstrap.py imports {module} as a bare sibling but the vast onstart never writes it"
-        )
     # PYBIN never silently empty: python fallback + a diagnostic when nothing resolves.
     assert "command -v python3 || command -v python" in script
     assert "no python interpreter" in script
@@ -214,6 +235,84 @@ def test_onstart_ships_every_bare_sibling_the_bootstrap_imports(monkeypatch):
     # doomed `"$PYBIN"` bootstrap + self-destroy invocations.
     assert 'if [ -z "$PYBIN" ]; then' in script
     assert "exit 1" in script
+
+
+@pytest.mark.parametrize("corrupt_capsule", [False, True])
+def test_onstart_self_destroys_even_when_the_capsule_fails_verification(
+    monkeypatch, tmp_path, corrupt_capsule
+):
+    """A capsule that fails its digest check must still reach the self-destroy backstop.
+
+    This is the failure mode the verification itself introduces: refusing to execute an unverified
+    capsule is correct, but a refusal that exits BEFORE the self-destroy leaves a rented GPU billing
+    until the control plane notices. The script is EXECUTED here (with bash) rather than pattern
+    matched, because the property is control flow -- `set -e`, an early `exit`, or a `&&` chain
+    anywhere above the backstop would break it while every substring assertion still passed.
+    """
+    from flash.providers.vast.jobs import builders
+
+    monkeypatch.setenv("VAST_API_KEY", "vk")
+    monkeypatch.setenv("HF_TOKEN", "hf")
+    script = builders.build_onstart(_build_payload(builders, _spec(), seed=0, attempt=1))
+
+    # redirect the box's absolute paths into a sandbox, and replace the 10-minute log-retrieval hold
+    # (which runs on the failure path) with a marker so the test does not sleep.
+    root = tmp_path / "root" / "flash"
+    script = script.replace("/root/flash", str(root)).replace("sleep 600", "echo FLASH_TEST_HELD")
+    if corrupt_capsule:
+        # a single flipped base64 character: the archive decodes to different bytes, so the digest
+        # check is what must catch it.
+        marker = "cat > " + str(root) + "/capsule.b64 <<'FLASH_CAPSULE_EOF'\n"
+        head, _, tail = script.partition(marker)
+        assert head, "the capsule heredoc marker moved"
+        assert tail, "the capsule heredoc marker moved"
+        first = "B" if tail[0] != "B" else "C"
+        script = head + marker + first + tail[1:]
+
+    # the bootstrap would try to rent-time install and fetch from HF, which is not what this test is
+    # about: swap the capsule INVOCATION for a marker write. The verification above it is untouched,
+    # so the corrupt case still never reaches this line.
+    ran = root / "capsule_ran"
+    script = script.replace(
+        f'"$PYBIN" {root}/capsule.pyz bootstrap',
+        f"touch {ran}",
+    )
+    # the self-destroy is the property under test, so it must run -- but against a local file rather
+    # than the real vast API. It writes a marker instead of issuing the DELETE.
+    destroyed = tmp_path / "destroyed"
+    script = script.replace(
+        "urllib.request.urlopen(req, timeout=30)",
+        f"open({str(destroyed)!r}, 'w').write(iid)",
+    )
+    script_path = tmp_path / "onstart.sh"
+    script_path.write_text(script)
+
+    proc = subprocess.run(
+        ["bash", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env={
+            **os.environ,
+            "CONTAINER_ID": "42",
+            "CONTAINER_API_KEY": "instance-scoped",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+    )
+
+    # the self-destroy ran in BOTH cases -- that is the whole point. A billing box must be released
+    # whether the capsule verified or not.
+    assert destroyed.exists(), proc.stderr[-3000:]
+    assert destroyed.read_text() == "42", proc.stderr[-3000:]
+    if corrupt_capsule:
+        # ...and the corrupted capsule was refused BEFORE it executed, with a non-zero exit.
+        assert "runtime capsule failed verification" in proc.stderr, proc.stderr[-3000:]
+        assert proc.returncode != 0
+        assert not ran.exists(), "an unverified capsule was executed anyway"
+    else:
+        assert ran.exists(), "the verified capsule never ran, so the control case proves nothing"
+        assert proc.returncode == 0
 
 
 def test_onstart_spills_large_spec_to_hf(monkeypatch):

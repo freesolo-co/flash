@@ -192,6 +192,8 @@ async def _opd_run(
     *,
     post_json,
     score_failure_handler,
+    fatal_rollout_exit_code,
+    mark_prompt_failure,
     permanent_teacher_exit: int,
     transient_teacher_exit: int,
     exit_process,
@@ -212,7 +214,6 @@ async def _opd_run(
     session_id = f"{uuid4().hex}-{global_step}-{example_index}-{rollout_ordinal}"
     outputs = []
     start_attempted = False
-    failure_exit_code = None
     try:
         start_attempted = True
         start = await run_executor_call(
@@ -257,14 +258,16 @@ async def _opd_run(
         )
         _attach_teacher_rows(outputs, score_payload)
     except Exception as error:
-        failure_exit_code = (
-            transient_teacher_exit
-            if getattr(error, "classification", None) == "transient"
-            else permanent_teacher_exit
-        )
-    finally:
+        failure_exit_code = fatal_rollout_exit_code(error)
+        with contextlib.suppress(BaseException):
+            mark_prompt_failure(
+                str(kwargs["uid"]),
+                "train",
+                global_step,
+                "failure",
+            )
         if start_attempted:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BaseException):
                 await run_executor_call(
                     self.loop,
                     lambda: post_json(
@@ -274,9 +277,19 @@ async def _opd_run(
                         {"session_id": session_id},
                     ),
                 )
-    if failure_exit_code is not None:
         exit_process(failure_exit_code)
-        raise AssertionError("multi-turn OPD process exit returned unexpectedly")
+        raise AssertionError("multi-turn OPD process exit returned unexpectedly") from error
+    if start_attempted:
+        with contextlib.suppress(Exception):
+            await run_executor_call(
+                self.loop,
+                lambda: post_json(
+                    bridge_url,
+                    bridge_token,
+                    "/multiturn/close",
+                    {"session_id": session_id},
+                ),
+            )
     return outputs
 
 
@@ -415,6 +428,8 @@ def build_flash_multi_turn_agent_loop(
     agent_loop_output,
     post_json,
     score_failure_handler,
+    fatal_rollout_exit_code,
+    mark_prompt_failure,
     deterministic_seed,
     permanent_teacher_exit: int = 86,
     transient_teacher_exit: int = 87,
@@ -442,6 +457,8 @@ def build_flash_multi_turn_agent_loop(
                 sampling_params,
                 post_json=post_json,
                 score_failure_handler=score_failure_handler,
+                fatal_rollout_exit_code=fatal_rollout_exit_code,
+                mark_prompt_failure=mark_prompt_failure,
                 permanent_teacher_exit=permanent_teacher_exit,
                 transient_teacher_exit=transient_teacher_exit,
                 exit_process=exit_process,

@@ -717,6 +717,7 @@ def _build_flash_task_runner(FlashPPOTrainer, tq):
                     resource_pool_manager=self.resource_pool_manager,
                 )
                 trainer.init_workers()
+                install_bounded_replay_buffer_sample(trainer)
                 trainer.fit()
             finally:
                 if trainer:
@@ -749,6 +750,13 @@ def _install_verl_extensions() -> None:
         from transfer_queue import KVBatchMeta
     except ImportError:
         from verl.utils.transferqueue_utils import KVBatchMeta, tq
+
+    def mark_prompt_failure(uid, partition_id, global_steps, status) -> None:
+        tq.kv_put(
+            key=uid,
+            partition_id=partition_id,
+            tag={"global_steps": global_steps, "status": status},
+        )
 
     from verl.experimental.agent_loop.agent_loop import (
         AgentLoopBase,
@@ -859,7 +867,9 @@ def _install_verl_extensions() -> None:
         agent_loop_base=AgentLoopBase,
         agent_loop_output=AgentLoopOutput,
         post_json=_post_json,
-        score_failure_handler=_exit_for_score_failure,
+        score_failure_handler=_defer_score_failure,
+        fatal_rollout_exit_code=_fatal_rollout_exit_code,
+        mark_prompt_failure=mark_prompt_failure,
         deterministic_seed=deterministic_rollout_seed,
         permanent_teacher_exit=_PERMANENT_TEACHER_EXIT,
         transient_teacher_exit=_TRANSIENT_TEACHER_EXIT,
@@ -900,8 +910,10 @@ if PLUGIN_LOADED_EXTERNALLY:
     from flash_opd_bridge import (
         FlashTeacherBridgeError,
         _coordinate_first_mutation_notice,
+        _defer_score_failure,
         _exit_for_score_failure,
         _fallback_classification,
+        _fatal_rollout_exit_code,
         _mutation_distributed,
         _post_json,
         _post_no_signal_abandoned,
@@ -923,8 +935,10 @@ else:
     from flash.engine.worker.train.opd.child.bridge import (  # noqa: F401
         FlashTeacherBridgeError,
         _coordinate_first_mutation_notice,
+        _defer_score_failure,
         _exit_for_score_failure,
         _fallback_classification,
+        _fatal_rollout_exit_code,
         _mutation_distributed,
         _post_json,
         _post_no_signal_abandoned,
@@ -941,6 +955,14 @@ else:
         _write_mutation_failure_fallback,
         _write_resample_failure_fallback,
         _write_score_delivery_failure_fallback,
+    )
+
+
+if PLUGIN_LOADED_EXTERNALLY:
+    from flash_opd_replay_guard import install_bounded_replay_buffer_sample
+else:
+    from flash.engine.worker.train.opd.child.replay_guard import (
+        install_bounded_replay_buffer_sample,
     )
 
 
