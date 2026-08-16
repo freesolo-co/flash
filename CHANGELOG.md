@@ -21,6 +21,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- Multi-turn GRPO now clones each sibling rollout from the task state that produced its prepared
+  prompt. Environments that record randomized episode choices on the task during `start_episode`
+  are stepped and scored against the same episode the model saw, without sharing mutable state
+  between sibling rollouts.
 - A RunPod attempt's stall window is now measured from evidence timestamps rather than from when
   the control plane happened to look at it. The window was seeded from the moment polling started
   and was reset again by the first status read, and a heartbeat was credited at the time it was
