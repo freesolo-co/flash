@@ -72,7 +72,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     # top-level keys, the old rollout-batch spelling, a public half without lora_alpha. reproducing
     # its digest means replaying the bytes it actually stored, read once from both halves.
     raw_public = status.spec if isinstance(status.spec, dict) else {}
-    persisted_envelope = runner.VersionedPersistedSpecEnvelope.read(raw_worker, raw_public)
+    persisted_envelope = runner.VersionedPersistedSpecEnvelope.read(snapshot, raw_public)
     has_workload_profile = bool(
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )

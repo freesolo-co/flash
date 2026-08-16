@@ -147,17 +147,33 @@ def test_versioned_envelope_reproduces_exact_historical_digest_bytes() -> None:
     raw_public, raw_worker, expected = _legacy_record()
     public = JobSpec.from_dict(raw_public)
     worker = JobSpec.from_dict(raw_worker)
-    persisted = runner.VersionedPersistedSpecEnvelope.read(raw_worker, raw_public)
+    persisted = runner.VersionedPersistedSpecEnvelope.read({"worker_spec": raw_worker}, raw_public)
 
     assert runner._preparation_digest(public, worker, None, persisted=persisted) == expected
 
     tampered = deepcopy(raw_public)
     tampered["worker_env"]["PUBLIC_OLD_OVERRIDE"] = "tampered"
-    tampered_envelope = runner.VersionedPersistedSpecEnvelope.read(raw_worker, tampered)
+    tampered_envelope = runner.VersionedPersistedSpecEnvelope.read(
+        {"worker_spec": raw_worker}, tampered
+    )
     assert runner._preparation_digest(public, worker, None, persisted=tampered_envelope) != expected
 
     next_version = replace(persisted, version=2)
     assert runner._preparation_digest(public, worker, None, persisted=next_version) != expected
+
+
+def test_envelope_version_is_persisted_and_validated() -> None:
+    from flash.runner.submit import _effective_preparation_snapshot
+
+    spec = _rollout_spec()
+    snapshot = _effective_preparation_snapshot(spec, spec, None)
+
+    assert snapshot["version"] == runner.VersionedPersistedSpecEnvelope.CURRENT_VERSION
+    assert runner.VersionedPersistedSpecEnvelope.read(snapshot, spec.to_dict()).version == 1
+    with pytest.raises(ValueError, match="unsupported persisted preparation envelope version 2"):
+        runner.VersionedPersistedSpecEnvelope.read({**snapshot, "version": 2}, spec.to_dict())
+    with pytest.raises(ValueError, match="version must be a positive integer"):
+        runner.VersionedPersistedSpecEnvelope.read({**snapshot, "version": True}, spec.to_dict())
 
 
 def test_envelope_never_replays_a_field_the_current_spec_still_defines() -> None:
@@ -176,6 +192,8 @@ def test_envelope_never_replays_a_field_the_current_spec_still_defines() -> None
 
 
 def test_legacy_record_recovers_after_worker_half_is_re_persisted() -> None:
+    from flash.runner.submit import _effective_preparation_snapshot
+
     raw_public, raw_worker, initial_digest = _legacy_record()
     status = runner.RunStatus(
         state="running",
@@ -189,12 +207,13 @@ def test_legacy_record_recovers_after_worker_half_is_re_persisted() -> None:
 
     recovered = runner.effective_spec_from_status(status)
     public = JobSpec.from_dict(raw_public)
-    persisted = runner.VersionedPersistedSpecEnvelope.read(None, raw_public)
-    re_persisted_digest = runner._preparation_digest(public, recovered, None, persisted=persisted)
-    status.effective_preparation = {
-        "worker_spec": recovered.to_internal_dict(),
-        "preparation_digest": re_persisted_digest,
-    }
+    persisted = runner.VersionedPersistedSpecEnvelope.read(
+        status.effective_preparation, raw_public, include_worker=False
+    )
+    status.effective_preparation = _effective_preparation_snapshot(
+        public, recovered, None, persisted=persisted
+    )
+    assert status.effective_preparation["version"] == 1
 
     recovered_again = runner.effective_spec_from_status(status)
 
