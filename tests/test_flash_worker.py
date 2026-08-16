@@ -825,15 +825,15 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     The previous version of this test read run_sft's source. That body was trl's and is deleted:
     run_sft now delegates to run_sft_train. Rather than drop the coverage, assert against the module
-    that really runs. Three of the old assertions are intentionally NOT reproduced -- kernel
-    installation, LoRA+ B-matrix ratio plumbing, and the chunked_nll loss_type -- because they were
-    properties of trl's SFTTrainer call, and verl owns its own loss and kernel path.
+    that really runs. Two of the old assertions are intentionally NOT reproduced -- kernel
+    installation and the chunked_nll loss_type -- because they were properties of trl's SFTTrainer
+    call, and verl owns its own loss and kernel path.
 
-    the optimizations now live in two modules rather than one. dataset preprocessing moved to
+    the optimizations now live in three modules rather than one. dataset preprocessing moved to
     flash.engine.profiling.sft_workload so estimate construction and training share one implementation,
-    and the sizing/memory choices stayed with the trainer that makes them. each assertion reads the
-    module that actually owns its behaviour: pointing them all at one module would let a symbol
-    disappear from the other and still pass.
+    sizing and memory choices stayed with the trainer and hydra config, and LoRA+ grouping moved to the
+    external child plugin. each assertion reads the module that actually owns its behaviour: pointing
+    them all at one module would let a symbol disappear from another and still pass.
     """
     import inspect
 
@@ -853,8 +853,10 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
     # this guard spans both modules. keep these in step when sft_train is split further.
     from flash.engine.worker.train.sft import config as sft_config
+    from flash.engine.worker.train.sft.child import plugin as sft_plugin
 
     train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
+    plugin_src = inspect.getsource(sft_plugin)
     # revision-aware vocab resolution: the worker must size the realized batch through the SAME
     # resolver the cost quote priced with, else a revision-pinned run drifts from its quote.
     assert "resolve_vocab_size(" in train_src
@@ -864,8 +866,8 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     # gradient checkpointing, with the MoE/GDN reentrant rule shared with grpo.
     assert "grad_checkpointing_on(" in train_src
     assert "grpo_use_reentrant(" in train_src
-    # LoRA+ survives (verl builds the optimizer itself, but flash still supplies the grouping).
-    assert "create_loraplus_optimizer" in train_src
+    # LoRA+ survives in the external child plugin that owns verl's optimizer grouping.
+    assert "create_loraplus_optimizer" in plugin_src
 
 
 @pytest.mark.parametrize(

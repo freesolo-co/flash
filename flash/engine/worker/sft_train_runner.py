@@ -5,6 +5,7 @@ Split out of ``flash.engine.worker.sft_train`` to keep that module under the fil
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -29,19 +30,14 @@ build_sft_overrides = _sft_train.build_sft_overrides
 # taken from the parent like every other name here, so the runner and `sft_train`'s own
 # `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
 liveness_heartbeat = _sft_train.liveness_heartbeat
-render_flash_qla_shim = _sft_train.render_flash_qla_shim
-render_gdn_varlen_shim = _sft_train.render_gdn_varlen_shim
-render_shim_marker_prologue = _sft_train.render_shim_marker_prologue
-render_wandb_link_shim = _sft_train.render_wandb_link_shim
+render_sitecustomize_bootstrap = _sft_train.render_sitecustomize_bootstrap
 shim_marker_file = _sft_train.shim_marker_file
 verify_applied_shim_markers = _sft_train.verify_applied_shim_markers
-wrap_shim_fragment = _sft_train.wrap_shim_fragment
 SHIM_FRAGMENT_FAILED_EXIT_CODE = _sft_train.SHIM_FRAGMENT_FAILED_EXIT_CODE
 sft_tokens_for_updates = _sft_train.sft_tokens_for_updates
 sft_under_ran = _sft_train.sft_under_ran
 validate_save_steps = _sft_train.validate_save_steps
 _render_sft_dataset_module = _sft_train._render_sft_dataset_module
-_render_sft_sitecustomize = _sft_train._render_sft_sitecustomize
 
 
 @dataclass(frozen=True)
@@ -139,8 +135,8 @@ class _SftProgress:
     train_tokens: int
     loraplus_applied: bool
     wandb_link: dict[str, str | None]
-    # what the child's wrapped sitecustomize fragments must prove applied (see
-    # wrap_shim_fragment); verified at the first optimizer step and again at child exit.
+    # what the child plugin must prove applied; verified at the first optimizer step and again at
+    # child exit.
     shim_markers: str = ""
     expected_shims: tuple[str, ...] = ()
     shims_verified: bool = False
@@ -535,44 +531,38 @@ def _write_sft_child_shims(
     seed: int,
     loggers: list[str],
     gdn_reset_arch: str | None,
-) -> tuple[str, tuple[str, ...]]:
-    """Write the child's sitecustomize and dataset module; return its marker file and shim names."""
-    core_source = _render_sft_sitecustomize(
-        seed=seed,
-        loraplus_ratio=_SFT_LORAPLUS_RATIO,
-        save_at_steps=options.save_at_steps,
-        total_steps=model.update_horizon,
-        reentrant_gradient_checkpointing=model.reentrant_gradient_checkpointing,
+) -> tuple[str, tuple[str, ...], str]:
+    """write the SFT plugin bundle, startup bootstrap, and non-secret plugin config."""
+    parent_dir = os.path.dirname(_sft_train.__file__)
+    copies = (
+        ("train/core/child/runtime.py", "flash_verl_runtime.py"),
+        ("train/sft/child/plugin.py", "flash_sft_plugin.py"),
+        ("train/sft/child/entry.py", "flash_sft_entry.py"),
     )
-    # both shims, not either: this one patches DistributedSampler/StatefulDataLoader so the child's
-    # row order matches the profile's byte for byte, and the gdn one patches the model's text
-    # forward to reset linear-attention state at packed example boundaries. different objects,
-    # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
-    core_source = _sft_train._append_exact_sft_dataloader_shim(core_source)
-    # every required fragment is wrapped fail-closed (see wrap_shim_fragment): execsitecustomize
-    # would otherwise swallow a fragment's exception and the child would train unpatched (no
-    # seeding, no exact dataloader order, no lora+, no boundary resets) while looking healthy.
-    # the wandb link shim stays unwrapped: it swallows its own failures by design and a logging
-    # link must not be able to abort paid training.
-    required_fragments = [("sft-core", core_source)]
-    if gdn_reset_arch is not None:
-        required_fragments.append(("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
-        # same gate as the boundary resets (this is a gdn hybrid), and the fragment itself
-        # no-ops off sm90. measured 1.055x end-to-end on an H200; on sm100 flashqla computes
-        # wrong gradients, so render_flash_qla_shim binds nothing there.
-        required_fragments.append(("flashqla-gdn", render_flash_qla_shim(gdn_reset_arch)))
+    for source, target in copies:
+        shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
     shim_markers = shim_marker_file(shim_dir)
-    # the workdir is wiped per attempt (_resolve_sft_options), so no stale marker can survive here.
-    shim_source = render_shim_marker_prologue(shim_markers) + "".join(
-        wrap_shim_fragment(name, source) for name, source in required_fragments
-    )
-    if "wandb" in loggers:
-        shim_source += render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(shim_source)
+        file.write(render_sitecustomize_bootstrap())
     with open(custom_dataset_path, "w", encoding="utf-8") as file:
         file.write(_render_sft_dataset_module())
-    return shim_markers, tuple(name for name, source in required_fragments if source)
+    plugin_config = json.dumps(
+        {
+            "marker_file": shim_markers,
+            "seed": int(seed),
+            "loraplus_ratio": float(_SFT_LORAPLUS_RATIO),
+            "loraplus_ready_marker": _LORAPLUS_READY_MARKER,
+            "save_at_steps": list(options.save_at_steps),
+            "total_steps": int(model.update_horizon),
+            "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),
+            "gdn_model_type": gdn_reset_arch,
+            "wandb": "wandb" in loggers,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected = ("sft-core",) + (("gdn-varlen",) if gdn_reset_arch else ())
+    return shim_markers, expected, plugin_config
 
 
 def _prepare_sft_child(
@@ -642,7 +632,7 @@ def _prepare_sft_child(
         "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),
     }
     overrides = build_sft_overrides(config)
-    shim_markers, expected_shims = _write_sft_child_shims(
+    shim_markers, expected_shims, plugin_config = _write_sft_child_shims(
         options,
         model,
         shim_dir=shim_dir,
@@ -678,6 +668,8 @@ def _prepare_sft_child(
         shim_dir=shim_dir,
         wandb_enabled="wandb" in loggers,
     )
+    child_env["VERL_USE_EXTERNAL_MODULES"] = "flash_sft_plugin"
+    child_env["FLASH_SFT_PLUGIN_CONFIG"] = plugin_config
     command = [
         capabilities.python_bin,
         "-m",
@@ -688,7 +680,7 @@ def _prepare_sft_child(
         # every rank torchrun starts, so a rank the batch cannot feed is the `batch_size=0` crash.
         f"--nproc-per-node={world_size}",
         "-m",
-        "verl.trainer.sft_trainer",
+        "flash_sft_entry",
         *overrides,
     ]
     return _SftChild(

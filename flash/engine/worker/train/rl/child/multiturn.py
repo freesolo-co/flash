@@ -17,7 +17,7 @@ import urllib.request
 from typing import Any
 from uuid import uuid4
 
-try:  # inside the verl child, copied in beside this file
+if __name__ == "flash_grpo_multiturn":
     from flash_multiturn_glue import (
         EnvGlueTokenizer,
         dedup_seam_terminator,
@@ -27,7 +27,7 @@ try:  # inside the verl child, copied in beside this file
         turn_is_unusable,
         validate_transcript_messages,
     )
-except ImportError:  # in-tree (tests, lint)
+else:
     from flash.engine.worker.train.core.child.glue import (
         EnvGlueTokenizer,
         dedup_seam_terminator,
@@ -45,13 +45,14 @@ except ImportError:  # in-tree (tests, lint)
 _NEXT_TURN_SLACK = 8
 
 
-def post_json(url: str, path: str, payload: dict) -> dict:
-    """post one json request to the parent's multi-turn bridge and return the decoded reply.
+def post_json(url: str, path: str, payload: dict, *, error_style: str = "multi-turn") -> dict:
+    """post one json request to a parent bridge and return the decoded reply.
 
-    Every failure raises because continuing would train on environment state that never completed.
-    Use no request deadline: lock queueing is batch-size dependent; the stall watchdog in
-    ``flash/providers/_lifecycle/poll.py`` bounds genuine wedges.
+    Every failure raises because continuing would train on state that never completed. Use no request
+    deadline: lock queueing is batch-size dependent; the stall watchdog bounds genuine wedges.
     """
+    if error_style not in {"multi-turn", "reward"}:
+        raise ValueError(f"unknown flash bridge error style: {error_style}")
     request = urllib.request.Request(
         url.rstrip("/") + path,
         data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
@@ -62,17 +63,20 @@ def post_json(url: str, path: str, payload: dict) -> dict:
         with urllib.request.urlopen(request) as response:
             body = response.read()
     except urllib.error.HTTPError as error:
-        # decode inside the guard, raise outside it: `suppress(Exception)` around the raise as well
-        # swallowed the detail-bearing RuntimeError it was meant to let through, so the bridge's own
-        # error text ("can't start new thread") could never reach the user and every failure read as
-        # a bare "returned HTTP 400".
+        # decode inside the guard, raise outside it: suppressing the raise itself drops the bridge's
+        # detail and leaves only a bare status code.
         detail = None
         with contextlib.suppress(Exception):
             detail = str(json.loads(error.read().decode("utf-8"))["error"])
-        # 5xx is the bridge failing to serve a valid request (resource exhaustion); 4xx is this
-        # request being rejected. naming which one it was stops a server fault from being read as a
-        # malformed payload.
         fault = "could not serve" if error.code >= 500 else "rejected"
+        if error_style == "reward":
+            if detail:
+                raise RuntimeError(
+                    f"flash reward bridge {fault} the request (HTTP {error.code}): {detail}"
+                ) from error
+            raise RuntimeError(
+                f"flash reward bridge {fault} the request: HTTP {error.code} with no error detail"
+            ) from error
         if detail:
             raise RuntimeError(
                 f"flash multi-turn bridge {fault} {path} (HTTP {error.code}): {detail}"
@@ -81,12 +85,24 @@ def post_json(url: str, path: str, payload: dict) -> dict:
             f"flash multi-turn bridge {fault} {path}: HTTP {error.code} with no error detail"
         ) from error
     except (OSError, http.client.HTTPException) as error:
+        if error_style == "reward":
+            raise RuntimeError(f"flash reward bridge request failed: {error}") from error
         raise RuntimeError(
             f"flash multi-turn bridge transport failed on {path}: {type(error).__name__}"
         ) from error
+    except Exception as error:
+        if error_style == "reward":
+            raise RuntimeError(
+                f"flash reward bridge returned an invalid response: {error}"
+            ) from error
+        raise
     try:
         return json.loads(body.decode("utf-8"))
     except (TypeError, ValueError) as error:
+        if error_style == "reward":
+            raise RuntimeError(
+                f"flash reward bridge returned an invalid response: {error}"
+            ) from error
         raise RuntimeError(f"flash multi-turn bridge returned malformed json for {path}") from error
 
 
