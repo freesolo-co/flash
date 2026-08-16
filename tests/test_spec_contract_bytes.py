@@ -354,28 +354,22 @@ def test_public_payload_is_the_worker_payload_minus_the_managed_registries():
     )
 
 
-def test_a_new_private_field_must_be_registered_to_stay_private():
-    """Public-by-default is the point of the projection, so prove the default actually holds.
+def test_every_privately_held_field_is_named_in_a_registry():
+    """Nothing may be stripped from the public payload without being named in a registry.
 
-    Under the old two-serializer shape a new field was PRIVATE by default: it reached
-    `to_internal_dict` via `asdict` and stayed out of `to_dict` until someone remembered to add it,
-    so forgetting was silent and the field never reached the public contract. Now forgetting is
-    loud in the opposite direction -- the field appears publicly -- which is the failure a test can
-    actually catch.
+    Both serializers are BLACKLISTS -- they emit everything and pop what is managed -- so a newly
+    added field is PUBLIC by default here and was public by default before the projection too.
+    Measured, not assumed: an unregistered field injected into the payload leaks into dev's public
+    output and into this one identically. The projection does not change that direction.
+
+    What it does change is that the boundary is now ENUMERABLE. A run of `data.pop(...)` statements
+    cannot be asserted against; three frozensets can. This test is the assertion that buys: if a
+    future edit strips a field inline instead of registering it, the strip stops being visible to
+    the registries and this fails.
     """
     registered = MANAGED_TOP_LEVEL_KEYS | {"project"}
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "sft",
-            "project": PROJECT,
-            "environment": {"id": "owner/project/env"},
-            "train": {"epochs": 1},
-            "gpu": {"type": "H100"},
-        }
-    )
     unregistered = {
-        name for name in spec.to_internal_dict() if name not in spec.to_dict()
+        name for name in spec().to_internal_dict() if name not in spec().to_dict()
     } - registered
     assert not unregistered, (
         f"{sorted(unregistered)} are stripped from the public payload but named in no registry, so "

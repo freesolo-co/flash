@@ -607,9 +607,10 @@ class JobSpec:
 
         Built as a PROJECTION of the worker payload, because that is the actual relationship: the
         public contract is the worker contract minus the platform-managed fields, and the three
-        MANAGED_*_KEYS sets name that difference exhaustively. Deriving it means a new field is
-        public by default and private only by naming it, so the two contracts cannot silently drift
-        apart -- which they could while this was a second `asdict(self)` with its own hand-kept pops.
+        MANAGED_*_KEYS sets name that difference exhaustively. This is still a blacklist -- a newly
+        added field is public until something strips it, exactly as before -- but the strips are now
+        enumerable rather than a run of statements, so a test can assert the boundary instead of
+        trusting that two independent `asdict(self)` bodies were kept in sync by hand.
 
         Its bytes are a recovery contract. ``_preparation_digest`` hashes this output as canonical
         JSON, so key PRESENCE is load-bearing even though key order is not: adding or dropping one
