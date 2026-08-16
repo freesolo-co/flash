@@ -7,14 +7,18 @@ build actually refuses it.
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
+import re
 import subprocess
 import sys
 import zipfile
 
 import pytest
 
+from flash.providers._lifecycle import instance
+from flash.providers.vast.jobs import builders as vast_builders
 from flash.runtime_capsule import (
     MANIFEST_NAME,
     CapsuleError,
@@ -25,6 +29,7 @@ from flash.runtime_capsule import (
     write_capsule,
 )
 from flash.runtime_capsule.manifest import parse_manifest, validate_member_path
+from flash.runtime_capsule.profiles import get_profile
 
 PROFILE = "instance-bootstrap"
 
@@ -318,6 +323,32 @@ def test_importing_any_member_is_inert(tmp_path):
     # importing the bootstrap must not start a training run either.
     assert result.returncode == 0, f"a member ran on import:\n{result.stderr}"
     assert "OK" in result.stdout
+
+
+def test_every_program_the_launch_scripts_invoke_is_a_capsule_member():
+    """Each `capsule.pyz <name>` in the provider launch text must name something the capsule runs.
+
+    The dispatcher test below proves an unknown name is REFUSED. That is only half the contract: it
+    says nothing about whether the names the launch scripts actually pass are known ones. Before the
+    capsule the two were the same text -- a helper was a heredoc written right where it was invoked,
+    so they could not desync. Now the name is a bare string in a shell line and the code is a member
+    resolved at run time, and nothing structural holds them together.
+
+    A rename that misses a call site is invisible locally: two of the invocations end in
+    `|| true` (hostlog) or `|| true` inside `fail()` (failmark), so on a rented box the program
+    simply never runs and the launch continues, losing the console log or the failure marker with no
+    error anywhere.
+    """
+    invoked = set()
+    for module in (instance, vast_builders):
+        for name in re.findall(r"capsule\.pyz ([a-z_]+)", inspect.getsource(module)):
+            invoked.add(name)
+    # the sources are (repo path, member path); a program name is the member stem.
+    profile = get_profile(PROFILE)
+    runnable = {member.removesuffix(".py") for _, member in profile.sources}
+
+    assert invoked, "found no capsule invocations to check -- the regex stopped matching"
+    assert invoked <= runnable, f"launch text invokes non-members: {sorted(invoked - runnable)}"
 
 
 @pytest.mark.parametrize(
