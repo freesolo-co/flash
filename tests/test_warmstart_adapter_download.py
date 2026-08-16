@@ -1,12 +1,12 @@
 """Focused retry tests for pinned warm-start adapter downloads."""
 
-import json
-import struct
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from huggingface_hub.errors import HfHubHTTPError
 from requests.exceptions import Timeout
+from safetensors.numpy import save
 
 import flash.engine.worker as worker
 import flash.engine.worker.model.adapter as adapter
@@ -46,18 +46,16 @@ def _prepare_download(monkeypatch):
 def _write_adapter_files(adir, *, include_tensor_data: bool) -> None:
     adir.mkdir()
     (adir / "adapter_config.json").write_text(_ADAPTER_CONFIG, encoding="utf-8")
-    header = {
-        "base_model.model.layers.0.q_proj.lora_A.default.weight": {
-            "dtype": "F32",
-            "shape": [1],
-            "data_offsets": [0, 4],
+    tensor_bytes = save(
+        {
+            "base_model.model.layers.0.q_proj.lora_A.default.weight": np.ones(
+                (1, 1), dtype=np.float32
+            )
         }
-    }
-    header_bytes = json.dumps(header).encode()
-    payload = struct.pack("<f", 1.0) if include_tensor_data else b""
-    (adir / "adapter_model.safetensors").write_bytes(
-        struct.pack("<Q", len(header_bytes)) + header_bytes + payload
     )
+    if not include_tensor_data:
+        tensor_bytes = tensor_bytes[:-4]
+    (adir / "adapter_model.safetensors").write_bytes(tensor_bytes)
 
 
 def test_warmstart_loadability_rejects_truncated_weights(tmp_path):
