@@ -20,7 +20,7 @@ from typing import Protocol
 
 from flash.envscan.formats import _looks_like_zlib
 from flash.envscan.patterns import SHORTEST_TOKEN_BYTES, _match
-from flash.envscan.wrapped import context_unwrapped
+from flash.envscan.wrapped import _BLOCK_HEADER, context_unwrapped
 
 
 # What a caller may offer for a second look at decoded bytes: given them, it names a credential or
@@ -470,6 +470,33 @@ _ASSIGNED_VALUE = re.compile(rb"""[=:]\s*["'`]?\Z""")
 _QUOTE_CHARACTERS = b"\"'`"
 
 
+def _is_complete_yaml_block_value(data: bytes, start: int, end: int) -> bool:
+    """Whether the run is all non-whitespace content of an assigned YAML block scalar."""
+    body_start = data.rfind(b"\n", 0, start)
+    if body_start < 0:
+        return False
+    indent = data[body_start + 1 : start]
+    if not indent or indent.strip(b" \t"):
+        return False
+
+    header_end = body_start - (data[body_start - 1 : body_start] == b"\r")
+    header_start = data.rfind(b"\n", 0, header_end) + 1
+    if _BLOCK_HEADER.fullmatch(data[header_start:header_end]) is None:
+        return False
+
+    at = end
+    while at < len(data):
+        line_end = data.find(b"\n", at)
+        if line_end < 0:
+            line_end = len(data)
+        line = data[at:line_end].removesuffix(b"\r")
+        if line.strip(b" \t"):
+            leading = len(line) - len(line.lstrip(b" \t"))
+            return leading < len(indent)
+        at = line_end + 1
+    return True
+
+
 def _is_assigned_value(data: bytes, start: int, end: int) -> bool:
     """Whether the run at `data[start:end]` was assigned or quoted rather than embedded in prose.
 
@@ -479,6 +506,7 @@ def _is_assigned_value(data: bytes, start: int, end: int) -> bool:
         optional whitespace and an optional opening quote.
       * fully quoted -- the run is the entire contents of a quoted string, which is how a JSON or
         YAML scalar carries one.
+      * yaml block value -- a `key: |` or `key: >` body whose only non-whitespace content is the run.
       * the whole buffer -- a `.b64` sidecar whose entire content is one encoded blob.
 
     A run inside a sentence matches none of them, so its refusal stays swallowed as speculative.
@@ -492,7 +520,7 @@ def _is_assigned_value(data: bytes, start: int, end: int) -> bool:
     after = data[end : end + 1]
     if not before and after in (b"", b"\n", b"\r"):
         return True
-    if _ASSIGNED_VALUE.search(before):
+    if _ASSIGNED_VALUE.search(before) or _is_complete_yaml_block_value(data, start, end):
         return True
     return bool(before[-1:] and before[-1:] in _QUOTE_CHARACTERS and before[-1:] == after)
 

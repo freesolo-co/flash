@@ -81,6 +81,36 @@ def test_a_wrapped_base64_value_is_joined(tmp_path, name, body):
     assert credential_in_file(_write(tmp_path, name, text)) == "a Freesolo API key"
 
 
+@pytest.mark.parametrize("indicator", ["|", ">"])
+def test_an_openssl_envelope_in_a_yaml_block_scalar_is_refused(tmp_path, indicator):
+    from flash.envscan.secrets import _Unscannable
+
+    envelope = b"Salted__12345678ciphertext01234567"
+    encoded = base64.b64encode(envelope).decode()
+    parts = [encoded[at : at + 16] for at in range(0, len(encoded), 16)]
+    block = f"secret: {indicator}\n" + "".join(f"  {part}\n" for part in parts)
+
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(_write(tmp_path, f"block-{indicator.encode().hex()}.yaml", block))
+
+
+def test_yaml_block_assignment_detection_stays_context_bound(tmp_path):
+    from flash.envscan.secrets import _Unscannable
+
+    envelope = b"Salted__12345678ciphertext01234567"
+    encoded = base64.b64encode(envelope).decode()
+    inline = _write(tmp_path, "inline.yaml", f"secret: {encoded}\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(inline)
+
+    parts = [encoded[at : at + 16] for at in range(0, len(encoded), 16)]
+    prose = "example wrapped text follows\n" + "".join(f"  {part}\n" for part in parts)
+    assert credential_in_file(_write(tmp_path, "README.md", prose)) is None
+
+    mixed = "secret: |\n" + "".join(f"  {part}\n" for part in parts) + "  ordinary prose\n"
+    assert credential_in_file(_write(tmp_path, "mixed.yaml", mixed)) is None
+
+
 @pytest.mark.parametrize(
     ("name", "body"),
     [
