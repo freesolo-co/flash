@@ -21,6 +21,16 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- An attempt's terminal artifacts (its strict marker plus `metrics.json`) are now interpreted by
+  one shared protocol instead of being decoded separately by live instance polling and by each
+  recovery path. The two decoders disagreed about identical bytes. A marker that could not be tied
+  to the attempt was a terminal failure to the live poller but indistinguishable from "no marker
+  yet" to recovery, so the same corrupt artifact produced a different story depending on which
+  layer happened to observe it; recovery now names it rather than logging silence. Neither path
+  ever adopted such a marker as completed work, and neither does now. Recovery also computed a
+  fresh observation window for the marker and then another for `metrics.json`, so the real ceiling
+  was their sum and moved with however long the first read took; both reads now share one window,
+  which makes the bound the cutoff rather than the sum.
 - CI runs the offline test suite on both supported interpreters (3.11 and 3.12) rather than
   3.11 alone, and sets `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` so a test that reaches the
   network fails deterministically instead of depending on runner connectivity.
