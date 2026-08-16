@@ -46,7 +46,7 @@ class GitHubUnavailableError(GitHubTransientError):
 
 
 class GitHubPermanentError(RuntimeError):
-    """GitHub answered, and the answer will not change on a retry: a 404 or a 422.
+    """GitHub answered, and the answer will not change on a retry: 401, 403, 404, or 422.
 
     Deliberately NOT a GitHubTransientError. Waiting is the right response to a blip and the wrong
     response to a typo, and the two are indistinguishable once both are a bare RuntimeError -- which
@@ -57,6 +57,10 @@ class GitHubPermanentError(RuntimeError):
     read, rather than leaking its existence with a 403. Both are permanent for this caller: no
     amount of retrying makes an unreadable ref resolvable, and the fix (check the name, or grant the
     token access) is the user's either way. The message carries GitHub's own text so it names which.
+
+    The credential codes reach here only after the rate-limit shapes (429, and the 403 that says
+    rate limit) have been claimed as transient, so a 401 or a surviving 403 is a token this plane
+    cannot fix by waiting: invalid, expired, or missing the scope. Same user-side fix as a typo.
     """
 
 

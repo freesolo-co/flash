@@ -242,8 +242,7 @@ _TOP_LEVEL_KEYS = frozenset(
 )
 # keys that WERE user-authorable and are now rejected with their own targeted error. they are absent
 # from _TOP_LEVEL_KEYS, so the unknown-key check below would otherwise report them as a typo and bury
-# the explanation of why they went away. distinct from core.spec._DROPPED_TOP_LEVEL_KEYS, which is
-# about tolerating removed keys on READ so persisted records still parse and rehash.
+# the explanation of why they went away.
 _REMOVED_TOP_LEVEL_KEYS = frozenset({"model_revision"})
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
@@ -329,10 +328,7 @@ def _validate_top_level(
     raw: dict[str, Any], project_required: bool
 ) -> tuple[str, str, str, str, bool]:
     """Validate the top-level config section."""
-    revision_raw = raw.get("model_revision")
-    # released clients serialize an unpinned spec as model_revision="". tolerate that legacy wire
-    # artifact, including whitespace-only strings, while continuing to reject every authored pin.
-    if "model_revision" in raw and (not isinstance(revision_raw, str) or revision_raw.strip()):
+    if "model_revision" in raw:
         raise ConfigError(
             "config key `model_revision` was removed because Flash-managed serving loads a "
             "pre-quantized FP8 checkpoint resolved per base model, so it cannot honor an arbitrary "

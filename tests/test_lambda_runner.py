@@ -3801,6 +3801,16 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     assert emb3["job_spec_in_hf"] is True
     assert emb3["job_spec_json"] == ""
     assert len(heavy) < 64_000 - 2_000
+    # this is the tightest real launch, and it clears by a margin measured in bytes. the three
+    # bootstrap modules are embedded as SOURCE, and _strip_docstrings drops docstrings but keeps
+    # comments -- so a comment added to any of them spends launch budget exactly like code does.
+    # report the slack rather than only the pass/fail, so the next author who lands here sees how
+    # much room is actually left instead of an opaque ValueError.
+    slack = (64_000 - 2_000) - len(heavy.encode())
+    assert slack >= 0, (
+        f"the heavy-secret launch is {-slack} bytes over budget. the bootstrap modules ship as "
+        "source text (comments included); shrink them rather than raising the cap."
+    )
 
 
 def test_build_user_data_rejects_a_payload_that_stays_oversized_after_spilling(monkeypatch):
