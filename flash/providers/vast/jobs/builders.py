@@ -116,9 +116,9 @@ def vast_image(gpu: str | None = None) -> str:
     Vast runs the worker via its own onstart, so the image's CMD is irrelevant — only the baked
     deps/cache matter. The Blackwell driver floor lives in the ``cuda_max_good`` offer filter, not
     the image."""
-    from flash.providers._lifecycle.worker import WORKER_IMAGE, worker_image_for_gpu
+    from flash.providers._lifecycle.worker import worker_image_for_gpu
 
-    return worker_image_for_gpu(gpu) or WORKER_IMAGE
+    return worker_image_for_gpu(gpu)
 
 
 def build_payload(
