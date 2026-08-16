@@ -83,9 +83,8 @@ def openai_base_url(control_url: str) -> str:
 
 
 def public_deployment(deployment: dict) -> dict:
-    """Return a public copy without private rollback state or the stale legacy URL field."""
+    """Return a public copy without private rollback state."""
     out = dict(deployment)
     out.pop("previous_deployment", None)
     out.pop("verification_generation", None)
-    out.pop("url", None)
     return out
