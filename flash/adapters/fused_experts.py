@@ -78,6 +78,12 @@ def validate_fused_expert_adapter_config(config: Mapping[str, Any], model_id: st
     if isinstance(modules, str):
         if modules != "all-linear":
             raise ValueError(f"adapter for {model_id} string target_modules must be 'all-linear'")
+        # all-linear names no modules, so only a default rank can resolve every ordinary target.
+        if declared.default is None:
+            raise ValueError(
+                f"adapter for {model_id} has no resolved default LoRA rank for 'all-linear' "
+                "target_modules"
+            )
         return
     if (
         not isinstance(modules, list)
