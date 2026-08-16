@@ -62,3 +62,64 @@ def test_a_qualified_id_is_normalised_per_segment():
 def test_an_over_long_name_is_refused():
     with pytest.raises(envs.EnvPublishError):
         envs.validate_publish_inputs(package_b64="", name="x" * (envs._MAX_ENV_NAME_CHARS + 1))
+
+
+def test_an_unreadable_member_names_the_file_and_survives_a_bare_oserror(tmp_path, monkeypatch):
+    """A member the scan cannot open is a refusal, and the refusal has to say which member.
+
+    The message previously carried only `exc.strerror`, which names the errno and not the file, so
+    a publisher was told a file could not be read without being told which one. `strerror` is also
+    unset on an `OSError` raised without an errno, which rendered the refusal as "...: None".
+    """
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "environment.py").write_text("def build():\n    return None\n")
+    locked = package / "secrets" / "config.json"
+    locked.parent.mkdir()
+    locked.write_text("{}")
+
+    def refuse_to_open(*_args, **_kwargs):
+        raise OSError("no errno on this one")
+
+    monkeypatch.setattr(envs, "reject_credential_bearing_package", refuse_to_open)
+    with pytest.raises(envs.EnvPublishError) as caught:
+        envs._reject_credentials(package)
+    assert "None" not in str(caught.value)
+    assert "could not be read to check it for credentials" in str(caught.value)
+
+
+def test_an_unreadable_member_is_named_relative_to_the_package(tmp_path, monkeypatch):
+    """The absolute path is the control plane's staging directory, which is the server's business
+    rather than the publisher's, so only the package-relative part is shown."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "environment.py").write_text("def build():\n    return None\n")
+
+    def refuse_to_open(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied", str(package / "secrets" / "config.json"))
+
+    monkeypatch.setattr(envs, "reject_credential_bearing_package", refuse_to_open)
+    with pytest.raises(envs.EnvPublishError) as caught:
+        envs._reject_credentials(package)
+    assert "secrets/config.json" in str(caught.value)
+    assert str(tmp_path) not in str(caught.value), "the staging path must not be echoed"
+
+
+def test_an_unreadable_member_name_holding_a_credential_is_redacted(tmp_path, monkeypatch):
+    """A member name can itself be the credential, so naming it in the refusal has to redact it
+    the same way every other message in the scan does."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "environment.py").write_text("def build():\n    return None\n")
+
+    def refuse_to_open(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied", str(package / f"{FREESOLO_KEY}.json"))
+
+    monkeypatch.setattr(envs, "reject_credential_bearing_package", refuse_to_open)
+    with pytest.raises(envs.EnvPublishError) as caught:
+        envs._reject_credentials(package)
+    message = str(caught.value)
+    assert FREESOLO_KEY not in message
+    # the member has to be named, masked -- asserting only the absence of the key would also pass
+    # on a message that never mentioned the file, which is the bug this pairs with.
+    assert ".json" in message

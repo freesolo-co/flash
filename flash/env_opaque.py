@@ -14,6 +14,11 @@ _ARROW_MAGIC = b"ARROW1"
 _ARROW_CONTINUATION = b"\xff\xff\xff\xff"
 _MAX_ARROW_METADATA_BYTES = 16 << 20
 _MAX_ARROW_VECTOR_ITEMS = 100_000
+# the Type union in Schema.fbs, 1-based: Null=1 through LargeListView=26. the bound only has to
+# reject a byte that cannot be a type at all, so it tracks the union's current length. a file
+# using a type added after this was written stops matching as Arrow and falls back to the literal
+# scan, which is the safe direction: a missed refusal, never a wrong one.
+_MAX_ARROW_TYPE_KIND = 26
 _GIT_PACK_HEADER_BYTES = 12
 _MAX_GIT_PACK_OBJECTS = 100_000
 _MAX_GIT_PACK_OUTPUT_BYTES = 64 << 20
@@ -153,7 +158,7 @@ def _valid_arrow_field(data: bytes, target: int, depth: int = 0) -> bool:
         return False
     type_kind_at = _flatbuffer_field(data, table, 2)
     type_at = _flatbuffer_target(data, _flatbuffer_field(data, table, 3, 4))
-    if type_kind_at is None or not 1 <= data[type_kind_at] <= 18:
+    if type_kind_at is None or not 1 <= data[type_kind_at] <= _MAX_ARROW_TYPE_KIND:
         return False
     if type_at is None or _flatbuffer_table_at(data, type_at) is None:
         return False

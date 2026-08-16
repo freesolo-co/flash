@@ -367,6 +367,12 @@ def credential_in_tar(
             if isinstance(source, bytes)
             else _read_at(source, remainder_at, source_size - remainder_at)
         )
+        if not tail:
+            # `_read_at` answers None when the remainder cannot be read, the same way the zip
+            # prefix and suffix paths are guarded. Without this the walk raised `AttributeError`
+            # out of a validation check and aborted the publish, where every other unreadable
+            # region is a refusal. There is nothing further to dispatch either way.
+            return None
         # tar writers pad the two zero end blocks to a 10 KiB record. Leaving those blocks in front
         # made a complete second tar invisible to the next structural walk; stripping only whole
         # zero blocks preserves a real suffix whose first header byte happens to be zero.

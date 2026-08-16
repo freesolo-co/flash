@@ -17,6 +17,7 @@ from pathlib import Path
 
 from flash.env_secrets import (
     _MAX_DECOMPRESS_SECONDS,
+    _redacted,
     _Unscannable,
     credential_in_name,
     reject_credential_bearing_package,
@@ -566,6 +567,27 @@ def _reject_credential_name(name: str) -> None:
             raise EnvPublishError(f"env name contains {kind}; rotate it and use a different name")
 
 
+def _unreadable_member(error: OSError, package_root: Path) -> str:
+    """Which package member could not be read, named the way every other refusal names one.
+
+    The path on the exception is inside the control plane's staging directory, which is the
+    server's business rather than the publisher's, so only the package-relative part is shown. A
+    member name can itself hold a credential, so it goes through the same redaction as the rest of
+    the scan's messages.
+
+    `strerror` is unset on an `OSError` raised without an errno, and interpolating it produced a
+    refusal reading "...: None". The member is the useful half anyway.
+    """
+    filename = getattr(error, "filename", None)
+    if not filename:
+        return "a file in the package"
+    try:
+        relative = Path(str(filename)).relative_to(package_root).as_posix()
+    except ValueError:
+        return "a file in the package"
+    return _redacted(relative, deadline=time.monotonic() + _MAX_DECOMPRESS_SECONDS)
+
+
 def _reject_credentials(package_root: Path) -> None:
     """Refuse a package carrying a credential, before anything is committed to the hub.
 
@@ -587,7 +609,7 @@ def _reject_credentials(package_root: Path) -> None:
         # instead of a 400. A member the scan cannot read is a refusal, not a server fault:
         # unverifiable is not clean, and the same answer is what the CLI would have given.
         raise EnvPublishError(
-            f"a file in the package could not be read to check it for credentials: {exc.strerror}"
+            f"{_unreadable_member(exc, package_root)} could not be read to check it for credentials"
         ) from None
 
 

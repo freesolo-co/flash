@@ -11,6 +11,8 @@ becomes unpublishable.
 
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from flash.env_opaque import opaque_format
@@ -84,3 +86,35 @@ def test_the_detector_reports_the_format_it_proved():
     assert opaque_format(b"\x89HDF\r\n\x1a\n" + b"\x00" * 128) == "HDF5"
     assert opaque_format(_rpm_lead() + b"\x00" * 128) == "RPM"
     assert opaque_format(b"ordinary bytes") is None
+
+
+@pytest.mark.parametrize("column", ["large_string", "large_binary"])
+def test_arrow_types_above_the_original_bound_are_recognised(tmp_path, column):
+    """The Arrow `Type` union runs to 26, not 18.
+
+    `LargeBinary` (19) and `LargeUtf8` (20) are what pandas and polars emit for ordinary wide
+    columns. Rejecting their discriminant made a structurally valid Arrow file stop matching as
+    opaque, so the refusal never fired and columnar values stayed invisible to the literal scan.
+
+    Flat columns only, deliberately: a nested type's footer takes a different validation path that
+    this finding does not reach, so including one would prove something other than the bound.
+    """
+    pa = pytest.importorskip("pyarrow", reason="arrow fixtures need the writer")
+    arrow_type = {"large_string": pa.large_string(), "large_binary": pa.large_binary()}[column]
+    # ordinary values, no credential: what is under test is that the file is recognized as a
+    # layout the scan cannot read. a key placed in the column would be found by the literal scan
+    # anyway, since Arrow stores short strings inline, and would pass whatever the bound was.
+    values = ["ordinary", "values"] if column == "large_string" else [b"ordinary", b"values"]
+
+    batch = pa.record_batch([pa.array(values, type=arrow_type)], names=["value"])
+    sink = io.BytesIO()
+    with pa.ipc.new_file(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+
+    assert opaque_format(sink.getvalue()) == "Arrow IPC"
+
+    path = tmp_path / "shard.arrow"
+    path.write_bytes(sink.getvalue())
+    with pytest.raises(_Unscannable) as caught:
+        credential_in_file(path)
+    assert "Arrow IPC" in str(caught.value)
