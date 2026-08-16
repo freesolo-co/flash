@@ -362,6 +362,11 @@ def test_every_privately_held_field_is_named_in_a_registry():
     cannot be asserted against; the registries can. Walks EVERY section, not just the top level:
     `environment.resolved_sha` was stripped inline and named in no registry, and a top-level-only
     version of this test passed while that was true.
+
+    The sections walked are the ones actually PRESENT in the payload, not the ones named in
+    `MANAGED_SECTION_KEYS`. Deriving them from the registry would make this test blind in exactly
+    the direction it exists to cover: an inline strip inside an unregistered section (`wandb`) is
+    the same defect as the `environment` one, and a registry-driven walk cannot see it.
     """
     public, worker = (
         spec(train={"epochs": 1, "init_from_adapter": "src/step-4"}).to_dict(),
@@ -373,10 +378,15 @@ def test_every_privately_held_field_is_named_in_a_registry():
     unregistered = {
         f"(top){name}" for name in set(worker) - set(public) - MANAGED_TOP_LEVEL_KEYS - exempt
     }
-    for section, managed_keys in MANAGED_SECTION_KEYS:
+    registered = dict(MANAGED_SECTION_KEYS)
+    for section, worker_section in worker.items():
+        if not isinstance(worker_section, dict):
+            continue
+        public_section = public.get(section) or {}
+        managed_keys = registered.get(section, frozenset())
         unregistered |= {
             f"{section}.{name}"
-            for name in set(worker[section]) - set(public[section]) - managed_keys - exempt
+            for name in set(worker_section) - set(public_section) - set(managed_keys) - exempt
         }
     # `gpu.type_fallbacks` is a reshape, not a removal: it is folded into the public `gpu.type`.
     unregistered -= {"gpu.type_fallbacks"}
