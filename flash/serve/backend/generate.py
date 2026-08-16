@@ -11,6 +11,7 @@ import re
 from importlib import metadata, resources
 from pathlib import Path
 
+from flash._internal.channel import DIST_NAME
 from flash.content.multimodal import _IMAGE_BLOCK_TYPES
 from flash.core.catalog import ModelInfo
 from flash.serve.backend.gpus import MODAL_GPUS_BY_NAME, ModalGpu, default_gpu
@@ -24,8 +25,6 @@ MIN_SCALEDOWN_WINDOW = 2
 MAX_SCALEDOWN_WINDOW = 20 * 60
 
 _TEMPLATE = "modal_app.py.tmpl"
-# the package this module ships in; `flash_requirement()` reads its installed metadata.
-_DISTRIBUTION = "freesolo-flash"
 _CONFIG_MARKER = "# flash generated config"
 # modal app names allow letters, digits and dashes.
 _UNSAFE_NAME = re.compile(r"[^a-z0-9-]+")
@@ -36,8 +35,10 @@ def flash_requirement() -> str:
 
     Derived from installed metadata rather than hardcoded, so a dev-channel CLI generates an app
     pinned to the dev-channel distribution instead of silently installing the production one.
+    `DIST_NAME` is what makes that true: the two channels ship under different distribution names,
+    so reading the production name unconditionally would fail to resolve on the dev channel.
     """
-    distribution = metadata.distribution(_DISTRIBUTION)
+    distribution = metadata.distribution(DIST_NAME)
     return f"{distribution.metadata['Name']}[serve-runtime]=={distribution.version}"
 
 

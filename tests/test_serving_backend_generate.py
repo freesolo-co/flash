@@ -9,6 +9,7 @@ details flash's client depends on are actually present.
 from __future__ import annotations
 
 import ast
+import inspect
 import re
 import sys
 import tomllib
@@ -17,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+import flash.serve.backend.generate as generate_module
+from flash._internal.channel import DIST_NAME
 from flash.content.multimodal import _IMAGE_BLOCK_TYPES
 from flash.core.catalog import MODELS
 from flash.serve.backend.generate import (
@@ -87,6 +90,28 @@ def test_engine_values_come_from_the_catalog(model_id):
     # than by a second constant that could drift from the runtime the app imports.
     assert values["FLASH_REQUIREMENT"] == flash_requirement()
     assert "[serve-runtime]==" in values["FLASH_REQUIREMENT"]
+
+
+def test_the_pinned_distribution_follows_the_release_channel():
+    """the two channels ship under different distribution names.
+
+    reading the production name unconditionally would make `flash serve setup` unable to resolve
+    its own version on the dev channel, and -- if it did resolve -- would pin the GPU container to
+    the production build a dev-channel user is deliberately not running.
+
+    `CHANNEL` is a source constant that scripts/build_dev_dist.py rewrites at build time, so
+    asserting against the imported `DIST_NAME` on this prod checkout would hold for a hardcoded
+    production name too. Reading the source is what actually distinguishes the two.
+    """
+    source = inspect.getsource(generate_module.flash_requirement)
+    assert "DIST_NAME" in source, (
+        "flash_requirement must resolve the distribution through channel.DIST_NAME; a hardcoded "
+        "name fails to resolve on the dev channel, where the package is freesolo-flash-dev"
+    )
+    assert '"freesolo-flash"' not in source
+    assert "'freesolo-flash'" not in source
+    # and it still produces a usable requirement on this (prod) checkout.
+    assert flash_requirement().startswith(f"{DIST_NAME}[serve-runtime]==")
 
 
 def test_the_serve_modal_extra_installs_what_the_generated_app_imports_locally():

@@ -144,3 +144,26 @@ def test_runtime_access_before_start_is_an_error() -> None:
 def test_engine_config_is_required() -> None:
     with pytest.raises(NotImplementedError):
         RuntimeContainer().engine_config()
+
+
+def test_a_failed_start_leaves_no_runtime_behind(monkeypatch) -> None:
+    """a runtime that never finished starting must not look started.
+
+    publishing it before `start()` returns would let later requests reach a half-initialized
+    engine, and the container would answer them instead of failing and being replaced.
+    """
+
+    class _DeadRuntime:
+        def __init__(self, config, on_engine_death=None) -> None:
+            self.config = config
+
+        async def start(self) -> None:
+            raise RuntimeError("engine core died during startup")
+
+    monkeypatch.setattr("flash.serve.modal.engine.VllmLoraRuntime", _DeadRuntime)
+    container = _Container()
+    with pytest.raises(RuntimeError, match="died during startup"):
+        asyncio.run(container.start_runtime())
+    # the failure must be visible to every later caller, not swallowed into a usable-looking one.
+    with pytest.raises(RuntimeError, match="has not been started"):
+        _ = container.runtime

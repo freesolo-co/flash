@@ -34,13 +34,19 @@ class RuntimeContainer:
         return self._runtime
 
     async def start_runtime(self) -> VllmLoraRuntime:
-        """construct and start the runtime once, wiring engine death to container draining."""
+        """construct and start the runtime once, wiring engine death to container draining.
+
+        the runtime is published only after `start()` returns, so a failed start leaves the
+        container with no runtime rather than one that looks started and answers requests from a
+        half-initialized engine.
+        """
         if self._runtime is None:
-            self._runtime = VllmLoraRuntime(
+            runtime = VllmLoraRuntime(
                 self.engine_config(),
                 on_engine_death=self._drain_on_engine_death,
             )
-            await self._runtime.start()
+            await runtime.start()
+            self._runtime = runtime
         return self._runtime
 
     async def close_runtime(self) -> None:
