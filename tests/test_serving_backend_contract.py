@@ -777,6 +777,49 @@ def test_concurrent_adapter_loads_register_each_adapter_once(client, engine_clas
     assert set(instance._registered) == {first["adapter_id"], second["adapter_id"]}
 
 
+def test_a_raising_post_load_read_still_unloads_what_it_just_registered(
+    client, engine_class, monkeypatch, tmp_path
+):
+    """a durable read that raises must not leave the adapter resident.
+
+    the disabled-record branch already undoes the load, but a transient Dict failure took the
+    early-return path out of the function with the adapter still registered -- holding a LoRA slot
+    and its cache with nothing left to reclaim them.
+    """
+    module = client.app.state.generated_module
+    monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
+    instance = engine_class.__new__(engine_class)
+    instance._locks = {}
+    instance._registered = {}
+    unloaded = []
+
+    async def register_adapter(spec):
+        return True
+
+    async def unload_adapter(adapter_id, *, expected_incarnation):
+        unloaded.append((adapter_id, expected_incarnation))
+        return True
+
+    instance._runtime = types.SimpleNamespace(
+        register_adapter=register_adapter,
+        unload_adapter=unload_adapter,
+    )
+    instance._adapter_path = lambda record: asyncio.sleep(0, result="/tmp/adapter")
+    reads = iter([{**REGISTRATION, "status": "registered"}])
+
+    async def read(adapter_id):
+        try:
+            return next(reads)
+        except StopIteration:
+            raise RuntimeError("dict unavailable") from None
+
+    monkeypatch.setattr(module, "_read", read)
+    with pytest.raises(RuntimeError, match="dict unavailable"):
+        _run_awaitable(engine_class._load_lora_locked(instance, REGISTRATION))
+    assert unloaded == [(REVISION, REVISION)]
+    assert REVISION not in instance._registered
+
+
 def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_removable(
     client, engine_class, monkeypatch, tmp_path
 ):

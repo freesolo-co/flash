@@ -290,8 +290,14 @@ class Engine(RuntimeContainer):
         spec = _adapter_spec(record, path)
         await self.runtime.register_adapter(spec)
         self._registered[adapter_id] = spec.incarnation
-        # the record can flip to disabled while weights were loading, so re-read and undo.
-        latest = await _read(adapter_id)
+        # the record can flip to disabled while weights were loading, so re-read and undo. a read
+        # that RAISES has to undo too: leaving the adapter resident would hold its slot and cache
+        # with nothing tracking that it needs reclaiming.
+        try:
+            latest = await _read(adapter_id)
+        except Exception:
+            await self._unload_locked(adapter_id)
+            raise
         latest_state = (latest.get("metadata") or {}).get("lifecycle_state") if latest else None
         if latest and (
             latest.get("status") == "disabled" or latest_state in ("disabled", "failed")
