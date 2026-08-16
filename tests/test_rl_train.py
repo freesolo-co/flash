@@ -286,7 +286,8 @@ def test_grpo_classified_exit_drains_group_after_leader_is_reaped(tmp_path, monk
 def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
     source = inspect.getsource(rl_train._execute_rl_child)
 
-    assert "child_stream = _rl_train()._GrpoSubprocessStream(proc)" in source
+    assert "child_stream = _rl_train()._GrpoSubprocessStream(" in source
+    assert "silence_watchdog=silence_watchdog" in source
     assert "for line in child_stream" in source
     assert "return child_stream.wait_and_classify()" in source
 
@@ -2009,7 +2010,7 @@ def test_resume_credits_required_steps_already_durable_on_hf(tmp_path, monkeypat
     # step 10 is verified on hf, so it is credited. step 15 is below the resume point but its
     # adapter never landed, so it stays uncredited and completeness still catches it. step 25 is
     # ahead of the resume point and is this run's job to publish.
-    assert uploader.published_steps == {10}
+    assert uploader.lifecycle.deployable_published_steps == {10}
     with pytest.raises(RuntimeError, match=r"not durably published: \[15, 25\]"):
         uploader.raise_if_incomplete()
 
@@ -2022,7 +2023,7 @@ def test_resume_step_is_not_credited_without_a_durable_adapter(tmp_path, monkeyp
     uploader = rl_train._VerlResumeUploader(str(tmp_path), resume_step=10, required_steps=(10,))
     uploader.credit_durable_required_steps(10)
 
-    assert uploader.published_steps == set()
+    assert uploader.lifecycle.deployable_published_steps == set()
 
 
 def test_checkpoint_retention_outlives_the_export_when_exact_saves_are_set(monkeypatch):
@@ -3719,7 +3720,7 @@ def test_resume_uploader_never_fails_the_run_on_an_upload_error(tmp_path):
         uploader.stop()  # must not raise
     finally:
         mod._w.upload_resume_checkpoint = original
-    assert 2 in uploader.processed_steps
+    assert 2 in uploader.lifecycle.discovered_steps
 
 
 def test_grpo_gradient_check_rejects_a_run_whose_rewards_never_varied():
@@ -3884,7 +3885,7 @@ def _patch_stage_and_publish(monkeypatch, staged: list[int], published: list[int
         "_publish_staged",
         lambda self, step, adapter_dir: (
             published.append(int(step)),
-            self.published_steps.add(step),
+            self.lifecycle.mark_deployable_published(step),
         )[0],
     )
 
@@ -3936,6 +3937,85 @@ def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path
     finally:
         uploader.stop()
     uploader.raise_if_incomplete()
+
+
+def test_a_gate_already_open_publishes_the_deployable_before_the_resume_upload(
+    tmp_path, monkeypatch
+):
+    """the opposite publication order to the withheld case above, and equally legitimate.
+
+    with gradient evidence already present, a required step is staged and published on the sweep
+    that finds it, BEFORE its resume upload runs. the withheld case reaches the same two facts in
+    the other order. the lifecycle records them independently precisely so neither ordering has to
+    be called the canonical one.
+    """
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    order: list[str] = []
+    staged: list[int] = []
+    published: list[int] = []
+    monkeypatch.setattr(
+        rl_train._w,
+        "upload_resume_checkpoint",
+        lambda step, path, **k: (order.append("resume"), k["after_upload"]())[0],
+        raising=False,
+    )
+    _patch_stage_and_publish(monkeypatch, staged, published)
+    _write_step(local_dir, 3)
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir), resume_step=0, required_steps=(3,), had_gradient=lambda: True
+    )
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not published:
+            time.sleep(0.05)
+    finally:
+        uploader.stop()
+
+    assert published == [3]
+    assert order.index("resume") == len(order) - 1, "the resume upload must not precede the publish"
+    facts = uploader.lifecycle.facts(3)
+    assert facts.staged
+    assert facts.deployable_published
+    assert facts.resume_uploaded
+    uploader.raise_if_incomplete()
+
+
+def test_a_failed_resume_upload_is_not_recorded_as_durable_and_stays_non_fatal(
+    tmp_path, monkeypatch
+):
+    """a resume upload that raises leaves resume_uploaded unset without failing the run.
+
+    grpo treats resume state as internal retry scaffolding: losing it costs restart distance, not
+    the policy. the attempt is still recorded so a permanently failing upload cannot respin every
+    0.5s, which is why "attempted" and "uploaded" have to be two different things.
+    """
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    attempts: list[int] = []
+
+    def exploding_upload(step, path, **kwargs):
+        attempts.append(int(step))
+        raise RuntimeError("hub is down")
+
+    monkeypatch.setattr(rl_train._w, "upload_resume_checkpoint", exploding_upload, raising=False)
+    _patch_stage_and_publish(monkeypatch, [], [])
+    _write_step(local_dir, 2)
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=())
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not attempts:
+            time.sleep(0.05)
+        time.sleep(1.0)  # several sweeps: the failed upload must not be retried on each one
+    finally:
+        uploader.stop()
+
+    assert attempts == [2], f"a permanently failing upload respun: {attempts}"
+    assert not uploader.lifecycle.facts(2).resume_uploaded
+    assert uploader.lifecycle.facts(2).discovered
+    uploader.raise_if_incomplete()  # non-fatal: no required save was owed
 
 
 def test_a_permanently_withheld_step_fails_the_run_and_does_not_hang_stop(tmp_path, monkeypatch):
@@ -3997,7 +4077,7 @@ def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_ti
 
 def test_resumed_required_step_can_still_publish_its_withheld_deployable(tmp_path, monkeypatch):
     # a previous worker resume-uploads a required checkpoint while withholding its adapter behind the
-    # gradient gate, so the step is durable as resume state but NOT published. seeding processed_steps
+    # gradient gate, so the step is durable as resume state but NOT published. seeding the lifecycle
     # with resume_step would hide it from _pending forever, and completeness would then fail a run on
     # the one step this worker is both able and allowed to publish.
     local_dir = tmp_path / "ckpt"
@@ -4112,7 +4192,7 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
         "_publish_staged",
         lambda self, step, adapter_dir: (
             published.append(int(step)),
-            self.published_steps.add(step),
+            self.lifecycle.mark_deployable_published(step),
         )[0],
     )
     for step in (1, 2, 3, 4):
@@ -4169,7 +4249,7 @@ def test_staging_failure_does_not_strand_an_earlier_publishable_step(tmp_path, m
         "_publish_staged",
         lambda self, step, adapter_dir: (
             published.append(int(step)),
-            self.published_steps.add(step),
+            self.lifecycle.mark_deployable_published(step),
         )[0],
     )
     for step in (1, 2):
@@ -5623,7 +5703,8 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
         "# index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order. "
         'env_prompts=[p["env_prompt"] for p in prompts], max_turns=int(inp["max_turns"]), '
         'per_turn_credit=bool(inp["per_turn_credit"]), '
-        "on_episode_scored=observability.record, )" in src
+        "on_episode_scored=observability.record, "
+        "parent_work=observability.parent_work, )" in src
     )
     assert 'if inp["multi_turn"] else None' in src
 

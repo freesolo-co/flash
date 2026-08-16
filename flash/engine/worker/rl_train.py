@@ -25,6 +25,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     _TEARDOWN_GRACE_S,
     VERL_REQUIREMENT,
     ChildOutputTail,
+    VerlChildSilenceWatchdog,
     _ChildExitWatchdog,
     clamp_engine_len,
     export_peft_adapter,
@@ -83,11 +84,12 @@ DATA_SOURCE = "flash_env"
 class _GrpoSubprocessStream:
     """one grpo child stream and the evidence latched from that same stream."""
 
-    def __init__(self, proc) -> None:
+    def __init__(self, proc, *, tail=None, silence_watchdog=None) -> None:
         self._proc = proc
         # the caller uses start_new_session, so the leader pid remains the group's stable identity.
         self._process_group_id = proc.pid
-        self._tail = ChildOutputTail()
+        self._tail = tail if tail is not None else ChildOutputTail()
+        self._silence_watchdog = silence_watchdog
         self._terminated = False
         self._orphaned_pipe = False
 
@@ -97,16 +99,27 @@ class _GrpoSubprocessStream:
         # inherits this same pipe, so a trainer that dies while it lives leaves a pipe nobody will
         # close and this loop would run forever on a paid gpu. the watchdog tears the group down,
         # which frees the cuda context AND closes the pipe, ending this loop.
-        with _ChildExitWatchdog(
-            self._proc, process_group_id=self._process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
-        ) as watchdog:
-            for line in self._proc.stdout:
-                # held ACROSS the yield. this is a generator, so the consumer's work for a line runs
-                # while suspended here -- counting only the arrival would make a consumer inside one
-                # long step look exactly like a reader blocked on a dead pipe.
-                with watchdog.handling_line():
-                    self._tail.record(line)
-                    yield line
+        if self._silence_watchdog is not None:
+            self._silence_watchdog.bind(
+                child_alive=lambda: self._proc.poll() is None,
+                teardown=self.terminate,
+            )
+            self._silence_watchdog.start()
+        try:
+            with _ChildExitWatchdog(
+                self._proc, process_group_id=self._process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
+            ) as watchdog:
+                for line in self._proc.stdout:
+                    # held across the yield. this is a generator, so the consumer's work for a line
+                    # runs while suspended here; counting only arrival makes a long callback look idle.
+                    with watchdog.handling_line():
+                        self._tail.record(line)
+                        if self._silence_watchdog is not None:
+                            self._silence_watchdog.observe_line(line)
+                        yield line
+        finally:
+            if self._silence_watchdog is not None:
+                self._silence_watchdog.stop()
         if watchdog.tore_down:
             self._orphaned_pipe = True
             # the group is already gone, so teardown must not be attempted a second time.
@@ -136,6 +149,8 @@ class _GrpoSubprocessStream:
             return_code = int(collected) if collected is not None else 1
         try:
             raise_for_classified_verl_exit(return_code, self._tail)
+            if self._silence_watchdog is not None:
+                self._silence_watchdog.raise_if_failed()
         except BaseException:
             self.terminate()
             raise
@@ -380,6 +395,7 @@ def run_rl_train():
             progress=_progress,
             fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
             progress_step=True,
+            sample_off_thread=True,
         ):
             rc = _execute_rl_child(
                 python_bin=python_bin,

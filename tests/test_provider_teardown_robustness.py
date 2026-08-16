@@ -130,7 +130,7 @@ def test_user_data_fails_fast_and_throttles_bootlog():
         "env": {"HF_TOKEN": "t"},
     }
     s = build_user_data(payload, image="img:tag")
-    assert "failmark.py" in s  # host writes the attempt-failure marker
+    assert "capsule.pyz failmark" in s  # host writes the attempt-failure marker
     assert 'fail "worker image pull failed' in s  # fail fast when the image can't pull
     assert 'fail "worker container did not start' in s
     assert "sleep 120" in s  # boot-log throttled to 120s
