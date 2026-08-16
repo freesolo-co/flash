@@ -197,6 +197,10 @@ def api(tmp_path, monkeypatch):
         lambda **_kwargs: True,
     )
     with TestClient(app_mod.create_app()) as client:
+        # the fake token exists only to satisfy startup preflight. leaving it live for requests makes
+        # submit-time environment pinning call the real GitHub API with `ghp-test`; tokenless planes
+        # deliberately defer that work to the worker. tests that exercise a token set their own.
+        monkeypatch.delenv("GITHUB_TOKEN")
         yield client
 
 
@@ -9018,6 +9022,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     """POST /v1/envs publishes an uploaded package to the managed environment hub."""
+    monkeypatch.setenv("GITHUB_TOKEN", "token-for-publish-path")
     import base64
     import io
     import tarfile
