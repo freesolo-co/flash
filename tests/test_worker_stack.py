@@ -567,23 +567,19 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
     ]
 
 
-def test_35b_warmstart_requires_fused_expert_targets(monkeypatch):
+def test_worker_exports_only_the_current_warmstart_adapter_surface(monkeypatch):
     worker = _import_worker(monkeypatch)
-    model_id = "Qwen/Qwen3.6-35B-A3B"
 
-    with pytest.raises(ValueError, match="omits required expert targets"):
-        worker.validate_lora_target_parameters({"target_modules": "all-linear"}, model_id)
-
-    worker.validate_lora_target_parameters(
-        {
-            "target_parameters": [
-                "mlp.experts.gate_up_proj",
-                "mlp.experts.down_proj",
-            ]
-        },
-        model_id,
-    )
-    worker.validate_lora_target_parameters({}, "Qwen/Qwen3.5-9B")
+    assert callable(worker.validate_warmstart_adapter)
+    assert callable(worker.lora_target_parameters)
+    for deleted in (
+        "adapter_has_fused_expert_tensors",
+        "expected_fused_expert_modules",
+        "legacy_fused_expert_config_is_recoverable",
+        "prepare_warmstart_adapter_config",
+        "restore_fused_expert_targets",
+    ):
+        assert not hasattr(worker, deleted)
 
 
 def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
