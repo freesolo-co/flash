@@ -119,6 +119,22 @@ def test_first_commit_landing_on_the_600s_deadline_still_spends_that_snapshot(mo
     assert uploads == [5]
 
 
+def test_a_failed_setup_snapshot_retries_on_the_next_poll_after_promotion(monkeypatch):
+    """promoting the deadline is upload state, so a failed upload must roll it back.
+
+    same poll as the test above -- the first commit lands while the 600-second deadline is already
+    due -- but the upload fails. promotion that survives the failure moves the deadline to the hourly
+    interval with ``since`` untouched, so the retry does not come at the next poll but an hour later,
+    long after the 3000-second teardown would have killed the run. the startup snapshot exists to
+    capture exactly that window, so losing it loses the evidence for runs that never reach step 1.
+    """
+    rows = [(n, n, 0, 0) for n in range(1, 5)]
+    rows += [(n, n, 1, 1) for n in range(5, 32)]
+    _waits, uploads = _drive(monkeypatch, rows, outcomes=[False])
+    # _drive records attempts: poll 5 is the one that failed, poll 6 is the retry it must not lose.
+    assert uploads == [5, 6]
+
+
 def test_pending_heartbeat_arms_only_before_committed_progress(monkeypatch):
     rows = []
     for poll in range(1, 16):
