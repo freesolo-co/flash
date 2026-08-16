@@ -26,6 +26,7 @@ from flash.engine.worker.opd_train import (
     _OPD_PARQUET_WRITE_BATCH_ROWS,
     _BridgePrompt,
     _build_opd_child_env,
+    _build_opd_plugin_config,
     _failure_accounting_metadata,
     _OpdProgressState,
     _OpdVerlCheckpointWatcher,
@@ -33,7 +34,6 @@ from flash.engine.worker.opd_train import (
     _processor_expanded_prompt_ids,
     _prompt_pool_fingerprint,
     _raise_verl_failure,
-    _render_opd_sitecustomize,
     _restore_verl_resume,
     _stage_retry_contract,
     _TeacherAlignmentBridge,
@@ -47,6 +47,8 @@ from flash.engine.worker.opd_train import (
 )
 from flash.engine.worker.teacher.client import TeacherScore
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
+from flash.engine.worker.train.core.child.runtime import install_checkpoint_handler_filter
+from flash.engine.worker.train.opd.child import plugin as opd_plugin
 from flash.engine.worker.train.opd.child.plugin import (
     FlashTeacherBridgeError,
     _AllNoSignalBatch,
@@ -70,7 +72,17 @@ from flash.engine.worker.train.opd.child.structured import (
     canonical_structured_spec,
 )
 from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
+from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import OPD_RESUME_STATE_VERSION
+
+
+@pytest.fixture(autouse=True)
+def _configure_opd_child_attempt_limit(monkeypatch):
+    monkeypatch.setitem(
+        opd_plugin._PLUGIN_CONFIG,
+        "no_signal_attempts",
+        OPD_NO_SIGNAL_ATTEMPTS,
+    )
 
 
 def _reference_groupwise_reverse_kl(sp_t, groups, kl_coef=1.0):
@@ -441,6 +453,28 @@ def test_all_no_signal_rollout_dispatches_bounded_usable_replacement():
     assert prepared == [True, True]
     assert resamples == [True, True]
     assert abandoned == []
+
+
+def test_changed_plugin_attempt_limit_controls_child_resampling(monkeypatch):
+    attempts = []
+    monkeypatch.setitem(opd_plugin._PLUGIN_CONFIG, "no_signal_attempts", 4)
+
+    def run_attempt(attempt_ordinal):
+        attempts.append(attempt_ordinal)
+        if attempt_ordinal < 3:
+            raise _AllNoSignalBatch(attempt_ordinal)
+        return "usable"
+
+    result = _run_with_no_signal_replacements(
+        run_attempt,
+        lambda _batch: None,
+        lambda: None,
+        lambda: None,
+        lambda: None,
+    )
+
+    assert result == "usable"
+    assert attempts == [0, 1, 2, 3]
 
 
 def test_shifted_group_metadata_uses_verl_prediction_layout():
@@ -5350,7 +5384,7 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
 
     def run_child():
         return opd_runner._run_child(
-            SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
+            SimpleNamespace(knobs=SimpleNamespace(max_completion=1536, save_at_steps=(1,))),
             object(),
             SimpleNamespace(update_horizon=1, local_dir="/unused", shim_dir=str(tmp_path)),
             SimpleNamespace(
@@ -5359,6 +5393,7 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
                 python_bin="python",
                 entry_path="entry.py",
                 bridge=object(),
+                gdn_reset_arch=None,
             ),
             {},
             (),
@@ -5530,8 +5565,7 @@ def test_sitecustomize_saves_only_exact_required_steps(monkeypatch):
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    source = _render_opd_sitecustomize(save_at_steps=(3, 7), total_steps=7)
-    exec(compile(source, "sitecustomize.py", "exec"), {})
+    install_checkpoint_handler_filter((3, 7), 7)
     handler = FakeCheckpointHandler()
 
     results = [handler.save_checkpoint(step) for step in range(1, 8)]
@@ -6224,6 +6258,39 @@ def test_image_token_suppression_is_gated_on_structured_image_blocks():
     assert _resolve_image_token_id(SimpleNamespace(), fallback) == 42
 
 
+def test_opd_plugin_config_is_serialized_with_the_child_environment(tmp_path):
+    plugin_config = _build_opd_plugin_config(
+        shim_dir=str(tmp_path),
+        save_at_steps=(3, 7),
+        total_steps=9,
+        gdn_model_type="qwen3_5",
+        loggers=["console", "wandb"],
+    )
+    assert json.loads(plugin_config) == {
+        "marker_file": str(tmp_path / "applied_shims.txt"),
+        "no_signal_attempts": OPD_NO_SIGNAL_ATTEMPTS,
+        "save_at_steps": [3, 7],
+        "total_steps": 9,
+        "gdn_model_type": "qwen3_5",
+        "wandb": True,
+    }
+
+    child = _build_opd_child_env(
+        shim_dir=str(tmp_path),
+        wandb_enabled=True,
+        bridge_url="http://127.0.0.1:4444",
+        bridge_token="bridge-token",
+        seed=42,
+        stop_sequences=(),
+        eos_token_ids=frozenset({1}),
+        structured_outputs=None,
+        model_vocab_size=248320,
+        thinking=False,
+        plugin_config=plugin_config,
+    )
+    assert child["FLASH_OPD_PLUGIN_CONFIG"] == plugin_config
+
+
 def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypatch, tmp_path):
     monkeypatch.setenv("PARASAIL_API_KEY", "parasail-secret")
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
@@ -6758,6 +6825,7 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
         _applied_shim_markers(tmp_path),
+        ("lora-rollout-guard",),
     )
 
     callbacks.on_line("step:1 - actor/distillation/loss:0.5")
@@ -6791,6 +6859,7 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch, tmp_path):
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
         _applied_shim_markers(tmp_path),
+        ("lora-rollout-guard",),
     )
 
     callbacks.on_line("step:1 - actor/distillation/loss:0.5")
@@ -6829,6 +6898,7 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
         _applied_shim_markers(tmp_path),
+        ("lora-rollout-guard",),
     )
 
     # the step number reaching on_step is the one backend_common parses, not a hand-picked int.
@@ -7282,11 +7352,8 @@ def test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction():
     assert source.count(".detach()") == 1
 
 
-def test_opd_sitecustomize_composes_into_valid_python_with_the_guard(tmp_path, monkeypatch):
-    """the wrapper indents a whole rendered fragment into a try block; a syntax slip there would
-    turn every opd child patch into a silent no-op, so compiling the composed file is the gate."""
+def test_opd_sitecustomize_is_only_the_startup_bootstrap(tmp_path, monkeypatch):
     import flash.engine.worker.opd_train_runner as opd_runner
-    from flash.engine.worker import backend_common
 
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()
@@ -7301,10 +7368,54 @@ def test_opd_sitecustomize_composes_into_valid_python_with_the_guard(tmp_path, m
 
     source = (shim_dir / "sitecustomize.py").read_text()
     compile(source, "sitecustomize.py", "exec")
-    # the canonical fragment records once through its deferred hook, never at wrapper startup.
-    assert source.count("_flash_record_applied_shim('lora-rollout-guard')") == 1
-    assert "_flash_lora_rollout_guard_applied()" in source
-    assert f"_flash_shim_os._exit({backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE})" in source
+    assert "tilelang libcudart" in source
+    assert "tf32" in source.lower()
+    assert "import verl" not in source
+    assert "lora rollout" not in source
+
+
+@pytest.mark.parametrize(
+    ("save_at_steps", "expects_core"),
+    [((3,), True), ((), False)],
+)
+def test_opd_child_records_the_core_marker_only_when_a_save_schedule_was_authored(
+    tmp_path, monkeypatch, save_at_steps, expects_core
+):
+    """the child installs opd-core only for a nonempty schedule, so the parent must match.
+
+    exact-save filtering is the entire meaning of that marker. an empty schedule keeps every save,
+    so installing the wrapper would import verl to build a pass-through, and the parent expecting
+    the marker afterwards would tear down a healthy run at its first step.
+    """
+    from flash.engine.worker.train.opd.child import runtime as opd_child
+
+    marker_file = tmp_path / "applied_shims.txt"
+    armed = []
+    monkeypatch.setattr(
+        opd_child.runtime,
+        "install_deferred_lora_rollout_guard",
+        lambda marker: armed.append("lora-rollout-guard"),
+    )
+    monkeypatch.setattr(
+        opd_child.runtime,
+        "install_checkpoint_handler_filter",
+        lambda steps, total: armed.append(("checkpoint", tuple(steps), total)),
+    )
+
+    opd_child.install(
+        {
+            "marker_file": str(marker_file),
+            "save_at_steps": list(save_at_steps),
+            "total_steps": 10,
+            "wandb": False,
+        }
+    )
+
+    recorded = marker_file.read_text().splitlines() if marker_file.exists() else []
+    assert ("opd-core" in recorded) is expects_core
+    assert (("checkpoint", save_at_steps, 10) in armed) is expects_core
+    # the rollout guard is required regardless of the checkpoint schedule.
+    assert "lora-rollout-guard" in armed
 
 
 def test_opd_stops_an_unguarded_child_at_its_first_step(tmp_path):
@@ -7320,7 +7431,8 @@ def test_opd_stops_an_unguarded_child_at_its_first_step(tmp_path):
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
-        opd_train.shim_marker_file(str(tmp_path)),  # no marker: the shim never applied
+        opd_train.shim_marker_file(str(tmp_path)),  # no marker: the plugin never applied
+        ("opd-core", "lora-rollout-guard"),
     )
 
     # output before the first step is not a verdict: fragments still print while later ones apply.

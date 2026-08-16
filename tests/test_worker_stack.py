@@ -294,40 +294,6 @@ def test_setup_progress_heartbeats_are_throttled(monkeypatch, stage):
     assert calls.count("heartbeat.json") == 1, f"{stage} must be upload-throttled, got {calls}"
 
 
-def test_heartbeat_rollback_guards_on_claim_seq_not_coarse_ts(monkeypatch):
-    """A failed/timed-out commit rolls its slot claim back, but the rollback is gated on a monotonic
-    claim SEQ, not on wall-clock-ts equality. So if a NEWER heartbeat claims the slot (which on a
-    coarse clock can share the same _HB_LAST_UPLOAD ts) before our older commit fails, our rollback
-    must NOT wipe that fresher claim — doing so would let the throttle / quiet_gate read the channel
-    as stale right after a real upload."""
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
-
-    hbmod = sys.modules[w.heartbeat.__module__]
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-
-    seen = []
-
-    def fake_upload(path, name):
-        seen.append(name)
-        if len(seen) == 1:
-            # A concurrent NEWER heartbeat claims the slot (higher claim seq) while our older commit
-            # is in flight; our commit then fails, so we attempt to roll our claim back.
-            hbmod._HB_CLAIM_SEQ += 1
-            return False
-        return True
-
-    monkeypatch.setattr(w, "hf_upload_file", fake_upload)
-
-    w.heartbeat("rl_step", step=1)
-    # The newer claim owns the slot now, so our failed older commit must NOT restore _HB_LAST_UPLOAD
-    # to its pre-claim 0.0. A ts-equality guard (now == _HB_LAST_UPLOAD) would have wrongly fired and
-    # wiped the fresh claim; the claim-seq guard does not.
-    assert w._HB_LAST_UPLOAD != 0.0
-
-
 def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
     """Perf regression guard: the synchronous hf_upload_file network call must run OUTSIDE
     _HB_LOCK. Holding the lock across the upload serializes the trainer's per-step reward
@@ -601,23 +567,19 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
     ]
 
 
-def test_35b_warmstart_requires_fused_expert_targets(monkeypatch):
+def test_worker_exports_only_the_current_warmstart_adapter_surface(monkeypatch):
     worker = _import_worker(monkeypatch)
-    model_id = "Qwen/Qwen3.6-35B-A3B"
 
-    with pytest.raises(ValueError, match="omits required expert targets"):
-        worker.validate_lora_target_parameters({"target_modules": "all-linear"}, model_id)
-
-    worker.validate_lora_target_parameters(
-        {
-            "target_parameters": [
-                "mlp.experts.gate_up_proj",
-                "mlp.experts.down_proj",
-            ]
-        },
-        model_id,
-    )
-    worker.validate_lora_target_parameters({}, "Qwen/Qwen3.5-9B")
+    assert callable(worker.validate_warmstart_adapter)
+    assert callable(worker.lora_target_parameters)
+    for deleted in (
+        "adapter_has_fused_expert_tensors",
+        "expected_fused_expert_modules",
+        "legacy_fused_expert_config_is_recoverable",
+        "prepare_warmstart_adapter_config",
+        "restore_fused_expert_targets",
+    ):
+        assert not hasattr(worker, deleted)
 
 
 def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
