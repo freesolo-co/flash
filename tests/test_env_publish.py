@@ -1379,6 +1379,23 @@ def test_publish_refuses_a_credential_supplied_as_the_env_name():
     assert envs.validate_publish_inputs(package_b64=_pkg_b64(_MINIMAL), name="demo")
 
 
+def test_an_unscannable_env_name_is_a_refusal_not_a_server_fault():
+    """A name the scan cannot finish reading is refused, not raised through the route.
+
+    `credential_in_name` decodes what a name encodes, so a name that IS an encoded container raises
+    `_Unscannable` rather than returning a kind. The route catches only `EnvPublishError`, so a
+    36-character caller-supplied name -- base64 of an OpenSSL `Salted__` header -- produced an
+    uncontrolled 500 out of a validation check. Unverifiable is not clean, the same answer the
+    package scan already gives.
+    """
+    unscannable = base64.b64encode(b"Salted__12345678ciphertext").decode()
+
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.validate_publish_inputs(package_b64=_pkg_b64(_MINIMAL), name=unscannable)
+    assert excinfo.value.status == 400
+    assert "cannot be checked for credentials" in str(excinfo.value)
+
+
 def test_an_oversized_env_name_is_rejected_before_encoded_content_scanning():
     """A caller-controlled base64 run must not escape as the scanner's internal size exception.
 

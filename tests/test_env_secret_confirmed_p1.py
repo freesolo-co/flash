@@ -374,6 +374,16 @@ def test_uri_oversized_continuing_authority_fails_closed(tmp_path):
     assert credential_in_file(path) == "a password"
 
 
+def test_arrow_marker_does_not_disable_source_rejoining(tmp_path):
+    from flash.envscan.secrets import credential_in_file
+
+    source = tmp_path / "marker.py"
+    source.write_bytes(
+        b'marker = "ARROW1"\nsecret = "fslo_" ' + b" ".join([b'"a1B2c3D4"'] * 6) + b"\n"
+    )
+    assert credential_in_file(source) == "a Freesolo API key"
+
+
 @pytest.mark.parametrize("filter_kind", range(5))
 def test_png_idat_unfiltering_reconstructs_credentials(tmp_path, filter_kind):
     from flash.envscan.secrets import credential_in_file

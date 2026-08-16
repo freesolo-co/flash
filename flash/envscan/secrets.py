@@ -25,7 +25,6 @@ import gzip
 import io
 import lzma
 import os
-import re
 import tarfile
 import time
 import zipfile
@@ -39,6 +38,17 @@ from flash.envscan.archive import (
     credential_in_cpio,
     credential_in_tar,
     credential_in_zip,
+)
+from flash.envscan.base64 import _Inspector, _match_base64, _RunTooLongToExpand
+from flash.envscan.buffers import (
+    _SCAN_CHUNK_BYTES,
+    _blocks_of,
+    _looks_like_container,
+    _looks_like_container_head,
+    _looks_like_source_container,
+    _paired_markers_kind,
+    _paired_state,
+    _zlib_prefix_inflates,
 )
 from flash.envscan.deflate import (
     _PDF_SIGNATURE,
@@ -55,16 +65,13 @@ from flash.envscan.deflate import (
     _UnreadableFilterChain,
 )
 from flash.envscan.formats import (
-    _COMPRESSED_MAGIC,
     _MAX_ARCHIVE_MEMBERS,
     _OVERLAY_PROBE_BYTES,
     _ZIP_TAIL_BYTES,
     OVERLAY_UNPROBED,
     _after_skippable_frames,
     _has_zip_end_record,
-    _looks_compressed,
     _looks_like_lzma_alone,
-    _looks_like_tar,
     _looks_like_textual,
     _looks_like_zlib,
     _overlay_offset,
@@ -73,12 +80,14 @@ from flash.envscan.formats import (
     # read HERE, so the tests that rebind it read the counter from here too.
     _zip_member_count,  # noqa: F401
 )
+from flash.envscan.joined import _rejoined
 
 # The two head-anchored walks and the refusal they raise, split out to keep this module under the
 # file-size limit. `_Unscannable` lives THERE because those walks raise it and this module imports
 # them, so the other direction would be a cycle. Re-exported because every other raise site and
 # every test still reads all three from here.
 from flash.envscan.keystores import (
+    _decoded_key_kind,
     _keystore_undecided,
     _openpgp_kind,
     _Unscannable,
@@ -90,68 +99,10 @@ from flash.envscan.openpgp import (
     _has_openpgp_message_armor,
     _unfinished_openpgp_message_armor,
 )
-from flash.envscan.patterns import (
-    _ASSIGNED_PATTERNS,
-    _LITERAL_PATTERNS,
-    _MAX_BODY,
-    _TOKEN_PATTERNS,
-    _match,
-    _unfinished_private_key_armor,
-)
-from flash.envscan.png import _PNG_SIGNATURE
+from flash.envscan.patterns import _MAX_BODY, _match, _unfinished_private_key_armor
 from flash.envscan.policy import _unexpandable_format, _uninspectable_reason
-from flash.envscan.scanbuf import (
-    _SCAN_CHUNK_BYTES,
-    _blocks_of,
-    _paired_markers_kind,
-    _paired_state,
-    _zlib_prefix_inflates,
-)
-
-
-def _looks_like_source_container(data: bytes) -> bool:
-    """Whether source-language rejoining is invalid for this structured byte stream."""
-    return data.startswith(
-        (*_COMPRESSED_MAGIC, b"!<arch>\n", b"!<thin>\n", b"%PDF-")
-    ) or _looks_like_tar(data)
-
-
-def _looks_like_container_head(data: bytes) -> bool:
-    """Whether a bounded prefix proves an oversized nested value is a container."""
-    return (
-        _looks_compressed(data)
-        or _looks_like_tar(data)
-        or data.startswith((b"!<arch>\n", b"!<thin>\n", b"%PDF-"))
-    )
-
-
-def _looks_like_container(data: bytes) -> bool:
-    """Whether `data` is a container worth reopening, by magic OR by zip structure.
-
-    Gating the recursion on this rather than recursing unconditionally keeps `_MAX_CONTAINER_DEPTH`
-    honest: the depth cap raises, so calling it for an ordinary deeply-nested file would refuse a
-    legitimate publish over nesting that never expanded anything.
-
-    `is_zipfile` scans for the end-of-central-directory record, so it recognises a zip behind any
-    preamble: a self-extracting zip whose first bytes are `MZ` is still reopened rather than
-    treated as final content.
-    """
-    return (
-        _looks_compressed(data)
-        or _looks_like_tar(data)
-        or data.startswith((b"!<arch>\n", b"!<thin>\n", b"%PDF-", _PNG_SIGNATURE))
-        # use the shared structural gate so crc, odc and binary cpio cannot become
-        # top-level-only formats. each walker still validates every member boundary.
-        or opaque_format(data) is not None
-        or _looks_like_cpio_header(data)
-        or zipfile.is_zipfile(io.BytesIO(data))
-        # a self-extracting shell archive, whose stub is a script rather than an executable: none
-        # of the tests above sees past it, since each asks what the file begins with and it begins
-        # with `#!/bin/sh`. `False` -- the search gave up with candidates unprobed -- counts as a
-        # container too, so the handler turns it into a refusal rather than ordinary bytes.
-        or _overlay_offset(data) is not None
-    )
-
+from flash.envscan.redact import redacted_name
+from flash.envscan.wide import credential_in_wide_runs
 
 # Carried between chunks so a credential straddling a chunk boundary is still matched. Derived from
 # `_MAX_BODY` rather than written as a bare number, so the two cannot drift apart: the overlap must
@@ -251,13 +202,25 @@ def _credential_kind(
     character keeps its padding byte NUL, so requiring an unbroken NUL run alongside the candidate
     costs nothing on genuine UTF-16/32 and leaves machine code with nothing long enough to match.
     """
-    # wide-encoding reconstruction (utf-16/utf-32 narrowing) arrives with the encoding stage.
-    return _decoded_kind(
+    if kind := _decoded_kind(
         data,
         deadline=deadline,
         depth=depth,
         truncated=truncated,
         paired=paired,
+        shell=shell,
+        literal_syntax=literal_syntax,
+        rejoin=rejoin,
+    ):
+        return kind
+    if b"\x00" not in data:
+        return None
+    return credential_in_wide_runs(
+        data,
+        detector=_decoded_kind,
+        deadline=deadline,
+        depth=depth,
+        truncated=truncated,
         shell=shell,
         literal_syntax=literal_syntax,
         rejoin=rejoin,
@@ -275,13 +238,89 @@ def _decoded_kind(
     literal_syntax: str | None = None,
     rejoin: bool = True,
 ) -> str | None:
-    """The kind of credential `data` contains literally.
+    """The kind of credential in `data` literally, or inside a base64 run within it."""
+    if kind := _match(data, paired=paired) or _match_base64(
+        data, _decoded_container(deadline, depth), truncated=truncated
+    ):
+        return kind
+    # A file can hold a credential in pieces that no contiguous run of its bytes contains: adjacent
+    # string literals, which the language concatenates at parse time, and a backslash-newline
+    # continuation, which the shell removes before the value is assigned. Python source is EXEMPT
+    # from the filename filter by design -- helper modules have to ship or the worker fails to
+    # import -- so a key split either way had nothing between it and the hub.
+    #
+    # Only tried when the literal pass found nothing, and `_rejoined` returns the input unchanged
+    # when no seam is present, so the ordinary file pays two cheap searches and no rematch.
+    if not rejoin:
+        return None
+    joined = _rejoined(data, shell=shell, literal_syntax=literal_syntax)
+    return _match(joined, paired=paired) if joined != data else None
 
-    Base64 decoding and source-literal rejoining arrive with the encoding stage; this stage matches
-    the bytes as they are written.
+
+def _decoded_container(deadline: float | None, depth: int) -> _Inspector | None:
+    """What `_match_base64` should do with decoded bytes that match no pattern, or None to stop.
+
+    A base64 value routinely holds a whole CONTAINER: a Kubernetes Secret, a cloud-init document
+    and a `kubectl -o yaml` export all store their values encoded, so a gzipped credential inside
+    one decoded here and was then matched while still compressed and published clean.
+
+    At the depth cap the container is REFUSED rather than skipped. Returning None there switched
+    the second look off and reported the member clean, so four nested zips around
+    `base64(gzip(secret))` published while the same gzip added as an ordinary fifth container
+    correctly raised -- the cap is a limit on what can be inspected, and every other limit in this
+    module raises rather than returning a verdict it did not reach. Only bytes that actually look
+    like a container are refused, so an ordinary deeply-nested file still publishes.
+
+    A refusal from the second look is swallowed only for a SPECULATIVE decode, unlike every other
+    unscannable path here, because `_match_base64` tries four alignments of every base64-shaped
+    run: the "container" handed over is then a re-interpretation of bytes never claimed to be one,
+    and an ELF holds enough such runs to produce one by chance. Measured on `containerd`, `ctr` and
+    `dockerd`: each decoded to something tripping the dictionary-zlib refusal, making them
+    unpublishable over bytes nobody encoded.
+
+    An exact WHOLE-RUN decode is not speculative -- the run is aligned, complete, and decodes to a
+    container in one piece -- so its refusal propagates. Swallowing that one turned a real
+    `zip -P` archive behind base64 into a clean result while the same archive scanned directly was
+    refused. `whole` carries that distinction down from `_match_base64`.
+
+    An exact decode is also checked for a format that cannot be inspected at ALL, which is not the
+    same question as whether it is a container. `openssl enc -a` writes its salted envelope in
+    base64 by design, and that form published a key the binary form of the same ciphertext refused.
     """
-    del deadline, depth, truncated, shell, literal_syntax, rejoin
-    return _match(data, paired=paired)
+    if deadline is None:
+        return None
+
+    def inspect(decoded: bytes, *, whole: bool = False) -> str | None:
+        if time.monotonic() > deadline:
+            raise _Unscannable("takes too long to decompress")
+        # exact decodes receive the same anchored binary checks as standalone files.
+        if whole and (kind := _decoded_key_kind(decoded)):
+            return kind
+        if whole and (fmt := _unexpandable_format(decoded, anchored=True)):
+            raise _Unscannable(_uninspectable_reason(fmt))
+        # raw deflate has no magic. probing only exact decodes avoids an inflate for every speculative
+        # base64 alignment in large csv files and keeps chance decodes from becoming trusted refusals.
+        if whole and (
+            kind := _credential_in_raw_deflate(decoded, deadline=deadline, depth=depth + 1)
+        ):
+            return kind
+        # Only bytes that actually look like a container are re-entered; anything else has already
+        # been through `_match` and would just be scanned a second time.
+        if not _looks_like_container(decoded):
+            return None
+        if depth >= _MAX_CONTAINER_DEPTH:
+            raise _Unscannable("nests compressed containers too deeply to inspect")
+        try:
+            return _credential_in_container(decoded, deadline=deadline, depth=depth + 1)
+        except _Unscannable:
+            if whole or time.monotonic() > deadline:
+                raise
+            return None
+        except _UNREADABLE_ARCHIVE:
+            return None
+
+    inspect.deadline = deadline  # type: ignore[attr-defined]
+    return inspect
 
 
 def _scan_stream_head(chunk: bytes, upcoming: bytes) -> tuple[str | None, bool, bool]:
@@ -404,24 +443,27 @@ def _scan_stream(handle: IO[bytes], *, deadline: float | None = None, depth: int
         # window is undecided instead, and undecided refuses.
         if bool(upcoming) and _unfinished_private_key_armor(window):
             raise _Unscannable("contains a private key armor header too long to read past")
-        # The two-marker detectors are left out here and run below instead, over state carried
-        # between windows. Inside `_match` they build a fresh record splitter per window, which
-        # knows neither the depth nor the quote phase the previous window ended on -- right for a
-        # whole file, wrong for one window of one.
-        if kind := _credential_kind(
-            window,
-            deadline=deadline,
-            depth=depth,
-            truncated=bool(upcoming),
-            paired=False,
-            shell=shell,
-            literal_syntax=literal_syntax,
-            # archive framing is not source syntax, so its raw pass must not join bytes that
-            # belong to separate names, headers, or members. exact metadata and members are
-            # scanned independently by their container walkers.
-            rejoin=not source_container,
-        ):
-            return kind
+        try:
+            # The two-marker detectors are left out here and run below instead, over state
+            # carried between windows. Inside `_match` they build a fresh record splitter per
+            # window, which knows neither the depth nor the quote phase the previous window ended
+            # on -- right for a whole file, wrong for one window of one.
+            if kind := _credential_kind(
+                window,
+                deadline=deadline,
+                depth=depth,
+                truncated=bool(upcoming),
+                paired=False,
+                shell=shell,
+                literal_syntax=literal_syntax,
+                # archive framing is not source syntax, so its raw pass must not join bytes that
+                # belong to separate names, headers, or members. exact metadata and members are
+                # scanned independently by their container walkers.
+                rejoin=not source_container,
+            ):
+                return kind
+        except _RunTooLongToExpand:
+            raise _Unscannable("contains a base64 run too long to expand") from None
         # A two-marker credential is paired across the WHOLE stream, not within one window. Those
         # detectors are order-independent and distance-free inside a single buffer, but a chunked
         # scan re-imposed a window between the halves at the chunk boundary. Remembering which
@@ -764,14 +806,6 @@ def _scan_member(handle: IO[bytes], deadline: float, depth: int) -> str | None:
     return _scan_stream(handle, deadline=deadline, depth=depth)
 
 
-def _archive_head(source: Path | bytes) -> bytes:
-    """Enough of `source` to tell which archive family it belongs to."""
-    if isinstance(source, bytes):
-        return source[:4122]
-    with source.open("rb") as handle:
-        return handle.read(4122)
-
-
 def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential in any readable member of a zip, or None."""
     return credential_in_zip(
@@ -788,7 +822,11 @@ def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> 
 
 def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential in any readable member of an ar or SVR4 cpio archive."""
-    head = _archive_head(source)
+    if isinstance(source, bytes):
+        head = source[:110]
+    else:
+        with source.open("rb") as handle:
+            head = handle.read(4122)
     # settlement means this handler actually walked an archive. without this decline, every other
     # file returned none here and incorrectly suppressed a later pdf or tar refusal as verified.
     if head.startswith((b"!<arch>\n", b"!<thin>\n")):
@@ -887,39 +925,13 @@ def credential_in_name(name: str, *, deadline: float | None = None) -> str | Non
 
 
 def _redacted(name: str, *, deadline: float | None = None) -> str:
-    """`name` with any credential body masked, safe to print.
-
-    The refusal names the member so the author can find it. When the credential is in that name,
-    printing it verbatim leaks the key into terminals, http responses, and collected logs. A token
-    body can be masked in place; a literal structure has to be withheld because it has no plaintext
-    body to replace.
-    """
-
-    def mask(match: re.Match[bytes]) -> bytes:
-        body = next((index for index, group in enumerate(match.groups(), 1) if group), None)
-        if body is None:
-            return match.group(0)
-        return match.group(0)[: match.start(body) - match.start()] + b"***"
-
-    # surrogatepass matches the name scanner. surrogateescape cannot encode a lone surrogate, and a
-    # reporting crash would replace the validation message that was supposed to protect the publish.
-    masked = name.encode("utf-8", "surrogatepass")
-    for _kind, pattern in _TOKEN_PATTERNS + _ASSIGNED_PATTERNS:
-        masked = pattern.sub(mask, masked)
-
-    decoded = masked.decode("utf-8", "replace")
-    try:
-        encoded = credential_in_name(decoded, deadline=deadline) is not None
-    except _Unscannable:
-        encoded = True
-    if any(pattern.search(masked) for _kind, pattern in _LITERAL_PATTERNS) or encoded:
-        parent = name.rsplit("/", 1)[0] if "/" in name else ""
-        return (
-            f"{parent}/<a file whose name encodes a credential>"
-            if parent
-            else "<a file whose name encodes a credential>"
-        )
-    return decoded
+    """`name` masked or withheld by the container-aware display helper."""
+    return redacted_name(
+        name,
+        credential_check=credential_in_name,
+        deadline=deadline,
+        refusals=(_Unscannable, _RunTooLongToExpand),
+    )
 
 
 def reject_credential_bearing_package(package_root: Path, *, display: dict[str, str]) -> None:
