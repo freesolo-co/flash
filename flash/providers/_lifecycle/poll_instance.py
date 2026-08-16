@@ -34,15 +34,11 @@ from flash.providers._lifecycle.terminal_artifacts import (
     AttemptIdentity,
     ProbeBudget,
     TerminalKind,
-    decode_terminal_marker,
     read_within,
     resolve_terminal_artifacts,
 )
 from flash.providers.artifacts.hf import worker_flagged_retriable
 from flash.providers.base import PollResult
-
-# re-exported: recovery imports the strict decoder through this module.
-__all__ = ["decode_terminal_marker", "poll_instance_job"]
 
 # a strict success marker can precede the separately uploaded metrics.json under hf read-after-write
 # lag. re-read metrics before falling back to the infra-retryable poll_error so marker-authorized

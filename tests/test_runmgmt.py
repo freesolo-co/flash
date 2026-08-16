@@ -1828,6 +1828,63 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     assert len(scheduled) == 1
 
 
+def test_completed_attempt_metrics_rereads_a_marker_that_is_not_visible_yet(monkeypatch):
+    """Recovery must RE-READ the marker, not sample it once.
+
+    The marker and metrics are two uploads of the same completion racing HF read-after-write lag, so
+    a marker that is invisible on the first read routinely surfaces moments later. Reading once would
+    report ABSENT and let the caller tear down an attempt that had already finished its paid work.
+    """
+    import io
+
+    import flash.providers._lifecycle.poll_instance as instance_poll
+    import flash.providers._lifecycle.terminal_artifacts as ta
+    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="lagging-marker",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        train=TrainSpec(hf_repo="org/repo"),
+    )
+    # the reread window must stay NONZERO: the shared cutoff is `now + tries * wait_s`, so a zero
+    # wait would expire the budget before the second read and the test would pass for the wrong
+    # reason. sleep is faked instead, leaving the retry loop real.
+    monkeypatch.setattr(instance_poll, "_TERMINAL_REREAD_WAIT_S", 5.0)
+    monkeypatch.setattr(lifecycle.time, "time", lambda: 201.0)
+    monkeypatch.setattr(ta.time, "sleep", lambda _s: None)
+    marker_reads = {"n": 0}
+
+    def artifact_reader(_repo, path):
+        def read(force=False):
+            if path.endswith("/vast_attempt0.json"):
+                marker_reads["n"] += 1
+                # invisible on the first read, exactly as HF lag presents it
+                if marker_reads["n"] <= 1:
+                    return None
+                return (
+                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
+                    '"run_id":"lagging-marker","ts":199.0}'
+                )
+            return json.dumps({"train_tokens": 4096})
+
+        return read
+
+    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+
+    assert lifecycle._completed_attempt_metrics(
+        spec,
+        provider="vast",
+        attempt=0,
+        launch_floor=100.0,
+        deadline_at=200.0,
+        log=io.StringIO(),
+    ) == {"train_tokens": 4096}
+    assert marker_reads["n"] >= 2  # a single sample would have reported ABSENT
+
+
 def test_completed_attempt_metrics_never_adopts_an_unverifiable_marker(monkeypatch):
     """Recovery must not adopt an artifact it cannot tie to this attempt, and must SAY so.
 

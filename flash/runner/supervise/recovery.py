@@ -267,9 +267,8 @@ def _completed_attempt_metrics(
         ),
         say=say,
         marker_deadline_at=marker_bound,
-        marker_message="recovery deadline reached; waiting for the terminal attempt marker",
+        marker_wait_message="recovery deadline reached; waiting for the terminal attempt marker",
         metrics_message="successful recovery marker seen; waiting for metrics.json",
-        wait_for_marker=True,
     )
     if resolution.kind is TerminalKind.SUCCESS:
         return resolution.metrics

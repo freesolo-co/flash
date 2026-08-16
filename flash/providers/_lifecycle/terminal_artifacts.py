@@ -215,20 +215,23 @@ def resolve_terminal_artifacts(
     budget: ProbeBudget,
     say: Callable[[str], None] | None = None,
     marker_deadline_at: float | None = None,
-    marker_message: str = "waiting for the terminal attempt marker",
+    marker_wait_message: str | None = None,
     metrics_message: str = "successful marker seen; waiting for metrics.json",
-    wait_for_marker: bool = False,
 ) -> TerminalResolution:
     """Decide what an attempt's marker plus metrics establish, under ONE shared budget.
 
     The strict marker is the sole terminal authority. A DONE file may later refine a
     marker-authorized success's completion timestamp, but it can never complete an attempt on its
     own, so it is deliberately not consulted here.
+
+    ``marker_wait_message`` both enables and narrates waiting for the marker itself: live polling
+    reads it once per iteration (the loop is the retry), while recovery re-reads it inside the shared
+    budget. Passing the message is what asks for that wait, so neither can be set without the other.
     """
     raw = (
-        read_within(read_marker, budget, say=say, message=marker_message)
-        if wait_for_marker
-        else read_marker()
+        read_marker()
+        if marker_wait_message is None
+        else read_within(read_marker, budget, say=say, message=marker_wait_message)
     )
     if raw is None:
         return ABSENT

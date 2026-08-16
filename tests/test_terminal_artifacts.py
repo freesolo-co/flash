@@ -151,7 +151,7 @@ def test_one_budget_is_shared_across_both_reads(monkeypatch):
         read_marker=read_marker,
         read_metrics=read_metrics,
         budget=budget,
-        wait_for_marker=True,
+        marker_wait_message="waiting for the terminal attempt marker",
     )
 
     assert resolution.kind is TerminalKind.PENDING
