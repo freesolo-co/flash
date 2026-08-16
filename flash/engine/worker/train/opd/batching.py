@@ -16,6 +16,7 @@ from flash.engine.worker.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.score_batcher import ScoreBatcher
 from flash.engine.worker.teacher.client import (
     _MAX_LOGPROB_ROUNDING_ERROR,
+    TeacherClient,
     TeacherError,
     TeacherScore,
 )
@@ -152,6 +153,7 @@ class _TextTeacherBatcher(ScoreBatcher):
         *,
         max_batch_size: int = OPD_TEACHER_SCORING_CONCURRENCY,
         flush_wait_s: float | None = None,
+        on_scored=None,
     ) -> None:
         super().__init__(
             self._score_items,
@@ -166,6 +168,7 @@ class _TextTeacherBatcher(ScoreBatcher):
             recheck_closed_after_wait=True,
         )
         self.teacher = teacher
+        self.on_scored = on_scored
 
     def _score_items(self, items: list[tuple[str, str]]) -> list[TeacherScore]:
         unique_items: list[tuple[str, str]] = []
@@ -178,10 +181,15 @@ class _TextTeacherBatcher(ScoreBatcher):
                 item_indexes[item] = index
                 unique_items.append(item)
             scatter_indexes.append(index)
-        scored = _validate_text_teacher_batch(
-            self.teacher.score_many(unique_items),
-            unique_items,
-        )
+        if self.on_scored is None:
+            teacher_scores = self.teacher.score_many(unique_items)
+        elif isinstance(self.teacher, TeacherClient):
+            teacher_scores = self.teacher.score_many(unique_items, on_scored=self.on_scored)
+        else:
+            teacher_scores = self.teacher.score_many(unique_items)
+            for _score in teacher_scores:
+                self.on_scored()
+        scored = _validate_text_teacher_batch(teacher_scores, unique_items)
         billed_indexes: set[int] = set()
         results: list[TeacherScore] = []
         for index in scatter_indexes:

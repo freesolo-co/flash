@@ -440,6 +440,8 @@ def _write_child_shims(
         ("train/opd/child/structured.py", "flash_opd_structured.py"),
         ("train/opd/child/multiturn.py", "flash_opd_multiturn.py"),
         ("train/opd/child/entry.py", "flash_opd_entry.py"),
+        ("train/opd/child/replay_guard.py", "flash_opd_replay_guard.py"),
+        ("../../_internal/diagnostics.py", "flash_child_diagnostics.py"),
     )
     for source, target in copies:
         shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
@@ -598,14 +600,24 @@ def _build_child_callbacks(
         _opd_train._w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
 
     child_tail = _opd_train.ChildOutputTail()
-    # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside
+    # one instance for the whole run: it measures silence across ticks, so it cannot live inside
     # the per-tick callback.
     tail_staleness = _opd_train.ChildTailStaleness()
+    silence_watchdog = _opd_train.VerlChildSilenceWatchdog(
+        child_tail,
+        baseline_step=resume_step,
+        parent_work=bridge.parent_work,
+    )
 
     def liveness_fields() -> dict[str, object]:
-        return _opd_train.stall_tail_fields(
-            int(progress["step"] or 0), child_tail, staleness=tail_staleness
-        )
+        work = bridge.parent_work.snapshot()
+        return {
+            **_opd_train.stall_tail_fields(
+                int(progress["step"] or 0), child_tail, staleness=tail_staleness
+            ),
+            "parent_work_completed": work.completed,
+            "parent_work_depth": work.depth,
+        }
 
     return _ChildCallbacks(
         on_line,
@@ -615,6 +627,7 @@ def _build_child_callbacks(
         progress,
         wandb_link,
         child_tail,
+        silence_watchdog,
     )
 
 
@@ -660,6 +673,7 @@ def _run_child(
                 progress=lambda: int(callbacks.progress["step"] or 0),
                 progress_step=True,
                 fields=callbacks.liveness_fields,
+                sample_off_thread=True,
             ):
                 return_code = _opd_train.run_verl_training(
                     command,
@@ -668,6 +682,7 @@ def _run_child(
                     on_line=callbacks.on_line,
                     heartbeat=callbacks.child_heartbeat,
                     tail=callbacks.child_tail,
+                    silence_watchdog=callbacks.silence_watchdog,
                 )
                 training_completed = return_code == 0
     finally:

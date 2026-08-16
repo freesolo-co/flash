@@ -22,6 +22,11 @@ import types
 import urllib.error
 import urllib.request
 
+try:
+    from flash_child_diagnostics import sanitize_diagnostic
+except ImportError:
+    from flash._internal.diagnostics import sanitize_diagnostic
+
 # duplicated rather than imported from the plugin: this module is copied flat into the child
 # workdir alongside it, and importing back would make the pair circular there. the parent reads
 # these same two numbers off the child's exit status, so they must stay in step.
@@ -58,6 +63,13 @@ class FlashTeacherBridgeError(RuntimeError):
         super().__init__(message)
         self.classification = classification
         self.delivery_unknown = delivery_unknown
+
+
+class _DeferredScoreFailure(RuntimeError):
+    def __init__(self, message: str, *, classification: str, exit_code: int) -> None:
+        super().__init__(message)
+        self.classification = classification
+        self.exit_code = exit_code
 
 
 def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
@@ -211,14 +223,49 @@ def _fallback_classification(error: FlashTeacherBridgeError) -> str:
     return "transient" if error.delivery_unknown else error.classification
 
 
-def _exit_for_score_failure(error: FlashTeacherBridgeError) -> None:
+def _prepare_score_failure(error: FlashTeacherBridgeError) -> tuple[str, int, str]:
+    """classify one score failure and persist only the evidence the parent cannot already have.
+
+    an explicitly rejected score is already recorded parent-side as a teacher failure, so writing a
+    delivery record for it would relabel a teacher rejection as a delivery failure. only a
+    delivery-unknown outcome leaves the parent with nothing to read.
+    """
     classification = _fallback_classification(error)
+    message = sanitize_diagnostic(str(error), limit=_FAILURE_FALLBACK_MAX_CHARS)
     if error.delivery_unknown:
-        _write_score_delivery_failure_fallback(classification, str(error))
+        _write_score_delivery_failure_fallback(classification, message)
     exit_code = (
         _PERMANENT_TEACHER_EXIT if classification == "permanent" else _TRANSIENT_TEACHER_EXIT
     )
+    return classification, exit_code, message
+
+
+def _defer_score_failure(error: FlashTeacherBridgeError) -> None:
+    """record the score failure here, but let the async caller exit after marking the prompt.
+
+    exiting on this executor thread would kill the process before the prompt is marked failed,
+    which is the wedge itself: verl keeps polling a prompt that stays `running` forever.
+    """
+    classification, exit_code, message = _prepare_score_failure(error)
+    raise _DeferredScoreFailure(
+        message,
+        classification=classification,
+        exit_code=exit_code,
+    ) from error
+
+
+def _exit_for_score_failure(error: FlashTeacherBridgeError) -> None:
+    _classification, exit_code, _message = _prepare_score_failure(error)
     os._exit(exit_code)
+
+
+def _fatal_rollout_exit_code(error: BaseException) -> int:
+    """map a fatal rollout error to the exit code the parent already classifies."""
+    if isinstance(error, _DeferredScoreFailure):
+        return error.exit_code
+    if getattr(error, "classification", None) == "transient":
+        return _TRANSIENT_TEACHER_EXIT
+    return _PERMANENT_TEACHER_EXIT
 
 
 def _unexpected_mutation_bridge_error(error: Exception) -> FlashTeacherBridgeError:

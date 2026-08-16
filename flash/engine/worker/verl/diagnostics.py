@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import collections
 import os
+import threading
+import time
+from collections.abc import Callable
 
 from flash._internal.diagnostics import sanitize_diagnostic
+from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
 # how many of the child's most recent output lines to retain for stall reporting. the child's last
 # words before it wedges are the whole diagnostic, and a stall is usually preceded by a short burst
@@ -54,6 +58,7 @@ class ChildOutputTail:
     def __init__(self, limit: int = CHILD_TAIL_LINES) -> None:
         self._lines: collections.deque[str] = collections.deque(maxlen=limit)
         self._written = 0
+        self._last_line: str | None = None
         self._retriable_infra_signature: str | None = None
         self._cuda_oom_evidence: str | None = None
         self._host_ram_kill_evidence: str | None = None
@@ -78,8 +83,11 @@ class ChildOutputTail:
             # across the cut and defeat full-value redaction. this is the worker side, where the
             # run's secret values are known, and every consumer of the retained tail (heartbeat
             # payload, streamed run log, persisted status) reads it from here.
-            self._lines.append(sanitize_diagnostic(text, limit=_CHILD_TAIL_LINE_CHARS))
-            self._written += 1
+            sanitized = sanitize_diagnostic(text, limit=_CHILD_TAIL_LINE_CHARS)
+            self._lines.append(sanitized)
+            if sanitized != self._last_line:
+                self._written += 1
+            self._last_line = sanitized
 
     @property
     def retriable_infra_signature(self) -> str | None:
@@ -98,11 +106,11 @@ class ChildOutputTail:
 
     @property
     def written(self) -> int:
-        """how many non-empty lines the child has produced, ever.
+        """how many consecutive-line changes the child has produced, ever.
 
-        monotonic and independent of the retention limit, which is what makes it usable as a
-        staleness signal: a child looping on the same line still advances this, and a child that has
-        gone silent cannot advance it even though its retained tail stays fully populated.
+        monotonic and independent of the retention limit. consecutive duplicate lines remain in the
+        retained tail but do not advance this counter, so a frozen warning loop is silence rather
+        than progress while a genuinely new line resets the stall window.
         """
         return self._written
 
@@ -177,19 +185,30 @@ class ChildTailStaleness:
     def __init__(self) -> None:
         self._written = -1
         self._since = 0
+        self._unchanged_at = time.monotonic()
+        self._elapsed = 0.0
 
     def observe(self, written: int) -> int:
         """record this tick's line count; return consecutive ticks with no new output.
 
         0 means the child spoke since the last observation. n>0 means it has been silent for n
-        ticks, which is the signal that separates a slow start from a wedge.
+        ticks, which is the signal that separates a slow start from a wedge. ``elapsed`` carries the
+        same silence in seconds, so a caller does not have to infer it from the tick cadence.
         """
+        now = time.monotonic()
         if written != self._written:
             self._written = written
             self._since = 0
+            self._unchanged_at = now
+            self._elapsed = 0.0
         else:
             self._since += 1
+            self._elapsed = max(0.0, now - self._unchanged_at)
         return self._since
+
+    @property
+    def elapsed(self) -> float:
+        return self._elapsed
 
 
 def stall_tail_fields(
@@ -216,7 +235,121 @@ def stall_tail_fields(
     fields: dict[str, object] = {"child_tail": recent}
     if staleness is not None:
         fields["child_tail_silent_ticks"] = staleness.observe(tail.written)
+        fields["child_tail_silent_seconds"] = staleness.elapsed
     return fields
+
+
+VERL_CHILD_SILENCE_SECONDS = 1200.0
+_VERL_CHILD_WATCH_TICK_SECONDS = 5.0
+
+
+class VerlChildSilenceWatchdog:
+    """tear down one live training child after sustained parent-and-child silence."""
+
+    def __init__(
+        self,
+        tail: ChildOutputTail,
+        *,
+        baseline_step: int,
+        parent_work: ParentWorkGauge | None = None,
+        child_alive: Callable[[], bool] | None = None,
+        teardown: Callable[[], None] | None = None,
+    ) -> None:
+        self._tail = tail
+        self._baseline_step = int(baseline_step)
+        self._parent_work = parent_work
+        self._child_alive = child_alive
+        self._teardown = teardown
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._armed = False
+        self._last_activity = time.monotonic()
+        self._tail_progress = tail.written
+        self._parent_completed = self._parent_snapshot().completed
+        self._failure: str | None = None
+        self._tore_down = False
+
+    def _parent_snapshot(self):
+        if self._parent_work is None:
+            from flash.engine.worker.verl.parent_work import ParentWorkSnapshot
+
+            return ParentWorkSnapshot(0, 0)
+        return self._parent_work.snapshot()
+
+    def bind(self, *, child_alive: Callable[[], bool], teardown: Callable[[], None]) -> None:
+        self._child_alive = child_alive
+        self._teardown = teardown
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        if self._child_alive is None or self._teardown is None:
+            raise RuntimeError("verl child silence watchdog is not bound")
+        self._thread = threading.Thread(
+            target=self._watch,
+            name="verl-child-silence-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=_VERL_CHILD_WATCH_TICK_SECONDS + 1.0)
+
+    def _arm(self) -> None:
+        with self._lock:
+            if not self._armed:
+                self._armed = True
+                self._last_activity = time.monotonic()
+
+    def observe_line(self, line: str) -> None:
+        if "Training Progress" in line:
+            self._arm()
+        self._record_activity()
+
+    def observe_step(self, step: int) -> None:
+        if int(step) > self._baseline_step:
+            self._arm()
+        self._record_activity()
+
+    def _record_activity(self) -> None:
+        snapshot = self._parent_snapshot()
+        with self._lock:
+            changed = self._tail.written != self._tail_progress
+            completed = snapshot.completed != self._parent_completed
+            if changed or completed or snapshot.depth > 0:
+                self._last_activity = time.monotonic()
+            self._tail_progress = self._tail.written
+            self._parent_completed = snapshot.completed
+
+    def check(self) -> None:
+        self._record_activity()
+        teardown = None
+        with self._lock:
+            alive = self._child_alive is not None and self._child_alive()
+            expired = time.monotonic() - self._last_activity >= VERL_CHILD_SILENCE_SECONDS
+            if self._armed and alive and expired and self._failure is None:
+                self._failure = (
+                    "verl_child_silence: no distinct child output or parent work completed for "
+                    f"{VERL_CHILD_SILENCE_SECONDS:.0f}s while training"
+                )
+                if not self._tore_down:
+                    self._tore_down = True
+                    teardown = self._teardown
+        if teardown is not None:
+            teardown()
+
+    def _watch(self) -> None:
+        while not self._stop.wait(_VERL_CHILD_WATCH_TICK_SECONDS):
+            self.check()
+            if self._failure is not None:
+                return
+
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise RuntimeError(self._failure)
 
 
 # the ray logs worth keeping when a raylet dies. the driver's own stdout only ever shows the

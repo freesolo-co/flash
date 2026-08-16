@@ -2818,13 +2818,18 @@ def test_resume_restores_bridge_counters_and_extends_full_curves():
 
 
 def _progress_bridge_snapshot(*, samples_seen: int, truncated_rollouts: int):
+    # the real bridge owns a parent-work gauge the child callbacks read for liveness, so the stub
+    # carries one too rather than a namespace the callbacks cannot query.
+    from flash.engine.worker.verl.parent_work import ParentWorkGauge
+
     return SimpleNamespace(
+        parent_work=ParentWorkGauge(),
         accounting_snapshot=lambda: {
             "aligned_sequences": 0,
             "coverage_sum": 0.0,
             "samples_seen": samples_seen,
             "truncated_rollouts": truncated_rollouts,
-        }
+        },
     )
 
 
@@ -5351,6 +5356,7 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
         child_heartbeat=lambda: None,
         liveness_fields=dict,
         child_tail=None,
+        silence_watchdog=None,
         wandb_link={"wandb_url": None, "wandb_id": None},
     )
     reconciled = []

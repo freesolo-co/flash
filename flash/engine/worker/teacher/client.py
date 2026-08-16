@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -779,7 +780,12 @@ class TeacherClient:
             turn_end_token_id=turn_end_tokens[0].token_id,
         )
 
-    def score_many(self, items: list[tuple[str, str]]) -> list[TeacherScore]:
+    def score_many(
+        self,
+        items: list[tuple[str, str]],
+        *,
+        on_scored: Callable[[], None] | None = None,
+    ) -> list[TeacherScore]:
         """Score each unique prompt and completion through one idempotent broker request.
 
         Bounded by `map_bounded`, which consumes completions as they arrive rather than in input
@@ -792,9 +798,16 @@ class TeacherClient:
         """
         if not items:
             return []
+
+        def score_one(item):
+            scored = self._score_one(*item)
+            if on_scored is not None:
+                on_scored()
+            return scored
+
         return map_bounded(
             items,
-            lambda item: self._score_one(*item),
+            score_one,
             cap=OPD_TEACHER_SCORING_CONCURRENCY,
         )
 
