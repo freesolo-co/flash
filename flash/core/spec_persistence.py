@@ -20,6 +20,10 @@ canonical JSON of `to_dict()` and `to_internal_dict()` output. Key ORDER is safe
 changes the digest and fails integrity validation for every warm-start and workload-profile run in
 flight. Change decoding here only with the corpus gate green.
 
+These functions take plain dicts and return plain dicts and scalars. That is the rule that keeps the
+module importable by `spec.py` rather than the other way round, and it is why `validated_section`
+takes its allowed-key set as an argument instead of reading `fields(TrainSpec)` itself.
+
 What is deliberately NOT here: `_coerce_wandb` and `_parse_persisted_gpu_types` are also called only
 from `JobSpec.from_dict`, so they belong to this contract by usage -- but they construct `WandbSpec`
 and reach `_validated_gpu_type`, which `__post_init__` needs too. Moving them would make this module
@@ -87,6 +91,70 @@ def announce_dropped_keys(data: dict[str, Any]) -> None:
             key,
             names,
         )
+
+
+def validated_section(
+    data: dict[str, Any],
+    name: str,
+    allowed: set[str],
+    *,
+    removed: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Read one nested block (``[train]``, ``[gpu]``) of a persisted record, rejecting unknown keys.
+
+    A missing block and an explicit null are the same state -- both mean "authored nothing" -- so both
+    normalize to empty rather than one of them raising. ``removed`` names keys whose behavior is gone:
+    they are dropped silently, because the record is immutable history and cannot be rewritten. An
+    unlisted unknown key stays fatal, which is what keeps the tolerance narrow instead of turning
+    every typo in a stored record into a silent default.
+    """
+    section = data.get(name)
+    if section is None:
+        section = {}
+    if not isinstance(section, dict):
+        raise TypeError(f"{name} must be an object")
+    section = {key: value for key, value in section.items() if key not in removed}
+    unknown = sorted(set(section) - allowed)
+    if unknown:
+        raise ValueError(f"{name} has unknown key(s): {', '.join(unknown)}")
+    return section
+
+
+def validated_persisted_providers(
+    gpu: dict[str, Any], gpu_type: str, gpu_type_fallbacks: tuple[str, ...]
+) -> tuple[str, tuple[str, ...]]:
+    """``(provider, providers)`` from a persisted ``[gpu]`` block, cross-checked against its classes.
+
+    ``GpuSpec.__post_init__`` runs the same both-set check but cannot replace this one: ``allow_empty``
+    here keys off whether the record CARRIED a ``providers`` key, and that presence is exactly what the
+    dataclass has already lost by the time it validates. An explicitly empty preference and an absent
+    one are different states in a stored record.
+    """
+    from flash.providers import PROVIDER_NAMES, validated_provider_preferences
+
+    provider = gpu.get("provider", "")
+    if not isinstance(provider, str):
+        raise TypeError("gpu.provider must be a string")
+    provider = provider.strip().lower()
+    providers = validated_provider_preferences(
+        gpu.get("providers", ()), allow_empty="providers" not in gpu
+    )
+    if provider and providers:
+        raise ValueError("gpu.provider and gpu.providers cannot both be set")
+    if provider or providers or gpu_type:
+        from flash.providers.base import providers_for
+
+        if provider and provider not in PROVIDER_NAMES:
+            raise ValueError(f"unknown gpu.provider {provider!r}")
+        # a hard provider pin must carry every acceptable class. provider preferences stay soft: an
+        # ineligible named provider contributes no candidate, while eligible named or unnamed
+        # configured providers remain available for failover.
+        for candidate in (gpu_type, *gpu_type_fallbacks):
+            if candidate and provider and provider not in providers_for(candidate):
+                raise ValueError(
+                    f"gpu.provider {provider!r} cannot provision gpu.type {candidate!r}"
+                )
+    return provider, providers
 
 
 def str_tuple(value: Any) -> tuple[str, ...]:

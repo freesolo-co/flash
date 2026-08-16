@@ -43,6 +43,8 @@ from flash.core.spec_persistence import (
     opt_float,
     opt_int,
     str_tuple,
+    validated_persisted_providers,
+    validated_section,
     volume_gb,
 )
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
@@ -663,51 +665,15 @@ class JobSpec:
                 "local environment paths are no longer supported; the worker only runs "
                 "published Freesolo environment ids"
             )
-        train = data.get("train", {})
-        if train is None:
-            train = {}
-        if not isinstance(train, dict):
-            raise TypeError("train must be an object")
-        train = {
-            key: value for key, value in train.items() if key not in REMOVED_PERSISTED_TRAIN_KEYS
-        }
-        unknown_train = sorted(set(train) - {item.name for item in fields(TrainSpec)})
-        if unknown_train:
-            raise ValueError(f"train has unknown key(s): {', '.join(unknown_train)}")
-        gpu = data.get("gpu")
-        if gpu is None:
-            gpu = {}
-        if not isinstance(gpu, dict):
-            raise TypeError("gpu must be an object")
-        unknown_gpu = sorted(set(gpu) - {item.name for item in fields(GpuSpec)})
-        if unknown_gpu:
-            raise ValueError(f"gpu has unknown key(s): {', '.join(unknown_gpu)}")
-        gpu_type, gpu_type_fallbacks = _parse_persisted_gpu_types(gpu)
-        provider = gpu.get("provider", "")
-        if not isinstance(provider, str):
-            raise TypeError("gpu.provider must be a string")
-        provider = provider.strip().lower()
-        providers_raw = gpu.get("providers", ())
-        from flash.providers import PROVIDER_NAMES, validated_provider_preferences
-
-        providers = validated_provider_preferences(
-            providers_raw, allow_empty="providers" not in gpu
+        train = validated_section(
+            data,
+            "train",
+            {item.name for item in fields(TrainSpec)},
+            removed=REMOVED_PERSISTED_TRAIN_KEYS,
         )
-        if provider and providers:
-            raise ValueError("gpu.provider and gpu.providers cannot both be set")
-        if provider or providers or gpu_type:
-            from flash.providers.base import providers_for
-
-            if provider and provider not in PROVIDER_NAMES:
-                raise ValueError(f"unknown gpu.provider {provider!r}")
-            # a hard provider pin must carry every acceptable class.
-            for candidate in (gpu_type, *gpu_type_fallbacks):
-                if candidate and provider and provider not in providers_for(candidate):
-                    raise ValueError(
-                        f"gpu.provider {provider!r} cannot provision gpu.type {candidate!r}"
-                    )
-            # provider preferences are soft. an ineligible named provider contributes no candidate,
-            # while eligible named or unnamed configured providers remain available for failover.
+        gpu = validated_section(data, "gpu", {item.name for item in fields(GpuSpec)})
+        gpu_type, gpu_type_fallbacks = _parse_persisted_gpu_types(gpu)
+        provider, providers = validated_persisted_providers(gpu, gpu_type, gpu_type_fallbacks)
         project_raw = data.get("project", "")
         if not isinstance(project_raw, str):
             raise TypeError("project must be a string")
