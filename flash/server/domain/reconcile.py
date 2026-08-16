@@ -95,7 +95,9 @@ def _resource_start_ts(record: dict, status: runner.RunStatus) -> float:
     launched = record.get("launched_at")
     if isinstance(launched, (int, float)) and not isinstance(launched, bool) and launched > 0:
         return float(launched)
-    identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    identity = record.get("identity")
+    if not isinstance(identity, dict):
+        identity = {}
     return float(identity.get("started_ts") or status.created_at)
 
 
@@ -190,8 +192,8 @@ def _settled_totals(records: list[dict], status: runner.RunStatus, now: float) -
         for key, value in (realized.by_resource or {}).items():
             by_resource[key] = by_resource.get(key, 0.0) + float(value)
         providers.add(realized.provider)
-        allocation = record.get("allocation") if isinstance(record.get("allocation"), dict) else {}
-        if allocation.get("gpu"):
+        allocation = record.get("allocation")
+        if isinstance(allocation, dict) and allocation.get("gpu"):
             gpus.add(str(allocation["gpu"]))
         audit.append(_resource_audit(record, realized))
         key = runner._attempt_resource_key(record.get("identity"))

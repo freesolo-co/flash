@@ -813,7 +813,7 @@ def cancel_run(run_id: str) -> RunStatus:
         cancel_charge_usd, billing_diagnostic = _cancellation_billing(
             run_id, effective_spec, bill_cancel=bill_cancel, rented_remote=rented_remote
         )
-        cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
+        cancel_updates: dict = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
         cancel_updates.update(billing_diagnostic)
         preserve_retry_state = (
             persistence_error is not None and persistence_error[1] == "not_required"
