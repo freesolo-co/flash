@@ -286,7 +286,8 @@ def test_grpo_classified_exit_drains_group_after_leader_is_reaped(tmp_path, monk
 def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
     source = inspect.getsource(rl_train._execute_rl_child)
 
-    assert "child_stream = _rl_train()._GrpoSubprocessStream(proc)" in source
+    assert "child_stream = _rl_train()._GrpoSubprocessStream(" in source
+    assert "silence_watchdog=silence_watchdog" in source
     assert "for line in child_stream" in source
     assert "return child_stream.wait_and_classify()" in source
 
@@ -5702,7 +5703,8 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
         "# index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order. "
         'env_prompts=[p["env_prompt"] for p in prompts], max_turns=int(inp["max_turns"]), '
         'per_turn_credit=bool(inp["per_turn_credit"]), '
-        "on_episode_scored=observability.record, )" in src
+        "on_episode_scored=observability.record, "
+        "parent_work=observability.parent_work, )" in src
     )
     assert 'if inp["multi_turn"] else None' in src
 

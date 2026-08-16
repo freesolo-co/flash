@@ -20,6 +20,7 @@ from flash.engine.profiling.sft_workload import (  # noqa: F401
 from flash.engine.worker.backend_common import (  # noqa: F401
     ChildOutputTail,
     ChildTailStaleness,
+    VerlChildSilenceWatchdog,
     clamp_engine_len,
     fused_ce_backend,
     gdn_probe_module,
