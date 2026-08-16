@@ -130,7 +130,9 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     # the self-contained bootstrap is embedded, with its redaction sibling next to it
     assert "FLASH_BOOTSTRAP_EOF" in script
     assert "FLASH_BOOTSTRAP_SECRETS_EOF" in script
+    assert "FLASH_BOOTSTRAP_CONSOLE_EOF" in script
     assert "/opt/flash/bootstrap_secrets.py" in script
+    assert "/opt/flash/bootstrap_console.py" in script
     assert "metrics.json" in script
     # runs the prebuilt WORKER_IMAGE via Docker with the GPU + the bootstrap as the command
     from flash.providers.runpod.serverless import WORKER_IMAGE
@@ -3722,18 +3724,33 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     assert "job_spec_in_hf" not in emb2
     assert uploaded == {}
 
-    # The threshold is only as good as the framing it was chosen against, and that framing grows
-    # every time the heredoc'd bootstrap sources do (embedding bootstrap_secrets.py alone added
-    # ~5,900 bytes). Pin the WORST inline case - a spec of exactly the threshold size - against the
-    # cap, so a future bootstrap that grows past the remaining budget fails here instead of at a
-    # provider's launch call. The margin is asserted too: the real payload also carries env,
-    # deadline, and cache fields this minimal one does not.
+    # build the threshold case through the real payload path so its deadline identity, cache mount,
+    # code prefix, environment, and attempt fields consume the same budget as production.
     uploaded.clear()
-    worst = inst.build_user_data(
-        {**payload, "job_spec_json": "x" * inst._SPEC_SPILL_THRESHOLD}, image="img:latest"
+    representative = inst.build_payload(
+        _spec(),
+        seed=0,
+        attempt=7,
+        arm="lambda",
+        cache_host_mount="/mnt/cache",
+        code_prefix=CODE_PREFIX,
+        deadline_at=_deadline_at(),
     )
+    spec_document = json.loads(representative["job_spec_json"])
+    spec_document["_threshold_padding"] = ""
+    compact = json.dumps(spec_document, separators=(",", ":"))
+    padding = inst._SPEC_SPILL_THRESHOLD - len(compact)
+    assert padding >= 0
+    spec_document["_threshold_padding"] = "x" * padding
+    representative["job_spec_json"] = json.dumps(spec_document, separators=(",", ":"))
+    assert len(representative["job_spec_json"]) == inst._SPEC_SPILL_THRESHOLD
+
+    worst = inst.build_user_data(representative, image="img:latest")
+    embedded_worst = json.loads(base64.b64decode(worst.split("FLASH_PAYLOAD_EOF")[1].strip()))
     assert uploaded == {}
-    assert len(worst) < 64_000 - 2_000
+    assert embedded_worst["job_spec_json"] == representative["job_spec_json"]
+    assert "job_spec_in_hf" not in embedded_worst
+    assert len(worst.encode()) < 62_000
 
     # The spec does not ride alone: runtime secrets (a multiline PEM is a valid one) share the same
     # user_data. A spec UNDER the threshold plus a big secret must still spill, because the binding

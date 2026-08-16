@@ -1,7 +1,7 @@
 """Bootstrap shared by instance-based providers (e.g. Lambda). Runs inside the worker container.
 
 Stdlib + huggingface_hub only — never import flash here. Reads payload from ``/root/flash/payload.json``.
-Launch scripts must ship ``bootstrap_secrets.py`` (credential redaction) next to this file.
+Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and ``bootstrap_pip.py``.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 if __package__:
+    from flash.providers._lifecycle import bootstrap_console as _bootstrap_console
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
         _payload_secrets,
@@ -29,6 +30,7 @@ if __package__:
 else:
     # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
     # same directory, and the script directory leads sys.path.
+    import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
@@ -38,7 +40,7 @@ else:
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
-_CONSOLE_UPLOAD_INTERVAL_S = 3600.0
+_CONSOLE_UPLOAD_INTERVAL_S = _bootstrap_console._CONSOLE_UPLOAD_INTERVAL_S
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
@@ -233,7 +235,7 @@ def hf_upload(
     repo_subpath: str,
     *,
     enforce_deadline: bool = True,
-) -> None:
+) -> bool:
     """Upload one artifact under the run's HF prefix; never raises."""
     try:
         from huggingface_hub import HfApi
@@ -246,14 +248,16 @@ def hf_upload(
             repo_id=payload["hf_repo"],
             repo_type="dataset",
         )
+        return True
     except Exception as exc:
         print(
             f"hf upload warn ({repo_subpath}): {_safe_detail(exc, secrets=_payload_secrets(payload))}",
             flush=True,
         )
+        return False
 
 
-def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> None:
+def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> bool:
     """Upload one console snapshot from an isolated process."""
     tail_path = console + ".tail"
     tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
@@ -261,7 +265,7 @@ def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str 
         tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
         f.write(_safe_detail(tail, 64_000, secrets=_payload_secrets(payload)))
-    hf_upload(payload, tail_path, f"console_{mode}.txt")
+    return hf_upload(payload, tail_path, f"console_{mode}.txt")
 
 
 def _console_upload_loop(
@@ -271,14 +275,17 @@ def _console_upload_loop(
     interval_s: float,
     stop_upload,
 ) -> None:
-    while not stop_upload.wait(interval_s):
+    def upload() -> bool:
         try:
-            _upload_console_snapshot(payload, console, mode)
+            return _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
             print(
                 f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
                 flush=True,
             )
+            return False
+
+    _bootstrap_console._run_console_upload_loop(console, interval_s, stop_upload, upload=upload)
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
@@ -641,22 +648,16 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         pump_secrets = _payload_secrets(payload)
 
         def pump():
+            """tee sanitized output to the provider log and raw output to the console file.
+
+            only this process knows payload secret values. keep the end of oversized lines because
+            native stacks and json diagnostics place the root cause there.
+            """
             try:
                 for line in proc.stdout:
                     with pump_write_lock:
                         if not pump_writes_enabled:
                             return
-                        # this process's stdout is the instance's container log, which the control
-                        # plane pulls as the failure detail (vast holds the box after a non-zero
-                        # exit precisely so it can). only this process knows the run's secret
-                        # VALUES, so each echoed child line is sanitized here at the source -- the
-                        # control-plane sanitizer downstream cannot value-redact a runtime secret
-                        # whose name it never sees. mirrors the runpod serverless handler. the
-                        # console FILE keeps the raw line; its upload path sanitizes the tail.
-                        # the bound keeps the END of an oversized line: the root cause sits at the
-                        # end of a native stack or json blob, and the control plane's failure
-                        # detail reads the provider's instance log rather than the uploaded
-                        # console, so a prefix cut here loses it everywhere.
                         print(
                             _safe_detail(line, 100_000, secrets=pump_secrets, keep="end"),
                             end="",
