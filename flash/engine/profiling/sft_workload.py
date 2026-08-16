@@ -74,8 +74,10 @@ class _SftTokenization:
     processor: Any | None
     # None for a text-only run; no image row can reach the caller in that case.
     image_row: Callable[..., tuple[list[int], list[int], bytes, int]] | None
-    # profiling defers per-source validation to one cached pass; the worker validates eagerly.
-    defer_image_validation: bool
+    # the normalizer bound to the deferral this run's image_row requires: the estimator validates
+    # descriptors itself through one cached pass, the processor validates eagerly. bound together
+    # with image_row rather than carried as a separate flag, which could disagree with it.
+    normalize_images: Callable | None
 
 
 def _resolve_sft_tokenization(
@@ -88,12 +90,12 @@ def _resolve_sft_tokenization(
     max_length: int,
 ) -> _SftTokenization:
     """resolve the tokenizer and bind the image-row tokenizer this run will use."""
-    from flash.content.multimodal import validate_multimodal_training
+    from flash.content.multimodal import normalize_prompt_images, validate_multimodal_training
     from flash.engine.profiling.image_tokens import ImageProfileValidationState, load_image_geometry
 
     processor = None
     image_row = None
-    defer_image_validation = False
+    normalize_images = None
     if multimodal:
         validate_multimodal_training(
             spec.model,
@@ -112,6 +114,7 @@ def _resolve_sft_tokenization(
                 max_length=max_length,
                 thinking=bool(spec.thinking),
             )
+            normalize_images = normalize_prompt_images
         else:
             geometry = load_image_geometry(spec.model, spec.model_revision)
             tokenizer = tokenizer_loader(spec.model, spec.model_revision)
@@ -123,12 +126,14 @@ def _resolve_sft_tokenization(
                 max_length=max_length,
                 thinking=bool(spec.thinking),
             )
-            defer_image_validation = True
+            # the estimator validates every descriptor itself through one cached, budgeted pass,
+            # so inspecting here too would decode each image twice.
+            normalize_images = partial(normalize_prompt_images, defer_validation=True)
     else:
         tokenizer = tokenizer_loader(spec.model, spec.model_revision)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    return _SftTokenization(tokenizer, processor, image_row, defer_image_validation)
+    return _SftTokenization(tokenizer, processor, image_row, normalize_images)
 
 
 def _materialize_verl_images(
@@ -768,11 +773,7 @@ def prepare_sft_workload(
     examples_preselected: bool = False,
 ) -> PreparedSftWorkload:
     """render, tokenize, filter, and pack the exact rows consumed by sft."""
-    from flash.content.multimodal import (
-        normalize_prompt_images,
-        record_has_images,
-        text_only_prompt_messages,
-    )
+    from flash.content.multimodal import record_has_images, text_only_prompt_messages
 
     train_spec = spec.train
     max_length = sft_max_length(spec)
@@ -818,10 +819,7 @@ def prepare_sft_workload(
         image_row=tokenization.image_row,
         max_length=max_length,
         image_dir=image_dir,
-        normalize_prompt_images=partial(
-            normalize_prompt_images,
-            defer_validation=tokenization.defer_image_validation,
-        ),
+        normalize_prompt_images=tokenization.normalize_images,
         record_has_images=record_has_images,
         text_only_prompt_messages=text_only_prompt_messages,
     )
