@@ -52,8 +52,8 @@ def _appended_eos_index(
     return None
 
 
-def _chatml_template(source) -> str | None:
-    """Return the metadata-selected template, or ``None`` unless it is a ChatML one."""
+def _selected_chat_template(source) -> str | None:
+    """return the metadata-selected template text, if the source exposes one."""
     get_template = getattr(source, "get_chat_template", None)
     if callable(get_template):
         try:
@@ -64,9 +64,13 @@ def _chatml_template(source) -> str | None:
         template = getattr(source, "chat_template", None)
         if isinstance(template, dict):
             template = template.get("default")
-    if not isinstance(template, str) or not all(
-        token in template for token in _CHATML_CONTROL_TOKENS
-    ):
+    return template if isinstance(template, str) else None
+
+
+def _chatml_template(source) -> str | None:
+    """return the selected template only when it carries both chatml controls."""
+    template = _selected_chat_template(source)
+    if template is None or not all(token in template for token in _CHATML_CONTROL_TOKENS):
         return None
     return template
 
@@ -252,7 +256,7 @@ def _rendered_message_probe(
     text_spans = _chatml_text_spans(rendered)
     occurrences = _rendered_field_occurrences(rendered, sentinels, text_spans)
 
-    paths = [set() for _ in source_messages]
+    paths: list[set[_MessagePath]] = [set() for _ in source_messages]
     runs: list[list[list[_MessagePath]]] = [[] for _ in source_messages]
     previous_source = -1
     previous_right = None
@@ -281,7 +285,7 @@ def _rendered_message_probe(
     if text_spans is None:
         return _RenderedMessageProbe(source_fields, None, ())
     span_roles = tuple(role for _, _, role in text_spans)
-    source_span_indexes = [set() for _ in source_messages]
+    source_span_indexes: list[set[int]] = [set() for _ in source_messages]
     for occurrence in occurrences:
         containing = _containing_body_spans(
             text_spans, occurrence.marker_start, occurrence.marker_end
@@ -302,19 +306,49 @@ def _path_value(message: dict, path: _MessagePath):
     return value
 
 
+def _rendered_field_runs(messages: list[dict], rendered_fields: tuple[_RenderedMessageFields, ...]):
+    for message, fields in zip(messages, rendered_fields, strict=True):
+        for run in fields.adjacent_runs:
+            yield "".join(str(_path_value(message, path)) for path in run)
+
+
+def reject_rendered_message_token(
+    template_source,
+    messages: list[dict],
+    token: str,
+    *,
+    template_kwargs: dict,
+) -> _RenderedMessageProbe | None:
+    """reject a token from every source field the selected chat template emits."""
+    template = _selected_chat_template(template_source)
+    if template is None:
+        return None
+    rendered_probe = _rendered_message_probe(
+        template_source,
+        template,
+        messages,
+        [],
+        template_kwargs,
+    )
+    if any(token in text for text in _rendered_field_runs(messages, rendered_probe.source_fields)):
+        raise ValueError(
+            f"sft message contains the reserved image marker {token!r} in a field emitted by "
+            "the chat template; remove it before training"
+        )
+    return rendered_probe
+
+
 def _reject_chatml_control_bodies(
     messages: list[dict], rendered_fields: tuple[_RenderedMessageFields, ...]
 ) -> None:
     """Reject controls inside rendered leaves or across directly adjacent rendered leaves."""
-    for message, fields in zip(messages, rendered_fields, strict=True):
-        for run in fields.adjacent_runs:
-            text = "".join(str(_path_value(message, path)) for path in run)
-            for token in _CHATML_CONTROL_TOKENS:
-                if token in text:
-                    raise ValueError(
-                        f"SFT message body contains reserved ChatML control token {token}; "
-                        "remove or escape the literal token before training"
-                    )
+    for text in _rendered_field_runs(messages, rendered_fields):
+        for token in _CHATML_CONTROL_TOKENS:
+            if token in text:
+                raise ValueError(
+                    f"SFT message body contains reserved ChatML control token {token}; "
+                    "remove or escape the literal token before training"
+                )
 
 
 def _has_authored_assistant_body(message: dict, fields: _RenderedMessageFields) -> bool:
@@ -341,25 +375,20 @@ def _source_span_association(
     for source_index, message in enumerate(source_messages):
         source_role = str(message.get("role")).strip().lower()
         expected_assistant = source_role == "assistant"
-        if fixed[source_index] is not None:
-            candidates = [fixed[source_index]]
+        direct = fixed[source_index]
+        if direct is not None:
+            candidates = [direct]
         else:
-            lower = next(
-                (
-                    fixed[index]
-                    for index in range(source_index - 1, -1, -1)
-                    if fixed[index] is not None
-                ),
-                0,
-            )
-            upper = next(
-                (
-                    fixed[index]
-                    for index in range(source_index + 1, len(fixed))
-                    if fixed[index] is not None
-                ),
-                len(span_roles) - 1,
-            )
+            lower = 0
+            for index in range(source_index - 1, -1, -1):
+                if (candidate := fixed[index]) is not None:
+                    lower = candidate
+                    break
+            upper = len(span_roles) - 1
+            for index in range(source_index + 1, len(fixed)):
+                if (candidate := fixed[index]) is not None:
+                    upper = candidate
+                    break
             candidates = [
                 span_index
                 for span_index in range(lower, upper + 1)
@@ -374,7 +403,7 @@ def _source_span_association(
 
     if any(association[index] > association[index + 1] for index in range(len(association) - 1)):
         return None
-    span_sources = [[] for _ in span_roles]
+    span_sources: list[list[int]] = [[] for _ in span_roles]
     for source_index, span_index in enumerate(association):
         span_sources[span_index].append(source_index)
     if any(not sources for sources in span_sources):
@@ -446,6 +475,7 @@ def assistant_only_mask(
     source_messages: list[dict],
     template_kwargs: dict,
     template_source=None,
+    rendered_probe: _RenderedMessageProbe | None = None,
 ) -> tuple[list[int], bool]:
     """Keep only assistant body supervision when the rendered transcript is parseable ChatML.
 
@@ -472,13 +502,14 @@ def assistant_only_mask(
     template = _chatml_template(template_source)
     if template is None:
         return loss_mask, False
-    rendered_probe = _rendered_message_probe(
-        template_source,
-        template,
-        source_messages,
-        target_messages,
-        template_kwargs,
-    )
+    if rendered_probe is None:
+        rendered_probe = _rendered_message_probe(
+            template_source,
+            template,
+            source_messages,
+            target_messages,
+            template_kwargs,
+        )
     _reject_chatml_control_bodies(source_messages, rendered_probe.source_fields)
     target_start = len(source_messages) - len(target_messages)
     rendered_fields = rendered_probe.source_fields[target_start:]

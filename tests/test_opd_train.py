@@ -45,8 +45,13 @@ from flash.engine.worker.opd_train import (
     build_opd_overrides,
     encode_shifted_group_metadata,
 )
+from flash.engine.worker.opd_train_runner import _prepare_prompt_messages
 from flash.engine.worker.teacher.client import TeacherScore
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
+from flash.engine.worker.train.core.child.glue import (
+    multi_modal_image_count,
+    validate_structured_messages,
+)
 from flash.engine.worker.train.core.child.runtime import install_checkpoint_handler_filter
 from flash.engine.worker.train.opd.child import plugin as opd_plugin
 from flash.engine.worker.train.opd.child.plugin import (
@@ -56,7 +61,6 @@ from flash.engine.worker.train.opd.child.plugin import (
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
     _init_transfer_queue,
-    _multi_modal_image_count,
     _post_json,
     _raw_prompt_has_image_block,
     _require_structured_runtime_versions,
@@ -872,6 +876,167 @@ def test_processor_expanded_prompt_ids_enforce_visual_token_budget(tmp_path):
     assert len(prompt_ids) > 3
     assert processor.rendered[0]["content"][0]["image"].size == (2, 2)
     assert [image.size for image in processor.images] == [(2, 2)]
+
+
+_IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n1c"
+    "AAAAASUVORK5CYII="
+)
+_OTHER_IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLs"
+    "AAAAAElFTkSuQmCC"
+)
+
+
+def test_parent_preparation_normalizes_real_image_blocks_before_transcript_validation():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "image_url", "image_url": {"url": _IMAGE_DATA_URI}},
+                {"type": "text", "text": "b"},
+            ],
+        }
+    ]
+
+    student_messages, descriptors = _prepare_prompt_messages(
+        {}, messages, multi_turn=True, package_root=None
+    )
+
+    assert student_messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "image"},
+                {"type": "text", "text": "b"},
+            ],
+        }
+    ]
+    assert len(descriptors) == 1
+    assert messages[0]["content"][1]["type"] == "image_url"
+
+
+def test_parent_preparation_attaches_top_level_image_without_flattening_text():
+    student_messages, descriptors = _prepare_prompt_messages(
+        {"image": _IMAGE_DATA_URI},
+        [{"role": "user", "content": "describe"}],
+        multi_turn=True,
+        package_root=None,
+    )
+
+    assert student_messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image"},
+            ],
+        }
+    ]
+    assert len(descriptors) == 1
+
+
+def test_parent_preparation_orders_image_normalization_before_block_validation(monkeypatch):
+    from flash.content import multimodal
+
+    calls = []
+    normalized_messages = [
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "q"}]}
+    ]
+
+    def normalize(_example, _messages, _package_root):
+        calls.append("normalize")
+        return SimpleNamespace(messages=normalized_messages, descriptors=["descriptor"])
+
+    def validate(messages, **kwargs):
+        calls.append(("validate", messages, kwargs))
+        assert kwargs["allow_content_blocks"] is True
+        return [{"role": "user", "content": "q"}]
+
+    monkeypatch.setattr(multimodal, "normalize_prompt_images", normalize)
+    monkeypatch.setattr(opd_train, "validate_transcript_messages", validate)
+
+    result = _prepare_prompt_messages(
+        {"image": _IMAGE_DATA_URI},
+        [{"role": "user", "content": "q"}],
+        multi_turn=True,
+        package_root=None,
+    )
+
+    assert calls == [
+        "normalize",
+        (
+            "validate",
+            normalized_messages,
+            {
+                "source": "environment initial prompt",
+                "allow_content_blocks": True,
+            },
+        ),
+    ]
+    assert result == (normalized_messages, ("descriptor",))
+
+
+@pytest.mark.parametrize(
+    ("messages", "match"),
+    [
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": _IMAGE_DATA_URI}],
+                    "tool_calls": [],
+                }
+            ],
+            "unsupported transcript metadata",
+        ),
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": _IMAGE_DATA_URI},
+                        {"type": "text"},
+                    ],
+                }
+            ],
+            "malformed text block",
+        ),
+    ],
+)
+def test_parent_preparation_rejects_unsupported_image_prompt_shapes(messages, match):
+    with pytest.raises(ValueError, match=match):
+        _prepare_prompt_messages({}, messages, multi_turn=True, package_root=None)
+
+
+def test_parent_preparation_keeps_text_only_messages_exact():
+    messages = [{"role": "system", "content": "rules"}, {"role": "user", "content": "q"}]
+
+    prepared, descriptors = _prepare_prompt_messages(
+        {}, messages, multi_turn=True, package_root=None
+    )
+
+    assert json.dumps(prepared, separators=(",", ":")) == json.dumps(
+        messages, separators=(",", ":")
+    )
+    assert descriptors == ()
+
+
+def test_structured_prompt_canonicalization_rejects_unsupported_block_fields():
+    with pytest.raises(ValueError, match=r"unsupported fields.*detail"):
+        validate_structured_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": "ref", "detail": "high"}],
+                }
+            ],
+            source="initial prompt",
+        )
 
 
 class _BridgeTokenizer:
@@ -2566,7 +2731,11 @@ def test_an_unusable_opd_turn_is_never_shown_to_the_environment():
     env = _RecordingEnv()
     bridge = _multiturn_bridge(env)
     bridge.start_multiturn(
-        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+        index=0,
+        session_id="s1",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
     )
 
     response = bridge.step_multiturn(
@@ -2596,7 +2765,11 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
     env = _RecordingEnv()
     bridge = _multiturn_bridge(env)
     bridge.start_multiturn(
-        index=0, session_id="s1", prompt_ids=[10, 11], raw_prompt=[{"role": "user", "content": "q"}]
+        index=0,
+        session_id="s1",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
     )
 
     response = bridge.step_multiturn(
@@ -4487,6 +4660,7 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
     bridge = _text_bridge(teacher)
     monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
     bridge._sessions["session-1"] = {
+        "index": 0,
         "turns": [
             {
                 "prompt_ids": [10, 11],
@@ -4509,6 +4683,109 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
     assert [_teacher_logsum(turn) for turn in result["turns"]] == [
         -float(index) for index in range(1, turns + 1)
     ]
+
+
+def test_image_multiturn_teacher_scores_structured_histories_in_one_ordered_batch(monkeypatch):
+    from flash.content import multimodal
+
+    descriptor_calls = []
+    captured = []
+
+    def data_uris(descriptors, package_root):
+        descriptor_calls.append((descriptors, package_root))
+        return ["data:image/png;base64,frozen"]
+
+    class Teacher:
+        def score_many_multimodal(self, items):
+            captured.extend(items)
+            return [
+                _teacher_score(
+                    [TeacherToken(text="AB", logprob=-float(index), start=0, end=2)],
+                    input_tokens=10 + index,
+                )
+                for index, _item in enumerate(items, start=1)
+            ]
+
+    monkeypatch.setattr(multimodal, "image_descriptors_to_data_uris", data_uris)
+    prompt = _BridgePrompt(
+        student_messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a"},
+                    {"type": "image"},
+                    {"type": "text", "text": "b"},
+                ],
+            }
+        ],
+        teacher_messages=[{"role": "user", "content": "a<|media_pad|>b"}],
+        prompt_ids=(10, 11),
+        image_descriptors=("descriptor",),
+        package_root="/package",
+    )
+    bridge = _TeacherAlignmentBridge(
+        prompts=[prompt],
+        tokenizer=_BridgeTokenizer(),
+        teacher=Teacher(),
+        thinking_prefill="<think>\n",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+    monkeypatch.setattr(bridge, "_require_multiturn", lambda: None)
+    first_history = list(prompt.student_messages)
+    second_history = [
+        *first_history,
+        {"role": "assistant", "content": "prior"},
+        {"role": "user", "content": "next"},
+    ]
+    bridge._sessions["image-session"] = {
+        "index": 0,
+        "turns": [
+            {
+                "prompt_ids": [10, 11],
+                "response_ids": [65, 66],
+                "completion_text": "AB",
+                "context_messages": history,
+                "truncated": False,
+                "skip_reason": "",
+            }
+            for history in (first_history, second_history)
+        ],
+        "score_cache": None,
+        "score_lock": threading.Lock(),
+        "lease_deadline": time.monotonic() + 60,
+    }
+
+    result = bridge.score_multiturn("image-session")
+
+    assert descriptor_calls == [(("descriptor",), "/package")]
+    assert captured == [
+        (
+            [
+                {"role": "user", "content": "a<|media_pad|>b"},
+                {"role": "assistant", "content": "<think>\n"},
+            ],
+            "AB",
+            ["data:image/png;base64,frozen"],
+            True,
+        ),
+        (
+            [
+                {"role": "user", "content": "a<|media_pad|>b"},
+                {"role": "assistant", "content": "prior"},
+                {"role": "user", "content": "next"},
+                {"role": "assistant", "content": "<think>\n"},
+            ],
+            "AB",
+            ["data:image/png;base64,frozen"],
+            True,
+        ),
+    ]
+    assert [_teacher_logsum(turn) for turn in result["turns"]] == [-1.0, -2.0]
+    assert bridge.teacher_input_tokens == 23
+    assert bridge.teacher_output_tokens == 2
+    assert bridge.parent_work.snapshot().completed == 2
 
 
 def test_multiturn_transient_bridge_failure_latches_terminal_cause():
@@ -6399,7 +6676,7 @@ def test_child_teacher_bridge_payload_sends_boundary_and_image_count_without_pix
         "image_count": 2,
     }
     assert pixel_marker not in json.dumps(payload)
-    assert _multi_modal_image_count(None) == 0
+    assert multi_modal_image_count(None) == 0
 
 
 def test_image_token_suppression_is_gated_on_structured_image_blocks():
@@ -7619,3 +7896,411 @@ def test_opd_names_the_failed_fragment_when_the_child_exits_fail_closed():
 
     # permanent: retrying re-runs the same incompatible verl/transformers stack.
     assert not isinstance(excinfo.value, opd_train._w.RetriableInfraError)
+
+
+def _drive_opd_multi_turn_episode(
+    *,
+    monkeypatch,
+    turns,
+    env_replies,
+    raw_prompt,
+    multi_modal_data=None,
+):
+    """Run the real OPD child loop end to end against a stub bridge, returning what it produced.
+
+    The loop is the thing under test: it decides whether the frozen media reaches each `generate`
+    call and each turn's actor output. Driving `_opd_run_turns` by hand, or asserting on the module
+    source, would restate that decision instead of exercising it -- and the media gap this covers
+    survived precisely because nothing ever ran this loop.
+    """
+    import asyncio
+
+    from flash.engine.worker.train.opd.child import bridge as _child_bridge
+    from flash.engine.worker.train.opd.child import multiturn as opd_multiturn
+
+    # teacher attachment builds torch tensors, which the offline env has no torch for. it runs
+    # strictly AFTER every generate call and every turn output, so stubbing it leaves the media
+    # path these tests measure fully exercised.
+    monkeypatch.setattr(opd_multiturn, "_attach_teacher_rows", lambda outputs, payload: None)
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_URL", "http://bridge.invalid")
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", "token")
+    monkeypatch.setenv("FLASH_OPD_SEED", "7")
+    monkeypatch.setenv("FLASH_OPD_MAX_TURNS", str(len(turns)))
+    monkeypatch.setenv("FLASH_OPD_MAX_MODEL_LEN", "4096")
+    monkeypatch.setenv(
+        "FLASH_OPD_ENV_CAPABILITIES",
+        json.dumps(["new_rollout_state", "record_model_turn", "env_reply", "rollout_done"]),
+    )
+
+    posted: dict[str, list] = {"start": [], "step": [], "score": [], "close": []}
+    replies = list(env_replies)
+    outputs: list[dict] = []
+
+    def post_json(url, token, path, payload):
+        posted[path.rsplit("/", 1)[-1]].append(payload)
+        if path.endswith("/start"):
+            return {"max_turns": len(turns)}
+        if path.endswith("/step"):
+            reply = replies.pop(0)
+            return {"messages": reply["messages"], "terminal": reply["terminal"]}
+        if path.endswith("/score"):
+            # one scored row per EMITTED turn: the loop rejects any other count, and the emitted
+            # count is what it decided, not what this stub assumed.
+            return {
+                "turns": [
+                    {
+                        "teacher_ids": [0] * (len(out["prompt_ids"]) + len(out["response_ids"])),
+                        "teacher_logprobs": [0.0]
+                        * (len(out["prompt_ids"]) + len(out["response_ids"])),
+                    }
+                    for out in outputs
+                ]
+            }
+        return {}
+
+    class _Tokenizer:
+        """one codepoint per token, so a turn's ids are readable straight off its text."""
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(chr(int(i)) for i in ids if int(i) != 99)
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [ord(c) for c in text]}
+
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "".join(str(m.get("content") or "") for m in messages)
+
+    class _Base:
+        """mirrors the parts of verl's AgentLoopBase the OPD loop actually calls."""
+
+        def __init__(self):
+            self.tokenizer = _Tokenizer()
+            self.rollout_config = SimpleNamespace(response_length=256)
+            self.server_manager = self
+            self._sent = list(turns)
+            # every generate call's media, so a test can prove the pixels ride along on turn 2+.
+            self.generate_media = []
+            self.generate_mm_kwargs = []
+
+        def _get_mm_processor_kwargs(self, audio_data=None):
+            return {"flash_probe": True}
+
+        async def process_multi_modal_info(self, messages):
+            return dict(multi_modal_data or {})
+
+        async def apply_chat_template(self, messages, **kwargs):
+            return [1, 2, 3]
+
+        async def generate(
+            self,
+            *,
+            request_id,
+            prompt_ids,
+            sampling_params,
+            image_data=None,
+            video_data=None,
+            audio_data=None,
+            mm_processor_kwargs=None,
+        ):
+            self.generate_media.append(image_data)
+            self.generate_mm_kwargs.append(mm_processor_kwargs)
+            text, stop_reason = self._sent.pop(0)
+            return SimpleNamespace(
+                token_ids=[ord(c) for c in text],
+                log_probs=[0.0] * len(text),
+                num_preempted=0,
+                stop_reason=stop_reason,
+                extra_fields={},
+            )
+
+    def hard_exit(code):
+        # the loop converts every failure into a bare exit code, discarding the exception. re-raise
+        # the live one so a broken driver reports its own cause instead of an opaque "exited 86".
+        raise AssertionError(f"OPD child loop hard-exited with {code}") from sys.exc_info()[1]
+
+    loop_class = opd_multiturn.build_flash_multi_turn_agent_loop(
+        register=lambda name: lambda cls: cls,
+        agent_loop_base=_Base,
+        agent_loop_output=lambda **kwargs: outputs.append(kwargs) or SimpleNamespace(**kwargs),
+        post_json=post_json,
+        score_failure_handler=lambda error: None,
+        # the real classifier, not a stub: this drive asserts a HEALTHY episode, so a stub that
+        # swallowed a fatal error would let the media assertions below run against a loop that had
+        # actually failed. the real one raises through hard_exit and names the cause.
+        fatal_rollout_exit_code=_child_bridge._fatal_rollout_exit_code,
+        mark_prompt_failure=lambda **kwargs: None,
+        deterministic_seed=lambda *parts: 1234,
+        process_exit=hard_exit,
+    )
+
+    driven = {}
+
+    async def _go():
+        instance = loop_class()
+        # the loop offloads the bridge's blocking posts onto this executor, so it has to be the
+        # one actually running the coroutine.
+        instance.loop = asyncio.get_running_loop()
+        driven["instance"] = instance
+        await instance.run(
+            {},
+            raw_prompt=raw_prompt,
+            index=0,
+            global_steps=0,
+            session_id=0,
+        )
+
+    asyncio.run(_go())
+    return driven["instance"], outputs, posted
+
+
+# "completed" under the per-turn cap is what makes a turn TERMINATED rather than truncated; a
+# truncated first turn would end the episode after one turn and never test the resend at all.
+_TWO_COMPLETED_TURNS = [("A", "completed"), ("B", "completed")]
+_TWO_TURN_REPLIES = [
+    {"messages": [{"role": "user", "content": "and now?"}], "terminal": False},
+    {"messages": [], "terminal": True},
+]
+# the shape verl's RLHFDataset actually hands the child for an image row: it splits the parquet
+# string on the `<image>` placeholder and substitutes a block (rl_dataset.py `_build_messages`).
+# a string prompt would enter the loop through a door a real image row cannot use, and would pass
+# even while the transcript validator rejected every genuine image episode before generation.
+_IMAGE_BLOCK_PROMPT = [
+    {
+        "role": "user",
+        "content": [{"type": "image", "image": "ref"}, {"type": "text", "text": "describe"}],
+    }
+]
+_TEXT_PROMPT = [{"role": "user", "content": "describe"}]
+
+
+_PIXELS = ["pixels"]
+
+
+@pytest.mark.parametrize(
+    ("raw_prompt", "multi_modal_data", "expected_media", "expected_image_count"),
+    [
+        pytest.param(_IMAGE_BLOCK_PROMPT, {"images": _PIXELS}, _PIXELS, 1, id="image"),
+        # the text control is not decoration: it pins the ABSENCE as None rather than {}, which verl
+        # would read as a multimodal row and push down the multimodal collate path.
+        pytest.param(_TEXT_PROMPT, None, None, 0, id="text-only"),
+    ],
+)
+def test_a_multi_turn_opd_episode_carries_its_frozen_media_on_every_turn(
+    monkeypatch, raw_prompt, multi_modal_data, expected_media, expected_image_count
+):
+    """The pixels ride along on turn 2+, not just the opening turn.
+
+    Each OPD turn re-sends the whole accumulated prefix, and that prefix still holds the episode's
+    image placeholder tokens. A `generate` call without the media leaves the engine with
+    placeholders it cannot expand: the rollout either dies on a feature/placeholder mismatch or
+    silently conditions on no image at all. The OPD child previously passed media on NO turn.
+
+    Both rows run the same assertions because the contract is the same one: whatever the episode
+    froze is what every turn sends. Only the frozen value differs, so a regression that hardcodes
+    either answer fails the other row.
+    """
+    instance, outputs, posted = _drive_opd_multi_turn_episode(
+        monkeypatch=monkeypatch,
+        turns=_TWO_COMPLETED_TURNS,
+        env_replies=_TWO_TURN_REPLIES,
+        raw_prompt=raw_prompt,
+        multi_modal_data=multi_modal_data,
+    )
+
+    assert instance.generate_media == [expected_media] * 2, (
+        "every turn must carry the frozen media, not just the first"
+    )
+    # the actor re-tokenizes each turn's prompt, so each turn's OUTPUT needs the media too.
+    assert [out["multi_modal_data"] for out in outputs] == [multi_modal_data] * 2
+    assert [out["mm_processor_kwargs"] for out in outputs] == [{"flash_probe": True}] * 2
+    assert instance.generate_mm_kwargs == [{"flash_probe": True}] * 2
+    # the bridge authenticates both the decoded count and canonical block placement.
+    assert posted["start"][0]["image_count"] == expected_image_count
+    assert posted["start"][0]["raw_prompt"] == (
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": "describe"}],
+            }
+        ]
+        if expected_image_count
+        else _TEXT_PROMPT
+    )
+
+
+class _StructuredImageEnv(_RecordingEnv):
+    def __init__(self, initial_messages):
+        super().__init__()
+        self.initial_messages = initial_messages
+        self.reply_contexts = []
+
+    def new_rollout_state(self, _example):
+        return {"messages": self.initial_messages, "prompt": None}
+
+    def env_reply(self, messages, _state):
+        self.reply_contexts.append(messages)
+        return [{"role": "user", "content": "next"}]
+
+
+def _image_prompt(image_source=_IMAGE_DATA_URI, *, image_first: bool = False):
+    image = {"type": "image", "image": image_source}
+    content = (
+        [image, {"type": "text", "text": "ab"}]
+        if image_first
+        else [{"type": "text", "text": "a"}, image, {"type": "text", "text": "b"}]
+    )
+    return [{"role": "user", "content": content}]
+
+
+def _structured_image_bridge(env, initial_messages):
+    from flash.content.multimodal import image_teacher_prompt_messages, normalize_prompt_images
+
+    normalized = normalize_prompt_images({}, initial_messages, None)
+    bridge = _multiturn_bridge(env)
+    bridge.prompts[0] = _BridgePrompt(
+        student_messages=normalized.messages,
+        teacher_messages=image_teacher_prompt_messages(
+            normalized.messages, len(normalized.descriptors)
+        ),
+        prompt_ids=(10, 11),
+        image_descriptors=tuple(normalized.descriptors),
+        package_root=None,
+        example={},
+    )
+    return bridge, normalized
+
+
+def test_multiturn_start_authenticates_parquet_text_block_canonicalization():
+    frozen = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+                {"type": "image", "image": _IMAGE_DATA_URI},
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
+    reconstructed = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "ab"},
+                {"type": "image", "image": _IMAGE_DATA_URI},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
+    env = _StructuredImageEnv(reconstructed)
+    bridge, _normalized = _structured_image_bridge(env, frozen)
+
+    bridge.start_multiturn(
+        index=0,
+        session_id="canonical",
+        prompt_ids=[10, 11],
+        raw_prompt=reconstructed,
+        image_count=1,
+    )
+
+    assert bridge._sessions["canonical"]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "ab"},
+                {"type": "image"},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
+
+
+def test_multiturn_start_rejects_rehydrated_media_placement_drift_at_same_count():
+    frozen = _image_prompt()
+    drifted = _image_prompt(image_first=True)
+    env = _StructuredImageEnv(drifted)
+    bridge, normalized = _structured_image_bridge(env, frozen)
+
+    with pytest.raises(ValueError, match="changed after prompt freezing"):
+        bridge.start_multiturn(
+            index=0,
+            session_id="placement-drift",
+            prompt_ids=[10, 11],
+            raw_prompt=normalized.messages,
+            image_count=1,
+        )
+
+
+def test_multiturn_start_rejects_same_structure_with_different_fresh_descriptor():
+    from flash.content.multimodal import normalize_prompt_images
+
+    frozen = _image_prompt()
+    changed_source = _image_prompt(_OTHER_IMAGE_DATA_URI)
+    env = _StructuredImageEnv(changed_source)
+    bridge, normalized = _structured_image_bridge(env, frozen)
+    fresh = normalize_prompt_images({}, changed_source, None)
+    assert fresh.messages == normalized.messages
+    assert len(fresh.descriptors) == len(normalized.descriptors) == 1
+    assert fresh.descriptors != normalized.descriptors
+
+    with pytest.raises(ValueError, match="changed after prompt freezing"):
+        bridge.start_multiturn(
+            index=0,
+            session_id="descriptor-drift",
+            prompt_ids=[10, 11],
+            raw_prompt=normalized.messages,
+            image_count=1,
+        )
+
+
+def test_valid_image_prompt_reaches_environment_with_media_placement_intact():
+    initial = _image_prompt()
+    env = _StructuredImageEnv(initial)
+    bridge, normalized = _structured_image_bridge(env, initial)
+
+    started = bridge.start_multiturn(
+        index=0,
+        session_id="valid",
+        prompt_ids=[10, 11],
+        raw_prompt=normalized.messages,
+        image_count=1,
+    )
+    bridge.step_multiturn(
+        {
+            "session_id": "valid",
+            "turn_ordinal": 0,
+            "accepted_prefix": [10, 11],
+            "raw_response_ids": [65],
+            "response_ids": [65],
+            "completion_text": "A",
+            "termination": "stop",
+            "stop_reason": "stop",
+            "max_tokens": 8,
+            "truncated": False,
+            "skip_reason": "",
+        }
+    )
+
+    assert started["max_turns"] >= 1
+    assert bridge._sessions["valid"]["messages"][0] == normalized.messages[0]
+    assert env.reply_contexts[0][0] == normalized.messages[0]
+    assert env.reply_contexts[0][1] == {"role": "assistant", "content": "A"}
+
+
+def test_text_only_multiturn_start_keeps_flat_transcript_state():
+    env = _RecordingEnv()
+    bridge = _multiturn_bridge(env)
+
+    bridge.start_multiturn(
+        index=0,
+        session_id="text",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
+    )
+
+    assert bridge._sessions["text"]["messages"] == [{"role": "user", "content": "q"}]
