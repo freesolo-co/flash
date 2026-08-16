@@ -1467,25 +1467,15 @@ def test_multimodal_overrides_hand_verl_the_images_column():
     assert "data.dataloader_num_workers=0" in o
 
 
-def test_rollout_overrides_disable_the_split_multimodal_processor_cache():
-    # vllm's mm processor cache is split across two processes: a sender that replaces an already-seen
-    # image with its hash, and a receiver that must still hold the item that hash names. verl sleeps
-    # the rollout replicas after every training batch, and sleep clears the RECEIVER only, so the
-    # sender then names items that are gone and the request dies on an assert. the assert kills the
-    # REQUEST, not the run: rollouts come back empty and the visible error is an IndexError off a
-    # zero-length reward tensor, nowhere near the cause. opd disables this; grpo is on the same
-    # lifecycle and must too.
-    o = rl_train.build_verl_overrides(_overrides_cfg(multimodal=True))
-    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0" in o
+def test_shared_rollout_cache_override_uses_the_current_vllm_key():
+    assert backend_common.rollout_mm_processor_cache_overrides() == [
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0"
+    ]
 
 
-def test_rollout_cache_override_is_unconditional_like_the_opd_path():
-    # unconditional on purpose, exactly as the opd driver does it: with no mm items there is no cache
-    # to disable, so it is inert on a text job. gating it on cfg["multimodal"] would leave the cache
-    # live for any future path that carries images without setting that flag -- the failure mode this
-    # test exists to prevent is silence, so the safe default is off everywhere.
-    o = rl_train.build_verl_overrides(_overrides_cfg())
-    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0" in o
+def test_grpo_unconditionally_disables_the_vllm_multimodal_processor_cache():
+    overrides = rl_train.build_verl_overrides(_overrides_cfg())
+    assert set(backend_common.rollout_mm_processor_cache_overrides()) <= set(overrides)
 
 
 def test_text_overrides_omit_every_multimodal_key():
@@ -4517,7 +4507,7 @@ def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None, exam
 
         # the four calls the multi-turn bridge drives an env through. defined unconditionally so a
         # test can delete one and assert the capability gate catches it.
-        def new_rollout_state(self, ex):
+        def new_rollout_state(self, ex, prepared_prompt):
             return {}
 
         def record_model_turn(self, state, text):
@@ -5067,14 +5057,15 @@ class _BridgeEnv:
         self.recorded: list[str] = []
         self.scored: list[dict] = []
 
-    def new_rollout_state(self, example):
-        # `messages` starts as a COPY of `prompt` and turns are appended onto it, matching
+    def new_rollout_state(self, example, prepared_prompt):
+        # `messages` starts as a copy of `prompt` and turns are appended onto it, matching
         # flash.envs.adapter.new_rollout_state. anything reading the transcript has to account
         # for that seeding rather than treating `messages` as turns-only.
+        prompt = [dict(message) for message in prepared_prompt]
         state: dict = {
             "example": example,
-            "prompt": list(self.prompt),
-            "messages": [dict(message) for message in self.prompt],
+            "prompt": prompt,
+            "messages": [dict(message) for message in prompt],
         }
         if self.max_episode_turns is not None:
             state["max_episode_turns"] = self.max_episode_turns
@@ -5143,69 +5134,45 @@ def test_bridge_start_lets_a_per_example_budget_lower_the_cap_but_never_raise_it
     ) == {"max_turns": 1}
 
 
-def test_bridge_start_adopts_the_datasets_prompt_over_a_second_start_episode():
-    # `new_rollout_state` calls `start_episode` a SECOND time; dataset preparation already called
-    # it to build the prompt the child generates against. an env that randomizes per episode hands
-    # back a DIFFERENT opening here, and the run would then score a response generated for prompt A
-    # against a reward computed for prompt B. the env below returns a fresh secret every call, the
-    # way a randomized env does.
-    class _RandomizingEnv(_BridgeEnv):
+def test_bridge_start_passes_the_index_aligned_prepared_prompt_into_state_creation():
+    class _RecordingEnv(_BridgeEnv):
         def __init__(self):
             super().__init__()
-            self.calls = 0
+            self.starts = []
 
-        def new_rollout_state(self, example):
-            self.calls += 1
-            return {
-                "example": example,
-                "prompt": [{"role": "user", "content": f"secret-{self.calls}"}],
-                "messages": [{"role": "user", "content": f"secret-{self.calls}"}],
-            }
+        def new_rollout_state(self, example, prepared_prompt):
+            self.starts.append((example, prepared_prompt))
+            return super().new_rollout_state(example, prepared_prompt)
 
-    env = _RandomizingEnv()
-    dataset_prompt = [{"role": "user", "content": "secret-0"}]
-    bridge = _bridge(env, examples=[{"index": 0}], env_prompts=[dataset_prompt])
+    env = _RecordingEnv()
+    example = {"index": 0}
+    prepared_prompt = [{"role": "user", "content": "prepared"}]
+    bridge = _bridge(env, examples=[example], env_prompts=[prepared_prompt])
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "answer"})
-    bridge.score({"session_id": "a", "turn_count": 1})
 
-    scored = env.scored[0]
-    assert scored["prompt"] == dataset_prompt, (
-        "the episode was scored against a prompt the model never saw"
-    )
-    assert scored["messages"][0] == dataset_prompt[0]
+    assert env.starts == [(example, prepared_prompt)]
+    state = bridge._sessions["a"]["state"]
+    assert state["prompt"] == prepared_prompt
+    assert state["messages"] == prepared_prompt
 
 
-def test_bridge_refuses_an_environment_reply_that_carries_an_image():
-    # the media a rollout conditions on is fixed from the INITIAL prompt, so an image returned
-    # mid-episode by step_episode cannot reach the model. the old code ran str() over the block list,
-    # which does not fail: the model read the literal "[{'type': 'image_url', ...}]" repr as its
-    # prompt text and every metric reported a healthy run. refusing is loud -- the reward server
-    # turns this into a 400 that fails the episode -- and silence is the defect being fixed.
-    env = _BridgeEnv(
-        replies=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "what changed?"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-                ],
-            }
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "image", "image_url": "x"}],
+        [{"type": "image_url", "image_url": "x"}],
+        [{"type": "input_image", "image_url": "x"}],
+        [
+            {"type": "text", "text": "what changed?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
         ],
-        done_after=99,
-    )
-    bridge = _bridge(env)
-    bridge.start({"index": 0, "session_id": "a"})
-    with pytest.raises(ValueError, match="image block"):
-        bridge.step({"session_id": "a", "completion_text": "answer"})
-
-
-@pytest.mark.parametrize("block_type", ["image", "image_url", "input_image"])
-def test_bridge_refuses_every_image_block_spelling(block_type):
-    # three spellings reach the adapter from real environments, and a check that knew only one would
-    # leave the other two silently stringified -- the same defect, just rarer and harder to see.
+    ],
+    ids=["image", "image-url", "input-image", "mixed-text-image"],
+)
+def test_bridge_refuses_every_image_reply_shape(content):
+    # every image spelling and a mixed text/image reply must fail rather than reach the child as text.
     env = _BridgeEnv(
-        replies=[{"role": "user", "content": [{"type": block_type, "image_url": "x"}]}],
+        replies=[{"role": "user", "content": content}],
         done_after=99,
     )
     bridge = _bridge(env)
@@ -6968,8 +6935,8 @@ def test_multi_turn_bridge_returns_turns_only_under_per_turn_credit():
     class _Env:
         max_turns = 2
 
-        def new_rollout_state(self, example):
-            return {"prompt": [], "messages": []}
+        def new_rollout_state(self, example, prepared_prompt):
+            return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
         def rollout_rewards_many(self, items):
             from flash.envs.base import RolloutReward
@@ -6994,8 +6961,8 @@ def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
     class _Env:
         max_turns = 2
 
-        def new_rollout_state(self, example):
-            return {"prompt": [], "messages": []}
+        def new_rollout_state(self, example, prepared_prompt):
+            return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
         def rollout_rewards_many(self, items):
             from flash.envs.base import RolloutReward
@@ -7145,8 +7112,8 @@ class _SpanEnv:
     def __init__(self):
         self.recorded: list[str] = []
 
-    def new_rollout_state(self, example):
-        return {"prompt": [], "messages": []}
+    def new_rollout_state(self, example, prepared_prompt):
+        return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
     def record_model_turn(self, state, text):
         self.recorded.append(text)
@@ -7164,41 +7131,12 @@ class _SpanEnv:
         return [RolloutReward(episode=1.0, turns=tuple(0.5 for _ in self.recorded)) for _ in items]
 
 
-def test_an_image_prompt_survives_the_multi_turn_transcript_validator(monkeypatch):
-    # an image prompt does NOT reach the child as text. verl's RLHFDataset rewrites the parquet's
-    # string content into blocks -- it splits on the `<image>` placeholder and substitutes an image
-    # block (rl_dataset.py `_build_messages`) -- so raw_prompt arrives block-shaped for exactly the
-    # rows flash writes for a multimodal job. validating it as text-only rejected every image episode
-    # at turn one with "content must be text for multi-turn".
+def test_an_image_prompt_reaches_media_extraction_and_the_rollout(monkeypatch):
+    # verl rewrites the parquet prompt into blocks before the child loop. media extraction must see
+    # those blocks before the model-facing transcript is flattened, and the decoded pixels must stay
+    # attached to the emitted episode for training.
     env = _SpanEnv()
-    out = _drive_multi_turn_episode(
-        stop_reasons=[("ab", "completed")],
-        env=env,
-        monkeypatch=monkeypatch,
-        max_turns=1,
-        multi_modal_data={"images": ["PIXELS"]},
-        raw_prompt=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": "/tmp/x.png"},
-                    {"type": "text", "text": "\nDescribe this image."},
-                ],
-            }
-        ],
-    )
-    # the episode ran rather than raising, and the decoded media is carried on the output so the
-    # training pass re-tokenizes against the same pixels the rollout conditioned on.
-    assert out["multi_modal_data"] == {"images": ["PIXELS"]}
-    assert env.recorded == ["ab"]
-
-
-def test_image_extraction_sees_the_blocks_not_the_flattened_text(monkeypatch):
-    # ORDER is the fix. flattening the transcript before extraction would hand verl's extractor plain
-    # strings, it would find no image blocks, and the run would train on the caption with the pixels
-    # silently dropped -- no error, no warning. so assert the extractor was handed the BLOCKS.
-    env = _SpanEnv()
-    _, instance = _drive_multi_turn_episode(
+    out, instance = _drive_multi_turn_episode(
         stop_reasons=[("ab", "completed")],
         env=env,
         monkeypatch=monkeypatch,
@@ -7210,11 +7148,14 @@ def test_image_extraction_sees_the_blocks_not_the_flattened_text(monkeypatch):
                 "role": "user",
                 "content": [
                     {"type": "image", "image": "/tmp/x.png"},
-                    {"type": "text", "text": "hi"},
+                    {"type": "text", "text": "\nDescribe this image."},
                 ],
             }
         ],
     )
+
+    assert out["multi_modal_data"] == {"images": ["PIXELS"]}
+    assert env.recorded == ["ab"]
     contents = instance.mm_info_contents
     assert isinstance(contents[0], list), (
         "media extraction was handed flattened text; the images are already gone by this point"

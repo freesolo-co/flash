@@ -758,6 +758,16 @@ def rollout_resident_overrides(sleep_unsupported: bool) -> list[str]:
     ]
 
 
+def rollout_mm_processor_cache_overrides() -> list[str]:
+    """disable vllm's split multimodal processor cache for every verl rollout.
+
+    verl sleep resets the engine-side receiver without resynchronizing the frontend sender, so a
+    repeated image can become a hash-only request for an item the receiver no longer holds. zero is
+    vllm's disable value for both halves and is inert when a rollout has no multimodal items.
+    """
+    return ["+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0"]
+
+
 def trainer_dtype_overrides() -> list[str]:
     """verl overrides that store the frozen base in bf16 instead of verl's fp32 default.
 

@@ -12,6 +12,7 @@ import threading
 import time
 import tracemalloc
 import types
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -54,7 +55,7 @@ class _RewardResult:
 @dataclass(frozen=True)
 class _EnvironmentTurn:
     role: str
-    content: str
+    content: str | list[dict]
 
 
 @dataclass(frozen=True)
@@ -276,6 +277,30 @@ def test_per_episode_state_survives_every_single_turn_scoring_entry_point(monkey
     assert sdk_env._picks == []
 
 
+def test_unprepared_rollout_preserves_nested_prompt_identity(monkeypatch):
+    nested_content = [{"type": "text", "text": "go"}]
+
+    class _NestedPromptEnv(_FakeMultiTurnEnv):
+        def start_episode(self, example, prompt_text):
+            return [{"role": "user", "content": nested_content}]
+
+    sdk_env = _NestedPromptEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        sdk_env,
+        "owner/env",
+        source=[{"input": "go"}],
+        contract_text="",
+    )
+    state = env.new_rollout_state({"input": "go"})
+
+    assert state["messages"][0] is not state["prompt"][0]
+    assert state["messages"][0]["content"] is state["prompt"][0]["content"]
+
+
 def test_sibling_rollouts_get_isolated_tasks(monkeypatch):
     sdk_env = _FakeMultiTurnEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
@@ -313,6 +338,123 @@ def test_sibling_rollouts_get_isolated_tasks(monkeypatch):
     env.reward("ignored", row, first)
     assert sdk_env.step_tasks[0] is first["task"]
     assert sdk_env.score_tasks[0] is first["task"]
+
+
+def test_bridge_clones_the_prepared_task_for_each_sibling_rollout(monkeypatch):
+    """the bridge must step and score copies of the task that produced the frozen prompt."""
+
+    class _PreparedTaskNonceEnv(_EnvironmentMultiTurn):
+        def __init__(self):
+            self.start_calls = 0
+            self.scored: list[tuple[str, str, str]] = []
+
+        def start_episode(self, task, prompt_text):
+            self.start_calls += 1
+            nonce = f"nonce-{self.start_calls}"
+            task.metadata["prompt_nonce"] = nonce
+            return [{"role": "user", "content": f"prompt:{nonce}"}]
+
+        def max_episode_turns(self, task):
+            return 2
+
+        def step_episode(self, task, messages, assistant_response):
+            task.metadata["session"] = assistant_response
+            return _EnvironmentStepResult(done=True, final_response_text=assistant_response)
+
+        def score_episodes(self, task, episodes):
+            nonce = str(task.metadata.get("prompt_nonce") or "")
+            session = str(task.metadata.get("session") or "")
+            rewards = []
+            for episode in episodes:
+                prompt = str(episode.messages[0].get("content") or "")
+                response = str(episode.response_text or "")
+                self.scored.append((nonce, session, prompt))
+                correct = prompt == f"prompt:{nonce}" and response == session
+                rewards.append(_RewardResult(score=float(correct), success=correct))
+            return rewards
+
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.engine.worker.train.rl.multi_turn import MultiTurnBridge
+    from flash.envs.adapter import FreesoloEnvironment
+
+    sdk_env = _PreparedTaskNonceEnv()
+    env = FreesoloEnvironment(
+        sdk_env,
+        "owner/env",
+        source=[{"input": "go"}],
+        contract_text="",
+    )
+    (row,) = env.dataset()
+    prepared_prompt = env.prompt_messages(row)
+    prepared_task = env._row_tasks[id(row)]
+    with pytest.raises(RuntimeError, match="dataset row task"):
+        env.new_rollout_state(dict(row), prepared_prompt)
+
+    batch_sizes: list[int] = []
+    rollout_rewards_many = env.rollout_rewards_many
+
+    def record_batch(items):
+        batch_sizes.append(len(items))
+        return rollout_rewards_many(items)
+
+    env.rollout_rewards_many = record_batch
+    bridge = MultiTurnBridge(
+        env,
+        [row],
+        env_prompts=[prepared_prompt],
+        max_turns=2,
+        score_batch_size=2,
+    )
+    try:
+        for session_id in ("left", "right"):
+            bridge.start({"index": 0, "session_id": session_id})
+
+        left_task = bridge._sessions["left"]["state"]["task"]
+        right_task = bridge._sessions["right"]["state"]["task"]
+        assert sdk_env.start_calls == 1
+        assert left_task.metadata["prompt_nonce"] == "nonce-1"
+        assert right_task.metadata["prompt_nonce"] == "nonce-1"
+        assert left_task is not right_task
+        assert left_task is not prepared_task
+        assert right_task is not prepared_task
+
+        bridge.step({"session_id": "left", "completion_text": "left"})
+        bridge.step({"session_id": "right", "completion_text": "right"})
+        assert left_task.metadata["session"] == "left"
+        assert right_task.metadata["session"] == "right"
+        assert "session" not in prepared_task.metadata
+
+        scores: dict[str, dict] = {}
+        errors: list[BaseException] = []
+        ready = threading.Barrier(3)
+
+        def score(session_id):
+            try:
+                ready.wait()
+                scores[session_id] = bridge.score({"session_id": session_id, "turn_count": 1})
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=score, args=(session_id,)) for session_id in ("left", "right")
+        ]
+        for thread in threads:
+            thread.start()
+        ready.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == []
+        assert batch_sizes == [2]
+        assert scores == {"left": {"score": 1.0}, "right": {"score": 1.0}}
+        assert sorted(sdk_env.scored) == [
+            ("nonce-1", "left", "prompt:nonce-1"),
+            ("nonce-1", "right", "prompt:nonce-1"),
+        ]
+    finally:
+        bridge.shutdown()
 
 
 def test_batched_scoring_uses_each_siblings_own_task(monkeypatch):
@@ -2246,9 +2388,14 @@ def test_step_episode_receives_the_raw_turn_not_the_scored_one(monkeypatch):
 
 
 class _BlockReplyMultiTurnEnv(_EnvironmentMultiTurn):
-    """Multi-turn env whose step_episode replies in openai-style text BLOCKS rather than a string."""
+    """multi-turn env whose terminal reply contains raw text and image blocks."""
 
     def __init__(self):
+        self.reply_content = [
+            {"type": "text", "text": "first "},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "second"},
+        ]
         self.scored: list[object] = []
 
     def start_episode(self, example, prompt_text):
@@ -2256,16 +2403,8 @@ class _BlockReplyMultiTurnEnv(_EnvironmentMultiTurn):
 
     def step_episode(self, example, messages, assistant_response):
         return _EnvironmentStepResult(
-            done=False,
-            messages=(
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "first "},
-                        {"type": "text", "text": "second"},
-                    ],
-                },
-            ),
+            done=True,
+            messages=({"role": "user", "content": self.reply_content},),
             final_response_text=None,
         )
 
@@ -2274,39 +2413,24 @@ class _BlockReplyMultiTurnEnv(_EnvironmentMultiTurn):
         return [_RewardResult(score=1.0, success=True) for _ in episodes]
 
 
-def test_a_block_reply_reaches_the_scorer_as_the_text_the_model_saw(monkeypatch):
-    """The turn handed to a turn-aware scorer must be the text the next model turn conditioned on.
-
-    The multi-turn child joins text blocks through message_content_text before the reply enters the
-    transcript, so the model reads "first second". Recording the turn with a bare str() stored the
-    python repr "[{'type': 'text', ...}]" instead, and score_episodes then graded a transcript that
-    never existed. The two views have to agree.
-    """
+def test_terminal_block_reply_reaches_score_episode_without_flattening(monkeypatch):
     sdk_env = _BlockReplyMultiTurnEnv()
     env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+    expected = deepcopy(sdk_env.reply_content)
 
     example = {"id": "a", "input": "2+2?", "output": "4"}
     state = env.new_rollout_state(example)
     env.record_model_turn(state, "a turn")
     env.env_reply(state["messages"], state)
+    sdk_env.reply_content[0]["text"] = "mutated by environment"
+    sdk_env.reply_content.append({"type": "text", "text": "late mutation"})
+    env._score_episode(example, state)
 
-    # record_model_turn appends the assistant turn first, so the env's reply is the last one.
-    recorded = [turn.content for turn in state["turns"]]
-    assert recorded[-1] == "first second", f"the scorer would grade {recorded[-1]!r}"
-    assert "'type'" not in recorded[-1], "a block-list repr reached the scored transcript"
-
-
-def test_a_plain_string_reply_is_still_recorded_unchanged(monkeypatch):
-    """The block fix must not alter the shape every existing multi-turn env already returns."""
-    sdk_env = _SteppingMultiTurnEnv()
-    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
-
-    example = {"id": "a", "input": "2+2?", "output": "4"}
-    state = env.new_rollout_state(example)
-    env.record_model_turn(state, _THINK_COMPLETION)
-    env.env_reply(state["messages"], state)
-
-    assert [turn.content for turn in state["turns"]][-1] == "next"
+    episode = sdk_env.scored[0]
+    assert episode.messages[-1]["content"] == expected
+    assert episode.turns[-1].content == expected
+    episode.messages[-1]["content"][0]["text"] = "mutated in messages"
+    assert episode.turns[-1].content == expected
 
 
 def test_stepping_the_env_leaves_the_scored_text_stripped(monkeypatch):

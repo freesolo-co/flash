@@ -24,7 +24,14 @@ import json
 
 import pytest
 
-from flash.core.spec import JobSpec
+from flash.core.spec import (
+    MANAGED_ENVIRONMENT_KEYS,
+    MANAGED_GPU_KEYS,
+    MANAGED_SECTION_KEYS,
+    MANAGED_TOP_LEVEL_KEYS,
+    MANAGED_TRAIN_KEYS,
+    JobSpec,
+)
 
 PROJECT = "11111111-1111-4111-8111-111111111111"
 
@@ -74,6 +81,18 @@ WORKER_ONLY_TOP_LEVEL = {
     "workload_profile_producer_version",
 }
 
+# the same boundary for the two nested sections. spelled out here rather than imported so the
+# registries in `flash.core.spec` have something independent to be checked against.
+MANAGED_TRAIN_FIELDS = {"hf_repo", "init_from_adapter_revision"}
+MANAGED_GPU_FIELDS = {
+    "disk_gb",
+    "network_volume",
+    "network_volume_gb",
+    "max_retries",
+    "max_wall_seconds",
+}
+MANAGED_ENVIRONMENT_FIELDS = {"resolved_sha"}
+
 
 def test_public_payload_emits_exactly_the_authorable_keys():
     assert set(spec().to_dict()) == PUBLIC_TOP_LEVEL
@@ -88,8 +107,6 @@ def test_worker_payload_is_the_public_key_set_plus_the_managed_fields():
 
 
 def test_public_payload_strips_every_managed_gpu_key():
-    from flash.core.spec import MANAGED_GPU_KEYS
-
     public_gpu = set(spec().to_dict()["gpu"])
     assert public_gpu.isdisjoint(MANAGED_GPU_KEYS)
     assert set(spec().to_internal_dict()["gpu"]) >= MANAGED_GPU_KEYS
@@ -241,3 +258,88 @@ def test_ordered_gpu_pin_round_trips_through_the_public_spelling():
     internal = decoded.to_internal_dict()["gpu"]
     assert internal["type"] == "H100"
     assert internal["type_fallbacks"] == ("A100 PCIe",)
+
+
+def test_registries_match_the_declared_boundary():
+    """The registries must equal this module's own literals, and nothing may leak the other way.
+
+    Deliberately NOT `set(worker) - set(public) == MANAGED_TOP_LEVEL_KEYS`: that compares the
+    registry against itself, so dropping a name shrinks both sides at once and the equation still
+    balances while the field leaks publicly. Mutation-verified -- that exact sabotage survived the
+    registry form. The payload difference itself is already pinned by
+    `test_public_payload_emits_exactly_the_authorable_keys` and
+    `test_worker_payload_is_the_public_key_set_plus_the_managed_fields`, so this only has to bind
+    the registries to the same independent literals.
+    """
+    assert MANAGED_TOP_LEVEL_KEYS == WORKER_ONLY_TOP_LEVEL
+    assert MANAGED_TRAIN_KEYS == MANAGED_TRAIN_FIELDS
+    assert MANAGED_GPU_KEYS == MANAGED_GPU_FIELDS
+    assert MANAGED_ENVIRONMENT_KEYS == MANAGED_ENVIRONMENT_FIELDS
+    public, worker = spec().to_dict(), spec().to_internal_dict()
+    # nothing travels the other way: the public payload invents no key the worker half lacks. this
+    # is what catches an empty `providers` or `type_fallbacks` reaching the public bytes, which
+    # would change every stored digest.
+    assert not set(public) - set(worker)
+    # every section present in the public payload, not just the registered ones. driving this loop
+    # from the managed section registry would let a key in an unregistered section (`wandb`) reach
+    # the public bytes unseen -- the same blind spot, in the opposite direction, as the section walk
+    # in test_every_privately_held_field_is_named_in_a_registry.
+    for section, public_section in public.items():
+        if not isinstance(public_section, dict):
+            continue
+        assert not set(public_section) - set(worker.get(section) or {}), (
+            f"the public payload emitted a [{section}] key the worker payload does not have"
+        )
+
+
+def test_every_privately_held_field_is_named_in_a_registry():
+    """Nothing may be stripped from the public payload without being named in a registry.
+
+    Both serializers are BLACKLISTS -- they emit everything and pop what is managed -- so a newly
+    added field is PUBLIC by default here and was public by default before the projection too.
+    Measured, not assumed: an unregistered field injected into the payload leaks into dev's public
+    output and into this one identically. The projection does not change that direction.
+
+    What it does change is that the boundary is now ENUMERABLE. A run of `data.pop(...)` statements
+    cannot be asserted against; the registries can. Walks EVERY section, not just the top level:
+    `environment.resolved_sha` was stripped inline and named in no registry, and a top-level-only
+    version of this test passed while that was true.
+
+    The sections walked are the ones actually PRESENT in the payload, not the ones named in
+    `MANAGED_SECTION_KEYS`. Deriving them from the registry would make this test blind in exactly
+    the direction it exists to cover: an inline strip inside an unregistered section (`wandb`) is
+    the same defect as the `environment` one, and a registry-driven walk cannot see it.
+
+    A section the public payload drops WHOLE is skipped: `workload_profile` is named in
+    `MANAGED_TOP_LEVEL_KEYS`, so descending into it would re-report a strip the top-level check has
+    already accounted for. The profile below is populated on purpose -- with an empty one that
+    distinction costs nothing and the test passes either way.
+    """
+    populated_profile = {"packing_mode": "packed", "examples_per_update": 2, "packed_blocks": 1}
+    candidate = spec(
+        train={"epochs": 1, "init_from_adapter": "src/step-4"},
+        workload_profile=populated_profile,
+    )
+    public, worker = candidate.to_dict(), candidate.to_internal_dict()
+    # `project` is public-only by construction (it has no worker counterpart), and the two warm-start
+    # topology keys are stripped conditionally, so no registry can express them.
+    exempt = {"project", "lora_rank", "lora_alpha"}
+    unregistered = {
+        f"(top){name}" for name in set(worker) - set(public) - MANAGED_TOP_LEVEL_KEYS - exempt
+    }
+    registered = dict(MANAGED_SECTION_KEYS)
+    for section, worker_section in worker.items():
+        if not isinstance(worker_section, dict) or section not in public:
+            continue
+        public_section = public.get(section) or {}
+        managed_keys = registered.get(section, frozenset())
+        unregistered |= {
+            f"{section}.{name}"
+            for name in set(worker_section) - set(public_section) - set(managed_keys) - exempt
+        }
+    # `gpu.type_fallbacks` is a reshape, not a removal: it is folded into the public `gpu.type`.
+    unregistered -= {"gpu.type_fallbacks"}
+    assert not unregistered, (
+        f"{sorted(unregistered)} are stripped from the public payload but named in no registry, so "
+        "the public contract is defined by statements again rather than by the registries"
+    )

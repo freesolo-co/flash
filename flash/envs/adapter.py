@@ -12,7 +12,6 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from flash.content.multimodal import message_content_text
 from flash.envs.base import (
     REWARD_GROUP_CONCURRENCY,
     BaseEnvironment,
@@ -137,7 +136,8 @@ class FreesoloEnvironment(BaseEnvironment):
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None
-        # cached dataset rows own one stable task for single-turn prompt and scoring hooks.
+        # cached dataset rows own the task that prompt preparation mutates. single-turn scoring
+        # reuses it directly; multi-turn rollouts clone its prepared episode state per sibling.
         self._row_tasks: dict[int, Any] = {}
         # whether this run samples <think> blocks. the worker sets it from the JobSpec once the
         # env is loaded; off by default so a CLI-side load (flash env test) grades raw text, which
@@ -563,15 +563,24 @@ class FreesoloEnvironment(BaseEnvironment):
     def tools(self) -> list:
         return []
 
-    def new_rollout_state(self, example: dict) -> dict:
-        record = deepcopy(self._canonical_record(example))
-        task = self._task_example_from_record(record)
-        prompt = self._with_system_prompt(self._env.start_episode(task, self._contract_text))
+    def new_rollout_state(self, example: dict, prepared_prompt: list[dict] | None = None) -> dict:
+        if prepared_prompt is None:
+            record = deepcopy(self._canonical_record(example))
+            task = self._task_example_from_record(record)
+            prompt = self._with_system_prompt(self._env.start_episode(task, self._contract_text))
+        else:
+            prepared_task = self._row_tasks.get(id(example))
+            if prepared_task is None:
+                raise RuntimeError("prepared Freesolo rollout requires its dataset row task")
+            task = deepcopy(prepared_task)
+            prompt = deepcopy(prepared_prompt)
         try:
             episode_turns: int | None = int(self._env.max_episode_turns(task))
         except Exception:
             episode_turns = None
-        messages = [dict(message) for message in prompt]
+        messages = (
+            [dict(message) for message in prompt] if prepared_prompt is None else deepcopy(prompt)
+        )
         return {
             "task": task,
             "prompt": prompt,
@@ -656,23 +665,16 @@ class FreesoloEnvironment(BaseEnvironment):
         state["turn"] = int(state.get("turn", 0)) + 1
         if step.metadata:
             state.setdefault("step_metadata", []).append(step.metadata)
-        replies = [dict(message) for message in step.messages]
-        state.setdefault("messages", []).extend(replies)
-        for message in replies:
-            # mirror the rule the multi-turn child applies to the same reply: block content is
-            # joined through message_content_text, everything else keeps str(). a bare str() on a
-            # block list yields the python repr, so a turn-aware scorer would grade
-            # "[{'type': 'text', ...}]" while the model conditioned on the joined text. the two
-            # branches have to agree exactly, or the divergence just moves to another shape.
-            raw_content = message.get("content", "")
+        replies = [deepcopy(dict(message)) for message in step.messages]
+        scored_replies = deepcopy(replies)
+        state.setdefault("messages", []).extend(scored_replies)
+        for message in scored_replies:
+            # score_episode receives a structural copy of the environment's raw chat content. the
+            # parent bridge flattens only the separate child-bound reply returned below.
             state.setdefault("turns", []).append(
                 self._EnvironmentTurn(
                     role=str(message.get("role", "")),
-                    content=(
-                        message_content_text(raw_content)
-                        if isinstance(raw_content, list)
-                        else str(raw_content)
-                    ),
+                    content=deepcopy(message.get("content", "")),
                 )
             )
         return replies
