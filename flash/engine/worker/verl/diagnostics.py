@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -237,6 +238,48 @@ def stall_tail_fields(
         fields["child_tail_silent_ticks"] = staleness.observe(tail.written)
         fields["child_tail_silent_seconds"] = staleness.elapsed
     return fields
+
+
+def build_verl_line_handler(
+    child_tail: ChildOutputTail,
+    *,
+    on_step: Callable[[int], None] | None,
+    on_line: Callable[[str], None] | None,
+    heartbeat: Callable[[], None] | None,
+    step_pattern: str,
+    heartbeat_interval_s: float,
+    silence_watchdog: VerlChildSilenceWatchdog | None,
+) -> Callable[[str], None]:
+    """build the per-line callback the streaming verl subprocess runs on every child line.
+
+    the watchdog observes the line before the caller's own callbacks: a callback that raises tears
+    the process group down, and the line it raised on is still evidence the child was speaking.
+    """
+    step_re = re.compile(step_pattern)
+    last_hb = 0.0
+
+    def handle_line(line: str) -> None:
+        nonlocal last_hb
+        print(line, end="", flush=True)
+        child_tail.record(line)
+        if silence_watchdog is not None:
+            silence_watchdog.observe_line(line)
+        if on_line is not None:
+            on_line(line)
+        match = step_re.search(line)
+        if match:
+            step = int(match.group(1))
+            if silence_watchdog is not None:
+                silence_watchdog.observe_step(step)
+            if on_step is not None:
+                on_step(step)
+        if heartbeat is not None:
+            now = time.monotonic()
+            if now - last_hb >= heartbeat_interval_s:
+                heartbeat()
+                last_hb = now
+
+    return handle_line
 
 
 VERL_CHILD_SILENCE_SECONDS = 1200.0

@@ -14,7 +14,6 @@ import atexit
 import contextlib
 import ctypes
 import os
-import re
 import signal
 import subprocess
 import threading
@@ -554,31 +553,16 @@ def run_verl_training(
     they are re-raised. ``silence_watchdog`` tears the group down when a child that reached the fit
     loop stops producing distinct output while the parent is idle.
     """
-    step_re = re.compile(step_pattern)
     child_tail = tail if tail is not None else ChildOutputTail()
-    last_hb = 0.0
-
-    def handle_line(line: str) -> None:
-        nonlocal last_hb
-        print(line, end="", flush=True)
-        child_tail.record(line)
-        if silence_watchdog is not None:
-            silence_watchdog.observe_line(line)
-        if on_line is not None:
-            on_line(line)
-        match = step_re.search(line)
-        if match:
-            step = int(match.group(1))
-            if silence_watchdog is not None:
-                silence_watchdog.observe_step(step)
-            if on_step is not None:
-                on_step(step)
-        if heartbeat is not None:
-            now = time.monotonic()
-            if now - last_hb >= heartbeat_interval_s:
-                heartbeat()
-                last_hb = now
-
+    handle_line = build_verl_line_handler(
+        child_tail,
+        on_step=on_step,
+        on_line=on_line,
+        heartbeat=heartbeat,
+        step_pattern=step_pattern,
+        heartbeat_interval_s=heartbeat_interval_s,
+        silence_watchdog=silence_watchdog,
+    )
     return_code = _run_streaming_verl_subprocess(
         cmd,
         env=env,
@@ -998,6 +982,7 @@ from flash.engine.worker.verl.diagnostics import (  # noqa: E402,F401
     ChildOutputTail,
     ChildTailStaleness,
     VerlChildSilenceWatchdog,
+    build_verl_line_handler,
     collect_ray_failure_logs,
     latest_ray_session_dir,
     raise_for_classified_verl_exit,

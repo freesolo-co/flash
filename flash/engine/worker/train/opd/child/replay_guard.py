@@ -6,9 +6,9 @@ import threading
 import time
 import types
 
-try:
+if __name__ == "flash_opd_replay_guard":
     from flash_child_diagnostics import sanitize_diagnostic
-except ImportError:
+else:
     from flash._internal.diagnostics import sanitize_diagnostic
 
 _REPLAY_STALL_SECONDS = 1200.0

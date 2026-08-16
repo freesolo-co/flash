@@ -22,9 +22,9 @@ import types
 import urllib.error
 import urllib.request
 
-try:
+if __name__ == "flash_opd_bridge":
     from flash_child_diagnostics import sanitize_diagnostic
-except ImportError:
+else:
     from flash._internal.diagnostics import sanitize_diagnostic
 
 # duplicated rather than imported from the plugin: this module is copied flat into the child

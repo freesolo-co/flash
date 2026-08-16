@@ -976,9 +976,9 @@ else:
     )
 
 
-try:
+if PLUGIN_LOADED_EXTERNALLY:
     from flash_opd_replay_guard import install_bounded_replay_buffer_sample
-except ImportError:
+else:
     from flash.engine.worker.train.opd.child.replay_guard import (
         install_bounded_replay_buffer_sample,
     )
