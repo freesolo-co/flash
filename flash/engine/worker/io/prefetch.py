@@ -16,7 +16,7 @@ import os
 import time
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.engine.worker.io.hf import model_revision_kwargs
+from flash.engine.huggingface import hub_error_transience, model_revision_kwargs
 from flash.engine.worker.perf import RetriableInfraError
 from flash.envs.loader import is_commit_sha
 
@@ -110,42 +110,8 @@ def _hf_cache_bytes(model_id: str, cache_dir: str | None = None) -> int | None:
 
 
 def _prefetch_error_is_retriable(exc: BaseException) -> bool:
-    import httpx
-    from huggingface_hub.errors import (
-        EntryNotFoundError,
-        GatedRepoError,
-        HfHubHTTPError,
-        LocalEntryNotFoundError,
-        RepositoryNotFoundError,
-        RevisionNotFoundError,
-    )
-    from requests.exceptions import ConnectionError as RequestsConnectionError
-    from requests.exceptions import Timeout as RequestsTimeout
-
-    if isinstance(exc, (RepositoryNotFoundError, RevisionNotFoundError, GatedRepoError)):
-        return False
-    if isinstance(exc, LocalEntryNotFoundError):
-        return True
-    if isinstance(exc, EntryNotFoundError):
-        return False
-    if isinstance(
-        exc,
-        (
-            RequestsConnectionError,
-            RequestsTimeout,
-            httpx.TimeoutException,
-            httpx.NetworkError,
-            httpx.RemoteProtocolError,
-        ),
-    ):
-        return True
-    if isinstance(exc, HfHubHTTPError):
-        resp = getattr(exc, "response", None)
-        status = getattr(resp, "status_code", None)
-        if status in {401, 403, 404}:
-            return False
-        return status is None or status == 429 or (isinstance(status, int) and 500 <= status <= 599)
-    return False
+    # generic local os errors remain permanent here; only hub/cache and transport failures retry.
+    return hub_error_transience(exc) is True
 
 
 def resolve_cached_model_commit(model_id: str, revision: str = "") -> str:

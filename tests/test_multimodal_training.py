@@ -369,7 +369,7 @@ def test_sft_rejects_image_completion_when_prompt_is_text_only():
     ]
 
     with pytest.raises(ValueError, match="image-bearing SFT completions are not supported"):
-        _reject_image_completion(completion)
+        _reject_image_completion(completion, image_bearing=False)
 
 
 def test_sft_mixed_text_completion_shapes_are_arrow_safe():

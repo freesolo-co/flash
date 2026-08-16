@@ -880,13 +880,14 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     the optimizations now live in three modules rather than one. dataset preprocessing moved to
     flash.engine.profiling.sft_workload so estimate construction and training share one implementation,
-    sizing and memory choices stayed with the trainer and hydra config, and LoRA+ grouping moved to the
-    external child plugin. each assertion reads the module that actually owns its behaviour: pointing
-    them all at one module would let a symbol disappear from another and still pass.
+    image-row tokenization lives in flash.engine.profiling.sft_image_rows, sizing and memory choices
+    stayed with the trainer and hydra config, and LoRA+ grouping moved to the external child plugin.
+    each assertion reads the module that actually owns its behaviour: pointing them all at one module
+    would let a symbol disappear from another and still pass.
     """
     import inspect
 
-    from flash.engine.profiling import sft_workload
+    from flash.engine.profiling import sft_image_rows, sft_workload
     from flash.engine.worker import sft_train
     from flash.engine.worker.entry import sft
 
@@ -894,9 +895,10 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "run_sft_train()" in inspect.getsource(sft.run_sft)
 
     workload_src = inspect.getsource(sft_workload)
+    image_rows_src = inspect.getsource(sft_image_rows)
     # completion-only supervision survives, as verl's loss_mask rather than trl's completion_mask.
     assert "_pretokenize_completion_only(" in workload_src
-    assert "completion_mask_from_ids(" in workload_src
+    assert "completion_mask_from_ids(" in image_rows_src
     assert '"loss_mask": tokenized["completion_mask"]' in workload_src
 
     # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
