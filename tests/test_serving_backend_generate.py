@@ -253,18 +253,14 @@ def test_serving_key_is_compared_in_constant_time(model_id):
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)
-def test_alias_swap_uses_one_api_container_and_a_process_local_lock(model_id):
-    """`alias_compare_and_swap` stays atomic without a distributed lease.
-
-    The generated api is pinned to one container, so every activation shares the same per-run
-    asyncio lock. This keeps the client-facing compare-and-swap contract while avoiding lock records
-    in the durable adapter store.
-    """
+def test_alias_swap_uses_the_serialized_lifecycle_coordinator(model_id):
+    """all durable lifecycle mutations share one cpu coordinator input."""
     source = render_app(MODELS[model_id])
-    assert "def _lock_for_run(" in source
-    assert "async with _lock_for_run(run_id):" in source
+    assert "class LifecycleCoordinator:" in source
+    assert "@modal.concurrent(max_inputs=1)" in source
+    assert "lifecycle.activate.remote.aio" in source
     assert "max_containers=1" in source
-    assert "_run_lock" not in source
+    assert "_RUN_LOCKS" not in source
     assert "skip_if_exists=True" not in source
 
 
@@ -345,7 +341,7 @@ def test_registration_settles_through_a_spawned_function(model_id):
         and node.func.attr == "create_task"
     ]
     assert not created, "registration must outlive the request that scheduled it"
-    assert "settle_adapter.spawn(record)" in source
+    assert "lifecycle.settle.spawn(record)" in source
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)
