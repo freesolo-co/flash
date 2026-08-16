@@ -20,12 +20,13 @@ import pytest
 from flash.content.multimodal import _IMAGE_BLOCK_TYPES
 from flash.core.catalog import MODELS
 from flash.serve.backend.generate import (
-    VLLM_VERSION,
     app_name_for,
+    flash_requirement,
     render_app,
     write_app,
 )
 from flash.serve.backend.gpus import MODAL_GPUS_BY_NAME
+from flash.serve.modal import APT_PACKAGES, CUDA_IMAGE
 
 _MODEL_IDS = sorted(MODELS)
 
@@ -82,7 +83,10 @@ def test_engine_values_come_from_the_catalog(model_id):
     assert values["MAX_MODEL_LEN"] == info.serving.max_model_len
     assert values["MAX_LORAS"] == info.serving.max_loras
     assert values["MAX_LORA_RANK"] == info.serving.max_lora_rank
-    assert values["VLLM_VERSION"] == VLLM_VERSION
+    # the gpu image installs this exact flash build, so vllm is pinned by the distribution rather
+    # than by a second constant that could drift from the runtime the app imports.
+    assert values["FLASH_REQUIREMENT"] == flash_requirement()
+    assert "[serve-runtime]==" in values["FLASH_REQUIREMENT"]
 
 
 def test_the_serve_modal_extra_installs_what_the_generated_app_imports_locally():
@@ -116,7 +120,10 @@ def test_the_serve_modal_extra_installs_what_the_generated_app_imports_locally()
     # wrong problem and cannot be fixed by adding the package it asks for. The names are
     # version-specific, so on 3.11 this still rejects a module that is only stdlib in 3.12, which
     # is what `requires-python = ">=3.11"` means.
-    missing = sorted(imported - sys.stdlib_module_names - packages)
+    # `flash` itself is the distribution providing this extra, so it is always importable. The
+    # runtime and modal helpers it reaches at module scope are import-light by design and pull in
+    # neither modal nor the gpu stack.
+    missing = sorted(imported - sys.stdlib_module_names - packages - {"flash"})
     assert not missing, f"[serve-modal] does not install {missing}, imported at module scope"
 
 
@@ -343,10 +350,16 @@ def test_image_carries_the_cuda_toolchain_the_engine_jits_against(model_id):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     assert "debian_slim" not in called
-    assert "from_registry" in called
-    assert "nvidia/cuda:12.8.0-devel-ubuntu22.04" in source
+    # the generated app builds on the shared image, so assert the toolchain where it now lives
+    # rather than re-declaring the registry and apt list in every generated file.
+    assert "base_image" in {
+        node.func.id
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert CUDA_IMAGE == "nvidia/cuda:12.8.0-devel-ubuntu22.04"
     for tool in ("build-essential", "ninja-build"):
-        assert tool in source, tool
+        assert tool in APT_PACKAGES, tool
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)

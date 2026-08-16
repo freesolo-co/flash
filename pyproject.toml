@@ -90,7 +90,9 @@ serve-modal = [
 # a replacement; this extra intentionally remains independent from both `gpu` and `serve-modal`.
 serve-runtime = [
     "pillow>=11.0.0",
-    "transformers>=5.0.0",
+    # same range as every other extra: the serving image resolves from these bounds rather than the
+    # lockfile, so an unbounded declaration silently rides a transformers line nothing validated.
+    "transformers>=5.6,<5.13",
     "vllm==0.23.0",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.

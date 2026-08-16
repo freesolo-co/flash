@@ -21,6 +21,14 @@ from typing import Any
 import modal
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from flash.serve.modal import RuntimeContainer, base_image
+from flash.serve.runtime import (
+    AdapterSpec,
+    EngineConfig,
+    GenerationRequest,
+    StreamDelta,
+    StreamFinished,
+)
 
 # flash generated config
 
@@ -29,25 +37,12 @@ TIMEOUT_SECONDS = 30 * 60
 CACHE_MOUNT = "/vol/flash-serving"
 ADAPTER_DIR = f"{CACHE_MOUNT}/adapters"
 
-image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
-    .apt_install("build-essential", "git", "ninja-build")
-    .pip_install(
-        f"vllm=={VLLM_VERSION}",
-        "fastapi[standard]",
-        "huggingface_hub[hf_transfer]",
-        "transformers",
-    )
-    .env(
-        {
-            "HF_HOME": CACHE_MOUNT,
-            "HF_HUB_CACHE": f"{CACHE_MOUNT}/hub",
-            "HF_HUB_DISABLE_XET": "1",
-            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-            "VLLM_MOE_USE_DEEP_GEMM": "0",
-        }
-    )
+# the gpu container installs the exact flash distribution that generated this file, so the vllm
+# pin and the serving runtime always match the code below.
+image = base_image(CACHE_MOUNT).pip_install(
+    FLASH_REQUIREMENT,
+    "fastapi[standard]",
+    "huggingface_hub[hf_transfer]",
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -113,6 +108,24 @@ def _fingerprint(record: dict[str, Any]) -> tuple:
         metadata.get("run_id"),
         metadata.get("checkpoint_step"),
         metadata.get("hf_revision"),
+    )
+
+
+def _adapter_spec(record: dict[str, Any], path: str) -> AdapterSpec:
+    """translate a durable record plus its downloaded path into a runtime adapter incarnation.
+
+    the incarnation carries the settle attempt so a stale settlement cannot unload the adapter a
+    later attempt registered. revision ids are immutable, so the id alone is the fallback identity.
+    """
+    metadata = record.get("metadata") or {}
+    adapter_id = record["adapter_id"]
+    attempt = metadata.get("settle_attempt")
+    return AdapterSpec(
+        adapter_id=adapter_id,
+        path=path,
+        incarnation=f"{adapter_id}@{attempt}" if attempt is not None else adapter_id,
+        thinking=bool(record.get("thinking")),
+        structured_outputs=record.get("structured_outputs") or None,
     )
 
 
@@ -212,35 +225,35 @@ def _registration_record(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     timeout=TIMEOUT_SECONDS,
 )
 @modal.concurrent(max_inputs=MAX_NUM_SEQS)
-class Engine:
+class Engine(RuntimeContainer):
+    def engine_config(self) -> EngineConfig:
+        return EngineConfig(
+            model=BASE_MODEL,
+            trust_remote_code=True,
+            max_loras=MAX_LORAS,
+            max_lora_rank=MAX_LORA_RANK,
+            engine_args={
+                "quantization": QUANTIZATION,
+                "kv_cache_dtype": KV_CACHE_DTYPE,
+                "max_model_len": MAX_MODEL_LEN,
+                "max_num_seqs": MAX_NUM_SEQS,
+                "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
+                **(
+                    {"max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS}
+                    if MAX_NUM_BATCHED_TOKENS
+                    else {}
+                ),
+            },
+        )
+
     @modal.enter()
     async def load(self) -> None:
-        from transformers import AutoTokenizer
-        from vllm import AsyncEngineArgs, AsyncLLMEngine
-
         # one engine container owns the gpu and its lora slots, so adapter identity and cache
         # lifetime use process-local locks instead of cross-container consensus.
         self._locks: dict[str, asyncio.Lock] = {}
-        self._allocator_lock = asyncio.Lock()
-        self._next_int_id = 1
-        self._loaded: dict[str, Any] = {}
-        self.tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
-        engine_args = AsyncEngineArgs(
-            model=BASE_MODEL,
-            quantization=QUANTIZATION,
-            kv_cache_dtype=KV_CACHE_DTYPE,
-            max_model_len=MAX_MODEL_LEN,
-            max_num_seqs=MAX_NUM_SEQS,
-            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-            enable_lora=True,
-            max_loras=MAX_LORAS,
-            max_lora_rank=MAX_LORA_RANK,
-            trust_remote_code=True,
-            **(
-                {"max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS} if MAX_NUM_BATCHED_TOKENS else {}
-            ),
-        )
-        self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+        # adapter id -> the exact incarnation this container registered, so an unload can be fenced.
+        self._registered: dict[str, str] = {}
+        await self.start_runtime()
 
     async def _adapter_path(self, record: dict[str, Any]) -> str:
         from huggingface_hub import snapshot_download
@@ -260,71 +273,48 @@ class Engine:
         )
         return f"{path}/{subfolder}" if subfolder else path
 
-    async def _allocate_int_id(self) -> int:
-        async with self._allocator_lock:
-            int_id = self._next_int_id
-            self._next_int_id += 1
-            return int_id
-
     async def _delete_adapter_cache_locked(self, adapter_id: str) -> None:
         directory = f"{ADAPTER_DIR}/{_adapter_digest(adapter_id)}"
         with contextlib.suppress(FileNotFoundError):
             await asyncio.to_thread(shutil.rmtree, directory)
 
-    async def _load_lora_locked(self, record: dict[str, Any]):
-        from vllm.lora.request import LoRARequest
-
+    async def _load_lora_locked(self, record: dict[str, Any]) -> None:
         adapter_id = record["adapter_id"]
-        cached = self._loaded.get(adapter_id)
-        if cached is not None:
-            return cached
+        if adapter_id in self._registered:
+            return
         current = await _read(adapter_id)
         state = (current.get("metadata") or {}).get("lifecycle_state") if current else None
         if current and (current.get("status") == "disabled" or state in ("disabled", "failed")):
             raise RuntimeError(f"{adapter_id} was undeployed before it could load")
-        int_id = await self._allocate_int_id()
-        request = None
-        resident = False
-        try:
-            path = await self._adapter_path(record)
-            request = LoRARequest(adapter_id, int_id, path)
-            await self.engine.add_lora(request)
-            resident = True
-            latest = await _read(adapter_id)
-            latest_state = (
-                (latest.get("metadata") or {}).get("lifecycle_state") if latest else None
-            )
-            if latest and (
-                latest.get("status") == "disabled" or latest_state in ("disabled", "failed")
-            ):
-                await self.engine.remove_lora(int_id)
-                resident = False
-                raise RuntimeError(f"{adapter_id} was undeployed while it was loading")
-        except Exception:
-            if resident and request is not None:
-                self._loaded[adapter_id] = request
-            raise
-        self._loaded[adapter_id] = request
-        return request
+        path = await self._adapter_path(record)
+        spec = _adapter_spec(record, path)
+        await self.runtime.register_adapter(spec)
+        self._registered[adapter_id] = spec.incarnation
+        # the record can flip to disabled while weights were loading, so re-read and undo.
+        latest = await _read(adapter_id)
+        latest_state = (latest.get("metadata") or {}).get("lifecycle_state") if latest else None
+        if latest and (
+            latest.get("status") == "disabled" or latest_state in ("disabled", "failed")
+        ):
+            await self._unload_locked(adapter_id)
+            raise RuntimeError(f"{adapter_id} was undeployed while it was loading")
 
-    async def _lora_request(self, record: dict[str, Any]):
-        adapter_id = record["adapter_id"]
-        cached = self._loaded.get(adapter_id)
-        if cached is not None:
-            return cached
-        async with self._locks.setdefault(adapter_id, asyncio.Lock()):
-            return await self._load_lora_locked(record)
+    async def _ensure_loaded(self, record: dict[str, Any]) -> None:
+        if record["adapter_id"] in self._registered:
+            return
+        async with self._locks.setdefault(record["adapter_id"], asyncio.Lock()):
+            await self._load_lora_locked(record)
 
     async def _unload_locked(self, adapter_id: str) -> bool:
-        request = self._loaded.get(adapter_id)
-        if request is None:
+        incarnation = self._registered.get(adapter_id)
+        if incarnation is None:
             await self._delete_adapter_cache_locked(adapter_id)
             return True
         try:
-            await self.engine.remove_lora(request.lora_int_id)
+            await self.runtime.unload_adapter(adapter_id, expected_incarnation=incarnation)
         except Exception:
             return False
-        self._loaded.pop(adapter_id, None)
+        self._registered.pop(adapter_id, None)
         await self._delete_adapter_cache_locked(adapter_id)
         return True
 
@@ -340,7 +330,7 @@ class Engine:
                 failure = f"{type(exc).__name__}: {exc}"
             current = await _read(adapter_id)
             if not isinstance(current, dict):
-                if failure is not None and adapter_id not in self._loaded:
+                if failure is not None and adapter_id not in self._registered:
                     await self._delete_adapter_cache_locked(adapter_id)
                 return {"ok": False}
             metadata = current.get("metadata") or {}
@@ -360,7 +350,7 @@ class Engine:
                     "failure": failure,
                 }
             await _write(current)
-            if failure is not None and adapter_id not in self._loaded:
+            if failure is not None and adapter_id not in self._registered:
                 await self._delete_adapter_cache_locked(adapter_id)
             return {"ok": failure is None, "failure": failure}
 
@@ -373,80 +363,40 @@ class Engine:
             evicted = await self._unload_locked(adapter_id)
             return {"ok": True, "evicted": evicted}
 
-    async def _prepare(self, payload: dict[str, Any], record: dict[str, Any]):
-        from vllm import SamplingParams
-
-        lora_request = await self._lora_request(record)
-        kwargs = dict(payload.get("chat_template_kwargs") or {})
-        kwargs["enable_thinking"] = bool(record.get("thinking"))
-        prompt_token_ids = await asyncio.to_thread(
-            lambda: list(
-                self.tokenizer.apply_chat_template(
-                    payload.get("messages") or [],
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    return_dict=False,
-                    **kwargs,
-                )
-            )
-        )
-        structured = record.get("structured_outputs") or None
-        structured_params = None
-        if isinstance(structured, dict) and any(
-            structured.get(key) is not None for key in ("json", "regex", "choice", "json_object")
-        ):
-            from vllm.sampling_params import StructuredOutputsParams
-
-            structured_params = StructuredOutputsParams(
-                **{key: value for key, value in structured.items() if value is not None}
-            )
-        sampling = SamplingParams(
-            temperature=float(payload.get("temperature") or 0.0),
+    async def _request(self, payload: dict[str, Any], record: dict[str, Any]):
+        await self._ensure_loaded(record)
+        adapter_id = record["adapter_id"]
+        return GenerationRequest(
+            adapter_id=adapter_id,
+            expected_incarnation=self._registered[adapter_id],
+            messages=payload.get("messages") or [],
             max_tokens=int(payload.get("max_tokens") or 512),
+            temperature=float(payload.get("temperature") or 0.0),
             top_p=float(payload.get("top_p") or 1.0),
             stop=payload.get("stop") or None,
-            structured_outputs=structured_params,
+            chat_template_kwargs=dict(payload.get("chat_template_kwargs") or {}),
         )
-        return prompt_token_ids, sampling, lora_request
 
     @modal.method()
     async def generate(self, payload: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
-        prompt_token_ids, sampling, lora_request = await self._prepare(payload, record)
-        final = None
-        async for out in self.engine.generate(
-            {"prompt_token_ids": prompt_token_ids},
-            sampling,
-            str(uuid.uuid4()),
-            lora_request=lora_request,
-        ):
-            final = out
-        if final is None:
-            raise RuntimeError("vLLM returned no output")
-        completion = final.outputs[0]
+        result = await self.runtime.generate(await self._request(payload, record))
         return {
-            "text": completion.text,
-            "finish_reason": getattr(completion, "finish_reason", None),
-            "prompt_tokens": len(getattr(final, "prompt_token_ids", None) or prompt_token_ids),
-            "completion_tokens": len(getattr(completion, "token_ids", None) or []),
+            "text": result.text,
+            "finish_reason": result.finish_reason,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
         }
 
     @modal.method(is_generator=True)
     async def generate_stream(self, payload: dict[str, Any], record: dict[str, Any]):
-        prompt_token_ids, sampling, lora_request = await self._prepare(payload, record)
-        sent = 0
+        request = await self._request(payload, record)
         finish_reason = None
-        async for out in self.engine.generate(
-            {"prompt_token_ids": prompt_token_ids},
-            sampling,
-            str(uuid.uuid4()),
-            lora_request=lora_request,
-        ):
-            completion = out.outputs[0]
-            finish_reason = getattr(completion, "finish_reason", None)
-            text = completion.text or ""
-            if len(text) > sent:
-                yield {"delta": text[sent:], "finish_reason": None}
-                sent = len(text)
+        async for event in self.runtime.stream(request):
+            # the runtime already yields normalized deltas, so no cumulative slicing is needed.
+            if isinstance(event, StreamDelta):
+                yield {"delta": event.text, "finish_reason": None}
+            elif isinstance(event, StreamFinished):
+                finish_reason = event.finish_reason
         yield {"delta": "", "finish_reason": finish_reason or "stop"}
 
 

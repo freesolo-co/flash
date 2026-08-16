@@ -268,6 +268,17 @@ def engine_class(client):
     return classes[0]
 
 
+@pytest.fixture
+def generated_module(client):
+    """the executed generated app.
+
+    the fixture execs the rendered source into a bare module without registering it in
+    `sys.modules`, so module-level helpers have to be reached through the client rather than
+    looked up by name.
+    """
+    return client.app.state.generated_module
+
+
 def _lifecycle(client, adapter_id):
     response = client.get(f"/adapters/{adapter_id}")
     return (response.json()["adapter"].get("metadata") or {}).get("lifecycle_state")
@@ -302,35 +313,22 @@ def _second_registration():
     }
 
 
-def _prepare_with(monkeypatch, engine_class, record, payload=None):
-    seen = []
+def _request_for(engine_class, record, payload=None):
+    """the runtime request the generated app builds for one chat payload and durable record.
 
-    class _SamplingParams:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-            seen.append(self)
-
-    class _StructuredOutputsParams:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-    vllm = types.ModuleType("vllm")
-    vllm.SamplingParams = _SamplingParams
-    sampling_params = types.ModuleType("vllm.sampling_params")
-    sampling_params.StructuredOutputsParams = _StructuredOutputsParams
-    monkeypatch.setitem(sys.modules, "vllm", vllm)
-    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sampling_params)
-
+    the app no longer constructs vllm sampling params itself, so the meaningful boundary is the
+    `GenerationRequest` handed to the runtime plus the adapter spec registered alongside it.
+    """
     instance = engine_class.__new__(engine_class)
-    instance.tokenizer = types.SimpleNamespace(apply_chat_template=lambda *a, **k: [1, 2, 3])
+    adapter_id = record["adapter_id"]
+    instance._registered = {adapter_id: "incarnation"}
 
-    async def lora_request(_record):
-        return "lora"
+    async def ensure_loaded(_record):
+        return None
 
-    instance._lora_request = lora_request
-    result = _run_awaitable(engine_class._prepare(instance, dict(payload or {}), record))
-    assert seen
-    return result, seen[-1]
+    instance._ensure_loaded = ensure_loaded
+    body = {"messages": [{"role": "user", "content": "hi"}], **(payload or {})}
+    return _run_awaitable(engine_class._request(instance, body, record))
 
 
 def test_healthz_advertises_the_required_capabilities(client):
@@ -614,23 +612,31 @@ def test_invalid_sampling_values_are_rejected(client, field, value):
     assert response.status_code == 400
 
 
-def test_a_registered_grammar_reaches_sampling_params(monkeypatch, engine_class):
+def test_a_registered_grammar_reaches_the_adapter_spec(generated_module):
     record = {**REGISTRATION, "structured_outputs": {"regex": "[ab]+"}}
-    _, sampling = _prepare_with(monkeypatch, engine_class, record)
-    assert sampling.structured_outputs.regex == "[ab]+"
+    spec = generated_module._adapter_spec(record, "/tmp/adapter")
+    assert spec.structured_outputs == {"regex": "[ab]+"}
 
 
-def test_generation_uses_the_record_grammar_not_the_request(monkeypatch, engine_class):
+def test_generation_uses_the_record_grammar_not_the_request(engine_class, generated_module):
+    """the registered grammar is authoritative; a request cannot widen or replace it."""
+    module = generated_module
     record = {**REGISTRATION, "structured_outputs": {"choice": ["yes", "no"]}}
-    payload = {"structured_outputs": {"regex": ".*"}}
-    _, sampling = _prepare_with(monkeypatch, engine_class, record, payload)
-    assert sampling.structured_outputs.choice == ["yes", "no"]
-    assert not hasattr(sampling.structured_outputs, "regex")
+    spec = module._adapter_spec(record, "/tmp/adapter")
+    assert spec.structured_outputs == {"choice": ["yes", "no"]}
+    # the request carries no grammar at all, so a caller-supplied one cannot reach the runtime.
+    request = _request_for(engine_class, record, {"structured_outputs": {"regex": ".*"}})
+    assert request.structured_outputs is None
 
 
-def test_an_omitted_max_tokens_gets_the_default(monkeypatch, engine_class):
-    _, sampling = _prepare_with(monkeypatch, engine_class, REGISTRATION)
-    assert sampling.max_tokens == 512
+def test_an_omitted_max_tokens_gets_the_default(engine_class):
+    assert _request_for(engine_class, REGISTRATION).max_tokens == 512
+
+
+def test_stop_sequences_reach_the_runtime_request(engine_class):
+    request = _request_for(engine_class, REGISTRATION, {"stop": ["END"]})
+    assert request.stop == ("END",)
+    assert _request_for(engine_class, REGISTRATION).stop == ()
 
 
 def test_undeploy_disables_the_alias_and_its_revisions(client):
@@ -668,7 +674,7 @@ def test_unload_deletes_cache_without_a_resident_request(
     (adapter_dir / "adapter.safetensors").write_text("weights")
     monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
     instance = engine_class.__new__(engine_class)
-    instance._loaded = {}
+    instance._registered = {}
 
     assert _run_awaitable(engine_class._unload_locked(instance, REVISION)) is True
     assert not adapter_dir.exists()
@@ -688,7 +694,7 @@ def test_unregister_preserves_cache_for_a_revived_revision(
     record["metadata"]["lifecycle_state"] = "registered"
     instance = engine_class.__new__(engine_class)
     instance._locks = {}
-    instance._loaded = {}
+    instance._registered = {}
 
     result = _run_awaitable(engine_class.unregister(instance, REVISION))
     assert result == {"ok": True, "evicted": False, "revived": True}
@@ -717,7 +723,7 @@ def test_failed_load_deletes_cache_when_no_lora_is_resident(
     instance._locks = {}
     instance._allocator_lock = asyncio.Lock()
     instance._next_int_id = 1
-    instance._loaded = {}
+    instance._registered = {}
 
     async def fail_path(_record):
         raise RuntimeError("download failed")
@@ -732,37 +738,24 @@ def test_failed_load_deletes_cache_when_no_lora_is_resident(
     assert current["metadata"]["lifecycle_state"] == "failed"
 
 
-def test_concurrent_adapter_loads_receive_unique_process_local_ids(
-    client, engine_class, monkeypatch
-):
+def test_concurrent_adapter_loads_register_each_adapter_once(client, engine_class, monkeypatch):
+    """two adapters loading at once must each register exactly once.
+
+    lora slot identity now belongs to the runtime, so what the generated app still owns is the
+    per-adapter lock that keeps a concurrent load from registering the same adapter twice.
+    """
     module = client.app.state.generated_module
-    lora_request = types.ModuleType("vllm.lora.request")
-
-    class _LoRARequest:
-        def __init__(self, name, int_id, path):
-            self.name = name
-            self.lora_int_id = int_id
-            self.path = path
-
-    lora_request.LoRARequest = _LoRARequest
-    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
-    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
-    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora_request)
     instance = engine_class.__new__(engine_class)
     instance._locks = {}
-    instance._allocator_lock = asyncio.Lock()
-    instance._next_int_id = 1
-    instance._loaded = {}
-    added = []
+    instance._registered = {}
+    registered = []
 
-    async def add_lora(request):
-        added.append(request)
+    async def register_adapter(spec):
         await asyncio.sleep(0)
+        registered.append(spec.adapter_id)
+        return True
 
-    instance.engine = types.SimpleNamespace(
-        add_lora=add_lora,
-        remove_lora=lambda int_id: asyncio.sleep(0),
-    )
+    instance._runtime = types.SimpleNamespace(register_adapter=register_adapter)
     instance._adapter_path = lambda record: asyncio.sleep(0, result="/tmp/adapter")
     first = dict(REGISTRATION)
     second = _second_registration()
@@ -773,46 +766,42 @@ def test_concurrent_adapter_loads_receive_unique_process_local_ids(
         }
 
     async def load_both():
-        return await asyncio.gather(
-            engine_class._lora_request(instance, first),
-            engine_class._lora_request(instance, second),
+        await asyncio.gather(
+            engine_class._ensure_loaded(instance, first),
+            engine_class._ensure_loaded(instance, second),
+            engine_class._ensure_loaded(instance, first),
         )
 
-    loaded = _run_awaitable(load_both())
-    assert [request.lora_int_id for request in loaded] == [1, 2]
-    assert [request.lora_int_id for request in added] == [1, 2]
+    _run_awaitable(load_both())
+    assert sorted(registered) == sorted({first["adapter_id"], second["adapter_id"]})
+    assert set(instance._registered) == {first["adapter_id"], second["adapter_id"]}
 
 
 def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_removable(
     client, engine_class, monkeypatch, tmp_path
 ):
+    """a failed unload must leave the adapter removable rather than orphaning it.
+
+    the record flips to disabled while weights are loading, so the app unloads what it just
+    registered. if that unload fails the adapter stays tracked, so a later unload can still
+    reclaim both the slot and its cache.
+    """
     module = client.app.state.generated_module
     monkeypatch.setattr(module, "ADAPTER_DIR", str(tmp_path))
-    lora_request = types.ModuleType("vllm.lora.request")
-
-    class _LoRARequest:
-        def __init__(self, name, int_id, path):
-            self.name = name
-            self.lora_int_id = int_id
-            self.path = path
-
-    lora_request.LoRARequest = _LoRARequest
-    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
-    monkeypatch.setitem(sys.modules, "vllm.lora", types.ModuleType("vllm.lora"))
-    monkeypatch.setitem(sys.modules, "vllm.lora.request", lora_request)
     instance = engine_class.__new__(engine_class)
     instance._locks = {}
-    instance._allocator_lock = asyncio.Lock()
-    instance._next_int_id = 1
-    instance._loaded = {}
+    instance._registered = {}
 
-    async def add_lora(request):
-        return None
+    async def register_adapter(spec):
+        return True
 
-    async def remove_lora(int_id):
+    async def failing_unload(adapter_id, *, expected_incarnation):
         raise RuntimeError("eviction failed")
 
-    instance.engine = types.SimpleNamespace(add_lora=add_lora, remove_lora=remove_lora)
+    instance._runtime = types.SimpleNamespace(
+        register_adapter=register_adapter,
+        unload_adapter=failing_unload,
+    )
     instance._adapter_path = lambda record: asyncio.sleep(0, result="/tmp/adapter")
     reads = iter(
         [
@@ -829,21 +818,24 @@ def test_a_failed_mid_load_eviction_keeps_the_resident_adapter_removable(
         return next(reads)
 
     monkeypatch.setattr(module, "_read", read)
-    with pytest.raises(RuntimeError, match="eviction failed"):
-        _run_awaitable(engine_class._lora_request(instance, REGISTRATION))
-    assert instance._loaded[REVISION].lora_int_id == 1
+    with pytest.raises(RuntimeError, match="undeployed while it was loading"):
+        _run_awaitable(engine_class._load_lora_locked(instance, REGISTRATION))
+    # the failed unload must not drop the adapter, or its slot and cache would leak. this record
+    # carries no settle attempt, so its incarnation is the bare adapter id.
+    assert instance._registered[REVISION] == REVISION
     adapter_dir = tmp_path / module._adapter_digest(REVISION)
     adapter_dir.mkdir()
 
-    removed = []
+    unloaded = []
 
-    async def remove_resident(int_id):
-        removed.append(int_id)
+    async def unload_ok(adapter_id, *, expected_incarnation):
+        unloaded.append((adapter_id, expected_incarnation))
+        return True
 
-    instance.engine.remove_lora = remove_resident
+    instance._runtime.unload_adapter = unload_ok
     assert _run_awaitable(engine_class._unload_locked(instance, REVISION)) is True
-    assert removed == [1]
-    assert REVISION not in instance._loaded
+    assert unloaded == [(REVISION, REVISION)]
+    assert REVISION not in instance._registered
     assert not adapter_dir.exists()
 
 

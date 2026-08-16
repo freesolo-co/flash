@@ -1864,9 +1864,10 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
         f"backend_common.TRANSFORMERS_REQUIREMENT ({vc.TRANSFORMERS_REQUIREMENT!r}); every extra "
         "must declare the range the worker image is built and tested against"
     )
-    # and every extra that names transformers at all must name it (three today: gpu, server, dev).
-    assert pyproject.count(f'"{vc.TRANSFORMERS_REQUIREMENT}"') == 3, (
-        "expected the transformers range in exactly the gpu, server and dev extras"
+    # and every extra that names transformers at all must name it (four today: gpu, server, dev,
+    # serve-runtime).
+    assert pyproject.count(f'"{vc.TRANSFORMERS_REQUIREMENT}"') == 4, (
+        "expected the transformers range in exactly the gpu, server, dev and serve-runtime extras"
     )
 
 

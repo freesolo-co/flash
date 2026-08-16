@@ -8,18 +8,13 @@ than invented, so an OSS deploy starts from the configuration Freesolo validated
 from __future__ import annotations
 
 import re
-from importlib import resources
+from importlib import metadata, resources
 from pathlib import Path
 
 from flash.content.multimodal import _IMAGE_BLOCK_TYPES
 from flash.core.catalog import ModelInfo
 from flash.serve.backend.gpus import MODAL_GPUS_BY_NAME, ModalGpu, default_gpu
 from flash.serve.contract import ADAPTER_REVISION_PATTERN, REFERENCE_SERVING_CAPABILITIES
-
-# Matches the version the production serving app runs. vLLM's Qwen3 GDN-hybrid support and the
-# multi-LoRA + fp8 path are both version-sensitive, so this is a single pinned constant rather than
-# a floating range.
-VLLM_VERSION = "0.23.0"
 
 # Modal stops the container after this idle period and the GPU stops costing anything. 5 minutes
 # trades a little idle spend for far fewer cold starts than Modal's 60s default.
@@ -29,9 +24,21 @@ MIN_SCALEDOWN_WINDOW = 2
 MAX_SCALEDOWN_WINDOW = 20 * 60
 
 _TEMPLATE = "modal_app.py.tmpl"
+# the package this module ships in; `flash_requirement()` reads its installed metadata.
+_DISTRIBUTION = "freesolo-flash"
 _CONFIG_MARKER = "# flash generated config"
 # modal app names allow letters, digits and dashes.
 _UNSAFE_NAME = re.compile(r"[^a-z0-9-]+")
+
+
+def flash_requirement() -> str:
+    """The pip requirement installing this exact Flash build with the serving runtime.
+
+    Derived from installed metadata rather than hardcoded, so a dev-channel CLI generates an app
+    pinned to the dev-channel distribution instead of silently installing the production one.
+    """
+    distribution = metadata.distribution(_DISTRIBUTION)
+    return f"{distribution.metadata['Name']}[serve-runtime]=={distribution.version}"
 
 
 def app_name_for(model_id: str) -> str:
@@ -83,7 +90,7 @@ def render_app(
         "MAX_LORAS": serving.max_loras,
         "MAX_LORA_RANK": serving.max_lora_rank,
         "GPU_MEMORY_UTILIZATION": serving.gpu_memory_utilization or 0.90,
-        "VLLM_VERSION": VLLM_VERSION,
+        "FLASH_REQUIREMENT": flash_requirement(),
         "SCALEDOWN_WINDOW_SECONDS": scaledown_window,
         "SECRET_NAME": secret_name,
         "DEPLOY_COMMAND": f"modal deploy {app_file}",
