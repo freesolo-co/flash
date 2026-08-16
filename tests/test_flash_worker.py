@@ -900,6 +900,17 @@ def test_train_body_uploads_console_on_missing_metrics(
     from flash.providers.runpod.serverless import endpoints
 
     code_prefix = "code/0123456789abcdef0123456789abcdef/flash"
+    run_code = tmp_path / "runcode"
+    late_marker = tmp_path / "late-live-attempted"
+    real_join = os.path.join
+
+    def mapped_join(*parts):
+        joined = real_join(*parts)
+        if joined == "/runcode" or joined.startswith("/runcode/"):
+            return str(run_code) + joined.removeprefix("/runcode")
+        return joined
+
+    monkeypatch.setattr(os.path, "join", mapped_join)
     list_calls = []
     download_calls = []
     monkeypatch.setattr(
@@ -921,11 +932,17 @@ def test_train_body_uploads_console_on_missing_metrics(
             return [
                 types.SimpleNamespace(path=f"{code_prefix}/__init__.py", size=0),
                 types.SimpleNamespace(path=f"{code_prefix}/engine/worker.py", size=10),
+                types.SimpleNamespace(
+                    path=f"{code_prefix}/providers/_lifecycle/bootstrap_console.py", size=10
+                ),
+                types.SimpleNamespace(path=f"{code_prefix}/adapters/artifacts.py", size=10),
                 types.SimpleNamespace(path=f"{code_prefix}/engine", tree_id="folder"),
             ]
 
         def upload_file(self, **kw):
             uploads.append(kw)
+            if str(kw.get("path_in_repo", "")).endswith("/console_sft.txt"):
+                time.sleep(0.05)
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
@@ -940,14 +957,34 @@ def test_train_body_uploads_console_on_missing_metrics(
 
     def fake_hf_hub_download(*, filename, local_dir, **kw):
         download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
-        return os.path.join(local_dir, filename)
+        target = run_code / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if filename.endswith("bootstrap_console.py"):
+            target.write_text(
+                "import threading, time\n"
+                "def _run_console_upload_loop(console, interval, stop, *, upload):\n"
+                "    upload()\n"
+                "    def late():\n"
+                "        stop.wait(); time.sleep(0.01); upload()\n"
+                f"        open({str(late_marker)!r}, 'w').write('1')\n"
+                "    threading.Thread(target=late, daemon=True).start()\n"
+                "    stop.wait()\n"
+            )
+        elif filename.endswith("artifacts.py"):
+            target.write_text(
+                "def attempt_scoped_artifact_name(kind, phase, attempt):\n"
+                "    return f'exact_{kind}_{phase}_attempt{attempt}.txt'\n"
+            )
+        else:
+            target.write_text("")
+        return str(target)
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
 
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
-            assert k["cwd"] == "/runcode/code/0123456789abcdef0123456789abcdef"
+            assert k["cwd"] == str(run_code / "code/0123456789abcdef0123456789abcdef")
             self.stdout = iter(console_lines)
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
@@ -962,7 +999,7 @@ def test_train_body_uploads_console_on_missing_metrics(
         "seed": 0,
         "hf_repo": "owner/runs",
         "job_spec_json": job_spec,
-        "env": {"HF_TOKEN": "tok", "PYTHONPATH": ""},
+        "env": {"HF_TOKEN": "tok", "PYTHONPATH": "", "ATTEMPT": "7"},
         "code_prefix": code_prefix,
         **_run_deadline_fields(),
     }
@@ -971,15 +1008,15 @@ def test_train_body_uploads_console_on_missing_metrics(
         with pytest.raises(RuntimeError, match=r"produced no /tmp/metrics\.json"):
             endpoints._train_body(input_data)
 
-        # The fix: the console for the crashed phase is uploaded so the failure is root-causable.
-        console_uploads = [
-            u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")
+        paths = [upload["path_in_repo"] for upload in uploads]
+        assert paths == [
+            "sft/flash-test-run/exact_console_sft_attempt7.txt",
+            "sft/flash-test-run/console_sft.txt",
         ]
-        assert console_uploads, (
-            f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
+        assert late_marker.exists(), (
+            "the late live callback must run after terminal teardown begins"
         )
-        assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/console_sft.txt"
-        with open(console_uploads[0]["path_or_fileobj"], encoding="utf-8") as f:
+        with open(uploads[-1]["path_or_fileobj"], encoding="utf-8") as f:
             uploaded_console = f.read()
         if terminated:
             assert not uploaded_console.startswith("worker booting\n")
@@ -1000,11 +1037,19 @@ def test_train_body_uploads_console_on_missing_metrics(
         assert [call["filename"] for call in download_calls] == [
             f"{code_prefix}/__init__.py",
             f"{code_prefix}/engine/worker.py",
+            f"{code_prefix}/providers/_lifecycle/bootstrap_console.py",
+            f"{code_prefix}/adapters/artifacts.py",
         ]
     finally:
-        # _train_body writes the hardcoded /tmp/console_sft.txt(.tail); remove them so this test
-        # doesn't leak state across tests (flaky under isolated/parallel runners).
-        for _p in ("/tmp/console_sft.txt", "/tmp/console_sft.txt.tail"):
+        # _train_body writes hardcoded console paths; remove them for parallel runs.
+        import shutil
+
+        shutil.rmtree(run_code, ignore_errors=True)
+        for _p in (
+            "/tmp/console_sft.txt",
+            "/tmp/console_sft.txt.live.tail",
+            "/tmp/console_sft.txt.final.tail",
+        ):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(_p)
 
