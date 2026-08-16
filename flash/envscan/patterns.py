@@ -1,6 +1,6 @@
 """What a credential looks like, and how to recognise one in a span of bytes.
 
-Split out of `flash.env_secrets` to keep that module under the file-size limit. It holds the
+Split out of `flash.envscan.secrets` to keep that module under the file-size limit. It holds the
 patterns and the matching over them; the scanning, decoding and container expansion that decide
 WHICH bytes to match against stay there. The dependency runs one way: this module knows nothing
 about files, archives or the publish.
@@ -13,8 +13,8 @@ from collections.abc import Iterator
 from typing import Protocol
 
 # The record tokenizer and the two-marker accumulator, split out to keep this module under
-# the file-size limit. Re-exported because `flash.env_buffers` imports them from here.
-from flash.env_records import (  # noqa: F401
+# the file-size limit. Re-exported because `flash.envscan.buffers` imports them from here.
+from flash.envscan.records import (  # noqa: F401
     _ESCAPE_BODY,
     _JSON_RECORD_SPLIT,
     _JSON_STRING_TAIL,
@@ -23,7 +23,7 @@ from flash.env_records import (  # noqa: F401
     _RecordHalves,
     _RecordSplitter,
 )
-from flash.env_sensitive import _MAX_BODY, GnuPGPrivateKey, UriPassword, _is_high_entropy
+from flash.envscan.sensitive import _MAX_BODY, GnuPGPrivateKey, UriPassword, _is_high_entropy
 
 # Bodies are bounded rather than open-ended so a match has a maximum length, which is what lets
 # `_SCAN_OVERLAP_BYTES` below be a real guarantee instead of a hope. The cap is far above every

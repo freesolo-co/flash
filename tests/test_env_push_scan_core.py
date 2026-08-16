@@ -16,7 +16,7 @@ import zipfile
 import pytest
 
 from flash.cli.commands.env.push import _check_env_push_credentials
-from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+from flash.envscan.secrets import _Unscannable, credential_in_file, credential_in_name
 
 # assembled rather than written whole so the literal never exists in the repository: push
 # protection blocks some complete token shapes, and a fixture is not worth a blocked push.

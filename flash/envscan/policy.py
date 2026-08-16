@@ -1,6 +1,6 @@
 """Deciding which recognised format a stream carries, and what to say when it cannot be read.
 
-The tables in `flash.env_formats` say what a signature IS. This says how hard to look for one and
+The tables in `flash.envscan.formats` say what a signature IS. This says how hard to look for one and
 how to phrase the refusal -- two questions of policy rather than of format, and the ones that carry
 the false-positive budget: a signature searched at an arbitrary offset can refuse an ordinary model
 shard, so the rule for which ones are searched lives here beside the reasoning for it.
@@ -11,7 +11,7 @@ imports the tables, and nothing here knows about files, packages or the scan.
 
 from __future__ import annotations
 
-from flash.env_formats import _ANCHORED_ONLY_MAGIC, _UNEXPANDABLE_MAGIC, ENCRYPTED_FORMATS
+from flash.envscan.formats import _ANCHORED_ONLY_MAGIC, _UNEXPANDABLE_MAGIC, ENCRYPTED_FORMATS
 
 # How long a signature must be to be searched for at an ARBITRARY offset rather than only at the
 # start of a stream. Six bytes is where the two real self-extracting formats sit (7-Zip at six, RAR

@@ -1665,7 +1665,7 @@ def test_push_allows_ordinary_environments_and_datasets(monkeypatch, tmp_path):
 
 def test_an_age_private_identity_requires_a_valid_age_bech32_value(tmp_path):
     """an age identity decrypts published age files but was absent from the credential patterns."""
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     identity = "AGE-SECRET-KEY-1QYPQXPQ9QCRSSZG2PVXQ6RS0ZQG3YYC5Z5TPWXQERGD3C8G7RUSQGPQYEE"
     for name, contents in (
@@ -1690,7 +1690,7 @@ def test_an_age_private_identity_requires_a_valid_age_bech32_value(tmp_path):
 def test_credential_scan_reads_across_chunk_boundaries_and_into_binaries(tmp_path):
     import sqlite3
 
-    from flash.env_secrets import (
+    from flash.envscan.secrets import (
         _MAX_BODY,
         _SCAN_CHUNK_BYTES,
         _SCAN_OVERLAP_BYTES,
@@ -1762,7 +1762,7 @@ def test_push_scans_generated_members_and_resists_post_scan_mutation(monkeypatch
 
 
 def test_push_refuses_every_issued_openai_key_family(tmp_path):
-    from flash.env_secrets import _credential_kind
+    from flash.envscan.secrets import _credential_kind
 
     # sk-svcacct- and sk-admin- carry project- and org-wide authority. Neither is reachable
     # through the bare `sk-` branch: the subtype's own hyphen ends its alphanumeric run early.
@@ -1837,7 +1837,7 @@ def test_push_refuses_a_credential_used_as_a_filename(monkeypatch, tmp_path, cap
 
 
 def test_push_refuses_a_credential_used_as_a_directory_name(monkeypatch, tmp_path):
-    from flash.env_secrets import credential_in_name
+    from flash.envscan.secrets import credential_in_name
 
     env_dir = tmp_path / "env"
     env_dir.mkdir()
@@ -1858,7 +1858,7 @@ def test_a_pem_header_without_a_key_body_is_prose_not_a_credential(tmp_path):
     Refusing on the header alone blocked a legitimate publish over writing about credentials, which
     is the kind of false refusal that gets a check disabled.
     """
-    from flash.env_secrets import _credential_kind
+    from flash.envscan.secrets import _credential_kind
 
     prose = b"If you see -----BEGIN RSA PRIVATE KEY----- in a log, redact it before sharing."
     assert _credential_kind(prose) is None
@@ -1872,7 +1872,7 @@ def test_a_pem_header_without_a_key_body_is_prose_not_a_credential(tmp_path):
 
 def test_slack_app_level_tokens_are_matched(tmp_path):
     """`xapp-` is a separate prefix, not another letter in the `xox?` set."""
-    from flash.env_secrets import _credential_kind
+    from flash.envscan.secrets import _credential_kind
 
     for prefix in ("xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "xapp-"):
         token = f"{prefix}1-A012BC3DEF-1234567890123-abcdefABCDEF0123456789"
@@ -1904,7 +1904,7 @@ def test_a_credential_cannot_hide_behind_a_wall_of_padding(tmp_path):
     import gzip
     import time
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     padded = tmp_path / "shard.jsonl.gz"
     with gzip.open(padded, "wb", compresslevel=9) as handle:
@@ -1926,8 +1926,8 @@ def test_push_refuses_an_archive_too_expensive_to_scan(monkeypatch, tmp_path, ca
     """
     import gzip
 
-    from flash import env_secrets as secrets
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan import secrets as secrets
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     env_dir = tmp_path / "env"
     env_dir.mkdir()
@@ -1967,7 +1967,7 @@ def test_a_gzip_with_trailing_bytes_is_not_published_as_unreadable(tmp_path):
     """
     import gzip
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     body = f'export KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()
     member = gzip.compress(body)
@@ -2009,7 +2009,7 @@ def test_a_plain_footer_after_a_zlib_record_is_not_a_refusal(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     key = f"fslo_{_FAKE_KEY_BODY}".encode()
 
@@ -2046,7 +2046,7 @@ def test_a_corrupt_xz_does_not_crash_the_publish(tmp_path):
     """
     import lzma
 
-    from flash.env_secrets import _UNREADABLE_ARCHIVE, credential_in_file
+    from flash.envscan.secrets import _UNREADABLE_ARCHIVE, credential_in_file
 
     assert issubclass(lzma.LZMAError, _UNREADABLE_ARCHIVE)
 
@@ -2068,8 +2068,8 @@ def test_the_expansion_budget_is_not_swallowed_by_the_per_member_handler(monkeyp
     """A timeout must still refuse, not be mistaken for an unreadable member and skipped."""
     import zipfile
 
-    from flash import env_secrets as secrets
-    from flash.env_secrets import (
+    from flash.envscan import secrets as secrets
+    from flash.envscan.secrets import (
         _UNREADABLE_ARCHIVE,
         _Unscannable,
         credential_in_file,
@@ -2104,7 +2104,7 @@ def test_scaffolding_placeholders_do_not_refuse_the_publish(placeholder):
     repeated-character ones, so a scaffolded environment could not be published at all. That is the
     failure mode that gets a check switched off.
     """
-    from flash.env_secrets import _credential_kind
+    from flash.envscan.secrets import _credential_kind
 
     assert _credential_kind(placeholder.encode()) is None
 
@@ -2120,7 +2120,7 @@ def test_scaffolding_placeholders_do_not_refuse_the_publish(placeholder):
 )
 def test_issued_keys_are_still_caught_after_narrowing_the_entropy_test(credential, kind):
     """The placeholder allowance must not open a hole: issued bodies are mixed-case with digits."""
-    from flash.env_secrets import _credential_kind
+    from flash.envscan.secrets import _credential_kind
 
     assert _credential_kind(credential.encode()) == kind
 
@@ -2135,8 +2135,8 @@ def test_a_scan_limit_refuses_rather_than_reporting_clean(tmp_path, monkeypatch)
     import gzip
     import io
 
-    from flash import env_secrets as secrets
-    from flash.env_secrets import _MAX_CONTAINER_DEPTH, _Unscannable, credential_in_file
+    from flash.envscan import secrets as secrets
+    from flash.envscan.secrets import _MAX_CONTAINER_DEPTH, _Unscannable, credential_in_file
 
     def _gz(payload: bytes) -> bytes:
         buf = io.BytesIO()
@@ -2183,7 +2183,7 @@ def test_an_assigned_key_with_no_prefix_is_caught_by_its_variable_name(tmp_path)
     through the variable they are assigned to rather than by shape -- 40 hex characters on their own
     are just as likely to be a commit sha, and refusing those would block ordinary publishes.
     """
-    from flash.env_secrets import _credential_kind, credential_in_file
+    from flash.envscan.secrets import _credential_kind, credential_in_file
 
     # a REAL legacy key's 40 hex characters, not a repeated pair: `3f` x 20 has two distinct
     # characters and is correctly read as a masked value rather than a key, so using it here would
@@ -2246,7 +2246,7 @@ def test_an_assigned_placeholder_does_not_refuse_the_publish(placeholder):
     scaffolded environment could not be published at all -- a false refusal, which is the failure
     mode that gets a check switched off, and worse here than the hole it came from.
     """
-    from flash.env_secrets import _credential_kind
+    from flash.envscan.secrets import _credential_kind
 
     assert _credential_kind(placeholder) is None
 
@@ -2261,8 +2261,8 @@ def test_one_expansion_budget_covers_the_whole_package(tmp_path, monkeypatch):
     import gzip
     import time
 
-    from flash import env_secrets as secrets
-    from flash.env_secrets import reject_credential_bearing_package
+    from flash.envscan import secrets as secrets
+    from flash.envscan.secrets import reject_credential_bearing_package
 
     package = tmp_path / "pkg"
     package.mkdir()
@@ -2297,7 +2297,7 @@ def test_a_binary_der_private_key_is_detected(tmp_path):
     """
     import subprocess
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     def _generate(*args: str, out: str):
         path = tmp_path / out
@@ -2337,7 +2337,7 @@ def test_every_rfc_8410_curve_is_detected_not_just_the_25519_pair(tmp_path):
     """
     import subprocess
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     for algorithm in ("ED25519", "X25519", "ED448", "X448"):
         path = tmp_path / f"{algorithm}.der"
@@ -2383,7 +2383,7 @@ def test_an_openpgp_secret_key_is_detected_armoured_and_binary(tmp_path):
     if shutil.which("gpg") is None:
         pytest.skip("gpg is not installed")
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     home = tmp_path / "gnupg"
     home.mkdir(mode=0o700)
@@ -2445,7 +2445,7 @@ def test_the_openpgp_packet_header_does_not_fire_on_ordinary_binaries():
     """
     import random
 
-    from flash.env_openpgp import _is_openpgp_secret_key
+    from flash.envscan.openpgp import _is_openpgp_secret_key
 
     # measured 1 in 4,400 on tag plus version alone, and 1 in 108,000 once the algorithm byte is
     # required too. 40,000 draws would fail essentially always at the former rate and pass at this
@@ -2473,7 +2473,7 @@ def test_a_hex_body_under_an_issuer_prefix_is_a_placeholder_not_a_key():
     ran before the rule that would have cleared it. An issued `hf_`/`fslo_` body is base62, so one
     confined to `[a-f]` with no digit is not a shape they take.
     """
-    from flash.env_secrets import _credential_kind
+    from flash.envscan.secrets import _credential_kind
 
     for placeholder in (
         b"hf_deadbeefdeadbeefdeadbeefdeadbeef",
@@ -2500,7 +2500,7 @@ def test_an_armoured_key_is_detected_through_its_armor_headers():
     The header keys are named exactly rather than accepting `[A-Za-z-]+:`, because a general rule
     would also skip `Warning:` and `Note:`, which is prose about a key rather than a key.
     """
-    from flash.env_secrets import _credential_kind
+    from flash.envscan.secrets import _credential_kind
 
     body = "A" * 64
     for headers in (
@@ -2524,7 +2524,7 @@ def test_every_openpgp_packet_length_encoding_is_parsed():
     every RSA secret key, and anything Sequoia, RNP or `--use-new-packet-format` writes -- so those
     returned false and published intact.
     """
-    from flash.env_openpgp import _is_openpgp_secret_key
+    from flash.envscan.openpgp import _is_openpgp_secret_key
 
     def _packet(tag: int, body_length: int) -> bytes:
         if body_length < 192:
@@ -2566,7 +2566,7 @@ def test_a_v7_tar_is_enumerated_despite_having_no_magic(tmp_path):
     import gzip
     import subprocess
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     source = tmp_path / "src"
     source.mkdir()
@@ -2597,7 +2597,7 @@ def test_a_stray_zip_signature_does_not_refuse_an_oversized_member():
     """
     import struct
 
-    from flash.env_secrets import _has_zip_end_record
+    from flash.envscan.secrets import _has_zip_end_record
 
     genuine = b"PK\x05\x06" + b"\x00" * 16 + struct.pack("<H", 5) + b"hello"
     assert _has_zip_end_record(genuine)
@@ -2614,7 +2614,7 @@ def test_a_name_holding_a_lone_surrogate_does_not_crash_the_check():
     Raised out of a security check, that turned the publish route's 400 into an uncaught 500, and
     crashed the scan of an archive whose member name held one rather than reporting its contents.
     """
-    from flash.env_secrets import _redacted, credential_in_name
+    from flash.envscan.secrets import _redacted, credential_in_name
 
     assert credential_in_name("bad\ud800name") is None
     # a real credential in a name that ALSO holds a surrogate is still found
@@ -2633,7 +2633,7 @@ def test_an_encrypted_pkcs8_key_in_der_is_detected(tmp_path):
     """
     import subprocess
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     plain = tmp_path / "plain.pem"
     subprocess.run(
@@ -2695,7 +2695,7 @@ def test_a_container_that_cannot_be_expanded_refuses_rather_than_passing(tmp_pat
     if shutil.which("zstd") is None:
         pytest.skip("zstd is not installed")
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     plain = tmp_path / "data.jsonl"
     plain.write_text(f'{{"key": "fslo_{_FAKE_KEY_BODY}"}}\n')
@@ -2713,7 +2713,7 @@ def test_a_pem_label_line_must_be_a_real_encrypted_key_header(tmp_path):
     Admitting any capitalized word plus a colon reopened the prose false positive that requiring a
     body was meant to close.
     """
-    from flash.env_secrets import _credential_kind
+    from flash.envscan.secrets import _credential_kind
 
     for prose in (
         b"See -----BEGIN RSA PRIVATE KEY-----\nWarning: never commit keys to the repo",
@@ -2737,7 +2737,7 @@ def test_every_pkcs1_modulus_length_form_is_recognised(tmp_path):
     """
     import subprocess
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     for bits in (512, 1024, 2048, 4096):
         pem, der = tmp_path / f"{bits}.pem", tmp_path / f"{bits}.der"
@@ -2773,8 +2773,8 @@ def test_an_openpgp_packet_shorter_than_its_fields_is_not_a_key(tmp_path):
     Ignoring it read those fields from BEYOND the packet, so `c5 01 04 00 00 00 00 01` -- an
     ordinary binary declaring a one-byte body -- was refused as a private key.
     """
-    from flash.env_openpgp import _is_openpgp_secret_key
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.openpgp import _is_openpgp_secret_key
+    from flash.envscan.secrets import credential_in_file
 
     assert not _is_openpgp_secret_key(bytes.fromhex("c501040000000001"))
     short = tmp_path / "short.bin"
@@ -2798,7 +2798,7 @@ def test_a_prepended_stub_does_not_hide_a_zips_real_member_count(tmp_path):
     import struct
     import zipfile
 
-    from flash.env_formats import _ZIP_END_RECORD, _zip_member_count
+    from flash.envscan.formats import _ZIP_END_RECORD, _zip_member_count
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -2821,7 +2821,7 @@ def test_a_prepended_stub_does_not_hide_a_zips_real_member_count(tmp_path):
 
 def test_a_seven_zip_archive_is_refused_rather_than_published(tmp_path):
     """7-Zip is as opaque to the stdlib as zstd, so its member bytes are unverifiable."""
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     archive = tmp_path / "shard.7z"
     archive.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00\x04" + bytes(range(256)) * 4)
@@ -2831,7 +2831,7 @@ def test_a_seven_zip_archive_is_refused_rather_than_published(tmp_path):
 
 def test_text_beginning_with_rar_is_not_treated_as_an_archive(tmp_path):
     """Four printable characters are prose. A real signature carries its version bytes."""
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     readme = tmp_path / "README.md"
     readme.write_bytes(b"Rar! archives are not supported here; use tar instead.\n" * 4)
@@ -2852,7 +2852,7 @@ def test_a_skippable_frame_does_not_hide_the_compressed_frame_behind_it(tmp_path
     """
     import struct
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     opaque = bytes((index * 7 + 13) % 251 for index in range(4096))
     for magic, label in ((b"\x28\xb5\x2f\xfd", "zstd"), (b"\x04\x22\x4d\x18", "lz4")):
@@ -2865,7 +2865,7 @@ def test_a_skippable_frame_does_not_hide_the_compressed_frame_behind_it(tmp_path
 
 def test_a_dsa_private_key_in_der_is_recognised(tmp_path):
     """DSA's AlgorithmIdentifier is a SEQUENCE, so the 1-byte-length branches did not cover it."""
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     # PKCS#8 PrivateKeyInfo: version 0, then AlgorithmIdentifier { OID 1.2.840.10040.4.1, params }
     body = (
@@ -2882,7 +2882,7 @@ def test_a_private_key_stored_as_a_jwk_is_recognised(tmp_path):
     import base64
     import json
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     def value(seed):
         raw = bytes((index * seed + 11) % 251 for index in range(32))
@@ -2910,7 +2910,7 @@ def test_a_directory_the_scan_cannot_enter_is_refused(tmp_path):
     The same tree with the directory readable is refused, so passing was purely a function of what
     could be opened -- a credential inside a mode-000 directory published intact.
     """
-    from flash.env_secrets import reject_credential_bearing_package
+    from flash.envscan.secrets import reject_credential_bearing_package
 
     package = tmp_path / "pkg"
     hidden = package / "sub"
@@ -2938,7 +2938,7 @@ def test_a_frame_prelude_too_long_to_read_past_refuses(tmp_path):
     content and a credential inside it published. The size is attacker-chosen, so the bound cannot
     be raised out of the problem; running out has to refuse instead.
     """
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     zstd = bytes([0x28, 0xB5, 0x2F, 0xFD])
     for payload in (8, 70 << 10):
@@ -2966,7 +2966,7 @@ def test_a_private_jwk_is_found_however_far_its_members_sit_apart(tmp_path):
     backtracked over every position of a near-match, which cost 4.2 seconds per MiB of
     `"kty":"RSA",` repeated -- roughly 18 minutes for a permitted 256 MiB package.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     scalar = "a1B2c3D4" * 8
     for name, body in (
@@ -2990,7 +2990,7 @@ def test_a_dh_private_key_in_der_is_detected(tmp_path):
     Enumerating RSA, the RFC 8410 curves, EC and DSA left `1.2.840.113549.1.3.1` uncovered, so a
     key `openssl pkey -check` accepts published intact.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     # PrivateKeyInfo: version 0, then the dhKeyAgreement AlgorithmIdentifier
     der = tmp_path / "dh.der"
@@ -3008,7 +3008,7 @@ def test_a_filename_that_is_itself_a_private_key_is_never_echoed(tmp_path):
     assignment patterns, so the key structures were echoed verbatim -- the refusal printed a
     complete Ed25519 private scalar to the terminal and anything collecting its output.
     """
-    from flash.env_secrets import _redacted, credential_in_name
+    from flash.envscan.secrets import _redacted, credential_in_name
 
     scalar = "ntpBr8-RhhOkeezY5aeBh2wrN4xaQ-CIq0s6j_A26FQ"
     name = f'keys/{{"crv":"Ed25519","d":"{scalar}","kty":"OKP"}}'
@@ -3033,7 +3033,7 @@ def test_a_zip64_member_count_cannot_be_forged_downward(tmp_path):
     import struct
     import zipfile
 
-    from flash.env_formats import _zip_member_count
+    from flash.envscan.formats import _zip_member_count
 
     archive = tmp_path / "many.zip"
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED, allowZip64=True) as writing:
@@ -3064,7 +3064,7 @@ def test_the_package_deadline_bounds_the_raw_file_scan(tmp_path):
     import contextlib
     import time
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     adversarial = tmp_path / "slow.json"
     adversarial.write_bytes(b'"kty":"RSA",' * ((4 << 20) // 12))
@@ -3093,7 +3093,7 @@ def test_a_jwk_whose_markers_span_a_scan_chunk_is_still_found(tmp_path):
     """
     import json
 
-    from flash.env_secrets import _SCAN_CHUNK_BYTES, credential_in_file
+    from flash.envscan.secrets import _SCAN_CHUNK_BYTES, credential_in_file
 
     spread = tmp_path / "big.jwk"
     spread.write_text(
@@ -3114,7 +3114,7 @@ def test_a_symmetric_jwk_holds_its_secret_in_k_not_d(tmp_path):
     asymmetric members, so the one key type where the secret IS the file passed as clean. That is
     what an HMAC signing key or an `A256GCM` content key exports as.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     symmetric = tmp_path / "hmac.jwk"
     symmetric.write_text('{"kty":"oct","k":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}')
@@ -3134,7 +3134,7 @@ def test_a_yaml_block_scalar_value_is_read_as_an_assignment(tmp_path):
     between the colon and the body does not cover the indicator characters -- so a key written that
     way in a `secrets.yaml` or a Helm values file matched nothing and published.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     # AWS's own published example value, so the fixture is unmistakably not a live key
     body = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
@@ -3163,7 +3163,7 @@ def test_a_raw_zlib_stream_is_expanded_rather_than_scanned_as_bytes(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     compressed = tmp_path / "shard.zz"
     compressed.write_bytes(zlib.compress(b"FREESOLO_API_KEY=fslo_AbCdEf0123456789AbCdEf\n"))
@@ -3184,7 +3184,7 @@ def test_a_self_extracting_rar_or_7z_is_refused_behind_its_stub(tmp_path):
     import contextlib
     import os
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     for name, signature in (("rar", b"Rar!\x1a\x07\x01\x00"), ("7z", b"7z\xbc\xaf\x27\x1c")):
         packed = tmp_path / f"{name}.exe"
@@ -3208,7 +3208,7 @@ def test_a_pbes1_encrypted_private_key_is_detected(tmp_path):
     """
     import subprocess
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     plain = tmp_path / "rsa.pem"
     generated = subprocess.run(
@@ -3252,7 +3252,7 @@ def test_a_putty_private_key_file_is_detected(tmp_path):
     import base64
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = tmp_path / "id.ppk"
     key.write_bytes(
@@ -3276,7 +3276,7 @@ def test_the_name_that_gets_written_is_scanned_not_only_the_one_supplied(tmp_pat
     committed into the hub path and the commit message. Scanning only the supplied name checked a
     string the publish never writes.
     """
-    from flash.env_secrets import credential_in_name
+    from flash.envscan.secrets import credential_in_name
     from flash.server.domain.envs import _sanitize_name
 
     folded = "fslo_abcd1!efgh!ijkl!mnop"
@@ -3300,7 +3300,7 @@ def test_a_member_count_cannot_be_forged_behind_a_stub_on_a_zip64_archive(tmp_pa
     import struct
     import zipfile
 
-    from flash.env_formats import _zip_member_count
+    from flash.envscan.formats import _zip_member_count
 
     body = tmp_path / "body.zip"
     with zipfile.ZipFile(body, "w", zipfile.ZIP_STORED, allowZip64=True) as writing:
@@ -3333,7 +3333,7 @@ def test_a_jwk_is_found_with_its_markers_in_either_order_across_chunks(tmp_path)
     """
     import json
 
-    from flash.env_secrets import _SCAN_CHUNK_BYTES, credential_in_file
+    from flash.envscan.secrets import _SCAN_CHUNK_BYTES, credential_in_file
 
     filler = "x" * (_SCAN_CHUNK_BYTES + 4096)
     body = "a1B2c3D4" * 8
@@ -3361,7 +3361,7 @@ def test_a_putty_key_is_found_however_large_its_public_section(tmp_path):
     import base64
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     public = base64.b64encode(os.urandom(535)).decode()
     lines = "\n".join(public[at : at + 64] for at in range(0, len(public), 64))
@@ -3391,7 +3391,7 @@ def test_a_multi_prime_rsa_private_key_is_detected(tmp_path):
     """
     import subprocess
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     plain = tmp_path / "multi.pem"
     generated = subprocess.run(
@@ -3417,7 +3417,7 @@ def test_a_zlib_stream_needing_a_preset_dictionary_is_refused(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     dictionary = b"FREESOLO_API_KEY="
     compressor = zlib.compressobj(zdict=dictionary)
@@ -3441,7 +3441,7 @@ def test_a_triple_quoted_assignment_is_read_as_an_assignment(tmp_path):
     That left a quote sitting where the body had to begin, so an ordinary Python or TOML multiline
     assignment matched nothing while its single-quoted equivalent was caught.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     for name, text in (
@@ -3466,7 +3466,7 @@ def test_a_yaml_block_header_is_read_in_either_indicator_order(tmp_path):
     emits an explicit indentation indicator -- ruamel, several Helm chart generators -- naturally
     puts the digit first.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     for header in ("|", "|-", "|+", ">-", "|2-", ">2+", "|-2", "|2"):
@@ -3486,7 +3486,7 @@ def test_a_jwk_member_name_is_matched_through_its_json_escape(tmp_path):
     import json
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     secret = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
     # `k` is `k`, `d` is `d`. The hex digits are case-insensitive per RFC 8259, so the
@@ -3526,7 +3526,7 @@ def test_an_sfx_archive_is_refused_however_long_its_stub(tmp_path):
     import os
     import random
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     for stub_kb in (1, 63, 64, 65, 256):
         packed = tmp_path / f"sfx{stub_kb}.exe"
@@ -3550,7 +3550,7 @@ def test_an_lz4_legacy_frame_is_refused_like_the_modern_one(tmp_path):
     """
     import os
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     for name, magic in (("legacy", b"\x02\x21\x4c\x18"), ("modern", b"\x04\x22\x4d\x18")):
         packed = tmp_path / f"{name}.lz4"
@@ -3568,7 +3568,7 @@ def test_an_openpgp_secret_key_is_found_behind_a_marker_packet(tmp_path):
     """
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     def packet(body_bytes: int) -> bytes:
         body = bytes([4]) + b"\x66\x00\x00\x00" + bytes([1]) + os.urandom(body_bytes)
@@ -3604,7 +3604,7 @@ def test_ordinary_text_is_not_refused_as_a_dictionary_compressed_stream(tmp_path
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     for name, text in (("a", "x = 1\n"), ("b", "x  = 1\n"), ("c", "x = 1\nimport os\n" * 40)):
         written = tmp_path / f"{name}.py"
@@ -3627,7 +3627,7 @@ def test_a_yaml_block_header_may_carry_a_comment(tmp_path):
     The header pattern stopped at the `#`, so the indented body never matched and the key
     published.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     for header in ("|", "| # injected value", ">- # generated", "|2- # note"):
@@ -3647,7 +3647,7 @@ def test_a_jwk_private_value_is_matched_through_its_json_escapes(tmp_path):
     import json
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     raw = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
     value = "x" + raw[1:]
@@ -3668,7 +3668,7 @@ def test_a_pem_body_is_found_at_any_wrap_width(tmp_path):
     Requiring 32 contiguous base64 characters meant a key rewrapped at 16 columns matched neither
     this pattern nor the 64/76-column joining, while `openssl pkey -check` still accepts it.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     header = "-----BEGIN PRIVATE KEY-----"
     footer = "-----END PRIVATE KEY-----"
@@ -3694,7 +3694,7 @@ def test_every_concatenated_zlib_record_is_scanned(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     secret = zlib.compress(b"FREESOLO_API_KEY=fslo_A1b2C3d4E5f6G7h8\n")
     benign = zlib.compress(b"just some ordinary configuration text\n" * 20)
@@ -3724,7 +3724,7 @@ def test_a_record_chain_that_exhausts_the_budget_is_refused(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _MAX_NESTED_BUFFER_BYTES, _Unscannable, credential_in_file
+    from flash.envscan.secrets import _MAX_NESTED_BUFFER_BYTES, _Unscannable, credential_in_file
 
     secret = zlib.compress(b"FREESOLO_API_KEY=fslo_A1b2C3d4E5f6G7h8\n")
     # exactly the budget, so this record inflates whole -- an OVER-budget record is a different
@@ -3761,7 +3761,7 @@ def test_a_decoy_directory_header_cannot_defeat_the_member_count(tmp_path):
     import struct
     import zipfile
 
-    from flash.env_formats import _zip_member_count
+    from flash.envscan.formats import _zip_member_count
 
     inner = io.BytesIO()
     with zipfile.ZipFile(inner, "w") as archive:
@@ -3794,7 +3794,7 @@ def test_a_member_whose_bytes_live_in_another_volume_is_refused(tmp_path):
     import struct
     import zipfile
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_LZMA) as archive:
@@ -3821,7 +3821,7 @@ def test_a_java_keystore_holding_a_private_key_is_detected(tmp_path):
     import os
     import struct
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     def keystore(*tags: int, magic: bytes = b"\xfe\xed\xfe\xed") -> bytes:
         """A store whose entries carry `tags`, laid out as the format actually declares them."""
@@ -3876,8 +3876,8 @@ def test_a_java_keystore_holding_a_private_key_is_detected(tmp_path):
     # A key past the entry bound is UNREAD, not absent -- the same fail-open the OpenPGP marker
     # bound had. The walk is bounded so a forged count cannot be a scan cost, and exhausting it
     # refuses rather than reporting the store clean.
-    from flash.env_formats import _MAX_JKS_ENTRIES
-    from flash.env_secrets import _Unscannable
+    from flash.envscan.formats import _MAX_JKS_ENTRIES
+    from flash.envscan.secrets import _Unscannable
 
     within = tmp_path / "within.jks"
     within.write_bytes(keystore(*([2] * (_MAX_JKS_ENTRIES - 1)), 1))
@@ -3899,7 +3899,7 @@ def test_the_truststore_every_jdk_ships_still_publishes(tmp_path):
     import os
     import struct
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = b""
     for index in range(200):
@@ -3923,7 +3923,7 @@ def test_a_key_behind_a_certificate_larger_than_a_chunk_is_detected(tmp_path):
     import os
     import struct
 
-    from flash.env_secrets import _SCAN_CHUNK_BYTES, credential_in_file
+    from flash.envscan.secrets import _SCAN_CHUNK_BYTES, credential_in_file
 
     def store(cert_bytes: int) -> bytes:
         body = struct.pack(">I", 2) + struct.pack(">H", 4) + b"cert"
@@ -3959,7 +3959,7 @@ def test_an_encrypted_openpgp_message_larger_than_the_head_is_refused(tmp_path):
     """
     import struct
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     def session(body_bytes: int, *, follow: bytes) -> bytes:
         """A v3 PKESK packet of `body_bytes`, then `follow`, laid out as real gpg writes one.
@@ -3997,7 +3997,7 @@ def test_an_armored_openpgp_message_is_refused(tmp_path):
     pattern never matched, and whose base64 body is ciphertext -- so decoding it finds nothing
     either. A Freesolo key inside published clean.
     """
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     armored = tmp_path / "secret.asc"
     armored.write_text(
@@ -4029,7 +4029,7 @@ def test_a_credential_in_a_self_extracting_shell_archive_is_found(tmp_path):
     """
     import gzip
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     stub = b'#!/bin/sh\n# self-extracting archive\ntail -c +NNN "$0" | gzip -dc\nexit 0\n'
     payload = gzip.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
@@ -4067,7 +4067,7 @@ def test_a_forged_directory_size_does_not_allocate_the_package(tmp_path):
     import tracemalloc
     import zipfile
 
-    from flash.env_formats import _zip_member_count
+    from flash.envscan.formats import _zip_member_count
 
     archive = tmp_path / "forged.zip"
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as package:
@@ -4091,7 +4091,7 @@ def test_a_real_zip_still_counts_its_members(tmp_path):
     """The bounded walk must still read an ordinary directory, including one behind a stub."""
     import zipfile
 
-    from flash.env_formats import _zip_member_count
+    from flash.envscan.formats import _zip_member_count
 
     ordinary = tmp_path / "ordinary.zip"
     with zipfile.ZipFile(ordinary, "w") as package:
@@ -4114,8 +4114,8 @@ def test_decoy_magics_do_not_hide_an_appended_payload(tmp_path):
     import gzip
     import random
 
-    from flash.env_formats import _MAX_OVERLAY_CANDIDATES
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.formats import _MAX_OVERLAY_CANDIDATES
+    from flash.envscan.secrets import credential_in_file
 
     stub = b'#!/bin/sh\ntail -c +NNN "$0" | gzip -dc\nexit 0\n'
     payload = gzip.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
@@ -4149,8 +4149,8 @@ def test_decoy_magics_do_not_hide_an_appended_payload(tmp_path):
     # The bound still exists, and when it genuinely bites it REFUSES. It is consulted per window,
     # so exhausting it takes decoys spanning more than one -- and the file behind them is then
     # unverified rather than clean.
-    from flash.env_formats import _STREAM_WINDOW_BYTES
-    from flash.env_secrets import _Unscannable
+    from flash.envscan.formats import _STREAM_WINDOW_BYTES
+    from flash.envscan.secrets import _Unscannable
 
     per_window = decoys(_MAX_OVERLAY_CANDIDATES + 100)
     pad = b"\x00" * max(0, _STREAM_WINDOW_BYTES - len(per_window))
@@ -4169,7 +4169,7 @@ def test_a_marker_packet_does_not_hide_an_encrypted_message(tmp_path):
     """
     import struct
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     body = b"\x03" + b"\x00" * 8 + b"\x01" + b"\x00" * 258
     message = b"\x85" + struct.pack(">H", 268) + body + b"\xd2\x40" + b"\x00" * 64
@@ -4194,8 +4194,8 @@ def test_a_secret_key_behind_the_marker_bound_is_refused(tmp_path):
     secret-key test looking at a marker header, which is not a key -- and the file published. The
     bound has to fail closed: still sitting on a marker means what follows is unread, not absent.
     """
-    from flash.env_openpgp import _MAX_OPENPGP_MARKERS
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.openpgp import _MAX_OPENPGP_MARKERS
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     marker = b"\xca\x03PGP"
     # a secret-key packet laid out as `gpg --export-secret-keys` writes one: tag 5 old-format with
@@ -4223,7 +4223,7 @@ def test_an_encrypted_openpgp_message_is_refused(tmp_path):
     The ciphertext carries no secret-key tag and matches no textual or DER check, so it read as
     ordinary bytes and published -- while an encrypted ZIP member, the same situation, is refused.
     """
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     # symmetric-key ESK exactly as `gpg --symmetric` writes it: tag 3 old-format, a 13-byte body,
     # version 4, cipher 9 (AES-256), S2K type 3. The body length puts the next packet at offset 15.
@@ -4253,7 +4253,7 @@ def test_a_sec1_key_is_found_on_every_supported_curve(tmp_path):
     """
     import subprocess
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     # `secp112r1` is the smallest curve OpenSSL carries, at a 14-byte scalar. A first pass at this
     # floored the range at 20 and left twelve curve families below it publishing intact.
@@ -4275,7 +4275,7 @@ def test_an_aws_secret_is_found_under_its_json_field_name(tmp_path):
     Anchoring only on `AWS_SECRET_ACCESS_KEY` meant a saved session credential -- which is exactly
     what lands beside an environment config -- published intact.
     """
-    from flash.env_secrets import _credential_kind
+    from flash.envscan.secrets import _credential_kind
 
     body = b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     assert _credential_kind(b'{"SecretAccessKey":"' + body + b'"}') == "an AWS secret access key"
@@ -4297,7 +4297,7 @@ def test_a_short_archive_magic_is_decisive_only_at_the_start(tmp_path):
     """
     import os
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     for name, magic in (
         ("zstd", b"\x28\xb5\x2f\xfd"),
@@ -4335,7 +4335,7 @@ def test_a_message_encrypted_to_two_recipients_is_refused(tmp_path):
     expected and reported "not encrypted". GnuPG decrypts the file happily, and a credential inside
     published intact -- while the same message to ONE recipient was refused.
     """
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     if not shutil.which("gpg"):
         pytest.skip("gpg is not installed")
@@ -4395,7 +4395,7 @@ def test_an_appended_bzip2_whose_first_block_exceeds_the_probe_is_expanded(tmp_p
     import bz2
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     payload = bz2.compress(os.urandom(200_000) + f"fslo_{_FAKE_KEY_BODY}".encode())
     # the probe really does yield nothing, or this fixture would not exercise the bug
@@ -4422,7 +4422,7 @@ def test_an_appended_gzip_whose_name_field_exceeds_the_probe_is_expanded(tmp_pat
     import gzip
     import io
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = f'export FREESOLO_API_KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode()
     buffered = io.BytesIO()
@@ -4467,7 +4467,7 @@ def test_a_json_escaped_credential_name_is_still_matched(tmp_path):
     import base64
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = base64.b64encode(os.urandom(30))[:40].decode()
     for name, text in (
@@ -4502,7 +4502,7 @@ def test_a_headerless_deflate_stream_is_expanded(tmp_path):
     import random
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     secret = f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode()
     compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
@@ -4539,7 +4539,7 @@ def test_a_netrc_machine_password_is_refused(tmp_path):
     import base64
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     token = os.urandom(20).hex()
     for name, text in (
@@ -4577,7 +4577,7 @@ def test_the_server_refuses_a_netrc_an_older_client_uploaded(tmp_path):
     """
     import os
 
-    from flash.env_secrets import reject_credential_bearing_package
+    from flash.envscan.secrets import reject_credential_bearing_package
 
     package = tmp_path / "package"
     package.mkdir()
@@ -4599,7 +4599,7 @@ def test_a_credential_in_a_pdf_stream_is_found(tmp_path):
     import random
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     record = zlib.compress(f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode())
     document = tmp_path / "report.pdf"
@@ -4636,7 +4636,7 @@ def test_a_pdf_with_more_streams_than_the_limit_is_refused(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     def document(streams):
         out = b"%PDF-1.4\n"
@@ -4669,7 +4669,7 @@ def test_an_aws_secret_with_escaped_slashes_is_matched(tmp_path):
     """
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = base64.b64encode(os.urandom(30)).decode()[:40].replace("+", "/")
     if "/" not in body:
@@ -4696,7 +4696,7 @@ def test_an_openssl_salted_envelope_is_refused(tmp_path):
     """
     import subprocess
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     plain = tmp_path / "key.txt"
     plain.write_bytes(f"FSLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode())
@@ -4747,7 +4747,7 @@ def test_a_pdf_filter_chain_is_decoded_before_inflating(tmp_path):
     import base64 as b64
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     key = f"fslo_{_FAKE_KEY_BODY}".encode()
     inner = zlib.compress(b"BT (FSLO_API_KEY=" + key + b") Tj ET\n" * 4)
@@ -4791,7 +4791,7 @@ def test_a_standalone_pdf_ascii85_stream_is_decoded(tmp_path):
     import base64
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     def document(declaration, payload):
         return (
@@ -4834,7 +4834,7 @@ def test_a_gzip_with_a_maximum_extra_field_is_probed_past_its_header(tmp_path):
     import struct
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = f"fslo_{_FAKE_KEY_BODY}".encode()
     body = b"export FSLO_API_KEY=" + key + b"\n"
@@ -4876,7 +4876,7 @@ def test_raw_deflate_probing_does_not_read_the_whole_file(tmp_path):
     import time
     import zlib
 
-    from flash.env_secrets import _blocks_of, _credential_in_raw_deflate
+    from flash.envscan.secrets import _blocks_of, _credential_in_raw_deflate
 
     key = f"fslo_{_FAKE_KEY_BODY}".encode()
     raw = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
@@ -4903,7 +4903,7 @@ def test_a_private_key_armor_header_spanning_a_chunk_is_refused(tmp_path):
     no length limit on an armor header -- so a 1.5 MB `Comment:` pushed the body into the next scan
     chunk, the halves appeared in no single window, and a real armored secret key published.
     """
-    from flash.env_secrets import _SCAN_CHUNK_BYTES, _Unscannable, credential_in_file
+    from flash.envscan.secrets import _SCAN_CHUNK_BYTES, _Unscannable, credential_in_file
 
     body = base64.encodebytes(random.Random(11).randbytes(2048)).decode()
     # every eighth character is a dot, so no 32-character base64 run hides inside the header itself
@@ -4931,7 +4931,7 @@ def test_a_secret_key_packet_after_a_public_one_is_found(tmp_path):
     writes -- leads with a public key block, so testing only the first packet passed the secret
     material behind it, and it matched no textual or DER pattern.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     # laid out as gpg writes them: a public key packet (tag 6), a user id (tag 13), a signature
     # (tag 2), then the secret key packet (tag 5) that the walk has to reach.
@@ -4961,7 +4961,7 @@ def test_paired_marker_bodies_go_through_the_entropy_test(tmp_path):
     captured body, so prose containing `Machine` and a masked `password XXXX...` was refused. The
     same gap paired a public JWK in one dataset row with an unrelated long `"d"` field in another.
     """
-    from flash.env_secrets import _SCAN_CHUNK_BYTES, credential_in_file
+    from flash.envscan.secrets import _SCAN_CHUNK_BYTES, credential_in_file
 
     later = time.monotonic() + 120
     prose = tmp_path / "README.md"
@@ -4998,7 +4998,7 @@ def test_a_non_pdf_is_declined_from_its_signature(tmp_path, monkeypatch):
     Every top-level file reaches this handler after the other probes decline, so an unconditional
     `read_bytes` allocated a second whole copy of every ordinary model shard in the package.
     """
-    from flash import env_secrets
+    from flash.envscan import secrets
 
     shard = tmp_path / "model.bin"
     shard.write_bytes(random.Random(9).randbytes(4 << 20))
@@ -5010,7 +5010,7 @@ def test_a_non_pdf_is_declined_from_its_signature(tmp_path, monkeypatch):
         "read_bytes",
         lambda self: (read_whole.append(self), original(self))[1],
     )
-    assert env_secrets._credential_in_pdf(shard, deadline=time.monotonic() + 120, depth=0) is None
+    assert secrets._credential_in_pdf(shard, deadline=time.monotonic() + 120, depth=0) is None
     assert read_whole == [], f"read the whole non-PDF: {read_whole}"
 
     # a real PDF still reaches the stream walk
@@ -5026,7 +5026,7 @@ def test_a_non_pdf_is_declined_from_its_signature(tmp_path, monkeypatch):
         + payload
         + b"\nendstream\nendobj\n"
     )
-    found = env_secrets._credential_in_pdf(document, deadline=time.monotonic() + 120, depth=0)
+    found = secrets._credential_in_pdf(document, deadline=time.monotonic() + 120, depth=0)
     assert found == "a Freesolo API key"
 
 
@@ -5040,7 +5040,7 @@ def test_raw_deflate_stops_when_its_output_budget_reaches_zero():
     """
     import zlib
 
-    from flash.env_deflate import _raw_deflate_from
+    from flash.envscan.deflate import _raw_deflate_from
 
     budget = 1024
     compressor = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
@@ -5065,7 +5065,7 @@ def test_a_filter_applied_after_flatedecode_is_undone(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = "fslo_" + _FAKE_KEY_BODY
     encoded = base64.a85encode(key.encode(), adobe=False) + b"~>"
@@ -5102,7 +5102,7 @@ def test_a_chance_zlib_header_is_not_read_whole(tmp_path, monkeypatch):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     later = time.monotonic() + 120
     accidental = tmp_path / "shard.bin"
@@ -5143,7 +5143,7 @@ def test_a_pdf_stream_beyond_the_dictionary_gap_is_refused(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     body = zlib.compress(f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode())
 
@@ -5198,7 +5198,7 @@ def test_a_private_key_armor_with_extension_headers_is_found(tmp_path):
     two. Requiring a known header NAME instead was the same mistake one layer in -- the standard
     puts no limit on which names appear, so an unrecognised one hid the key.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = "\n".join([_FAKE_KEY_BODY] * 6)
 
@@ -5233,7 +5233,7 @@ def test_a_certificate_only_pkcs12_is_not_reported_as_a_private_key(tmp_path):
     can: `pkcs8ShroudedKeyBag` is present exactly when a key is, and the certificate bag OID sits
     INSIDE the encrypted SafeContents where nothing can see it.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     # The DER body both files share: a PKCS#8 RSA PrivateKeyInfo, which is what the private-key
     # pattern matches on. Built rather than asserted about, so the test exercises the PFX wrapper
@@ -5270,8 +5270,8 @@ def test_a_new_format_packet_length_is_decoded_for_every_tag(tmp_path):
     trillion-byte body assembled from four bytes of the packet's own payload, so the walk stopped
     and a secret key behind a modern public-key or literal packet was reported clean.
     """
-    from flash.env_openpgp import _openpgp_body_length
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.openpgp import _openpgp_body_length
+    from flash.envscan.secrets import credential_in_file
 
     # a new-format PUBLIC key packet (tag 6), which is what Sequoia, RNP and
     # `--use-new-packet-format` write, across all three length encodings RFC 4880 defines
@@ -5311,7 +5311,7 @@ def test_jwk_markers_pair_within_one_record_not_across_a_dataset(tmp_path):
     was refused over a file with no credential in it, and the entropy test cannot separate the two
     because a build id scores exactly as random as a key body does.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     unrelated = tmp_path / "shard.jsonl"
     unrelated.write_bytes(
@@ -5333,7 +5333,7 @@ def test_a_jwk_pairs_across_any_distance_inside_one_object(tmp_path):
     read chunks -- has to pair. A boundary that split on distance rather than on the enclosing
     object would publish exactly that key.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     padding = b'"pad":"' + b"m" * (3 << 20) + b'"'
     for name, body in (
@@ -5368,7 +5368,7 @@ def test_record_boundaries_survive_a_value_split_by_a_read_boundary(tmp_path):
     quote, and the string is then genuinely unterminated in any buffering, so refusing it would be
     correct JSON reading rather than the defect under test.
     """
-    from flash.env_secrets import _SCAN_CHUNK_BYTES, _SCAN_OVERLAP_BYTES, credential_in_file
+    from flash.envscan.secrets import _SCAN_CHUNK_BYTES, _SCAN_OVERLAP_BYTES, credential_in_file
 
     public = b'{"kty":"EC","crv":"P-256","x":"%s","y":"%s"}' % (
         _FAKE_KEY_BODY.encode(),
@@ -5410,7 +5410,7 @@ def test_a_netrc_entry_spanning_lines_is_still_one_record(tmp_path):
     entry is `machine`, `login` and `password` on three separate lines -- so it put the two halves
     in different records and published the key.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     entry = b"machine api.wandb.ai\n  login user\n  password %s\n" % _FAKE_KEY_BODY.encode()
     for name, body in (
@@ -5440,7 +5440,7 @@ def test_an_overlay_search_does_not_reprobe_identical_candidates(tmp_path):
     """
     import time
 
-    from flash.env_formats import OVERLAY_UNPROBED, _overlay_offset
+    from flash.envscan.formats import OVERLAY_UNPROBED, _overlay_offset
 
     spam = tmp_path / "spam.run"
     spam.write_bytes(b"#!/bin/sh\n" + b"\x1f\x8b\x08" * 350_000)
@@ -5472,7 +5472,7 @@ def test_a_pdf_stream_is_found_after_every_legal_line_ending(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
     for name, eol in (("cr.pdf", b"\r"), ("lf.pdf", b"\n"), ("crlf.pdf", b"\r\n")):
@@ -5491,7 +5491,7 @@ def test_a_pdf_filter_name_written_with_hex_escapes_is_still_flate(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
     for name, spelling in (
@@ -5535,7 +5535,7 @@ def test_a_pdf_predictor_refuses_rather_than_reading_differences(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
     predicted = tmp_path / "predicted.pdf"
@@ -5561,7 +5561,7 @@ def test_an_indirect_pdf_filter_reference_refuses(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
     indirect = tmp_path / "indirect.pdf"
@@ -5579,7 +5579,7 @@ def test_an_encrypted_pdf_refuses_rather_than_skipping_its_streams(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     body = zlib.compress(b'export FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode())
     encrypted = tmp_path / "encrypted.pdf"
@@ -5603,7 +5603,7 @@ def test_an_encrypt_key_ends_at_any_legal_separator(tmp_path):
     import os
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     # really ciphertext: if the key were findable in these bytes, a refusal would prove nothing
     cipher = bytes(
@@ -5656,7 +5656,7 @@ def test_narrowed_wide_text_keeps_the_truncation_state_of_its_chunk(tmp_path):
     import gzip
     import os
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     # incompressible padding, so the ENCODED form really does exceed one read chunk
     blob = base64.b64encode(
@@ -5685,7 +5685,7 @@ def test_a_version_5_session_packet_is_read_with_its_own_layout(tmp_path):
     """
     import os
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     def packet(tag: int, body: bytes) -> bytes:
         return bytes([0xC0 | tag, len(body)]) + body
@@ -5712,7 +5712,7 @@ def test_a_one_asymmetric_key_declaring_version_1_is_recognised(tmp_path):
     """
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     algorithm = b"\x30\x05\x06\x03\x2b\x65\x70"
     private = b"\x04\x22\x04\x20" + os.urandom(32)
@@ -5736,7 +5736,7 @@ def test_a_stream_behind_an_unreversible_filter_is_refused(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     key = b"fslo_%s" % _FAKE_KEY_BODY.encode()
     for name, dictionary, body in (
@@ -5765,7 +5765,7 @@ def test_an_escaped_predictor_key_is_still_a_predictor(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     key = b"fslo_%s" % _FAKE_KEY_BODY.encode()
     differences = bytearray()
@@ -5803,7 +5803,7 @@ def test_a_pdf_larger_than_the_scan_buffer_is_refused(tmp_path):
     object's filters may sit at any offset -- so the bound refuses rather than parsing incrementally,
     which is the answer every other oversized container already gets.
     """
-    from flash.env_secrets import _MAX_NESTED_BUFFER_BYTES, _Unscannable, credential_in_file
+    from flash.envscan.secrets import _MAX_NESTED_BUFFER_BYTES, _Unscannable, credential_in_file
 
     def document(payload: bytes) -> bytes:
         return (
@@ -5836,7 +5836,7 @@ def test_a_pdf_filter_declared_across_a_comment_is_still_decoded(tmp_path):
     import base64
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = b'FREESOLO_API_KEY="fslo_%s"\n' % _FAKE_KEY_BODY.encode()
     stream = base64.a85encode(zlib.compress(key)) + b"~>"
@@ -5860,7 +5860,7 @@ def test_an_openssh_key_with_its_armor_stripped_is_still_a_private_key(tmp_path)
     """
     import base64
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     blob = b"openssh-key-v1\x00" + b"\x00\x00\x00\x04none" * 2 + b"\x00\x00\x00\x00" + b"\x11" * 96
 
@@ -5894,7 +5894,7 @@ def test_scanning_a_name_is_charged_to_the_packages_budget(tmp_path):
     """
     import time
 
-    from flash.env_secrets import credential_in_name
+    from flash.envscan.secrets import credential_in_name
 
     # a deadline already in the past leaves no budget, so an expansion cannot be started under it
     assert credential_in_name(f"fslo_{_FAKE_KEY_BODY}", deadline=time.monotonic() - 1.0) == (
@@ -5905,7 +5905,7 @@ def test_scanning_a_name_is_charged_to_the_packages_budget(tmp_path):
     package.mkdir()
     (package / "ordinary.txt").write_bytes(b"nothing here\n")
     spent: list[float | None] = []
-    import flash.env_secrets as secrets
+    import flash.envscan.secrets as secrets
 
     original = secrets.credential_in_name
 
@@ -5936,7 +5936,7 @@ def test_a_pdf_dictionary_is_read_to_its_own_opening_bracket(tmp_path):
     import base64
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     key = b"fslo_%s" % _FAKE_KEY_BODY.encode()
     gap = b" " * 600
@@ -5978,8 +5978,8 @@ def test_the_all_stream_pass_refuses_rather_than_stopping_at_its_cap(tmp_path):
     streams followed by an `/ASCIIHexDecode` stream holding a hex-spelled key never reached the
     filtered one -- and the flate walk counts only flate streams, so it did not reach it either.
     """
-    from flash.env_deflate import _MAX_PDF_STREAMS
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.deflate import _MAX_PDF_STREAMS
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     def document(objects):
         body = b"%PDF-1.7\n"
@@ -6017,7 +6017,7 @@ def test_a_version_3_openpgp_secret_key_is_recognised(tmp_path):
     """
     import os
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = bytes([3]) + b"\x67\x00\x00\x00" + b"\x00\x1e" + bytes([1]) + os.urandom(70)
     published = tmp_path / "v3.pgp"
@@ -6043,7 +6043,7 @@ def test_an_age_encrypted_file_is_refused_like_every_other_ciphertext(tmp_path):
     import base64
     import os
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     native = tmp_path / "secrets.age"
     native.write_bytes(b"age-encryption.org/v1\n-> X25519 abcd\n" + os.urandom(200))
@@ -6073,7 +6073,7 @@ def test_jwk_halves_in_sibling_objects_are_not_one_key(tmp_path):
     refused a legitimate publish. The entropy test cannot separate the two, because a build id
     scores exactly as random as a key body.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     payload = "abcdefghijklmnopqrstuvwxyz012345"
 
@@ -6105,7 +6105,7 @@ def test_prose_naming_the_pgp_armor_is_not_ciphertext(tmp_path):
     ciphertext, and refusing it named a remedy -- decrypt and remove the message -- for a file that
     has none.
     """
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     prose = tmp_path / "README.md"
     prose.write_text("Look for a block starting with -----BEGIN PGP MESSAGE----- in the archive.\n")
@@ -6156,7 +6156,7 @@ def test_a_comment_before_an_indirect_pdf_filter_is_still_a_reference(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     stream = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
     resolved = b"2 0 obj\n/FlateDecode\nendobj\n"
@@ -6182,7 +6182,7 @@ def test_an_indirect_pdf_decode_parameter_is_refused(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     columns = 8
     raw = f"fslo_{_FAKE_KEY_BODY}".encode()
@@ -6229,7 +6229,7 @@ def test_a_legacy_lzma_stream_is_expanded_like_an_xz_one(tmp_path):
     """
     import lzma
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = f"fslo_{_FAKE_KEY_BODY}".encode()
     alone = lzma.compress(key, format=lzma.FORMAT_ALONE)
@@ -6254,7 +6254,7 @@ def test_a_version_one_key_store_of_certificates_is_publishable(tmp_path):
     """
     import struct
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     der = bytes.fromhex("308201223045") + b"\x00" * 200
 
@@ -6298,7 +6298,7 @@ def test_a_noncanonical_lzma_dictionary_size_is_still_expanded(tmp_path):
     import lzma
     import struct
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = f"fslo_{_FAKE_KEY_BODY}".encode()
     canonical = lzma.compress(key, format=lzma.FORMAT_ALONE)
@@ -6326,7 +6326,7 @@ def test_a_comment_before_a_pdf_predictor_value_is_still_a_predictor(tmp_path):
     """
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     columns = 8
     raw = f"fslo_{_FAKE_KEY_BODY}".encode()
@@ -6368,7 +6368,7 @@ def test_a_gzip_whose_extra_field_fills_the_probe_is_still_probed(tmp_path):
     import gzip
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = f"fslo_{_FAKE_KEY_BODY}".encode()
 
@@ -6407,7 +6407,7 @@ def test_a_broken_overlay_candidate_does_not_hide_a_valid_one(tmp_path):
     """
     import bz2
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     payload = f"fslo_{_FAKE_KEY_BODY}".encode() + b"\n" + b"filler to lengthen the stream " * 20
     valid = bz2.compress(payload)
@@ -6437,7 +6437,7 @@ def test_recognising_lzma_alone_does_not_probe_a_third_of_a_spreadsheet(tmp_path
     A high declared-output ceiling keeps chance 64-bit fields out without excluding a legitimate
     expansion merely because its plaintext is larger than the package carrying it.
     """
-    from flash.env_formats import _looks_like_lzma_alone
+    from flash.envscan.formats import _looks_like_lzma_alone
 
     def _header(properties: int, dictionary: int, declared: int) -> bytes:
         return (
@@ -6471,7 +6471,7 @@ def test_an_overlay_payload_uses_the_same_depth_as_its_standalone_stream(tmp_pat
     """
     import gzip
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     payload = b"harmless plaintext\n"
     for _ in range(4):
@@ -6496,7 +6496,7 @@ def test_trailing_streams_after_bzip2_xz_and_lzma_alone_are_scanned(tmp_path):
     import lzma
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     trailing = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
     control = tmp_path / "trailing.z"
@@ -6523,8 +6523,8 @@ def test_a_large_declared_lzma_expansion_is_still_recognised(tmp_path):
     """
     import lzma
 
-    from flash.env_formats import _looks_like_lzma_alone
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.formats import _looks_like_lzma_alone
+    from flash.envscan.secrets import credential_in_file
 
     target = 268_435_477
     key = f"fslo_{_FAKE_KEY_BODY}".encode()
@@ -6559,7 +6559,7 @@ def test_pdf_encrypt_names_are_limited_to_structural_dictionaries(tmp_path):
     the document-wide regex refused harmless text containing `/Encrypt`; only a trailer or xref
     dictionary may declare that streams are ciphertext and therefore unreadable.
     """
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     encrypted = tmp_path / "encrypted.pdf"
     encrypted.write_bytes(b"%PDF-1.4\ntrailer\n<< /Root 1 0 R /Encrypt 3 0 R >>\n%%EOF\n")
@@ -6584,7 +6584,7 @@ def test_single_quoted_jwk_mappings_are_recognised(tmp_path):
     the two markers remain paired by object scope; admitting a bare `d` field would refuse ordinary
     mappings that are not keys.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     scalar = "AbCdEf0123456789AbCdEf"
     double = tmp_path / "double.json"
@@ -6606,7 +6606,7 @@ def test_embedded_age_armor_requires_and_scans_its_body(tmp_path):
     anchoring at byte zero missed embedded ciphertext. searching for the marker alone would instead
     refuse the readme most likely to explain the format, so a plausible armored body is required.
     """
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     armor = (
         "-----BEGIN AGE ENCRYPTED FILE-----\n"
@@ -6631,7 +6631,7 @@ def test_embedded_age_armor_requires_and_scans_its_body(tmp_path):
 
 def test_an_embedded_native_age_document_is_refused(tmp_path):
     """native age recognition was anchored at byte zero and missed a yaml block scalar."""
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     document = (
         "age-encryption.org/v1\n-> X25519 abcdefghijklmnopqrstuvwxyz012345\nsome ciphertext\n"
@@ -6658,7 +6658,7 @@ def test_indirect_pdf_filter_is_read_only_from_a_stream_dictionary(tmp_path):
     A document-wide regex refused the literal string even though PDF tokenization already skips such
     strings for `/Encrypt`; the same reference in the owning dictionary remains unreadable.
     """
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     def pdf(body: bytes) -> bytes:
         return b"%PDF-1.4\n" + body + b"\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
@@ -6683,7 +6683,7 @@ def test_single_quoted_record_values_do_not_expose_their_braces(tmp_path):
     The tokenizer skipped only double-quoted strings, so the brace closed the object before `d` and
     separated the two markers of a private JWK that the equivalent double-quoted object detects.
     """
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     payload = "AbCdEf0123456789AbCdEf"
     control = tmp_path / "double.json"
@@ -6701,7 +6701,7 @@ def test_single_quoted_record_values_do_not_expose_their_braces(tmp_path):
 
 def test_unix_compress_is_refused_when_lzw_cannot_be_expanded(tmp_path):
     """Unix compress is opaque to the stdlib, so scanning its lzw bytes approved a hidden key."""
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     key = f"fslo_{_FAKE_KEY_BODY}".encode()
     control = tmp_path / "control.txt"
@@ -6733,7 +6733,7 @@ def test_unix_compress_is_refused_when_lzw_cannot_be_expanded(tmp_path):
 
 def test_an_assigned_value_cannot_cross_onto_the_next_mapping_key(tmp_path):
     """Assignment whitespace crossed a newline and adopted an unrelated 40-hex yaml key."""
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = "0123456789abcdef0123456789abcdef01234567"
     control = tmp_path / "control.yaml"
@@ -6751,7 +6751,7 @@ def test_an_assigned_value_cannot_cross_onto_the_next_mapping_key(tmp_path):
 
 def test_shell_quoted_backslashes_are_not_decoded_as_python_escapes(tmp_path):
     """Posix shell quotes keep `\\x`, so python escape decoding invented a credential."""
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = _FAKE_KEY_BODY
     escaped = body[:10] + f"\\x{ord(body[10]):02x}" + body[11:]
@@ -6769,7 +6769,7 @@ def test_a_pdf_dictionary_beyond_the_lookback_is_refused(tmp_path):
     """A flate declaration outside the 64 kib lookback left its stream approved as literal bytes."""
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     packed = zlib.compress((f"fslo_{_FAKE_KEY_BODY}" * 40).encode())
 
@@ -6798,7 +6798,7 @@ def test_a_flate_pdf_inline_image_is_inspected(tmp_path):
     """Inline images use `BI ... ID` rather than object dictionaries, so their zlib bytes were skipped."""
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     packed = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
     control = tmp_path / "control.pdf"
@@ -6817,7 +6817,7 @@ def test_a_flate_pdf_inline_image_is_inspected(tmp_path):
 
 def test_assigned_values_on_following_lines_are_scanned(tmp_path):
     """assignment matching must cross to a value line without adopting the next mapping key."""
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = "0123456789abcdef0123456789abcdef01234567"
     next_key = tmp_path / "next-key.yaml"
@@ -6837,7 +6837,7 @@ def test_inline_images_inside_flate_pdf_streams_are_inspected(tmp_path):
     """inline images inside an inflated page content stream need a second inline-image walk."""
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     packed_key = zlib.compress(f"fslo_{_FAKE_KEY_BODY}".encode())
     inline = b"BI /W 21 /H 1 /CS /G /BPC 8 /F /Fl ID " + packed_key + b" EI\n"
@@ -6861,7 +6861,7 @@ def test_png_compressed_text_chunks_are_decoded(tmp_path):
     import struct
     import zlib
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = f"fslo_{_FAKE_KEY_BODY}".encode()
 
@@ -6918,7 +6918,7 @@ def test_png_iccp_profiles_are_decoded(tmp_path):
     import struct
     import zlib
 
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     def chunk(kind: bytes, payload: bytes) -> bytes:
         return (
@@ -6968,7 +6968,7 @@ def test_cpio_shell_members_preserve_filename_context(tmp_path):
     import shutil
     import subprocess
 
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     if shutil.which("cpio") is None:
         pytest.skip("cpio is not installed")

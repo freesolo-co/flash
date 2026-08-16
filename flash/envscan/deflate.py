@@ -1,6 +1,6 @@
 """Expanding DEFLATE payloads that carry no magic of their own.
 
-Two shapes the magic-based recognition in `flash.env_formats` cannot reach: a headerless RFC 1951
+Two shapes the magic-based recognition in `flash.envscan.formats` cannot reach: a headerless RFC 1951
 stream, which has no header at all, and the compressed streams inside a PDF, which begin after an
 object header rather than at byte zero. Both hold their credential nowhere a pattern can see, so a
 file in either shape published intact while the same payload standing alone was expanded.
@@ -23,8 +23,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO
 
-from flash.env_pdf import pdf_dictionary_spans, pdf_inline_images, pdf_tokens
-from flash.env_png import _PNG_SIGNATURE, _png_text_payloads
+from flash.envscan.pdf import pdf_dictionary_spans, pdf_inline_images, pdf_tokens
+from flash.envscan.png import _PNG_SIGNATURE, _png_text_payloads
 
 # Where a PDF keeps its compressed content, and how many of those streams are expanded. The
 # `/FlateDecode` filter names the encoding, and the `stream` keyword with its mandatory newline
