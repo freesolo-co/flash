@@ -15,7 +15,13 @@ from __future__ import annotations
 import pytest
 
 from flash.core.spec import JobSpec
-from flash.schema import ConfigError, spec_from_dict
+from flash.schema import (
+    _ENVIRONMENT_KEYS,
+    _GPU_KEYS,
+    _TOP_LEVEL_KEYS,
+    ConfigError,
+    spec_from_dict,
+)
 from tests._helpers.specs import raw_spec
 
 # (id, raw-dict override applied to a minimal valid spec, expected error fragment). Each override
@@ -138,3 +144,29 @@ def test_public_spec_round_trips_through_user_parser():
     # rank and its derived alpha survive the public round trip.
     assert reparsed.train.lora_rank == 16
     assert reparsed.train.lora_alpha == 32
+
+
+def test_authored_surface_is_exactly_what_the_public_payload_carries():
+    """What a user may author is what `to_dict()` emits -- one subtraction, not two lists.
+
+    The parser's accept-set and the serializer's strip-set are the same boundary read from opposite
+    sides, so a managed field added to one and forgotten in the other is a field the parser invites a
+    user to set and the serializer then silently drops. Asserted against the PAYLOAD rather than
+    against `MANAGED_TOP_LEVEL_KEYS`: comparing the derived set to the registry it is derived from
+    cannot fail, while comparing it to what the serializer actually emits can.
+    """
+    public = _fully_managed_internal_spec().to_dict()
+    assert set(public) == _TOP_LEVEL_KEYS
+    assert set(public["environment"]) <= _ENVIRONMENT_KEYS
+    assert set(public["gpu"]) <= _GPU_KEYS
+
+
+def test_every_public_payload_key_survives_the_authored_parser():
+    """The derived accept-set has to admit every key the serializer emits, nested ones included.
+
+    A subset check on the sections above passes if the parser accepts MORE than it should; this
+    closes that direction by proving the exact payload re-parses. Without it, widening a derived set
+    would go unnoticed until a real submit.
+    """
+    public = _fully_managed_internal_spec().to_dict()
+    spec_from_dict(public, run_id="flash-managed-run")
