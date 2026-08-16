@@ -123,11 +123,12 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
     # payload travels base64-encoded inside a quoted heredoc, byte-exact
     b64 = script.split("FLASH_PAYLOAD_EOF")[1].strip()
     assert json.loads(base64.b64decode(b64)) == payload
-    # the SHARED instance bootstrap is embedded + run as the container command, with its
-    # redaction sibling next to it
+    # the shared instance bootstrap is embedded and run as the container command, with every
+    # imported sibling next to it.
     assert "FLASH_BOOTSTRAP_EOF" in script
     assert "/root/flash/bootstrap.py" in script
     assert "/root/flash/bootstrap_secrets.py" in script
+    assert "/root/flash/bootstrap_console.py" in script
     # it is genuinely the shared module (a distinctive line only that file has)
     from pathlib import Path
 
@@ -161,6 +162,7 @@ def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch
         "FLASH_PAYLOAD_EOF",
         "FLASH_BOOTSTRAP_EOF",
         "FLASH_BOOTSTRAP_SECRETS_EOF",
+        "FLASH_BOOTSTRAP_CONSOLE_EOF",
         "FLASH_BOOTSTRAP_PIP_EOF",
     ):
         assert f"\n{term}\n" in script, f"{term} terminator must be on its own line"

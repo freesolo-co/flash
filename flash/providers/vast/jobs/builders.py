@@ -168,6 +168,7 @@ def build_onstart(payload: dict) -> str:
     lifecycle_dir = Path(__file__).parent.parent.parent / "_lifecycle"
     bootstrap_src = (lifecycle_dir / "bootstrap.py").read_text()
     bootstrap_secrets_src = (lifecycle_dir / "bootstrap_secrets.py").read_text()
+    bootstrap_console_src = (lifecycle_dir / "bootstrap_console.py").read_text()
     bootstrap_pip_src = (lifecycle_dir / "bootstrap_pip.py").read_text()
     # Vast's args-mode wrapper resets PATH, so `python3` can resolve to the OS python (PEP 668
     # externally-managed), not the image's stack python. Prefer the image's baked interpreter
@@ -197,6 +198,9 @@ FLASH_BOOTSTRAP_EOF
 cat > /root/flash/bootstrap_secrets.py <<'FLASH_BOOTSTRAP_SECRETS_EOF'
 {bootstrap_secrets_src}
 FLASH_BOOTSTRAP_SECRETS_EOF
+cat > /root/flash/bootstrap_console.py <<'FLASH_BOOTSTRAP_CONSOLE_EOF'
+{bootstrap_console_src}
+FLASH_BOOTSTRAP_CONSOLE_EOF
 cat > /root/flash/bootstrap_pip.py <<'FLASH_BOOTSTRAP_PIP_EOF'
 {bootstrap_pip_src}
 FLASH_BOOTSTRAP_PIP_EOF
