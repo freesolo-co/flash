@@ -98,3 +98,32 @@ def test_a_corrupt_archive_does_not_crash_the_publish(tmp_path):
     # refusing is acceptable; crashing the publish is not
     with contextlib.suppress(_Unscannable):
         credential_in_file(path)
+
+
+def test_an_unreadable_tar_remainder_does_not_crash_the_publish(tmp_path, monkeypatch):
+    """A concatenated tar's remainder is read separately, and that read can fail.
+
+    `_read_at` answers None when it cannot read, which the zip prefix and suffix paths both guard
+    against. The tar remainder path called `.startswith` on it directly, so an i/o failure raised
+    `AttributeError` out of a validation check and aborted the publish, where every other
+    unreadable region is a refusal.
+    """
+    from flash import env_archive
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        info = tarfile.TarInfo("a.txt")
+        info.size = 5
+        archive.addfile(info, io.BytesIO(b"hello"))
+    path = tmp_path / "concat.tar"
+    path.write_bytes(buffer.getvalue() + b"TRAILING" * 128)
+
+    real = env_archive._read_at
+
+    def flaky(source, start, size):
+        return None if start > 0 else real(source, start, size)
+
+    monkeypatch.setattr(env_archive, "_read_at", flaky)
+    # refusing is acceptable; an AttributeError out of a validation check is not
+    with contextlib.suppress(_Unscannable):
+        credential_in_file(path)
