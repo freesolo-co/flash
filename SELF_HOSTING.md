@@ -389,6 +389,14 @@ flash serve gpus --model Qwen/Qwen3.5-4B   # what fits where, and what it costs
 flash serve setup --model Qwen/Qwen3.5-4B  # generate, then ask before deploying
 ```
 
+`[serve-modal]` is deliberately light: it installs Modal and its HTTP dependencies but no GPU
+stack, so `modal deploy` can import the generated file on your laptop. vLLM runs only in the GPU
+container, which installs `freesolo-flash[serve-runtime]` pinned to the exact version of the CLI
+that generated the app. That pin is read from installed package metadata rather than hardcoded,
+so a dev-channel CLI generates an app that installs the dev-channel build instead of silently
+falling back to the published one. Regenerate the app after upgrading the CLI if you want the
+GPU container to move with it.
+
 Then put both variables in the **`flash-server` process environment** - not just the shell you
 ran setup in:
 

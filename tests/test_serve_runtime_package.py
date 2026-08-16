@@ -8,7 +8,12 @@ import tomllib
 import zipfile
 from pathlib import Path
 
+from flash.engine.worker.backend_common import TRANSFORMERS_REQUIREMENT
+
 ROOT = Path(__file__).resolve().parents[1]
+# the generated self-hosted app is rendered from this resource at runtime, so a wheel that omits it
+# leaves `flash serve setup` broken on every install that is not an editable checkout.
+TEMPLATE_RESOURCE = "flash/serve/backend/templates/modal_app.py.tmpl"
 RUNTIME_FILES = {
     "flash/serve/runtime/__init__.py",
     "flash/serve/runtime/adapters.py",
@@ -28,7 +33,7 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
     assert project["project"]["dependencies"] == []
     assert extras["serve-runtime"] == [
         "pillow>=11.0.0",
-        "transformers>=5.0.0",
+        TRANSFORMERS_REQUIREMENT,
         "vllm==0.23.0",
     ]
     assert all("serve-runtime" not in dependency for dependency in extras["serve-modal"])
@@ -54,9 +59,30 @@ def test_wheel_contains_runtime_and_declares_extra(tmp_path: Path) -> None:
     with zipfile.ZipFile(wheels[0]) as wheel:
         names = set(wheel.namelist())
         assert names >= RUNTIME_FILES
+        # the template is data, not python, so nothing imports it and a packaging miss would only
+        # surface the first time a user ran `flash serve setup` off a real install.
+        assert TEMPLATE_RESOURCE in names
         metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
         metadata = wheel.read(metadata_name).decode()
 
     assert "Provides-Extra: serve-runtime" in metadata
     assert "Requires-Dist: vllm==0.23.0; extra == 'serve-runtime'" in metadata
     assert "Requires-Dist: vllm==0.19.1; extra == 'gpu'" in metadata
+
+
+def test_the_shipped_template_renders_an_app_that_pins_this_build() -> None:
+    """`render_app()` works from packaged resources and pins the generating distribution.
+
+    reading the template through `importlib.resources` is what an installed wheel does, so this
+    covers the path a user hits rather than the source tree the other tests read directly.
+    """
+    from flash.core.catalog import MODELS
+    from flash.serve.backend.generate import flash_requirement, render_app
+
+    source = render_app(MODELS["Qwen/Qwen3.5-4B"])
+    requirement = flash_requirement()
+    assert f"FLASH_REQUIREMENT = {requirement!r}" in source
+    assert "[serve-runtime]==" in requirement
+    # the app delegates to the runtime, so it must not carry its own vllm engine mechanics.
+    for symbol in ("AsyncEngineArgs", "AsyncLLMEngine", "SamplingParams", "LoRARequest"):
+        assert symbol not in source
