@@ -346,15 +346,12 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         "workload_profile",
     ):
         effective[managed_top] = public.get(managed_top)
-    # the pin value is stripped from every new public spec. a runner-assigned pin is asymmetric by
-    # design, as is an authored pin inherited by a new warm-start child after the public key's removal.
-    # exclude those two cases only. a historical authored source still carries its public revision and
-    # remains structurally compared. both asymmetric shapes are digest-protected: the marker triggers
-    # verification for auto pins, and every warm start verifies its complete preparation snapshot.
-    if not public.get("model_revision") and (
-        worker_spec.model_revision_auto or public.get("train", {}).get("init_from_adapter")
-    ):
-        effective["model_revision"] = public.get("model_revision")
+    # the pin value is stripped from EVERY public spec (`to_dict` drops it), so the worker half
+    # legitimately carries a revision the public half cannot: a runner-assigned pin, or an authored
+    # pin a warm-start child inherited. the asymmetry is therefore unconditional and excluded here.
+    # it stays digest-protected: the auto marker triggers digest verification, and every warm start
+    # verifies its complete preparation snapshot.
+    effective["model_revision"] = public.get("model_revision")
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
     public_ref = public_train.get("init_from_adapter") or ""
