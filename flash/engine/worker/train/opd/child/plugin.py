@@ -23,9 +23,11 @@ PLUGIN_LOADED_EXTERNALLY = __name__ == "flash_opd_plugin"
 _PLUGIN_CONFIG: dict[str, Any] = {}
 
 if PLUGIN_LOADED_EXTERNALLY:
+    from flash_multiturn_glue import multi_modal_image_count
     from flash_opd_multiturn import build_flash_multi_turn_agent_loop
     from flash_opd_structured import StructuredOutputReplay, canonical_structured_spec
 else:
+    from flash.engine.worker.train.core.child.glue import multi_modal_image_count
     from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
     from flash.engine.worker.train.opd.child.structured import (
         StructuredOutputReplay,
@@ -232,26 +234,6 @@ def _run_with_no_signal_replacements(
     raise AssertionError("unreachable no-signal replacement state")
 
 
-def _multi_modal_image_count(multi_modal_data) -> int:
-    if not multi_modal_data:
-        return 0
-    if not isinstance(multi_modal_data, dict):
-        raise TypeError("verl multimodal data must be a mapping")
-    # verl's rollout carries the payload under "image" (singular) for single-image rows and
-    # "images" for lists; count whichever is present.
-    images = multi_modal_data.get("images")
-    if images is None:
-        images = multi_modal_data.get("image")
-    if images is None:
-        return 0
-    if not isinstance(images, (list, tuple)):
-        return 1
-    try:
-        return len(images)
-    except TypeError as error:
-        raise TypeError("verl multimodal images must be a sized collection") from error
-
-
 def _bridge_score_payload(
     index: int,
     prompt_ids: list[int],
@@ -265,7 +247,7 @@ def _bridge_score_payload(
         "index": int(index),
         "prompt_length": len(prompt_ids),
         "sequence_ids": prompt_ids + response_ids,
-        "image_count": _multi_modal_image_count(multi_modal_data),
+        "image_count": multi_modal_image_count(multi_modal_data),
     }
     if forced is not None:
         payload["forced"] = list(forced)

@@ -124,6 +124,31 @@ def _validate_teacher_transport() -> tuple[str, str]:
     return capability, control_panel_url
 
 
+def _prepare_prompt_messages(
+    example: dict,
+    messages: list[dict],
+    *,
+    multi_turn: bool,
+    package_root: str | None,
+) -> tuple[list[dict], tuple[str, ...]]:
+    from flash.content.multimodal import normalize_prompt_images, record_has_images
+
+    if record_has_images(example, messages):
+        normalized = normalize_prompt_images(example, messages, package_root)
+        if multi_turn:
+            _opd_train.validate_transcript_messages(
+                normalized.messages,
+                source="environment initial prompt",
+                allow_content_blocks=True,
+            )
+        return normalized.messages, tuple(normalized.descriptors)
+    if multi_turn:
+        messages = _opd_train.validate_transcript_messages(
+            messages, source="environment initial prompt"
+        )
+    return messages, ()
+
+
 def _prepare_prompts(
     request: _OpdRequest,
     prompt_rows: list[tuple[Any, Any]],
@@ -131,11 +156,7 @@ def _prepare_prompts(
     capability: str,
     control_panel_url: str,
 ) -> _PromptState:
-    from flash.content.multimodal import (
-        image_teacher_prompt_messages,
-        normalize_prompt_images,
-        record_has_images,
-    )
+    from flash.content.multimodal import image_teacher_prompt_messages
     from flash.engine.worker.teacher.client import TeacherClient
 
     teacher = TeacherClient(capability, control_panel_url, request.knobs.teacher_model)
@@ -187,15 +208,14 @@ def _prepare_prompts(
     with _opd_train.liveness_heartbeat("opd_image_prep", progress=lambda: prepped[0]):
         for example, messages in prompt_rows:
             prepped[0] += 1
-            if request.multi_turn:
-                messages = _opd_train.validate_transcript_messages(
-                    messages, source="environment initial prompt"
-                )
-            if record_has_images(example, messages):
+            student_messages, image_descriptors = _prepare_prompt_messages(
+                example,
+                messages,
+                multi_turn=request.multi_turn,
+                package_root=package_root,
+            )
+            if image_descriptors:
                 assert processor is not None
-                normalized = normalize_prompt_images(example, messages, package_root)
-                student_messages = normalized.messages
-                image_descriptors = tuple(normalized.descriptors)
                 teacher_messages = image_teacher_prompt_messages(
                     student_messages, len(image_descriptors)
                 )
@@ -207,9 +227,7 @@ def _prepare_prompts(
                     enable_thinking=bool(_opd_train._w.THINKING),
                 )
             else:
-                student_messages = messages
-                teacher_messages = messages
-                image_descriptors = ()
+                teacher_messages = student_messages
                 if processor is not None:
                     # mixed job: the verl child tokenizes EVERY row through the multimodal dataset
                     # path (the processor), so text-only rows must freeze via the same path or the
@@ -224,7 +242,7 @@ def _prepare_prompts(
                 else:
                     prompt_ids = _opd_train._normalize_prompt_ids(
                         tokenizer.apply_chat_template(
-                            messages,
+                            student_messages,
                             tokenize=True,
                             add_generation_prompt=True,
                             enable_thinking=_opd_train._w.THINKING,

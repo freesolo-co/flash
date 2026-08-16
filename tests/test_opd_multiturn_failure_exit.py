@@ -16,7 +16,16 @@ class _Loop:
     def __init__(self, loop):
         self.loop = loop
 
-    async def apply_chat_template(self, _prompt):
+    # the prompt now goes through the shared media path before any turn runs, so the stub has to
+    # model the three calls the real vllm loop exposes. a text-only prompt carries no media, which
+    # is what these failure-path tests use -- the empty dict is the honest answer, not a shortcut.
+    async def process_multi_modal_info(self, _messages):
+        return {}
+
+    def _get_mm_processor_kwargs(self, _audio_data=None):
+        return {}
+
+    async def apply_chat_template(self, _prompt, **_kwargs):
         return [1, 2]
 
     async def _run_turns(self, *_args, **_kwargs):

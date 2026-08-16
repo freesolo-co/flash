@@ -22,6 +22,7 @@ if __name__ == "flash_grpo_multiturn":
         EnvGlueTokenizer,
         dedup_seam_terminator,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         turn_is_unusable,
@@ -32,6 +33,7 @@ else:
         EnvGlueTokenizer,
         dedup_seam_terminator,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         turn_is_unusable,
@@ -190,63 +192,6 @@ class _EpisodeTranscript:
         self.prefix_ids.extend(glue_ids)
 
 
-class _EpisodePrompt:
-    """the tokenized initial prompt plus the decoded media every generate call must carry.
-
-    an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. both
-    apply_chat_template and every generate call need the decoded media alongside the ids, or the
-    engine sees placeholders it cannot expand and the rollout either dies on a feature/placeholder
-    mismatch or conditions on nothing. text-only prompts yield {}.
-    """
-
-    def __init__(self, multi_modal_data, mm_processor_kwargs, prompt_ids):
-        self.multi_modal_data = multi_modal_data
-        self.mm_processor_kwargs = mm_processor_kwargs
-        self.prompt_ids = prompt_ids
-        self.images = multi_modal_data.get("images")
-        self.videos = multi_modal_data.get("videos")
-        self.audios = multi_modal_data.get("audios")
-
-
-async def _prepare_episode_prompt(loop_self, raw_prompt) -> _EpisodePrompt:
-    """extract the media and render the ids from the ORIGINAL blocks, then validate the transcript.
-
-    ORDER MATTERS, which is why all three steps live in one function rather than as statements a
-    caller could reorder or forget. an image prompt does not arrive as text: verl's RLHFDataset
-    rewrites the parquet's string content into blocks, splitting on the `<image>` placeholder and
-    substituting an image block (rl_dataset.py `_build_messages`), so `raw_prompt` is
-    [{"type": "image", ...}, {"type": "text", ...}] for exactly the rows flash writes for a
-    multimodal job. the media has to come out of those ORIGINAL blocks first, or the pixels are gone
-    by the time the rollout asks for them -- and validating first would reject the block shape
-    outright, which is how multi-turn image rollouts died before the order was pinned here.
-
-    the media extraction and the chat template both read those original blocks: the pixels live in
-    the image/video/audio blocks, and the template needs them in place to emit the placeholder
-    tokens the decoded pixels expand into.
-
-    the validation is a GATE, not a value: this loop generates from `prompt_ids`, so the flattened
-    text is discarded. it still runs, because it is what rejects a transcript this loop cannot
-    represent (unsupported blocks, tool-call metadata) before the episode is paid for. blocks are
-    permitted in that check precisely because the steps above already hold the media and the
-    block-rendered ids.
-    """
-    messages = [dict(message) for message in raw_prompt]
-    multi_modal_data = await loop_self.process_multi_modal_info(messages)
-    images = multi_modal_data.get("images")
-    videos = multi_modal_data.get("videos")
-    audios = multi_modal_data.get("audios")
-    mm_processor_kwargs = loop_self._get_mm_processor_kwargs(audios)
-    prompt_ids = await loop_self.apply_chat_template(
-        messages,
-        images=images,
-        videos=videos,
-        audios=audios,
-        mm_processor_kwargs=mm_processor_kwargs,
-    )
-    validate_transcript_messages(messages, source="initial prompt", allow_content_blocks=True)
-    return _EpisodePrompt(multi_modal_data, mm_processor_kwargs, prompt_ids)
-
-
 class _EpisodeSettings:
     """the per-run rollout settings the parent hands the child through the environment.
 
@@ -352,7 +297,7 @@ async def _grpo_run(
     agent_loop_output,
     **kwargs,
 ):
-    prompt = await _prepare_episode_prompt(self, kwargs["raw_prompt"])
+    prompt = await prepare_episode_prompt(self, kwargs["raw_prompt"])
     prompt_ids = prompt.prompt_ids
     mm_processor_kwargs = prompt.mm_processor_kwargs
     settings = _EpisodeSettings()
