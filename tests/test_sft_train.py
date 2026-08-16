@@ -3325,6 +3325,68 @@ def _publishing_watcher(monkeypatch, tmp_path, *, steps, required_steps):
     return watcher, published
 
 
+def test_a_failed_optional_publish_is_not_credited_as_a_durable_deployable(monkeypatch, tmp_path):
+    """returning None must not become a published fact.
+
+    `publish_deployable_checkpoint` returns None for a best-effort publish that failed and for a
+    directory holding no adapter; it raises instead of returning None when the save is required. So
+    the only way to credit an artifact that was never written is an optional publish, and the ledger
+    has to gate on the returned subfolder rather than on the call having returned at all.
+
+    The consequence is not cosmetic: `sft_train` suppresses the end-of-run final publish for any
+    step in `deployable_published_steps` (sft_train.py:633). Crediting a failed optional publish of
+    the final step therefore SKIPS the final publish, and a run ends with no servable adapter while
+    reporting success.
+
+    The sibling coalescing test cannot catch this -- its publish mock returns a subfolder, so the
+    guard is never exercised with a falsy return. Verified by mutation: deleting the `if published:`
+    guard leaves the whole sft/grpo/opd suite green and fails only this test.
+    """
+    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+
+    local_dir = tmp_path / "ckpt"
+    checkpoint_dir = local_dir / "global_step_7"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    # the best-effort failure shape: swallowed the error and published nothing.
+    monkeypatch.setattr(
+        sft_checkpoints._w, "publish_deployable_checkpoint", lambda adapter, step, **kw: None
+    )
+    monkeypatch.setattr(
+        sft_checkpoints._w,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (
+            kwargs["before_upload"](),
+            kwargs["after_upload"](),
+            True,
+        )[2],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+    )
+    watcher._publish(7, str(checkpoint_dir))
+
+    assert watcher.lifecycle.deployable_published_steps == set(), (
+        "a publish that returned None was credited as a durable deployable"
+    )
+    # the resume state genuinely landed, so that fact stays true: the two artifacts are independent
+    # trees and a failed adapter publish says nothing about the full-state upload.
+    assert watcher.lifecycle.facts(7).resume_uploaded
+    assert watcher.lifecycle.facts(7).discovered
+
+
 def test_watcher_run_coalesces_an_optional_backlog(monkeypatch, tmp_path):
     watcher, published = _publishing_watcher(
         monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=()
@@ -3450,7 +3512,7 @@ def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):
 
     `_OpdVerlCheckpointWatcher` subclasses the sft watcher, so a cleanup placed in a shared method
     would silently reach it. Both siblings hand their export to something that runs LATER -- rl
-    republishes from `staged_steps` on a subsequent sweep, opd passes `adapter_dir` into
+    republishes from `staged_adapters` on a subsequent sweep, opd passes `adapter_dir` into
     `_stage_retry_contract` -- so for them the directory is live state, not garbage. The sft path is
     safe to clear precisely because it has no such consumer.
 
@@ -3520,7 +3582,7 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     """the rl half of the same contract, driven across the two sweeps that actually span it.
 
     The rl uploader stages an adapter on the sweep a checkpoint appears and publishes it on a LATER
-    one, once the gradient gate opens -- `staged_steps` carries the path between them. That gap is
+    one, once the gradient gate opens -- `staged_adapters` carries the path between them. That gap is
     the whole reason the sft deletion cannot be lifted into shared code.
 
     The gate is what opens the gap, so the test has to close it. An earlier version passed
