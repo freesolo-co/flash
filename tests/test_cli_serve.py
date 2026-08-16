@@ -628,6 +628,39 @@ def test_status_never_sends_the_serving_key_to_another_origin(same_origin):
             server.server_close()
 
 
+def test_the_authenticated_probe_waits_as_long_as_the_control_plane_does(monkeypatch):
+    """The probe timeout must match the control plane's own per-request ceiling.
+
+    An authenticated probe wakes a scaled-to-zero backend, so a tighter bound here reports
+    `unreachable` for a backend `flash/serve/deploy.py` would have waited for and reached. The
+    expected value is read from that module rather than hardcoded, so the two cannot drift apart
+    without this failing.
+    """
+    import inspect
+    import re
+
+    import flash.serve.deploy as deploy_mod
+    import flash.serve.probe as probe_mod
+
+    source = inspect.getsource(deploy_mod._serving_request)
+    ceiling = float(re.search(r"timeout = ([\d.]+) if timeout_s is None", source).group(1))
+    assert ceiling == probe_mod.PROBE_TIMEOUT_SECONDS
+
+    seen: dict[str, object] = {}
+
+    class _Opener:
+        def open(self, request, timeout=None):
+            seen["timeout"] = timeout
+            raise urllib.error.HTTPError(request.full_url, 404, "nope", {}, None)
+
+    monkeypatch.setattr(probe_mod.urllib.request, "build_opener", lambda *a: _Opener())
+    probe_mod.request_json("https://acme.modal.run", {})
+    assert seen["timeout"] == ceiling, (
+        f"the probe used {seen['timeout']}s against a {ceiling}s control-plane ceiling; a cold "
+        "backend the control plane reaches would be reported unreachable"
+    )
+
+
 def test_the_printed_key_is_kept_where_the_user_can_send_it_back(monkeypatch, capsys):
     """Both key-setup paths must generate into a variable, not inline into `modal secret create`.
 

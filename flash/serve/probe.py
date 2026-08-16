@@ -13,6 +13,10 @@ from flash.serve.urls import displayable_url, url_origin
 
 HEALTHZ_STARTUP_BUDGET_SECONDS = 90.0
 HEALTHZ_RETRY_DELAY_SECONDS = 5.0
+# matches the control plane's own per-request ceiling (flash/serve/deploy.py). an authenticated
+# probe wakes a scaled-to-zero backend, so a tighter bound here reports "unreachable" for a
+# backend the control plane would have waited for and reached.
+PROBE_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -45,7 +49,7 @@ def request_json(url: str, headers: dict[str, str], path: str = "/healthz") -> P
     opener = urllib.request.build_opener(_SameOriginRedirect)
     request = urllib.request.Request(f"{url}{path}", headers=headers, method="GET")
     try:
-        with opener.open(request, timeout=30) as response:
+        with opener.open(request, timeout=PROBE_TIMEOUT_SECONDS) as response:
             return ProbeResult(status_code=response.status, payload=json.load(response))
     except urllib.error.HTTPError as exc:
         try:
