@@ -96,7 +96,10 @@ class _DeferredFinder:
         self.active_targets: set[str] = set()
 
     def register(self, target: str, apply) -> None:
+        """queue a callback and arm this finder, without importing the target."""
         self.pending.setdefault(target, []).append(apply)
+        if self not in sys.meta_path:
+            sys.meta_path.insert(0, self)
 
     def find_spec(self, fullname, path=None, target=None):
         if fullname not in self.pending:
@@ -128,11 +131,8 @@ class _DeferredFinder:
             self.active_targets.discard(target)
             if not self.pending.get(target):
                 self.pending.pop(target, None)
-            self._prune()
-
-    def _prune(self) -> None:
-        if not self.pending:
-            self.uninstall()
+            if not self.pending:
+                self.uninstall()
 
     def uninstall(self) -> None:
         sys.meta_path[:] = [finder for finder in sys.meta_path if finder is not self]
@@ -161,13 +161,13 @@ def _arm_deferred(
                 traceback.print_exc()
 
     loaded = sys.modules.get(target)
+    # a target that is mid-drain is already in sys.modules, so applying here would
+    # jump the queue. register instead and let the active drain pick it up in order.
     if loaded is not None and target not in _DEFERRED_FINDER.active_targets:
         apply(loaded)
         return
 
     _DEFERRED_FINDER.register(target, apply)
-    if _DEFERRED_FINDER not in sys.meta_path:
-        sys.meta_path.insert(0, _DEFERRED_FINDER)
 
 
 def install_deferred_required(
