@@ -108,6 +108,26 @@ class CheckpointLedger:
         """This step's policy gave up on further progress; earlier facts stay true."""
         self._mark(step, failed=True)
 
+    def seed_resumed_step(
+        self, resume_step: int, required_steps: frozenset[int] | set[int]
+    ) -> None:
+        """Record what the attempt being resumed from already made durable.
+
+        The restored checkpoint lands in ``local_dir`` as ``global_step_N`` with the tracker
+        pointing at it, so an unseeded watcher treats it as pending on its first sweep and re-runs
+        the merge and the multi-GB resume upload for state the artifact store already holds.
+
+        A required step is deliberately NOT claimed as discovered: the previous attempt may have
+        uploaded resume state while a gradient gate withheld its deployable adapter, and this
+        watcher must still stage and publish that adapter. The deployable is a separate artifact
+        and is credited only by a caller that confirmed it, never inferred from the step counter.
+        """
+        if not resume_step:
+            return
+        self.mark_resume_uploaded(resume_step)
+        if resume_step not in required_steps:
+            self.mark_discovered(resume_step)
+
     @property
     def discovered_steps(self) -> set[int]:
         """Steps already claimed, for filtering the next sweep."""

@@ -96,6 +96,33 @@ def test_crediting_a_remote_deployable_does_not_claim_the_step():
     assert not ledger.facts(5).discovered
 
 
+def test_seeding_a_resumed_required_step_leaves_it_discoverable():
+    """the rule all three publishers share, asserted once where it now lives.
+
+    a required step must NOT be claimed by seeding: the previous attempt may have uploaded resume
+    state while a gradient gate withheld its deployable adapter, and this worker still has to stage
+    and publish that adapter. claiming it would filter it out of the first sweep and the run would
+    end owing a servable artifact it never wrote.
+    """
+    required = CheckpointLedger()
+    required.seed_resumed_step(40, frozenset({40}))
+
+    assert required.facts(40).resume_uploaded, "hf holds the state this attempt restored from"
+    assert not required.facts(40).discovered, "a required step must stay visible to the first sweep"
+    assert not required.facts(40).deployable_published, "seeding never infers a published adapter"
+
+    # an optional step has nothing further owed, so claiming it stops a pointless multi-GB re-upload.
+    optional = CheckpointLedger()
+    optional.seed_resumed_step(40, frozenset({80}))
+    assert optional.facts(40).discovered
+
+    # no resume step means nothing was restored, so nothing may be asserted about step 0.
+    fresh = CheckpointLedger()
+    fresh.seed_resumed_step(0, frozenset())
+    assert fresh.discovered_steps == set()
+    assert not fresh.facts(0).resume_uploaded
+
+
 def test_missing_deployables_reports_ascending_and_ignores_extra_published_steps():
     ledger = CheckpointLedger()
     ledger.mark_deployable_published(9)

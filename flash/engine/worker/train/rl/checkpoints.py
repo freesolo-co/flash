@@ -68,13 +68,7 @@ class _VerlResumeUploader:
         self.local_dir = local_dir
         self.required_steps = frozenset(required_steps)
         self.lifecycle = CheckpointLedger()
-        # seed the resumed step's resume state because hf already has it, but do not claim a required
-        # step as discovered: a prior worker may have uploaded resume state while the gradient gate
-        # withheld its deployable adapter, which this worker must still stage and publish.
-        if resume_step:
-            self.lifecycle.mark_resume_uploaded(resume_step)
-            if resume_step not in self.required_steps:
-                self.lifecycle.mark_discovered(resume_step)
+        self.lifecycle.seed_resumed_step(resume_step, self.required_steps)
         # attempted, NOT uploaded: a step joins this before the upload call so a permanently failing
         # upload cannot respin every 0.5s. durability is the ledger's resume_uploaded fact, which is
         # recorded from the transport's own callback.

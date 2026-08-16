@@ -325,14 +325,16 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
 
         def publish_required_adapter() -> None:
             if step in self.required_steps:
-                published = _w.publish_deployable_checkpoint(
+                # opd publishes only required steps, and a required publish raises rather than
+                # returning None, so reaching the next line IS the durable fact. sft needs a
+                # returned-subfolder check because its `required` varies per step.
+                _w.publish_deployable_checkpoint(
                     adapter_dir,
                     step,
                     required=True,
                     _provenance_ready=True,
                 )
-                if published:
-                    self.lifecycle.mark_deployable_published(step)
+                self.lifecycle.mark_deployable_published(step)
 
         def record_resume_upload() -> None:
             # runs only after the folder commit and its prune land, which the return value does not

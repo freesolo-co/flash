@@ -141,21 +141,13 @@ def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: i
 def _seed_resume_lifecycle(watcher, required_steps: tuple[int, ...], resume_step: int) -> None:
     """record what a previous attempt already made durable, before the watcher's first sweep.
 
-    the staged resume checkpoint lands in local_dir as ``global_step_N`` with the tracker pointing
-    at it, so an unseeded watcher sees it as pending on its first sweep and re-runs the merger and
-    the multi-GB resume upload for state hf already holds.
-
-    the two facts are seeded separately because they are separately true. hf demonstrably holds the
-    resume state -- this attempt restored from it. the deployable is a different artifact: the prior
-    attempt's publish was best-effort for a periodic save, so a required step is credited only when
-    ``_durable_required_save_steps`` finds its adapter on hf. a required step whose adapter is
-    missing stays undiscovered, so this watcher stages and publishes it without re-uploading the
-    full state hf already has.
+    the resume-state half of this is the shared rule and lives on the ledger. what stays here is the
+    part only sft and opd can answer: the prior attempt's deployable publish was best-effort for a
+    periodic save, so a required step is credited only when ``_durable_required_save_steps`` finds
+    its adapter on hf. a required step whose adapter is missing stays undiscovered, so this watcher
+    stages and publishes it without re-uploading the full state hf already has.
     """
-    if resume_step:
-        watcher.lifecycle.mark_resume_uploaded(resume_step)
-        if resume_step not in required_steps:
-            watcher.lifecycle.mark_discovered(resume_step)
+    watcher.lifecycle.seed_resumed_step(resume_step, frozenset(required_steps))
     for step in _durable_required_save_steps(required_steps, resume_step):
         watcher.lifecycle.mark_deployable_published(step)
         watcher.lifecycle.mark_discovered(step)
