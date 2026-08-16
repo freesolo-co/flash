@@ -5,7 +5,14 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections.abc import Mapping
+from typing import Any
 
+from flash.adapters.fused_experts import (
+    has_complete_fused_expert_tensors,
+    lora_target_parameters,
+    validate_fused_expert_adapter_config,
+)
 from flash.adapters.lora_rank import resolve_adapter_ref
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.worker.io.hf import (
@@ -17,35 +24,23 @@ from flash.engine.worker.io.hf import (
 )
 from flash.engine.worker.model.lora import (
     _read_adapter_tensor_keys,
+    _read_adapter_tensor_metadata,
 )
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 
 _ADAPTER_DOWNLOAD_RETRIES = 4
 _ADAPTER_DOWNLOAD_BACKOFF_S = 5.0
-_QWEN35_EXPERT_TARGET_PARAMETERS = (
-    "mlp.experts.gate_up_proj",
-    "mlp.experts.down_proj",
-)
 
 
-def lora_target_parameters(model_id: str | None) -> list[str] | None:
-    """return direct parameter targets required by the model's fused expert layout."""
-    if model_id == "Qwen/Qwen3.6-35B-A3B":
-        return list(_QWEN35_EXPERT_TARGET_PARAMETERS)
-    return None
-
-
-def validate_lora_target_parameters(config: dict, model_id: str) -> None:
-    """fail closed when a warm-start adapter omits required fused expert parameters."""
-    required = set(lora_target_parameters(model_id) or ())
-    if not required:
+def validate_warmstart_adapter(config: Mapping[str, Any], model_id: str, adapter_dir: str) -> None:
+    """Validate a downloaded warm-start adapter without changing its config or files."""
+    validate_fused_expert_adapter_config(config, model_id)
+    if not lora_target_parameters(model_id):
         return
-    actual = set(config.get("target_parameters") or ())
-    missing = sorted(required - actual)
-    if missing:
+    tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
+    if not has_complete_fused_expert_tensors(tensors, config, model_id):
         raise ValueError(
-            f"warm-start adapter for {model_id} omits required expert targets {missing}; "
-            "retrain the source adapter with the current Flash version"
+            f"warm-start adapter for {model_id} does not contain complete fused expert LoRA weights"
         )
 
 

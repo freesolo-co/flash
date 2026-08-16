@@ -95,9 +95,9 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
             f"{describe_structured_outputs(structured_outputs)}"
         )
     # stop_sequences: on the retired trl backend these ride generation_kwargs["stop"] into vllm's
-    # SamplingParams. verl builds its sampling params without a stop field, so a sitecustomize shim
-    # inserts the key; see render_stop_sequences_shim. note grpo_mask_truncated_completions below
-    # gates itself OFF when stop_sequences is set, on either backend.
+    # SamplingParams. verl builds its sampling params without a stop field, so the deferred child
+    # plugin inserts the key. note grpo_mask_truncated_completions below gates itself OFF when
+    # stop_sequences is set, on either backend.
     stop_sequences = (
         tuple(str(s) for s in (getattr(train_spec, "stop_sequences", ()) or ()))
         if train_spec
@@ -105,8 +105,8 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
     )
     # per-turn credit is equivalent to per-episode credit for a single-turn env, so accept it there.
     # on multi-turn, centre each turn against sibling turns and rewrite the stock advantage tensor;
-    # the agent loop records token spans and the bridge returns per-turn rewards. see
-    # render_per_turn_credit_shim.
+    # the agent loop records token spans and the bridge returns per-turn rewards through the deferred
+    # child plugin.
     credit_assignment = (
         getattr(train_spec, "credit_assignment", DEFAULT_CREDIT_ASSIGNMENT) if train_spec else None
     )
@@ -172,7 +172,7 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
 def _resolve_warmstart_config(train_spec, model_id, adapter_path, lora_rank, lora_alpha):
     with open(os.path.join(adapter_path, "adapter_config.json")) as f:
         source_config = json.load(f)
-    _w.validate_lora_target_parameters(source_config, model_id)
+    _w.validate_warmstart_adapter(source_config, model_id, adapter_path)
     # a patterned adapter trains some modules at higher rank than the base `r`; verl allocates
     # one uniform rank, so it must cover the MAXIMUM prepared rank or the load truncates.
     ranks = [int(source_config.get("r", lora_rank))]
