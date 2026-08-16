@@ -17,6 +17,7 @@ from flash.serve.runtime import (
     EngineConfig,
     EngineDeadError,
     GenerationRequest,
+    RuntimeNotReadyError,
     StreamDelta,
     StreamFinished,
     StreamReady,
@@ -376,10 +377,11 @@ def test_stream_trusts_pinned_delta_output_and_counts_chunks() -> None:
     asyncio.run(runtime.start())
     engine = _Engine.latest
     assert engine is not None
+    # no delta reports a cache count, so the finished event must report cache state as unreported.
     engine.responses.append(
         [
-            _output("he", [1], prompt_tokens=4),
-            _output("llo", [2, 3], prompt_tokens=4, finish_reason=None),
+            _output("he", [1], prompt_tokens=4, cached_tokens=None),
+            _output("llo", [2, 3], prompt_tokens=4, cached_tokens=None, finish_reason=None),
             _output("!", [4], prompt_tokens=4, cached_tokens=None),
         ]
     )
@@ -398,6 +400,90 @@ def test_stream_trusts_pinned_delta_output_and_counts_chunks() -> None:
     assert final.cached_tokens == 0
     assert final.cached_tokens_reported is False
     assert engine.generate_calls[0]["sampling"].kwargs["output_kind"] == "delta"
+    asyncio.run(runtime.close())
+
+
+def _delta_without_prompt_metadata(text: str, token_ids: list[int], finish_reason: str | None):
+    """a delta carrying no prompt or cache metadata, as vllm emits after the first one."""
+    return SimpleNamespace(
+        outputs=[
+            SimpleNamespace(text=text, token_ids=token_ids, finish_reason=finish_reason),
+        ],
+    )
+
+
+def test_stream_accounting_reads_metadata_from_the_first_reporting_delta() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    # vllm reports prompt and cache metadata on the first delta only; later deltas omit it.
+    engine.responses.append(
+        [
+            _output("he", [1], prompt_tokens=7, cached_tokens=5, finish_reason=None),
+            _delta_without_prompt_metadata("llo", [2, 3], None),
+            _delta_without_prompt_metadata("!", [4], "stop"),
+        ]
+    )
+
+    async def collect():
+        return [event async for event in runtime.stream(GenerationRequest(prompt="hello"))]
+
+    events = asyncio.run(collect())
+    final = events[-1]
+    assert isinstance(final, StreamFinished)
+    assert final.text == "hello!"
+    assert final.finish_reason == "stop"
+    assert final.prompt_tokens == 7
+    assert final.cached_tokens == 5
+    assert final.cached_tokens_reported is True
+    assert final.completion_tokens == 4
+    asyncio.run(runtime.close())
+
+
+def test_stream_requires_some_delta_to_report_prompt_tokens() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append(
+        [
+            _delta_without_prompt_metadata("he", [1], None),
+            _delta_without_prompt_metadata("llo", [2], "stop"),
+        ]
+    )
+
+    async def collect():
+        return [event async for event in runtime.stream(GenerationRequest(prompt="hello"))]
+
+    with pytest.raises(RuntimeNotReadyError, match="expanded prompt token count"):
+        asyncio.run(collect())
+    asyncio.run(runtime.close())
+
+
+def test_stop_sequences_reach_sampling_params_in_both_paths() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append([_output("hi", [1])])
+    asyncio.run(runtime.generate(GenerationRequest(prompt="hello", stop=["END", "STOP"])))
+    assert engine.generate_calls[0]["sampling"].kwargs["stop"] == ["END", "STOP"]
+
+    engine.responses.append([_output("hi", [1])])
+
+    async def collect():
+        return [
+            event async for event in runtime.stream(GenerationRequest(prompt="hello", stop="DONE"))
+        ]
+
+    asyncio.run(collect())
+    assert engine.generate_calls[1]["sampling"].kwargs["stop"] == ["DONE"]
+
+    # absent stop sequences must reach vllm as none, not as an empty list.
+    engine.responses.append([_output("hi", [1])])
+    asyncio.run(runtime.generate(GenerationRequest(prompt="hello")))
+    assert engine.generate_calls[2]["sampling"].kwargs["stop"] is None
     asyncio.run(runtime.close())
 
 

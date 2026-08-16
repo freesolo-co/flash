@@ -43,9 +43,18 @@ class _StreamState:
     token_ids: list[int]
     text: str = ""
     final_output: Any = None
+    prompt_tokens: int | None = None
+    cached_tokens: int = 0
+    cached_reported: bool = False
 
     def consume(self, request_output: Any) -> str:
         self.final_output = request_output
+        # under delta output vllm reports prompt and cache metadata on the first delta only, so
+        # keep the first values seen instead of reading them off the last one.
+        if self.prompt_tokens is None:
+            self.prompt_tokens = _optional_prompt_tokens(request_output)
+        if not self.cached_reported:
+            self.cached_tokens, self.cached_reported = _cached_token_state(request_output)
         output = _single_sequence(request_output)
         chunk_ids = [int(value) for value in (getattr(output, "token_ids", None) or [])]
         self.token_ids.extend(chunk_ids)
@@ -59,6 +68,18 @@ def _single_sequence(request_output: Any) -> Any:
     if not isinstance(outputs, list | tuple) or len(outputs) != 1:
         raise RuntimeNotReadyError("vllm must return exactly one output sequence")
     return outputs[0]
+
+
+def _optional_prompt_tokens(request_output: Any) -> int | None:
+    """prompt token count when this output reports one, else none.
+
+    a delta that omits prompt metadata is expected rather than invalid, but a delta that reports
+    an unusable value is still an error.
+    """
+    prompt_token_ids = getattr(request_output, "prompt_token_ids", None)
+    if prompt_token_ids is None and getattr(request_output, "num_prompt_tokens", None) is None:
+        return None
+    return _num_prompt_tokens(request_output)
 
 
 def _num_prompt_tokens(request_output: Any) -> int:
@@ -460,6 +481,8 @@ class VllmLoraRuntime:
             top_p=request.top_p,
             output_kind=output_kind,
             structured_outputs=structured.params,
+            # pass none rather than an empty list so vllm keeps its own default.
+            stop=list(request.stop) or None,
         )
 
     async def _prepare_prompt(
@@ -506,7 +529,8 @@ class VllmLoraRuntime:
         if state.final_output is None:
             raise RuntimeNotReadyError("vllm returned no output")
         sequence = _single_sequence(state.final_output)
-        cached_tokens, cached_reported = _cached_token_state(state.final_output)
+        if state.prompt_tokens is None:
+            raise RuntimeNotReadyError("vllm did not report the expanded prompt token count")
         return StreamFinished(
             request_id=request_id,
             runtime_id=self.runtime_id,
@@ -514,10 +538,10 @@ class VllmLoraRuntime:
             incarnation=adapter.incarnation if adapter is not None else None,
             text=state.text,
             finish_reason=getattr(sequence, "finish_reason", None),
-            prompt_tokens=_num_prompt_tokens(state.final_output),
+            prompt_tokens=state.prompt_tokens,
             completion_tokens=len(state.token_ids),
-            cached_tokens=cached_tokens,
-            cached_tokens_reported=cached_reported,
+            cached_tokens=state.cached_tokens,
+            cached_tokens_reported=state.cached_reported,
             duration_seconds=time.perf_counter() - started,
             thinking=thinking,
         )

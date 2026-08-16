@@ -135,6 +135,24 @@ def test_generation_request_requires_exactly_one_prompt_form() -> None:
         GenerationRequest(adapter_id="adapter", prompt="x")
 
 
+def test_stop_sequences_normalize_to_a_tuple() -> None:
+    # none and an empty sequence both mean "no stop sequences".
+    assert GenerationRequest(prompt="x").stop == ()
+    assert GenerationRequest(prompt="x", stop=None).stop == ()
+    assert GenerationRequest(prompt="x", stop=[]).stop == ()
+    # a bare string is one sequence, not one entry per character.
+    assert GenerationRequest(prompt="x", stop="END").stop == ("END",)
+    assert GenerationRequest(prompt="x", stop=["a", "b"]).stop == ("a", "b")
+    assert GenerationRequest(prompt="x", stop=("a", "b")).stop == ("a", "b")
+    assert GenerationRequest(prompt="x", stop=[" pad "]).stop == ("pad",)
+
+
+@pytest.mark.parametrize("value", ["", "   ", ["ok", ""], ["ok", "  "], [1], ["ok", None], 7, {}])
+def test_stop_sequences_reject_unusable_values(value) -> None:
+    with pytest.raises(RuntimeConfigurationError):
+        GenerationRequest(prompt="x", stop=value)
+
+
 def test_structured_outputs_normalization_and_explicit_off() -> None:
     assert normalize_structured_outputs(SCHEMA) == {"json": SCHEMA}
     assert normalize_structured_outputs("json_object") == {"json_object": True}

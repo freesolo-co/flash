@@ -59,6 +59,17 @@ def _require_int(value: Any, name: str, *, minimum: int) -> int:
     return value
 
 
+def _normalize_stop(value: Any, name: str) -> tuple[str, ...]:
+    # a bare string is one stop sequence, not a sequence of single characters.
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (_nonempty(value, name),)
+    if not isinstance(value, Sequence):
+        raise RuntimeConfigurationError(f"{name} must be a string or a sequence of strings")
+    return tuple(_nonempty(entry, name) for entry in value)
+
+
 def _require_finite_number(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise RuntimeConfigurationError(f"{name} must be a finite number")
@@ -206,6 +217,7 @@ class GenerationRequest:
     thinking: bool | None = None
     chat_template_kwargs: Mapping[str, Any] = field(default_factory=dict)
     structured_outputs: Any = None
+    stop: Any = None
 
     def __post_init__(self) -> None:
         if self.adapter_id is not None:
@@ -261,6 +273,8 @@ class GenerationRequest:
         object.__setattr__(
             self, "structured_outputs", normalize_structured_outputs(self.structured_outputs)
         )
+        # an empty sequence and none both mean "no stop sequences", so they normalize together.
+        object.__setattr__(self, "stop", _normalize_stop(self.stop, "stop"))
 
 
 @dataclass(frozen=True, slots=True)
