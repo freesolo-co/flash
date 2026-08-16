@@ -281,7 +281,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
             "completion-only fallback because the rendered transcript was not parseable ChatML; "
             "interleaved observations are not proven masked"
         )
-    elif not multiturn_targets and getattr(options.env, "multi_turn", False):
+    if not multiturn_targets and getattr(options.env, "multi_turn", False):
         print(
             "[sft][warn] this is a multi-turn environment but no row ships a multi-turn "
             "target completion"
