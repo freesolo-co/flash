@@ -15,6 +15,13 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from flash.env_secrets import (
+    _MAX_DECOMPRESS_SECONDS,
+    _redacted,
+    _Unscannable,
+    credential_in_name,
+    reject_credential_bearing_package,
+)
 from flash.envs.loader import _github_token
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
@@ -30,6 +37,7 @@ _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_DOWNLOAD_BYTES = _MAX_UNCOMPRESSED_BYTES
 _MAX_MEMBERS = ARCHIVE_MEMBER_LIMIT
 _MAX_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
+_MAX_ENV_NAME_CHARS = 1024
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
@@ -388,6 +396,22 @@ def _github_publish_once(
             _push_environment_commit(checkout=checkout, token=token)
 
 
+def _reject_credential_slug_segments(*segments: str) -> None:
+    """Refuse credential-bearing resolved path segments under one shared scan deadline."""
+    deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
+    for segment in segments:
+        try:
+            kind = credential_in_name(segment, deadline=deadline)
+        except _Unscannable as exc:
+            raise EnvPublishError(
+                f"env destination {exc}, so it cannot be checked for credentials"
+            ) from None
+        if kind:
+            raise EnvPublishError(
+                f"env destination contains {kind}; rotate it and use different path segments"
+            )
+
+
 def _github_publish(
     dest: Path,
     *,
@@ -403,6 +427,7 @@ def _github_publish(
         )
     repo = _DEFAULT_GITHUB_REPO
     ns, project, clean = publish_slug_for_name(name, key, project_slug)
+    _reject_credential_slug_segments(ns, project, clean)
     publish_root = f"{ns}/{project}/{clean}"
     if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
         raise EnvPublishError("env package must contain environment.py")
@@ -448,6 +473,9 @@ def validate_publish_inputs(*, package_b64: object, name: object) -> bytes:
         raise EnvPublishError("env package must be a base64 string")
     if not name:
         raise EnvPublishError("missing env name")
+    if len(name) > _MAX_ENV_NAME_CHARS:
+        raise EnvPublishError(f"env name is too long (limit {_MAX_ENV_NAME_CHARS} characters)")
+    _reject_credential_name(name)
     max_encoded = ((_MAX_UPLOAD_BYTES + 2) // 3) * 4 + 3
     if len(package_b64) > max_encoded:
         raise EnvPublishError(
@@ -480,7 +508,109 @@ def publish_package(
     with tempfile.TemporaryDirectory(prefix="flash-env-publish-") as tmp:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)
+        _reject_credentials(dest)
         return _github_publish(dest, name=name, key=key, project_slug=project_slug)
+
+
+def _published_forms(name: str) -> list[str]:
+    """The strings a publish of `name` would actually write, raw input included.
+
+    The NORMALIZED form has to be scanned, not just the raw one, because normalization is what
+    reaches the hub: it folds separators, so a name the patterns reject can become one they match.
+    `fslo_abcd1!efgh!ijkl!mnop` carries no key body across the `!`s and passed, then normalized to
+    `fslo_abcd1-efgh-ijkl-mnop`, which IS a Freesolo key -- and that is the string committed into
+    the hub path and the commit message.
+
+    A qualified `namespace/project/name` is normalized SEGMENT BY SEGMENT, because that is how
+    `publish_slug_for_name` writes it: the separators survive as directory boundaries, so no token
+    spans them. Folding the whole id into one string welded unrelated segments into a credential
+    nobody published -- `acme/fslo_/AbCdEf0123456789` became `acme-fslo_-abcdef0123456789` and was
+    refused as a Freesolo key, while the publish writes `acme/fslo_/abcdef0123456789`, in which no
+    key is contiguous. Scanning a string the publish never writes rejects a legitimate name.
+    """
+    parts = [part.strip() for part in name.split("/")]
+    # Only a well-formed qualified id is split. Anything else keeps the whole-string normalization,
+    # so a name that merely CONTAINS slashes cannot use one to hide a key from the fold.
+    segments = parts if len(parts) == 3 and all(parts) else [name]
+    # The raw input is scanned whole and the segments only NORMALIZED: a credential contiguous in
+    # a raw segment is contiguous in the raw name too, so scanning raw segments separately would
+    # re-scan what the first form already covers, and each scan may decode and inflate.
+    return list(dict.fromkeys([name, *(_sanitize_name(segment) for segment in segments)]))
+
+
+def _reject_credential_name(name: str) -> None:
+    """Refuse a publish whose NAME carries a credential.
+
+    The name is scanned as well as the package. It becomes the hub path and the commit message, so
+    a credential passed as the environment name is published just as permanently as one in a file
+    -- and it never reaches `_reject_credentials`, which only ever sees the extracted tree.
+
+    One budget covers every form. `credential_in_name` decodes and inflates what a name encodes, a
+    single one of which was measured at 9.6 seconds, and this checks up to four; a fresh budget per
+    form multiplied the bound by the number of spellings rather than sharing it.
+
+    A refusal is translated the same way `_reject_credentials` translates one. A name that is an
+    exact base64 encoding of an uninspectable format -- base64 of `Salted__...` is 36 characters --
+    raises `_Unscannable` out of the scan, and the route catches only `EnvPublishError`, so that
+    short caller-controlled name produced an uncontrolled 500 instead of the 400 the check means.
+    Unverifiable is not clean, here as everywhere else in the scan.
+    """
+    deadline = time.monotonic() + _MAX_DECOMPRESS_SECONDS
+    for form in _published_forms(name):
+        try:
+            kind = credential_in_name(form, deadline=deadline)
+        except _Unscannable as exc:
+            raise EnvPublishError(
+                f"env name {exc}, so it cannot be checked for credentials"
+            ) from None
+        if kind:
+            raise EnvPublishError(f"env name contains {kind}; rotate it and use a different name")
+
+
+def _unreadable_member(error: OSError, package_root: Path) -> str:
+    """Which package member could not be read, named the way every other refusal names one.
+
+    The path on the exception is inside the control plane's staging directory, which is the
+    server's business rather than the publisher's, so only the package-relative part is shown. A
+    member name can itself hold a credential, so it goes through the same redaction as the rest of
+    the scan's messages.
+
+    `strerror` is unset on an `OSError` raised without an errno, and interpolating it produced a
+    refusal reading "...: None". The member is the useful half anyway.
+    """
+    filename = getattr(error, "filename", None)
+    if not filename:
+        return "a file in the package"
+    try:
+        relative = Path(str(filename)).relative_to(package_root).as_posix()
+    except ValueError:
+        return "a file in the package"
+    return _redacted(relative, deadline=time.monotonic() + _MAX_DECOMPRESS_SECONDS)
+
+
+def _reject_credentials(package_root: Path) -> None:
+    """Refuse a package carrying a credential, before anything is committed to the hub.
+
+    The CLI runs this same check before uploading, but the CLI is not the trust boundary: an older
+    client, a direct `Client.publish_env`, or a raw `POST /v1/envs` arrives here having skipped it
+    entirely. The server is what writes to the shared hub, whose history is permanent, so the check
+    has to hold here too.
+
+    Runs on the safely extracted tree, so what is scanned is exactly what would be committed.
+    """
+    try:
+        reject_credential_bearing_package(package_root, display={})
+    except ValueError as exc:
+        raise EnvPublishError(str(exc)) from None
+    except OSError as exc:
+        # An uploaded tar can carry a regular file with mode 000, which extracts fine and then
+        # cannot be opened by a non-root control plane. Only `ValueError` was translated, and the
+        # route catches only `EnvPublishError`, so that package produced an uncontrolled 500
+        # instead of a 400. A member the scan cannot read is a refusal, not a server fault:
+        # unverifiable is not clean, and the same answer is what the CLI would have given.
+        raise EnvPublishError(
+            f"{_unreadable_member(exc, package_root)} could not be read to check it for credentials"
+        ) from None
 
 
 _SLUG_SEGMENT_RE = re.compile(r"^[a-z0-9._-]+$")
