@@ -24,7 +24,12 @@ import json
 
 import pytest
 
-from flash.core.spec import JobSpec
+from flash.core.spec import (
+    MANAGED_GPU_KEYS,
+    MANAGED_TOP_LEVEL_KEYS,
+    MANAGED_TRAIN_KEYS,
+    JobSpec,
+)
 
 PROJECT = "11111111-1111-4111-8111-111111111111"
 
@@ -72,6 +77,17 @@ WORKER_ONLY_TOP_LEVEL = {
     "workload_profile",
     "workload_profile_input_digest",
     "workload_profile_producer_version",
+}
+
+# the same boundary for the two nested sections. spelled out here rather than imported so the
+# registries in `flash.core.spec` have something independent to be checked against.
+MANAGED_TRAIN_FIELDS = {"hf_repo", "init_from_adapter_revision"}
+MANAGED_GPU_FIELDS = {
+    "disk_gb",
+    "network_volume",
+    "network_volume_gb",
+    "max_retries",
+    "max_wall_seconds",
 }
 
 
@@ -305,3 +321,63 @@ def test_ordered_gpu_pin_round_trips_through_the_public_spelling():
     internal = decoded.to_internal_dict()["gpu"]
     assert internal["type"] == "H100"
     assert internal["type_fallbacks"] == ("A100 PCIe",)
+
+
+def test_public_payload_is_the_worker_payload_minus_the_managed_registries():
+    """The projection's contract, stated as an equation rather than as two parallel serializers.
+
+    `to_dict()` is built from `to_internal_dict()`, so the only structural difference between the
+    public and worker contracts is the three MANAGED_*_KEYS sets. If a future edit reintroduces a
+    second `asdict(self)` and the two drift, this fails on the difference rather than at a recovery
+    digest months later.
+    """
+    public, worker = spec().to_dict(), spec().to_internal_dict()
+    # Compared against the literal key sets this module already declares, NOT against the registries
+    # themselves. `set(worker) - set(public) == MANAGED_TOP_LEVEL_KEYS` reads well but compares the
+    # registry against itself: dropping a name shrinks both sides at once, so the equation balances
+    # while the field leaks publicly. Mutation-verified -- that exact sabotage survived the registry
+    # form of this assertion.
+    assert set(worker) - set(public) == WORKER_ONLY_TOP_LEVEL
+    assert set(worker["train"]) - set(public["train"]) == MANAGED_TRAIN_FIELDS
+    assert set(worker["gpu"]) - set(public["gpu"]) == MANAGED_GPU_FIELDS
+    # and the registries must equal those same independent literals, so a drifting registry and a
+    # drifting serializer cannot cancel out above.
+    assert MANAGED_TOP_LEVEL_KEYS == WORKER_ONLY_TOP_LEVEL
+    assert MANAGED_TRAIN_KEYS == MANAGED_TRAIN_FIELDS
+    assert MANAGED_GPU_KEYS == MANAGED_GPU_FIELDS
+    # nothing travels the other way: the public payload invents no key the worker half lacks.
+    assert not set(public) - set(worker)
+    assert not set(public["train"]) - set(worker["train"])
+    assert not set(public["gpu"]) - set(worker["gpu"]), (
+        "the public payload emitted a [gpu] key the worker payload does not have; an empty "
+        "`providers` or `type_fallbacks` reaching the public bytes changes every stored digest"
+    )
+
+
+def test_a_new_private_field_must_be_registered_to_stay_private():
+    """Public-by-default is the point of the projection, so prove the default actually holds.
+
+    Under the old two-serializer shape a new field was PRIVATE by default: it reached
+    `to_internal_dict` via `asdict` and stayed out of `to_dict` until someone remembered to add it,
+    so forgetting was silent and the field never reached the public contract. Now forgetting is
+    loud in the opposite direction -- the field appears publicly -- which is the failure a test can
+    actually catch.
+    """
+    registered = MANAGED_TOP_LEVEL_KEYS | {"project"}
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "sft",
+            "project": PROJECT,
+            "environment": {"id": "owner/project/env"},
+            "train": {"epochs": 1},
+            "gpu": {"type": "H100"},
+        }
+    )
+    unregistered = {
+        name for name in spec.to_internal_dict() if name not in spec.to_dict()
+    } - registered
+    assert not unregistered, (
+        f"{sorted(unregistered)} are stripped from the public payload but named in no registry, so "
+        "the public contract is defined by statements again rather than by MANAGED_*_KEYS"
+    )
