@@ -15,6 +15,7 @@ if __name__ == "flash_opd_multiturn":
         dedup_seam_terminator,
         normalize_token_ids,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         validate_glue_template,
@@ -26,6 +27,7 @@ else:
         dedup_seam_terminator,
         normalize_token_ids,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         validate_glue_template,
@@ -38,6 +40,7 @@ __all__ = [
     "dedup_seam_terminator",
     "normalize_token_ids",
     "prepare_assistant_turn",
+    "prepare_episode_prompt",
     "run_executor_call",
     "sum_preemptions",
     "validate_glue_template",
@@ -120,17 +123,25 @@ def _opd_turn_output_fields(
     turn_ordinal: int,
     generated_seconds: float,
     num_preempted: int,
+    multi_modal_data=None,
+    mm_processor_kwargs=None,
 ) -> dict:
     """the fields one OPD turn contributes to its own AgentLoopOutput.
 
     OPD emits one output per turn rather than one per episode, so the prompt is the prefix this turn
     conditioned on and the whole response is model-generated (mask all ones).
+
+    every turn's prefix still contains the episode's image placeholders, so every turn's output
+    carries the same frozen media: the actor forward re-tokenizes this prompt and would otherwise
+    see placeholders with no pixels to expand. text-only rows pass None and are unchanged.
     """
     return {
         "prompt_ids": list(prefix_ids),
         "response_ids": list(response_ids),
         "response_mask": [1] * len(response_ids),
         "response_logprobs": response_logprobs,
+        "multi_modal_data": multi_modal_data or None,
+        "mm_processor_kwargs": mm_processor_kwargs,
         "num_turns": turn_ordinal + 1,
         "metrics": {
             "generate_sequences": generated_seconds,
@@ -189,7 +200,8 @@ async def _opd_run(
     raw_prompt = validate_transcript_messages(
         [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
     )
-    prompt_ids = await self.apply_chat_template(raw_prompt)
+    prompt = await prepare_episode_prompt(self, raw_prompt)
+    prompt_ids = prompt.prompt_ids
     settings = _OpdEpisodeSettings()
     bridge_url = settings.bridge_url
     bridge_token = settings.bridge_token
@@ -213,6 +225,7 @@ async def _opd_run(
                     "session_id": session_id,
                     "prompt_ids": prompt_ids,
                     "raw_prompt": raw_prompt,
+                    "image_count": prompt.image_count(),
                 },
             ),
         )
@@ -223,7 +236,7 @@ async def _opd_run(
             sampling_params,
             outputs,
             settings=settings,
-            prompt_ids=prompt_ids,
+            prompt=prompt,
             session_id=session_id,
             turn_limit=turn_limit,
             global_step=global_step,
@@ -272,7 +285,7 @@ async def _opd_run_turns(
     outputs: list,
     *,
     settings,
-    prompt_ids,
+    prompt,
     session_id: str,
     turn_limit: int,
     global_step: int,
@@ -292,7 +305,7 @@ async def _opd_run_turns(
     glue_tokenizer = EnvGlueTokenizer(self.tokenizer, thinking=settings.thinking)
     generated_seconds = 0.0
     num_preempted = -1
-    prefix_ids = list(prompt_ids)
+    prefix_ids = list(prompt.prompt_ids)
     for turn_ordinal in range(turn_limit):
         remaining_context = max_model_len - len(prefix_ids)
         if remaining_context <= 0:
@@ -316,10 +329,16 @@ async def _opd_run_turns(
             eos_token_ids=eos_token_ids,
         )
         request_started = time.perf_counter()
+        # the media rides along on EVERY turn, not just the first: each turn re-sends the whole
+        # prefix, whose placeholder tokens still need their pixels to expand.
         generated = await self.server_manager.generate(
             request_id=uuid4().hex,
             prompt_ids=prefix_ids,
             sampling_params=params,
+            image_data=prompt.images,
+            video_data=prompt.videos,
+            audio_data=prompt.audios,
+            mm_processor_kwargs=prompt.mm_processor_kwargs,
         )
         generated_seconds += time.perf_counter() - request_started
         num_preempted = sum_preemptions(num_preempted, generated.num_preempted)
@@ -368,6 +387,8 @@ async def _opd_run_turns(
                     turn_ordinal=turn_ordinal,
                     generated_seconds=generated_seconds,
                     num_preempted=num_preempted,
+                    multi_modal_data=prompt.multi_modal_data,
+                    mm_processor_kwargs=prompt.mm_processor_kwargs,
                 )
             )
         )
@@ -432,7 +453,7 @@ def build_flash_multi_turn_agent_loop(
             outputs: list,
             *,
             settings,
-            prompt_ids,
+            prompt,
             session_id: str,
             turn_limit: int,
             global_step: int,
@@ -450,7 +471,7 @@ def build_flash_multi_turn_agent_loop(
                 sampling_params,
                 outputs,
                 settings=settings,
-                prompt_ids=prompt_ids,
+                prompt=prompt,
                 session_id=session_id,
                 turn_limit=turn_limit,
                 global_step=global_step,

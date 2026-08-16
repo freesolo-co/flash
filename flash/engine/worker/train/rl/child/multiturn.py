@@ -22,6 +22,7 @@ if __name__ == "flash_grpo_multiturn":
         EnvGlueTokenizer,
         dedup_seam_terminator,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         turn_is_unusable,
@@ -32,6 +33,7 @@ else:
         EnvGlueTokenizer,
         dedup_seam_terminator,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         turn_is_unusable,
@@ -190,41 +192,6 @@ class _EpisodeTranscript:
         self.prefix_ids.extend(glue_ids)
 
 
-class _EpisodePrompt:
-    """the tokenized initial prompt plus the decoded media every generate call must carry.
-
-    an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. both
-    apply_chat_template and every generate call need the decoded media alongside the ids, or the
-    engine sees placeholders it cannot expand and the rollout either dies on a feature/placeholder
-    mismatch or conditions on nothing. text-only prompts yield {}.
-    """
-
-    def __init__(self, multi_modal_data, mm_processor_kwargs, prompt_ids):
-        self.multi_modal_data = multi_modal_data
-        self.mm_processor_kwargs = mm_processor_kwargs
-        self.prompt_ids = prompt_ids
-        self.images = multi_modal_data.get("images")
-        self.videos = multi_modal_data.get("videos")
-        self.audios = multi_modal_data.get("audios")
-
-
-async def _prepare_episode_prompt(loop_self, raw_prompt) -> _EpisodePrompt:
-    """decode the prompt's media and apply the chat template, in that order."""
-    multi_modal_data = await loop_self.process_multi_modal_info(raw_prompt)
-    images = multi_modal_data.get("images")
-    videos = multi_modal_data.get("videos")
-    audios = multi_modal_data.get("audios")
-    mm_processor_kwargs = loop_self._get_mm_processor_kwargs(audios)
-    prompt_ids = await loop_self.apply_chat_template(
-        raw_prompt,
-        images=images,
-        videos=videos,
-        audios=audios,
-        mm_processor_kwargs=mm_processor_kwargs,
-    )
-    return _EpisodePrompt(multi_modal_data, mm_processor_kwargs, prompt_ids)
-
-
 class _EpisodeSettings:
     """the per-run rollout settings the parent hands the child through the environment.
 
@@ -333,7 +300,7 @@ async def _grpo_run(
     raw_prompt = validate_transcript_messages(
         [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
     )
-    prompt = await _prepare_episode_prompt(self, raw_prompt)
+    prompt = await prepare_episode_prompt(self, raw_prompt)
     prompt_ids = prompt.prompt_ids
     mm_processor_kwargs = prompt.mm_processor_kwargs
     settings = _EpisodeSettings()

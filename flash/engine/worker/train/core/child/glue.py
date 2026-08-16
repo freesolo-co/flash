@@ -259,3 +259,64 @@ async def run_executor_call(loop, callback):
         with contextlib.suppress(Exception):
             await asyncio.shield(task)
         raise
+
+
+class EpisodePrompt:
+    """the tokenized initial prompt plus the decoded media every generate call must carry.
+
+    an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. both
+    apply_chat_template and every generate call need the decoded media alongside the ids, or the
+    engine sees placeholders it cannot expand and the rollout either dies on a feature/placeholder
+    mismatch or conditions on nothing. text-only prompts yield {}.
+
+    the media is frozen at episode start and resent unchanged on every turn. later environment
+    replies never add to it: a mid-episode image would change the placeholder/pixel correspondence
+    the prompt ids were built against, which is why both loops reject one upstream.
+    """
+
+    __slots__ = (
+        "audios",
+        "images",
+        "mm_processor_kwargs",
+        "multi_modal_data",
+        "prompt_ids",
+        "videos",
+    )
+
+    def __init__(self, multi_modal_data, mm_processor_kwargs, prompt_ids):
+        self.multi_modal_data = multi_modal_data
+        self.mm_processor_kwargs = mm_processor_kwargs
+        self.prompt_ids = prompt_ids
+        self.images = multi_modal_data.get("images")
+        self.videos = multi_modal_data.get("videos")
+        self.audios = multi_modal_data.get("audios")
+
+    def image_count(self) -> int:
+        """how many images the engine actually decoded for this prompt.
+
+        the bridge authenticates this against the frozen parent prompt, so it counts what the child
+        will condition on rather than what the transcript appears to mention.
+        """
+        images = self.images
+        if images is None:
+            return 0
+        if not isinstance(images, (list, tuple)):
+            return 1
+        return len(images)
+
+
+async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
+    """decode the prompt's media and apply the chat template, in that order."""
+    multi_modal_data = await loop_self.process_multi_modal_info(raw_prompt)
+    images = multi_modal_data.get("images")
+    videos = multi_modal_data.get("videos")
+    audios = multi_modal_data.get("audios")
+    mm_processor_kwargs = loop_self._get_mm_processor_kwargs(audios)
+    prompt_ids = await loop_self.apply_chat_template(
+        raw_prompt,
+        images=images,
+        videos=videos,
+        audios=audios,
+        mm_processor_kwargs=mm_processor_kwargs,
+    )
+    return EpisodePrompt(multi_modal_data, mm_processor_kwargs, prompt_ids)

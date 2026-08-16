@@ -469,6 +469,7 @@ class _TeacherAlignmentBridge:
         session_id: str,
         prompt_ids: list[int],
         raw_prompt: list[dict],
+        image_count: int = 0,
     ) -> dict:
         self._require_multiturn()
         if index < 0 or index >= len(self.prompts):
@@ -476,6 +477,15 @@ class _TeacherAlignmentBridge:
         prompt = self.prompts[index]
         if prompt.example is None:
             raise ValueError("multi-turn OPD prompt is missing its environment example")
+        # the same authentication single-turn does at score time, but at episode START: a child
+        # that decoded a different number of images than the parent froze would condition every
+        # turn on the wrong pixels, and the exact-id check below cannot see that.
+        expected_image_count = len(prompt.image_descriptors)
+        if int(image_count) != expected_image_count:
+            raise ValueError(
+                f"multi-turn rollout reported {int(image_count)} image(s) for dataset index "
+                f"{index}; the frozen prompt has {expected_image_count}"
+            )
         prompt_ids = [int(token_id) for token_id in prompt_ids]
         if prompt_ids != list(prompt.prompt_ids):
             raise ValueError("multi-turn rollout prompt ids do not match the frozen flash prompt")
@@ -828,6 +838,7 @@ class _TeacherAlignmentBridge:
                 session_id=payload["session_id"],
                 prompt_ids=payload["prompt_ids"],
                 raw_prompt=payload["raw_prompt"],
+                image_count=payload.get("image_count", 0),
             ),
             "/multiturn/step": self.step_multiturn,
             "/multiturn/score": lambda payload: self.score_multiturn(payload["session_id"]),

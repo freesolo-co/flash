@@ -7458,3 +7458,208 @@ def test_opd_names_the_failed_fragment_when_the_child_exits_fail_closed():
 
     # permanent: retrying re-runs the same incompatible verl/transformers stack.
     assert not isinstance(excinfo.value, opd_train._w.RetriableInfraError)
+
+
+def _drive_opd_multi_turn_episode(
+    *,
+    monkeypatch,
+    turns,
+    env_replies,
+    multi_modal_data=None,
+):
+    """Run the real OPD child loop end to end against a stub bridge, returning what it produced.
+
+    The loop is the thing under test: it decides whether the frozen media reaches each `generate`
+    call and each turn's actor output. Driving `_opd_run_turns` by hand, or asserting on the module
+    source, would restate that decision instead of exercising it -- and the media gap this covers
+    survived precisely because nothing ever ran this loop.
+    """
+    import asyncio
+
+    from flash.engine.worker.train.opd.child import multiturn as opd_multiturn
+
+    # teacher attachment builds torch tensors, which the offline env has no torch for. it runs
+    # strictly AFTER every generate call and every turn output, so stubbing it leaves the media
+    # path these tests measure fully exercised.
+    monkeypatch.setattr(opd_multiturn, "_attach_teacher_rows", lambda outputs, payload: None)
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_URL", "http://bridge.invalid")
+    monkeypatch.setenv("FLASH_OPD_BRIDGE_TOKEN", "token")
+    monkeypatch.setenv("FLASH_OPD_SEED", "7")
+    monkeypatch.setenv("FLASH_OPD_MAX_TURNS", str(len(turns)))
+    monkeypatch.setenv("FLASH_OPD_MAX_MODEL_LEN", "4096")
+    monkeypatch.setenv(
+        "FLASH_OPD_ENV_CAPABILITIES",
+        json.dumps(["new_rollout_state", "record_model_turn", "env_reply", "rollout_done"]),
+    )
+
+    posted: dict[str, list] = {"start": [], "step": [], "score": [], "close": []}
+    replies = list(env_replies)
+    outputs: list[dict] = []
+
+    def post_json(url, token, path, payload):
+        posted[path.rsplit("/", 1)[-1]].append(payload)
+        if path.endswith("/start"):
+            return {"max_turns": len(turns)}
+        if path.endswith("/step"):
+            reply = replies.pop(0)
+            return {"messages": reply["messages"], "terminal": reply["terminal"]}
+        if path.endswith("/score"):
+            # one scored row per EMITTED turn: the loop rejects any other count, and the emitted
+            # count is what it decided, not what this stub assumed.
+            return {
+                "turns": [
+                    {
+                        "teacher_ids": [0] * (len(out["prompt_ids"]) + len(out["response_ids"])),
+                        "teacher_logprobs": [0.0]
+                        * (len(out["prompt_ids"]) + len(out["response_ids"])),
+                    }
+                    for out in outputs
+                ]
+            }
+        return {}
+
+    class _Tokenizer:
+        """one codepoint per token, so a turn's ids are readable straight off its text."""
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(chr(int(i)) for i in ids if int(i) != 99)
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [ord(c) for c in text]}
+
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "".join(str(m.get("content") or "") for m in messages)
+
+    class _Base:
+        """mirrors the parts of verl's AgentLoopBase the OPD loop actually calls."""
+
+        def __init__(self):
+            self.tokenizer = _Tokenizer()
+            self.rollout_config = SimpleNamespace(response_length=256)
+            self.server_manager = self
+            self._sent = list(turns)
+            # every generate call's media, so a test can prove the pixels ride along on turn 2+.
+            self.generate_media = []
+            self.generate_mm_kwargs = []
+
+        def _get_mm_processor_kwargs(self, audio_data=None):
+            return {"flash_probe": True}
+
+        async def process_multi_modal_info(self, messages):
+            return dict(multi_modal_data or {})
+
+        async def apply_chat_template(self, messages, **kwargs):
+            return [1, 2, 3]
+
+        async def generate(
+            self,
+            *,
+            request_id,
+            prompt_ids,
+            sampling_params,
+            image_data=None,
+            video_data=None,
+            audio_data=None,
+            mm_processor_kwargs=None,
+        ):
+            self.generate_media.append(image_data)
+            self.generate_mm_kwargs.append(mm_processor_kwargs)
+            text, stop_reason = self._sent.pop(0)
+            return SimpleNamespace(
+                token_ids=[ord(c) for c in text],
+                log_probs=[0.0] * len(text),
+                num_preempted=0,
+                stop_reason=stop_reason,
+                extra_fields={},
+            )
+
+    def hard_exit(code):
+        # the loop converts every failure into a bare exit code, discarding the exception. re-raise
+        # the live one so a broken driver reports its own cause instead of an opaque "exited 86".
+        raise AssertionError(f"OPD child loop hard-exited with {code}") from sys.exc_info()[1]
+
+    loop_class = opd_multiturn.build_flash_multi_turn_agent_loop(
+        register=lambda name: lambda cls: cls,
+        agent_loop_base=_Base,
+        agent_loop_output=lambda **kwargs: outputs.append(kwargs) or SimpleNamespace(**kwargs),
+        post_json=post_json,
+        score_failure_handler=lambda error: None,
+        deterministic_seed=lambda *parts: 1234,
+        process_exit=hard_exit,
+    )
+
+    driven = {}
+
+    async def _go():
+        instance = loop_class()
+        # the loop offloads the bridge's blocking posts onto this executor, so it has to be the
+        # one actually running the coroutine.
+        instance.loop = asyncio.get_running_loop()
+        driven["instance"] = instance
+        await instance.run(
+            {},
+            raw_prompt=[{"role": "user", "content": "describe"}],
+            index=0,
+            global_steps=0,
+            session_id=0,
+        )
+
+    asyncio.run(_go())
+    return driven["instance"], outputs, posted
+
+
+# "completed" under the per-turn cap is what makes a turn TERMINATED rather than truncated; a
+# truncated first turn would end the episode after one turn and never test the resend at all.
+_TWO_COMPLETED_TURNS = [("A", "completed"), ("B", "completed")]
+_TWO_TURN_REPLIES = [
+    {"messages": [{"role": "user", "content": "and now?"}], "terminal": False},
+    {"messages": [], "terminal": True},
+]
+
+
+def test_multi_turn_opd_resends_the_frozen_image_on_every_turn(monkeypatch):
+    """The pixels have to ride along on turn 2+, not just the opening turn.
+
+    Each OPD turn re-sends the whole accumulated prefix, and that prefix still holds the episode's
+    image placeholder tokens. A `generate` call without the media leaves the engine with
+    placeholders it cannot expand: the rollout either dies on a feature/placeholder mismatch or
+    silently conditions on no image at all. The OPD child previously passed media on NO turn.
+    """
+    sentinel = ["pixels"]
+    instance, outputs, posted = _drive_opd_multi_turn_episode(
+        monkeypatch=monkeypatch,
+        turns=_TWO_COMPLETED_TURNS,
+        env_replies=_TWO_TURN_REPLIES,
+        multi_modal_data={"images": sentinel},
+    )
+
+    assert instance.generate_media == [sentinel, sentinel], (
+        "every turn must carry the frozen media, not just the first"
+    )
+    assert instance.generate_mm_kwargs == [{"flash_probe": True}] * 2
+    # the actor re-tokenizes each turn's prompt, so each turn's OUTPUT needs the media too.
+    assert [out["multi_modal_data"] for out in outputs] == [{"images": sentinel}] * 2
+    assert [out["mm_processor_kwargs"] for out in outputs] == [{"flash_probe": True}] * 2
+    # the bridge authenticates this against the frozen parent prompt before the episode runs.
+    assert posted["start"][0]["image_count"] == 1
+
+
+def test_multi_turn_opd_keeps_a_text_only_episode_free_of_multimodal_fields(monkeypatch):
+    """A text-only row must stay exactly as it was: verl treats {} as a multimodal row.
+
+    Passing an empty dict rather than None would push a text-only rollout down the multimodal
+    collate path, so the absence has to be None on every turn.
+    """
+    instance, outputs, posted = _drive_opd_multi_turn_episode(
+        monkeypatch=monkeypatch,
+        turns=_TWO_COMPLETED_TURNS,
+        env_replies=_TWO_TURN_REPLIES,
+        multi_modal_data=None,
+    )
+
+    assert instance.generate_media == [None, None]
+    assert [out["multi_modal_data"] for out in outputs] == [None, None]
+    assert posted["start"][0]["image_count"] == 0
