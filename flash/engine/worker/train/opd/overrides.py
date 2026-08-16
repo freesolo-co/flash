@@ -2,7 +2,7 @@
 
 `build_opd_overrides` renders the exact verl 0.8.0 synchronous-PPO and distillation config surface
 the child is launched with; the rest prepare what that child needs on disk and in its environment
-(a sitecustomize shim, the resolved env vars, and the rollout parquet).
+(the resolved env vars and rollout parquet).
 
 Split out of `flash.engine.worker.opd_train` to keep that module under the file-size limit.
 """
@@ -17,12 +17,12 @@ from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
-    render_tf32_shim,
-    render_tilelang_cudart_shim,
     rollout_resident_overrides,
+    shim_marker_file,
     trainer_dtype_overrides,
 )
 from flash.engine.worker.sft_train import _build_verl_child_env, _hydra_val
+from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 
 _REQUIRED_OVERRIDE_KEYS = (
     "train_files",
@@ -360,30 +360,27 @@ def build_opd_overrides(config: dict) -> list[str]:
     return overrides
 
 
-def _render_opd_sitecustomize(*, save_at_steps: tuple[int, ...], total_steps: int) -> str:
-    required_steps = tuple(int(step) for step in save_at_steps)
-    # the tf32 fragment goes first, and above the verl import: it is the child's only opt-in to
-    # tensor-core fp32 matmul, and an import that raises here must not cost the run its throughput.
-    # the cudart fragment follows it and still precedes the verl import: it repoints tilelang's
-    # libcudart stub on disk, which only works while nothing has imported vllm and bound the stub.
-    return f"""# generated flash opd runtime patches for verl 0.8
-{render_tf32_shim()}
-{render_tilelang_cudart_shim()}
-from verl.utils.checkpoint.checkpoint_handler import CheckpointHandler as _FlashCheckpointHandler
-
-_flash_required_save_steps = frozenset({required_steps!r})
-_flash_total_steps = {int(total_steps)}
-_flash_original_save_checkpoint = _FlashCheckpointHandler.save_checkpoint
-
-
-def _flash_save_exact_checkpoint(self, step):
-    if _flash_required_save_steps and step not in _flash_required_save_steps and step != _flash_total_steps:
-        return None
-    return _flash_original_save_checkpoint(self, step)
-
-
-_FlashCheckpointHandler.save_checkpoint = _flash_save_exact_checkpoint
-"""
+def _build_opd_plugin_config(
+    *,
+    shim_dir: str,
+    save_at_steps,
+    total_steps: int,
+    gdn_model_type: str | None,
+    loggers,
+) -> str:
+    """serialize the non-secret OPD runtime patch configuration."""
+    return json.dumps(
+        {
+            "marker_file": shim_marker_file(shim_dir),
+            "no_signal_attempts": OPD_NO_SIGNAL_ATTEMPTS,
+            "save_at_steps": list(save_at_steps),
+            "total_steps": int(total_steps),
+            "gdn_model_type": gdn_model_type,
+            "wandb": "wandb" in loggers,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _build_opd_child_env(
@@ -406,6 +403,7 @@ def _build_opd_child_env(
     abandonment_failure_path: str = "",
     resample_failure_path: str = "",
     cycle_commit_failure_path: str = "",
+    plugin_config: str = "",
 ) -> dict[str, str]:
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
@@ -454,6 +452,8 @@ def _build_opd_child_env(
                 "FLASH_OPD_THINKING": "1" if thinking else "0",
             }
         )
+    if plugin_config:
+        child["FLASH_OPD_PLUGIN_CONFIG"] = plugin_config
     return child
 
 

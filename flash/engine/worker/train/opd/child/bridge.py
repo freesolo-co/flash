@@ -39,9 +39,9 @@ def _plugin():
     keeps those patches effective; a direct call would bind this module's own function. The flat
     name is the one that exists in the verl child workdir, where `flash` is not importable.
     """
-    try:
+    if __name__ == "flash_opd_bridge":
         import flash_opd_plugin as plugin
-    except ImportError:
+    else:
         from flash.engine.worker.train.opd.child import plugin
 
     return plugin
