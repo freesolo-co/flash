@@ -7,8 +7,11 @@ import io
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError, LocalEntryNotFoundError
 
+from flash.content import multimodal
 from flash.engine.profiling import image_tokens
 from flash.engine.profiling.image_tokens import (
     ImageGeometry,
@@ -51,10 +54,24 @@ def _png_bytes(width: int, height: int) -> bytes:
 
 
 def _truncated_bmp_bytes(width: int, height: int) -> bytes:
+    """Bytes whose header still reports (width, height) but whose pixels cannot be decoded.
+
+    The truncation is the point: a check that reads only the header accepts this payload, so any
+    test using it is asserting that the geometry path decodes rather than merely measures. That
+    property is asserted here so it holds for every caller instead of at one call site.
+    """
     image_module = pytest.importorskip("PIL.Image")
     out = io.BytesIO()
     image_module.new("RGB", (width, height), (12, 34, 56)).save(out, format="BMP")
-    return out.getvalue()[:-10]
+    truncated = out.getvalue()[:-10]
+    with image_module.open(io.BytesIO(truncated)) as image:
+        assert image.size == (width, height)
+    return truncated
+
+
+def _hub_http_error(status: int) -> HfHubHTTPError:
+    response = SimpleNamespace(status_code=status, headers={}, request=SimpleNamespace())
+    return HfHubHTTPError("hub request failed", response=response)
 
 
 class TestSmartResizeMatchesTransformers:
@@ -158,21 +175,28 @@ class TestGeometryFromConfig:
         with pytest.raises(ImageGeometryUnavailable, match=field):
             geometry_from_preprocessor_config(config)
 
-    def test_rejects_an_invalid_size_budget_even_when_the_root_budget_wins(self):
-        with pytest.raises(ImageGeometryUnavailable, match="shortest_edge"):
-            geometry_from_preprocessor_config(
-                {
-                    "patch_size": 16,
-                    "merge_size": 2,
-                    "min_pixels": 65536,
-                    "size": {"shortest_edge": "ignored-if-not-validated"},
-                }
-            )
-
-    @pytest.mark.parametrize("value", [[], "pixels", 1, False])
-    def test_rejects_a_present_non_object_size(self, value):
-        with pytest.raises(ImageGeometryUnavailable, match="size must be an object"):
-            geometry_from_preprocessor_config({"patch_size": 16, "merge_size": 2, "size": value})
+    @pytest.mark.parametrize(
+        ("config", "match"),
+        [
+            pytest.param(
+                {"min_pixels": 65536, "size": {"shortest_edge": "ignored-if-not-validated"}},
+                "shortest_edge",
+                id="invalid-size-budget-even-when-the-root-budget-wins",
+            ),
+            pytest.param(
+                {"min_pixels": 4096, "max_pixels": 1024},
+                "min_pixels",
+                id="inverted-pixel-budget",
+            ),
+            *(
+                pytest.param({"size": value}, "size must be an object", id=f"non-object-size-{i}")
+                for i, value in enumerate([[], "pixels", 1, False])
+            ),
+        ],
+    )
+    def test_rejects_an_unusable_published_budget(self, config, match):
+        with pytest.raises(ImageGeometryUnavailable, match=match):
+            geometry_from_preprocessor_config({"patch_size": 16, "merge_size": 2, **config})
 
     def test_none_pixel_budget_fields_use_the_existing_defaults(self):
         geometry = geometry_from_preprocessor_config(
@@ -202,17 +226,6 @@ class TestGeometryFromConfig:
         coarse = ImageGeometry(patch_size=32, merge_size=2, min_pixels=65536, max_pixels=16777216)
         assert image_pad_tokens(640, 480, coarse) != image_pad_tokens(640, 480, QWEN_GEOMETRY)
 
-    def test_rejects_an_inverted_pixel_budget(self):
-        with pytest.raises(ImageGeometryUnavailable, match="min_pixels"):
-            geometry_from_preprocessor_config(
-                {
-                    "patch_size": 16,
-                    "merge_size": 2,
-                    "min_pixels": 4096,
-                    "max_pixels": 1024,
-                }
-            )
-
     def test_rejects_a_non_object_config(self):
         with pytest.raises(ImageGeometryUnavailable):
             geometry_from_preprocessor_config([])  # type: ignore[arg-type]
@@ -236,92 +249,57 @@ class TestImageGeometrySubmissionFailures:
         return excinfo.value
 
     @pytest.mark.parametrize(
-        ("status", "expected_plane_fault", "expected_http_status"),
+        ("raised", "expected_plane_fault"),
         [
-            (401, False, 400),
-            (403, False, 400),
-            (404, False, 400),
-            (408, True, 503),
-            (425, True, 503),
-            (429, True, 503),
-            (500, True, 503),
-            (503, True, 503),
+            # the hub reports both classes through one exception type, so only the status separates
+            # "this model cannot be quoted" from "the hub is briefly unreachable".
+            *(
+                pytest.param(_hub_http_error(status), plane_fault, id=f"hub-{status}")
+                for status, plane_fault in [
+                    (401, False),
+                    (403, False),
+                    (404, False),
+                    (408, True),
+                    (425, True),
+                    (429, True),
+                    (500, True),
+                    (503, True),
+                ]
+            ),
+            pytest.param(httpx.ReadTimeout("timed out"), True, id="network-timeout"),
+            pytest.param(
+                LocalEntryNotFoundError("cache entry is unavailable"), True, id="cache-miss"
+            ),
+            pytest.param(
+                EntryNotFoundError("preprocessor_config.json is missing"), False, id="no-hub-file"
+            ),
         ],
     )
-    def test_hub_http_status_distinguishes_permanent_and_transient_failures(
-        self, monkeypatch, status, expected_plane_fault, expected_http_status
+    def test_a_failed_download_is_classified_by_whether_retrying_could_help(
+        self, monkeypatch, raised, expected_plane_fault
     ):
-        from huggingface_hub.errors import HfHubHTTPError
-
-        response = SimpleNamespace(
-            status_code=status,
-            headers={},
-            request=SimpleNamespace(),
-        )
-        failure = self._load_failure(
-            monkeypatch,
-            HfHubHTTPError("hub request failed", response=response),
-        )
+        failure = self._load_failure(monkeypatch, raised)
 
         assert failure.plane_fault is expected_plane_fault
-        assert self._submission_status(failure) == expected_http_status
-
-    def test_network_timeout_is_a_plane_fault(self, monkeypatch):
-        import httpx
-
-        failure = self._load_failure(monkeypatch, httpx.ReadTimeout("timed out"))
-
-        assert failure.plane_fault is True
-        assert self._submission_status(failure) == 503
-
-    def test_local_cache_miss_is_a_plane_fault(self, monkeypatch):
-        from huggingface_hub.errors import LocalEntryNotFoundError
-
-        failure = self._load_failure(
-            monkeypatch,
-            LocalEntryNotFoundError("cache entry is unavailable"),
-        )
-
-        assert failure.plane_fault is True
-        assert self._submission_status(failure) == 503
-
-    def test_local_file_io_failure_is_a_plane_fault(self, monkeypatch, tmp_path):
-        missing_path = tmp_path / "missing-preprocessor-config.json"
-        monkeypatch.setattr(
-            "huggingface_hub.hf_hub_download",
-            lambda **_kwargs: str(missing_path),
-        )
-
-        with pytest.raises(ImageGeometryUnavailable) as excinfo:
-            load_image_geometry("org/model")
-
-        assert excinfo.value.plane_fault is True
-        assert self._submission_status(excinfo.value) == 503
-
-    def test_missing_hub_file_is_a_submission_error(self, monkeypatch):
-        from huggingface_hub.errors import EntryNotFoundError
-
-        failure = self._load_failure(
-            monkeypatch,
-            EntryNotFoundError("preprocessor_config.json is missing"),
-        )
-
-        assert failure.plane_fault is False
-        assert self._submission_status(failure) == 400
+        assert self._submission_status(failure) == (503 if expected_plane_fault else 400)
 
     @pytest.mark.parametrize(
-        "contents",
+        ("contents", "expected_plane_fault"),
         [
-            "{not-json",
-            json.dumps([]),
-            json.dumps({"patch_size": 16, "merge_size": 0}),
+            # a download that "succeeded" but left nothing readable is the plane's own fault; a file
+            # that read fine and is simply not usable geometry is the submission's.
+            pytest.param(None, True, id="downloaded-path-does-not-exist"),
+            pytest.param("{not-json", False, id="not-json"),
+            pytest.param(json.dumps([]), False, id="not-an-object"),
+            pytest.param(json.dumps({"patch_size": 16, "merge_size": 0}), False, id="bad-geometry"),
         ],
     )
-    def test_malformed_or_invalid_config_is_a_submission_error(
-        self, monkeypatch, tmp_path, contents
+    def test_a_downloaded_config_is_classified_by_whether_it_could_be_read(
+        self, monkeypatch, tmp_path, contents, expected_plane_fault
     ):
         config_path = tmp_path / "preprocessor_config.json"
-        config_path.write_text(contents)
+        if contents is not None:
+            config_path.write_text(contents)
         monkeypatch.setattr(
             "huggingface_hub.hf_hub_download",
             lambda **_kwargs: str(config_path),
@@ -330,8 +308,8 @@ class TestImageGeometrySubmissionFailures:
         with pytest.raises(ImageGeometryUnavailable) as excinfo:
             load_image_geometry("org/model")
 
-        assert excinfo.value.plane_fault is False
-        assert self._submission_status(excinfo.value) == 400
+        assert excinfo.value.plane_fault is expected_plane_fault
+        assert self._submission_status(excinfo.value) == (503 if expected_plane_fault else 400)
 
 
 class TestExpandImagePadRuns:
@@ -365,36 +343,33 @@ class TestExpandImagePadRuns:
 
 class TestDescriptorPadTokens:
     def test_counts_each_fully_validated_descriptor(self):
-        from flash.content.multimodal import normalize_image_source
-
         descriptors = [
-            normalize_image_source(_png_bytes(640, 480), None),
-            normalize_image_source(_png_bytes(56, 56), None),
+            multimodal.normalize_image_source(_png_bytes(640, 480), None),
+            multimodal.normalize_image_source(_png_bytes(56, 56), None),
         ]
         assert descriptor_pad_tokens(
             descriptors, None, QWEN_GEOMETRY, ImageProfileValidationState()
         ) == [300, 64]
 
-    def test_rejects_a_descriptor_that_is_not_an_image(self):
-        descriptor = json.dumps({"kind": "bytes", "value": "bm90YW5pbWFnZQ=="})
-        with pytest.raises(ValueError, match="not a valid image"):
-            descriptor_pad_tokens([descriptor], None, QWEN_GEOMETRY, ImageProfileValidationState())
-
-    def test_rejects_a_truncated_payload_that_still_has_valid_dimensions(self):
-        image_module = pytest.importorskip("PIL.Image")
-        data = _truncated_bmp_bytes(64, 64)
-        with image_module.open(io.BytesIO(data)) as image:
-            assert image.size == (64, 64)
-        descriptor = json.dumps({"kind": "bytes", "value": base64.b64encode(data).decode("ascii")})
-
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param(b"notanimage", id="not-an-image-at-all"),
+            # a truncated bitmap still parses a valid header, so a dimensions-only check would
+            # accept it and the worker would then fail on a row the quote already charged for.
+            pytest.param(_truncated_bmp_bytes(64, 64), id="truncated-with-valid-dimensions"),
+        ],
+    )
+    def test_rejects_a_payload_that_cannot_be_fully_decoded(self, payload):
+        descriptor = json.dumps(
+            {"kind": "bytes", "value": base64.b64encode(payload).decode("ascii")}
+        )
         with pytest.raises(ValueError, match="not a valid image"):
             descriptor_pad_tokens([descriptor], None, QWEN_GEOMETRY, ImageProfileValidationState())
 
     def test_rejects_a_deferred_truncated_path_without_committing_state(
         self, tmp_path, monkeypatch
     ):
-        from flash.content import multimodal
-
         dataset = tmp_path / "dataset"
         dataset.mkdir()
         corrupt_path = dataset / "corrupt.bmp"
@@ -425,8 +400,6 @@ class TestDescriptorPadTokens:
         assert state.decoded_work_bytes == 0
 
     def test_rejects_aggregate_decoded_bytes_before_full_decode(self, monkeypatch):
-        from flash.content import multimodal
-
         data = _png_bytes(10, 10)
         descriptors = [multimodal.normalize_image_source(data, None) for _ in range(2)]
         monkeypatch.setattr(image_tokens, "MAX_TOTAL_DECODED_BYTES", 599)
@@ -440,8 +413,6 @@ class TestDescriptorPadTokens:
             descriptor_pad_tokens(descriptors, None, QWEN_GEOMETRY, ImageProfileValidationState())
 
     def test_source_limit_stops_before_reading_the_next_distinct_descriptor(self, monkeypatch):
-        from flash.content import multimodal
-
         data = _png_bytes(10, 10)
         first = multimodal.normalize_image_source(data, None)
         second = multimodal.normalize_image_source(_png_bytes(11, 10), None)
@@ -467,8 +438,6 @@ class TestDescriptorPadTokens:
         assert reads == [first]
 
     def test_failed_row_commits_no_partial_profile_cache_accounting(self, monkeypatch):
-        from flash.content import multimodal
-
         valid = multimodal.normalize_image_source(_png_bytes(10, 10), None)
         corrupt_data = _truncated_bmp_bytes(64, 64)
         corrupt = json.dumps(
