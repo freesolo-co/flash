@@ -104,6 +104,21 @@ def test_healthy_run_committing_before_600s_skips_the_setup_snapshot(monkeypatch
     assert uploads == [30]
 
 
+def test_first_commit_landing_on_the_600s_deadline_still_spends_that_snapshot(monkeypatch):
+    """promotion is read after ``due``, so it only ever moves the NEXT deadline.
+
+    this is the one poll where the ordering is observable: the 600-second deadline is already due
+    and the first commit lands on that same poll. reading the promotion first would cancel a
+    deadline that had already come due, losing the startup snapshot -- the only evidence covering
+    everything before the first commit. every other script agrees under both orderings, so without
+    this case the ordering is documented but unproven.
+    """
+    rows = [(n, n, 0, 0) for n in range(1, 5)]
+    rows += [(n, n, 1, 1) for n in range(5, 12)]
+    _waits, uploads = _drive(monkeypatch, rows)
+    assert uploads == [5]
+
+
 def test_pending_heartbeat_arms_only_before_committed_progress(monkeypatch):
     rows = []
     for poll in range(1, 16):
