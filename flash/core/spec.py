@@ -1,16 +1,44 @@
-"""Structured job specification shared by CLI/API/runner and GPU workers."""
+"""Structured job specification shared by CLI/API/runner and GPU workers.
+
+One `JobSpec` value is read through four different contracts, and the serializers below are how
+they are told apart:
+
+- authored configuration -- what a user writes. validated by `flash.schema.spec_from_dict`, NOT by
+  `JobSpec.from_dict`; the two are not interchangeable.
+- public representation -- `to_dict()`, deliberately lossy: it strips every platform-managed field
+  so the result re-validates through the authored parser.
+- persisted recovery record -- `from_dict()`, tolerant of historical spellings. its decoding rules
+  live in `flash.core.spec_persistence`.
+- resolved worker payload -- `to_internal_dict()` / `to_json()`, complete, including every managed
+  and resolved field the GPU worker needs.
+
+`flash/runner/preparation.py::_preparation_digest` hashes the canonical JSON of `to_dict()` and
+`to_internal_dict()`, so the BYTES those two emit are a recovery contract, not an implementation
+detail. See their docstrings before changing either.
+"""
 
 from __future__ import annotations
 
 import json
-import logging
 import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 from uuid import UUID
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
-from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm, samples_on_policy
+from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
+from flash.core.spec_persistence import (
+    DROPPED_TOP_LEVEL_KEYS as _DROPPED_TOP_LEVEL_KEYS,
+)
+from flash.core.spec_persistence import (
+    REMOVED_PERSISTED_TRAIN_KEYS,
+    announce_dropped_keys,
+    migrated_optimizer_batch,
+    opt_float,
+    opt_int,
+    str_tuple,
+    volume_gb,
+)
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
@@ -43,15 +71,6 @@ def _coerce_credit_assignment(value: Any) -> CreditAssignment:
             if normalized == mode:
                 return mode
     raise ValueError(f"credit_assignment must be one of {CREDIT_ASSIGNMENTS}; got {value!r}")
-
-
-def _str_tuple(value: Any) -> tuple[str, ...]:
-    """Normalize a string-or-list knob to a tuple of strings; a bare string is one element, not iterated."""
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        return (value,) if value else ()
-    return tuple(s for s in (str(x) for x in value) if s)
 
 
 def coerce_bool(value: Any) -> bool:
@@ -88,18 +107,6 @@ def _coerce_wandb(value: Any) -> WandbSpec:
         return s or None
 
     return WandbSpec(project=_label(value.get("project")), run_name=_label(value.get("run_name")))
-
-
-def _volume_gb(value: Any, default: int = 100) -> int:
-    """Parse volume size in GB; non-positive / non-numeric / missing values return default."""
-    if isinstance(value, bool):
-        # bool is an int subclass; reject to avoid int(True)==1 becoming a 1 GB volume.
-        return default
-    try:
-        gb = int(value)
-    except (TypeError, ValueError):
-        return default
-    return gb if gb > 0 else default
 
 
 def _validated_gpu_type(value: Any, *, field_name: str) -> str:
@@ -189,55 +196,6 @@ def attributed_gpu_type(status: Any) -> str:
     worker_spec = preparation.get("worker_spec") if isinstance(preparation, dict) else None
     selected = persisted_gpu_head(worker_spec)
     return selected or persisted_gpu_head(field("spec"))
-
-
-def _opt_int(value: Any) -> int | None:
-    """Parse optional int; rejects bools (bool is int subclass — int(True)==1 is a footgun)."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise TypeError(f"expected a number, got bool {value!r}")
-    return int(value)
-
-
-def _opt_float(value: Any) -> float | None:
-    """Parse optional float; rejects bools (mirrors _opt_int)."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise TypeError(f"expected a number, got bool {value!r}")
-    return float(value)
-
-
-def _migrated_optimizer_batch(train: dict, algorithm: str) -> tuple[int | None, int | None]:
-    """``(batch_size, prompts_per_step)`` with the pre-1.1.43 rollout spelling migrated.
-
-    grpo/opd authored the optimizer batch as ``batch_size`` until it was split into
-    ``prompts_per_step``. The schema rejects the old name on SUBMISSION, but `from_dict` also
-    reparses PERSISTED specs, and the deployed release (1.1.40) has no ``prompts_per_step`` at all
-    -- so every rollout run in flight across this upgrade carries only the old key. The workers read
-    ``prompts_per_step`` alone, so without this a recovered run silently resumes on the recipe
-    default: 64 instead of an authored 32 on grpo, which OOMs a card rented for 32, and 8 on opd.
-
-    The old key is MOVED, not copied, and is dropped whenever the new one is present. Leaving it
-    populated would re-emit both names from ``to_dict()``, and a spec carrying both is rejected by
-    the schema -- breaking the resubmit that recovery and ``flash runs get`` perform, and leaving
-    `vram.py::_optimizer_batch_value` (which takes the larger of the two) free to size a card off
-    the stale value that ranking ignores. That applies to a payload written mid-upgrade carrying
-    BOTH spellings too: ``prompts_per_step`` wins, so the superseded key has to go with it.
-
-    A non-positive legacy value is discarded rather than migrated: ``minimum=1`` would have
-    rejected it at submission, and carrying it forward only fails later on a rented GPU. It is
-    discarded from BOTH names for the same round-trip reason -- retaining it under the old one
-    would re-emit a key the schema rejects for this algorithm.
-    """
-    batch_size = _opt_int(train.get("batch_size"))
-    prompts_per_step = _opt_int(train.get("prompts_per_step"))
-    if not samples_on_policy(algorithm):
-        return batch_size, prompts_per_step
-    if prompts_per_step is not None:
-        return None, prompts_per_step
-    return None, batch_size if batch_size is not None and batch_size >= 1 else None
 
 
 _MAX_GPU_COUNT = 8
@@ -370,12 +328,6 @@ class EnvironmentSpec:
     resolved_sha: str = ""
 
 
-# internal persisted-record compatibility only, never public config parsing. #968 removed
-# advantage_clip, but already-provisioned strict records still carry the unused key and otherwise fail
-# attach/recovery. do not generalize this allowlist: removed ``seeds`` must still raise (#536).
-REMOVED_PERSISTED_TRAIN_KEYS = frozenset({"advantage_clip"})
-
-
 @dataclass(frozen=True)
 class TrainSpec:
     epochs: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -505,55 +457,6 @@ MANAGED_GPU_KEYS = frozenset(
     {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
 )
 
-# Removed public top-level fields that a PERSISTED record can still carry. Stored run records are
-# never rewritten, and effective_preparation.worker_spec is written with to_internal_dict() (asdict),
-# which emitted every field including the defaulted ones -- so every record written before a field
-# was dropped still names it. This registry also drives historical public-digest replay for
-# model_revision, which remains an internal field. Without it a still-running job can lose its
-# recovery, deploy, and serving paths after the upgrade.
-#
-# Ignored on READ only. Most keys here no longer exist as JobSpec fields; model_revision remains an
-# internal runner field, but the public schema rejects it and to_dict omits it. Keeping it in this set
-# lets digest recovery identify the historical public key without weakening JobSpec.from_dict.
-_DROPPED_TOP_LEVEL_KEYS = frozenset(
-    {"model_policy", "model_revision", "worker_env", "workload_profile_kind"}
-)
-
-# Tolerating a dropped key keeps a pre-upgrade run's recovery path, but the values behind it stop
-# being applied -- so a run that authored them now trains on managed defaults instead of what was
-# submitted. That is announced rather than silent. Only user-authorable keys qualify: model_policy
-# was platform-managed (to_dict popped it), so its loss cannot change what a submitted config asked
-# for. The values are deliberately NOT forwarded -- doing so would reinstate the override table this
-# removal exists to close, and would deliver it without the validation the deleted parser performed.
-_ANNOUNCED_DROPPED_KEYS = frozenset({"worker_env"})
-
-
-def _announce_dropped_keys(data: dict[str, Any]) -> None:
-    """Log the removed user-authored keys a persisted record still carries and no longer applies.
-
-    Only announced when the payload names the run. A public spec is ``to_dict()`` output, which pops
-    the server-assigned run_id, and the same stored run is read through both shapes -- so warning
-    without an id would emit an unactionable "run <unknown>" line and duplicate the identified one
-    the worker-spec read already produced. Every provisioned run records an internal worker spec
-    (asdict, run_id included), and that is the read this fires on.
-    """
-    run_id = str(data.get("run_id") or "").strip()
-    if not run_id:
-        return
-    for key in sorted(_ANNOUNCED_DROPPED_KEYS):
-        value = data.get(key)
-        if not value:
-            continue
-        names = ", ".join(sorted(str(k) for k in value)) if isinstance(value, dict) else str(value)
-        logging.getLogger("flash.spec").warning(
-            "run %s was submitted with [%s] (%s); that table was removed and its values are NOT "
-            "applied -- this run uses managed defaults instead. resubmit without it if the run "
-            "depends on those values.",
-            run_id,
-            key,
-            names,
-        )
-
 
 @dataclass(frozen=True)
 class WandbSpec:
@@ -651,6 +554,15 @@ class JobSpec:
 
         omit platform-managed fields because the control plane/runner assigns them and the public
         parser rejects them. internal callers use ``to_internal_dict()``.
+
+        This is the PUBLIC contract and it is deliberately lossy: what it drops is what the authored
+        parser would reject, so the result re-validates through ``flash.schema.spec_from_dict``. Do
+        not hand its output to a worker or provider path -- those need ``to_internal_dict()``.
+
+        Its bytes are a recovery contract. ``_preparation_digest`` hashes this output as canonical
+        JSON, so key PRESENCE is load-bearing even though key order is not: adding or dropping one
+        key here invalidates the stored digest of every warm-start and workload-profile run in
+        flight, which fails integrity validation on recovery.
         """
         data = asdict(self)
         # server-assigned identity — never authored in a config.
@@ -696,7 +608,17 @@ class JobSpec:
         return data
 
     def to_internal_dict(self) -> dict[str, Any]:
-        """Return the complete control-plane and worker representation."""
+        """Return the complete control-plane and worker representation.
+
+        This is the RESOLVED WORKER contract: every managed and resolved field the GPU worker needs,
+        including the ones ``to_dict()`` strips. It is what gets persisted as
+        ``effective_preparation.worker_spec`` and what ``to_json()`` ships to a provider. The
+        authored parser rejects this shape, so it must never be offered as a public payload.
+
+        Its bytes are a recovery contract for the same reason as ``to_dict()`` -- and note the two
+        empty-value pops below are part of it: an omitted empty field and an explicit empty one hash
+        differently, so removing either pop would break existing digests.
+        """
         data = asdict(self)
         # missing and unset are the same internal state. omitting the empty value preserves that state
         # without serializing it into an explicit empty preference, which every parser rejects.
@@ -712,13 +634,22 @@ class JobSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
+        """Decode a PERSISTED or internal job spec. This is not the authored-config parser.
+
+        Authored configuration goes through ``flash.schema.spec_from_dict``, which is strict because
+        an unknown key there is a typo the author can still fix. This one reads bytes that were
+        already written -- by an older Flash, for a run that may still be training -- so it tolerates
+        the historical spellings registered in ``flash.core.spec_persistence``. The two are NOT
+        interchangeable: decoding a user's config here would silently accept platform-managed fields
+        that the public parser exists to reject.
+        """
         if not isinstance(data, dict):
             raise TypeError("job spec must be an object")
         allowed_top_level = {item.name for item in fields(cls)}
         unknown_top_level = sorted(set(data) - allowed_top_level - _DROPPED_TOP_LEVEL_KEYS)
         if unknown_top_level:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
-        _announce_dropped_keys(data)
+        announce_dropped_keys(data)
         env = data.get("environment") or {}
         # Reject stale payloads carrying a local `path`; worker only runs published env ids.
         if isinstance(env, dict) and env.get("path"):
@@ -778,7 +709,7 @@ class JobSpec:
         algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
         # one reading of the optimizer batch for both keys: the rollout spelling changed in 1.1.43
         # and a persisted spec can still carry the old one.
-        batch_size, prompts_per_step = _migrated_optimizer_batch(train, algorithm)
+        batch_size, prompts_per_step = migrated_optimizer_batch(train, algorithm)
         return cls(
             model=data.get("model", cls.model),
             model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
@@ -787,11 +718,11 @@ class JobSpec:
                 id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
-                secrets=_str_tuple(env.get("secrets")),
+                secrets=str_tuple(env.get("secrets")),
                 resolved_sha=str(env.get("resolved_sha") or ""),
             ),
             train=TrainSpec(
-                epochs=_opt_int(train.get("epochs")),
+                epochs=opt_int(train.get("epochs")),
                 lora_rank=int(train.get("lora_rank", 32)),
                 # round-trip a stored alpha (authored value, internal carrier, or a warm-start's
                 # inherited parent alpha); fall back to 2 x rank when absent.
@@ -803,22 +734,22 @@ class JobSpec:
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
                 init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
-                learning_rate=_opt_float(train.get("learning_rate")),
+                learning_rate=opt_float(train.get("learning_rate")),
                 batch_size=batch_size,
                 prompts_per_step=prompts_per_step,
-                max_context_tokens=_opt_int(train.get("max_context_tokens")),
-                save_every=_opt_int(train.get("save_every")),
+                max_context_tokens=opt_int(train.get("max_context_tokens")),
+                save_every=opt_int(train.get("save_every")),
                 max_steps=parse_max_steps(train.get("max_steps")),
                 save_at_steps=train.get("save_at_steps"),
-                max_examples=_opt_int(train.get("max_examples")),
-                group_size=_opt_int(train.get("group_size")),
-                temperature=_opt_float(train.get("temperature")),
-                max_completion_tokens=_opt_int(train.get("max_completion_tokens")),
-                kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
-                entropy_quantile=_opt_float(train.get("entropy_quantile")),
-                thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
+                max_examples=opt_int(train.get("max_examples")),
+                group_size=opt_int(train.get("group_size")),
+                temperature=opt_float(train.get("temperature")),
+                max_completion_tokens=opt_int(train.get("max_completion_tokens")),
+                kl_penalty_coef=opt_float(train.get("kl_penalty_coef")),
+                entropy_quantile=opt_float(train.get("entropy_quantile")),
+                thinking_length_penalty_coef=opt_float(train.get("thinking_length_penalty_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
-                stop_sequences=_str_tuple(train.get("stop_sequences")),
+                stop_sequences=str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
                 credit_assignment=_coerce_credit_assignment(train.get("credit_assignment")),
             ),
@@ -833,7 +764,7 @@ class JobSpec:
                 # survives the to_dict()->from_dict() hops in _with_model_disk / _spec_with_gpu /
                 # _assign_managed_hf_repo before deploy.
                 network_volume=gpu.get("network_volume"),
-                network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
+                network_volume_gb=volume_gb(gpu.get("network_volume_gb")),
                 count=gpu.get("count", 1),
                 type_fallbacks=gpu_type_fallbacks,
             ),
