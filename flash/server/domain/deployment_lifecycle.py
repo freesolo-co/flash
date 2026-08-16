@@ -514,7 +514,6 @@ class _Attempt:
         )
 
     def _commit_ready(self, activated_current: dict) -> None:
-        lifecycle = self._lifecycle
         current = dict(activated_current)
         current["verify"] = True
         current = deployment_state(
@@ -526,18 +525,28 @@ class _Attempt:
         verification_generation = current.get("verification_generation")
         current = public_deployment_view(current)
         try:
-            if not lifecycle.commit_ready(
-                self.run_id, current, verification_generation, self.is_checkpoint, self.prev_state
-            ):
-                lifecycle.reconcile_ready_commit_miss(
-                    self.run_id,
-                    current,
-                    verification_generation,
-                    self.is_checkpoint,
-                    self.deployment,
-                )
+            self._commit_or_reconcile(current, verification_generation)
         except Exception as exc:
             self._recover_ready_commit(current, verification_generation, exc)
+
+    def _commit_or_reconcile(self, current: dict, verification_generation) -> None:
+        """Commit the ready record, reconciling if the CAS lost to a newer writer.
+
+        The retry in `_recover_ready_commit` must reissue this exact call. A commit that
+        reconciled on the first attempt but not on the retry would leave the alias live with no
+        matching record, so the two paths share one body rather than two copies that can drift.
+        """
+        lifecycle = self._lifecycle
+        if not lifecycle.commit_ready(
+            self.run_id, current, verification_generation, self.is_checkpoint, self.prev_state
+        ):
+            lifecycle.reconcile_ready_commit_miss(
+                self.run_id,
+                current,
+                verification_generation,
+                self.is_checkpoint,
+                self.deployment,
+            )
 
     def _recover_ready_commit(self, current: dict, verification_generation, exc: Exception) -> None:
         lifecycle = self._lifecycle
@@ -549,16 +558,7 @@ class _Attempt:
                 and latest_deployment.get("state") in DEPLOYMENT_READY_STATES
             ):
                 return
-            if not lifecycle.commit_ready(
-                self.run_id, current, verification_generation, self.is_checkpoint, self.prev_state
-            ):
-                lifecycle.reconcile_ready_commit_miss(
-                    self.run_id,
-                    current,
-                    verification_generation,
-                    self.is_checkpoint,
-                    self.deployment,
-                )
+            self._commit_or_reconcile(current, verification_generation)
         except Exception as recovery_exc:
             divergence = (
                 "deployment_record_diverged: serving alias was activated for "
