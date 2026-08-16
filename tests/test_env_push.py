@@ -1833,6 +1833,62 @@ def test_credential_scan_refuses_an_identified_zip_it_cannot_open(tmp_path):
     assert credential_in_file(stored) == "a Freesolo API key"
 
 
+def test_credential_scan_reads_wide_encodings(tmp_path):
+    """UTF-16/32 text interleaves NULs, so a key in it matches none of the byte patterns.
+
+    A PowerShell `env.ps1` is UTF-16 by default on Windows, which is exactly the sourceable secrets
+    file this whole check exists for -- in the one encoding that walked straight past it.
+    """
+    from flash.env_secrets import credential_in_file
+
+    for encoding in ("utf-16", "utf-16-be", "utf-32", "utf-32-be"):
+        wide = tmp_path / f"env-{encoding}.ps1"
+        wide.write_bytes(f'$env:FREESOLO_API_KEY = "fslo_{_FAKE_KEY_BODY}"\n'.encode(encoding))
+        assert credential_in_file(wide) == "a Freesolo API key", encoding
+
+    # narrowing must not invent a credential out of unrelated NUL-padded bytes
+    padded = tmp_path / "padded.bin"
+    padded.write_bytes(b"\x00".join(b"ordinary binary content" for _ in range(50)))
+    assert credential_in_file(padded) is None
+
+
+def test_narrowing_does_not_invent_a_credential_out_of_machine_code(tmp_path):
+    """Every second byte of a compiled binary is not text, and must not be read as though it were.
+
+    Narrowing the whole file unconditionally was the bug: an ELF holds no credential, but taking
+    every second byte of x86 instruction bytes spells plausible tokens often enough that 5 of 500
+    ordinary system binaries were refused -- `/usr/bin/bash` narrowed to a string matching the
+    Freesolo key pattern. Refusing a legitimate publish is the failure here, so the fixture is the
+    real thing rather than a hand-made one: a binary on this machine, chosen for having no
+    credential in its literal bytes.
+
+    Guarded by the wide encodings above, which must keep working; a gate that fixed this by simply
+    not narrowing would pass this test and lose the `env.ps1` case the narrowing exists for.
+    """
+    from flash.env_secrets import _decoded_kind, credential_in_file
+
+    # Lifted verbatim from `/usr/bin/bash`, where this was first seen: three symbol names and their
+    # NUL terminators. Taking every second byte spells `fslo_eietossvdrdrcsP3`, which matches the
+    # Freesolo pattern and passes the entropy test. Pinned as bytes rather than read from the
+    # machine's own `/usr/bin`, which differs between here and CI and would make the test prove
+    # something different in each place -- or nothing, if the binaries it happened to pick were
+    # clean.
+    symbols = b"fos\x00loop_redirections\x00saved-redirects\x00PS3\x00"
+    assert _decoded_kind(symbols[0::2]) == "a Freesolo API key", "fixture no longer narrows"
+
+    # padded to an even offset so the fixture keeps the parity that narrows
+    binary = tmp_path / "libexample.so"
+    binary.write_bytes(b"\x7fELF\x02\x01\x01\x00" + symbols * 4)
+    assert credential_in_file(binary) is None
+
+    # The NULs here are string terminators, scattered through a symbol table rather than the
+    # regular padding column of wide text -- which is exactly what separates this from the
+    # `env.ps1` case above and what the gate keys on.
+    wide = tmp_path / "env.ps1"
+    wide.write_bytes(f'$env:FREESOLO_API_KEY = "fslo_{_FAKE_KEY_BODY}"\n'.encode("utf-16"))
+    assert credential_in_file(wide) == "a Freesolo API key"
+
+
 def test_push_refuses_a_credential_used_as_a_filename(monkeypatch, tmp_path, capsys):
     """A file NAMED after a key publishes it in the repository's file tree, contents irrelevant.
 
@@ -1869,6 +1925,41 @@ def test_push_refuses_a_credential_used_as_a_directory_name(monkeypatch, tmp_pat
     assert cli.cmd_env_push(_args(env_dir)) == 1
     assert credential_in_name("a/b/hf_AbCdEf0123456789012345/c.txt") == "a Hugging Face token"
     assert credential_in_name("src/hf_hub_download_helper.py") is None
+
+
+def test_a_container_encoded_into_a_member_name_is_expanded():
+    """A name gets the same container inspection a file's contents get.
+
+    The name scan passed no deadline, and that is exactly what switches `_decoded_container` off --
+    so an encoded container in a name was only ever matched in its still-compressed form. A
+    66-character filename holding `base64(gzip(key))` published clean, while decoding and inflating
+    the published path recovers the whole key: the name is in the repo tree forever, so this leaks
+    through the listing even with an empty file under it.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import credential_in_name
+
+    encoded = (
+        base64.urlsafe_b64encode(gzip.compress(f"fslo_{_FAKE_KEY_BODY}".encode()))
+        .decode()
+        .rstrip("=")
+    )
+    # the name really does carry the key, recoverable by ordinary tools
+    assert f"fslo_{_FAKE_KEY_BODY}".encode() in gzip.decompress(
+        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    )
+    assert credential_in_name(encoded) == "a Freesolo API key"
+
+    # ordinary names must not become refusals or false matches -- base64-SHAPED names are common
+    for ordinary in (
+        "model-00001-of-00002.safetensors",
+        "data/shard_0001.tar.gz",
+        "aGVsbG8gd29ybGQK",
+        "checkpoint-1000/optimizer.pt",
+    ):
+        assert credential_in_name(ordinary) is None, ordinary
 
 
 def test_a_pem_header_without_a_key_body_is_prose_not_a_credential(tmp_path):
@@ -2312,6 +2403,29 @@ def test_a_zip_behind_an_executable_stub_is_still_expanded(tmp_path):
     assert credential_in_file(sfx) == "a Freesolo API key"
 
 
+def test_a_base64_encoded_credential_is_decoded_and_found(tmp_path):
+    """A Kubernetes Secret stores every value base64-encoded, sharing no substring with the key.
+
+    Measured before adopting this: 630,011 base64-shaped runs across 8,769 real hub files decode to
+    zero credential matches, so decoding candidates costs no legitimate publish.
+    """
+    import base64
+
+    from flash.env_secrets import _credential_kind, credential_in_file
+
+    encoded = base64.b64encode(f"fslo_{_FAKE_KEY_BODY}".encode()).decode()
+    manifest = tmp_path / "secret.yaml"
+    manifest.write_text(f"apiVersion: v1\nkind: Secret\ndata:\n  api-key: {encoded}\n")
+    assert credential_in_file(manifest) == "a Freesolo API key"
+
+    # an encoded whole file, which is how a sourceable env file travels in a manifest
+    whole = base64.b64encode(f'export FREESOLO_API_KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode())
+    assert _credential_kind(b"data:\n  env.sh: " + whole) == "a Freesolo API key"
+
+    # ordinary prose and short tokens must not be decoded into false positives
+    assert _credential_kind(b"the quick brown fox jumps over the lazy dog repeatedly") is None
+
+
 @pytest.mark.parametrize(
     "placeholder",
     [
@@ -2400,6 +2514,34 @@ def test_a_scan_limit_refuses_rather_than_reporting_clean(tmp_path, monkeypatch)
     within = tmp_path / "shallow.gz"
     within.write_bytes(shallow)
     assert credential_in_file(within) == "a Freesolo API key"
+
+
+def test_a_credential_straddling_a_base64_window_is_still_decoded(tmp_path):
+    """A long base64 run is decoded in OVERLAPPING windows, so no cut can hide a key.
+
+    Bounding the run itself was worse than bounding nothing: a base64 blob longer than the bound
+    was skipped entirely, so encoding a big config file was enough to publish the key inside it.
+    Slicing into adjacent windows instead moved the hole rather than closing it -- a credential
+    across the cut decodes into neither piece.
+    """
+    import base64
+
+    from flash.env_base64 import _BASE64_WINDOW
+    from flash.env_secrets import _credential_kind, credential_in_file
+
+    secret = f"fslo_{_FAKE_KEY_BODY}".encode()
+
+    # a run far past any single window, with the key deliberately placed on the seam
+    prefix_bytes = (_BASE64_WINDOW // 4) * 3
+    blob = base64.b64encode(b"A" * prefix_bytes + secret + b"B" * prefix_bytes)
+    assert len(blob) > _BASE64_WINDOW, "the run must exceed one window to test the overlap"
+    manifest = tmp_path / "secret.yaml"
+    manifest.write_bytes(b"data:\n  bundle: " + blob + b"\n")
+    assert credential_in_file(manifest) == "a Freesolo API key"
+
+    # base64 inside a wide encoding: the two supported forms must compose, not merely pass alone
+    wide = base64.b64encode(secret).decode().encode("utf-16-le")
+    assert _credential_kind(wide) == "a Freesolo API key"
 
 
 def test_an_assigned_key_with_no_prefix_is_caught_by_its_variable_name(tmp_path):
@@ -2602,6 +2744,34 @@ def test_one_expansion_budget_covers_the_whole_package(tmp_path, monkeypatch):
     assert elapsed < 3.0, f"budget appears to reset per file ({elapsed:.1f}s)"
 
 
+def test_a_refusal_never_echoes_a_credential_in_a_filename(tmp_path):
+    """Masking covered only prefixed tokens, so the newer credential forms printed in full.
+
+    The refusal names the member so the author can find it, and when the credential IS that name,
+    printing it re-leaks the key into a terminal and whatever collects its output -- the one thing
+    the rest of this module is careful never to do.
+    """
+    import base64
+
+    from flash.env_secrets import _redacted, credential_in_name
+
+    body = "0123456789abcdef" * 2 + "01234567"
+    assigned = f"cache/wandb_api_key={body}.json"
+    assert credential_in_name(assigned) == "a Weights & Biases API key"
+    assert body not in _redacted(assigned)
+    assert "wandb_api_key" in _redacted(assigned), "the author still needs to find the file"
+
+    # a base64 name has no plaintext body to mask, so the name is withheld and the directory given
+    encoded = base64.b64encode(f"fslo_{_FAKE_KEY_BODY}".encode()).decode().replace("=", "")
+    nested = f"cache/{encoded}.bin"
+    assert credential_in_name(nested) == "a Freesolo API key"
+    assert encoded[:20] not in _redacted(nested)
+    assert "cache/" in _redacted(nested)
+
+    # an ordinary path is returned untouched
+    assert _redacted("src/environment.py") == "src/environment.py"
+
+
 def test_a_tar_nested_inside_another_container_is_expanded(tmp_path):
     """Tar was recognised at top level only, so one layer in it became final content again.
 
@@ -2762,12 +2932,80 @@ def test_an_oversized_tar_refuses_rather_than_passing(tmp_path, monkeypatch):
     assert outcome in ("a Freesolo API key", "contains an archive too large to inspect")
 
 
+def test_a_credential_in_line_wrapped_base64_is_decoded(tmp_path):
+    """MIME wraps base64 every 76 characters, and the run pattern stops at the newline.
+
+    A wrapped blob therefore arrived as a series of per-line runs, and a credential crossing a break
+    decoded into neither -- 20 of 60 possible key offsets, i.e. every key unlucky enough to straddle
+    a line.
+    """
+    import base64
+
+    from flash.env_secrets import _credential_kind
+
+    secret = f"fslo_{_FAKE_KEY_BODY}".encode()
+    # sweep the key across the 76-column boundary rather than testing one lucky placement
+    for pad in range(30, 56):
+        wrapped = base64.encodebytes(b"P" * pad + secret + b"Q" * 40)
+        assert wrapped.count(b"\n") > 1, "the fixture must actually wrap"
+        assert _credential_kind(wrapped) == "a Freesolo API key", pad
+
+    # unrelated adjacent values must NOT be welded into one run: joining arbitrary line pairs
+    # would decode bytes that neither line contained.
+    pair = (
+        b"KEY="
+        + base64.b64encode(b"hello there friend")
+        + b"\nOTHER="
+        + base64.b64encode(b"goodbye now everyone")
+    )
+    assert _credential_kind(pair) is None
+
+
 def _wrapped(raw: bytes, width: int, eol: bytes) -> bytes:
     """`raw` base64-encoded and broken every `width` characters with `eol`."""
     import base64
 
     body = base64.b64encode(raw)
     return eol.join(body[i : i + width] for i in range(0, len(body), width))
+
+
+def test_a_credential_crossing_a_crlf_or_single_line_break_is_decoded():
+    """The two shapes the first wrapping pass could not join.
+
+    It required two or more FULL-width lines, so the commonest blob of all -- one just over the
+    width, i.e. one full line plus a short tail -- never joined, and it matched only `\\n`, so a
+    Windows checkout or a YAML export wrapping with CRLF never joined either. Both leave a key
+    that straddles the break decoding into neither side: 20 of 70 offsets missed on CRLF, 3 on
+    the two-line blob.
+
+    Sweeping the key across the boundary is what exposes this. A single placement is not enough --
+    a 53-byte key fits inside one 76-column line, so a fixed fixture reports "caught" from the
+    per-line run while the join is doing nothing.
+    """
+    from flash.env_secrets import _credential_kind
+
+    secret = f"fslo_{_FAKE_KEY_BODY}".encode()
+    for width in (76, 64):
+        for eol in (b"\n", b"\r\n"):
+            for pad in range(70):
+                # a tail of filler forces several lines; no tail is the one-full-line-plus-tail
+                # shape, which is the case that never joined at all
+                for tail in (b"", b"Q" * 40):
+                    blob = _wrapped(b"P" * pad + secret + tail, width, eol)
+                    if eol not in blob:
+                        continue  # too short to wrap, so nothing to join
+                    assert _credential_kind(blob) == "a Freesolo API key", (width, eol, pad, tail)
+
+    # control: adjacent full-width lines of unrelated data must still not be welded together
+    import base64
+
+    unrelated = (
+        base64.b64encode(b"first value here, long enough to fill a line" * 2)[:76]
+        + b"\r\n"
+        + base64.b64encode(b"second unrelated value entirely" * 2)[:76]
+        + b"\r\n"
+    )
+    assert _credential_kind(unrelated) is None
 
 
 def test_a_binary_der_private_key_is_detected(tmp_path):
@@ -3212,6 +3450,36 @@ def test_a_genuinely_oversized_archive_still_refuses(tmp_path):
         monkeypatch.undo()
 
 
+def test_an_indented_wrapped_base64_block_is_joined():
+    """A wrapped blob is routinely indented: a YAML block scalar, a value under a `data:` key.
+
+    Requiring the next line to start in column 0 missed 20 of 60 key offsets on a two-space-indented
+    block, at both widths -- and indented is the commonest way a blob is embedded in a config file.
+    """
+    import base64
+    import os
+
+    from flash.env_secrets import _credential_kind
+
+    secret = f"fslo_{_FAKE_KEY_BODY}".encode()
+    for width in (76, 64):
+        for indent in (b"", b"  ", b"    ", b"\t"):
+            for pad in range(60):
+                body = base64.b64encode(b"P" * pad + secret)
+                blob = b"\n".join(
+                    indent + body[index : index + width] for index in range(0, len(body), width)
+                )
+                if b"\n" not in blob:
+                    continue
+                assert _credential_kind(blob) == "a Freesolo API key", (width, indent, pad)
+
+    # the indent must not weld two unrelated indented values into one decodable run
+    unrelated = (
+        base64.b64encode(os.urandom(57)) + b"\n  " + base64.b64encode(os.urandom(57)) + b"\n"
+    )
+    assert _credential_kind(unrelated) is None
+
+
 def test_a_name_holding_a_lone_surrogate_does_not_crash_the_check():
     """`surrogateescape` is a DECODE-only handler, so encoding a lone surrogate raised.
 
@@ -3429,6 +3697,26 @@ def test_a_v7_tar_with_a_non_ascii_name_is_still_expanded(tmp_path):
     with zipfile.ZipFile(nested, "w", zipfile.ZIP_DEFLATED) as outer:
         outer.write(archive, "inner.tar")
     assert credential_in_file(nested) == "a Freesolo API key"
+
+
+def test_a_url_safe_base64_credential_is_decoded():
+    """RFC 4648 section 5 swaps `+/` for `-_`, which is what a JWT or a token-in-a-URL uses.
+
+    Accepting only the standard alphabet split such a value at its first `-`, and the surviving
+    fragments decoded to neither the whole token nor anything matching.
+    """
+    import base64
+
+    from flash.env_secrets import _credential_kind
+
+    # a leading 0xf8 byte is what forces the differing character into the encoding
+    raw = b"\xf8fslo_" + _FAKE_KEY_BODY.encode()
+    standard = base64.b64encode(raw)
+    url_safe = base64.urlsafe_b64encode(raw)
+    assert standard != url_safe, "the fixture must actually differ between the two alphabets"
+
+    assert _credential_kind(standard) == "a Freesolo API key"
+    assert _credential_kind(url_safe) == "a Freesolo API key"
 
 
 def test_every_pkcs1_modulus_length_form_is_recognised(tmp_path):
@@ -3853,6 +4141,49 @@ def test_a_symmetric_jwk_holds_its_secret_in_k_not_d(tmp_path):
     assert credential_in_file(public) is None
 
 
+def test_a_short_credential_is_found_in_its_wide_encoding_too(tmp_path):
+    """The wide-run floor must sit at or below the shortest credential any pattern admits.
+
+    At 24 it sat above three of them, so a `pit_` (from 20 characters), `fslo_` (21) or `hf_` (23)
+    key was detected as ASCII and missed in its UTF-16 form -- the encoding the narrowing exists to
+    cover. A run has to hold the whole credential for the narrowed text to match.
+    """
+    from flash.env_secrets import credential_in_file
+
+    for name, text in (
+        ("pit", "pit_R08qzjI6GKFSufrd"),
+        ("fslo", "fslo_WJKY40uvSwMFLZDe"),
+        ("hf", "hf_S2qHx6kwXoIIXGvOoNZY"),
+    ):
+        wide = tmp_path / f"{name}.ps1"
+        wide.write_bytes(f"$env:KEY = '{text}'".encode("utf-16-le"))
+        assert credential_in_file(wide) is not None, f"{name} missed in UTF-16"
+
+    # the padding column is what identifies wide text: an ELF still narrows into nothing
+    binary = tmp_path / "binary.so"
+    binary.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"fos\x00loop_redirections\x00PS3\x00" * 40)
+    assert credential_in_file(binary) is None
+
+
+def test_a_credential_wrapped_in_the_url_safe_alphabet_is_joined(tmp_path):
+    """Line-joining accepted only `+/` while the run pattern accepted `-_` as well.
+
+    A url-safe base64 blob was therefore never recognised as wrapped, its lines were left unjoined,
+    and a credential straddling a break decoded into neither side -- the exact bypass joining
+    exists to close, reachable just by encoding with the other alphabet.
+    """
+    import base64
+
+    from flash.env_secrets import credential_in_file
+
+    raw = b"\xfb\xef\xff" * 10 + b"fslo_AbCdEf0123456789AbCdEf" + b"\xfe\xff\xef" * 3
+    encoded = base64.urlsafe_b64encode(raw)
+    assert b"-" in encoded or b"_" in encoded, "fixture no longer exercises the url-safe alphabet"
+    wrapped = tmp_path / "wrapped.txt"
+    wrapped.write_bytes(b"\n".join(encoded[at : at + 64] for at in range(0, len(encoded), 64)))
+    assert credential_in_file(wrapped) == "a Freesolo API key"
+
+
 def test_a_yaml_block_scalar_value_is_read_as_an_assignment(tmp_path):
     """YAML may put an assigned value on the FOLLOWING lines rather than after the colon.
 
@@ -4134,6 +4465,25 @@ def test_a_multi_prime_rsa_private_key_is_detected(tmp_path):
     assert credential_in_file(der) == "a private key"
 
 
+def test_unpadded_base64_is_padded_rather_than_truncated(tmp_path):
+    """Trimming a run to a whole quartet discarded up to two decoded bytes off the END.
+
+    That is enough to take a token below its pattern's minimum length, so unpadded base64url of a
+    20-character `pit_` key or a 23-character `hf_` token decoded to something matching nothing.
+    Unpadded output is what `rstrip("=")`, a JWT segment and most token-in-a-URL encodings emit.
+    """
+    import base64
+
+    from flash.env_secrets import credential_in_file
+
+    for name, token in (("pit", "pit_AbCdEf0123456789"), ("hf", "hf_AbCdEf0123456789AbCd")):
+        encoded = base64.urlsafe_b64encode(token.encode()).decode()
+        assert encoded.endswith("="), "fixture no longer exercises omitted padding"
+        written = tmp_path / f"{name}.txt"
+        written.write_text(encoded.rstrip("="))
+        assert credential_in_file(written) is not None, name
+
+
 def test_a_zlib_stream_needing_a_preset_dictionary_is_refused(tmp_path):
     """FDICT means the stream was compressed against a dictionary the file does not carry.
 
@@ -4345,6 +4695,32 @@ def test_ordinary_text_is_not_refused_as_a_dictionary_compressed_stream(tmp_path
     packed.write_bytes(blob)
     with pytest.raises(_Unscannable):
         credential_in_file(packed)
+
+
+def test_the_base64_floor_admits_the_shortest_token_the_patterns_match(tmp_path):
+    """The encoded floor is derived from the shortest credential, not chosen.
+
+    `xoxb-` plus its 10-character body is 15 bytes, which encodes to 20 characters -- below a fixed
+    24 -- so a minimum-length Slack token in a Kubernetes Secret was never decoded even though the
+    same token in plaintext was caught.
+    """
+    import base64
+
+    from flash.env_base64 import _MIN_BASE64_RUN
+    from flash.env_patterns import SHORTEST_TOKEN_BYTES
+    from flash.env_secrets import credential_in_file
+
+    token = b"xoxb-AbCdEf0123"
+    assert len(token) == SHORTEST_TOKEN_BYTES
+    encoded = base64.b64encode(token).decode()
+    assert len(encoded) == _MIN_BASE64_RUN
+
+    written = tmp_path / "secret.yaml"
+    written.write_text(f"data:\n  token: {encoded}\n")
+    assert credential_in_file(written) == "a Slack token"
+
+    # the floor tracks the patterns rather than being written twice
+    assert _MIN_BASE64_RUN == -(-SHORTEST_TOKEN_BYTES * 4 // 3)
 
 
 def test_a_yaml_block_header_may_carry_a_comment(tmp_path):
@@ -4962,6 +5338,36 @@ def test_an_uncorroborated_member_count_does_not_refuse_a_clean_file(tmp_path):
     assert _zip_member_count(shrunk, 100_000) == 300
 
 
+def test_the_wide_text_floor_admits_the_shortest_token(tmp_path):
+    """Lowering the base64 floor for Slack left the independent wide-text floor at 20.
+
+    The two floors answer the same question about the same patterns. `xoxb-` plus its 10-character
+    body is 15 bytes, so its UTF-16 form carries 15 NUL columns -- under a hardcoded 20, and the
+    token that was detected as ASCII was missed in the encoding this narrowing exists to cover.
+    """
+    from flash.env_buffers import _WIDE_RUN
+    from flash.env_patterns import SHORTEST_TOKEN_BYTES
+    from flash.env_secrets import _credential_kind
+
+    token = b"xoxb-AbCdEf0123"
+    assert len(token) == SHORTEST_TOKEN_BYTES
+    assert _credential_kind(token) == "a Slack token"
+    assert _credential_kind(token.decode().encode("utf-16-le")) == "a Slack token"
+    assert _credential_kind(token.decode().encode("utf-16-be")) == "a Slack token"
+
+    # derived, not written: the floor moves with the shortest token the patterns admit
+    assert _WIDE_RUN.pattern == rb"\x01{%d,}" % SHORTEST_TOKEN_BYTES
+
+    # the NUL-column gate still keeps ordinary machine code from narrowing into a token
+    import pathlib
+
+    binary = pathlib.Path("/usr/bin/python3")
+    if binary.exists():
+        from flash.env_secrets import credential_in_file
+
+        assert credential_in_file(binary) is None
+
+
 def test_a_secret_key_behind_the_marker_bound_is_refused(tmp_path):
     """Bounding the marker walk turned the bound itself into the bypass.
 
@@ -5303,6 +5709,35 @@ def test_a_headerless_deflate_stream_is_expanded(tmp_path):
         assert credential_in_file(noise) is None
 
 
+def test_a_base64_value_holding_a_container_is_expanded(tmp_path):
+    """A Kubernetes Secret stores a gzipped credential base64, and both layers have to come off.
+
+    The decode succeeded and the decoded bytes were then pattern-matched while still COMPRESSED, so
+    `b64encode(gzip.compress(secret))` published clean -- even though base64 of the plaintext and
+    the bare gzip were each detected on their own.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import credential_in_file
+
+    secret = f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode()
+    encoded = base64.b64encode(gzip.compress(secret))
+
+    value = tmp_path / "encoded.txt"
+    value.write_bytes(encoded)
+    assert credential_in_file(value) == "a Freesolo API key"
+
+    manifest = tmp_path / "secret.yaml"
+    manifest.write_bytes(b"apiVersion: v1\nkind: Secret\ndata:\n  env: " + encoded + b"\n")
+    assert credential_in_file(manifest) == "a Freesolo API key"
+
+    # an ordinary compressed document encoded the same way still publishes
+    innocent = tmp_path / "docs.txt"
+    innocent.write_bytes(base64.b64encode(gzip.compress(b"just some documentation " * 40)))
+    assert credential_in_file(innocent) is None
+
+
 def test_a_netrc_machine_password_is_refused(tmp_path):
     """A `.netrc` password names no service, so nothing else here could anchor on it.
 
@@ -5402,6 +5837,37 @@ def test_a_credential_in_a_pdf_stream_is_found(tmp_path):
     assert credential_in_file(shard) is None
 
 
+def test_a_credential_split_across_adjacent_literals_is_found(tmp_path):
+    """Adjacent string literals concatenate, so the file holds no contiguous copy of the key.
+
+    Python source is exempt from the filename filter by design -- helper modules have to ship or
+    the worker fails to import -- so a key split this way had nothing between it and the hub, while
+    the same key written as one literal was caught.
+    """
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}"
+    for name, source in (
+        ("adjacent.py", f'FREESOLO_API_KEY = "{key[:18]}" "{key[18:]}"\n'),
+        ("wrapped.py", f'FREESOLO_API_KEY = (\n    "{key[:18]}"\n    "{key[18:]}"\n)\n'),
+        ("three.py", f'KEY = "{key[:12]}" "{key[12:24]}" "{key[24:]}"\n'),
+    ):
+        helper = tmp_path / name
+        helper.write_text(source)
+        assert credential_in_file(helper) == "a Freesolo API key", name
+
+    # a comma between two literals is two values, not one string, so unrelated entries are never
+    # welded into a credential nobody wrote
+    for name, source in (
+        ("list.json", '["alpha_value_here", "beta_value_here"]\n'),
+        ("dict.json", '{"a": "xxxx", "b": "yyyy"}\n'),
+        ("prose.txt", 'he said "hello" "world" and left\n'),
+    ):
+        innocent = tmp_path / name
+        innocent.write_text(source)
+        assert credential_in_file(innocent) is None, name
+
+
 def test_a_pdf_with_more_streams_than_the_limit_is_refused(tmp_path):
     """The stream walk is bounded, and stopping at the bound reported the rest as clean.
 
@@ -5435,6 +5901,77 @@ def test_a_pdf_with_more_streams_than_the_limit_is_refused(tmp_path):
         credential_in_file(over)
 
 
+def test_a_base64_container_longer_than_one_window_is_expanded(tmp_path):
+    """A container has to be seen whole, and windowing cut it in half.
+
+    Only the first window decoded to anything carrying a gzip header; every later window started
+    mid-stream, so the expansion saw a prefix and never reached the tail. A 13 KB base64 of a
+    gzip published clean while the same gzip standing alone was expanded.
+    """
+    import base64
+    import gzip
+    import random
+
+    from flash.env_secrets import credential_in_file
+
+    # The filler has to be BOTH bulky when compressed and genuinely compressed. `os.urandom` is
+    # not: DEFLATE stores an incompressible tail verbatim, so the key survives literally in the
+    # gzip bytes and is found with no expansion at all -- the test would pass without the fix.
+    # Fully repetitive filler is not either: it compresses so far that the run never reaches one
+    # window. Semi-random words sit between the two.
+    draws = random.Random(7)
+    words = [
+        "".join(draws.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(8)) for _ in range(4000)
+    ]
+    filler = "\n".join(draws.choice(words) for _ in range(2000)).encode()
+    packed = gzip.compress(filler + b"\n" + f"FREESOLO_API_KEY=fslo_{_FAKE_KEY_BODY}\n".encode())
+    assert b"fslo_" not in packed, "filler must not leave the key stored literally"
+    encoded = base64.b64encode(packed)
+    assert len(encoded) > 8192, "the run must exceed one decode window"
+
+    bare = tmp_path / "shard.gz"
+    bare.write_bytes(packed)
+    assert credential_in_file(bare) == "a Freesolo API key"
+
+    value = tmp_path / "encoded.txt"
+    value.write_bytes(encoded)
+    assert credential_in_file(value) == "a Freesolo API key"
+
+
+def test_a_line_continuation_inside_a_credential_is_rejoined(tmp_path):
+    """The shell removes a backslash-newline before the value is ever assigned.
+
+    So `KEY="fslo_AbCd\\<newline>Ef01"` exports the whole credential while no contiguous run of
+    bytes in the file holds it. The literal-pair join added earlier covered only adjacent QUOTED
+    literals, which is not how a long line gets wrapped in a shell file.
+    """
+    from flash.env_secrets import credential_in_file
+
+    whole = tmp_path / "env.sh"
+    whole.write_bytes(f'FREESOLO_API_KEY="fslo_{_FAKE_KEY_BODY}"\n'.encode())
+    assert credential_in_file(whole) == "a Freesolo API key"
+
+    split = tmp_path / "wrapped.sh"
+    split.write_bytes(
+        b'FREESOLO_API_KEY="fslo_'
+        + _FAKE_KEY_BODY[:10].encode()
+        + b"\\\n"
+        + _FAKE_KEY_BODY[10:].encode()
+        + b'"\n'
+    )
+    assert credential_in_file(split) == "a Freesolo API key"
+
+    # an ESCAPED backslash at end of line is not a continuation, so two unrelated lines must not
+    # be welded into a run that decodes to a credential nobody wrote
+    for name, source in (
+        ("paths.sh", 'ROOT="C:\\\\"\nNAME="ordinary"\n'),
+        ("makefile", "all:\n\tgcc -o out \\\n\t\tmain.c\n"),
+    ):
+        innocent = tmp_path / name
+        innocent.write_text(source)
+        assert credential_in_file(innocent) is None, name
+
+
 def test_an_aws_secret_with_escaped_slashes_is_matched(tmp_path):
     """`\\/` is a legal JSON escape, and an AWS secret is base64 so it carries `/` routinely.
 
@@ -5458,6 +5995,44 @@ def test_an_aws_secret_with_escaped_slashes_is_matched(tmp_path):
     slashed = body.replace("/", "\\/")
     escaped.write_text(f'{{"SecretAccessKey": "{slashed}"}}')
     assert credential_in_file(escaped) == "an AWS secret access key"
+
+
+def test_a_json_unicode_escape_inside_a_credential_is_resolved(tmp_path):
+    """`\\u0045` IS `E` to every JSON parser, so the escape spells the key without spelling it.
+
+    `json.loads` returns the identical credential either way -- the reader of the file gets the
+    working key -- but the raw bytes the patterns read carry a six-character escape where one
+    character belongs, so the run breaks and the file published clean. One escaped character
+    anywhere in the body is enough, and encoders that emit `\\u` for ASCII (Python's
+    `ensure_ascii`, several log formatters) can produce it without anyone choosing to.
+    """
+    import json
+
+    from flash.env_secrets import credential_in_file
+
+    def escaped(text: str) -> str:
+        return "".join(f"\\u00{ord(letter):02x}" for letter in text)
+
+    for name, key in (
+        ("one.json", f"fslo_{_FAKE_KEY_BODY[:4]}{escaped(_FAKE_KEY_BODY[4])}{_FAKE_KEY_BODY[5:]}"),
+        ("all.json", f"fslo_{escaped(_FAKE_KEY_BODY)}"),
+        ("prefix.json", f"{escaped('f')}slo_{_FAKE_KEY_BODY}"),
+    ):
+        published = tmp_path / name
+        published.write_text(f'{{"FREESOLO_API_KEY": "{key}"}}')
+        # the escape is not a near-miss spelling: the parser hands the caller the real key
+        assert json.loads(published.read_text())["FREESOLO_API_KEY"] == f"fslo_{_FAKE_KEY_BODY}"
+        assert credential_in_file(published) == "a Freesolo API key", name
+
+    # resolving escapes must not invent a credential in a document that holds none, and an escaped
+    # non-ASCII character stays untouched rather than being folded into some encoding
+    for name, source in (
+        ("prose.json", '{"note": "caf\\u00e9 \\u0041BC", "count": 1}'),
+        ("newline.json", '{"text": "line\\u000aline"}'),
+    ):
+        innocent = tmp_path / name
+        innocent.write_text(source)
+        assert credential_in_file(innocent) is None, name
 
 
 def test_an_openssl_salted_envelope_is_refused(tmp_path):
@@ -5640,6 +6215,47 @@ def test_a_gzip_with_a_maximum_extra_field_is_probed_past_its_header(tmp_path):
     assert credential_in_file(noise) is None
 
 
+def test_a_base64_container_cut_by_a_chunk_boundary_is_refused(tmp_path):
+    """A container does not survive being cut: only the first piece carries its header.
+
+    The scan reads a file in bounded chunks, so a long encoded blob arrives in pieces and the
+    windowed pass sees a prefix that stops before the tail. Measured: the credential in a gzip
+    whose base64 crossed the 1 MiB chunk boundary published clean, while the same blob one byte
+    shorter was caught. Unexpanded is not clean.
+    """
+    import gzip
+    import json
+    import random
+
+    from flash.env_secrets import _SCAN_CHUNK_BYTES, _Unscannable, credential_in_file
+
+    draws = random.Random(13)
+    words = [
+        bytes(draws.choice(b"abcdefghijklmnopqrstuvwxyz") for _ in range(8)) for _ in range(400)
+    ]
+    filler = bytearray()
+    while len(filler) < (6 << 20):
+        filler += draws.choice(words) + b" "
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    blob = gzip.compress(bytes(filler) + b"\nFSLO_API_KEY=" + key + b"\n", 1)
+    encoded = base64.b64encode(blob)
+    # semi-random filler on purpose: incompressible padding would leave the key stored VERBATIM in
+    # the gzip bytes, and fully repetitive padding never reaches a chunk boundary at all
+    assert b"fslo_" not in blob
+    assert len(encoded) > _SCAN_CHUNK_BYTES
+
+    cut = tmp_path / "secret.b64"
+    cut.write_bytes(b"DATA=" + encoded + b"\n")
+    with pytest.raises(_Unscannable, match="too long to expand"):
+        credential_in_file(cut)
+
+    # a long run that is NOT a container loses nothing by being cut, so it still publishes: the
+    # windowed pass reads a literal credential wherever it lands
+    padded = tmp_path / "rows.json"
+    padded.write_text(json.dumps({"note": "x" * (_SCAN_CHUNK_BYTES + 4096), "tail": "ok"}))
+    assert credential_in_file(padded) is None
+
+
 def test_raw_deflate_probing_does_not_read_the_whole_file(tmp_path):
     """Every file reaching the handler is probed, so reading it whole doubled a publish's memory.
 
@@ -5669,6 +6285,121 @@ def test_raw_deflate_probing_does_not_read_the_whole_file(tmp_path):
     assert max(sizes) <= (1 << 20)
     # and a non-stream is still rejected rather than mistaken for deflate
     assert _credential_in_raw_deflate(big, deadline=later, depth=1) is None
+
+
+def test_a_zlib_stream_at_any_level_is_recognised_behind_base64(tmp_path):
+    """A cut base64 run holding a zlib stream is refused whatever level wrote it.
+
+    `_CONTAINER_MAGIC` listed `x\x9c`, which is only zlib's DEFAULT level. `zlib.compress(data, 9)`
+    writes `x\xda`, so a level-9 stream whose base64 crossed the 1 MiB scan chunk was not seen as a
+    container, the truncation refusal never fired, and the credential published clean.
+    """
+    import zlib
+
+    from flash.env_secrets import _SCAN_CHUNK_BYTES, _Unscannable, credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    for level in (1, 6, 9):
+        raw = zlib.compress(random.Random(level).randbytes(1 << 20) + key, level)
+        encoded = base64.b64encode(raw)
+        assert len(encoded) > _SCAN_CHUNK_BYTES, (level, len(encoded))
+        cut = tmp_path / f"cut{level}.txt"
+        cut.write_bytes(b"DATA=" + encoded + b"\n")
+        with pytest.raises(_Unscannable):
+            credential_in_file(cut, deadline=time.monotonic() + 120)
+
+
+def test_an_unpadded_base64_container_is_padded_rather_than_truncated(tmp_path):
+    """A whole run is padded up, not cut back, so the container's last bytes survive.
+
+    Trimming to the previous multiple of four discards up to three encoded characters, which for a
+    zip are bytes of the end-of-central-directory record: the archive then would not open, whole-run
+    inspection declined, and the credential inside published.
+    """
+    import zipfile
+
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("a.txt", random.Random(3).randbytes(20000).hex())
+        archive.writestr("env.sh", b"export FSLO_API_KEY=" + key + b"\n")
+        archive.writestr("b.txt", random.Random(4).randbytes(20000).hex())
+    encoded = base64.b64encode(buf.getvalue()).rstrip(b"=")
+    assert len(encoded) % 4, "fixture must be unpadded to exercise the padding"
+    unpadded = tmp_path / "unpadded.txt"
+    unpadded.write_bytes(b"DATA=" + encoded + b"\n")
+    assert credential_in_file(unpadded, deadline=time.monotonic() + 120) == "a Freesolo API key"
+
+
+def test_a_base64_container_at_the_depth_cap_is_refused(tmp_path):
+    """The nesting cap refuses a decoded container rather than reporting it clean.
+
+    Returning None at the cap switched the second look off, so four nested zips around
+    `base64(gzip(secret))` published while the same gzip as an ordinary fifth container refused --
+    making "encode the last layer" the way past the limit.
+    """
+    import gzip
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    inner = io.BytesIO()
+    with gzip.GzipFile(fileobj=inner, mode="wb") as handle:
+        handle.write(b"export FSLO_API_KEY=" + key + b"\n")
+
+    def nest(payload: bytes, name: str) -> bytes:
+        for layer in range(4):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(name, payload)
+            payload, name = buf.getvalue(), f"layer{layer}.zip"
+        return payload
+
+    encoded = tmp_path / "encoded.zip"
+    encoded.write_bytes(nest(base64.b64encode(inner.getvalue()), "inner.b64"))
+    with pytest.raises(_Unscannable):
+        credential_in_file(encoded, deadline=time.monotonic() + 120)
+
+    # an ordinary file nested just as deeply still publishes: the cap refuses CONTAINERS, not depth
+    plain = tmp_path / "plain.zip"
+    plain.write_bytes(nest(b"just some text\n", "inner.txt"))
+    assert credential_in_file(plain, deadline=time.monotonic() + 120) is None
+
+
+def test_a_refusal_from_a_whole_run_base64_container_propagates(tmp_path):
+    """An exact whole-run decode is not speculative, so its refusal is not swallowed.
+
+    Swallowing every refusal from the second look kept an ELF's chance base64 runs publishable, but
+    also turned a real encrypted zip behind base64 into a clean result while the same archive
+    scanned directly was refused.
+    """
+    import struct
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("env.sh", b"export FSLO_API_KEY=" + key + b"\n")
+    raw = bytearray(buf.getvalue())
+    for signature, offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        at = raw.find(signature)
+        flags = struct.unpack_from("<H", raw, at + offset)[0]
+        struct.pack_into("<H", raw, at + offset, flags | 0x1)
+
+    direct = tmp_path / "direct.zip"
+    direct.write_bytes(bytes(raw))
+    with pytest.raises(_Unscannable):
+        credential_in_file(direct, deadline=time.monotonic() + 120)
+
+    encoded = tmp_path / "encoded.txt"
+    encoded.write_bytes(b"DATA=" + base64.b64encode(bytes(raw)) + b"\n")
+    with pytest.raises(_Unscannable):
+        credential_in_file(encoded, deadline=time.monotonic() + 120)
 
 
 def test_a_private_key_armor_header_spanning_a_chunk_is_refused(tmp_path):
@@ -5805,6 +6536,50 @@ def test_a_non_pdf_is_declined_from_its_signature(tmp_path, monkeypatch):
     assert found == "a Freesolo API key"
 
 
+def test_a_chance_container_in_prose_does_not_refuse(tmp_path):
+    """A base64-shaped run inside prose stays speculative, so its refusal is swallowed.
+
+    Propagating a refusal from any exactly-decoding run made two real hub datasets unpublishable: a
+    9.7 MB JSONL of issue text holds base64-shaped words by chance, and one decoded to bytes
+    beginning `x\\x9c` with the FDICT bit set, so the dictionary refusal fired on bytes nobody
+    encoded. Bounding characters cannot separate the two -- prose is full of them, and a real
+    `zip -P` archive is 142 bytes, SMALLER than the accidental runs -- so the test is whether the
+    run was ASSIGNED.
+    """
+    import zlib
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    # a REAL preset-dictionary stream. Setting the FDICT bit by hand does not work: the two header
+    # bytes must stay a multiple of 31, so flipping one breaks the check that identifies zlib at
+    # all and the refusal is never reached. zlib writes both the flag and a valid checksum here.
+    compressor = zlib.compressobj(
+        6,
+        zlib.DEFLATED,
+        zlib.MAX_WBITS,
+        zlib.DEF_MEM_LEVEL,
+        zlib.Z_DEFAULT_STRATEGY,
+        b"the quick brown fox",
+    )
+    stream = compressor.compress(b"the quick brown fox jumps over the lazy dog" * 4)
+    stream += compressor.flush()
+    assert stream[1] & 0x20, "fixture must carry the FDICT flag"
+    run = base64.b64encode(stream).decode().rstrip("=")
+
+    later = time.monotonic() + 120
+    prose = tmp_path / "issues.jsonl"
+    prose.write_text(
+        '{"title":"crash on startup","body":"the traceback mentions ' + run + ' in the log"}\n'
+    )
+    assert credential_in_file(prose, deadline=later) is None
+
+    # the same bytes ASSIGNED are a value someone encoded, and stay refused
+    assigned = tmp_path / "config.env"
+    assigned.write_text("PAYLOAD=" + run + "\n")
+    with pytest.raises(_Unscannable):
+        credential_in_file(assigned, deadline=later)
+
+
 def test_raw_deflate_stops_when_its_output_budget_reaches_zero():
     """A block boundary landing exactly on the budget must not inflate the next block whole.
 
@@ -5907,6 +6682,129 @@ def test_a_chance_zlib_header_is_not_read_whole(tmp_path, monkeypatch):
     dictionary.write_bytes(stream)
     with pytest.raises(_Unscannable):
         credential_in_file(dictionary, deadline=later)
+
+
+def test_a_secret_key_packet_past_the_first_chunk_is_not_reported_clean(tmp_path):
+    """A keyring whose secret packet sits beyond the scan chunk must not publish.
+
+    The sequence walk runs on the FIRST chunk alone, and it stopped as soon as a packet declared
+    more body than was in hand -- which is exactly what a well-formed keyring looks like when a
+    large early packet crosses the boundary. Measured with a real GnuPG export: `gpg --import`
+    installed the secret key from bytes this reported clean.
+    """
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    # a public key packet, then filler, then the secret key: the order `gpg --export` followed by
+    # `gpg --export-secret-keys` writes, which is what a "back up my keys" one-liner produces.
+    public = b"\x99\x00\x10" + b"\x04" + b"\x6a\x7e\x7e\x1e" + b"\x01" + b"\x00" * 10
+    secret = b"\x95\x03\x98\x04" + b"\x6a\x7e\x7e\x1e" + b"\x01" + b"\x00" * 16
+    # old-format tag 12, four-byte length: legal, parsed, and long enough to span the chunk.
+    filler = lambda size: b"\xb2" + size.to_bytes(4, "big") + b"\x00" * size  # noqa: E731
+
+    compact = tmp_path / "compact.pgp"
+    compact.write_bytes(public + filler(16) + secret)
+    assert credential_in_file(compact) == "a private key"
+
+    spanning = tmp_path / "spanning.pgp"
+    spanning.write_bytes(public + filler(_SCAN_CHUNK_BYTES + 4096) + secret)
+    with pytest.raises(_Unscannable, match="cannot walk to the end"):
+        credential_in_file(spanning)
+
+    # a keyring cut short at TRUE end of file has nothing unread behind it, so refusing it would
+    # fail a publish over bytes that demonstrably hold no key.
+    truncated = tmp_path / "truncated.pgp"
+    truncated.write_bytes(public + b"\xb2" + (4096).to_bytes(4, "big") + b"\x00" * 32)
+    assert credential_in_file(truncated) is None
+
+
+def test_ordinary_binary_is_not_refused_as_an_unfinishable_openpgp_sequence():
+    """Random bytes must not be walked as a packet sequence and then refused for outrunning it.
+
+    The walk entered on bit 7 of the first byte alone -- set on HALF of all random bytes -- and the
+    next four bytes were then read as a body length, averaging two gigabytes. That declared body
+    ran past the buffer, which the caller reports as "cannot walk to the end" and refuses. Measured
+    at 18.8% of random 4 KiB blocks: roughly one upload in five blocked over nothing, and the shape
+    is ordinary (a model shard, a random-padded archive member), not crafted.
+
+    Two things were missing and BOTH are needed. The tag must name a packet type the format
+    defines, which removes the new-format half. That is not sufficient on its own: an old-format
+    tag is four bits, so a random byte names a real type most of the time -- the payload that
+    actually failed CI was `0x92`, a legal one-pass signature header -- so a body larger than the
+    scan could ever hold is also required to end the walk rather than report it undecided.
+
+    Asserted at the chunk size the scan really reads. A 4 KiB probe still shows a residual from the
+    two-byte length form, which can only claim 64 KB and so cannot outrun a megabyte chunk.
+
+    The bodies are drawn from a SEEDED generator, and the rate is asserted with a margin rather than
+    at zero. A megabyte of random bytes lands on a walkable header about twice in a thousand -- a
+    real residual, measured at 0.20% before any of this and 0.23% after -- so 64 unseeded draws fail
+    roughly one run in seven, on a property that has not regressed. Seeding makes the verdict a
+    function of the code alone; the margin is what the assertion is actually about, since the point
+    is that ordinary binary is not refused WHOLESALE, as it was at 18.8%.
+    """
+    import random
+
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_openpgp import _openpgp_secret_key_in_sequence
+
+    bodies = random.Random(20260815)
+    draws = 256
+    refused = sum(
+        1
+        for _ in range(draws)
+        if _openpgp_secret_key_in_sequence(bodies.randbytes(_SCAN_CHUNK_BYTES), truncated=True)
+        is None
+    )
+    assert refused <= draws // 64, f"{refused}/{draws} random chunks refused as unfinishable"
+
+    # the shape that failed CI, pinned exactly: an old-format one-pass signature tag whose 4-byte
+    # length declares a body no scan holds. Undecided here is what refused the publish.
+    implausible = b"\x92" + (1 << 31).to_bytes(4, "big") + bodies.randbytes(4096)
+    assert _openpgp_secret_key_in_sequence(implausible, truncated=True) is False
+
+    # and a body that IS plausible still reports undecided, which is the property being preserved:
+    # the fix must not turn "a real packet I could not finish reading" into a confident clean.
+    spanning = b"\x92" + (1 << 20).to_bytes(4, "big") + bodies.randbytes(4096)
+    assert _openpgp_secret_key_in_sequence(spanning, truncated=True) is None
+
+
+def test_an_openssl_envelope_written_in_base64_is_refused(tmp_path):
+    """`openssl enc -a` is the same ciphertext as `openssl enc`, and just as unreadable.
+
+    The binary form was refused at the anchored format check, but the base64 form reached the
+    decoded-bytes hook, which asked only whether the decode looked like a CONTAINER. An encrypted
+    envelope is not a container, so it returned None and a whole Freesolo key published.
+    """
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    # `Salted__`, an 8-byte salt, then ciphertext: the layout `openssl enc -salt` writes.
+    envelope = b"Salted__" + bytes(range(8)) + bytes(range(256)) * 2
+
+    binary = tmp_path / "enc.bin"
+    binary.write_bytes(envelope)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(binary)
+
+    # the sidecar form: one encoded blob and the trailing newline every text file carries
+    sidecar = tmp_path / "enc.b64"
+    sidecar.write_bytes(base64.b64encode(envelope) + b"\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(sidecar)
+
+    # and as an assigned value, which is how a Kubernetes Secret carries one
+    assigned = tmp_path / "secret.yaml"
+    assigned.write_bytes(b"data:\n  creds: " + base64.b64encode(envelope) + b"\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(assigned)
+
+    # prose ABOUT the format is not an envelope, and an ordinary encoded file is still publishable
+    prose = tmp_path / "notes.md"
+    prose.write_text("the `Salted__` header precedes the salt.\n" * 20)
+    assert credential_in_file(prose) is None
+    harmless = tmp_path / "config.b64"
+    harmless.write_bytes(base64.b64encode(b"ordinary configuration text\n" * 8) + b"\n")
+    assert credential_in_file(harmless) is None
 
 
 def test_a_pdf_stream_beyond_the_dictionary_gap_is_refused(tmp_path):
@@ -6201,6 +7099,32 @@ def test_a_netrc_entry_spanning_lines_is_still_one_record(tmp_path):
         assert credential_in_file(published) == "a machine password in a netrc file", name
 
 
+def test_the_wrapped_block_guard_is_linear_in_the_run_it_rejects(tmp_path):
+    """The cheap guard in front of the joining pattern must not be quadratic.
+
+    Widening it to accept narrower columns as an open-ended run made it take the longest match at
+    every start position and backtrack it away one character at a time when no break followed:
+    53 seconds on 100 KB of one long non-matching run, and hours on the megabyte chunks the scan
+    actually reads. A single unbroken run of base64 characters is an ordinary thing for a file to
+    contain, so this is reached without anyone crafting it.
+    """
+    import time
+
+    from flash.env_base64 import _WRAPPED_HINT
+
+    # one long run with no break after it: the shape that has no match to find
+    haystack = b'{"pad":"' + b"z" * (1 << 20) + b'"}\n'
+    started = time.monotonic()
+    assert _WRAPPED_HINT.search(haystack) is None
+    assert time.monotonic() - started < 5
+
+    # and it still recognises the blocks it was widened for, at every column in the range
+    for width in (32, 64, 76, 128):
+        wrapped = (b"a" * width + b"\n") * 2
+        assert _WRAPPED_HINT.search(wrapped), width
+    assert _WRAPPED_HINT.search(b"a" * 31 + b"\n") is None
+
+
 def test_an_overlay_search_does_not_reprobe_identical_candidates(tmp_path):
     """Overlapping magics are the same probe repeated, not a search.
 
@@ -6450,6 +7374,111 @@ def test_narrowed_wide_text_keeps_the_truncation_state_of_its_chunk(tmp_path):
     assert verdicts[0] == verdicts[1], verdicts
 
 
+def test_a_credential_split_by_any_supported_escape_is_rejoined(tmp_path):
+    """`\\U000000XX` and `\\xXX` name the same character `\\u00XX` does.
+
+    Only the JSON spelling was decoded, so the same key written for TOML or Python published:
+    `tomllib.loads('key="fslo_AbCd\\\\U00000045..."')` and a Python sidecar using `\\x45` both hand
+    the complete credential to whatever reads them, while the raw bytes a pattern sees are split by
+    the escape and match nothing.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY.encode()
+    for name, spelling in (
+        ("json.json", b'{"key":"fslo_\\u0041%s"}' % body),
+        ("toml.toml", b'key="fslo_\\U00000041%s"' % body),
+        ("python.py", b'KEY = "fslo_\\x41%s"' % body),
+    ):
+        published = tmp_path / name
+        published.write_bytes(spelling)
+        assert credential_in_file(published) == "a Freesolo API key", name
+
+
+def test_adjacent_literals_join_across_different_quote_styles(tmp_path):
+    """Python concatenates `'a'"b"` exactly as it concatenates `'a''b'`.
+
+    The seam pattern required the two quotes to MATCH, so a key split across literals written with
+    different delimiters stayed split while the matched spelling was refused. What separates a
+    concatenation from two list elements is the whitespace-only separator, not which quote each
+    side uses.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY.encode()
+    for name, source in (
+        ("matched.py", b"KEY = 'fslo_Ab''%s'" % body),
+        ("mixed.py", b"KEY = 'fslo_Ab'\"%s\"" % body),
+        ("reversed.py", b"KEY = \"fslo_Ab\"'%s'" % body),
+    ):
+        published = tmp_path / name
+        published.write_bytes(source)
+        assert credential_in_file(published) == "a Freesolo API key", name
+
+    # a separator that is not whitespace is two values, not one literal, and must not be welded
+    for name, source in (
+        ("list.py", b'V = ["fslo_Ab", "%s"]' % body),
+        ("dict.py", b'D = {"fslo_Ab": "%s"}' % body),
+        ("csv.csv", b'"fslo_Ab","%s"\n' % body),
+    ):
+        published = tmp_path / name
+        published.write_bytes(source)
+        assert credential_in_file(published) is None, name
+
+
+def test_a_partial_length_packet_does_not_end_the_openpgp_walk(tmp_path):
+    """A partial body length is walkable, and stopping at one hid the packets behind it.
+
+    RFC 4880 4.2.2.4 lets a data packet arrive in chunks, each declaring its own length until a
+    definite one ends it. There is no single stated length to read, so the walk treated it as an
+    unreadable header and returned NORMALLY -- a confident "no key here" about a remainder it never
+    examined. A legal partial-length literal packet between a public packet and a secret-key packet
+    therefore published the secret key.
+    """
+    import os
+
+    from flash.env_secrets import credential_in_file
+
+    def packet(tag: int, body: bytes) -> bytes:
+        return bytes([0xC0 | tag, len(body)]) + body
+
+    material = bytes([4]) + b"\x67\x00\x00\x00" + bytes([1]) + os.urandom(70)
+    public, secret = packet(6, material), packet(5, material)
+    # tag 11 (literal data) may carry a partial length: 0xE2 declares a 4-byte chunk, then a
+    # definite chunk ends the packet
+    partial = bytes([0xC0 | 11, 0xE2]) + b"ABCD" + bytes([3]) + b"xyz"
+    for name, data in (
+        ("plain.pgp", public + secret),
+        ("definite.pgp", public + packet(11, b"b\x00\x00\x00\x00\x00hello") + secret),
+        ("partial.pgp", public + partial + secret),
+    ):
+        published = tmp_path / name
+        published.write_bytes(data)
+        assert credential_in_file(published) == "a private key", name
+
+    # ordinary binary must not be refused because a random byte lands in the partial range: the
+    # length is only read that way on the data packets the format allows it on.
+    #
+    # Seeded, and the gate is a RATE rather than zero. A chunk of random bytes refuses at some small
+    # rate whatever this does -- the walk has other ways to run out of sequence -- so demanding zero
+    # made the test fail on its own noise at 64 draws. Measured over 1024 draws: 2-3 refusals with
+    # the tag gate against 10-17 with every tag allowed a partial length, which is the regression
+    # this exists to catch, so the ceiling sits between the two.
+    import random
+
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_openpgp import _openpgp_secret_key_in_sequence
+
+    draws, ceiling = 1024, 6
+    rng = random.Random(20260815)
+    refused = sum(
+        1
+        for _ in range(draws)
+        if _openpgp_secret_key_in_sequence(rng.randbytes(_SCAN_CHUNK_BYTES), truncated=True) is None
+    )
+    assert refused <= ceiling, f"{refused}/{draws} random chunks refused over a partial length"
+
+
 def test_a_version_5_session_packet_is_read_with_its_own_layout(tmp_path):
     """A v5 SKESK carries an AEAD algorithm byte the v4 layout does not have.
 
@@ -6626,6 +7655,44 @@ def test_a_pdf_filter_declared_across_a_comment_is_still_decoded(tmp_path):
         assert credential_in_file(published) == "a Freesolo API key", name
 
 
+def test_a_zip_member_name_is_checked_like_a_tar_member_name(tmp_path):
+    """A zip entry's NAME publishes whatever it spells, exactly as a tar member's does.
+
+    The tar walk checked names and the zip walk did not, so `fslo_<key>.json` inside a zip was read
+    only for its (empty) contents and published with the key in the archive's listing. A name that
+    is itself an encoded container is refused rather than decoded speculatively -- and the raw scan
+    over the archive's own bytes swallowed that refusal, so a member named with base64 of an
+    OpenSSL-encrypted file returned clean while the same string passed to the name scanner refused.
+    """
+    import base64
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    keyed = tmp_path / "keyed.zip"
+    with zipfile.ZipFile(keyed, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"fslo_{_FAKE_KEY_BODY}.json", "{}")
+    assert credential_in_file(keyed) == "a Freesolo API key"
+
+    # a name the scan cannot finish reading is a refusal here too, the same answer the name
+    # scanner already gives for that string on its own
+    unscannable = base64.b64encode(b"Salted__12345678ciphertext").decode()
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(unscannable)
+    hidden = tmp_path / "hidden.zip"
+    with zipfile.ZipFile(hidden, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(unscannable, "{}")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(hidden)
+
+    # ordinary member names must not become refusals or false matches
+    plain = tmp_path / "plain.zip"
+    with zipfile.ZipFile(plain, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("model-00001-of-00002.safetensors", "weights")
+        archive.writestr("configs/train.toml", "[train]\nsteps = 10\n")
+    assert credential_in_file(plain) is None
+
+
 def test_an_openssh_key_with_its_armor_stripped_is_still_a_private_key(tmp_path):
     """`-----BEGIN OPENSSH PRIVATE KEY-----` wraps base64 of a blob that IS the key.
 
@@ -6697,6 +7764,107 @@ def test_scanning_a_name_is_charged_to_the_packages_budget(tmp_path):
     assert spent, "the package walk must scan its member names"
     assert all(deadline is not None for deadline in spent), "each name must carry a budget"
     assert len(set(spent)) == 1, "every name in one package shares ONE budget"
+
+
+def test_adjacent_literals_join_across_a_literal_prefix(tmp_path):
+    """`b'fslo_AbCd' b'Ef...'` is one string to Python, exactly as the bare pair is.
+
+    The seam pattern could not cross the `b`/`r`/`f`/`u` prefix on the second literal, so a key
+    written that way published while the unprefixed spelling of the same value was refused -- and
+    an executable sidecar is exactly where a `b''` pair is ordinary.
+    """
+    from flash.env_secrets import credential_in_file
+
+    half, rest = f"fslo_{_FAKE_KEY_BODY[:12]}", _FAKE_KEY_BODY[12:]
+    for name, prefix in (
+        ("bare.py", ""),
+        ("bytes.py", "b"),
+        ("raw.py", "r"),
+        ("rawbytes.py", "rb"),
+    ):
+        published = tmp_path / name
+        published.write_bytes(f"KEY = {prefix}'{half}' {prefix}'{rest}'\n".encode())
+        assert credential_in_file(published) == "a Freesolo API key", name
+
+    # two list elements are still two values: the separator carries a comma, so nothing is joined
+    listed = tmp_path / "list.py"
+    listed.write_bytes(f"KEYS = [b'{half}', b'{rest}']\n".encode())
+    assert credential_in_file(listed) is None
+
+
+def test_a_tar_entry_that_is_not_a_file_still_has_its_name_checked(tmp_path):
+    """A directory's NAME is in the archive listing exactly as a file's is.
+
+    The entry-type filter ran first, so a directory, symlink or device node never reached the name
+    scanner: a directory named with base64 of an OpenSSL-encrypted file returned clean here while
+    the same string handed to `credential_in_name` was refused.
+    """
+    import base64
+    import tarfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    def archive(path, name, kind):
+        with tarfile.open(path, "w") as tar:
+            entry = tarfile.TarInfo(name)
+            entry.type, entry.mode = kind, 0o755
+            tar.addfile(entry)
+
+    keyed = tmp_path / "dir.tar"
+    archive(keyed, f"fslo_{_FAKE_KEY_BODY}", tarfile.DIRTYPE)
+    assert credential_in_file(keyed) == "a Freesolo API key"
+
+    unscannable = tmp_path / "unscannable.tar"
+    archive(unscannable, base64.b64encode(b"Salted__12345678ciphertext").decode(), tarfile.DIRTYPE)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(unscannable)
+
+    # an ordinary directory entry is still not a refusal
+    plain = tmp_path / "plain.tar"
+    archive(plain, "checkpoints", tarfile.DIRTYPE)
+    assert credential_in_file(plain) is None
+
+
+def test_a_zip_directory_entry_still_has_its_name_checked(tmp_path):
+    """The same hole in the other format, which the trailing slash hides twice over.
+
+    `ZipInfo.is_dir` IS the trailing `/`, so a directory entry skipped the name scanner -- and the
+    slash also lands inside the base64 run, which stops the raw pass over the archive's own bytes
+    from recovering the encoded stream. A directory named with base64 of a gzipped key returned
+    clean while the name scanner refused that same string on its own.
+    """
+    import base64
+    import gzip
+    import io
+    import zipfile
+
+    from flash.env_secrets import credential_in_file, credential_in_name
+
+    def archive(path, name):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zipped:
+            zipped.writestr(name + "/", b"")
+            zipped.writestr("readme.txt", b"hello\n")
+        path.write_bytes(buffer.getvalue())
+
+    encoded = (
+        base64.b64encode(gzip.compress(f"fslo_{_FAKE_KEY_BODY}".encode())).decode().rstrip("=")
+    )
+    assert credential_in_name(encoded) == "a Freesolo API key"  # the control the zip has to match
+
+    keyed = tmp_path / "dir.zip"
+    archive(keyed, encoded)
+    assert credential_in_file(keyed) == "a Freesolo API key"
+
+    # the plain spelling too, which needs no decoding to be visible in the listing
+    named = tmp_path / "named.zip"
+    archive(named, f"fslo_{_FAKE_KEY_BODY}")
+    assert credential_in_file(named) == "a Freesolo API key"
+
+    # an ordinary directory entry is still not a refusal
+    plain = tmp_path / "plain.zip"
+    archive(plain, "checkpoints")
+    assert credential_in_file(plain) is None
 
 
 def test_a_pdf_dictionary_is_read_to_its_own_opening_bracket(tmp_path):
@@ -6782,6 +7950,49 @@ def test_the_all_stream_pass_refuses_rather_than_stopping_at_its_cap(tmp_path):
         credential_in_file(under)
 
 
+def test_a_partial_packet_whose_final_chunk_outruns_the_buffer_is_undecided(tmp_path):
+    """A declared length reaching past the bytes in hand is unread, not empty.
+
+    The offset was returned unchecked, so slicing at it produced an EMPTY remainder -- and an empty
+    remainder walks to the end finding nothing. A secret-key packet behind such a chunk was
+    reported clean while `gpg --import` installed the key from those same bytes.
+    """
+    import os
+    import struct
+
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    material = bytes([4]) + b"\x67\x00\x00\x00" + bytes([1]) + os.urandom(70)
+
+    def packet(tag, body):
+        return bytes([0xC0 | tag, len(body)]) + body
+
+    public, secret = packet(6, material), packet(5, material)
+
+    def sequence(body):
+        # a partial chunk, then a five-octet definite length naming `body`
+        return (
+            public
+            + bytes([0xC0 | 11, 0xE2])
+            + b"ABCD"
+            + bytes([0xFF])
+            + struct.pack(">I", len(body))
+            + body
+            + secret
+        )
+
+    outruns = tmp_path / "outruns.pgp"
+    outruns.write_bytes(sequence(b"Z" * (_SCAN_CHUNK_BYTES * 2)))
+    with pytest.raises(_Unscannable, match="cannot walk to the end"):
+        credential_in_file(outruns)
+
+    # the same shape whose final chunk FITS is still walked to the secret key behind it
+    fits = tmp_path / "fits.pgp"
+    fits.write_bytes(sequence(b"Z" * 100) + b"\x00" * (_SCAN_CHUNK_BYTES + 16))
+    assert credential_in_file(fits) == "a private key"
+
+
 def test_a_version_3_openpgp_secret_key_is_recognised(tmp_path):
     """A v3 secret key is obsolete, not unreadable.
 
@@ -6806,6 +8017,26 @@ def test_a_version_3_openpgp_secret_key_is_recognised(tmp_path):
             bytes([0x80 | (5 << 2)]) + bytes([len(body)]) + bytes([version]) + body[1:]
         )
         assert credential_in_file(ordinary) is None, version
+
+
+def test_a_name_detected_only_after_rejoining_is_withheld_not_printed(tmp_path):
+    """Masking cannot redact a key whose body is split by the seam that hid it.
+
+    The substitutions run over the RAW name, so a key spelled `fslo_AbCd\\x45f...` or across two
+    adjacent literals matched none of them and the refusal printed the complete reversible spelling
+    into the terminal and any collected logs -- the one thing this module is careful never to do.
+    """
+    from flash.env_secrets import _redacted, credential_in_name
+
+    half, rest = f"fslo_{_FAKE_KEY_BODY[:12]}", _FAKE_KEY_BODY[12:]
+    for name in (f"{half}\\x{ord(rest[0]):02x}{rest[1:]}", f"'{half}' '{rest}'"):
+        assert credential_in_name(name) == "a Freesolo API key", name
+        shown = _redacted(name)
+        assert _FAKE_KEY_BODY[12:] not in shown, f"the refusal echoed the key: {shown}"
+        assert "encodes a credential" in shown
+
+    # an ordinary name is still shown verbatim, which is what makes the refusal actionable
+    assert _redacted("configs/train.toml") == "configs/train.toml"
 
 
 def test_an_ar_archive_is_walked_member_by_member(tmp_path):
@@ -6846,6 +8077,40 @@ def test_an_ar_archive_is_walked_member_by_member(tmp_path):
     plain = tmp_path / "plain.deb"
     plain.write_bytes(ar([("debian-binary", b"2.0\n"), ("readme", b"nothing to see\n")]))
     assert credential_in_file(plain) is None
+
+
+def test_gnu_ar_symbol_table_names_are_scanned_as_exact_metadata(tmp_path):
+    """gnu ar symbol indexes bypassed exact metadata scanning and fell into the speculative pass."""
+    import base64
+    import subprocess
+    import zlib
+
+    from flash.env_secrets import credential_in_file, credential_in_name
+
+    key = b"fslo_AbCdEf0123456789"
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    symbol = base64.b64encode(compressor.compress(key) + compressor.flush()).rstrip(b"=").decode()
+    assert credential_in_name(symbol) == "a Freesolo API key"
+
+    source = tmp_path / "key.c"
+    source.write_text(f"int {symbol}(void) {{ return 0; }}\n")
+    obj = tmp_path / "key.o"
+    archive = tmp_path / "libkey.a"
+    subprocess.run(["cc", "-c", str(source), "-o", str(obj)], check=True)
+    subprocess.run(["ar", "rcs", str(archive), str(obj)], check=True)
+    symbols = subprocess.run(
+        ["nm", "-s", str(archive)], check=True, capture_output=True, text=True
+    ).stdout
+    assert symbol in symbols, "nm did not find the symbol in the real archive index"
+    assert credential_in_file(archive) == "a Freesolo API key"
+
+    ordinary_source = tmp_path / "ordinary.c"
+    ordinary_source.write_text("int ordinary_symbol(void) { return 0; }\n")
+    ordinary_obj = tmp_path / "ordinary.o"
+    ordinary = tmp_path / "libordinary.a"
+    subprocess.run(["cc", "-c", str(ordinary_source), "-o", str(ordinary_obj)], check=True)
+    subprocess.run(["ar", "rcs", str(ordinary), str(ordinary_obj)], check=True)
+    assert credential_in_file(ordinary) is None
 
 
 def test_an_age_encrypted_file_is_refused_like_every_other_ciphertext(tmp_path):
@@ -6982,6 +8247,48 @@ def test_a_zip_appended_to_another_zip_is_still_walked(tmp_path):
     assert credential_in_file(plain) is None
 
 
+def test_an_octal_escape_is_resolved_like_the_hex_ones(tmp_path):
+    """Python resolves `\\105` to `E` exactly as it resolves `\\x45`.
+
+    Only the hex and unicode spellings were rejoined, so a key body carrying one octal escape
+    evaluated to the complete credential at runtime while the raw bytes a pattern reads were split
+    by the escape and matched nothing.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY[:2] + "\\105" + _FAKE_KEY_BODY[3:]
+    escaped = tmp_path / "sidecar.py"
+    escaped.write_text(f'KEY = "fslo_{body}"\n')
+    assert eval(f'"fslo_{body}"')[7] == "E"  # the fixture must really decode to the key
+    assert credential_in_file(escaped) == "a Freesolo API key"
+
+    # a short octal escape is left alone, so an ordinary regex string is not rewritten
+    ordinary = tmp_path / "pattern.py"
+    ordinary.write_text('SPLIT = "\\1 and \\2"\n')
+    assert credential_in_file(ordinary) is None
+
+
+def test_a_comment_between_adjacent_literals_is_still_a_seam(tmp_path):
+    """Inside parentheses the tokenizer discards a trailing comment exactly as it does whitespace.
+
+    `('fslo_AbCd'  # prefix\\n 'Ef...')` is one string at runtime, so the seam had to close for the
+    same reason the plain adjacent pair does -- and the comment text between the quotes kept it
+    open.
+    """
+    from flash.env_secrets import credential_in_file
+
+    split = tmp_path / "helper.py"
+    split.write_text(
+        f"KEY = ('fslo_{_FAKE_KEY_BODY[:8]}'  # the issuer prefix\n       '{_FAKE_KEY_BODY[8:]}')\n"
+    )
+    assert credential_in_file(split) == "a Freesolo API key"
+
+    # two list elements separated by a comment are still two values, not one
+    listed = tmp_path / "names.py"
+    listed.write_text('NAMES = ["alpha",  # first\n         "beta"]\n')
+    assert credential_in_file(listed) is None
+
+
 def test_jwk_halves_in_sibling_objects_are_not_one_key(tmp_path):
     """Records split at depth ZERO, so two sibling objects shared one record.
 
@@ -7055,6 +8362,32 @@ def _ar_archive(members: list[tuple[str, bytes]]) -> bytes:
         if len(body) % 2:
             out += b"\n"
     return bytes(out)
+
+
+def test_an_ar_long_name_is_resolved_before_it_is_scanned(tmp_path):
+    """GNU ar stores a long member name in the `//` table and writes `/<offset>` in the header.
+
+    Only the placeholder was scanned, so the name that actually leaks through the archive's listing
+    was never read: a member whose resolved name is base64 of an OpenSSL-encrypted file returned
+    clean here while that same string handed to the name scanner refused it.
+    """
+    import base64
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    encrypted = b"Salted__12345678" + b"ciphertextciphertextciphertext"
+    long_name = base64.b64encode(encrypted).decode()
+
+    # the control: this name on its own is refused, so the archive carrying it must be too
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(long_name)
+
+    archive = tmp_path / "long.a"
+    archive.write_bytes(
+        _ar_archive([("//", (long_name + "/\n").encode()), ("/0", b"harmless contents here")])
+    )
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(archive)
 
 
 def test_a_clean_ar_walk_settles_a_deferred_refusal(tmp_path):
@@ -7178,6 +8511,80 @@ def test_bytes_after_the_zip_end_record_are_still_scanned(tmp_path):
     appended.write_bytes(ordinary + trailing)
     assert zipfile.is_zipfile(appended)  # still a valid zip to every reader
     assert credential_in_file(appended) == "a Freesolo API key"
+
+
+def test_a_tar_link_target_is_scanned_like_a_member_name(tmp_path):
+    """A symlink's TARGET is in the archive's listing exactly as its own name is.
+
+    Only `info.name` was read, so a link whose target is base64 of an OpenSSL-encrypted file was
+    passed over -- the entry is not a file, so the type filter skipped it before anything looked at
+    where it pointed, while the same string handed to the name scanner refused it.
+    """
+    import base64
+    import tarfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    encrypted = b"Salted__12345678" + b"ciphertextciphertextciphertext"
+    target = base64.b64encode(encrypted).decode()
+
+    # the control: this target on its own is refused, so the tar carrying it must be too
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(target)
+
+    archive = tmp_path / "linked.tar"
+    with tarfile.open(archive, "w") as tar:
+        info = tarfile.TarInfo("safe-link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = target
+        tar.addfile(info)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(archive)
+
+
+def test_tar_owner_names_are_scanned_as_exact_metadata(tmp_path):
+    """ustar owner fields bypassed exact metadata scanning and fell into the speculative raw pass."""
+    import base64
+    import subprocess
+    import zlib
+
+    from flash.env_secrets import credential_in_file, credential_in_name
+
+    key = b"fslo_AbCdEf0123456789"
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    encoded = base64.b64encode(compressor.compress(key) + compressor.flush()).rstrip(b"=").decode()
+    assert len(encoded) == 31
+    assert credential_in_name(encoded) == "a Freesolo API key"
+
+    source = tmp_path / "ordinary.txt"
+    source.write_text("nothing here\n")
+    for field in ("owner", "group"):
+        archive = tmp_path / f"{field}.tar"
+        command = [
+            "tar",
+            "--format=ustar",
+            "--owner=ordinary-owner",
+            "--group=ordinary-group",
+            f"--{field}={encoded}",
+            "-cf",
+            str(archive),
+            source.name,
+        ]
+        subprocess.run(command, cwd=tmp_path, check=True)
+        listing = subprocess.run(
+            ["tar", "--list", "--verbose", "--file", str(archive)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert encoded in listing, "tar did not write the requested ustar metadata"
+        assert credential_in_file(archive) == "a Freesolo API key", field
+
+    plain = tmp_path / "plain.tar"
+    subprocess.run(
+        ["tar", "--format=ustar", "-cf", str(plain), source.name], cwd=tmp_path, check=True
+    )
+    assert credential_in_file(plain) is None
 
 
 def _pdf_with_stream(stream: bytes, entries: bytes, extra: bytes = b"") -> bytes:
@@ -7438,6 +8845,34 @@ def test_a_noncanonical_lzma_dictionary_size_is_still_expanded(tmp_path):
     assert credential_in_file(rewritten) == "a Freesolo API key"
 
 
+def test_a_named_unicode_escape_is_resolved_like_the_others(tmp_path):
+    """Python resolves `\\N{LATIN CAPITAL LETTER E}` to `E` exactly as it resolves `\\x45`.
+
+    The hex, unicode and octal spellings were rejoined but the named one was not, so a key body
+    carrying a single `\\N{...}` evaluated to the whole credential at runtime while the raw bytes a
+    pattern reads were split by the escape and matched nothing.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY
+    plain = tmp_path / "plain.py"
+    plain.write_text(f"API_KEY = 'fslo_{body}'\n")
+    assert credential_in_file(plain) == "a Freesolo API key"  # the control the pair must match
+
+    # the escape sits early, so the run left behind it is too short to match on its own
+    escaped = f"{body[:10]}\\N{{LATIN CAPITAL LETTER B}}{body[11:]}"
+    assert body[10] == "B"  # the escape stands in for exactly this character
+    split = tmp_path / "split.py"
+    split.write_text(f"API_KEY = 'fslo_{escaped}'\n")
+    assert f"fslo_{body}".encode() not in split.read_bytes()  # not literally present
+    assert credential_in_file(split) == "a Freesolo API key"
+
+    # a name that resolves to nothing ASCII is left alone rather than guessed at
+    unknown = tmp_path / "unknown.py"
+    unknown.write_text("LABEL = '\\N{NO SUCH CHARACTER NAME}'\n")
+    assert credential_in_file(unknown) is None
+
+
 def test_a_comment_before_a_pdf_predictor_value_is_still_a_predictor(tmp_path):
     """A `%` comment may sit between `/Predictor` and its number, as anywhere else in a PDF.
 
@@ -7610,6 +9045,84 @@ def test_recognising_lzma_alone_does_not_probe_a_third_of_a_spreadsheet(tmp_path
     assert accepted == 0, "arbitrary size fields still pass, so the probe cost returns"
 
 
+def test_redaction_withholds_a_name_whose_decoded_container_holds_a_credential():
+    """Redaction must inspect the encoded container that made the name unsafe.
+
+    The name scanner inflated base64 of gzip and found the key, but `_redacted` decoded only one
+    base64 layer. Its refusal then printed the reversible filename verbatim to terminals, HTTP
+    responses, and logs, recreating the leak while reporting it.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import _redacted, credential_in_name
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    encoded = base64.urlsafe_b64encode(gzip.compress(key, mtime=0)).decode().rstrip("=")
+    assert credential_in_name(encoded) == "a Freesolo API key"
+
+    shown = _redacted(encoded)
+    assert encoded not in shown
+    assert "encodes a credential" in shown
+
+
+def test_top_level_literals_on_consecutive_lines_are_not_joined(tmp_path):
+    """A newline joins literals only when syntax supplies an implicit continuation.
+
+    Python treats two quoted top-level lines as separate statements. Welding them invented a key
+    that never exists at runtime, while the same pair inside parentheses is one real string and must
+    remain covered.
+    """
+    from flash.env_secrets import credential_in_file
+
+    first, rest = f"fslo_{_FAKE_KEY_BODY[:10]}", _FAKE_KEY_BODY[10:]
+    bracketed = tmp_path / "bracketed.py"
+    bracketed.write_text(f'KEY = ("{first}"\n       "{rest}")\n')
+    assert credential_in_file(bracketed) == "a Freesolo API key"
+
+    separate = tmp_path / "separate.py"
+    separate.write_text(f'x = "{first}"\n"{rest}"\n')
+    assert credential_in_file(separate) is None
+
+
+def test_a_gnu_thin_ar_scans_its_resolved_member_names(tmp_path):
+    """Thin ar omits member bodies but still publishes every resolved name in its listing.
+
+    Treating only `!<arch>` as ar skipped `!<thin>` entirely, so a GNU long name encoding a gzipped
+    key returned clean even though scanning the same published name directly reports the key.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import credential_in_file, credential_in_name
+
+    encoded = (
+        base64.urlsafe_b64encode(gzip.compress(f"fslo_{_FAKE_KEY_BODY}".encode(), mtime=0))
+        .decode()
+        .rstrip("=")
+    )
+    assert credential_in_name(encoded) == "a Freesolo API key"
+
+    def header(name: str, size: int) -> bytes:
+        return (
+            name.ljust(16).encode()[:16]
+            + b"0".ljust(12)
+            + b"0".ljust(6)
+            + b"0".ljust(6)
+            + b"100644".ljust(8)
+            + str(size).ljust(10).encode()[:10]
+            + b"`\n"
+        )
+
+    names = (encoded + "/\n").encode()
+    archive = b"!<thin>\n" + header("//", len(names)) + names
+    archive += b"\n" if len(names) % 2 else b""
+    archive += header("/0", 9)
+    thin = tmp_path / "members.a"
+    thin.write_bytes(archive)
+    assert credential_in_file(thin) == "a Freesolo API key"
+
+
 def test_a_newc_cpio_member_is_scanned_as_its_own_file(tmp_path):
     """A cpio member can hold compressed content absent from the archive's literal byte scan.
 
@@ -7641,6 +9154,55 @@ def test_a_newc_cpio_member_is_scanned_as_its_own_file(tmp_path):
     published = tmp_path / "package.cpio"
     published.write_bytes(bytes(archive))
     assert credential_in_file(published) == "a Freesolo API key"
+
+
+def test_a_gzip_original_filename_is_scanned_before_its_payload(tmp_path):
+    """The gzip FNAME field is published metadata and can itself encode opaque credential content.
+
+    Only the plaintext body was scanned, so a harmless stream whose original filename was base64 of
+    an OpenSSL envelope returned clean. The same filename passed directly to the name scanner is an
+    intended opaque-content refusal.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext").decode().rstrip("=")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(encoded)
+
+    plain = gzip.compress(b"harmless plaintext\n", mtime=0)
+    named = (
+        plain[:3] + bytes([plain[3] | 0x08]) + plain[4:10] + encoded.encode() + b"\0" + plain[10:]
+    )
+    published = tmp_path / "named.gz"
+    published.write_bytes(named)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
+def test_shell_assignment_words_join_quoted_and_unquoted_segments(tmp_path):
+    """POSIX shell concatenates every quoted and unquoted segment in one assignment word.
+
+    Removing quote-to-quote seams alone missed both boundary directions, even though the shell exports
+    the same complete key as the ordinary fully quoted control. Restricting the join to `NAME=` words
+    avoids joining arbitrary prose or separate source statements.
+    """
+    from flash.env_secrets import credential_in_file
+
+    whole = tmp_path / "whole.sh"
+    whole.write_text(f'API_KEY="fslo_{_FAKE_KEY_BODY}"\n')
+    assert credential_in_file(whole) == "a Freesolo API key"
+
+    first, rest = _FAKE_KEY_BODY[:10], _FAKE_KEY_BODY[10:]
+    for name, source in (
+        ("suffix.sh", f'API_KEY=fslo_{first}"{rest}"\n'),
+        ("prefix.sh", f'API_KEY="fslo_{first}"{rest}\n'),
+    ):
+        script = tmp_path / name
+        script.write_text(source)
+        assert credential_in_file(script) == "a Freesolo API key", name
 
 
 def test_an_overlay_payload_uses_the_same_depth_as_its_standalone_stream(tmp_path):
@@ -7767,6 +9329,39 @@ def test_concatenated_tars_do_not_consume_container_depth(tmp_path):
     assert credential_in_file(concatenated) is None
 
 
+def test_zip_comments_are_scanned_as_exact_metadata(tmp_path):
+    """zip comments are published metadata, and exact base64 ciphertext must refuse like a name.
+
+    the raw archive scan treats base64 candidates as speculative and suppresses their refusal, so
+    comments carrying an openssl envelope were approved while the byte-identical member name refused.
+    """
+    import base64
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    value = base64.b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    named = tmp_path / "named.zip"
+    with zipfile.ZipFile(named, "w") as archive:
+        archive.writestr(value.decode(), b"harmless\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(named)
+
+    global_comment = tmp_path / "global-comment.zip"
+    with zipfile.ZipFile(global_comment, "w") as archive:
+        archive.writestr("harmless.txt", b"harmless\n")
+        archive.comment = value
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(global_comment)
+
+    entry_comment = tmp_path / "entry-comment.zip"
+    with zipfile.ZipFile(entry_comment, "w") as archive:
+        archive.writestr("harmless.txt", b"harmless\n")
+        archive.infolist()[0].comment = value
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(entry_comment)
+
+
 def test_pdf_encrypt_names_are_limited_to_structural_dictionaries(tmp_path):
     """a pdf name inside a literal string is page content, not an encryption dictionary.
 
@@ -7866,6 +9461,74 @@ def test_an_embedded_native_age_document_is_refused(tmp_path):
     assert credential_in_file(mention) is None
 
 
+def test_rejoining_skips_both_joins_when_no_quote_can_close_a_seam(monkeypatch):
+    """Neither join can change a byte without a quote, so neither may walk one.
+
+    Both were called unconditionally while every other pass in `_rejoined` sat behind a
+    memchr-speed substring test. On the 300 MiB expansion the padding test builds, that cost
+    3.79 s and 4.28 s to prove a block of NULs holds no quote, taking the scan from 41 s to 53 s
+    against its 60 s budget. Under the two workers CI runs the suite with, the scan then missed
+    its deadline and reported a real key as clean.
+
+    Asserting that the passes are NOT ENTERED is what makes this a regression test. Both return
+    their input unchanged when they match nothing, so comparing the output cannot tell a skipped
+    pass from one that walked every byte and found nothing -- which is exactly the cost being
+    guarded against. Counting the calls separates them. Elapsed time is avoided deliberately:
+    this repository reserves the `wallclock` marker for tests whose assertion IS real time.
+    """
+    from flash import env_joined
+
+    entered = []
+    for name in ("_join_adjacent_literals", "_join_shell_assignments"):
+        original = getattr(env_joined, name)
+
+        def counted(data, _name=name, _original=original):
+            entered.append(_name)
+            return _original(data)
+
+        monkeypatch.setattr(env_joined, name, counted)
+
+    env_joined._rejoined(b"\0" * (1 << 20))
+    assert entered == [], "a quote-free block was walked by a join that cannot match in it"
+
+    env_joined._rejoined(b"no quotes here, just words and numbers 12345\n" * 100)
+    assert entered == [], "ordinary prose was walked by a join that cannot match in it"
+
+    # an equals sign alone must not buy the assignment walk either, since a seam needs a quote
+    env_joined._rejoined(b"threshold=12\nlimit=48\n" * 100)
+    assert entered == [], "an unquoted assignment was walked for a seam it cannot contain"
+
+    # and the joins must still run, and still work, once a quote IS present
+    body = _FAKE_KEY_BODY
+    welded = f'API_KEY=fslo_{body[:10]}"{body[10:]}"\n'.encode()
+    assert f"fslo_{body}".encode() in env_joined._rejoined(welded)
+    assert entered == ["_join_adjacent_literals", "_join_shell_assignments"]
+
+
+def test_a_gzip_comment_is_scanned_as_published_metadata(tmp_path):
+    """FCOMMENT is published metadata and can encode opaque content just as FNAME can.
+
+    The header walk advanced past the comment but discarded it, so a harmless gzip carrying base64
+    of an OpenSSL envelope there returned clean while the same text passed directly was refused.
+    """
+    import base64
+    import gzip
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(encoded.decode())
+
+    plain = gzip.compress(b"harmless plaintext\n", mtime=0)
+    commented = plain[:3] + bytes([plain[3] | 0x10]) + plain[4:10] + encoded + b"\0" + plain[10:]
+    assert gzip.decompress(commented) == b"harmless plaintext\n"
+    published = tmp_path / "commented.gz"
+    published.write_bytes(commented)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
 def test_a_crc_cpio_member_uses_the_newc_member_walk(tmp_path):
     """SVR4 crc changes only the magic and checksum field, not the member layout.
 
@@ -7903,6 +9566,93 @@ def test_a_crc_cpio_member_uses_the_newc_member_walk(tmp_path):
     assert credential_in_file(published) == "a Freesolo API key"
 
 
+def test_narrow_base64_is_joined_only_inside_one_declared_value(tmp_path):
+    """A producer chooses wrapping width, so 32 columns cannot be a security boundary.
+
+    Lowering the global floor would join ubiquitous short lines across prose, csv, and source. A YAML
+    block or continued assignment instead proves equally-indented lines belong to one value, allowing
+    16- and 24-column wrapping without charging unrelated text for the wider scan.
+    """
+    import base64
+
+    from flash.env_secrets import credential_in_file
+
+    encoded = base64.b64encode(f"fslo_{_FAKE_KEY_BODY}".encode()).decode()
+
+    def wrapped(width: int, indent: str) -> str:
+        return ("\n" + indent).join(
+            encoded[at : at + width] for at in range(0, len(encoded), width)
+        )
+
+    control = tmp_path / "control.yaml"
+    control.write_text("secret: |\n  " + wrapped(32, "  ") + "\n")
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    scalar = tmp_path / "scalar.yaml"
+    scalar.write_text("secret: |\n  " + wrapped(16, "  ") + "\n")
+    assert credential_in_file(scalar) == "a Freesolo API key"
+
+    assignment = tmp_path / "assignment.yaml"
+    assignment.write_text("secret: " + wrapped(24, "        ") + "\n")
+    assert credential_in_file(assignment) == "a Freesolo API key"
+
+    ordinary = tmp_path / "ordinary.yaml"
+    ordinary.write_text(
+        "notes: |\n  documentationabc\n  configurationxyz\n  representationqr\n  implementationst\n"
+    )
+    assert credential_in_file(ordinary) is None
+
+
+def test_python_raw_strings_are_not_escape_decoded(tmp_path):
+    """A raw Python string keeps its backslash, so decoding `\\x42` invents a runtime credential.
+
+    Escape decoding must skip only raw spans: ordinary strings still resolve the escape, verbatim
+    credentials inside raw strings still scan, and adjacent raw literals still concatenate.
+    """
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY
+    escaped = body[:10] + "\\x42" + body[11:]
+    assert body[10] == "B"
+
+    control = tmp_path / "ordinary.py"
+    control.write_text(f'KEY = "fslo_{escaped}"\n')
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    raw = tmp_path / "raw.py"
+    raw.write_text(f'KEY = r"fslo_{escaped}"\n')
+    assert credential_in_file(raw) is None
+
+    verbatim = tmp_path / "verbatim.py"
+    verbatim.write_text(f'KEY = r"fslo_{body}"\n')
+    assert credential_in_file(verbatim) == "a Freesolo API key"
+
+    split = tmp_path / "split.py"
+    split.write_text(f'KEY = r"fslo_{body[:12]}" r"{body[12:]}"\n')
+    assert credential_in_file(split) == "a Freesolo API key"
+
+
+def test_encoded_name_run_uses_path_and_extension_boundaries():
+    """A component boundary or extension does not make an exact encoded ciphertext speculative.
+
+    The whole-name guard swallowed a refusal unless the base64 run occupied every byte, so putting
+    the same encoded OpenSSL envelope under a directory or adding `.enc` made it publishable.
+    """
+    import base64
+
+    from flash.env_secrets import _Unscannable, credential_in_name
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").decode().rstrip("=")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(encoded)
+
+    for name in (f"dir/{encoded}", f"{encoded}.enc", f"{encoded}.bin"):
+        with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+            credential_in_name(name)
+
+    assert credential_in_name(f"prefix{encoded}suffix") is None
+
+
 def test_portable_ascii_cpio_members_are_scanned(tmp_path):
     """Portable-ASCII cpio uses octal fields and no newc alignment, but its members still publish.
 
@@ -7933,6 +9683,34 @@ def test_portable_ascii_cpio_members_are_scanned(tmp_path):
     assert credential_in_file(published) == "a Freesolo API key"
 
 
+def test_shell_arguments_are_not_joined_as_adjacent_literals(tmp_path):
+    """Shell quotes separate argv words, while Python adjacent literals form one runtime string.
+
+    Joining both grammars identically invented a key in `printf` arguments that no shell variable or
+    process ever receives, refusing a harmless script while the Python spelling is a real credential.
+    """
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}"
+    first, second = f"fslo_{_FAKE_KEY_BODY[:8]}", _FAKE_KEY_BODY[8:]
+
+    standalone = tmp_path / "fragment.sh"
+    standalone.write_text(f'X="{first}"\n')
+    assert credential_in_file(standalone) is None, "the first shell word must be sub-threshold"
+
+    python_control = tmp_path / "control.py"
+    python_control.write_text(f'x = "{first}" "{second}"\n')
+    assert credential_in_file(python_control) == "a Freesolo API key"
+
+    shell_control = tmp_path / "real.sh"
+    shell_control.write_text(f'X="{key}"\n')
+    assert credential_in_file(shell_control) == "a Freesolo API key"
+
+    harmless = tmp_path / "arguments.sh"
+    harmless.write_text(f'printf \'%s %s\' "{first}" "{second}"\n')
+    assert credential_in_file(harmless) is None
+
+
 def test_indirect_pdf_filter_is_read_only_from_a_stream_dictionary(tmp_path):
     """`/Filter 2 0 R` drawn as page text is not the dictionary key controlling a stream.
 
@@ -7958,6 +9736,33 @@ def test_indirect_pdf_filter_is_read_only_from_a_stream_dictionary(tmp_path):
     assert credential_in_file(literal) is None
 
 
+def test_zip_extra_record_payloads_are_scanned_as_exact_metadata(tmp_path):
+    """A zip extra field publishes each record's data just as exactly as a name or comment.
+
+    Scanning only the archive bytes made the tag and size framing part of the base64 context, so an
+    encoded OpenSSL envelope in the data payload stayed speculative and its refusal was swallowed.
+    """
+    import base64
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    control = tmp_path / "name.zip"
+    with zipfile.ZipFile(control, "w") as archive:
+        archive.writestr(encoded.decode(), "harmless\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(control)
+
+    published = tmp_path / "extra.zip"
+    with zipfile.ZipFile(published, "w") as archive:
+        info = zipfile.ZipInfo("harmless.txt")
+        info.extra = b"\xff\xff" + len(encoded).to_bytes(2, "little") + encoded
+        archive.writestr(info, "harmless\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
 def test_single_quoted_record_values_do_not_expose_their_braces(tmp_path):
     """A brace inside a single-quoted mapping value is data, not the end of its key record.
 
@@ -7978,6 +9783,44 @@ def test_single_quoted_record_values_do_not_expose_their_braces(tmp_path):
     quoted = tmp_path / "single_brace.py"
     quoted.write_text(f"{{'kty':'OKP','note':'}}','d':'{payload}'}}\n")
     assert credential_in_file(quoted) == "a private key"
+
+
+def test_a_broken_base64_container_run_is_reconstructed_at_one_seam(tmp_path):
+    """A non-base64 separator splits one encoded container into runs the decoder never sees whole.
+
+    JSON slash escaping, punctuation replacement, and an inserted key all caused the same gzip to
+    miss, proving the boundary rather than escape decoding is what must be reconstructed.
+    """
+    import gzip
+
+    from flash.env_secrets import credential_in_file
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    suffix = bytes.fromhex("38b4e652e44da7f2370d9e260e27136550a4a3a6d07f5c0c")
+    packed = gzip.compress(key + b"\n" + suffix, mtime=0)
+    encoded = base64.b64encode(packed).decode()
+    middle = [
+        index
+        for index, character in enumerate(encoded)
+        if character == "/" and 20 <= index <= len(encoded) - 21
+    ]
+    assert middle, "the fixed gzip must carry one slash between two substantial runs"
+    at = middle[0]
+    assert b"fslo_" not in packed, "the control must require gzip expansion"
+
+    control = tmp_path / "plain.json"
+    control.write_text(f'{{"blob":"{encoded}"}}\n')
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    variants = {
+        "escaped": encoded[:at] + "\\/" + encoded[at + 1 :],
+        "punctuation": encoded[:at] + "!" + encoded[at + 1 :],
+        "json-key": encoded[:at] + '","x":"' + encoded[at + 1 :],
+    }
+    for name, value in variants.items():
+        published = tmp_path / f"{name}.json"
+        published.write_text(f'{{"blob":"{value}"}}\n')
+        assert credential_in_file(published) == "a Freesolo API key", name
 
 
 def test_unix_compress_is_refused_when_lzw_cannot_be_expanded(tmp_path):
@@ -8046,6 +9889,26 @@ def test_shell_quoted_backslashes_are_not_decoded_as_python_escapes(tmp_path):
         assert credential_in_file(published) is None, name
 
 
+def test_base64_decoded_raw_deflate_reenters_the_container_scan(tmp_path):
+    """Raw deflate has no magic, so the decoded-container gate discarded its hidden key."""
+    import zlib
+
+    from flash.env_secrets import credential_in_file, credential_in_name
+
+    key = f"fslo_{_FAKE_KEY_BODY}".encode()
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    raw = compressor.compress(key) + compressor.flush()
+    control = tmp_path / "control.deflate"
+    control.write_bytes(raw)
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    encoded = base64.b64encode(raw)
+    published = tmp_path / "payload.b64"
+    published.write_bytes(encoded + b"\n")
+    assert credential_in_file(published) == "a Freesolo API key"
+    assert credential_in_name(encoded.decode()) == "a Freesolo API key"
+
+
 def test_a_pdf_dictionary_beyond_the_lookback_is_refused(tmp_path):
     """A flate declaration outside the 64 kib lookback left its stream approved as literal bytes."""
     import zlib
@@ -8094,6 +9957,35 @@ def test_a_flate_pdf_inline_image_is_inspected(tmp_path):
         + b" EI\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
     )
     assert credential_in_file(published) == "a Freesolo API key"
+
+
+@pytest.mark.wallclock
+def test_broken_base64_reconstruction_honours_the_shared_deadline(tmp_path):
+    """Speculative misses swallowed timeouts, so every remaining seam ran after the budget expired."""
+    import gzip
+    import time
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    rows = []
+    for index in range(120):
+        filler = bytes((index * 7 + offset * 31) % 251 for offset in range(16 << 10))
+        encoded = base64.b64encode(gzip.compress(filler, mtime=0)).decode()
+        cut = len(encoded) // 2
+        rows.append(f"value_{index}: {encoded[:cut]}!{encoded[cut + 1 :]}")
+    published = tmp_path / "broken.yaml"
+    published.write_text("\n".join(rows) + "\n")
+
+    budget = 0.5
+    started = time.monotonic()
+    timed_out = False
+    try:
+        credential_in_file(published, deadline=started + budget)
+    except _Unscannable as exc:
+        timed_out = "too long" in str(exc)
+    elapsed = time.monotonic() - started
+    assert elapsed < budget * 3, f"deadline overran: {elapsed:.3f}s for a {budget:.1f}s budget"
+    assert timed_out, "the shared deadline expired without refusing the unscanned content"
 
 
 def test_a_pdf_nested_in_a_zip_reenters_the_pdf_stream_walk(tmp_path):
@@ -8231,6 +10123,80 @@ def test_assigned_values_on_following_lines_are_scanned(tmp_path):
         assert credential_in_file(published) == "a Weights & Biases API key", name
 
 
+def test_ansi_c_shell_quotes_decode_escapes(tmp_path):
+    """ansi-c `$'...'` evaluates escapes that ordinary posix single quotes preserve."""
+    from flash.env_secrets import credential_in_file
+
+    body = _FAKE_KEY_BODY
+    escaped = body[:10] + f"\\x{ord(body[10]):02x}" + body[11:]
+    literal = tmp_path / "literal.sh"
+    literal.write_text(f"API_KEY='fslo_{escaped}'\n")
+    assert credential_in_file(literal) is None
+
+    published = tmp_path / "ansi-c.sh"
+    published.write_text(f"API_KEY=$'fslo_{escaped}'\n")
+    assert credential_in_file(published) == "a Freesolo API key"
+
+
+def test_zip_local_header_extra_payloads_are_scanned(tmp_path):
+    """zip local-header extra fields may differ from the central copy exposed by zipfile."""
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+
+    def archive(path):
+        with zipfile.ZipFile(path, "w") as zipped:
+            info = zipfile.ZipInfo("harmless.txt")
+            info.extra = b"\xff\xff" + len(encoded).to_bytes(2, "little") + encoded
+            zipped.writestr(info, b"harmless\n")
+
+    control = tmp_path / "central-extra.zip"
+    archive(control)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(control)
+
+    published = tmp_path / "local-extra.zip"
+    archive(published)
+    raw = bytearray(published.read_bytes())
+    central = raw.index(b"PK\x01\x02")
+    name_size = int.from_bytes(raw[central + 28 : central + 30], "little")
+    extra_size = int.from_bytes(raw[central + 30 : central + 32], "little")
+    extra_at = central + 46 + name_size
+    raw[extra_at + 4 : extra_at + extra_size] = b"x" * (extra_size - 4)
+    published.write_bytes(raw)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
+def test_gzip_extra_subfield_payloads_are_scanned(tmp_path):
+    """gzip fextra subfield payloads are published metadata, like its filename and comment."""
+    import gzip
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    ordinary = gzip.compress(b"harmless\n", mtime=0)
+
+    named_header = bytearray(ordinary[:10])
+    named_header[3] |= 0x08
+    named = tmp_path / "named.gz"
+    named.write_bytes(bytes(named_header) + encoded + b"\0" + ordinary[10:])
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(named)
+
+    extra_header = bytearray(ordinary[:10])
+    extra_header[3] |= 0x04
+    subfield = b"ZZ" + len(encoded).to_bytes(2, "little") + encoded
+    published = tmp_path / "extra.gz"
+    published.write_bytes(
+        bytes(extra_header) + len(subfield).to_bytes(2, "little") + subfield + ordinary[10:]
+    )
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
+
+
 def test_little_endian_binary_cpio_combines_size_halfwords(tmp_path):
     """binary cpio stores each 32-bit size as a high halfword followed by a low halfword."""
     import zlib
@@ -8258,6 +10224,23 @@ def test_little_endian_binary_cpio_combines_size_halfwords(tmp_path):
         assert credential_in_file(published) == "a Freesolo API key", order
 
 
+def test_archive_raw_bytes_are_not_rejoined_as_shell_source(tmp_path):
+    """archive framing must not join a member name to unrelated member bytes as shell source."""
+    import zipfile
+
+    from flash.env_secrets import credential_in_file
+
+    first, rest = _FAKE_KEY_BODY[:10], _FAKE_KEY_BODY[10:]
+    control = tmp_path / "control.sh"
+    control.write_text(f"API_KEY=fslo_{first}\\\n{rest}\n")
+    assert credential_in_file(control) == "a Freesolo API key"
+
+    published = tmp_path / "archive.sh"
+    with zipfile.ZipFile(published, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr(f"API_KEY=fslo_{first}\\", f"\n{rest}\n")
+    assert credential_in_file(published) is None
+
+
 def test_inline_images_inside_flate_pdf_streams_are_inspected(tmp_path):
     """inline images inside an inflated page content stream need a second inline-image walk."""
     import zlib
@@ -8279,6 +10262,54 @@ def test_inline_images_inside_flate_pdf_streams_are_inspected(tmp_path):
     published = tmp_path / "compressed-inline.pdf"
     published.write_bytes(_flate_pdf(b"/Filter /FlateDecode", content))
     assert credential_in_file(published) == "a Freesolo API key"
+
+
+def test_paired_credentials_are_scanned_in_wide_text(tmp_path):
+    """utf-16 and utf-32 narrowed views must retain paired jwk and netrc detection."""
+    from flash.env_secrets import credential_in_file
+
+    cases = (
+        ("jwk", f'{{"kty":"RSA","n":"public-only","d":"{_FAKE_KEY_BODY}"}}\n', "a private key"),
+        (
+            "netrc",
+            f"machine api.wandb.ai\n  login user\n  password {_FAKE_KEY_BODY}\n",
+            "a machine password in a netrc file",
+        ),
+    )
+    for name, text, expected in cases:
+        control = tmp_path / f"{name}-utf8.txt"
+        control.write_text(text)
+        assert credential_in_file(control) == expected
+        for encoding in ("utf-16-le", "utf-32-le"):
+            published = tmp_path / f"{name}-{encoding}.txt"
+            published.write_bytes(text.encode(encoding))
+            assert credential_in_file(published) == expected, (name, encoding)
+
+
+def test_zip_symlink_targets_are_scanned_like_names(tmp_path):
+    """a zip symlink target path is published metadata and needs filename semantics."""
+    import stat
+    import zipfile
+
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    target = f"safe/{encoded.decode()}.json"
+
+    control = tmp_path / "named.zip"
+    with zipfile.ZipFile(control, "w") as archive:
+        archive.writestr(target, b"harmless\n")
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(control)
+
+    published = tmp_path / "linked.zip"
+    with zipfile.ZipFile(published, "w", zipfile.ZIP_DEFLATED) as archive:
+        info = zipfile.ZipInfo("safe-link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, target.encode())
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
 
 
 def test_a_zip_local_header_without_its_end_record_is_refused(tmp_path):
@@ -8492,6 +10523,42 @@ def test_png_compressed_metadata_is_scanned_inside_zip(tmp_path):
     with zipfile.ZipFile(nested, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("profile.png", image)
     assert credential_in_file(nested) == "a Freesolo API key"
+
+
+def test_cpio_symlink_targets_are_scanned_like_names(tmp_path):
+    """a cpio symlink body is a published target path, not only generic content."""
+    import shutil
+    import subprocess
+
+    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+
+    if shutil.which("cpio") is None:
+        pytest.skip("cpio is not installed")
+
+    encoded = base64.urlsafe_b64encode(b"Salted__12345678ciphertext01234567").rstrip(b"=")
+    target = f"dir/{encoded.decode()}"
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_name(target)
+
+    work = tmp_path / "cpio"
+    work.mkdir()
+    (work / "link").symlink_to(target)
+    built = subprocess.run(
+        ["cpio", "-o", "-H", "newc"],
+        input=b"link\n",
+        cwd=work,
+        check=True,
+        capture_output=True,
+    )
+    listing = subprocess.run(
+        ["cpio", "-itv"], input=built.stdout, check=True, capture_output=True
+    ).stdout.decode()
+    assert f"link -> {target}" in listing
+
+    published = tmp_path / "linked.cpio"
+    published.write_bytes(built.stdout)
+    with pytest.raises(_Unscannable, match="OpenSSL-encrypted"):
+        credential_in_file(published)
 
 
 def test_cpio_shell_members_preserve_filename_context(tmp_path):

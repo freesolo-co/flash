@@ -6,6 +6,7 @@ import base64
 import bz2
 import gzip
 import lzma
+import random
 import struct
 import zipfile
 import zlib
@@ -348,6 +349,34 @@ def test_parquet_magic_fails_closed_without_using_the_filename(tmp_path):
     assert credential_in_file(fake) is None
 
 
+def test_avro_ocf_fails_closed_only_at_the_anchored_magic(tmp_path):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    avro = _avro_ocf(_KEY)
+    standalone = tmp_path / "dataset.bin"
+    standalone.write_bytes(avro)
+    with pytest.raises(_Unscannable, match="Avro"):
+        credential_in_file(standalone)
+
+    exact = tmp_path / "dataset.b64"
+    exact.write_bytes(base64.b64encode(avro))
+    with pytest.raises(_Unscannable, match="Avro"):
+        credential_in_file(exact)
+
+    wrapped = tmp_path / "dataset-wrapped.b64"
+    wrapped.write_bytes(base64.encodebytes(avro))
+    with pytest.raises(_Unscannable, match="Avro"):
+        credential_in_file(wrapped)
+
+    offset = tmp_path / "offset.bin"
+    offset.write_bytes(b"prefix Obj\x01" + avro[4:])
+    assert credential_in_file(offset) is None
+
+    fake_name = tmp_path / "dataset.avro"
+    fake_name.write_text("ordinary rows with no credential\n")
+    assert credential_in_file(fake_name) is None
+
+
 def test_framed_snappy_streams_fail_closed_on_the_complete_identifier(tmp_path):
     from flash.env_secrets import _Unscannable, credential_in_file
 
@@ -365,6 +394,87 @@ def test_framed_snappy_streams_fail_closed_on_the_complete_identifier(tmp_path):
     prose = tmp_path / "snappy.txt"
     prose.write_bytes(b"the standard stream identifier spells sNaPpY in documentation\n")
     assert credential_in_file(prose) is None
+
+
+def test_wrapped_container_newline_at_chunk_boundary_is_not_clean(tmp_path):
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    avro = _avro_ocf(_KEY)
+    encoded = base64.b64encode(avro)
+    assert len(encoded) > 76
+    label = b"value: "
+    for ending, name in ((b"\n", "lf"), (b"\r\n", "crlf")):
+        padding = _SCAN_CHUNK_BYTES - len(label) - 76 - len(ending)
+        boundary = tmp_path / f"boundary-{name}.txt"
+        boundary.write_bytes(b"#" * padding + label + encoded[:76] + ending + encoded[76:])
+        with pytest.raises(_Unscannable, match="base64 run too long"):
+            credential_in_file(boundary)
+
+    harmless_encoded = base64.b64encode(b"ordinary harmless bytes " * 20)
+    gap = b"#" * 33
+    padding = _SCAN_CHUNK_BYTES - len(label) - 76 - 1 - len(gap)
+    shifted = tmp_path / "shifted-control.txt"
+    shifted.write_bytes(
+        b"#" * padding + label + harmless_encoded[:76] + b"\n" + gap + harmless_encoded[76:]
+    )
+    assert credential_in_file(shifted) is None
+
+    harmless = tmp_path / "harmless-wrapped.txt"
+    harmless.write_bytes(base64.encodebytes(b"ordinary harmless bytes " * 20))
+    assert credential_in_file(harmless) is None
+
+    adjacent = tmp_path / "adjacent-lines.txt"
+    adjacent.write_bytes(base64.b64encode(b"A" * 57) + b"\n" + base64.b64encode(b"B" * 57))
+    assert credential_in_file(adjacent) is None
+
+
+def test_gitlab_personal_access_tokens_use_the_issued_body_contract(tmp_path):
+    from flash.env_secrets import credential_in_file
+
+    prefix = b"gl" + b"pat-"
+    token = prefix + b"Ab3dE5fG7hJ9kLmN2pQr"
+    assert len(token.removeprefix(prefix)) == 20
+    plain = tmp_path / "gitlab.txt"
+    plain.write_bytes(token)
+    assert credential_in_file(plain) == "a GitLab personal access token"
+
+    encoded = tmp_path / "gitlab.b64"
+    encoded.write_bytes(base64.b64encode(token))
+    assert credential_in_file(encoded) == "a GitLab personal access token"
+
+    wide = tmp_path / "gitlab-wide.bin"
+    wide.write_bytes(token.decode().encode("utf-16-le"))
+    assert credential_in_file(wide) == "a GitLab personal access token"
+
+    assignment = tmp_path / "gitlab.env"
+    assignment.write_bytes(b"GITLAB_TOKEN=" + token)
+    assert credential_in_file(assignment) == "a GitLab personal access token"
+
+    near = b"x" + token
+    near_plain = tmp_path / "gitlab-near.txt"
+    near_plain.write_bytes(near)
+    assert credential_in_file(near_plain) is None
+
+    near_encoded = tmp_path / "gitlab-near.b64"
+    near_encoded.write_bytes(base64.b64encode(near))
+    assert credential_in_file(near_encoded) is None
+
+    near_wide = tmp_path / "gitlab-near-wide.bin"
+    near_wide.write_bytes(near.decode().encode("utf-16-le"))
+    assert credential_in_file(near_wide) is None
+
+    for index, control in enumerate(
+        (
+            prefix + b"Ab3dE5fG7hJ9kLmN2pQ",
+            prefix + b"AAAAAAAAAAAAAAAAAAAA",
+            b"glpatt-Ab3dE5fG7hJ9kLmN2pQr",
+            prefix + b"Ab3dE5fG7hJ9kLmN2pQrX",
+        )
+    ):
+        candidate = tmp_path / f"gitlab-control-{index}.txt"
+        candidate.write_bytes(control)
+        assert credential_in_file(candidate) is None
 
 
 def test_npm_access_tokens_require_exact_issued_boundaries(tmp_path):
@@ -395,6 +505,54 @@ def test_npm_access_tokens_require_exact_issued_boundaries(tmp_path):
         control = tmp_path / f"npm-control-{index}.txt"
         control.write_bytes(content)
         assert credential_in_file(control) is None
+
+
+def test_compound_filename_extensions_preserve_exact_container_values(tmp_path):
+    from flash.env_secrets import _Unscannable, credential_in_name
+
+    envelope = b"Salted__12345678ciphertext"
+    encoded = base64.urlsafe_b64encode(envelope).rstrip(b"=").decode()
+    for name in (
+        f"{encoded}.tar.gz",
+        f"{encoded}.backup.tar.gz.sig",
+        f"parent.dir/nested/{encoded}.tar.gz",
+    ):
+        with pytest.raises(_Unscannable, match="OpenSSL"):
+            credential_in_name(name)
+
+    split = len(encoded) // 2
+    controls = (
+        f".{encoded}.tar.gz",
+        f"prefix~{encoded}.tar.gz",
+        f"{encoded}~suffix.tar.gz",
+        f"{encoded}.",
+        f"{encoded}..tar.gz",
+        f"parent.dir/{encoded[:split]}/{encoded[split:]}.tar.gz",
+        ".env",
+        "trailing.",
+        "repeated..dots",
+    )
+    for name in controls:
+        assert credential_in_name(name) is None
+
+
+def test_compound_extensions_allow_slashes_inside_exact_base64_values():
+    from flash.env_secrets import _Unscannable, credential_in_name
+
+    encoded = "KLUv/QABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f"
+    assert base64.b64decode(encoded).startswith(b"\x28\xb5\x2f\xfd")
+    for name in (encoded, f"{encoded}.gz", f"{encoded}.tar.gz"):
+        with pytest.raises(_Unscannable, match="zstd"):
+            credential_in_name(name)
+
+    split = encoded.index("/")
+    controls = (
+        f"{encoded}.gz/ordinary.txt",
+        f"parent.dir/{encoded[:split]}/{encoded[split + 1 :]}.tar.gz",
+        "parent.dir/ordinary.tar.gz",
+    )
+    for name in controls:
+        assert credential_in_name(name) is None
 
 
 def test_ansible_vault_requires_a_supported_header_and_hex_body(tmp_path):
@@ -440,6 +598,59 @@ def test_ansible_vault_requires_a_supported_header_and_hex_body(tmp_path):
     fake_name = tmp_path / "ordinary.vault"
     fake_name.write_text("ordinary rows with no credential\n")
     assert credential_in_file(fake_name) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "contents"),
+    [
+        ("literal.yaml", "note: 'quoted ''text'' before fslo_AbCd\\x45f0123456789AbCdEf'\n"),
+        ("literal.toml", "note = 'text before fslo_AbCd\\x45f0123456789AbCdEf'\n"),
+        ("multiline.toml", "note = '''\ntext before fslo_AbCd\\x45f0123456789AbCdEf\n'''\n"),
+    ],
+)
+def test_yaml_and_toml_literal_strings_preserve_backslashes(tmp_path, name, contents):
+    from flash.env_secrets import credential_in_file
+
+    literal = tmp_path / name
+    literal.write_text(contents)
+    assert credential_in_file(literal) is None
+
+    basic = tmp_path / "basic.toml"
+    basic.write_text('note = "fslo_AbCd\\x45f0123456789AbCdEf"\n')
+    assert credential_in_file(basic) == "a Freesolo API key"
+
+
+def test_yaml_and_toml_literal_lexers_ignore_apostrophes_in_other_states(tmp_path):
+    from flash.env_secrets import credential_in_file
+
+    escaped = "fslo_AbCd\\x45f0123456789AbCdEf"
+    yaml_basic = tmp_path / "adversarial.yaml"
+    yaml_basic.write_text(f"note: \"apostrophe ' before {escaped} ' after\"\n")
+    assert credential_in_file(yaml_basic) == "a Freesolo API key"
+
+    yaml_comment = tmp_path / "comment.yaml"
+    yaml_comment.write_text(f'# apostrophe \'\nnote: "{escaped}"\n')
+    assert credential_in_file(yaml_comment) == "a Freesolo API key"
+
+    yaml_block = tmp_path / "block.yaml"
+    yaml_block.write_text(f"note: |\n  apostrophe ' and literal {escaped}\nnext: harmless\n")
+    assert credential_in_file(yaml_block) is None
+
+    toml_basic = tmp_path / "adversarial.toml"
+    toml_basic.write_text(f"note = \"apostrophe ' before {escaped} ' after\"\n")
+    assert credential_in_file(toml_basic) == "a Freesolo API key"
+
+    toml_multiline = tmp_path / "multiline-basic.toml"
+    toml_multiline.write_text(f'note = """apostrophe \' before {escaped} \' after"""\n')
+    assert credential_in_file(toml_multiline) == "a Freesolo API key"
+
+    toml_comment = tmp_path / "comment.toml"
+    toml_comment.write_text(f'# apostrophe \'\nnote = "{escaped}"\n')
+    assert credential_in_file(toml_comment) == "a Freesolo API key"
+
+    literal = tmp_path / "literal-control.toml"
+    literal.write_text(f"note = '{escaped}'\n")
+    assert credential_in_file(literal) is None
 
 
 @pytest.mark.parametrize(
@@ -517,6 +728,42 @@ def test_container_timeout_cannot_be_suppressed_by_a_settled_handler(tmp_path, m
     assert env_secrets._credential_in_container(b"not a container", deadline=1.0, depth=1) is None
 
 
+def test_oversized_base64_refusal_is_limited_to_containers(tmp_path):
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    ordinary = tmp_path / "image.b64"
+    ordinary.write_bytes(base64.b64encode(b"A" * 3_200_000))
+    assert len(ordinary.read_bytes()) > 4 << 20
+    assert credential_in_file(ordinary) is None
+
+    false_zlib = tmp_path / "false-zlib.b64"
+    false_zlib.write_bytes(base64.b64encode(b"\x78\x9c" + b"\xff" * 3_200_000))
+    assert len(false_zlib.read_bytes()) > 4 << 20
+    assert credential_in_file(false_zlib) is None
+
+    fdict = tmp_path / "fdict.b64"
+    fdict.write_bytes(base64.b64encode(b"\x78\x20" + b"\xff" * 3_200_000))
+    with pytest.raises(_Unscannable, match="base64 run too long"):
+        credential_in_file(fdict)
+
+    rng = random.Random(20260815)
+    packed = gzip.compress(rng.randbytes(3_250_000), mtime=0) + gzip.compress(_KEY, mtime=0)
+    encoded = base64.b64encode(packed)
+    assert len(encoded) > 4 << 20
+    assert _KEY not in packed
+    container = tmp_path / "container.b64"
+    container.write_bytes(encoded)
+    with pytest.raises(_Unscannable, match="base64 run too long"):
+        credential_in_file(container)
+
+    zlib_container = tmp_path / "zlib-container.b64"
+    zlib_encoded = base64.b64encode(zlib.compress(rng.randbytes(3_250_000) + _KEY))
+    assert len(zlib_encoded) > 4 << 20
+    zlib_container.write_bytes(zlib_encoded)
+    with pytest.raises(_Unscannable, match="base64 run too long"):
+        credential_in_file(zlib_container)
+
+
 def test_gzip_metadata_uses_name_and_raw_container_scanning(tmp_path):
     from flash.env_secrets import credential_in_file
 
@@ -547,6 +794,49 @@ def test_zip_metadata_uses_the_full_bounded_scanner(tmp_path, location):
         if location == "comment":
             zipped.comment = packed
     assert credential_in_file(archive) == "a Freesolo API key"
+
+
+def test_openpgp_exact_nonfinal_packet_boundary_is_undecided(tmp_path):
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    body_size = _SCAN_CHUNK_BYTES - 5
+    public = b"\x9a" + body_size.to_bytes(4, "big") + b"\x04\0\0\0\0\x01" + bytes(body_size - 6)
+    assert len(public) == _SCAN_CHUNK_BYTES
+    secret = b"\xc5\x06\x04\0\0\0\0\x01"
+
+    compact = tmp_path / "compact.pgp"
+    compact.write_bytes(b"\x99\0\x06\x04\0\0\0\0\x01" + secret)
+    assert credential_in_file(compact) == "a private key"
+
+    boundary = tmp_path / "boundary.pgp"
+    boundary.write_bytes(public + secret)
+    with pytest.raises(_Unscannable, match="cannot walk to the end"):
+        credential_in_file(boundary)
+
+
+def test_long_openpgp_message_headers_do_not_cross_windows_cleanly(tmp_path):
+    from flash.env_buffers import _SCAN_CHUNK_BYTES
+    from flash.env_secrets import _Unscannable, credential_in_file
+
+    armored = tmp_path / "message.asc"
+    armored.write_bytes(
+        b"-----BEGIN PGP MESSAGE-----\nComment: "
+        + b"x" * (_SCAN_CHUNK_BYTES + 4096)
+        + b"\n\n"
+        + b"A" * 64
+        + b"\n-----END PGP MESSAGE-----\n"
+    )
+    with pytest.raises(_Unscannable, match="OpenPGP message armor header"):
+        credential_in_file(armored)
+
+    prose = tmp_path / "README.md"
+    prose.write_text("documentation mentions -----BEGIN PGP MESSAGE----- as marker prose\n")
+    assert credential_in_file(prose) is None
+
+    exact_line = tmp_path / "MARKERS.md"
+    exact_line.write_text("-----BEGIN PGP MESSAGE-----\nthis line explains the marker\n")
+    assert credential_in_file(exact_line) is None
 
 
 def test_terminal_brotli_sidecars_are_rejected_by_name(tmp_path):
@@ -600,3 +890,32 @@ def test_concatenated_raw_deflate_records_share_bounds(tmp_path):
     footer = tmp_path / "footer.deflate"
     footer.write_bytes(_raw_deflate(b"harmless\n") + b"invalid footer")
     assert credential_in_file(footer) is None
+
+
+def test_exact_base64_decodes_run_openpgp_and_keystore_checks(tmp_path):
+    from flash.env_secrets import credential_in_file
+
+    secret_packet = b"\xc5\x20\x04\0\0\0\0\x01" + bytes(26)
+    public_packet = b"\xc6" + secret_packet[1:]
+    key_store = _jks(1)
+    secret_store = _jks(3, magic=b"\xce\xce\xce\xce")
+    trust_store = _jks(2)
+
+    for name, raw, expected in (
+        ("openpgp", secret_packet, "a private key"),
+        ("openpgp-sequence", public_packet + secret_packet, "a private key"),
+        ("openpgp-marker", b"\xca\x03PGP" + secret_packet, "a private key"),
+        ("jks", key_store, "a key store"),
+        ("jceks", secret_store, "a key store"),
+    ):
+        control = tmp_path / f"{name}.bin"
+        control.write_bytes(raw)
+        assert credential_in_file(control) == expected
+
+        encoded = tmp_path / f"{name}.yaml"
+        encoded.write_text("value: " + base64.b64encode(raw).decode() + "\n")
+        assert credential_in_file(encoded) == expected
+
+    trust = tmp_path / "trust.yaml"
+    trust.write_text("value: " + base64.b64encode(trust_store).decode() + "\n")
+    assert credential_in_file(trust) is None
