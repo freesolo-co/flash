@@ -276,7 +276,7 @@ class _ReachedArtifactResolution(Exception):
     """Sentinel: execution got past the warm-start revision check."""
 
 
-def test_warm_start_inherits_a_legacy_authored_source_revision(monkeypatch):
+def test_warm_start_inherits_an_authored_source_revision(monkeypatch):
     """A child inherits an authored source pin without laundering its deploy provenance."""
     from fastapi import HTTPException
 
@@ -293,7 +293,7 @@ def test_warm_start_inherits_a_legacy_authored_source_revision(monkeypatch):
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    stored_public = {**source.to_dict(), "model_revision": _REVISION}
+    stored_public = source.to_dict()
     source_status = R.RunStatus(
         state="done",
         run_id=source.run_id,
@@ -301,10 +301,7 @@ def test_warm_start_inherits_a_legacy_authored_source_revision(monkeypatch):
         effective_preparation={
             "worker_spec": source.to_internal_dict(),
             "preparation_digest": R._preparation_digest(
-                JobSpec.from_dict(stored_public),
-                source,
-                None,
-                legacy_public_keys={"model_revision": _REVISION},
+                JobSpec.from_dict(stored_public), source, None
             ),
         },
     )

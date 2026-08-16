@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-from flash.env_base64 import _match_base64
-from flash.env_patterns import _ASSIGNED_PATTERNS, _LITERAL_PATTERNS, _TOKEN_PATTERNS
+from flash.envscan.base64 import _match_base64
+from flash.envscan.patterns import _ASSIGNED_PATTERNS, _LITERAL_PATTERNS, _TOKEN_PATTERNS
 
 CredentialCheck = Callable[..., str | None]
 

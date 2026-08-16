@@ -120,7 +120,7 @@ def _rpm_lead() -> bytes:
 
 @pytest.mark.parametrize("offset", [0, 512, 1024, 4096])
 def test_hdf5_signatures_at_superblock_positions_fail_closed(tmp_path, offset):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     artifact = tmp_path / "dataset.bin"
     artifact.write_bytes(bytes(offset) + b"\x89HDF\r\n\x1a\n" + zlib.compress(_KEY))
@@ -129,7 +129,7 @@ def test_hdf5_signatures_at_superblock_positions_fail_closed(tmp_path, offset):
 
 
 def test_hdf5_false_positive_controls_remain_clean(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     controls = {
         "filename.h5": b"ordinary values\n",
@@ -151,7 +151,7 @@ def test_hdf5_false_positive_controls_remain_clean(tmp_path):
     ],
 )
 def test_arrow_file_and_stream_framing_fail_closed(tmp_path, payload):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     artifact = tmp_path / "records.bin"
     artifact.write_bytes(payload)
@@ -160,7 +160,7 @@ def test_arrow_file_and_stream_framing_fail_closed(tmp_path, payload):
 
 
 def test_arrow_false_positive_controls_remain_clean(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     controls = {
         "records.arrow": b"ordinary records\n",
@@ -188,7 +188,7 @@ def test_arrow_false_positive_controls_remain_clean(tmp_path):
     ],
 )
 def test_native_gnupg_private_key_sexpressions_are_detected(tmp_path, expression):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     key = tmp_path / "native.key"
     key.write_bytes(
@@ -199,7 +199,7 @@ def test_native_gnupg_private_key_sexpressions_are_detected(tmp_path, expression
 
 
 def test_native_gnupg_false_positive_controls_remain_clean(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     controls = {
         "public.key": b"Key: (public-key (rsa (n #A1B2#) (e #010001#)))\n",
@@ -227,7 +227,7 @@ def test_native_gnupg_false_positive_controls_remain_clean(tmp_path):
     ],
 )
 def test_git_pack_and_bundle_fail_closed(tmp_path, payload):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     artifact = tmp_path / "objects.bin"
     artifact.write_bytes(payload)
@@ -236,8 +236,8 @@ def test_git_pack_and_bundle_fail_closed(tmp_path, payload):
 
 
 def test_native_gnupg_oversized_recognized_header_fails_closed(tmp_path, monkeypatch):
-    from flash import env_sensitive
-    from flash.env_secrets import credential_in_file
+    from flash.envscan import sensitive as env_sensitive
+    from flash.envscan.secrets import credential_in_file
 
     monkeypatch.setattr(env_sensitive, "_MAX_GNUPG_HEADER_BYTES", 96)
     key = tmp_path / "long-native.key"
@@ -254,7 +254,7 @@ def test_native_gnupg_oversized_recognized_header_fails_closed(tmp_path, monkeyp
 
 
 def test_git_pack_and_bundle_false_positive_controls_remain_clean(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     controls = {
         "objects.pack": b"ordinary object names\n",
@@ -275,7 +275,7 @@ def test_git_pack_and_bundle_false_positive_controls_remain_clean(tmp_path):
 
 
 def test_real_git_pack_is_structurally_recognized(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     if shutil.which("git") is None:
         pytest.skip("git is not installed")
@@ -303,8 +303,8 @@ def test_real_git_pack_is_structurally_recognized(tmp_path):
 
 
 def test_git_bundle_preamble_past_buffer_bound_fails_closed(tmp_path, monkeypatch):
-    from flash import env_opaque
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan import opaque as env_opaque
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     monkeypatch.setattr(env_opaque, "_MAX_GIT_BUNDLE_HEADER_BYTES", 256)
     preamble = b"# v2 git bundle\n" + b"1" * 40 + b" refs/heads/main\n"
@@ -316,7 +316,7 @@ def test_git_bundle_preamble_past_buffer_bound_fails_closed(tmp_path, monkeypatc
 
 
 def test_uri_userinfo_passwords_are_detected_without_echoing_values(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     plain = tmp_path / "plain.txt"
     plain.write_bytes(b"endpoint=https://build:" + b"a1B2c3D4" * 4 + b"@example.com:443/path\n")
@@ -341,7 +341,7 @@ def test_uri_userinfo_passwords_are_detected_without_echoing_values(tmp_path):
 
 
 def test_uri_userinfo_false_positive_controls_remain_clean(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     controls = {
         "user-only.txt": b"https://user@example.com/path\n",
@@ -366,7 +366,7 @@ def test_uri_userinfo_false_positive_controls_remain_clean(tmp_path):
 
 
 def test_uri_oversized_continuing_authority_fails_closed(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     path = tmp_path / "oversized-uri.txt"
     authority = b"user:a1B2c3D4e5F6g7H8@" + b"a" * 800 + b":70000"
@@ -375,7 +375,7 @@ def test_uri_oversized_continuing_authority_fails_closed(tmp_path):
 
 
 def test_arrow_marker_does_not_disable_source_rejoining(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     source = tmp_path / "marker.py"
     source.write_bytes(
@@ -386,7 +386,7 @@ def test_arrow_marker_does_not_disable_source_rejoining(tmp_path):
 
 @pytest.mark.parametrize("filter_kind", range(5))
 def test_png_idat_unfiltering_reconstructs_credentials(tmp_path, filter_kind):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     previous = b"ordinary-pixel-row".ljust(len(_KEY), b".")
     rows = [(0, previous), (filter_kind, _filtered(_KEY, previous, filter_kind))]
@@ -396,7 +396,7 @@ def test_png_idat_unfiltering_reconstructs_credentials(tmp_path, filter_kind):
 
 
 def test_png_fdat_unfiltering_reconstructs_credentials(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     ihdr = struct.pack(">IIBBBBB", len(_KEY), 1, 8, 0, 0, 0, 0)
     control = struct.pack(">IIIIIHHBB", 0, len(_KEY), 1, 0, 0, 0, 0, 0, 0)
@@ -431,7 +431,7 @@ def test_png_fdat_unfiltering_reconstructs_credentials(tmp_path):
     ],
 )
 def test_clean_png_sample_layouts_remain_clean(tmp_path, bit_depth, color_type, width, row):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     path = tmp_path / f"layout-{color_type}-{bit_depth}.png"
     path.write_bytes(_png([(0, row)], width=width, bit_depth=bit_depth, color_type=color_type))
@@ -439,8 +439,8 @@ def test_clean_png_sample_layouts_remain_clean(tmp_path, bit_depth, color_type, 
 
 
 def test_png_malformed_unsupported_budget_and_deadline_fail_closed(tmp_path):
-    from flash import env_deflate
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan import deflate as env_deflate
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     unsupported = tmp_path / "interlaced.png"
     unsupported.write_bytes(_png([(0, b"a")], width=1, interlace=1))
@@ -466,7 +466,7 @@ def test_png_malformed_unsupported_budget_and_deadline_fail_closed(tmp_path):
 
 
 def test_png_metadata_and_icc_payloads_keep_existing_behavior(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     secret_text = tmp_path / "text.png"
     secret_text.write_bytes(
@@ -514,7 +514,7 @@ def test_png_metadata_and_icc_payloads_keep_existing_behavior(tmp_path):
     ],
 )
 def test_opaque_formats_fail_closed_inside_archives(tmp_path, payload):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     archive = tmp_path / "nested.zip"
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as packed:
@@ -524,7 +524,7 @@ def test_opaque_formats_fail_closed_inside_archives(tmp_path, payload):
 
 
 def test_rpm_leads_fail_closed_without_filename_guessing(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     rpm = tmp_path / "payload.bin"
     rpm.write_bytes(_rpm_lead() + zlib.compress(_KEY))

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from flash.env_buffers import _wide_runs
+from flash.envscan.buffers import _wide_runs
 
 Detector = Callable[..., str | None]
 

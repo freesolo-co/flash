@@ -17,7 +17,7 @@ import gzip
 
 import pytest
 
-from flash.env_secrets import credential_in_file
+from flash.envscan.secrets import credential_in_file
 
 FREESOLO_KEY = "fslo_" + "A1bCdEfGhIjKlMnOpQrS"
 ASSIGNMENT = f"FREESOLO_API_KEY={FREESOLO_KEY}"

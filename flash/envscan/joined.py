@@ -7,7 +7,7 @@ resolves to the character it names. Each one splits a token across a seam that i
 pattern but absent by the time anything reads the value, so a key written that way published intact
 while the same key on one line was refused.
 
-Split out to keep `flash.env_secrets` under the file-size limit. The dependency runs one way: this
+Split out to keep `flash.envscan.secrets` under the file-size limit. The dependency runs one way: this
 knows about bytes, nothing about files, packages or the scan.
 """
 

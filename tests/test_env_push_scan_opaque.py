@@ -12,11 +12,13 @@ becomes unpublishable.
 from __future__ import annotations
 
 import io
+import shutil
+import subprocess
 
 import pytest
 
-from flash.env_opaque import opaque_format
-from flash.env_secrets import _Unscannable, credential_in_file
+from flash.envscan.opaque import _BUNDLE_PREREQUISITE, opaque_format
+from flash.envscan.secrets import _Unscannable, credential_in_file
 
 FREESOLO_KEY = "fslo_" + "A1bCdEfGhIjKlMnOpQrS"
 
@@ -118,3 +120,51 @@ def test_arrow_types_above_the_original_bound_are_recognised(tmp_path, column):
     with pytest.raises(_Unscannable) as caught:
         credential_in_file(path)
     assert "Arrow IPC" in str(caught.value)
+
+
+def _git_bundle(tmp_path, *args: str) -> bytes:
+    """A bundle written by git itself, not hand-assembled to match the parser."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def run(*command: str) -> None:
+        subprocess.run(command, cwd=repo, check=True, capture_output=True)
+
+    run("git", "init", "-q")
+    run("git", "config", "user.email", "test@example.invalid")
+    run("git", "config", "user.name", "Test")
+    (repo / "a.txt").write_text("hello\n")
+    run("git", "add", "a.txt")
+    run("git", "commit", "-q", "-m", "init")
+    out = tmp_path / "out.bundle"
+    run("git", "bundle", "create", str(out), *args)
+    return out.read_bytes()
+
+
+@pytest.mark.parametrize("selector", [["--all"], ["HEAD"]])
+def test_a_real_git_bundle_is_recognised(tmp_path, selector):
+    """`git bundle create --all` writes a bare `HEAD` line beside the `refs/...` ones.
+
+    Per gitformat-bundle a reference is `obj-id SP refname`, and refname is unqualified, so
+    requiring a `refs/` prefix made an ordinary bundle stop matching. It then fell through to the
+    literal scan, where a pack's contents are deflated and a credential inside is not contiguous.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git is needed to write a real bundle")
+    assert opaque_format(_git_bundle(tmp_path, *selector)) == "Git bundle"
+
+
+def test_a_bundle_prerequisite_without_a_comment_is_accepted():
+    """`prerequisite = "-" obj-id SP comment` with `comment = *CHAR`, so the comment may be
+    empty. Demanding a non-empty one rejected a valid header the same way."""
+    oid = b"3c49ea908b80928b8b72559f408aacaa2ce399d3"
+    assert _BUNDLE_PREREQUISITE.fullmatch(b"-" + oid) is not None
+    assert _BUNDLE_PREREQUISITE.fullmatch(b"-" + oid + b" ") is not None
+    assert _BUNDLE_PREREQUISITE.fullmatch(b"-" + oid + b" a comment") is not None
+
+
+def test_bundle_prose_is_not_a_bundle(tmp_path):
+    """The recognition stays structural: a document quoting a bundle header is not one."""
+    path = tmp_path / "notes.md"
+    path.write_bytes(b"a bundle line looks like 3c49ea90 refs/heads/main\n")
+    assert credential_in_file(path) is None

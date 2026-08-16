@@ -55,20 +55,40 @@ def test_urlopen_raises_typed_error_on_rate_limit_403(monkeypatch):
         _urlopen(urllib.request.Request("https://api.github.com/x"))
 
 
-def test_urlopen_non_rate_limit_403_stays_plain_runtime_error(monkeypatch):
-    # a 403 that is not a rate limit (auth failure, repo not found) must stay a plain runtimeerror
-    # (non-retriable) so the run fails fast instead of looping on a fresh worker forever.
-    from flash.envs.loader import GitHubRateLimitError, _urlopen
+@pytest.mark.parametrize("code", [401, 403])
+def test_urlopen_treats_credential_failure_as_permanent(monkeypatch, code):
+    # a 401, or a 403 that is not a rate limit, is a token this plane cannot fix by waiting. it must
+    # be non-retriable (so the run does not loop on a fresh worker) AND typed permanent, so the
+    # submit-time preflight fails closed instead of deferring the same error past gpu allocation.
+    from flash.envs.loader import GitHubPermanentError, GitHubRateLimitError, _urlopen
 
     _patch_no_sleep(monkeypatch)
     monkeypatch.setattr(
         urllib.request,
         "urlopen",
-        lambda *a, **k: (_ for _ in ()).throw(_http_error(403, '{"message": "Bad credentials"}')),
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(code, '{"message": "Bad credentials"}')),
     )
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(GitHubPermanentError) as exc:
         _urlopen(urllib.request.Request("https://api.github.com/x"))
     assert not isinstance(exc.value, GitHubRateLimitError)
+
+
+def test_urlopen_rate_limit_403_stays_transient_not_permanent(monkeypatch):
+    # the rate-limit 403 is claimed before the credential branch: it is a quota to wait out, not a
+    # bad token, so widening the permanent set must not swallow it.
+    from flash.envs.loader import GitHubPermanentError, GitHubRateLimitError, _urlopen
+
+    _patch_no_sleep(monkeypatch)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            _http_error(403, '{"message": "API rate limit exceeded"}')
+        ),
+    )
+    with pytest.raises(GitHubRateLimitError) as exc:
+        _urlopen(urllib.request.Request("https://api.github.com/x"))
+    assert not isinstance(exc.value, GitHubPermanentError)
 
 
 @pytest.mark.parametrize("code", [404, 422])

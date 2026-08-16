@@ -4,7 +4,7 @@ A Kubernetes Secret stores every value base64-encoded, and that is an ordinary f
 an environment -- so a credential can be fully present in a file while sharing no substring with any
 pattern. These three functions are what make the encoded form visible.
 
-Split from `flash.env_secrets` to keep that module under the file-size limit. The dependency runs
+Split from `flash.envscan.secrets` to keep that module under the file-size limit. The dependency runs
 one way -- nothing here imports the scanning -- so these can be tested on bytes alone.
 """
 
@@ -18,9 +18,9 @@ import zlib
 from collections.abc import Iterator
 from typing import Protocol
 
-from flash.env_formats import _looks_like_zlib
-from flash.env_patterns import SHORTEST_TOKEN_BYTES, _match
-from flash.env_wrapped import context_unwrapped
+from flash.envscan.formats import _looks_like_zlib
+from flash.envscan.patterns import SHORTEST_TOKEN_BYTES, _match
+from flash.envscan.wrapped import context_unwrapped
 
 
 # What a caller may offer for a second look at decoded bytes: given them, it names a credential or

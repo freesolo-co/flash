@@ -1,7 +1,7 @@
 """Byte predicates the credential scan applies to a buffer it already holds.
 
 None of these open a file, expand a container, or call back into the scan: each answers one
-question about bytes in hand. Kept apart from `flash.env_secrets` for that reason as much as for
+question about bytes in hand. Kept apart from `flash.envscan.secrets` for that reason as much as for
 the file-size limit -- the scanning module imports these, never the reverse, so they can be tested
 on literal bytes with no archive, no deadline and no recursion.
 """
@@ -15,16 +15,21 @@ import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
-from flash.env_archive import _looks_like_cpio_header
-from flash.env_formats import _COMPRESSED_MAGIC, _looks_compressed, _looks_like_tar, _overlay_offset
-from flash.env_opaque import looks_like_opaque_candidate, opaque_format
-from flash.env_patterns import (
+from flash.envscan.archive import _looks_like_cpio_header
+from flash.envscan.formats import (
+    _COMPRESSED_MAGIC,
+    _looks_compressed,
+    _looks_like_tar,
+    _overlay_offset,
+)
+from flash.envscan.opaque import looks_like_opaque_candidate, opaque_format
+from flash.envscan.patterns import (
     _PAIRED_PATTERNS,
     SHORTEST_TOKEN_BYTES,
     _RecordHalves,
     _RecordSplitter,
 )
-from flash.env_png import _PNG_SIGNATURE
+from flash.envscan.png import _PNG_SIGNATURE
 
 # Read in bounded chunks so a large dataset member is never held in memory whole. This costs no
 # more I/O than the publish already pays: `_tar_b64` reads every one of these bytes to gzip them.

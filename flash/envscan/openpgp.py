@@ -5,7 +5,7 @@ the DER checks, so a private key in that form had nothing between it and the hub
 read the packet grammar itself: what a stream begins with, what its sequence holds, and whether an
 armored message is ciphertext this check cannot see into.
 
-Split from `flash.env_formats` to keep both modules under the file-size limit. The dependency runs
+Split from `flash.envscan.formats` to keep both modules under the file-size limit. The dependency runs
 one way -- nothing here imports the scanning -- so these can be tested on bytes alone.
 """
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 
-from flash.env_formats import _has_ansible_vault
+from flash.envscan.formats import _has_ansible_vault
 
 _MAX_OPENPGP_MARKERS = 8
 

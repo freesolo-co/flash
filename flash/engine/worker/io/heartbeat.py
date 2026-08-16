@@ -97,6 +97,19 @@ _HB_UPLOAD_LOCK = threading.Lock()
 # Terminal/error commits wait longer — no later heartbeat can repair them.
 _HB_UPLOAD_LOCK_TIMEOUT_S = 30.0
 _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
+# True while a thread holds _HB_UPLOAD_LOCK and is inside the HF commit. Read under _HB_LOCK.
+#
+# The throttle clock (_HB_LAST_UPLOAD) only advances AFTER a commit lands, so during a slow HF
+# commit every other throttled caller still computes upload_due=True, walks into
+# _HB_UPLOAD_LOCK.acquire() and blocks there for up to the acquire timeout -- 30s, or 120s on a
+# critical stage. That stalls the liveness daemon, and `liveness_heartbeat`'s join delays leaving
+# the wrapped stage by the same window.
+#
+# A marker rather than claiming the clock before the upload: an optimistic claim has to be rolled
+# back when the commit fails, and the rollback has to decide whether a NEWER heartbeat already
+# moved the clock (the reason the old code carried a claim sequence). This says only "a commit is
+# in flight right now", is cleared in a finally, and so cannot strand the throttle on a failure.
+_HB_UPLOAD_IN_FLIGHT = False
 # retain at least one metric row per second across the 900s training heartbeat throttle window.
 GRPO_METRIC_HISTORY_LIMIT = 1024
 
@@ -127,6 +140,12 @@ def _console_heartbeat_snapshot(
     return json.dumps(console_payload)
 
 
+def _set_upload_in_flight(value: bool) -> None:
+    """Mark whether an HF heartbeat commit is running. Call with _HB_LOCK held."""
+    global _HB_UPLOAD_IN_FLIGHT
+    _HB_UPLOAD_IN_FLIGHT = value
+
+
 def _heartbeat_upload_due(
     stage: str,
     *,
@@ -140,6 +159,22 @@ def _heartbeat_upload_due(
     """return eligibility from committed throttle state while _HB_LOCK is held."""
     if initial or _is_critical_stage(stage):
         return True
+    # a commit is already in flight and will advance the throttle clock when it lands. an unforced
+    # ping would only queue behind it on _HB_UPLOAD_LOCK, publish a snapshot older than the one
+    # being written, and block its caller for the acquire timeout -- 30s, or 120s on a critical
+    # stage. that is what stalls the liveness daemon, whose `join` then delays leaving the wrapped
+    # stage by the same window. skipping loses nothing: the in-flight commit carries this stage.
+    #
+    # three exemptions, all above or inside this check:
+    #   - initial and critical stages return True earlier: a terminal or error snapshot has no later
+    #     heartbeat to repair it, so it must queue and land.
+    #   - `force` is excluded here because it carries billing state. a forced commit marks a
+    #     DISTINCT completed step, and a cancel bills the last step a heartbeat recorded, so
+    #     dropping one to avoid a wait could under-report a step the run really finished.
+    # the daemon's own pings are never forced (liveness and keepalive both leave it False), so this
+    # exemption does not reopen the stall it fixes.
+    if _HB_UPLOAD_IN_FLIGHT and not force:
+        return False
     if _w._HB_TERMINAL_ONLY:
         return (
             _w._HB_LAST_UPLOAD == 0.0 or (now - _w._HB_LAST_UPLOAD) >= _HB_TERMINAL_ONLY_INTERVAL_S
@@ -234,12 +269,18 @@ def heartbeat(
                     up = f"/tmp/.hb-upload-{os.getpid()}-{threading.get_ident()}.json"
                     with open(up, "w") as f:
                         f.write(snapshot)
+                    with _HB_LOCK:
+                        _set_upload_in_flight(True)
                     try:
                         if initial:
                             committed = _w.hf_upload_file(up, "heartbeat.json", required=True)
                         else:
                             committed = _w.hf_upload_file(up, "heartbeat.json")
                     finally:
+                        # cleared before the throttle clock is advanced below, and in a finally so a
+                        # raising upload cannot leave every later heartbeat permanently skipped.
+                        with _HB_LOCK:
+                            _set_upload_in_flight(False)
                         with contextlib.suppress(OSError):
                             os.remove(up)
                     if committed is False:

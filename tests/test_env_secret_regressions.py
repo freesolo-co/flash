@@ -118,8 +118,8 @@ def _snappy_key_frame() -> bytes:
 
 
 def test_pdf_dictionary_index_is_single_pass_and_deadline_bounded(tmp_path, monkeypatch):
-    from flash import env_deflate
-    from flash.env_secrets import credential_in_file
+    from flash.envscan import deflate as env_deflate
+    from flash.envscan.secrets import credential_in_file
 
     body = bytearray(b"%PDF-1.7\n")
     packed = zlib.compress(b"harmless\n")
@@ -150,7 +150,7 @@ def test_pdf_dictionary_index_is_single_pass_and_deadline_bounded(tmp_path, monk
 
 
 def test_pdf_deadline_expires_inside_lexical_walk(monkeypatch):
-    from flash import env_deflate
+    from flash.envscan import deflate as env_deflate
 
     packed = zlib.compress(b"harmless")
     document = _pdf_stream(b"/Note (" + b"x" * (32 << 10) + b") /Filter /FlateDecode", packed)
@@ -168,7 +168,7 @@ def test_pdf_deadline_expires_inside_lexical_walk(monkeypatch):
 
 
 def test_pdf_long_direct_filter_arrays_are_lexically_parsed(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     gap = b" " * (70 << 10)
     encoded = base64.a85encode(zlib.compress(_KEY)) + b"~>"
@@ -206,7 +206,7 @@ def test_pdf_long_direct_filter_arrays_are_lexically_parsed(tmp_path):
     ],
 )
 def test_pdf_inline_image_supported_filter_chains_are_inspected(tmp_path, declaration, encode):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     payload = encode(zlib.compress(_KEY))
     inline = b"BI /W 1 /H 1 " + declaration + b" ID " + payload + b" EI\n"
@@ -217,7 +217,7 @@ def test_pdf_inline_image_supported_filter_chains_are_inspected(tmp_path, declar
 
 @pytest.mark.parametrize("filter_name", [b"/AHx", b"/ASCIIHexDecode", b"/LZW", b"/LZWDecode"])
 def test_pdf_inline_image_unsupported_filters_fail_closed(tmp_path, filter_name):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     inline = b"BI /W 1 /H 1 /F " + filter_name + b" ID " + _KEY.hex().encode() + b"> EI\n"
     document = tmp_path / "inline-unsupported.pdf"
@@ -227,7 +227,7 @@ def test_pdf_inline_image_unsupported_filters_fail_closed(tmp_path, filter_name)
 
 
 def test_pdf_inline_image_escaped_filter_keys_preserve_boundaries(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     supported = tmp_path / "inline-escaped-supported.pdf"
     supported.write_bytes(_pdf_stream(b"", b"BI /#46 /Fl ID " + zlib.compress(_KEY) + b" EI\n"))
@@ -255,7 +255,7 @@ def test_pdf_inline_image_escaped_filter_keys_preserve_boundaries(tmp_path):
 
 
 def test_pdf_inline_image_markers_ignore_strings_and_comments(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     controls = (
         b"(BI /F /LZW ID opaque EI)",
@@ -273,7 +273,7 @@ def test_pdf_inline_image_markers_ignore_strings_and_comments(tmp_path):
 
 
 def test_pdf_inline_image_decode_parameters_are_lexically_paired(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     def document(name: str, header: bytes, payload: bytes):
         path = tmp_path / name
@@ -317,7 +317,7 @@ def test_pdf_inline_image_decode_parameters_are_lexically_paired(tmp_path):
 
 
 def test_ar_members_preserve_resolved_filename_context(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     escaped = _KEY.decode().replace("B", "\\x42", 1).encode()
     standalone = tmp_path / "member.sh"
@@ -334,7 +334,7 @@ def test_ar_members_preserve_resolved_filename_context(tmp_path):
 
 
 def test_parquet_magic_fails_closed_without_using_the_filename(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     parquet = tmp_path / "dataset.bin"
     footer = b"minimal parquet metadata"
@@ -350,7 +350,7 @@ def test_parquet_magic_fails_closed_without_using_the_filename(tmp_path):
 
 
 def test_avro_ocf_fails_closed_only_at_the_anchored_magic(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     avro = _avro_ocf(_KEY)
     standalone = tmp_path / "dataset.bin"
@@ -378,7 +378,7 @@ def test_avro_ocf_fails_closed_only_at_the_anchored_magic(tmp_path):
 
 
 def test_framed_snappy_streams_fail_closed_on_the_complete_identifier(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     framed = _snappy_key_frame()
     assert _KEY not in framed
@@ -397,8 +397,8 @@ def test_framed_snappy_streams_fail_closed_on_the_complete_identifier(tmp_path):
 
 
 def test_wrapped_container_newline_at_chunk_boundary_is_not_clean(tmp_path):
-    from flash.env_buffers import _SCAN_CHUNK_BYTES
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.buffers import _SCAN_CHUNK_BYTES
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     avro = _avro_ocf(_KEY)
     encoded = base64.b64encode(avro)
@@ -430,7 +430,7 @@ def test_wrapped_container_newline_at_chunk_boundary_is_not_clean(tmp_path):
 
 
 def test_gitlab_personal_access_tokens_use_the_issued_body_contract(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     prefix = b"gl" + b"pat-"
     token = prefix + b"Ab3dE5fG7hJ9kLmN2pQr"
@@ -478,7 +478,7 @@ def test_gitlab_personal_access_tokens_use_the_issued_body_contract(tmp_path):
 
 
 def test_npm_access_tokens_require_exact_issued_boundaries(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     body = b"Ab3dE5fG7hJ9kLmN2pQr4sTu6vWx8yZ01aB2"
     assert len(body) == 36
@@ -508,7 +508,7 @@ def test_npm_access_tokens_require_exact_issued_boundaries(tmp_path):
 
 
 def test_compound_filename_extensions_preserve_exact_container_values(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_name
+    from flash.envscan.secrets import _Unscannable, credential_in_name
 
     envelope = b"Salted__12345678ciphertext"
     encoded = base64.urlsafe_b64encode(envelope).rstrip(b"=").decode()
@@ -537,7 +537,7 @@ def test_compound_filename_extensions_preserve_exact_container_values(tmp_path):
 
 
 def test_compound_extensions_allow_slashes_inside_exact_base64_values():
-    from flash.env_secrets import _Unscannable, credential_in_name
+    from flash.envscan.secrets import _Unscannable, credential_in_name
 
     encoded = "KLUv/QABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f"
     assert base64.b64decode(encoded).startswith(b"\x28\xb5\x2f\xfd")
@@ -556,7 +556,7 @@ def test_compound_extensions_allow_slashes_inside_exact_base64_values():
 
 
 def test_ansible_vault_requires_a_supported_header_and_hex_body(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     def vault_body(ciphertext: bytes = b"c" * 64) -> bytes:
         payload = b"a" * 64 + b"\n" + b"b" * 64 + b"\n" + ciphertext
@@ -566,12 +566,12 @@ def test_ansible_vault_requires_a_supported_header_and_hex_body(tmp_path):
         )
 
     ciphertext = vault_body()
-    standalone = tmp_path / "secrets.txt"
+    standalone = tmp_path / "env_secrets.txt"
     standalone.write_bytes(b"$ANSIBLE_VAULT;1.1;AES256\n" + ciphertext)
     with pytest.raises(_Unscannable, match="Ansible Vault"):
         credential_in_file(standalone)
 
-    embedded = tmp_path / "secrets.yaml"
+    embedded = tmp_path / "env_secrets.yaml"
     embedded.write_bytes(
         b"password: !vault |\n  $ANSIBLE_VAULT;1.2;AES256;production\n  "
         + ciphertext.replace(b"\n", b"\n  ")
@@ -609,7 +609,7 @@ def test_ansible_vault_requires_a_supported_header_and_hex_body(tmp_path):
     ],
 )
 def test_yaml_and_toml_literal_strings_preserve_backslashes(tmp_path, name, contents):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     literal = tmp_path / name
     literal.write_text(contents)
@@ -621,7 +621,7 @@ def test_yaml_and_toml_literal_strings_preserve_backslashes(tmp_path, name, cont
 
 
 def test_yaml_and_toml_literal_lexers_ignore_apostrophes_in_other_states(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     escaped = "fslo_AbCd\\x45f0123456789AbCdEf"
     yaml_basic = tmp_path / "adversarial.yaml"
@@ -671,7 +671,7 @@ def test_yaml_and_toml_literal_lexers_ignore_apostrophes_in_other_states(tmp_pat
     ],
 )
 def test_nested_overflow_retains_overlay_refusal(tmp_path, monkeypatch, suffix, compress):
-    from flash import env_secrets
+    from flash.envscan import secrets as env_secrets
 
     monkeypatch.setattr(env_secrets, "_MAX_NESTED_BUFFER_BYTES", 64 << 10)
     member = b"#!/bin/sh\n" + b"x" * (70 << 10) + compress(_KEY)
@@ -688,7 +688,7 @@ def test_nested_overflow_retains_overlay_refusal(tmp_path, monkeypatch, suffix, 
 
 
 def test_container_timeout_cannot_be_suppressed_by_a_settled_handler(tmp_path, monkeypatch):
-    from flash import env_secrets
+    from flash.envscan import secrets as env_secrets
 
     keyed = tmp_path / "keyed.gz"
     keyed.write_bytes(gzip.compress(_KEY, mtime=0))
@@ -729,7 +729,7 @@ def test_container_timeout_cannot_be_suppressed_by_a_settled_handler(tmp_path, m
 
 
 def test_oversized_base64_refusal_is_limited_to_containers(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     ordinary = tmp_path / "image.b64"
     ordinary.write_bytes(base64.b64encode(b"A" * 3_200_000))
@@ -765,7 +765,7 @@ def test_oversized_base64_refusal_is_limited_to_containers(tmp_path):
 
 
 def test_gzip_metadata_uses_name_and_raw_container_scanning(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     nested = tmp_path / "nested-extra.gz"
     nested.write_bytes(_gzip_with_extra(zlib.compress(_KEY)))
@@ -782,7 +782,7 @@ def test_gzip_metadata_uses_name_and_raw_container_scanning(tmp_path):
 
 @pytest.mark.parametrize("location", ["comment", "extra"])
 def test_zip_metadata_uses_the_full_bounded_scanner(tmp_path, location):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     packed = zlib.compress(_KEY)
     archive = tmp_path / f"metadata-{location}.zip"
@@ -797,8 +797,8 @@ def test_zip_metadata_uses_the_full_bounded_scanner(tmp_path, location):
 
 
 def test_openpgp_exact_nonfinal_packet_boundary_is_undecided(tmp_path):
-    from flash.env_buffers import _SCAN_CHUNK_BYTES
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.buffers import _SCAN_CHUNK_BYTES
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     body_size = _SCAN_CHUNK_BYTES - 5
     public = b"\x9a" + body_size.to_bytes(4, "big") + b"\x04\0\0\0\0\x01" + bytes(body_size - 6)
@@ -816,8 +816,8 @@ def test_openpgp_exact_nonfinal_packet_boundary_is_undecided(tmp_path):
 
 
 def test_long_openpgp_message_headers_do_not_cross_windows_cleanly(tmp_path):
-    from flash.env_buffers import _SCAN_CHUNK_BYTES
-    from flash.env_secrets import _Unscannable, credential_in_file
+    from flash.envscan.buffers import _SCAN_CHUNK_BYTES
+    from flash.envscan.secrets import _Unscannable, credential_in_file
 
     armored = tmp_path / "message.asc"
     armored.write_bytes(
@@ -840,7 +840,7 @@ def test_long_openpgp_message_headers_do_not_cross_windows_cleanly(tmp_path):
 
 
 def test_terminal_brotli_sidecars_are_rejected_by_name(tmp_path):
-    from flash.env_secrets import _Unscannable, credential_in_file, credential_in_name
+    from flash.envscan.secrets import _Unscannable, credential_in_file, credential_in_name
 
     top_level = tmp_path / "payload.br"
     top_level.write_bytes(b"opaque brotli bytes")
@@ -861,7 +861,7 @@ def test_terminal_brotli_sidecars_are_rejected_by_name(tmp_path):
 
 
 def test_concatenated_raw_deflate_records_share_bounds(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     concatenated = tmp_path / "records.deflate"
     concatenated.write_bytes(
@@ -893,7 +893,7 @@ def test_concatenated_raw_deflate_records_share_bounds(tmp_path):
 
 
 def test_exact_base64_decodes_run_openpgp_and_keystore_checks(tmp_path):
-    from flash.env_secrets import credential_in_file
+    from flash.envscan.secrets import credential_in_file
 
     secret_packet = b"\xc5\x20\x04\0\0\0\0\x01" + bytes(26)
     public_packet = b"\xc6" + secret_packet[1:]
