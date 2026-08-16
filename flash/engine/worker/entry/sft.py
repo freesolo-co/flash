@@ -151,11 +151,50 @@ def sft_under_ran(final_step: int, update_horizon: int) -> bool:
     return int(final_step) < int(update_horizon)
 
 
-def _reject_image_completion(completion) -> None:
-    from flash.content.multimodal import record_has_images
+def _reject_image_completion(
+    completion,
+    *,
+    image_bearing: bool,
+    source_messages=None,
+    template_source=None,
+    template_kwargs: dict | None = None,
+) -> None:
+    """reject image targets always, and reserved pad tokens only on image-bearing rows.
+
+    the estimator tokenizes an image-bearing prompt and completion as one stream, so a literal
+    image-pad token in any field emitted by the chat template is indistinguishable from a real image
+    block. the rendered field probe covers content and nested tool-call fields without rejecting
+    unrendered metadata. on a text-only row the same registered token is ordinary authored text and
+    retains the normal prompt mask or completion supervision.
+    """
+    from flash.content.multimodal import (
+        IMAGE_PAD_TOKEN,
+        message_content_text,
+        record_has_images,
+    )
 
     if record_has_images({}, completion):
         raise ValueError("image-bearing SFT completions are not supported")
+    if not image_bearing:
+        return
+    for message in completion or []:
+        if IMAGE_PAD_TOKEN in message_content_text(
+            message.get("content") if isinstance(message, dict) else None
+        ):
+            raise ValueError(
+                f"sft completion text contains the reserved image marker {IMAGE_PAD_TOKEN!r}; "
+                "remove it from the target"
+            )
+    if template_source is not None:
+        from flash.engine.worker.model.chatml_mask import reject_rendered_message_token
+
+        messages = list(source_messages if source_messages is not None else completion or [])
+        reject_rendered_message_token(
+            template_source,
+            messages,
+            IMAGE_PAD_TOKEN,
+            template_kwargs=template_kwargs or {},
+        )
 
 
 def run_sft():

@@ -9,6 +9,7 @@ import json
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 MAX_IMAGES_PER_EXAMPLE = 8
 MAX_IMAGE_SOURCE_BYTES = 20 * 1024 * 1024
@@ -140,18 +141,30 @@ def _validate_dimensions(width: int, height: int) -> int:
     return pixels * 3
 
 
-def _inspect_image_bytes(data: bytes) -> int:
+def inspect_image_bytes(data: bytes) -> tuple[int, int, int]:
+    """Validate one image's header and return its (decoded_rgb_bytes, width, height).
+
+    Reads the header only: the pixels are not decoded here.
+    """
     try:
         from PIL import Image
     except ImportError as exc:
         raise RuntimeError("Pillow is required for multimodal image training") from exc
     try:
         with Image.open(io.BytesIO(data)) as image:
-            return _validate_dimensions(image.width, image.height)
+            return (
+                _validate_dimensions(image.width, image.height),
+                image.width,
+                image.height,
+            )
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError("image source is not a valid image") from exc
+
+
+def _inspect_image_bytes(data: bytes) -> int:
+    return inspect_image_bytes(data)[0]
 
 
 def _pil_descriptor(image: object) -> str:
@@ -165,14 +178,26 @@ def _pil_descriptor(image: object) -> str:
     return _descriptor("bytes", base64.b64encode(data).decode("ascii"))
 
 
-def normalize_image_source(source: object, package_root: str | Path | None) -> str:
-    """Convert one supported image source to an Arrow-safe descriptor."""
+def normalize_image_source(
+    source: object,
+    package_root: str | Path | None,
+    *,
+    defer_validation: bool = False,
+) -> str:
+    """Convert one supported image source to an Arrow-safe descriptor.
+
+    ``defer_validation`` skips the per-source pixel inspection for EVERY source kind, for a caller
+    that validates the resulting descriptors itself. Profiling does exactly that, through one cached
+    pass that bounds total decode work; inspecting here as well would decode each image twice and
+    charge only some kinds to that budget. Every other caller validates eagerly.
+    """
     root = Path(package_root) if package_root is not None else None
     if isinstance(source, bytearray):
         source = bytes(source)
     if isinstance(source, bytes):
         _check_source_size(len(source))
-        _inspect_image_bytes(source)
+        if not defer_validation:
+            _inspect_image_bytes(source)
         return _descriptor("bytes", base64.b64encode(source).decode("ascii"))
     if _is_pil_image(source):
         return _pil_descriptor(source)
@@ -183,7 +208,8 @@ def normalize_image_source(source: object, package_root: str | Path | None) -> s
     scheme = parsed.scheme.lower()
     if scheme == "data":
         data = _data_uri_bytes(value)
-        _inspect_image_bytes(data)
+        if not defer_validation:
+            _inspect_image_bytes(data)
         return _descriptor("data_uri", value)
     if scheme in {"http", "https"}:
         # flash never fetches a user-supplied URL server-side. download the image ahead of time
@@ -198,8 +224,10 @@ def normalize_image_source(source: object, package_root: str | Path | None) -> s
     if scheme:
         raise ValueError(f"unsupported image URL scheme: {scheme}")
     path = _package_image_path(value, root)
-    _inspect_image_bytes(path.read_bytes())
-    return _descriptor("path", path.relative_to(root.resolve()).as_posix())
+    descriptor = _descriptor("path", path.relative_to(root.resolve()).as_posix())
+    if not defer_validation:
+        _inspect_image_bytes(path.read_bytes())
+    return descriptor
 
 
 def _image_source_from_block(block: dict) -> object | None:
@@ -284,7 +312,11 @@ def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
     return stripped
 
 
-def _reject_literal_image_placeholder(text: str, message_index: int) -> None:
+def _reject_literal_image_placeholder(
+    text: str,
+    message_index: int,
+    markers: tuple[str, ...] = (IMAGE_TEACHER_PLACEHOLDER, IMAGE_PAD_TOKEN),
+) -> None:
     """Reject prompt text that already contains a reserved image marker.
 
     two distinct markers, one reason. the rendered prompt marks image positions with
@@ -298,8 +330,12 @@ def _reject_literal_image_placeholder(text: str, message_index: int) -> None:
     contributes a run the renderer never produced -- and a run from text can make up for an image
     the provider silently dropped, which is exactly the failure the guard exists to catch. keeping
     it out of the source text is what makes "one run per image" mean what it says.
+
+    ``markers`` narrows the set for callers where only one of the two is live. local sft training
+    never renders the teacher placeholder, so a literal ``<|media_pad|>`` there is ordinary text
+    for a qwen tokenizer and rejecting it would be a false refusal.
     """
-    for marker in (IMAGE_TEACHER_PLACEHOLDER, IMAGE_PAD_TOKEN):
+    for marker in markers:
         if marker in text:
             raise ValueError(
                 f"message {message_index} text contains the reserved image marker "
@@ -364,8 +400,14 @@ def normalize_prompt_images(
     record: dict,
     messages: list[dict],
     package_root: str | Path | None,
+    *,
+    defer_validation: bool = False,
 ) -> NormalizedImages:
-    """Normalize prompt image blocks and top-level fields without mutating the record."""
+    """Normalize prompt image blocks and top-level fields without mutating the record.
+
+    ``defer_validation`` is forwarded to :func:`normalize_image_source`; see it for when a caller
+    may skip the per-source pixel inspection.
+    """
     if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
         raise ValueError("prompt messages must be a list of message objects")
     pending = list(_top_level_sources(record))
@@ -381,14 +423,18 @@ def normalize_prompt_images(
                 f"example contains {image_count} images, exceeding the "
                 f"{MAX_IMAGES_PER_EXAMPLE}-image limit"
             )
-        descriptor = normalize_image_source(source, package_root)
+        descriptor = normalize_image_source(
+            source,
+            package_root,
+            defer_validation=defer_validation,
+        )
         descriptor_bytes += _descriptor_size(descriptor)
         if descriptor_bytes > MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES:
             raise ValueError(
                 f"example encoded image descriptors total {descriptor_bytes} bytes, exceeding the "
                 f"{MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES}-byte limit"
             )
-        source_bytes += descriptor_source_size(descriptor, package_root)
+        source_bytes += _descriptor_source_size(descriptor, package_root)
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
                 f"example image sources total {source_bytes} bytes, exceeding the "
@@ -465,10 +511,27 @@ def normalize_prompt_images(
             add_descriptor(source)
             image_blocks.append({"type": "image"})
         normalized[first_user]["content"] = [*content, *image_blocks]
+    # checked here, on the finished blocks, rather than inside the loop above: string content never
+    # enters that loop, and the top-level-image path appends to a message the loop already passed.
+    # this is the one point every shape has converged to the same form.
+    #
+    # the unit is a RUN of consecutive text blocks, not one block, for the reason the teacher
+    # renderer already documents: "<|image_" and "pad|>" are each harmless alone and only become
+    # the reserved marker once the template concatenates them. an image block ends a run, since the
+    # processor puts its own expansion there and user text cannot reach across it.
+    for message_index, message in enumerate(normalized):
+        text_run: list[str] = []
+        for block in message["content"]:
+            if block.get("type") == "text":
+                text_run.append(block["text"])
+                continue
+            _reject_literal_image_placeholder("".join(text_run), message_index, (IMAGE_PAD_TOKEN,))
+            text_run = []
+        _reject_literal_image_placeholder("".join(text_run), message_index, (IMAGE_PAD_TOKEN,))
     return NormalizedImages(normalized, descriptors)
 
 
-def descriptor_source_size(descriptor: str, package_root: str | Path | None) -> int:
+def _descriptor_source_size(descriptor: str, package_root: str | Path | None) -> int:
     kind, value = _parse_descriptor(descriptor)
     if kind == "bytes":
         return len(base64.b64decode(value, validate=True))
@@ -481,7 +544,8 @@ def descriptor_source_size(descriptor: str, package_root: str | Path | None) -> 
     raise ValueError("invalid internal image descriptor kind")
 
 
-def _read_descriptor_source(descriptor: str, package_root: str | Path | None) -> bytes:
+def read_descriptor_source(descriptor: str, package_root: str | Path | None) -> bytes:
+    """Read one descriptor's raw source bytes under the per-source size limit."""
     kind, value = _parse_descriptor(descriptor)
     if kind == "bytes":
         try:
@@ -532,7 +596,7 @@ def image_descriptors_to_data_uris(
     source_bytes = 0
     decoded_bytes = 0
     for descriptor in descriptors:
-        data = _read_descriptor_source(descriptor, package_root)
+        data = read_descriptor_source(descriptor, package_root)
         source_bytes += len(data)
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
@@ -553,20 +617,65 @@ def _decode_image_bytes(data: bytes):
         from PIL import Image
     except ImportError as exc:
         raise RuntimeError("Pillow is required for multimodal image training") from exc
+    converted = None
     try:
         with Image.open(io.BytesIO(data)) as image:
             _validate_dimensions(image.width, image.height)
             image.load()
-            return image.convert("RGB")
+            converted = image.convert("RGB")
+            converted.load()
+            return converted
     except ValueError:
+        if converted is not None:
+            converted.close()
         raise
     except Exception as exc:
+        if converted is not None:
+            converted.close()
         raise ValueError("image source is not a valid image") from exc
+
+
+def messages_with_decoded_images(messages: list[dict], images: list[object]) -> list[dict]:
+    """Bind decoded images into a message list's image blocks, in order.
+
+    Shared by sft, opd, and grpo: each algorithm decodes the row's descriptors itself and then
+    needs the same binding into the chat-template input.
+    """
+    image_iter = iter(images)
+    prepared = []
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                copied_block = dict(block)
+                if copied_block.get("type") == "image":
+                    copied_block["image"] = next(image_iter)
+                blocks.append(copied_block)
+            copied["content"] = blocks
+        prepared.append(copied)
+    try:
+        next(image_iter)
+    except StopIteration:
+        return prepared
+    raise ValueError("unused decoded image while preparing multimodal sft tokens")
+
+
+def decode_descriptor_pixels(data: bytes) -> None:
+    """Fully decode one image's pixels for validation, then release it.
+
+    Header inspection accepts an image whose pixel data is truncated or corrupt; only a full decode
+    finds that, and the caller wants the failure, not the image.
+    """
+    image = _decode_image_bytes(data)
+    image.close()
 
 
 def decode_image_descriptors(
     descriptors: list[str], package_root: str | Path | None
 ) -> list[object]:
+    """decode one row to fully loaded rgb images under aggregate limits."""
     if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
         raise ValueError(
             f"example contains {len(descriptors)} images, exceeding the {MAX_IMAGES_PER_EXAMPLE}-image limit"
@@ -575,7 +684,7 @@ def decode_image_descriptors(
     source_bytes = 0
     decoded_bytes = 0
     for descriptor in descriptors:
-        data = _read_descriptor_source(descriptor, package_root)
+        data = read_descriptor_source(descriptor, package_root)
         source_bytes += len(data)
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
@@ -587,7 +696,14 @@ def decode_image_descriptors(
                 f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
             )
         prepared.append(data)
-    return [_decode_image_bytes(data) for data in prepared]
+    images: list[Any] = []
+    try:
+        images.extend(_decode_image_bytes(data) for data in prepared)
+    except Exception:
+        for image in images:
+            image.close()
+        raise
+    return images
 
 
 def resolve_image_pad_token_id(processor, tok) -> int:
