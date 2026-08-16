@@ -382,27 +382,21 @@ def test_heartbeat_console_marks_commit_state_and_bounds_payload():
     assert "throttled" not in committed
 
 
-def test_waiting_heartbeat_rechecks_after_success_and_skips_duplicate(monkeypatch):
+def test_concurrent_heartbeat_commits_once_and_skips_the_duplicate(monkeypatch):
+    """Two throttled heartbeats racing one HF commit produce exactly one upload.
+
+    Previously the second thread proved this by BLOCKING on the upload lock and re-checking
+    eligibility after the first commit landed. That wait is the contention this no longer pays: the
+    in-flight marker makes the second heartbeat skip immediately. The outcome contract is unchanged
+    and is what this asserts -- one upload attempt, one committed result, one skipped result, and
+    the committed step recorded from the commit that actually ran.
+    """
     import flash.engine.worker as worker
 
-    hbmod = sys.modules[worker.heartbeat.__module__]
     first_started = threading.Event()
     release_first = threading.Event()
-    waiting = threading.Event()
     attempts: list[int] = []
     results: list[bool] = []
-
-    class ObservedLock:
-        def __init__(self):
-            self.lock = threading.Lock()
-
-        def acquire(self, *args, **kwargs):
-            if self.lock.locked():
-                waiting.set()
-            return self.lock.acquire(*args, **kwargs)
-
-        def release(self):
-            self.lock.release()
 
     def upload(*_args, **_kwargs):
         attempts.append(1)
@@ -410,7 +404,6 @@ def test_waiting_heartbeat_rechecks_after_success_and_skips_duplicate(monkeypatc
         assert release_first.wait(5.0)
         return True
 
-    monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK", ObservedLock())
     monkeypatch.setattr(worker, "hf_upload_file", upload)
     monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 0.0)
@@ -427,7 +420,9 @@ def test_waiting_heartbeat_rechecks_after_success_and_skips_duplicate(monkeypatc
     threads[0].start()
     assert first_started.wait(5.0)
     threads[1].start()
-    assert waiting.wait(5.0)
+    # the second thread must not need the first to finish: it skips instead of queueing.
+    threads[1].join(timeout=5.0)
+    assert not threads[1].is_alive(), "the second heartbeat blocked behind the in-flight upload"
     release_first.set()
     for thread in threads:
         thread.join(timeout=5.0)
@@ -1434,3 +1429,119 @@ def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
     assert all("\n" not in name for name in bounded)
     assert "reward" not in bounded
     assert "step" not in bounded
+
+
+def test_throttled_heartbeat_does_not_block_behind_an_in_flight_upload(monkeypatch):
+    """A slow HF commit must not stall every other throttled heartbeat on the upload lock.
+
+    The throttle clock only advances AFTER a commit lands, so while one is in flight every other
+    throttled caller still computes ``upload_due`` and blocks in ``_HB_UPLOAD_LOCK.acquire()`` for
+    up to the acquire timeout (30s, or 120s on a critical stage). That window stalls the liveness
+    daemon, and ``liveness_heartbeat``'s join delays leaving the wrapped stage by the same amount.
+    """
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    import flash.engine.worker as ne
+
+    monkeypatch.setattr(hb, "_HB_UPLOAD_LOCK_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(ne, "_HB_TERMINAL_ONLY", False)
+    monkeypatch.setattr(ne, "_HB_LAST_UPLOAD", 0.0)  # never uploaded -> due
+
+    upload_started = threading.Event()
+    release_upload = threading.Event()
+
+    def slow_upload(*args, **kwargs):
+        upload_started.set()
+        release_upload.wait(10)
+        return True
+
+    monkeypatch.setattr(ne, "hf_upload_file", slow_upload)
+
+    committer = threading.Thread(target=lambda: ne.heartbeat("rl_step", step=1), daemon=True)
+    committer.start()
+    try:
+        assert upload_started.wait(5), "the first heartbeat never reached its upload"
+
+        t0 = time.time()
+        assert ne.heartbeat("rl_step", liveness=True) is False
+        blocked = time.time() - t0
+        assert blocked < 1.0, (
+            f"a throttled heartbeat waited {blocked:.2f}s behind an in-flight upload; it must skip "
+            "rather than queue on the upload lock"
+        )
+    finally:
+        release_upload.set()
+        committer.join(10)
+
+    # the marker is transient: once the commit lands, later heartbeats are eligible again.
+    assert hb._HB_UPLOAD_IN_FLIGHT is False
+
+
+def test_terminal_heartbeat_still_queues_behind_an_in_flight_upload(monkeypatch):
+    """Skipping is only for throttled pings. A terminal/error snapshot has no later heartbeat to
+    repair it, so it must still wait for the lock and commit."""
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    import flash.engine.worker as ne
+
+    monkeypatch.setattr(ne, "_HB_TERMINAL_ONLY", False)
+    with hb._HB_LOCK:
+        hb._set_upload_in_flight(True)
+    try:
+        with hb._HB_LOCK:
+            assert (
+                hb._heartbeat_upload_due(
+                    "done",
+                    liveness=False,
+                    force=False,
+                    initial=False,
+                    first_timing=False,
+                    fields={},
+                    now=time.time(),
+                )
+                is True
+            ), "a terminal stage must not be skipped by the in-flight marker"
+            assert (
+                hb._heartbeat_upload_due(
+                    "rl_step",
+                    liveness=False,
+                    force=False,
+                    initial=True,
+                    first_timing=False,
+                    fields={},
+                    now=time.time(),
+                )
+                is True
+            ), "the initial heartbeat must not be skipped by the in-flight marker"
+    finally:
+        with hb._HB_LOCK:
+            hb._set_upload_in_flight(False)
+
+
+def test_failed_upload_clears_the_in_flight_marker(monkeypatch):
+    """A raising upload must not strand the marker, which would skip every later heartbeat."""
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    import flash.engine.worker as ne
+
+    monkeypatch.setattr(ne, "_HB_TERMINAL_ONLY", False)
+    monkeypatch.setattr(ne, "_HB_LAST_UPLOAD", 0.0)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("hf unreachable")
+
+    monkeypatch.setattr(ne, "hf_upload_file", boom)
+    with pytest.raises(RuntimeError, match="hf unreachable"):
+        ne.heartbeat("rl_step", step=1)
+
+    assert hb._HB_UPLOAD_IN_FLIGHT is False
+    with hb._HB_LOCK:
+        assert (
+            hb._heartbeat_upload_due(
+                "rl_step",
+                liveness=False,
+                force=False,
+                initial=False,
+                first_timing=False,
+                fields={},
+                now=time.time(),
+            )
+            is True
+        ), "a failed upload must leave later heartbeats eligible"
