@@ -29,6 +29,17 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- A GRPO or OPD run whose rollout actor exited hard no longer wedges on a paid GPU until the
+  wall-time limit. The actor's `os._exit` bypassed verl's own prompt handler, so the prompt
+  stayed `running` forever and verl's unbounded replay poll waited on it at ~0% utilization. The
+  child now writes durable failure evidence, marks the prompt failed, cleans up, and only then
+  exits, and replay sampling fails the step on an explicit failure tag or a positively dead
+  actor instead of returning a survivor-only batch that would silently train on fewer rollouts
+  than were collected. A child that reaches the fit loop and then stops producing distinct
+  output, while the parent has no teacher or environment work in flight, is torn down with a
+  named cause rather than running silently to the limit; repeated identical lines count as
+  silence, and authoritative OOM, host-RAM, and infrastructure evidence still classifies the
+  exit first.
 - `flash models deploy` now warns before it moves the shared `<run-id>` model id onto a
   different checkpoint. Every checkpoint of a run is served under that one id, so deploying
   `<run-id>/step-50` while `step-100` was live silently changed what `<run-id>` served for
