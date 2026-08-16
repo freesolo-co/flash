@@ -58,6 +58,9 @@ class FakeMultimodalTokenizer(FakeTokenizer):
     def convert_tokens_to_ids(self, token):
         return self.IMAGE_PAD_ID if token == "<|image_pad|>" else 5
 
+    def convert_ids_to_tokens(self, token_id):
+        return "<|image_pad|>" if token_id == self.IMAGE_PAD_ID else "<unknown>"
+
     def apply_chat_template(
         self,
         messages,

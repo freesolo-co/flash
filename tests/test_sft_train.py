@@ -772,6 +772,7 @@ class _PreparedSourceProcessor:
         self.tokenizer = tokenizer
         self.prepared_image = prepared_image
         self.prepared_renders = 0
+        self.probe_renders = 0
         self.chat_template = (
             "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
             "{{ message['content'] }}{{ message['tool_calls'][0]['function']['name'] }}"
@@ -799,6 +800,8 @@ class _PreparedSourceProcessor:
         )
         if prepared:
             self.prepared_renders += 1
+            if "flashchatmlfieldprobe" in repr(messages):
+                self.probe_renders += 1
         rendered = []
         for message in messages:
             body = message_content_text(message.get("content"))
@@ -1310,6 +1313,87 @@ def test_multimodal_probe_uses_exact_prepared_source_messages(monkeypatch):
         )
 
     assert processor.prepared_renders >= 3
+
+
+def test_image_pad_probe_uses_exact_prepared_source_messages(monkeypatch):
+    from flash.content.multimodal import IMAGE_PAD_TOKEN
+    from flash.engine.profiling import sft_image_rows
+    from flash.engine.worker.model.chatml_mask import reject_rendered_message_token
+
+    tokenizer = _ExactChatMlTokenizer()
+    prepared_image = SimpleNamespace(close=lambda: None)
+    processor = _PreparedSourceProcessor(tokenizer, prepared_image)
+    monkeypatch.setattr(
+        sft_image_rows, "decode_image_descriptors", lambda descriptors, root: [prepared_image]
+    )
+    prompt = [{"role": "user", "content": [{"type": "image"}]}]
+    completion = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "<|image_", "arguments": "pad|>payload"},
+                }
+            ],
+        }
+    ]
+
+    # the processor deliberately omits tool fields until image blocks contain prepared objects.
+    reject_rendered_message_token(
+        processor,
+        [*prompt, *completion],
+        IMAGE_PAD_TOKEN,
+        template_kwargs={"enable_thinking": False},
+    )
+    with pytest.raises(ValueError, match="reserved image marker"):
+        sft_image_rows.process_sft_image_row(
+            processor,
+            prompt,
+            completion,
+            ["descriptor"],
+            package_root=None,
+            max_length=4096,
+            thinking=False,
+        )
+
+    assert processor.prepared_renders == 1
+
+
+def test_clean_multimodal_row_reuses_the_validated_prepared_probe(monkeypatch):
+    from flash.engine.profiling import sft_image_rows
+
+    tokenizer = _ExactChatMlTokenizer()
+    prepared_image = SimpleNamespace(close=lambda: None)
+    processor = _PreparedSourceProcessor(tokenizer, prepared_image)
+    monkeypatch.setattr(
+        sft_image_rows, "decode_image_descriptors", lambda descriptors, root: [prepared_image]
+    )
+
+    sft_image_rows.process_sft_image_row(
+        processor,
+        [{"role": "user", "content": [{"type": "image"}]}],
+        [
+            {
+                "role": "assistant",
+                "content": "answer",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"city":"london"}'},
+                    }
+                ],
+            }
+        ],
+        ["descriptor"],
+        package_root=None,
+        max_length=4096,
+        thinking=False,
+    )
+
+    assert processor.prepared_renders == 3
+    assert processor.probe_renders == 1
 
 
 def test_exact_mask_keeps_prompt_assistant_history_masked_and_full_target_active():

@@ -645,6 +645,120 @@ def test_normalization_keeps_the_teacher_placeholder_out_of_the_local_sft_check(
     assert normalized.messages[0]["content"][0]["text"].endswith("here")
 
 
+class _ToolCallChatTemplate:
+    chat_template = (
+        "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+        "{{ message['content'] }}{{ message['tool_calls'][0]['function']['name'] }}"
+        "{{ message['tool_calls'][0]['function']['arguments'] }}<|im_end|>\n{% endfor %}"
+    )
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **_kwargs):
+        assert not tokenize
+        rendered = []
+        for message in messages:
+            body = str(message.get("content") or "")
+            for call in message.get("tool_calls", []):
+                function = call.get("function", {})
+                body += str(function.get("name", ""))
+                body += str(function.get("arguments", ""))
+            rendered.append(f"<|im_start|>{message.get('role')}\n{body}<|im_end|>\n")
+        if add_generation_prompt:
+            rendered.append("<|im_start|>assistant\n")
+        return "".join(rendered)
+
+
+@pytest.mark.parametrize(
+    ("location", "field", "value"),
+    [
+        pytest.param("prompt", "name", mm.IMAGE_PAD_TOKEN, id="prompt-function-name"),
+        pytest.param(
+            "prompt",
+            "arguments",
+            json.dumps({mm.IMAGE_PAD_TOKEN: "value"}),
+            id="prompt-argument-name",
+        ),
+        pytest.param("completion", "name", mm.IMAGE_PAD_TOKEN, id="completion-function-name"),
+        pytest.param(
+            "completion",
+            "arguments",
+            json.dumps({"outer": {"inner": mm.IMAGE_PAD_TOKEN}}),
+            id="completion-nested-argument-value",
+        ),
+    ],
+)
+def test_sft_rejects_image_pad_from_rendered_tool_call_fields(location, field, value):
+    from flash.engine.worker.entry.sft import _reject_image_completion
+
+    function = {"name": "lookup", "arguments": json.dumps({"city": "london"})}
+    function[field] = value
+    tool_message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"type": "function", "function": function}],
+    }
+    prompt = [tool_message] if location == "prompt" else [{"role": "user", "content": "go"}]
+    completion = (
+        [tool_message] if location == "completion" else [{"role": "assistant", "content": "ok"}]
+    )
+
+    with pytest.raises(ValueError, match="reserved image marker"):
+        _reject_image_completion(
+            completion,
+            source_messages=[*prompt, *completion],
+            template_source=_ToolCallChatTemplate(),
+        )
+
+
+def test_sft_rejects_image_pad_split_across_adjacent_rendered_tool_fields():
+    from flash.engine.worker.entry.sft import _reject_image_completion
+
+    completion = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "<|image_", "arguments": "pad|>"},
+                }
+            ],
+        }
+    ]
+    with pytest.raises(ValueError, match="reserved image marker"):
+        _reject_image_completion(
+            completion,
+            source_messages=completion,
+            template_source=_ToolCallChatTemplate(),
+        )
+
+
+def test_sft_rendered_tool_call_guard_allows_ordinary_fields_and_media_pad():
+    from flash.engine.worker.entry.sft import _reject_image_completion
+
+    completion = [
+        {
+            "role": "assistant",
+            "content": f"literal {mm.IMAGE_TEACHER_PLACEHOLDER}",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": json.dumps(
+                            {"marker": mm.IMAGE_TEACHER_PLACEHOLDER, "city": "london"}
+                        ),
+                    },
+                }
+            ],
+        }
+    ]
+    _reject_image_completion(
+        completion,
+        source_messages=[{"role": "user", "content": "go"}, *completion],
+        template_source=_ToolCallChatTemplate(),
+    )
+
+
 def test_sft_completion_text_carrying_the_pad_token_is_rejected():
     """A target is rejected for the pad token for the same reason a prompt is.
 

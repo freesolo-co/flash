@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
 
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
@@ -61,25 +61,24 @@ class PreparedSftWorkload:
     truncated_reasoning_spans: int
 
 
+_ImageRowResult = tuple[list[int], list[int], bytes, int, bool]
+
+
+@dataclass(frozen=True)
+class _SftImagePipeline:
+    """the bound normalization and tokenization path for every image row in one run."""
+
+    normalize: Callable[..., Any]
+    tokenize: Callable[..., _ImageRowResult]
+
+
 @dataclass(frozen=True)
 class _SftTokenization:
-    """the tokenizer plus the one bound way this run turns an image row into tokens.
-
-    the processor and the torch-free estimator are alternatives, never both: binding the choice
-    once here keeps every later caller from re-deriving it, and makes the invalid combination
-    (neither available, or both) unrepresentable rather than merely unreached.
-    """
+    """the tokenizer and optional structurally complete image pipeline for one run."""
 
     tokenizer: Any
-    # the real processor when one was loaded, else None. exposed only because
-    # PreparedSftWorkload publishes it; the image path goes through image_row.
     processor: Any | None
-    # None for a text-only run; no image row can reach the caller in that case.
-    image_row: Callable[..., tuple[list[int], list[int], bytes, int]] | None
-    # the normalizer bound to the deferral this run's image_row requires: the estimator validates
-    # descriptors itself through one cached pass, the processor validates eagerly. bound together
-    # with image_row rather than carried as a separate flag, which could disagree with it.
-    normalize_images: Callable | None
+    image: _SftImagePipeline | None
 
 
 def _resolve_sft_tokenization(
@@ -95,10 +94,10 @@ def _resolve_sft_tokenization(
     from flash.content.multimodal import normalize_prompt_images, validate_multimodal_training
     from flash.engine.profiling.image_tokens import ImageProfileValidationState, load_image_geometry
 
-    processor = None
-    image_row = None
-    normalize_images = None
-    if multimodal:
+    if not multimodal:
+        tokenizer = tokenizer_loader(spec.model, spec.model_revision)
+        resolved = _SftTokenization(tokenizer, None, None)
+    else:
         validate_multimodal_training(
             spec.model,
             "sft",
@@ -110,32 +109,36 @@ def _resolve_sft_tokenization(
                 spec.model_revision,
             )
             tokenizer = processor.tokenizer
-            image_row = partial(
-                process_sft_image_row,
-                processor,
-                max_length=max_length,
-                thinking=bool(spec.thinking),
+            image = _SftImagePipeline(
+                normalize=normalize_prompt_images,
+                tokenize=partial(
+                    process_sft_image_row,
+                    processor,
+                    max_length=max_length,
+                    thinking=bool(spec.thinking),
+                ),
             )
-            normalize_images = normalize_prompt_images
+            resolved = _SftTokenization(tokenizer, processor, image)
         else:
             geometry = load_image_geometry(spec.model, spec.model_revision)
             tokenizer = tokenizer_loader(spec.model, spec.model_revision)
-            image_row = partial(
-                estimate_sft_image_row,
-                tokenizer,
-                geometry=geometry,
-                validation_state=ImageProfileValidationState(),
-                max_length=max_length,
-                thinking=bool(spec.thinking),
+            image = _SftImagePipeline(
+                # the estimator validates each descriptor through one cached, budgeted pass, so
+                # normalization defers the eager decode instead of decoding every image twice.
+                normalize=partial(normalize_prompt_images, defer_validation=True),
+                tokenize=partial(
+                    estimate_sft_image_row,
+                    tokenizer,
+                    geometry=geometry,
+                    validation_state=ImageProfileValidationState(),
+                    max_length=max_length,
+                    thinking=bool(spec.thinking),
+                ),
             )
-            # the estimator validates every descriptor itself through one cached, budgeted pass,
-            # so inspecting here too would decode each image twice.
-            normalize_images = partial(normalize_prompt_images, defer_validation=True)
-    else:
-        tokenizer = tokenizer_loader(spec.model, spec.model_revision)
+            resolved = _SftTokenization(tokenizer, None, image)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    return _SftTokenization(tokenizer, processor, image_row, normalize_images)
+    return resolved
 
 
 def _materialize_verl_images(
@@ -150,7 +153,7 @@ def _materialize_verl_images(
     from flash.content.multimodal import decode_image_descriptors
 
     os.makedirs(image_dir, exist_ok=True)
-    images = decode_image_descriptors(descriptors, package_root)
+    images = cast("list[Any]", decode_image_descriptors(descriptors, package_root))
     rows: list[str] = []
     try:
         for image_index, image in enumerate(images):
@@ -434,10 +437,9 @@ def _tokenize_prompt_rows(
     *,
     package_root,
     tokenizer,
-    image_row: Callable[..., tuple[list[int], list[int], bytes, int]] | None,
+    image: _SftImagePipeline | None,
     max_length: int,
     image_dir: str | None,
-    normalize_prompt_images: Callable,
     record_has_images: Callable,
     text_only_prompt_messages: Callable,
 ) -> _TokenizedSftRows:
@@ -471,7 +473,16 @@ def _tokenize_prompt_rows(
         completion_messages,
         coerced_scalar_output,
     ) in enumerate(prompt_rows):
-        _reject_image_completion(completion_messages)
+        has_images = record_has_images(example, prompt_messages)
+        if has_images:
+            _reject_image_completion(completion_messages)
+        else:
+            _reject_image_completion(
+                completion_messages,
+                source_messages=[*prompt_messages, *completion_messages],
+                template_source=tokenizer,
+                template_kwargs={"enable_thinking": spec.thinking},
+            )
         # read before the image branch rewrites `completion_messages` to its text-only form.
         multiturn = len(completion_messages) > 1
         if multiturn:
@@ -482,18 +493,18 @@ def _tokenize_prompt_rows(
             and completion_messages[0].get("role") == "assistant"
         ):
             coerced_singleturn_targets += 1
-        if record_has_images(example, prompt_messages):
-            normalized = normalize_prompt_images(example, prompt_messages, package_root)
+        if has_images:
+            if image is None:
+                raise RuntimeError("multimodal sft row has no image pipeline")
+            normalized = image.normalize(example, prompt_messages, package_root)
             completion_messages = text_only_prompt_messages(completion_messages)
-            if image_row is None:
-                raise RuntimeError("multimodal sft row has no image tokenizer")
             (
                 input_ids,
                 loss_mask,
                 multimodal_inputs,
                 untruncated_length,
                 assistant_mask_applied,
-            ) = image_row(
+            ) = image.tokenize(
                 normalized.messages,
                 completion_messages,
                 normalized.descriptors,
@@ -764,9 +775,16 @@ def _build_sft_profile(
     )
 
 
+class _HorizonReasoningFields(TypedDict):
+    authored_reasoning_turns: int
+    rendered_reasoning_spans: int
+    truncated_reasoning_spans: int
+    reasoning_rows: int
+
+
 def _horizon_reasoning_fields(
     retained: _RetainedSftRows, horizon: _SftStepHorizon
-) -> dict[str, int]:
+) -> _HorizonReasoningFields:
     """The three reasoning counts, plus the row count they were totalled over.
 
     ``retained.row_reasoning`` is index-aligned with the retained rows, so the horizon's row count
@@ -887,10 +905,9 @@ def prepare_sft_workload(
         prompt_rows,
         package_root=package_root,
         tokenizer=tokenizer,
-        image_row=tokenization.image_row,
+        image=tokenization.image,
         max_length=max_length,
         image_dir=image_dir,
-        normalize_prompt_images=tokenization.normalize_images,
         record_has_images=record_has_images,
         text_only_prompt_messages=text_only_prompt_messages,
     )

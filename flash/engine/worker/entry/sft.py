@@ -151,14 +151,18 @@ def sft_under_ran(final_step: int, update_horizon: int) -> bool:
     return int(final_step) < int(update_horizon)
 
 
-def _reject_image_completion(completion) -> None:
-    """Reject a target that carries an image, as a block or as the model's own pad token.
+def _reject_image_completion(
+    completion,
+    *,
+    source_messages=None,
+    template_source=None,
+    template_kwargs: dict | None = None,
+) -> None:
+    """reject image targets and literal pad tokens from every rendered source field.
 
-    the two are the same rejection because they are the same thing at the id level: the estimator
-    tokenizes prompt and completion as one stream, so a literal ``<|image_pad|>`` in assistant text
-    encodes to the id the expander treats as an image slot and is indistinguishable from a real
-    image block. only the block form is representable as content, which is why the block check
-    alone looks sufficient and is not.
+    the estimator tokenizes prompt and completion as one stream, so a literal image-pad token in any
+    field emitted by the chat template is indistinguishable from a real image block. the rendered
+    field probe covers content and nested tool-call fields without rejecting unrendered metadata.
     """
     from flash.content.multimodal import (
         IMAGE_PAD_TOKEN,
@@ -176,6 +180,16 @@ def _reject_image_completion(completion) -> None:
                 f"sft completion text contains the reserved image marker {IMAGE_PAD_TOKEN!r}; "
                 "remove it from the target"
             )
+    if template_source is not None:
+        from flash.engine.worker.model.chatml_mask import reject_rendered_message_token
+
+        messages = list(source_messages if source_messages is not None else completion or [])
+        reject_rendered_message_token(
+            template_source,
+            messages,
+            IMAGE_PAD_TOKEN,
+            template_kwargs=template_kwargs or {},
+        )
 
 
 def run_sft():
