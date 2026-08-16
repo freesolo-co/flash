@@ -5,6 +5,7 @@ Split out of ``flash.engine.worker.rl_train`` to keep that module under the file
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -22,15 +23,11 @@ from flash.engine.worker.backend_common import (
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
-    render_shim_marker_prologue,
-    render_tf32_shim,
-    render_tilelang_cudart_shim,
-    render_wandb_link_shim,
+    render_sitecustomize_bootstrap,
     shim_marker_file,
     verify_applied_shim_markers,
     verl_device_capability,
     verl_step_number,
-    wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
@@ -40,30 +37,15 @@ from flash.engine.worker.io.heartbeat import (
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.train.core.step_timing import StepTiming
+from flash.engine.worker.train.rl.child.plugin import required_patch_names
 from flash.engine.worker.train.rl.multi_turn import (
     MultiTurnBridge,
-    copy_multi_turn_child_modules,
+    copy_grpo_child_modules,
     multi_turn_child_env,
     start_reward_server,
 )
-from flash.engine.worker.train.rl.shims import (
-    render_deferred_patch_runtime,
-    render_entropy_quantile_shim,
-    render_exact_save_steps_shim,
-    render_image_pad_ban_shim,
-    render_kl_ref_adapter_shim,
-    render_per_turn_credit_shim,
-    render_rank_device_assert_shim,
-    render_reentrant_checkpointing_shim,
-    render_reward_module,
-    render_stop_sequences_shim,
-    render_structured_outputs_shim,
-)
+from flash.engine.worker.train.rl.reward_module import render_reward_module
 from flash.engine.worker.train.rl.single_turn import score_single_turn, score_single_turn_batch
-from flash.engine.worker.verl.child_io import (
-    LORA_ROLLOUT_GUARD_SHIM,
-    render_lora_rollout_guard_fragment,
-)
 
 
 def _rl_train():
@@ -201,94 +183,45 @@ def _prepare_rl_files(inp, prompts):
         "shim_py": os.path.join(shim_dir, "sitecustomize.py"),
         "shim_markers": shim_markers,
         "rank_device_claims": rank_device_claims,
+        "plugin_config_path": os.path.join(shim_dir, "flash_grpo_plugin_config.json"),
     }
 
 
-def _write_rl_shim(inp, files) -> list[str]:
-    """write the child sitecustomize; return the marker names it must prove applied.
+def _write_rl_shim(inp, files) -> None:
+    """write the minimal startup bootstrap and copy the complete GRPO plugin bundle."""
+    with open(files["shim_py"], "w", encoding="utf-8") as file:
+        file.write(render_sitecustomize_bootstrap())
+    copy_grpo_child_modules(files["shim_dir"])
 
-    every correctness-critical fragment is wrapped fail-closed (see wrap_shim_fragment): cpython's
-    execsitecustomize would otherwise swallow a fragment's exception and let the child train
-    unpatched, with every fragment after the failing one silently skipped too.
-    """
-    # one sitecustomize holds every patch: python imports it once, so a second file would never be
-    # loaded. each feature renderer returns "" when its feature is off; the tf32 fragment is
-    # unconditional, so this source is never empty.
-    required_fragments = [
-        # first, so a collapsed rank->device map is reported before any other patch runs and long
-        # before the model load that currently hides it. inert at one card.
-        ("rank-device-assert", render_rank_device_assert_shim(int(inp["dp_cards"]))),
-        (
-            "reentrant-checkpointing",
-            render_reentrant_checkpointing_shim(
-                inp["reentrant_checkpointing"], multimodal=bool(inp["multimodal"])
-            ),
-        ),
-        ("entropy-quantile", render_entropy_quantile_shim(inp["entropy_quantile"])),
-        ("per-turn-credit", render_per_turn_credit_shim(inp["per_turn_credit"])),
-        ("stop-sequences", render_stop_sequences_shim(inp["stop_sequences"])),
-        ("image-pad-ban", render_image_pad_ban_shim(inp["image_pad_token_id"])),
-        ("structured-outputs", render_structured_outputs_shim(inp["structured_outputs"])),
-        ("exact-save-steps", render_exact_save_steps_shim(inp["save_at_steps"], inp["steps"])),
-        (
-            "kl-ref-adapter",
-            render_kl_ref_adapter_shim(
-                bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0
-            ),
-        ),
-    ]
-    shim_source = "".join(
-        part
-        for part in (
-            # first: torch's matmul flags are process-wide state, and reading them back is how the
-            # rest of the child sees the choice. nothing below depends on it, but a later fragment
-            # that raised would otherwise cost the whole run its tensor-core throughput. tf32, the
-            # tilelang cudart repoint and the wandb link stay unwrapped on purpose: all three
-            # swallow their own failures by design and none may abort a paid run.
-            render_tf32_shim(),
-            # before anything that can import vllm -- so above the wrapped fragments too. the
-            # fragment repoints tilelang's libcudart stub on disk, and vllm's CuMemAllocator binds
-            # libcudart the first time a sleeping engine is built. after the stub is already mapped
-            # into this process there is nothing left to fix.
-            render_tilelang_cudart_shim(),
-            render_shim_marker_prologue(files["shim_markers"]),
-            # above every wrapped fragment: each one registers with this registry rather than
-            # importing verl at startup, which is what keeps ray free to pin each rank to its own
-            # card (see train/rl/shims.render_deferred_patch_runtime). unwrapped -- it only defines
-            # the registry and touches no cuda, so there is no patch here that could fail open.
-            render_deferred_patch_runtime(),
-            # every fragment above defers its patch to the import of the module it targets, so this
-            # wrapper now spans only the registration. a marker written here would prove a callback
-            # was queued, not that the patch ran, and the parent's verify_applied_shim_markers would
-            # pass for a child training unpatched. each deferred body records its own name once the
-            # patch is actually installed.
-            *(
-                wrap_shim_fragment(name, source, record_immediately=False)
-                for name, source in required_fragments
-            ),
-            # unconditional: every flash rollout is a lora rollout, and a base-model fallback is
-            # indistinguishable from a working run in the metrics.
-            render_lora_rollout_guard_fragment(),
-            # gated on the key rather than the resolved logger list: that list needs python_bin,
-            # which is resolved after this file is written. the shim is inert either way -- it only
-            # fires when verl actually calls wandb.init, which requires wandb in the logger list.
-            render_wandb_link_shim() if os.environ.get("WANDB_API_KEY") else "",
-        )
-        if part
-    )
-    with open(files["shim_py"], "w") as f:
-        f.write(shim_source)
 
-    # multi-turn: copy the child-side agent loop next to the shim so the verl interpreter can
-    # import it (see copy_multi_turn_child_modules for why it is a copy and not an import).
-    if inp["multi_turn"]:
-        copy_multi_turn_child_modules(files["shim_dir"])
-    return [name for name, source in required_fragments if source] + [LORA_ROLLOUT_GUARD_SHIM]
+def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) -> None:
+    """serialize the final GRPO plugin configuration after capability resolution."""
+    config = {
+        "marker_file": files["shim_markers"],
+        "dp_cards": int(inp["dp_cards"]),
+        "reentrant_checkpointing": bool(inp["reentrant_checkpointing"]),
+        "multimodal": bool(inp["multimodal"]),
+        "entropy_quantile": inp["entropy_quantile"],
+        "per_turn_credit": bool(inp["per_turn_credit"]),
+        "stop_sequences": list(inp["stop_sequences"]),
+        "image_pad_token_id": inp["image_pad_token_id"],
+        "structured_outputs": inp["structured_outputs"],
+        "save_at_steps": list(inp["save_at_steps"]),
+        "total_steps": int(inp["steps"]),
+        "kl_ref_adapter": bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0,
+        "multi_turn": bool(inp["multi_turn"]),
+        "gdn_model_type": gdn_reset_arch,
+        "wandb": "wandb" in loggers,
+    }
+    expected = required_patch_names(config)
+    with open(files["plugin_config_path"], "w", encoding="utf-8") as handle:
+        json.dump(config, handle, sort_keys=True, separators=(",", ":"))
+    files["expected_shims"] = expected
 
 
 def _prepare_rl_runtime(inp, env, tok, prompts):
     files = _prepare_rl_files(inp, prompts)
-    files["expected_shims"] = _write_rl_shim(inp, files)
+    _write_rl_shim(inp, files)
     return files, _start_reward_runtime(inp, env, tok, prompts, files)
 
 
@@ -431,29 +364,21 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
     env_for_verl = parent._build_verl_child_env(
         shim_dir=files["shim_dir"], wandb_enabled="wandb" in loggers
     )
+    env_for_verl["VERL_USE_EXTERNAL_MODULES"] = "flash_grpo_plugin"
+    env_for_verl["FLASH_GRPO_PLUGIN_CONFIG_PATH"] = files["plugin_config_path"]
     env_for_verl["FLASH_VERL_REWARD_URL"] = reward_url
     # where each rank records the gpu it opened. ray fans this env to every actor, which is what
-    # makes the file a rendezvous point: the check needs to compare ranks that have no process
-    # group yet (see render_rank_device_assert_shim).
+    # makes the file a rendezvous point: the deferred plugin check compares ranks before a process
+    # group exists.
     env_for_verl["FLASH_RANK_DEVICE_CLAIMS"] = files["rank_device_claims"]
     # the model is prefetched above; keep the subprocess off hf's rate-limited api.
     env_for_verl["HF_HUB_OFFLINE"] = "1"
     env_for_verl["TRANSFORMERS_OFFLINE"] = "1"
     env_for_verl["HF_HUB_DISABLE_XET"] = "1"
     if inp["multi_turn"]:
-        # the plugin named here and the loop it builds live in shim_dir, so PYTHONPATH must
-        # carry it -- see below.
         env_for_verl.update(
             multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
         )
-    # python imports sitecustomize automatically at startup, so the shim patches verl before
-    # main_ppo runs. prepend rather than replace: an inherited PYTHONPATH may carry the verl
-    # install itself, and ray workers inherit this env so every actor gets the same patch.
-    # multi-turn needs the same entry for its copied-in agent loop modules. unconditional: the
-    # shim always carries at least the tf32 fragment, so a skipped entry would silently drop it.
-    env_for_verl["PYTHONPATH"] = os.pathsep.join(
-        item for item in (files["shim_dir"], os.environ.get("PYTHONPATH", "")) if item
-    )
     return env_for_verl
 
 
@@ -537,7 +462,7 @@ def _execute_rl_child(
     # every wait answers ChildProcessError for a zombie nobody will collect.
     adopt_orphaned_descendants()
     proc = subprocess.Popen(
-        [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
+        [python_bin, "-m", "flash_grpo_entry", *overrides],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -27,12 +28,10 @@ from flash.engine.worker.sft_train import (
     _VERL_OPTIMIZER_NAME,
     _build_verl_child_env,
     _render_sft_dataset_module,
-    _render_sft_sitecustomize,
     _write_sft_parquet,
     build_sft_overrides,
-    render_exact_sft_dataloader_shim,
-    render_loraplus_shim,
 )
+from flash.engine.worker.train.sft.child import plugin as sft_plugin
 
 # distinct from `flash.__version__` on purpose: the worker resolves that to "0+unknown" (no flash
 # distribution is installed there), so a fixture built from it could not catch a worker that
@@ -875,14 +874,9 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    source = _render_sft_sitecustomize(
-        seed=43,
-        loraplus_ratio=16,
-        save_at_steps=(3, 7),
-        total_steps=9,
-        reentrant_gradient_checkpointing=False,
-    )
-    exec(compile(source, "sitecustomize.py", "exec"), {})
+    sft_plugin._install_seeded_dataloader(43)
+    sft_plugin._install_linear_scheduler()
+    sft_plugin._install_loraplus(16, "CUSTOM_LORAPLUS_READY")
 
     engine = FakeEngine()
     engine.optimizer_config = SimpleNamespace(
@@ -897,10 +891,30 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
         total_training_steps=20,
     )
     assert engine._build_optimizer(SimpleNamespace()) == "lora+"
-    assert _LORAPLUS_READY_MARKER in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "CUSTOM_LORAPLUS_READY ratio=16 optimizer=AdamW" in output
+    assert _LORAPLUS_READY_MARKER not in output
     assert optimizer_calls[0]["optimizer_kwargs"]["eps"] == 1e-8
     assert engine._build_lr_scheduler("optimizer") == "linear"
     assert scheduler_calls == [("optimizer", {"num_warmup_steps": 2, "num_training_steps": 20})]
+
+
+def test_sft_plugin_config_carries_the_canonical_loraplus_marker(tmp_path):
+    from flash.engine.worker import sft_train_runner
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    _, _, raw_config = sft_train_runner._write_sft_child_shims(
+        SimpleNamespace(save_at_steps=(3,)),
+        SimpleNamespace(update_horizon=7, reentrant_gradient_checkpointing=False),
+        shim_dir=str(shim_dir),
+        custom_dataset_path=str(shim_dir / "dataset.py"),
+        seed=42,
+        loggers=[],
+        gdn_reset_arch=None,
+    )
+
+    assert json.loads(raw_config)["loraplus_ready_marker"] == _LORAPLUS_READY_MARKER
 
 
 def _exec_dataloader_shim(monkeypatch):
@@ -931,8 +945,14 @@ def _exec_dataloader_shim(monkeypatch):
         "torchdata.stateful_dataloader",
         _module("torchdata.stateful_dataloader", StatefulDataLoader=FakeStatefulDataLoader),
     )
+    sft_trainer = _module("verl.trainer.sft_trainer", StatefulDataLoader=FakeStatefulDataLoader)
+    monkeypatch.setitem(sys.modules, "verl", _module("verl"))
+    monkeypatch.setitem(
+        sys.modules, "verl.trainer", _module("verl.trainer", sft_trainer=sft_trainer)
+    )
+    monkeypatch.setitem(sys.modules, "verl.trainer.sft_trainer", sft_trainer)
 
-    exec(compile(render_exact_sft_dataloader_shim(), "sitecustomize.py", "exec"), {})
+    sft_plugin._install_exact_dataloaders()
     return FakeDistributedSampler, FakeStatefulDataLoader, sampler_calls, loader_calls
 
 
@@ -983,8 +1003,16 @@ def test_dataloader_shim_patches_the_classes_verl_imports(monkeypatch):
 
     assert DistributedSampler is sampler
     assert StatefulDataLoader is loader
-    assert DistributedSampler.__init__.__name__ == "_flash_exact_sampler_init"
-    assert StatefulDataLoader.__init__.__name__ == "_flash_exact_loader_init"
+    assert DistributedSampler.__init__.__name__ == "exact_sampler_init"
+    assert StatefulDataLoader.__init__.__name__ == "exact_loader_init"
+
+    # the class __init__ patch above is the whole mechanism, so the trainer attribute must stay
+    # the original class. an extra function wrapper there would force drop_last a second time and
+    # hide the fact that verl constructs the loader through the shared class.
+    from verl.trainer import sft_trainer
+
+    assert sft_trainer.StatefulDataLoader is loader
+    assert isinstance(sft_trainer.StatefulDataLoader, type)
 
 
 def test_shipped_shim_carries_the_exact_dataloader_patch(monkeypatch):
@@ -997,18 +1025,17 @@ def test_shipped_shim_carries_the_exact_dataloader_patch(monkeypatch):
 
     import flash.engine.worker.sft_train as sft_train_module
 
-    fragment = render_exact_sft_dataloader_shim()
-    source = "".join(pathlib.Path(sft_train_module.__file__).read_text().split())
-    assert "shim_source+=render_exact_sft_dataloader_shim()" in source
-    assert "shuffle" in fragment
-    assert "drop_last" in fragment
+    plugin_source = pathlib.Path(sft_plugin.__file__).read_text()
+    runner_source = (
+        pathlib.Path(sft_train_module.__file__).with_name("sft_train_runner.py").read_text()
+    )
+    assert "_install_exact_dataloaders()" in plugin_source
+    assert "flash_sft_plugin.py" in runner_source
+    assert 'kwargs["shuffle"] = False' in plugin_source
+    assert 'kwargs["drop_last"] = False' in plugin_source
 
 
-def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointing():
-    """GRAD-001: lora freezes the embeddings, so nothing entering the first checkpointed layer
-    requires grad and reentrant checkpointing returns no gradient at all. the shim must call
-    enable_input_require_grads() BEFORE gradient_checkpointing_enable(), or every sft run
-    trains nothing while reporting done and billing."""
+def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointing(monkeypatch):
     calls = []
 
     class FakeModule:
@@ -1022,35 +1049,24 @@ def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointi
         def _build_module(self):
             return FakeModule()
 
-    source = _render_sft_sitecustomize(
-        seed=1,
-        loraplus_ratio=16,
-        save_at_steps=(),
-        total_steps=4,
-        reentrant_gradient_checkpointing=True,
-    )
-    # execute only the reentrant block: the surrounding shim imports verl/torch at module scope.
-    block = source[source.index("def _flash_build_reentrant_module") :]
-    block = block[: block.index("_FlashFSDPEngine._build_module = _flash_build_reentrant_module")]
-    namespace = {"_flash_original_build_module": FakeEngine._build_module}
-    exec(compile(block, "shim.py", "exec"), namespace)
+    transformer_impl = _module("verl.workers.engine.fsdp.transformer_impl", FSDPEngine=FakeEngine)
+    for name, module in {
+        "verl": _module("verl"),
+        "verl.workers": _module("verl.workers"),
+        "verl.workers.engine": _module("verl.workers.engine"),
+        "verl.workers.engine.fsdp": _module("verl.workers.engine.fsdp"),
+        "verl.workers.engine.fsdp.transformer_impl": transformer_impl,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
 
-    namespace["_flash_build_reentrant_module"](FakeEngine())
+    sft_plugin._install_reentrant_checkpointing()
+    FakeEngine()._build_module()
 
-    # order matters: enabling checkpointing first would capture the graph before any input
-    # requires grad, so asserting mere presence would pass on a broken shim.
     assert calls[0] == "require_grads"
-    assert calls[1] == ("gc_enable", {"gradient_checkpointing_kwargs": {"use_reentrant": True}})
-
-    # the non-reentrant path never patches _build_module at all, so it must not appear.
-    non_reentrant = _render_sft_sitecustomize(
-        seed=1,
-        loraplus_ratio=16,
-        save_at_steps=(),
-        total_steps=4,
-        reentrant_gradient_checkpointing=False,
+    assert calls[1] == (
+        "gc_enable",
+        {"gradient_checkpointing_kwargs": {"use_reentrant": True}},
     )
-    assert "enable_input_require_grads" not in non_reentrant
 
 
 class _TolerantWatcher:
@@ -1186,12 +1202,13 @@ def test_step_gate_admits_a_line_a_tqdm_bar_was_flushed_in_front_of():
     assert parse_verl_metric(glued, "train/lr") == 5e-05
 
 
-def test_loraplus_shim_has_no_plain_lora_fallback():
-    source = render_loraplus_shim(16)
-    assert _LORAPLUS_READY_MARKER in source
+def test_loraplus_installer_has_no_plain_lora_fallback():
+    source = inspect.getsource(sft_plugin._install_loraplus)
+    assert "ready_marker" in source
+    assert not hasattr(sft_plugin, "_LORAPLUS_READY_MARKER")
     assert "falling back" not in source
-    assert "_flash_original_build_optimizer" not in source
-    assert render_loraplus_shim(1) == ""
+    assert "original_build_optimizer" not in source
+    assert "if ratio <= 1" in source
 
 
 def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypatch, tmp_path):
@@ -1863,7 +1880,8 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     assert "--nproc-per-node=1" in captured["command"]
     assert "trainer.n_gpus_per_node=1" in captured["command"]
     assert "engine.ulysses_sequence_parallel_size=1" in captured["command"]
-    assert "verl.trainer.sft_trainer" in captured["command"]
+    assert "flash_sft_entry" in captured["command"]
+    assert captured["child_env"]["VERL_USE_EXTERNAL_MODULES"] == "flash_sft_plugin"
     custom_path = next(
         value.split("=", 1)[1]
         for value in captured["command"]

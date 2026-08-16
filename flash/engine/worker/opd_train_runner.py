@@ -26,10 +26,7 @@ from flash.engine.worker.train.opd.state import (
     _RuntimeState,
     _WorkloadState,
 )
-from flash.engine.worker.verl.child_io import (
-    LORA_ROLLOUT_GUARD_SHIM,
-    render_lora_rollout_guard_fragment,
-)
+from flash.engine.worker.verl.child_io import LORA_ROLLOUT_GUARD_SHIM
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
     resolve_reshard_after_forward,
@@ -435,38 +432,25 @@ def _write_child_shims(
     shim_dir = workload.shim_dir
     parent_dir = os.path.dirname(_opd_train.__file__)
     copies = (
+        ("train/core/child/runtime.py", "flash_verl_runtime.py"),
+        ("train/core/child/glue.py", "flash_multiturn_glue.py"),
+        ("train/opd/child/runtime.py", "flash_opd_runtime.py"),
         ("train/opd/child/plugin.py", "flash_opd_plugin.py"),
-        # the plugin imports this by its flat name at child-import time, so it has to land next to it.
         ("train/opd/child/bridge.py", "flash_opd_bridge.py"),
         ("train/opd/child/structured.py", "flash_opd_structured.py"),
         ("train/opd/child/multiturn.py", "flash_opd_multiturn.py"),
-        ("train/core/child/glue.py", "flash_multiturn_glue.py"),
+        ("train/opd/child/entry.py", "flash_opd_entry.py"),
     )
     for source, target in copies:
         shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
     entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
-    with open(entry_path, "w", encoding="utf-8") as file:
-        file.write("import verl\nfrom flash_opd_plugin import main\nmain()\n")
     # use a zero custom reward: verl still runs scoring when use_task_rewards=false, and its default
     # registry has no flash_opd entry (reward_loop.py:146-155).
     reward_path = os.path.join(shim_dir, "flash_opd_reward.py")
     with open(reward_path, "w", encoding="utf-8") as file:
         file.write(_opd_train._OPD_ZERO_REWARD_SOURCE)
-    opd_shim_source = _opd_train._render_opd_sitecustomize(
-        save_at_steps=request.knobs.save_at_steps,
-        total_steps=workload.update_horizon,
-    )
-    if gdn_reset_arch is not None:
-        opd_shim_source += _opd_train.render_gdn_varlen_shim(gdn_reset_arch)
-    # fail closed because base-model rollouts can look healthy while distilling the wrong policy.
-    opd_shim_source += render_lora_rollout_guard_fragment()
-    if "wandb" in loggers:
-        opd_shim_source += _opd_train.render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(
-            _opd_train.render_shim_marker_prologue(_opd_train.shim_marker_file(shim_dir))
-            + opd_shim_source
-        )
+        file.write(_opd_train.render_sitecustomize_bootstrap())
     return entry_path, reward_path
 
 
@@ -552,6 +536,7 @@ def _build_child_callbacks(
     bridge: Any,
     resume_step: int,
     shim_markers: str,
+    expected_shims: tuple[str, ...],
 ) -> _ChildCallbacks:
     progress = {
         "step": resume_step,
@@ -580,7 +565,7 @@ def _build_child_callbacks(
         # whole gpu and teacher budget. not on the first output line: fragments print while later
         # ones are still applying.
         if not shims_verified:
-            _opd_train.verify_applied_shim_markers(shim_markers, (LORA_ROLLOUT_GUARD_SHIM,))
+            _opd_train.verify_applied_shim_markers(shim_markers, expected_shims)
             shims_verified = True
         # use parse_verl_metric because numpy 2 pprint emits np.float64(...); float() would drop
         # every step and leave a trained run with an empty loss curve.
@@ -645,8 +630,20 @@ def _run_child(
     progress_state = _opd_train._OpdProgressState(runtime.resume_state)
     watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state)
     shim_markers = _opd_train.shim_marker_file(workload.shim_dir)
+    # the child installs opd-core only for a nonempty schedule, because exact-save
+    # filtering is the entire meaning of that marker.
+    expected_shims = (
+        (("opd-core",) if request.knobs.save_at_steps else ())
+        + (LORA_ROLLOUT_GUARD_SHIM,)
+        + (("gdn-varlen",) if runtime.gdn_reset_arch else ())
+    )
     callbacks = _build_child_callbacks(
-        watcher, progress_state, runtime.bridge, runtime.resume_step, shim_markers
+        watcher,
+        progress_state,
+        runtime.bridge,
+        runtime.resume_step,
+        shim_markers,
+        expected_shims,
     )
     child_env = _build_child_env(request, prompt_state, workload, runtime, eos_token_ids)
     command = [runtime.python_bin, runtime.entry_path, *overrides]
@@ -760,6 +757,13 @@ def _build_child_env(
         abandonment_failure_path=workload.abandonment_failure_path,
         resample_failure_path=workload.resample_failure_path,
         cycle_commit_failure_path=workload.cycle_commit_failure_path,
+        plugin_config=_opd_train._build_opd_plugin_config(
+            shim_dir=workload.shim_dir,
+            save_at_steps=request.knobs.save_at_steps,
+            total_steps=workload.update_horizon,
+            gdn_model_type=runtime.gdn_reset_arch,
+            loggers=runtime.loggers,
+        ),
     )
 
 
