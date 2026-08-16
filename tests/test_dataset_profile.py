@@ -531,8 +531,63 @@ def _image_package(tmp_path: Path, width: int = 640, height: int = 480) -> Path:
     return entrypoint
 
 
+_QWEN_TEST_GEOMETRY = ImageGeometry(
+    patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
+)
+
+
+@pytest.fixture
+def published_geometry(monkeypatch):
+    """Pin the published vision geometry so quotes are arithmetic, not a hub round trip."""
+    monkeypatch.setattr(
+        "flash.engine.profiling.image_tokens.load_image_geometry",
+        lambda *_args, **_kwargs: _QWEN_TEST_GEOMETRY,
+    )
+    return _QWEN_TEST_GEOMETRY
+
+
+def _image_profile(entrypoint: Path, *, max_context_tokens: int = 4096):
+    """Quote one packaged image dataset through the torch-free control-plane path."""
+    spec = replace(
+        _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
+        train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=max_context_tokens),
+    )
+    return profile_packaged_sft_dataset(
+        spec,
+        producer_version="1.2.3",
+        tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
+        packing_support=lambda _model, _revision: ("gdn-hybrid", True),
+    )
+
+
+def _image_profile_from_spec(spec):
+    """Quote an explicit spec through the same torch-free path, for failure cases."""
+    return profile_packaged_sft_dataset(
+        spec,
+        producer_version="1.2.3",
+        tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
+        packing_support=lambda _model, _revision: ("gdn-hybrid", True),
+    )
+
+
+def _spy_on_pixel_decodes(monkeypatch) -> list:
+    """Record the size of every image whose pixels are actually decoded."""
+    from flash.content import multimodal
+
+    decoded: list = []
+    real_decode = multimodal._decode_image_bytes
+
+    def count_successful_decode(data):
+        image = real_decode(data)
+        decoded.append(image.size)
+        return image
+
+    monkeypatch.setattr(multimodal, "_decode_image_bytes", count_successful_decode)
+    return decoded
+
+
 def test_control_plane_profiles_image_rows_without_loading_a_processor(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, published_geometry
 ) -> None:
     """Image sft is quotable on the torch-free plane, and never touches the VL processor.
 
@@ -540,29 +595,14 @@ def test_control_plane_profiles_image_rows_without_loading_a_processor(
     trapped so the test fails if profiling ever reaches for it again.
     """
     entrypoint = _image_package(tmp_path)
-    # the 640x480 image alone expands to 300 tokens, so the context has to hold it plus the
-    # completion or every row truncates to an empty target.
-    spec = replace(
-        _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
-        train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=1024),
-    )
     monkeypatch.setattr(
         "flash.engine.profiling.sft_workload._default_processor_loader",
         lambda *_args: (_ for _ in ()).throw(AssertionError("processor loader reached")),
     )
-    monkeypatch.setattr(
-        "flash.engine.profiling.image_tokens.load_image_geometry",
-        lambda *_args, **_kwargs: ImageGeometry(
-            patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
-        ),
-    )
 
-    profile = profile_packaged_sft_dataset(
-        spec,
-        producer_version="1.2.3",
-        tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
-        packing_support=lambda _model, _revision: ("gdn-hybrid", True),
-    )
+    # the 640x480 image alone expands to 300 tokens, so the context has to hold it plus the
+    # completion or every row truncates to an empty target.
+    profile = _image_profile(entrypoint, max_context_tokens=1024)
 
     assert profile.retained_examples == 1
     # a 640x480 image expands to 300 pad tokens, so the row cannot be near-empty text.
@@ -572,32 +612,17 @@ def test_control_plane_profiles_image_rows_without_loading_a_processor(
     assert profile.architecture_mode == "multimodal"
 
 
-def test_the_quote_grows_with_the_image_the_user_packaged(tmp_path, monkeypatch) -> None:
+def test_the_quote_grows_with_the_image_the_user_packaged(tmp_path, published_geometry) -> None:
     """The billed token total has to track image size, not just be non-zero.
 
     A profile that counted one token per image would still "work" -- it would return, and the run
     would train -- while quoting a 1024x768 screenshot at the price of a thumbnail. The whole point
     of the arithmetic is that the number moves.
     """
-    monkeypatch.setattr(
-        "flash.engine.profiling.image_tokens.load_image_geometry",
-        lambda *_args, **_kwargs: ImageGeometry(
-            patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
-        ),
-    )
 
     def tokens_for(width: int, height: int, directory: str) -> int:
         entrypoint = _image_package(tmp_path / directory, width=width, height=height)
-        spec = replace(
-            _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
-            train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=4096),
-        )
-        return profile_packaged_sft_dataset(
-            spec,
-            producer_version="1.2.3",
-            tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
-            packing_support=lambda _model, _revision: ("gdn-hybrid", True),
-        ).real_tokens_per_epoch
+        return _image_profile(entrypoint).real_tokens_per_epoch
 
     small = tokens_for(56, 56, "small")
     large = tokens_for(1024, 768, "large")
@@ -605,9 +630,9 @@ def test_the_quote_grows_with_the_image_the_user_packaged(tmp_path, monkeypatch)
     assert large - small == 768 - 64
 
 
-def test_repeated_descriptors_decode_once_but_count_every_occurrence(tmp_path, monkeypatch) -> None:
-    from flash.content import multimodal
-
+def test_repeated_descriptors_decode_once_but_count_every_occurrence(
+    tmp_path, monkeypatch, published_geometry
+) -> None:
     image_module = pytest.importorskip("PIL.Image")
     rows = [
         {"input": "same", "output": "answer", "images": ["dataset/a.png"]},
@@ -632,21 +657,7 @@ def test_repeated_descriptors_decode_once_but_count_every_occurrence(tmp_path, m
     image_module.new("RGB", (300, 200), (10, 200, 10)).save(
         entrypoint.parent / "dataset" / "b.png", format="PNG"
     )
-    monkeypatch.setattr(
-        "flash.engine.profiling.image_tokens.load_image_geometry",
-        lambda *_args, **_kwargs: ImageGeometry(
-            patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
-        ),
-    )
-    successful_decodes = []
-    real_decode = multimodal._decode_image_bytes
-
-    def count_successful_decode(data):
-        image = real_decode(data)
-        successful_decodes.append(image.size)
-        return image
-
-    monkeypatch.setattr(multimodal, "_decode_image_bytes", count_successful_decode)
+    successful_decodes = _spy_on_pixel_decodes(monkeypatch)
     image_paths = {
         (entrypoint.parent / "dataset" / "a.png").resolve(),
         (entrypoint.parent / "dataset" / "b.png").resolve(),
@@ -662,16 +673,7 @@ def test_repeated_descriptors_decode_once_but_count_every_occurrence(tmp_path, m
 
     monkeypatch.setattr(Path, "read_bytes", count_image_read)
 
-    spec = replace(
-        _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
-        train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=4096),
-    )
-    profile = profile_packaged_sft_dataset(
-        spec,
-        producer_version="1.2.3",
-        tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
-        packing_support=lambda _model, _revision: ("gdn-hybrid", True),
-    )
+    profile = _image_profile(entrypoint)
 
     assert successful_decodes == [(56, 56), (300, 200)]
     assert sorted(path.name for path in image_reads) == ["a.png", "b.png"]
@@ -681,9 +683,8 @@ def test_repeated_descriptors_decode_once_but_count_every_occurrence(tmp_path, m
 
 
 def test_profile_rejects_cumulative_unique_decoded_work_before_crossing_decode(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, published_geometry
 ) -> None:
-    from flash.content import multimodal
     from flash.engine.profiling import image_tokens
 
     image_module = pytest.importorskip("PIL.Image")
@@ -701,40 +702,16 @@ def test_profile_rejects_cumulative_unique_decoded_work_before_crossing_decode(
     image_module.new("RGB", (300, 200), (10, 200, 10)).save(
         entrypoint.parent / "dataset" / "b.png", format="PNG"
     )
-    monkeypatch.setattr(
-        image_tokens,
-        "load_image_geometry",
-        lambda *_args, **_kwargs: ImageGeometry(
-            patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
-        ),
-    )
     monkeypatch.setattr(image_tokens, "MAX_PROFILE_DECODED_WORK_BYTES", 56 * 56 * 3)
-    successful_decodes = []
-    real_decode = multimodal._decode_image_bytes
-
-    def count_successful_decode(data):
-        image = real_decode(data)
-        successful_decodes.append(image.size)
-        return image
-
-    monkeypatch.setattr(multimodal, "_decode_image_bytes", count_successful_decode)
-    spec = replace(
-        _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
-        train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=4096),
-    )
+    successful_decodes = _spy_on_pixel_decodes(monkeypatch)
 
     with pytest.raises(ValueError, match="profile decoded image work"):
-        profile_packaged_sft_dataset(
-            spec,
-            producer_version="1.2.3",
-            tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
-            packing_support=lambda _model, _revision: ("gdn-hybrid", True),
-        )
+        _image_profile(entrypoint)
 
     assert successful_decodes == [(56, 56)]
 
 
-def test_an_unreadable_image_is_a_packaging_error_not_a_crash(tmp_path, monkeypatch) -> None:
+def test_an_unreadable_image_is_a_packaging_error_not_a_crash(tmp_path, published_geometry) -> None:
     entrypoint = _package(
         tmp_path,
         {
@@ -745,20 +722,9 @@ def test_an_unreadable_image_is_a_packaging_error_not_a_crash(tmp_path, monkeypa
         },
     )
     spec = _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B")
-    monkeypatch.setattr(
-        "flash.engine.profiling.image_tokens.load_image_geometry",
-        lambda *_args, **_kwargs: ImageGeometry(
-            patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
-        ),
-    )
 
     with pytest.raises(ValueError, match="not a valid image"):
-        profile_packaged_sft_dataset(
-            spec,
-            producer_version="1.2.3",
-            tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
-            packing_support=lambda _model, _revision: ("gdn-hybrid", True),
-        )
+        _image_profile_from_spec(spec)
 
 
 def test_image_sft_is_rejected_for_a_model_that_cannot_see_images(tmp_path) -> None:
@@ -768,12 +734,7 @@ def test_image_sft_is_rejected_for_a_model_that_cannot_see_images(tmp_path) -> N
     spec = _spec(environment_id=str(entrypoint), model="test/model")
 
     with pytest.raises(ValueError, match="does not support image-bearing"):
-        profile_packaged_sft_dataset(
-            spec,
-            producer_version="1.2.3",
-            tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
-            packing_support=lambda _model, _revision: ("gdn-hybrid", True),
-        )
+        _image_profile_from_spec(spec)
 
 
 def test_profile_streams_jsonl_and_tokenizes_only_the_deterministic_max_examples_prefix(
