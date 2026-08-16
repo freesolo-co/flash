@@ -637,7 +637,6 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
         providers_for,
         rentable_gpu_counts,
     )
-    from flash.providers.fit_errors import vram_fit_error_message, vram_knob_advice
 
     provider = config.provider if config.provider != "auto" else "auto"
     if config.gpu_type:
@@ -716,52 +715,77 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
                 )
             )
     if not ranked:
-        # a pinned class is blocked by the class itself, so name it -- the pool-wide message would
-        # report the widest validated shape, which is not hardware this quote was ever allowed to
-        # use. `_wider_shape_remedy` searches only `names`, already narrowed to the pin, so the
-        # `--gpus N` clause it appends can never name a shape the pin forbids. an unpinned run
-        # falls through to the pool-wide message, which reports the count that would fit.
-        remedy = _wider_shape_remedy(config, need, names)
-        if config.gpu_type:
-            # name every acceptable class, not just the head: with fallbacks authored, reporting the
-            # head alone tells the user to fix a class that may not be the one that failed, and
-            # hides that the whole declared set was ranked and rejected.
-            declared = tuple(
-                GPU_INFO[canonical_gpu(name)].name
-                for name in (config.gpu_type, *config.gpu_type_fallbacks)
-            )
-            label = (
-                repr(declared[0])
-                if len(declared) == 1
-                else "none of " + ", ".join(repr(name) for name in declared)
-            )
-            raise ValueError(
-                f"exact GPU {label} cannot fit this run: it requires at least {need} GB"
-                + (
-                    remedy
-                    or _catalog_check_remedy(config, need, names)
-                    or f". {vram_knob_advice(config.method).capitalize()}."
-                )
-            )
-        raise ValueError(
-            vram_fit_error_message(
-                config.method,
-                need,
-                requested_gpu_count=ceiling,
-                effective_gpu_count=safe_gpu_count,
-                max_gpu_count=auto_cap,
-                gpu_names=names,
-                providers=None if provider == "auto" else (provider,),
-                # same rule the ranking loop rejected shapes with, so the advice cannot name a
-                # width the retry will not launch on.
-                executed_width=lambda count: executed_gpu_count(config, count),
-                # an offline quote does not know the configured fleet, so it cannot claim that
-                # dropping a provider pin would make a wider shape purchasable.
-                widenable_without_pin=None,
-            )
+        _raise_no_fitting_shape(
+            config,
+            need,
+            names,
+            provider=provider,
+            ceiling=ceiling,
+            safe_gpu_count=safe_gpu_count,
+            auto_cap=auto_cap,
         )
     _cost, count, _combined, _per_card, gpu, hourly = min(ranked)
     return gpu, need, count, provider, hourly
+
+
+def _raise_no_fitting_shape(
+    config: RunConfig,
+    need: float,
+    names: tuple[str, ...],
+    *,
+    provider: str,
+    ceiling: int | None,
+    safe_gpu_count: int,
+    auto_cap: int,
+) -> None:
+    """Reject a run no rentable shape fits, naming what the quote was allowed to rank."""
+    from flash.providers.base import GPU_INFO, canonical_gpu
+    from flash.providers.fit_errors import vram_fit_error_message, vram_knob_advice
+
+    # a pinned class is blocked by the class itself, so name it -- the pool-wide message would
+    # report the widest validated shape, which is not hardware this quote was ever allowed to
+    # use. `_wider_shape_remedy` searches only `names`, already narrowed to the pin, so the
+    # `--gpus N` clause it appends can never name a shape the pin forbids. an unpinned run
+    # falls through to the pool-wide message, which reports the count that would fit.
+    remedy = _wider_shape_remedy(config, need, names)
+    if config.gpu_type:
+        # name every acceptable class, not just the head: with fallbacks authored, reporting the
+        # head alone tells the user to fix a class that may not be the one that failed, and
+        # hides that the whole declared set was ranked and rejected.
+        declared = tuple(
+            GPU_INFO[canonical_gpu(name)].name
+            for name in (config.gpu_type, *config.gpu_type_fallbacks)
+        )
+        label = (
+            repr(declared[0])
+            if len(declared) == 1
+            else "none of " + ", ".join(repr(name) for name in declared)
+        )
+        raise ValueError(
+            f"exact GPU {label} cannot fit this run: it requires at least {need} GB"
+            + (
+                remedy
+                or _catalog_check_remedy(config, need, names)
+                or f". {vram_knob_advice(config.method).capitalize()}."
+            )
+        )
+    raise ValueError(
+        vram_fit_error_message(
+            config.method,
+            need,
+            requested_gpu_count=ceiling,
+            effective_gpu_count=safe_gpu_count,
+            max_gpu_count=auto_cap,
+            gpu_names=names,
+            providers=None if provider == "auto" else (provider,),
+            # same rule the ranking loop rejected shapes with, so the advice cannot name a
+            # width the retry will not launch on.
+            executed_width=lambda count: executed_gpu_count(config, count),
+            # an offline quote does not know the configured fleet, so it cannot claim that
+            # dropping a provider pin would make a wider shape purchasable.
+            widenable_without_pin=None,
+        )
+    )
 
 
 def _allocation_quote_shape(config: RunConfig, allocation) -> tuple[str, int, int, str, float]:
