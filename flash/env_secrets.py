@@ -20,6 +20,7 @@ free of any import from it so the dependency runs one way.
 from __future__ import annotations
 
 import bz2
+import functools
 import gzip
 import io
 import lzma
@@ -32,6 +33,13 @@ import zlib
 from pathlib import Path
 from typing import IO, NoReturn
 
+from flash.env_archive import (
+    _looks_like_cpio_header,
+    credential_in_ar,
+    credential_in_cpio,
+    credential_in_tar,
+    credential_in_zip,
+)
 from flash.env_deflate import (
     _PDF_SIGNATURE,
     _document_payloads,
@@ -48,6 +56,7 @@ from flash.env_deflate import (
 )
 from flash.env_formats import (
     _COMPRESSED_MAGIC,
+    _MAX_ARCHIVE_MEMBERS,
     _OVERLAY_PROBE_BYTES,
     _ZIP_TAIL_BYTES,
     OVERLAY_UNPROBED,
@@ -130,6 +139,9 @@ def _looks_like_container(data: bytes) -> bool:
         _looks_compressed(data)
         or _looks_like_tar(data)
         or data.startswith((b"!<arch>\n", b"!<thin>\n", b"%PDF-", _PNG_SIGNATURE))
+        # use the shared structural gate so crc, odc and binary cpio cannot become
+        # top-level-only formats. each walker still validates every member boundary.
+        or _looks_like_cpio_header(data)
         or zipfile.is_zipfile(io.BytesIO(data))
         # a self-extracting shell archive, whose stub is a script rather than an executable: none
         # of the tests above sees past it, since each asks what the file begins with and it begins
@@ -749,51 +761,55 @@ def _archive_head(source: Path | bytes) -> bytes:
         return handle.read(4122)
 
 
-def _zip_tail(source: Path | bytes) -> bytes:
-    """The last bytes of `source`, where a zip end-of-central-directory record would sit."""
-    if isinstance(source, bytes):
-        return source[-_ZIP_TAIL_BYTES:]
-    with source.open("rb") as handle:
-        handle.seek(0, os.SEEK_END)
-        handle.seek(max(0, handle.tell() - _ZIP_TAIL_BYTES))
-        return handle.read()
-
-
 def _credential_in_zip(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
-    """Refuse a zip, whose members this stage cannot walk.
-
-    Member expansion arrives with the archive stage. Until then a zip is refused rather than
-    reported clean: unverifiable is not clean, and reporting a container clean because nothing
-    opened it is the one outcome that publishes a key.
-    """
-    del deadline, depth
-    if not _has_zip_end_record(_zip_tail(source)):
-        raise zipfile.BadZipFile("not a zip archive")
-    raise _Unscannable(_uninspectable_reason("zip"))
+    """The kind of credential in any readable member of a zip, or None."""
+    return credential_in_zip(
+        source,
+        deadline=deadline,
+        depth=depth,
+        scan=_scan_member,
+        refusal=_Unscannable,
+        named=functools.partial(credential_in_name, deadline=deadline),
+        metadata=_scan_member,
+        member_limit=_MAX_ARCHIVE_MEMBERS,
+    )
 
 
 def _credential_in_ar(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
-    """Refuse an ar or SVR4 cpio archive, whose members this stage cannot walk."""
-    del deadline, depth
+    """The kind of credential in any readable member of an ar or SVR4 cpio archive."""
     head = _archive_head(source)
-    # settlement means this handler actually recognised an archive. without the decline, every
-    # other file would report clean here and suppress a later pdf or tar refusal as verified.
+    # settlement means this handler actually walked an archive. without this decline, every other
+    # file returned none here and incorrectly suppressed a later pdf or tar refusal as verified.
     if head.startswith((b"!<arch>\n", b"!<thin>\n")):
-        raise _Unscannable(_uninspectable_reason("ar"))
-    raise zipfile.BadZipFile("not an ar archive")
+        walker = credential_in_ar
+    elif _looks_like_cpio_header(head):
+        walker = credential_in_cpio
+    else:
+        raise zipfile.BadZipFile("not an ar or cpio archive")
+    return walker(
+        source,
+        deadline=deadline,
+        depth=depth,
+        scan=_scan_member,
+        refusal=_Unscannable,
+        named=functools.partial(credential_in_name, deadline=deadline),
+        member_limit=_MAX_ARCHIVE_MEMBERS,
+        size_limit=_MAX_NESTED_BUFFER_BYTES,
+    )
 
 
 def _credential_in_tar(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
-    """Refuse a tar, whose members this stage cannot walk."""
-    del deadline, depth
-    handle = io.BytesIO(source) if isinstance(source, bytes) else source.open("rb")
-    try:
-        with tarfile.open(fileobj=handle, mode="r:*") as archive:
-            if archive.next() is None:
-                raise tarfile.ReadError("empty tar")
-    finally:
-        handle.close()
-    raise _Unscannable(_uninspectable_reason("tar"))
+    """The kind of credential in any readable member of a tar, or None."""
+    return credential_in_tar(
+        source,
+        deadline=deadline,
+        depth=depth,
+        scan=_scan_member,
+        dispatch=_credential_in_container,
+        refusal=_Unscannable,
+        named=functools.partial(credential_in_name, deadline=deadline),
+        member_limit=_MAX_ARCHIVE_MEMBERS,
+    )
 
 
 def credential_in_file(path: Path, *, deadline: float | None = None) -> str | None:
