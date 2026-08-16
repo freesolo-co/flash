@@ -84,6 +84,7 @@ from flash.env_keystores import (
     _Unscannable,
 )
 from flash.env_names import exact_name_values
+from flash.env_opaque import OpaqueDeadlineExceeded, opaque_format
 from flash.env_openpgp import (
     _encrypted_text_format,
     _has_openpgp_message_armor,
@@ -141,6 +142,7 @@ def _looks_like_container(data: bytes) -> bool:
         or data.startswith((b"!<arch>\n", b"!<thin>\n", b"%PDF-", _PNG_SIGNATURE))
         # use the shared structural gate so crc, odc and binary cpio cannot become
         # top-level-only formats. each walker still validates every member boundary.
+        or opaque_format(data) is not None
         or _looks_like_cpio_header(data)
         or zipfile.is_zipfile(io.BytesIO(data))
         # a self-extracting shell archive, whose stub is a script rather than an executable: none
@@ -468,6 +470,11 @@ def _credential_in_container(source: Path | bytes, *, deadline: float, depth: in
     """
     if depth > _MAX_CONTAINER_DEPTH:
         raise _Unscannable("nests compressed containers too deeply to inspect")
+    try:
+        if fmt := opaque_format(source, deadline=deadline):
+            raise _Unscannable(_uninspectable_reason(fmt))
+    except OpaqueDeadlineExceeded:
+        raise _Unscannable("takes too long to decompress") from None
     # EVERY applicable format is tried, not just the first one that claims a match. The detectors
     # are heuristics over untrusted bytes and one of them was decisive: `is_zipfile` searches the
     # last 64 KiB for the end-of-central-directory record, so four bytes of `PK\x05\x06` ANYWHERE
