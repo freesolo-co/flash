@@ -360,7 +360,8 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 ## Serving
 
 `flash serve setup` generates a self-hosted Modal backend for one catalog base model and many LoRA
-adapters. Deploy one app per base model. Training and export remain independent of serving.
+adapters. Deploy one app per base model. Training and export remain independent of serving. Catalog
+serving checkpoint repositories are informational only and are never resolved by the training path.
 
 ```bash
 pip install 'freesolo-flash[serve-modal]'
