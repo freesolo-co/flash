@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -135,10 +136,7 @@ class FreesoloEnvironment(BaseEnvironment):
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None
-        # id(row) -> that row's one TaskExample, filled by dataset() as it builds the rows. see
-        # _task_example for why every hook that touches a row must be handed the same object.
-        # written once, before any rollout can run, so concurrent GRPO grading only ever reads it.
-        # keyed on id() and kept exactly as long as _dataset_cache, whose rows own those ids.
+        # cached dataset rows own one stable task for single-turn prompt and scoring hooks.
         self._row_tasks: dict[int, Any] = {}
         # whether this run samples <think> blocks. the worker sets it from the JobSpec once the
         # env is loaded; off by default so a CLI-side load (flash env test) grades raw text, which
@@ -174,31 +172,7 @@ class FreesoloEnvironment(BaseEnvironment):
         return cap
 
     def _task_example(self, example: dict):
-        """The ONE ``TaskExample`` for this dataset row, reused by every hook that touches it.
-
-        The SDK hands the env a task object and nothing else: ``score_responses(example, texts)``
-        has no prompt parameter, so the task is the only channel from ``start_episode`` to
-        ``score_response``. Building a fresh one per call cut that channel for single-turn envs --
-        an env that CHOSE something per episode (the image it rendered, a sampled distractor set,
-        a randomized target) conditioned generation on one task object and was then graded against
-        a different one, so the grader could not identify what the model had actually been shown.
-        Silently wrong rewards, which GRPO then optimizes.
-
-        Whether that broke was luck, not design: ``task_example_from_record`` passes a record's
-        ``metadata`` dict through BY REFERENCE but substitutes a fresh ``{}`` when the record has
-        none, so an env stashing its choice in ``example.metadata`` survived only for rows whose
-        source data happened to carry a metadata field. One task per row makes it uniform.
-
-        This is the contract the multi-turn path already has -- ``new_rollout_state`` builds the
-        task once and ``_score_episode`` grades with that same ``state["task"]``. Single-turn now
-        matches it rather than being the odd one out.
-
-        The tasks are built by :meth:`dataset` alongside the rows themselves, keyed by row
-        IDENTITY, so this is a lookup rather than a cache: there is no fill, no eviction and no
-        lock, and a row can never be graded through a task built for a different one. Anything
-        that is not a dataset row -- an eval case, a bare ``{"output": ...}`` -- has no episode to
-        preserve and gets a per-call task, exactly as before.
-        """
+        """Return a cached dataset row's stable task, or a fresh task for any other row."""
         task = self._row_tasks.get(id(example))
         if task is not None:
             return task
@@ -308,12 +282,8 @@ class FreesoloEnvironment(BaseEnvironment):
                 raw["id"] = example_id
             record = self._canonical_record(raw)
             records.append(record)
-            # build this row's ONE task here, next to the row itself: every later hook --
-            # start_episode, sft_completion, scoring -- looks it up instead of minting its own.
-            # see _task_example.
+            # single-turn prompt and scoring hooks share the row-owned task.
             row_tasks[id(record)] = self._task_example_from_record(record)
-        # assigned together: the rows own the ids the task map is keyed on, so neither may be
-        # visible without the other.
         self._dataset_cache = records
         self._row_tasks = row_tasks
         return records
@@ -456,10 +426,18 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def _grouped_results(self, items, *, task_of, payload_of, scorer, method: str) -> list:
         """Group rollouts that share an example and scatter full reward results in input order."""
-        groups: dict[str, dict] = {}
-        order: list[str] = []
+        groups: dict[tuple[str, int | None], dict] = {}
+        order: list[tuple[str, int | None]] = []
         for i, (ex, st) in enumerate(items):
-            key = json.dumps(ex, sort_keys=True, default=str)
+            # only the FIRST member's task is passed to the scorer, so members must agree on it.
+            # sibling rollouts of one row carry their own session task that each episode mutated
+            # (`new_rollout_state`), and those are not interchangeable: grouping them on the row
+            # value alone would score every sibling against whichever session happened to be first.
+            session_task = st.get("task")
+            key = (
+                json.dumps(ex, sort_keys=True, default=str),
+                None if session_task is None else id(session_task),
+            )
             grp = groups.get(key)
             if grp is None:
                 grp = groups[key] = {"task": task_of(ex, st), "idxs": [], "payloads": []}
@@ -468,7 +446,7 @@ class FreesoloEnvironment(BaseEnvironment):
             grp["payloads"].append(payload_of(st))
         out: list = [None] * len(items)
 
-        def score_group(key: str) -> tuple[str, list]:
+        def score_group(key: tuple[str, int | None]) -> tuple[tuple[str, int | None], list]:
             grp = groups[key]
             rewards = scorer(grp["task"], grp["payloads"])
             if len(rewards) != len(grp["payloads"]):
@@ -585,7 +563,8 @@ class FreesoloEnvironment(BaseEnvironment):
         return []
 
     def new_rollout_state(self, example: dict) -> dict:
-        task = self._task_example(example)
+        record = deepcopy(self._canonical_record(example))
+        task = self._task_example_from_record(record)
         prompt = self._with_system_prompt(self._env.start_episode(task, self._contract_text))
         try:
             episode_turns: int | None = int(self._env.max_episode_turns(task))
