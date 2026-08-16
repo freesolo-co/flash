@@ -549,6 +549,25 @@ def test_image_teacher_prompt_rejects_a_marker_split_across_adjacent_text_blocks
             id="blocks",
         ),
         pytest.param(True, f"m {mm.IMAGE_PAD_TOKEN}", id="string-content-top-level-image"),
+        pytest.param(
+            False,
+            [
+                {"type": "image"},
+                {"type": "text", "text": "<|image_"},
+                {"type": "text", "text": "pad|>"},
+            ],
+            id="marker-split-across-adjacent-text-blocks",
+        ),
+        pytest.param(
+            False,
+            [
+                {"type": "image"},
+                {"type": "text", "text": "<|ima"},
+                {"type": "text", "text": "ge_p"},
+                {"type": "text", "text": "ad|>"},
+            ],
+            id="marker-split-three-ways",
+        ),
     ],
 )
 def test_normalization_rejects_the_pad_token_in_image_prompt_text(tmp_path, record_images, content):
@@ -576,6 +595,37 @@ def test_normalization_rejects_the_pad_token_in_image_prompt_text(tmp_path, reco
         ]
     with pytest.raises(ValueError, match="reserved image marker"):
         mm.normalize_prompt_images(record, messages, None)
+
+
+def test_normalization_allows_marker_fragments_separated_by_an_image_block(tmp_path):
+    """An image between the fragments makes them ordinary text, so refusing them would be wrong.
+
+    This is why the check runs per RUN of consecutive text blocks rather than over the whole
+    joined message: the processor puts the image's own expansion between these two pieces, so they
+    never concatenate into the reserved marker. A whole-message check would reject a legitimate
+    dataset, and a per-block check would accept the adjacent-fragment case that is a real defect.
+    """
+    uri = _data_uri(_png_bytes())
+    normalized = mm.normalize_prompt_images(
+        {},
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<|image_"},
+                    {"type": "image_url", "image_url": {"url": uri}},
+                    {"type": "text", "text": "pad|>"},
+                ],
+            }
+        ],
+        None,
+    )
+    assert len(normalized.descriptors) == 1
+    assert [block["type"] for block in normalized.messages[0]["content"]] == [
+        "text",
+        "image",
+        "text",
+    ]
 
 
 def test_normalization_keeps_the_teacher_placeholder_out_of_the_local_sft_check(tmp_path):

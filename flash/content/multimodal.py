@@ -504,10 +504,20 @@ def normalize_prompt_images(
     # checked here, on the finished blocks, rather than inside the loop above: string content never
     # enters that loop, and the top-level-image path appends to a message the loop already passed.
     # this is the one point every shape has converged to the same form.
+    #
+    # the unit is a RUN of consecutive text blocks, not one block, for the reason the teacher
+    # renderer already documents: "<|image_" and "pad|>" are each harmless alone and only become
+    # the reserved marker once the template concatenates them. an image block ends a run, since the
+    # processor puts its own expansion there and user text cannot reach across it.
     for message_index, message in enumerate(normalized):
+        text_run: list[str] = []
         for block in message["content"]:
             if block.get("type") == "text":
-                _reject_literal_image_placeholder(block["text"], message_index, (IMAGE_PAD_TOKEN,))
+                text_run.append(block["text"])
+                continue
+            _reject_literal_image_placeholder("".join(text_run), message_index, (IMAGE_PAD_TOKEN,))
+            text_run = []
+        _reject_literal_image_placeholder("".join(text_run), message_index, (IMAGE_PAD_TOKEN,))
     return NormalizedImages(normalized, descriptors)
 
 
