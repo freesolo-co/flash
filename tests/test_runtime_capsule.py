@@ -1,0 +1,293 @@
+"""Runtime capsule: determinism, execution, and every rejection path.
+
+The rejection tests carry the weight here. A verifier that accepts everything is indistinguishable
+from no verifier at all, so each way a capsule can be wrong gets its own case that proves the
+build actually refuses it.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import subprocess
+import sys
+import zipfile
+
+import pytest
+
+from flash.runtime_capsule import (
+    MANIFEST_NAME,
+    CapsuleError,
+    build_capsule,
+    read_capsule,
+    sha256_bytes,
+    verify_capsule,
+    write_capsule,
+)
+from flash.runtime_capsule.manifest import parse_manifest, validate_member_path
+
+PROFILE = "instance-bootstrap"
+
+
+def _repack(archive: bytes, mutate) -> bytes:
+    """Rebuild an archive after `mutate` edits its {name: bytes} payload."""
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        payload = {name: zf.read(name) for name in zf.namelist()}
+    mutate(payload)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in sorted(payload):
+            zf.writestr(name, payload[name])
+    return buffer.getvalue()
+
+
+def test_capsule_build_is_deterministic():
+    """Same sources, same bytes -- a digest stamped at image build must still match at run time."""
+    first, _ = build_capsule(PROFILE)
+    second, _ = build_capsule(PROFILE)
+    assert first == second
+
+
+def test_capsule_declares_every_member_with_a_digest():
+    archive, manifest = build_capsule(PROFILE)
+    _parsed, contents = read_capsule(archive)
+    assert {m.path for m in manifest.members} == set(contents)
+    for member in manifest.members:
+        assert member.size == len(contents[member.path])
+        assert member.sha256 == sha256_bytes(contents[member.path])
+
+
+def test_capsule_verifies_against_an_external_digest():
+    archive, _ = build_capsule(PROFILE)
+    assert (
+        verify_capsule(
+            archive, expected_sha256=sha256_bytes(archive), expected_profile=PROFILE
+        ).profile
+        == PROFILE
+    )
+
+
+def test_capsule_rejects_a_wrong_external_digest():
+    """The digest comes from the trusted payload, so a mismatch means the bytes are not ours."""
+    archive, _ = build_capsule(PROFILE)
+    with pytest.raises(CapsuleError, match="digest mismatch"):
+        verify_capsule(archive, expected_sha256="0" * 64)
+
+
+def test_capsule_rejects_a_mutated_member():
+    """A SAME-LENGTH edit, so the size check cannot be what catches it.
+
+    Length-preserving is the realistic tampering shape (flip a comparison, swap a constant); a
+    longer payload would trip the cheaper size check and leave the digest check unproven.
+    """
+    archive, _ = build_capsule(PROFILE)
+
+    def mutate(payload):
+        original = payload["bootstrap_pip.py"]
+        payload["bootstrap_pip.py"] = b"#" + original[1:]
+        assert len(payload["bootstrap_pip.py"]) == len(original)
+
+    with pytest.raises(CapsuleError, match="sha256 mismatch"):
+        read_capsule(_repack(archive, mutate))
+
+
+def test_capsule_rejects_a_truncated_member():
+    archive, _ = build_capsule(PROFILE)
+
+    def mutate(payload):
+        payload["bootstrap_pip.py"] = payload["bootstrap_pip.py"][:-20]
+
+    with pytest.raises(CapsuleError, match="size mismatch"):
+        read_capsule(_repack(archive, mutate))
+
+
+def test_capsule_rejects_a_missing_member():
+    archive, _ = build_capsule(PROFILE)
+
+    def mutate(payload):
+        payload.pop("bootstrap_pip.py")
+
+    with pytest.raises(CapsuleError, match="missing declared member"):
+        read_capsule(_repack(archive, mutate))
+
+
+def test_capsule_rejects_an_undeclared_member():
+    """The direction that matters most: an ADDED module the manifest never named.
+
+    Checking only that declared members match would let this through, and the loader would then
+    have an importable module nobody reviewed sitting next to the real ones.
+    """
+    archive, _ = build_capsule(PROFILE)
+
+    def mutate(payload):
+        payload["sitecustomize.py"] = b"import os\nos.environ['OWNED'] = '1'\n"
+
+    with pytest.raises(CapsuleError, match="undeclared member"):
+        read_capsule(_repack(archive, mutate))
+
+
+def test_capsule_rejects_a_consistently_replaced_manifest_only_by_digest():
+    """A manifest replaced ALONGSIDE its members is internally consistent.
+
+    This is exactly why the expected digest lives outside the archive: read_capsule cannot catch
+    it, and verify_capsule must.
+    """
+    archive, _ = build_capsule(PROFILE)
+
+    def mutate(payload):
+        payload["bootstrap_pip.py"] = b"# replaced wholesale\n"
+        manifest = json.loads(payload[MANIFEST_NAME].decode())
+        for member in manifest["members"]:
+            if member["path"] == "bootstrap_pip.py":
+                member["size"] = len(payload["bootstrap_pip.py"])
+                member["sha256"] = sha256_bytes(payload["bootstrap_pip.py"])
+        payload[MANIFEST_NAME] = (
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+
+    forged = _repack(archive, mutate)
+    # internally consistent: the cheap check passes
+    read_capsule(forged)
+    # but it is not the archive the control plane published
+    with pytest.raises(CapsuleError, match="digest mismatch"):
+        verify_capsule(forged, expected_sha256=sha256_bytes(archive))
+
+
+def test_capsule_rejects_a_wrong_profile():
+    archive, _ = build_capsule(PROFILE)
+    with pytest.raises(CapsuleError, match="profile mismatch"):
+        verify_capsule(archive, expected_sha256=sha256_bytes(archive), expected_profile="verl-sft")
+
+
+def test_capsule_rejects_a_symlink_member():
+    archive, _ = build_capsule(PROFILE)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        payload = {name: zf.read(name) for name in zf.namelist()}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in sorted(payload):
+            zf.writestr(name, payload[name])
+        info = zipfile.ZipInfo("evil.py")
+        info.external_attr = (0o120777 << 16) | 0o200000
+        zf.writestr(info, "/etc/passwd")
+    with pytest.raises(CapsuleError, match="symlink"):
+        read_capsule(buffer.getvalue())
+
+
+def test_capsule_rejects_a_non_zip_payload():
+    with pytest.raises(CapsuleError, match="not a readable zip"):
+        read_capsule(b"this is not an archive at all")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/passwd",
+        "../escape.py",
+        "a/../../escape.py",
+        "dir\\evil.py",
+        "c:evil.py",
+        "a//b.py",
+        "./b.py",
+        "",
+    ],
+)
+def test_member_paths_that_escape_or_alias_are_rejected(path):
+    with pytest.raises(CapsuleError):
+        validate_member_path(path)
+
+
+def test_manifest_rejects_an_unknown_format_version():
+    """An unknown version is refused, never best-effort parsed."""
+    archive, _ = build_capsule(PROFILE)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        manifest = json.loads(zf.read(MANIFEST_NAME).decode())
+    manifest["format_version"] = 99
+    with pytest.raises(CapsuleError, match="unsupported capsule format_version"):
+        parse_manifest((json.dumps(manifest) + "\n").encode())
+
+
+def test_manifest_rejects_an_unknown_field():
+    archive, _ = build_capsule(PROFILE)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        manifest = json.loads(zf.read(MANIFEST_NAME).decode())
+    manifest["run_this_too"] = "payload.py"
+    with pytest.raises(CapsuleError, match="unknown field"):
+        parse_manifest((json.dumps(manifest) + "\n").encode())
+
+
+def test_manifest_rejects_a_duplicated_member():
+    archive, _ = build_capsule(PROFILE)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        manifest = json.loads(zf.read(MANIFEST_NAME).decode())
+    manifest["members"].append(dict(manifest["members"][0]))
+    with pytest.raises(CapsuleError, match="more than once"):
+        parse_manifest((json.dumps(manifest) + "\n").encode())
+
+
+def test_manifest_rejects_an_entrypoint_that_is_not_a_member():
+    archive, _ = build_capsule(PROFILE)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        manifest = json.loads(zf.read(MANIFEST_NAME).decode())
+    manifest["entrypoint"] = "not_shipped.py"
+    with pytest.raises(CapsuleError, match="not a declared member"):
+        parse_manifest((json.dumps(manifest) + "\n").encode())
+
+
+def test_capsule_members_import_with_flash_absent(tmp_path):
+    """The point of the capsule: the far end runs it with stock Python and no flash package.
+
+    Imports run under `-S` with the repo off sys.path, so a member that secretly needed the
+    installed flash package would fail here rather than on a paid GPU.
+    """
+    archive, _ = build_capsule(PROFILE)
+    capsule = tmp_path / "instance-bootstrap.pyz"
+    write_capsule(capsule, archive)
+
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import importlib, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import bootstrap\n"
+        "assert not bootstrap.__package__, bootstrap.__package__\n"
+        "assert callable(bootstrap.main)\n"
+        "import pickle\n"
+        "assert pickle.loads(pickle.dumps(bootstrap._console_upload_loop)) "
+        "is bootstrap._console_upload_loop\n"
+        "for name in ('bootstrap_secrets', 'bootstrap_pip', 'hostlog', 'failmark'):\n"
+        "    importlib.import_module(name)\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", str(probe), str(capsule)],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout
+
+
+def test_capsule_entry_does_not_own_spawn_targets():
+    """`__main__` must only dispatch.
+
+    multiprocessing's spawn start method re-imports the entry as `__mp_main__`, so a target
+    defined in a zipapp's `__main__` cannot be unpickled by the child -- the bootstrap's console
+    uploader would die on a rented box while every local test passed.
+    """
+    archive, _ = build_capsule(PROFILE)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        main_src = zf.read("__main__.py").decode()
+    assert "def " not in main_src
+    assert "runpy.run_module" in main_src
+
+
+def test_write_capsule_is_atomic_and_executable(tmp_path):
+    archive, _ = build_capsule(PROFILE)
+    destination = tmp_path / "nested" / "capsule.pyz"
+    write_capsule(destination, archive)
+    assert destination.read_bytes() == archive
+    assert destination.stat().st_mode & 0o111
+    # no temp files left behind
+    assert sorted(p.name for p in destination.parent.iterdir()) == ["capsule.pyz"]
