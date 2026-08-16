@@ -10,10 +10,17 @@ backend is one implementation of this contract, not the definition of it.
 
 Two ways to get a backend:
 
-- **`flash serve setup`** generates a Modal app that implements this contract and deploys it to
-  your own Modal account. Start here; the rest of this document is why it does what it does.
+- **`flash serve setup`** generates a Modal app from the backend template included in this
+  repository and deploys it to your own Modal account. Start here; the rest of this document is why
+  it does what it does.
 - **Write your own** against this document, then prove it with the conformance suite at the
   bottom.
+
+One generated app and URL serve exactly one base model. `GET /healthz` advertises that model, and
+registration for any other base model is rejected before GPU allocation. Multiple base models
+therefore require distinct generated apps and URLs, or an external gateway that routes each model
+to its app. Freesolo's hosted multi-model backend remains external to this repository; the included
+template is the self-hosted single-model implementation.
 
 ## Vocabulary
 
@@ -258,11 +265,11 @@ deploys of one run silently overwrite each other, which is precisely what
 The check and the write must be atomic. A read-then-write with a gap between them is not a
 compare-and-swap, no matter what `/healthz` says.
 
-**What the generated Modal app actually guarantees.** Its CPU API function is pinned to one
-container, and concurrent requests inside that container share a process-local `asyncio.Lock` per
-run. The read, expectation check, and alias write execute under that lock, so exactly one activation
-with a given expectation can commit. `modal.Dict` remains the durable record store across cold
-starts; it is not used as a lock or lease service.
+**What the generated Modal app actually guarantees.** One CPU-only lifecycle coordinator is pinned
+to one container and serialized to one input. Registration, settlement, activation, and removal all
+pass through it, so the expectation check and alias write cannot overlap another durable lifecycle
+mutation. `modal.Dict` remains the durable record store across cold starts; the API and GPU engine
+read it but never write lifecycle state.
 
 A custom backend may use any primitive that provides the same atomic compare-and-swap guarantee,
 such as a database row lock or Redis transaction. The endpoint contract above is unchanged.
@@ -309,6 +316,11 @@ succeeding.
 
 Disabling is a state change on the record, not necessarily an engine eviction. The contract is that
 the alias stops resolving; reclaiming GPU memory is your implementation's business.
+
+The generated Modal app disables the alias and revisions before deleting their digest-scoped cache
+directories from the volume. `DELETE` never starts or calls the GPU engine, so an undeploy remains
+GPU-free when the app is cold. A cache cleanup error leaves every record disabled and returns a
+retryable failure; repeating the same `DELETE` retries cleanup without reviving the run.
 
 ### `POST /v1/chat/completions`
 

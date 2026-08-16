@@ -359,15 +359,19 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Serving
 
-`flash/serve/` is a **client** for a multi-LoRA serving app (a Modal app that serves every
-adapter on one GPU per base model, scaling to zero when idle). This repository does not
-include that serving backend.
+This repository includes both the serving client and the generated self-hosted Modal backend.
+`flash serve setup` renders that backend into your working directory, where it serves multiple
+LoRA adapters for exactly one base model and scales its GPU to zero when idle.
 
-Training, checkpoint streaming, and adapter export are fully self-hostable and do not
-depend on it. Your trained adapters land in your own HuggingFace repos and can be served
-by any stack that loads LoRA adapters - vLLM, TGI, or your own. Point `FREESOLO_SERVING_URL`
-at a compatible deployment if you want `flash models deploy` and `flash models chat` to work
-end to end.
+One generated app and URL serve one base model. Its health response advertises that one model,
+and registration for a different base model is rejected before any GPU allocation. To serve
+multiple base models, deploy one generated app and URL per model and route between them with an
+external gateway. Freesolo's hosted multi-model backend is separate infrastructure and remains
+external to this repository.
+
+Training, checkpoint streaming, and adapter export remain independent of serving. Your trained
+adapters land in your own HuggingFace repos and can also be served by any compatible stack that
+loads LoRA adapters, including vLLM, TGI, or your own implementation.
 
 ### Standing one up
 
