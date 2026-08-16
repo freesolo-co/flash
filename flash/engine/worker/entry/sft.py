@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import random
 
+from flash.engine.worker.model.chatml_mask import assistant_only_mask
 from flash.engine.worker.model.packing import (
     completion_mask_from_ids,
+    packing_appends_eos,
     tokenize_for_packing,
     untruncated_lengths_for_packing,
 )
@@ -37,7 +39,8 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
 
     Returns ``(kept_texts, pretok, n_dropped)``. Each pretok row also carries
     ``untruncated_length``: its token count BEFORE the cap. The post-slice length can never exceed
-    max_length, so it cannot say whether the cap actually bound; this can.
+    max_length, so it cannot say whether the cap actually bound; this can. It also carries
+    ``assistant_mask_applied``: whether the render was readable enough to mask non-assistant turns.
     """
     full_ids = tokenize_for_packing([t["text"] for t in texts], tokenizer, max_length)
     # the same encode without the cap, so a truncated row reports its real size rather than the cap.
@@ -45,14 +48,27 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
     prompt_ids = tokenizer(
         [t["prompt_text"] for t in texts], truncation=True, max_length=max_length
     )["input_ids"]
-    pretok = [
-        {
-            "input_ids": ids,
-            "completion_mask": completion_mask_from_ids(pids, ids),
-            "untruncated_length": length,
-        }
-        for ids, pids, length in zip(full_ids, prompt_ids, untruncated, strict=True)
-    ]
+    pretok = []
+    for text, ids, pids, length in zip(texts, full_ids, prompt_ids, untruncated, strict=True):
+        mask, role_aware = assistant_only_mask(
+            completion_mask_from_ids(pids, ids),
+            ids,
+            tokenizer,
+            text["target_messages"],
+            # the appended EOS counts only when it SURVIVED the cap: an equal-length row proves the
+            # token that terminates the example is still there to supervise.
+            appended_eos=packing_appends_eos(text["text"], tokenizer) and len(ids) == length,
+            source_messages=text["source_messages"],
+            template_kwargs=text["template_kwargs"],
+        )
+        pretok.append(
+            {
+                "input_ids": ids,
+                "completion_mask": mask,
+                "assistant_mask_applied": role_aware,
+                "untruncated_length": length,
+            }
+        )
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
     kept = [
         (t, r)

@@ -20,6 +20,7 @@ from flash.engine.profiling.sft_workload import (  # noqa: F401
 from flash.engine.worker.backend_common import (  # noqa: F401
     ChildOutputTail,
     ChildTailStaleness,
+    VerlChildSilenceWatchdog,
     clamp_engine_len,
     fused_ce_backend,
     gdn_probe_module,
@@ -28,9 +29,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     parse_verl_metric,
     parse_wandb_link,
     probe_verl_capabilities,
-    render_gdn_varlen_shim,
-    render_shim_marker_prologue,
-    render_wandb_link_shim,
+    render_sitecustomize_bootstrap,
     require_gdn_boundary_resets,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
@@ -43,7 +42,6 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     verify_applied_shim_markers,
     verl_device_capability,
     verl_step_number,
-    wrap_shim_fragment,
 )
 from flash.engine.worker.entry.opd import (  # noqa: F401
     _resolve_opd_knobs,
@@ -57,7 +55,7 @@ from flash.engine.worker.sft_train import (  # noqa: F401
     _export_checkpoint_adapter,
     _NvidiaSmiPeakSampler,
     _probe_gpu_in_subprocess,
-    _processed_resume_steps,
+    _seed_resume_lifecycle,
     _verl_image_message_content,
     _warmstart_adapter_path,
 )
@@ -373,7 +371,8 @@ def run_opd_train(spec=None) -> None:
             "opd_finalizing", progress=lambda: final_step, progress_step=True, keepalive=True
         ):
             adapter_dir = _export_and_upload_adapter(request, workload, runtime, result)
-            # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher and final-save paths are disjoint, so processed_steps must not suppress it.
+            # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher
+            # and final-save paths are disjoint, so the watcher's lifecycle must not suppress it.
             if final_save_due(final_step, knobs.save_at_steps):
                 _w.publish_deployable_checkpoint(adapter_dir, final_step, _provenance_ready=True)
         setup_seconds = _report_training_complete(result, started_at)
@@ -484,8 +483,8 @@ from flash.engine.worker.train.opd.failures import (  # noqa: E402,F401
 from flash.engine.worker.train.opd.overrides import (  # noqa: E402,F401
     _OPD_PARQUET_WRITE_BATCH_ROWS,
     _build_opd_child_env,
+    _build_opd_plugin_config,
     _opd_multimodal_parquet_features,
-    _render_opd_sitecustomize,
     _write_opd_parquet,
     build_opd_overrides,
 )

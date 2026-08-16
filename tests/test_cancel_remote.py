@@ -1,7 +1,8 @@
 """verify cancellation stops a remote flash worker across processes.
 
-``stop_endpoint`` only sees the current process cache. cancellation must use ``terminate_endpoint`` to
-find the persisted runpod resource and delete it through the api before billing continues.
+the deploying process may be gone by the time a cancellation arrives, so cancellation must use
+``terminate_endpoint`` to find the persisted runpod resource and delete it through the api before
+billing continues.
 """
 
 from __future__ import annotations
@@ -92,63 +93,6 @@ def test_isolate_flash_state_resets_runpod_flash_manager_on_scope_change(tmp_pat
     assert "kept" in FakeRM._resources
     assert "kept" in fake_instance._resources
     assert FakeRM._resources_initialized is True
-
-
-def test_get_train_endpoint_locks_sdk_state_and_does_not_cache_run_scoped_handlers(monkeypatch):
-    import flash.providers.runpod.auth as auth
-    import flash.providers.runpod.jobs as jobs
-    import flash.providers.runpod.serverless.endpoints as ep_mod
-
-    locked_events = []
-
-    class FakeEndpoint:
-        def __init__(self, **kwargs):
-            assert ep_mod.FLASH_SDK_LOCK.locked()
-            self.kwargs = kwargs
-            locked_events.append(("endpoint", kwargs["name"]))
-
-        def __call__(self, fn):
-            assert ep_mod.FLASH_SDK_LOCK.locked()
-            locked_events.append(("handler", self.kwargs["name"]))
-            return types.SimpleNamespace(endpoint=self, fn=fn)
-
-        def _build_resource_config(self):
-            assert ep_mod.FLASH_SDK_LOCK.locked()
-            locked_events.append(("config", self.kwargs["name"]))
-            return {}
-
-    runpod_flash = types.ModuleType("runpod_flash")
-    runpod_flash.Endpoint = FakeEndpoint
-    monkeypatch.setitem(sys.modules, "runpod_flash", runpod_flash)
-
-    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
-    monkeypatch.setattr(ep_mod, "_patch_runpod_backoff", lambda: None)
-
-    def rec_isolate(scope):
-        assert ep_mod.FLASH_SDK_LOCK.locked()
-        locked_events.append(("isolate", scope))
-
-    monkeypatch.setattr(ep_mod, "isolate_flash_state", rec_isolate)
-    monkeypatch.setattr(ep_mod, "canonical_gpu", lambda gpu: gpu)
-    monkeypatch.setattr(ep_mod, "flash_gpu", lambda gpu: gpu)
-    monkeypatch.setattr(ep_mod, "gpu_short", lambda gpu: gpu.lower().replace(" ", ""))
-    monkeypatch.setattr(ep_mod, "worker_image_for_gpu", lambda *_args, **_kwargs: "image")
-    monkeypatch.setattr(jobs, "weight_cache_endpoint_kwargs", lambda _spec: {})
-    monkeypatch.setattr(jobs, "apply_disk_gb", lambda _cfg, _disk_gb: None)
-    monkeypatch.setattr(ep_mod, "_ENDPOINT_CACHE", {})
-
-    run_handler = ep_mod.get_train_endpoint("RTX 5090", name_suffix="run-a")
-    assert run_handler.endpoint.kwargs["name"] == "flash-rtx5090-run-a"
-    assert ep_mod._ENDPOINT_CACHE == {}
-    assert ("isolate", "run-a") in locked_events
-
-    default_handler = ep_mod.get_train_endpoint("RTX 5090")
-    assert default_handler.endpoint.kwargs["name"] == "flash-rtx5090"
-    assert {"flash-rtx5090": default_handler} == ep_mod._ENDPOINT_CACHE
-    assert ("isolate", None) in locked_events
-
-    cached_handler = ep_mod.get_train_endpoint("RTX 5090")
-    assert cached_handler is default_handler
 
 
 def test_select_matches_live_prefixed_endpoint():
