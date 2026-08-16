@@ -814,13 +814,27 @@ class TeacherClient:
     def score_many_multimodal(
         self,
         items: list[tuple[list[dict[str, Any]], str, list[str] | tuple[str, ...], bool]],
+        *,
+        on_scored: Callable[[], None] | None = None,
     ) -> list[TeacherScore]:
-        """Score image-conditioned completions through the managed chat broker route."""
+        """Score image-conditioned completions through the managed chat broker route.
+
+        Reports each completion through `on_scored` for the same reason the text route does: the
+        child is silent while the parent waits on the teacher, so without this signal a long image
+        scoring phase is indistinguishable from a wedged child.
+        """
         if not items:
             return []
+
+        def score_one(item):
+            scored = self._score_one_multimodal(*item)
+            if on_scored is not None:
+                on_scored()
+            return scored
+
         return map_bounded(
             items,
-            lambda item: self._score_one_multimodal(*item),
+            score_one,
             cap=OPD_TEACHER_SCORING_CONCURRENCY,
         )
 

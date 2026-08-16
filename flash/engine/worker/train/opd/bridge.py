@@ -365,6 +365,7 @@ class _TeacherAlignmentBridge:
                 teacher=self.teacher,
                 thinking_prefill=self.thinking_prefill,
                 text_teacher_batcher=self._text_teacher_batcher,
+                on_scored=self.parent_work.complete,
             )
         except TeacherError as error:
             if error.permanent:
