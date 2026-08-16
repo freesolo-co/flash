@@ -54,7 +54,7 @@ from flash.engine.worker.sft_train import (  # noqa: F401
     _export_checkpoint_adapter,
     _NvidiaSmiPeakSampler,
     _probe_gpu_in_subprocess,
-    _processed_resume_steps,
+    _seed_resume_lifecycle,
     _verl_image_message_content,
     _warmstart_adapter_path,
 )
@@ -370,7 +370,8 @@ def run_opd_train(spec=None) -> None:
             "opd_finalizing", progress=lambda: final_step, progress_step=True, keepalive=True
         ):
             adapter_dir = _export_and_upload_adapter(request, workload, runtime, result)
-            # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher and final-save paths are disjoint, so processed_steps must not suppress it.
+            # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher
+            # and final-save paths are disjoint, so the watcher's lifecycle must not suppress it.
             if final_save_due(final_step, knobs.save_at_steps):
                 _w.publish_deployable_checkpoint(adapter_dir, final_step, _provenance_ready=True)
         setup_seconds = _report_training_complete(result, started_at)

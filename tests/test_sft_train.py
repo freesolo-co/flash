@@ -31,6 +31,7 @@ from flash.engine.worker.sft_train import (
     _write_sft_parquet,
     build_sft_overrides,
 )
+from flash.engine.worker.train.core.checkpoint_lifecycle import CheckpointLedger
 from flash.engine.worker.train.sft.child import plugin as sft_plugin
 
 # distinct from `flash.__version__` on purpose: the worker resolves that to "0+unknown" (no flash
@@ -1078,7 +1079,7 @@ class _TolerantWatcher:
     """
 
     def __init__(self, **kwargs):
-        self.processed_steps = set()
+        self.lifecycle = CheckpointLedger()
 
     def start(self):
         return None
@@ -1259,12 +1260,17 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
     monkeypatch.setattr(
         worker,
         "publish_deployable_checkpoint",
-        lambda adapter, step, **kwargs: published.append((adapter, step, kwargs)),
+        # a subfolder, as the real transport returns; None means nothing was published.
+        lambda adapter, step, **kwargs: (
+            published.append((adapter, step, kwargs)),
+            f"sft/run/checkpoints/step-{step}/adapter",
+        )[1],
     )
 
     def fake_upload(step, checkpoint, **kwargs):
         kwargs["before_upload"]()
         uploaded.append((step, checkpoint))
+        kwargs["after_upload"]()
         return True
 
     monkeypatch.setattr(worker, "upload_resume_checkpoint", fake_upload)
@@ -1286,7 +1292,10 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
     assert published[0][1] == 5
     assert published[0][2]["required"] is True
     assert [step for step, _ in uploaded] == [5]
-    assert watcher.processed_steps == {5}
+    # a required step is durable on both trees, and the ledger records each fact separately.
+    assert watcher.lifecycle.facts(5).deployable_published
+    assert watcher.lifecycle.facts(5).resume_uploaded
+    assert watcher.lifecycle.missing_deployables(watcher.required_steps) == []
 
 
 def test_checkpoint_watcher_exports_the_sft_layout(monkeypatch, tmp_path):
@@ -1388,7 +1397,7 @@ def test_a_required_save_survives_verl_pruning_it_mid_publish(monkeypatch, tmp_p
         "the upload lost its source when verl pruned the checkpoint, so a required save would fail "
         "an otherwise successful paid run"
     )
-    assert watcher.processed_steps == {2}
+    assert watcher.lifecycle.discovered_steps == {2}
     # the staging links are transient: they must not outlive the publish and accumulate on the pod.
     assert not os.path.exists(os.path.join(str(tmp_path / "exports"), "_staging", "global_step_2"))
 
@@ -1406,11 +1415,24 @@ def test_resume_credits_only_required_saves_that_are_durable(monkeypatch):
     monkeypatch.setattr(worker, "hf_api", Api)
 
     assert sft_train._durable_required_save_steps((3, 5, 9), 5) == {3}
+
     # a resume step that is itself a required save is credited only when its adapter is on hf, so
     # step 5 stays publishable while the already-durable step 3 does not.
-    assert sft_train._processed_resume_steps((3, 5, 9), 5) == {3}
-    # a resume step that is not a required save is always credited: hf already holds its state.
-    assert sft_train._processed_resume_steps((3, 9), 5) == {3, 5}
+    required = types.SimpleNamespace(lifecycle=CheckpointLedger())
+    sft_train._seed_resume_lifecycle(required, (3, 5, 9), 5)
+    assert required.lifecycle.discovered_steps == {3}
+    assert required.lifecycle.deployable_published_steps == {3}
+    # its resume state is durable regardless: this attempt restored from it.
+    assert required.lifecycle.facts(5).resume_uploaded
+    assert not required.lifecycle.facts(5).deployable_published
+
+    # a resume step that is not a required save is always claimed: hf already holds its state and
+    # nothing further is owed for it.
+    optional = types.SimpleNamespace(lifecycle=CheckpointLedger())
+    sft_train._seed_resume_lifecycle(optional, (3, 9), 5)
+    assert optional.lifecycle.discovered_steps == {3, 5}
+    # claimed is not published: no adapter was ever confirmed for step 5.
+    assert optional.lifecycle.deployable_published_steps == {3}
 
 
 def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypatch, tmp_path):
@@ -1447,13 +1469,16 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
     def fake_upload(step, checkpoint, **kwargs):
         kwargs["before_upload"]()
         uploaded.append(step)
+        kwargs["after_upload"]()
         return True
 
     monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
     monkeypatch.setattr(
         worker,
         "publish_deployable_checkpoint",
-        lambda adapter, step, **kwargs: published.append(step),
+        # returns a subfolder like the real transport: it returns None when a best-effort publish
+        # fails or finds no adapter, and the watcher must not credit those.
+        lambda adapter, step, **kwargs: (published.append(step), f"sft/run/step-{step}")[1],
     )
     monkeypatch.setattr(worker, "upload_resume_checkpoint", fake_upload)
     watcher = sft_train._VerlCheckpointWatcher(
@@ -1464,7 +1489,7 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
         model_revision="commit",
         required_steps=(),
     )
-    watcher.processed_steps.update(sft_train._processed_resume_steps((), resume_step))
+    sft_train._seed_resume_lifecycle(watcher, (), resume_step)
 
     watcher.start()
     watcher.stop(require_complete=True)
@@ -1473,7 +1498,11 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
     assert [os.path.basename(path) for path in exported] == ["global_step_2"]
     assert published == [2]
     assert uploaded == [2]
-    assert watcher.processed_steps == {1, 2}
+    assert watcher.lifecycle.discovered_steps == {1, 2}
+    # the seeded step's resume state is durable because this attempt restored from it, but this
+    # worker published nothing for it.
+    assert watcher.lifecycle.facts(1).resume_uploaded
+    assert watcher.lifecycle.deployable_published_steps == {2}
 
 
 def _stub_sft_run(
@@ -1660,7 +1689,7 @@ def _stub_sft_run(
     class _DefaultWatcher:
         def __init__(self, **kwargs):
             self.required_steps = frozenset(kwargs["required_steps"])
-            self.processed_steps = set()
+            self.lifecycle = CheckpointLedger()
 
         def start(self):
             return None
@@ -1920,10 +1949,10 @@ def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypa
     class Watcher:
         def __init__(self, **kwargs):
             self.required_steps = frozenset(kwargs["required_steps"])
-            self.processed_steps = set()
+            self.lifecycle = CheckpointLedger()
 
         def start(self):
-            seeded["at_start"] = set(self.processed_steps)
+            seeded["at_start"] = set(self.lifecycle.discovered_steps)
 
         def stop(self, *, require_complete):
             assert require_complete is True
@@ -2237,7 +2266,7 @@ def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monke
 
     class Watcher:
         def __init__(self, **kwargs):
-            self.processed_steps = set()
+            self.lifecycle = CheckpointLedger()
             self.required_steps = frozenset(kwargs.get("required_steps", ()))
 
         def start(self):
@@ -2249,7 +2278,7 @@ def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monke
         def stop(self, *, require_complete):
             stopped.append(require_complete)
             if require_complete:
-                missing = sorted(self.required_steps - self.processed_steps)
+                missing = self.lifecycle.missing_deployables(self.required_steps)
                 if missing:
                     raise RuntimeError(f"required saves were not durably published: {missing}")
 
@@ -3119,7 +3148,7 @@ def test_an_adapter_is_freed_even_when_before_upload_never_ran(monkeypatch, tmp_
     that argument -- so it is deliberately not claimed here.
 
     Retaining the adapter on either reachable path looks protective, but nothing in the sft watcher
-    ever reads `export_root` again -- the step joins `processed_steps` and `_pending` filters it out
+    ever reads `export_root` again -- the step is marked discovered and `_pending` filters it out
     forever -- so the directory would simply accumulate. The busy-slot branch is the one that fires
     on EVERY step once an upload is slow enough to hold the slot, which is exactly the busy-disk case
     this PR exists for, so that is the one simulated below.
@@ -3270,9 +3299,20 @@ def _publishing_watcher(monkeypatch, tmp_path, *, steps, required_steps):
     monkeypatch.setattr(
         sft_checkpoints._w,
         "upload_resume_checkpoint",
-        lambda step, ckpt, **kwargs: (published.append(step), kwargs["before_upload"](), True)[2],
+        lambda step, ckpt, **kwargs: (
+            published.append(step),
+            kwargs["before_upload"](),
+            kwargs["after_upload"](),
+            True,
+        )[3],
     )
-    monkeypatch.setattr(sft_checkpoints._w, "publish_deployable_checkpoint", lambda *a, **kw: None)
+    # returns the published subfolder the way the real transport does: it returns None for a
+    # best-effort publish that failed or found no adapter, and the watcher must not credit those.
+    monkeypatch.setattr(
+        sft_checkpoints._w,
+        "publish_deployable_checkpoint",
+        lambda adapter, step, **kw: f"sft/run/checkpoints/step-{step}/adapter",
+    )
 
     watcher = sft_train._VerlCheckpointWatcher(
         local_dir=str(local_dir),
@@ -3285,6 +3325,68 @@ def _publishing_watcher(monkeypatch, tmp_path, *, steps, required_steps):
     return watcher, published
 
 
+def test_a_failed_optional_publish_is_not_credited_as_a_durable_deployable(monkeypatch, tmp_path):
+    """returning None must not become a published fact.
+
+    `publish_deployable_checkpoint` returns None for a best-effort publish that failed and for a
+    directory holding no adapter; it raises instead of returning None when the save is required. So
+    the only way to credit an artifact that was never written is an optional publish, and the ledger
+    has to gate on the returned subfolder rather than on the call having returned at all.
+
+    The consequence is not cosmetic: `sft_train` suppresses the end-of-run final publish for any
+    step in `deployable_published_steps` (sft_train.py:633). Crediting a failed optional publish of
+    the final step therefore SKIPS the final publish, and a run ends with no servable adapter while
+    reporting success.
+
+    The sibling coalescing test cannot catch this -- its publish mock returns a subfolder, so the
+    guard is never exercised with a falsy return. Verified by mutation: deleting the `if published:`
+    guard leaves the whole sft/grpo/opd suite green and fails only this test.
+    """
+    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+
+    local_dir = tmp_path / "ckpt"
+    checkpoint_dir = local_dir / "global_step_7"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    # the best-effort failure shape: swallowed the error and published nothing.
+    monkeypatch.setattr(
+        sft_checkpoints._w, "publish_deployable_checkpoint", lambda adapter, step, **kw: None
+    )
+    monkeypatch.setattr(
+        sft_checkpoints._w,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (
+            kwargs["before_upload"](),
+            kwargs["after_upload"](),
+            True,
+        )[2],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+    )
+    watcher._publish(7, str(checkpoint_dir))
+
+    assert watcher.lifecycle.deployable_published_steps == set(), (
+        "a publish that returned None was credited as a durable deployable"
+    )
+    # the resume state genuinely landed, so that fact stays true: the two artifacts are independent
+    # trees and a failed adapter publish says nothing about the full-state upload.
+    assert watcher.lifecycle.facts(7).resume_uploaded
+    assert watcher.lifecycle.facts(7).discovered
+
+
 def test_watcher_run_coalesces_an_optional_backlog(monkeypatch, tmp_path):
     watcher, published = _publishing_watcher(
         monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=()
@@ -3295,7 +3397,60 @@ def test_watcher_run_coalesces_an_optional_backlog(monkeypatch, tmp_path):
 
     assert watcher._error is None
     assert published == [450]
-    assert watcher.processed_steps == {350, 400, 450}
+    # all three are claimed so the next sweep skips them, but the two that were coalesced away must
+    # not look identical to the one that was actually published. that conflation is what the
+    # lifecycle ledger exists to remove: a superseded step has no durable artifact behind it.
+    assert watcher.lifecycle.discovered_steps == {350, 400, 450}
+    assert watcher.lifecycle.deployable_published_steps == {450}
+    assert not watcher.lifecycle.facts(350).deployable_published
+    assert not watcher.lifecycle.facts(400).staged
+
+
+def test_a_required_save_without_an_artifact_repo_fails_instead_of_passing_silently(
+    monkeypatch, tmp_path
+):
+    """a required save is owed a servable adapter, so no repository means the run failed.
+
+    upload_resume_checkpoint returns True at `if not _w.HF_REPO` BEFORE running before_upload, so
+    the required publish that would have raised is never reached. checking completeness against the
+    steps this watcher handled therefore passed a run that published nothing at all. the completeness
+    check reads the published-adapter fact instead, which no-repo can never set.
+    """
+    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+
+    local_dir = tmp_path / "ckpts"
+    (local_dir / "global_step_5" / "huggingface").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("5")
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    # the real no-repo path: returns True without running either callback.
+    monkeypatch.setattr(
+        sft_checkpoints._w, "upload_resume_checkpoint", lambda step, ckpt, **kwargs: True
+    )
+    monkeypatch.setattr(
+        sft_checkpoints._w,
+        "publish_deployable_checkpoint",
+        lambda *a, **kw: pytest.fail("no repository, so nothing can be published"),
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(5,),
+    )
+    watcher._publish(5, str(local_dir / "global_step_5"))
+
+    assert watcher.lifecycle.facts(5).discovered
+    assert not watcher.lifecycle.facts(5).deployable_published
+    assert watcher.lifecycle.missing_deployables(watcher.required_steps) == [5]
 
 
 def test_a_publisher_keeping_up_still_publishes_every_periodic_save(monkeypatch, tmp_path):
@@ -3347,7 +3502,9 @@ def test_the_opd_watcher_publishes_every_step_despite_the_sft_bound(monkeypatch,
     assert watcher._publishable(pending) == pending, (
         "the opd watcher inherited the sft backlog skip, dropping a resume point"
     )
-    assert watcher.processed_steps == set(), "opd marked a step processed without publishing it"
+    assert watcher.lifecycle.discovered_steps == set(), (
+        "opd claimed a step during backlog selection without publishing it"
+    )
 
 
 def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):
@@ -3355,7 +3512,7 @@ def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):
 
     `_OpdVerlCheckpointWatcher` subclasses the sft watcher, so a cleanup placed in a shared method
     would silently reach it. Both siblings hand their export to something that runs LATER -- rl
-    republishes from `staged_steps` on a subsequent sweep, opd passes `adapter_dir` into
+    republishes from `staged_adapters` on a subsequent sweep, opd passes `adapter_dir` into
     `_stage_retry_contract` -- so for them the directory is live state, not garbage. The sft path is
     safe to clear precisely because it has no such consumer.
 
@@ -3425,7 +3582,7 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     """the rl half of the same contract, driven across the two sweeps that actually span it.
 
     The rl uploader stages an adapter on the sweep a checkpoint appears and publishes it on a LATER
-    one, once the gradient gate opens -- `staged_steps` carries the path between them. That gap is
+    one, once the gradient gate opens -- `staged_adapters` carries the path between them. That gap is
     the whole reason the sft deletion cannot be lifted into shared code.
 
     The gate is what opens the gap, so the test has to close it. An earlier version passed
@@ -3483,13 +3640,14 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     # sweep one, gate SHUT: the step is staged because verl may prune its checkpoint at any time,
     # but nothing may be published yet. this is the window the adapter has to survive.
     for step, path in uploader._pending():
-        if step in uploader.required_steps and step not in uploader.staged_steps:
-            uploader.staged_steps[step] = uploader._stage_deployable(step, path)
+        if step in uploader.required_steps and step not in uploader.staged_adapters:
+            uploader.staged_adapters[step] = uploader._stage_deployable(step, path)
+            uploader.lifecycle.mark_staged(step)
             uploader._publish_ready()
-        uploader.processed_steps.add(step)
+        uploader.lifecycle.mark_discovered(step)
     uploader._publish_ready()
 
-    adapter_dir = uploader.staged_steps[4]
+    adapter_dir = uploader.staged_adapters[4]
     assert published == [], "the gradient gate was shut, so nothing may have been published"
     assert os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")), (
         "the rl watcher discarded a staged adapter while the gradient gate was still shut"
@@ -3498,7 +3656,8 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     # verl is free to prune its own checkpoint now; only `export_root` carries the step forward.
     shutil.rmtree(checkpoint_dir)
 
-    # sweep two, gate OPEN: the surviving directory is read back out of `staged_steps` and published.
+    # sweep two, gate OPEN: the surviving directory is read back out of the staged adapters and
+    # published.
     gate_open = True
     uploader._publish_ready()
 

@@ -659,11 +659,9 @@ def _prepare_sft_child(
     # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded
     # watcher re-merges it and re-uploads full state hf already has, holding the resume-upload
     # lock while the first genuinely new checkpoint waits behind it.
-    watcher.processed_steps.update(
-        _sft_train._processed_resume_steps(options.save_at_steps, resume_step)
-    )
+    _sft_train._seed_resume_lifecycle(watcher, options.save_at_steps, resume_step)
     if resume_step >= model.update_horizon:
-        missing = sorted(watcher.required_steps - watcher.processed_steps)
+        missing = watcher.lifecycle.missing_deployables(watcher.required_steps)
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
     child_env = _sft_train._build_verl_child_env(
