@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 
+from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -61,13 +62,13 @@ def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: i
         raise RuntimeError("the prepared SFT warm-start adapter could not be downloaded")
     with open(os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8") as file:
         config = json.load(file)
-    rank = int(config.get("r") or 0)
+    rank = rank_from_adapter_config(config, source=os.path.join(adapter_dir, "adapter_config.json"))
     if rank != expected_rank:
         raise ValueError(
             f"SFT warm-start adapter rank {rank} does not match the prepared train.lora_rank "
             f"{expected_rank}; rank changes are not supported"
         )
-    _w.validate_lora_target_parameters(config, model_id)
+    _w.validate_warmstart_adapter(config, model_id, adapter_dir)
     base = str(config.get("base_model_name_or_path") or "").strip()
     if base and base != model_id:
         raise ValueError("SFT warm-start adapter base model does not match the target model")
@@ -137,20 +138,19 @@ def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: i
     return durable
 
 
-def _processed_resume_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
-    """steps a resumed watcher must not publish again, for seeding ``processed_steps``.
+def _seed_resume_lifecycle(watcher, required_steps: tuple[int, ...], resume_step: int) -> None:
+    """record what a previous attempt already made durable, before the watcher's first sweep.
 
-    the staged resume checkpoint lands in local_dir as ``global_step_N`` with the tracker pointing
-    at it, so an unseeded watcher sees it as pending on its first sweep and re-runs the merger and
-    the multi-GB resume upload for state hf already holds. the resume artifact only exists because a
-    previous attempt published its deployable first (``before_upload``), so the step's deployable is
-    already on hf. a resume step that IS a required save is credited only when
-    ``_durable_required_save_steps`` finds its adapter on hf, leaving it to be staged otherwise.
+    the resume-state half of this is the shared rule and lives on the ledger. what stays here is the
+    part only sft and opd can answer: the prior attempt's deployable publish was best-effort for a
+    periodic save, so a required step is credited only when ``_durable_required_save_steps`` finds
+    its adapter on hf. a required step whose adapter is missing stays undiscovered, so this watcher
+    stages and publishes it without re-uploading the full state hf already has.
     """
-    processed = _durable_required_save_steps(required_steps, resume_step)
-    if resume_step and resume_step not in required_steps:
-        processed.add(resume_step)
-    return processed
+    watcher.lifecycle.seed_resumed_step(resume_step, frozenset(required_steps))
+    for step in _durable_required_save_steps(required_steps, resume_step):
+        watcher.lifecycle.mark_deployable_published(step)
+        watcher.lifecycle.mark_discovered(step)
 
 
 _CHILD_ENV_EXACT = frozenset(
@@ -321,11 +321,6 @@ def _resolve_sft_fused_ce_backend(caps):
     return fused_ce_backend(caps)
 
 
-def _append_exact_sft_dataloader_shim(shim_source: str) -> str:
-    shim_source += render_exact_sft_dataloader_shim()
-    return shim_source
-
-
 def _sft_profile_max_length(profile) -> int:
     max_length = profile.max_length
     return max_length  # noqa: RET504
@@ -355,10 +350,7 @@ from flash.engine.worker.backend_common import (  # noqa: E402,F401
     parse_verl_metric,
     parse_wandb_link,
     probe_verl_capabilities,
-    render_flash_qla_shim,
-    render_gdn_varlen_shim,
-    render_shim_marker_prologue,
-    render_wandb_link_shim,
+    render_sitecustomize_bootstrap,
     require_gdn_boundary_resets,
     resolve_verl_loggers,
     resolve_verl_python,
@@ -368,7 +360,6 @@ from flash.engine.worker.backend_common import (  # noqa: E402,F401
     strict_gdn_probe_module,
     verify_applied_shim_markers,
     verl_step_number,
-    wrap_shim_fragment,
 )
 from flash.engine.worker.entry.sft import _model_arch_dims, sft_under_ran  # noqa: E402,F401
 from flash.engine.worker.io.heartbeat import liveness_heartbeat  # noqa: E402
@@ -387,12 +378,9 @@ from flash.engine.worker.train.sft.config import (  # noqa: E402,F401
     _hydra_val,
     _optimizer_override_config,
     _render_sft_dataset_module,
-    _render_sft_sitecustomize,
     _sft_parquet_features,
     _write_sft_parquet,
     build_sft_overrides,
-    render_exact_sft_dataloader_shim,
-    render_loraplus_shim,
 )
 
 # isort: split
@@ -628,12 +616,13 @@ def run_sft_train(spec=None) -> None:
             python_bin=child.python_bin,
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # only a step this session's watcher actually published may suppress the final publish.
-        # the seeded resume step is excluded: the prior attempt's deployable publish is best-effort
-        # (`required=False`) while its resume upload is not, so hf can hold the resumable state
-        # without the servable adapter. re-publishing is an idempotent upload to the same path.
-        if final_save_due(final_step, options.save_at_steps) and final_step not in (
-            child.watcher.processed_steps - {child.resume_step}
+        # only a durably published adapter may suppress the final publish. the seeded resume step no
+        # longer needs excluding by hand: it is credited as deployable_published only when its
+        # adapter was actually found on hf, so a resume that carried resumable state without a
+        # servable adapter falls through to this publish instead of being skipped.
+        if (
+            final_save_due(final_step, options.save_at_steps)
+            and final_step not in child.watcher.lifecycle.deployable_published_steps
         ):
             _w.publish_deployable_checkpoint(adapter_dir, final_step)
         outputs = _SftOutputs(adapter_dir, train_wall, device_peak_gpu_gb)
