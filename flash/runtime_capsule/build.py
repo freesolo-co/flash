@@ -61,15 +61,18 @@ RUNNABLE = {runnable!r}
 DEFAULT = {entry_module!r}
 
 argv = sys.argv[1:]
-if argv and argv[0] in RUNNABLE:
-    target, sys.argv = argv[0], [argv[0], *argv[1:]]
-elif argv and argv[0].startswith("--run="):
-    name = argv[0][len("--run=") :]
-    if name not in RUNNABLE:
-        sys.exit("flash capsule: unknown program %r (have: %s)" % (name, ", ".join(RUNNABLE)))
-    target, sys.argv = name, [name, *argv[1:]]
+if argv and argv[0].startswith("--run="):
+    name, rest = argv[0][len("--run=") :], argv[1:]
+elif argv:
+    # a bare first argument is ALWAYS a program name, never a program argument. the alternative --
+    # treating an unrecognized word as an argument to the default -- means a typo'd or renamed
+    # launch line silently starts the training bootstrap on a rented box.
+    name, rest = argv[0], argv[1:]
 else:
-    target, sys.argv = DEFAULT, [DEFAULT, *argv]
+    name, rest = DEFAULT, []
+if name not in RUNNABLE:
+    sys.exit("flash capsule: unknown program %r (have: %s)" % (name, ", ".join(RUNNABLE)))
+target, sys.argv = name, [name, *rest]
 
 runpy.run_module(target, run_name="__main__", alter_sys=True)
 """

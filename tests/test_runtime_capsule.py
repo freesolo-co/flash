@@ -269,6 +269,65 @@ def test_capsule_members_import_with_flash_absent(tmp_path):
     assert "OK" in result.stdout
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["nonesuch"],  # a plain typo
+        ["hostlogg"],  # a near-miss on a real member
+        ["--run=nonesuch"],  # the explicit form
+        ["bootstrap.py"],  # the member PATH rather than its program name
+    ],
+)
+def test_capsule_refuses_an_unknown_program_instead_of_running_the_default(tmp_path, argv):
+    """An unrecognized program name must exit non-zero, NOT fall through to the entrypoint.
+
+    The entrypoint is the training bootstrap: it installs packages, fetches code from HF, and starts
+    a run. Treating an unknown first argument as an argument TO that default means a typo'd or
+    stale launch line silently starts training on a box rented for something else, and the exit
+    status still looks like the host helper succeeded.
+    """
+    archive, _ = build_capsule(PROFILE)
+    capsule = tmp_path / "capsule.pyz"
+    write_capsule(capsule, archive)
+
+    result = subprocess.run(
+        [sys.executable, "-S", str(capsule), *argv],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+    )
+    assert result.returncode != 0, result.stdout
+    assert "unknown program" in result.stderr, result.stderr
+    # the refusal names what IS runnable, so the fix is obvious from the box's log.
+    assert "bootstrap" in result.stderr
+
+
+def test_capsule_runs_a_named_host_helper_and_passes_its_arguments(tmp_path):
+    """The dispatch is only fail-closed if the real names still work -- and still get their args.
+
+    deadline_sleep takes the number of seconds to sleep, so an argv that arrives shifted (or not at
+    all) turns every bounded wait on the box into an immediate return or a hang.
+    """
+    archive, _ = build_capsule(PROFILE)
+    capsule = tmp_path / "capsule.pyz"
+    write_capsule(capsule, archive)
+    (tmp_path / "payload.json").write_text("{}")
+
+    # no payload at the box path -> the helper exits 125 (its "cannot read the deadline" code)
+    # rather than sleeping. What matters here is that it RAN: an unknown-name refusal exits 1 with
+    # "unknown program", and the default (bootstrap) would fail differently again.
+    result = subprocess.run(
+        [sys.executable, "-S", str(capsule), "deadline_sleep", "0"],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+    )
+    assert "unknown program" not in result.stderr, result.stderr
+    assert result.returncode == 125, (result.returncode, result.stderr)
+
+
 def test_capsule_entry_does_not_own_spawn_targets():
     """`__main__` must only dispatch.
 
