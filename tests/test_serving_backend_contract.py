@@ -579,7 +579,7 @@ def test_a_failed_adapter_load_reports_failed_not_ready(client):
     assert "max_lora_rank" in record["metadata"]["failure"]
 
 
-def test_a_lost_settle_response_does_not_overwrite_a_committed_ready_record(client):
+def test_a_late_settle_exception_preserves_an_already_ready_record(client):
     module = client.app.state.generated_module
 
     async def committed_then_lost(record):
@@ -599,6 +599,32 @@ def test_a_lost_settle_response_does_not_overwrite_a_committed_ready_record(clie
     assert record["status"] == "ready"
     assert record["metadata"]["lifecycle_state"] == "ready"
     assert client.app.state.unregistered == []
+
+
+def test_engine_response_error_unloads_exact_attempt_and_marks_it_failed(client):
+    module = client.app.state.generated_module
+
+    async def response_error(record):
+        raise RuntimeError("engine response unavailable")
+
+    client.app.state.engine_methods["settle"] = response_error
+    assert client.post("/adapters", json=REGISTRATION).status_code == 202
+    registered = client.get(f"/adapters/{REVISION}").json()["adapter"]
+    incarnation = module._record_incarnation(registered)
+    assert incarnation == f"{REVISION}@{registered['metadata']['settle_attempt']}"
+    assert registered["status"] == "registered"
+    assert module._lifecycle_state(registered) == "registered"
+
+    _drain_spawn_queue(client)
+
+    failed = client.get(f"/adapters/{REVISION}").json()["adapter"]
+    assert client.app.state.unregistered == [(REVISION, incarnation)]
+    assert failed["status"] == "disabled"
+    assert module._lifecycle_state(failed) == "failed"
+    assert (
+        "the serving engine did not answer: engine response unavailable"
+        in failed["metadata"]["failure"]
+    )
 
 
 def test_redeploying_the_same_checkpoint_after_undeploy_uses_a_fresh_incarnation(
