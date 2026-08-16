@@ -19,6 +19,13 @@ canonical JSON of `to_dict()` and `to_internal_dict()` output. Key ORDER is safe
 (`sort_keys=True`), but key PRESENCE is not -- adding, dropping, or renaming a key in a decode path
 changes the digest and fails integrity validation for every warm-start and workload-profile run in
 flight. Change decoding here only with the corpus gate green.
+
+What is deliberately NOT here: `_coerce_wandb` and `_parse_persisted_gpu_types` are also called only
+from `JobSpec.from_dict`, so they belong to this contract by usage -- but they construct `WandbSpec`
+and reach `_validated_gpu_type`, which `__post_init__` needs too. Moving them would make this module
+import the dataclasses that import it. The boundary is therefore drawn at "persisted-decoding logic
+that does not depend on the spec types themselves"; collapsing that seam properly is the job of the
+later split that gives the persisted record its own type, not of this move.
 """
 
 from __future__ import annotations

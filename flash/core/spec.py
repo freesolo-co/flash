@@ -27,6 +27,12 @@ from uuid import UUID
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
+
+# `DROPPED_TOP_LEVEL_KEYS` keeps its historical private alias rather than being renamed at its 5 call
+# sites: `flash.runner` re-exports it as a package attribute and `preparation.py` reads it back through
+# `_runner()`, which is the seam the tests patch. Renaming it is a separate change from moving it, and
+# doing both at once would put a live recovery path's patch points inside a refactor whose whole claim
+# is that nothing behavioral moved.
 from flash.core.spec_persistence import (
     DROPPED_TOP_LEVEL_KEYS as _DROPPED_TOP_LEVEL_KEYS,
 )
