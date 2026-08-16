@@ -536,6 +536,26 @@ def _check_env_push_limits(
         )
 
 
+def _check_env_push_credentials(pkg: Path, *, entrypoint: Path) -> None:
+    """Refuse to publish a package that carries a credential, after staging and before upload.
+
+    Filename filters answer the wrong question. `_ENV_PUSH_SECRET_PATTERNS` drops files *named*
+    like secret stores, so the sourceable shell file convention (`env.sh`, `setenv.sh`,
+    `secrets.sh`) sails straight through and a plain `flash env push .` published a live
+    `FREESOLO_API_KEY` into an org-shared hub repo, permanently in its git history.
+
+    Scans the STAGED package, so what is checked is byte for byte what is uploaded. Checking the
+    source tree instead left the generated members unscanned -- the synthesized README embeds
+    `--name`, so a key passed there was published verbatim -- and left a window in which any local
+    process rewriting a source file put unscanned bytes into the archive.
+    """
+    from flash.env_secrets import reject_credential_bearing_package
+
+    # the entrypoint is staged as environment.py, so name it in the author's terms: telling them
+    # to fix `environment.py` when their file is `custom_env.py` points at a file they don't have.
+    reject_credential_bearing_package(pkg, display={_ENV_ENTRYPOINT: entrypoint.name})
+
+
 def _copy_env_sidecars(
     env_root: Path, dest: Path, *, entrypoint: Path, include_full_tree: bool
 ) -> None:
@@ -716,6 +736,13 @@ def cmd_env_push(args) -> int:
         readme = pkg / "README.md"
         if not readme.exists():
             readme.write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
+        # Every member now exists exactly as it will be uploaded, so this is the one point at which
+        # scanning proves something about the archive rather than about a tree that may since have
+        # changed. `_tar_b64` below reads this same staged directory, nothing else.
+        try:
+            _check_env_push_credentials(pkg, entrypoint=entrypoint)
+        except (OSError, ValueError) as exc:
+            return _err(f"cannot publish {src}: {exc}")
         # One progress widget spans both phases the user otherwise waits through silently:
         # packaging (walk + gzip, slow for large datasets) and the upload itself.
         bar = _UploadProgress(env_name)
