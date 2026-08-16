@@ -7,25 +7,15 @@ import contextlib
 import os
 import re
 import threading
-from typing import Any
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.providers._lifecycle.worker import (
-    DEFAULT_EXECUTION_TIMEOUT_MS,
-    WORKER_SYSTEM_DEPS,
-    logger,
-    resolve_worker_deps,
-    worker_image_for_gpu,
-)
+from flash.providers._lifecycle.worker import logger
 from flash.providers.base import canonical_gpu, gpu_short
-from flash.providers.runpod.gpus import flash_gpu
 
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
 
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-
-_ENDPOINT_CACHE: dict[str, Any] = {}
 
 
 def _reset_flash_resource_manager(rm_module) -> None:
@@ -747,65 +737,6 @@ def endpoint_name(friendly_gpu: str, suffix: str | None = None) -> str:
     return f"{base}-{safe}" if safe else base
 
 
-def get_train_endpoint(
-    friendly_gpu: str,
-    execution_timeout_ms: int | None = None,
-    name_suffix: str | None = None,
-    disk_gb: int | None = None,
-    spec=None,
-):
-    """Build (and cache) the live Flash endpoint handler for a GPU class."""
-    from runpod_flash import Endpoint
-
-    from flash.core.spec import gpu_count_of
-    from flash.providers.runpod.auth import ensure_auth
-
-    ensure_auth()
-    _patch_runpod_backoff()
-
-    friendly = canonical_gpu(friendly_gpu)
-    name = endpoint_name(friendly, name_suffix)
-    cache_handler = name_suffix is None
-    with FLASH_SDK_LOCK:
-        isolate_flash_state(name_suffix)
-        if cache_handler and name in _ENDPOINT_CACHE:
-            return _ENDPOINT_CACHE[name]
-        kwargs = {
-            "name": name,
-            "gpu": flash_gpu(friendly),
-            # one worker occupies gpu.count cards of this class; count == 1 is the historical path.
-            "gpu_count": gpu_count_of(spec),
-            "min_cuda_version": min_cuda_for(friendly),
-            "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-            "workers": (0, 1),
-        }
-        image = worker_image_for_gpu(friendly, allow_default=False)
-        if image:
-            kwargs["image"] = image
-        else:
-            kwargs["dependencies"] = resolve_worker_deps()
-            kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-        # Local import: avoids a jobs<->endpoints import cycle (jobs imports this module).
-        from flash.providers.runpod.jobs import (
-            grow_weight_cache_volumes,
-            weight_cache_endpoint_kwargs,
-        )
-
-        # resize before attach because existing volumes keep their provisioned size.
-        # reread the key after waiting for the lock so resize and Endpoint use the same account.
-        grow_weight_cache_volumes(spec, ensure_auth())
-        kwargs.update(weight_cache_endpoint_kwargs(spec))
-        ep = Endpoint(**kwargs)
-        handler = ep(_train_body)
-        from flash.providers.runpod.jobs import apply_disk_gb
-
-        cfg = ep._build_resource_config()
-        apply_disk_gb(cfg, disk_gb)
-        if cache_handler:
-            _ENDPOINT_CACHE[name] = handler
-        return handler
-
-
 def _run_suffix(run_id: str | None) -> str | None:
     """Stable, collision-free per-run endpoint suffix: sha1(run_id)[:8] with a readable prefix.
 
@@ -819,27 +750,6 @@ def _run_suffix(run_id: str | None) -> str | None:
     h = hashlib.sha1(run_id.encode()).hexdigest()[:8]
     prefix = re.sub(r"[^a-z0-9]", "", run_id.lower())[-12:]
     return f"{prefix}{h}" if prefix else h
-
-
-def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
-    """Scale cached endpoint(s) to zero. Only touches in-process cache; use terminate_endpoint for cross-process teardown."""
-    friendly = canonical_gpu(friendly_gpu)
-    prefix = f"flash-{gpu_short(friendly)}"
-    if name:
-        match = [k for k in _ENDPOINT_CACHE if k == name]
-    else:
-        match = [k for k in _ENDPOINT_CACHE if k.startswith(prefix)]
-    for key in match:
-        handler = _ENDPOINT_CACHE.pop(key, None)
-        ep = getattr(handler, "__self__", None) or getattr(handler, "endpoint", None)
-        for meth in ("scale_to_zero", "stop", "delete"):
-            fn = getattr(ep, meth, None)
-            if callable(fn):
-                try:
-                    fn()
-                    break
-                except Exception:
-                    continue
 
 
 def _endpoint_name_matches_run(name: str, target: str) -> bool:
@@ -981,6 +891,4 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
     except Exception as exc:
         logger.warning("REST endpoint cleanup failed for %s: %s", target, exc)
 
-    with contextlib.suppress(Exception):
-        stop_endpoint(friendly, name=target)
     return results

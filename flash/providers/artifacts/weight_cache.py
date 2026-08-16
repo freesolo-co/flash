@@ -36,7 +36,6 @@ from flash.providers.runpod import api as runpod_api  # noqa: F401
 # half reads them back through it. an autofix that drops them as unused breaks those tests.
 from flash.providers.runpod.jobs import (  # noqa: F401
     GraceTimer,
-    build_function_input,
     decode_output,
     deploy_train_endpoint,
     weight_cache_datacenters,

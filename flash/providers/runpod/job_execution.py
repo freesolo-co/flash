@@ -26,11 +26,6 @@ from flash.providers._lifecycle.poll import (
 from flash.providers.base import PollResult
 from flash.providers.runpod import jobs as _jobs
 from flash.providers.runpod.resources import WEIGHT_CACHE_GROW_BUDGET_S
-from flash.providers.runpod.serverless import (
-    WORKER_SYSTEM_DEPS,
-    _train_body,
-    resolve_worker_deps,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -219,7 +214,7 @@ def deploy_train_endpoint(
     _jobs._patch_runpod_backoff()
     friendly = _jobs.canonical_gpu(friendly_gpu)
     name = _jobs.endpoint_name(friendly, name_suffix)
-    image = _jobs.worker_image_for_gpu(friendly, allow_default=True)
+    image = _jobs.worker_image_for_gpu(friendly)
     context = _DeployContext(deadline_at, spec, cache_volumes, set())
 
     def _deploy_once() -> tuple[object, str]:
@@ -242,11 +237,7 @@ def deploy_train_endpoint(
                 "execution_timeout_ms": execution_timeout_ms or _jobs.DEFAULT_EXECUTION_TIMEOUT_MS,
                 "workers": (0, 1),
             }
-            if image:
-                kwargs["image"] = image
-            else:
-                kwargs["dependencies"] = resolve_worker_deps()
-                kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+            kwargs["image"] = image
             # reconcile the selected account before attach because the SDK returns existing volumes
             # at their old size. do this once per account and preserve the later create allowance.
             if owning_key not in context.reconciled:
@@ -261,7 +252,6 @@ def deploy_train_endpoint(
                 override if override is not None else _jobs.weight_cache_endpoint_kwargs(spec)
             )
             ep = Endpoint(**kwargs)
-            ep._qb_target = _train_body
             config = ep._build_resource_config()
             _jobs.apply_disk_gb(config, disk_gb)
             rm = ResourceManager()

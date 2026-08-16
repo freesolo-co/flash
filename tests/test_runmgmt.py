@@ -2111,7 +2111,6 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
         "deploy_train_endpoint",
         lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT),
     )
-    monkeypatch.setattr(jobs, "build_function_input", lambda payload: payload)
     monkeypatch.setattr(
         jobs.runpod_api,
         "submit_job",

@@ -257,15 +257,31 @@ def hf_upload(
         return False
 
 
-def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> bool:
-    """Upload one console snapshot from an isolated process."""
-    tail_path = console + ".tail"
+def _upload_console_snapshot(
+    payload: dict, console: str, mode: str, extra: str = "", final: bool = False
+) -> bool:
+    """Upload one console snapshot from an isolated process.
+
+    The periodic snapshot and the terminal one never share a scratch file or a repo destination.
+    Reaping the periodic child at teardown is best-effort, so one killed mid-write would otherwise
+    truncate the scratch file the terminal snapshot is uploading, or overwrite the terminal artifact
+    itself -- losing the failure detail the control plane reads, including the wall-clock-cap marker.
+
+    The terminal snapshot keeps the canonical ``console_<mode>.txt`` the control plane reads; the
+    periodic one takes the attempt-scoped name it reads separately, matching the serverless handler,
+    so a retry cannot overwrite the attempt that reproduced the failure. This module can never
+    import flash, so the format is spelled out here and pinned against
+    ``flash.adapters.artifacts.attempt_scoped_artifact_name`` by test rather than by coincidence --
+    a name the reader does not expect looks exactly like a worker that uploaded nothing.
+    """
+    kind = "" if final else f"_attempt{payload.get('attempt', 0)}"
+    tail_path = f"{console}{kind}.tail"
     tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
     if extra:
         tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
         f.write(_safe_detail(tail, 64_000, secrets=_payload_secrets(payload)))
-    return hf_upload(payload, tail_path, f"console_{mode}.txt")
+    return hf_upload(payload, tail_path, f"console_{mode}{kind}.txt")
 
 
 def _console_upload_loop(
@@ -453,7 +469,7 @@ def _upload_console_tail_bounded(
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_upload_console_snapshot,
-        args=(payload, console, mode, extra),
+        args=(payload, console, mode, extra, True),
         daemon=True,
     )
     process.start()
