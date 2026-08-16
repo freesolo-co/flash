@@ -935,6 +935,7 @@ from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
     resolve_rollout_enforce_eager,
     resolve_verl_loggers,
     resolve_verl_python,
+    rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
     strict_gdn_probe_module,

@@ -12,7 +12,6 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from flash.content.multimodal import message_content_text
 from flash.envs.base import (
     REWARD_GROUP_CONCURRENCY,
     BaseEnvironment,
@@ -656,23 +655,16 @@ class FreesoloEnvironment(BaseEnvironment):
         state["turn"] = int(state.get("turn", 0)) + 1
         if step.metadata:
             state.setdefault("step_metadata", []).append(step.metadata)
-        replies = [dict(message) for message in step.messages]
-        state.setdefault("messages", []).extend(replies)
-        for message in replies:
-            # mirror the rule the multi-turn child applies to the same reply: block content is
-            # joined through message_content_text, everything else keeps str(). a bare str() on a
-            # block list yields the python repr, so a turn-aware scorer would grade
-            # "[{'type': 'text', ...}]" while the model conditioned on the joined text. the two
-            # branches have to agree exactly, or the divergence just moves to another shape.
-            raw_content = message.get("content", "")
+        replies = [deepcopy(dict(message)) for message in step.messages]
+        scored_replies = deepcopy(replies)
+        state.setdefault("messages", []).extend(scored_replies)
+        for message in scored_replies:
+            # score_episode receives a structural copy of the environment's raw chat content. the
+            # parent bridge flattens only the separate child-bound reply returned below.
             state.setdefault("turns", []).append(
                 self._EnvironmentTurn(
                     role=str(message.get("role", "")),
-                    content=(
-                        message_content_text(raw_content)
-                        if isinstance(raw_content, list)
-                        else str(raw_content)
-                    ),
+                    content=deepcopy(message.get("content", "")),
                 )
             )
         return replies

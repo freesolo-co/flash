@@ -12,6 +12,7 @@ import threading
 import time
 import tracemalloc
 import types
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -54,7 +55,7 @@ class _RewardResult:
 @dataclass(frozen=True)
 class _EnvironmentTurn:
     role: str
-    content: str
+    content: str | list[dict]
 
 
 @dataclass(frozen=True)
@@ -2246,9 +2247,14 @@ def test_step_episode_receives_the_raw_turn_not_the_scored_one(monkeypatch):
 
 
 class _BlockReplyMultiTurnEnv(_EnvironmentMultiTurn):
-    """Multi-turn env whose step_episode replies in openai-style text BLOCKS rather than a string."""
+    """multi-turn env whose terminal reply contains raw text and image blocks."""
 
     def __init__(self):
+        self.reply_content = [
+            {"type": "text", "text": "first "},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "second"},
+        ]
         self.scored: list[object] = []
 
     def start_episode(self, example, prompt_text):
@@ -2256,16 +2262,8 @@ class _BlockReplyMultiTurnEnv(_EnvironmentMultiTurn):
 
     def step_episode(self, example, messages, assistant_response):
         return _EnvironmentStepResult(
-            done=False,
-            messages=(
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "first "},
-                        {"type": "text", "text": "second"},
-                    ],
-                },
-            ),
+            done=True,
+            messages=({"role": "user", "content": self.reply_content},),
             final_response_text=None,
         )
 
@@ -2274,39 +2272,24 @@ class _BlockReplyMultiTurnEnv(_EnvironmentMultiTurn):
         return [_RewardResult(score=1.0, success=True) for _ in episodes]
 
 
-def test_a_block_reply_reaches_the_scorer_as_the_text_the_model_saw(monkeypatch):
-    """The turn handed to a turn-aware scorer must be the text the next model turn conditioned on.
-
-    The multi-turn child joins text blocks through message_content_text before the reply enters the
-    transcript, so the model reads "first second". Recording the turn with a bare str() stored the
-    python repr "[{'type': 'text', ...}]" instead, and score_episodes then graded a transcript that
-    never existed. The two views have to agree.
-    """
+def test_terminal_block_reply_reaches_score_episode_without_flattening(monkeypatch):
     sdk_env = _BlockReplyMultiTurnEnv()
     env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+    expected = deepcopy(sdk_env.reply_content)
 
     example = {"id": "a", "input": "2+2?", "output": "4"}
     state = env.new_rollout_state(example)
     env.record_model_turn(state, "a turn")
     env.env_reply(state["messages"], state)
+    sdk_env.reply_content[0]["text"] = "mutated by environment"
+    sdk_env.reply_content.append({"type": "text", "text": "late mutation"})
+    env._score_episode(example, state)
 
-    # record_model_turn appends the assistant turn first, so the env's reply is the last one.
-    recorded = [turn.content for turn in state["turns"]]
-    assert recorded[-1] == "first second", f"the scorer would grade {recorded[-1]!r}"
-    assert "'type'" not in recorded[-1], "a block-list repr reached the scored transcript"
-
-
-def test_a_plain_string_reply_is_still_recorded_unchanged(monkeypatch):
-    """The block fix must not alter the shape every existing multi-turn env already returns."""
-    sdk_env = _SteppingMultiTurnEnv()
-    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
-
-    example = {"id": "a", "input": "2+2?", "output": "4"}
-    state = env.new_rollout_state(example)
-    env.record_model_turn(state, _THINK_COMPLETION)
-    env.env_reply(state["messages"], state)
-
-    assert [turn.content for turn in state["turns"]][-1] == "next"
+    episode = sdk_env.scored[0]
+    assert episode.messages[-1]["content"] == expected
+    assert episode.turns[-1].content == expected
+    episode.messages[-1]["content"][0]["text"] = "mutated in messages"
+    assert episode.turns[-1].content == expected
 
 
 def test_stepping_the_env_leaves_the_scored_text_stripped(monkeypatch):

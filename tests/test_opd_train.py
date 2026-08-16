@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker import opd_train, rl_train, score_batcher
+from flash.engine.worker import backend_common, opd_train, rl_train, score_batcher
 from flash.engine.worker.opd_train import (
     _OPD_PARQUET_WRITE_BATCH_ROWS,
     _BridgePrompt,
@@ -6064,27 +6064,9 @@ def test_opd_pins_the_blackwell_attention_backends_like_grpo_does():
     ), on
 
 
-def test_opd_disables_the_vllm_multimodal_processor_cache():
-    """Image OPD does not run without this, and the failure it produces names neither images nor
-    the cache.
-
-    vLLM splits the mm processor cache across two processes: the frontend SENDER replaces an image
-    it has seen before with just its hash, and the engine-core RECEIVER is supposed to still hold
-    the item. OPD's rollout lifecycle clears the receiver on every sleep/pause without clearing the
-    sender, so the sender keeps sending hashes for items the receiver dropped and each request dies
-    on `assert mm_item is not None`. That kills requests, not the run, so what surfaces is empty
-    rollouts and then an IndexError on a zero-length reward tensor.
-
-    Asserted on the parsed VALUE rather than substring presence, because the two ways this
-    regresses are both silent: a nonzero size re-enables the cache, and the pre-0.13 flag name is
-    rejected by vLLM's arg parser at startup, long after the GPU is paid for.
-    """
-    emitted = build_opd_overrides(_config())
-    overrides = dict(value.split("=", 1) for value in emitted)
-    assert overrides["+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb"] == "0"
-    # `disable_mm_preprocessor_cache` was REMOVED in vllm 0.13.0. it reads like the right knob and
-    # still appears in older verl examples, so pin it out rather than trusting review to catch it.
-    assert not any("disable_mm_preprocessor_cache" in override for override in emitted)
+def test_opd_unconditionally_disables_the_vllm_multimodal_processor_cache():
+    overrides = build_opd_overrides(_config())
+    assert set(backend_common.rollout_mm_processor_cache_overrides()) <= set(overrides)
 
 
 def test_both_ray_rollouts_pin_blackwell_attention_from_the_same_resolver():

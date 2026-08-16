@@ -17,6 +17,7 @@ from flash.engine.profiling.sft_workload import _multimodal_messages_with_images
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
+    rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
     trainer_dtype_overrides,
@@ -332,26 +333,7 @@ def _rollout_overrides(cfg: dict) -> list[str]:
         ),
         # safetensors load format is required for lora rollout on vllm.
         "actor_rollout_ref.rollout.load_format=safetensors",
-        # turn OFF vllm's multimodal processor cache, for the same reason the opd driver does
-        # (train/opd/overrides.py). the cache is split across two processes: a SENDER half in the
-        # frontend replaces an already-seen image with just its hash, and a RECEIVER half in the
-        # engine core is supposed to still hold the item that hash names. verl leaves
-        # rollout.enable_sleep_mode defaulted True and main_ppo_sync sleeps the replicas after
-        # init_workers and again after every training batch, and each sleep reaches
-        # `EngineCore._reset_caches()`, which clears the RECEIVER only. the sender then keeps sending
-        # hash-only requests for images the receiver has dropped, and each one dies on
-        # `assert mm_item is not None`.
-        #
-        # grpo is on that same lifecycle: rollout_resident_overrides only disables sleep for catalog
-        # models flagged sleep_unsupported, so every other image-capable model rolls out with sleep on
-        # and the cache live. the assertion kills the REQUEST rather than the run, so rollouts come
-        # back empty and verl indexes [-1] into a zero-length reward tensor -- the visible error is an
-        # IndexError that never mentions images.
-        #
-        # unconditional, like the opd path: with no mm items there is no cache, so this is inert on a
-        # text job. 0 is vllm's own disable value and gates BOTH halves, so no hash-only request can
-        # be built and there is nothing left to desync.
-        "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0",
+        *rollout_mm_processor_cache_overrides(),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
         # sleep_unsupported). shared with the opd driver, which runs the same verl sleep path.
         *rollout_resident_overrides(bool(cfg.get("sleep_unsupported"))),
