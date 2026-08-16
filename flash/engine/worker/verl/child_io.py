@@ -196,7 +196,6 @@ def render_sitecustomize_bootstrap() -> str:
 
 
 from flash.engine.worker.train.core.child.runtime import (  # noqa: E402,F401
-    FLASH_FLASH_QLA_MARKER,
     FLASH_GDN_VARLEN_MARKER,
     FLASH_LORA_ROLLOUT_MARKER,
     FLASH_WANDB_LINK_MARKER,

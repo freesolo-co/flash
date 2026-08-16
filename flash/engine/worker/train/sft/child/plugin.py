@@ -15,7 +15,6 @@ PLUGIN_LOADED_EXTERNALLY = __name__ == "flash_sft_plugin"
 def _install_exact_dataloaders() -> None:
     from torch.utils.data.distributed import DistributedSampler
     from torchdata.stateful_dataloader import StatefulDataLoader
-    from verl.trainer import sft_trainer
 
     sampler_init = DistributedSampler.__init__
     if not getattr(sampler_init, "_flash_exact_sampler", False):
@@ -36,16 +35,6 @@ def _install_exact_dataloaders() -> None:
 
         exact_loader_init._flash_exact_loader = True
         StatefulDataLoader.__init__ = exact_loader_init
-
-    original_loader = sft_trainer.StatefulDataLoader
-    if not getattr(original_loader, "_flash_non_dropping", False):
-
-        def non_dropping_loader(*args, **kwargs):
-            kwargs["drop_last"] = False
-            return original_loader(*args, **kwargs)
-
-        non_dropping_loader._flash_non_dropping = True
-        sft_trainer.StatefulDataLoader = non_dropping_loader
 
 
 def _install_seeded_dataloader(seed: int) -> None:
@@ -139,7 +128,6 @@ def _install_loraplus(ratio: float, ready_marker: str) -> None:
                 loraplus_weight_decay=config.weight_decay,
                 **{key: value for key, value in optimizer_kwargs.items() if key != "lr"},
             )
-        self._flash_loraplus_applied = True
         print(
             f"{ready_marker} ratio={ratio:g} optimizer={optimizer_cls.__name__}",
             flush=True,
@@ -154,9 +142,9 @@ def _install_core(config: dict) -> None:
     _install_exact_dataloaders()
     _install_seeded_dataloader(seed)
     _install_linear_scheduler()
-    runtime.install_checkpoint_handler_filter(
-        config.get("save_at_steps", ()), int(config["total_steps"])
-    )
+    save_at_steps = tuple(config.get("save_at_steps", ()))
+    if save_at_steps:
+        runtime.install_checkpoint_handler_filter(save_at_steps, int(config["total_steps"]))
     if config.get("reentrant_gradient_checkpointing"):
         _install_reentrant_checkpointing()
     _install_loraplus(

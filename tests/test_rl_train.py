@@ -361,11 +361,12 @@ def test_no_grpo_plugin_module_imports_cuda_sensitive_packages_at_module_scope()
 
 def _clear_deferred_target(target: str) -> None:
     sys.modules.pop(target, None)
-    sys.meta_path[:] = [
-        finder
-        for finder in sys.meta_path
-        if not isinstance(finder, child_runtime._DeferredFinder) or finder.target != target
-    ]
+    finder = child_runtime._DEFERRED_FINDER
+    finder.pending.pop(target, None)
+    finder.active_targets.discard(target)
+    # the shared finder stays installed while any other target is still armed.
+    if not finder.pending:
+        finder.uninstall()
 
 
 def test_a_deferred_fragment_records_its_marker_only_once_the_patch_applies(tmp_path, monkeypatch):
@@ -685,11 +686,8 @@ def test_the_deferred_registry_runs_patches_at_the_targets_real_import(tmp_path,
 
         assert fired == [("first", "imported"), ("second", "imported")]
         assert Path(marker_file).read_text().splitlines() == ["first", "second"]
-        assert not [
-            finder
-            for finder in sys.meta_path
-            if isinstance(finder, child_runtime._DeferredFinder) and finder.target == target
-        ]
+        assert target not in child_runtime._DEFERRED_FINDER.pending
+        assert child_runtime._DEFERRED_FINDER not in sys.meta_path
     finally:
         _clear_deferred_target(target)
 

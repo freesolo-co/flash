@@ -69,8 +69,9 @@ def install_required(name: str, marker_file: str, installer, *args, **kwargs) ->
 
 
 class _DeferredLoader:
-    def __init__(self, finder, inner):
+    def __init__(self, finder, target: str, inner):
         self._finder = finder
+        self._target = target
         self._inner = inner
 
     def create_module(self, spec):
@@ -78,23 +79,27 @@ class _DeferredLoader:
         return create(spec) if callable(create) else None
 
     def exec_module(self, module):
+        # a real loader failure must leave the queue armed for a later retry
+        # and must not record any marker.
         self._inner.exec_module(module)
-        self._finder.uninstall()
-        self._finder.apply(module)
+        self._finder.drain(self._target, module)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
 
 class _DeferredFinder:
-    """stackable one-shot finder that never imports its target while being armed."""
+    """one target-keyed registry finder that never imports a target while armed."""
 
-    def __init__(self, target: str, apply):
-        self.target = target
-        self.apply = apply
+    def __init__(self):
+        self.pending: dict[str, list] = {}
+        self.active_targets: set[str] = set()
+
+    def register(self, target: str, apply) -> None:
+        self.pending.setdefault(target, []).append(apply)
 
     def find_spec(self, fullname, path=None, target=None):
-        if fullname != self.target:
+        if fullname not in self.pending:
             return None
         positions = [index for index, finder in enumerate(sys.meta_path) if finder is self]
         remaining = sys.meta_path[positions[0] + 1 :] if positions else sys.meta_path
@@ -104,12 +109,36 @@ class _DeferredFinder:
                 continue
             spec = find(fullname, path, target)
             if spec is not None and spec.loader is not None:
-                spec.loader = _DeferredLoader(self, spec.loader)
+                spec.loader = _DeferredLoader(self, fullname, spec.loader)
                 return spec
         return None
 
+    def drain(self, target: str, module) -> None:
+        """apply every queued callback for one target in registration order."""
+        self.active_targets.add(target)
+        try:
+            queue = self.pending.get(target)
+            while queue:
+                # pop before applying so a callback that registers another
+                # same-target callback queues behind the remaining work.
+                apply = queue.pop(0)
+                apply(module)
+                queue = self.pending.get(target)
+        finally:
+            self.active_targets.discard(target)
+            if not self.pending.get(target):
+                self.pending.pop(target, None)
+            self._prune()
+
+    def _prune(self) -> None:
+        if not self.pending:
+            self.uninstall()
+
     def uninstall(self) -> None:
         sys.meta_path[:] = [finder for finder in sys.meta_path if finder is not self]
+
+
+_DEFERRED_FINDER = _DeferredFinder()
 
 
 def _arm_deferred(
@@ -132,10 +161,13 @@ def _arm_deferred(
                 traceback.print_exc()
 
     loaded = sys.modules.get(target)
-    if loaded is not None:
+    if loaded is not None and target not in _DEFERRED_FINDER.active_targets:
         apply(loaded)
-    else:
-        sys.meta_path.insert(0, _DeferredFinder(target, apply))
+        return
+
+    _DEFERRED_FINDER.register(target, apply)
+    if _DEFERRED_FINDER not in sys.meta_path:
+        sys.meta_path.insert(0, _DEFERRED_FINDER)
 
 
 def install_deferred_required(
@@ -193,16 +225,20 @@ def install_wandb_link_reporting() -> None:
 
 def install_checkpoint_handler_filter(save_at_steps, total_steps: int) -> None:
     """keep only requested checkpoint handler saves and the final save."""
+    required_steps = frozenset(int(step) for step in save_at_steps)
+    if not required_steps:
+        # an empty schedule keeps every save, so the wrapper is a pass-through.
+        return
+
     from verl.utils.checkpoint.checkpoint_handler import CheckpointHandler
 
-    required_steps = frozenset(int(step) for step in save_at_steps)
     total_steps = int(total_steps)
     current = CheckpointHandler.save_checkpoint
     if getattr(current, "_flash_exact_save_patched", False):
         return
 
     def save_checkpoint(self, step):
-        if required_steps and step not in required_steps and step != total_steps:
+        if step not in required_steps and step != total_steps:
             return None
         return current(self, step)
 

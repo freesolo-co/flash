@@ -10,13 +10,15 @@ else:
 
 def install(config: dict) -> None:
     marker_file = str(config["marker_file"])
-    runtime.install_required(
-        "opd-core",
-        marker_file,
-        runtime.install_checkpoint_handler_filter,
-        tuple(config.get("save_at_steps", ())),
-        int(config["total_steps"]),
-    )
+    save_at_steps = tuple(config.get("save_at_steps", ()))
+    if save_at_steps:
+        runtime.install_required(
+            "opd-core",
+            marker_file,
+            runtime.install_checkpoint_handler_filter,
+            save_at_steps,
+            int(config["total_steps"]),
+        )
     model_type = config.get("gdn_model_type")
     if model_type:
         runtime.install_deferred_gdn(str(model_type), marker_file)

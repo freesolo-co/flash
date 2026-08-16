@@ -1006,6 +1006,14 @@ def test_dataloader_shim_patches_the_classes_verl_imports(monkeypatch):
     assert DistributedSampler.__init__.__name__ == "exact_sampler_init"
     assert StatefulDataLoader.__init__.__name__ == "exact_loader_init"
 
+    # the class __init__ patch above is the whole mechanism, so the trainer attribute must stay
+    # the original class. an extra function wrapper there would force drop_last a second time and
+    # hide the fact that verl constructs the loader through the shared class.
+    from verl.trainer import sft_trainer
+
+    assert sft_trainer.StatefulDataLoader is loader
+    assert isinstance(sft_trainer.StatefulDataLoader, type)
+
 
 def test_shipped_shim_carries_the_exact_dataloader_patch(monkeypatch):
     """The rendered fragment is only worth testing if it reaches the file verl imports.

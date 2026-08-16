@@ -5384,7 +5384,7 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
 
     def run_child():
         return opd_runner._run_child(
-            SimpleNamespace(knobs=SimpleNamespace(max_completion=1536)),
+            SimpleNamespace(knobs=SimpleNamespace(max_completion=1536, save_at_steps=(1,))),
             object(),
             SimpleNamespace(update_horizon=1, local_dir="/unused", shim_dir=str(tmp_path)),
             SimpleNamespace(
@@ -7372,6 +7372,50 @@ def test_opd_sitecustomize_is_only_the_startup_bootstrap(tmp_path, monkeypatch):
     assert "tf32" in source.lower()
     assert "import verl" not in source
     assert "lora rollout" not in source
+
+
+@pytest.mark.parametrize(
+    ("save_at_steps", "expects_core"),
+    [((3,), True), ((), False)],
+)
+def test_opd_child_records_the_core_marker_only_when_a_save_schedule_was_authored(
+    tmp_path, monkeypatch, save_at_steps, expects_core
+):
+    """the child installs opd-core only for a nonempty schedule, so the parent must match.
+
+    exact-save filtering is the entire meaning of that marker. an empty schedule keeps every save,
+    so installing the wrapper would import verl to build a pass-through, and the parent expecting
+    the marker afterwards would tear down a healthy run at its first step.
+    """
+    from flash.engine.worker.train.opd.child import runtime as opd_child
+
+    marker_file = tmp_path / "applied_shims.txt"
+    armed = []
+    monkeypatch.setattr(
+        opd_child.runtime,
+        "install_deferred_lora_rollout_guard",
+        lambda marker: armed.append("lora-rollout-guard"),
+    )
+    monkeypatch.setattr(
+        opd_child.runtime,
+        "install_checkpoint_handler_filter",
+        lambda steps, total: armed.append(("checkpoint", tuple(steps), total)),
+    )
+
+    opd_child.install(
+        {
+            "marker_file": str(marker_file),
+            "save_at_steps": list(save_at_steps),
+            "total_steps": 10,
+            "wandb": False,
+        }
+    )
+
+    recorded = marker_file.read_text().splitlines() if marker_file.exists() else []
+    assert ("opd-core" in recorded) is expects_core
+    assert (("checkpoint", save_at_steps, 10) in armed) is expects_core
+    # the rollout guard is required regardless of the checkpoint schedule.
+    assert "lora-rollout-guard" in armed
 
 
 def test_opd_stops_an_unguarded_child_at_its_first_step(tmp_path):

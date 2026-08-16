@@ -630,8 +630,12 @@ def _run_child(
     progress_state = _opd_train._OpdProgressState(runtime.resume_state)
     watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state)
     shim_markers = _opd_train.shim_marker_file(workload.shim_dir)
-    expected_shims = ("opd-core", LORA_ROLLOUT_GUARD_SHIM) + (
-        ("gdn-varlen",) if runtime.gdn_reset_arch else ()
+    # the child installs opd-core only for a nonempty schedule, because exact-save
+    # filtering is the entire meaning of that marker.
+    expected_shims = (
+        (("opd-core",) if request.knobs.save_at_steps else ())
+        + (LORA_ROLLOUT_GUARD_SHIM,)
+        + (("gdn-varlen",) if runtime.gdn_reset_arch else ())
     )
     callbacks = _build_child_callbacks(
         watcher,

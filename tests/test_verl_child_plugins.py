@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import importlib
 import inspect
 import json
@@ -132,7 +133,7 @@ def test_grpo_external_plugin_arms_without_importing_cuda_sensitive_targets(tmp_
                 "total_steps": 10,
                 "kl_ref_adapter": True,
                 "multi_turn": True,
-                "gdn_model_type": None,
+                "gdn_model_type": "qwen3_next",
                 "wandb": False,
             }
         )
@@ -146,12 +147,17 @@ forbidden = sorted(
     or name.startswith("torch.") or name.startswith("verl.") or name.startswith("vllm.")
 )
 assert forbidden == [], forbidden
-targets = [
-    finder.target for finder in sys.meta_path
+finders = [
+    finder for finder in sys.meta_path
     if type(finder).__name__ == "_DeferredFinder"
 ]
-assert "verl.single_controller.base.worker" in targets
-assert targets.count("verl.experimental.agent_loop.agent_loop") == 4
+assert len(finders) == 1, len(finders)
+pending = finders[0].pending
+assert "verl.single_controller.base.worker" in pending
+# maximal grpo registers 12 callbacks behind exactly one finder, four of which
+# share the agent_loop target.
+assert len(pending["verl.experimental.agent_loop.agent_loop"]) == 4
+assert sum(len(queue) for queue in pending.values()) == 12, pending
 print("plugin-armed")
 """
     result = subprocess.run(
@@ -205,11 +211,12 @@ def test_sitecustomize_contains_only_startup_behavior():
 
 def _clear_deferred_target(target: str) -> None:
     sys.modules.pop(target, None)
-    sys.meta_path[:] = [
-        finder
-        for finder in sys.meta_path
-        if not isinstance(finder, runtime._DeferredFinder) or finder.target != target
-    ]
+    finder = runtime._DEFERRED_FINDER
+    finder.pending.pop(target, None)
+    finder.active_targets.discard(target)
+    # the shared finder stays installed while any other target is still armed.
+    if not finder.pending:
+        finder.uninstall()
 
 
 @pytest.mark.parametrize("names", [("gdn-varlen", "flashqla-gdn"), ("flashqla-gdn", "gdn-varlen")])
@@ -241,11 +248,8 @@ def test_deferred_finders_stack_in_both_orders_and_mark_after_application(
         assert imported.loaded is True
         assert applied == list(names)
         assert Path(marker_file).read_text().splitlines() == list(names)
-        assert not [
-            finder
-            for finder in sys.meta_path
-            if isinstance(finder, runtime._DeferredFinder) and finder.target == target
-        ]
+        assert target not in runtime._DEFERRED_FINDER.pending
+        assert runtime._DEFERRED_FINDER not in sys.meta_path
     finally:
         _clear_deferred_target(target)
 
@@ -254,24 +258,298 @@ def test_deferred_loader_supports_an_exec_module_only_loader():
     applied = []
 
     class Finder:
-        def uninstall(self):
-            applied.append("uninstalled")
-
-        def apply(self, module):
-            applied.append(module.loaded)
+        def drain(self, target, module):
+            applied.append((target, module.loaded))
 
     class ExecOnlyLoader:
         def exec_module(self, module):
             module.loaded = "executed"
 
-    loader = runtime._DeferredLoader(Finder(), ExecOnlyLoader())
+    loader = runtime._DeferredLoader(Finder(), "flash_exec_only", ExecOnlyLoader())
     spec = importlib.util.spec_from_loader("flash_exec_only", loader)
     module = importlib.util.module_from_spec(spec)
 
+    # a loader without create_module must still work under pep 451.
+    assert loader.create_module(spec) is None
     loader.exec_module(module)
 
     assert module.loaded == "executed"
-    assert applied == ["uninstalled", "executed"]
+    assert applied == [("flash_exec_only", "executed")]
+
+
+def _arm(target: str, name: str, marker_file: str, patch, required: bool = False) -> None:
+    runtime._arm_deferred(
+        name=name,
+        marker_file=marker_file,
+        target=target,
+        patch=patch,
+        required=required,
+    )
+
+
+def test_one_finder_serves_every_pending_target_until_the_last_one_drains(tmp_path, monkeypatch):
+    """the registry must not stack a finder per patch, and must outlive a partial drain."""
+    first, second = "flash_registry_a", "flash_registry_b"
+    marker_file = str(tmp_path / "markers")
+    for target in (first, second):
+        (tmp_path / f"{target}.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for target in (first, second):
+        _clear_deferred_target(target)
+    fired = []
+
+    try:
+        for target in (first, second):
+            _arm(target, f"patch-{target}", marker_file, lambda m, t=target: fired.append(t))
+
+        installed = [f for f in sys.meta_path if isinstance(f, runtime._DeferredFinder)]
+        assert len(installed) == 1
+        assert installed[0] is runtime._DEFERRED_FINDER
+
+        importlib.import_module(first)
+
+        # one target drained, the other is still armed, so the finder must remain.
+        assert fired == [first]
+        assert runtime._DEFERRED_FINDER in sys.meta_path
+        assert first not in runtime._DEFERRED_FINDER.pending
+
+        importlib.import_module(second)
+
+        assert fired == [first, second]
+        assert runtime._DEFERRED_FINDER not in sys.meta_path
+        assert runtime._DEFERRED_FINDER.pending == {}
+    finally:
+        for target in (first, second):
+            _clear_deferred_target(target)
+
+
+def test_same_target_callbacks_run_fifo_including_ones_registered_while_draining(
+    tmp_path, monkeypatch
+):
+    """a callback that arms another same-target callback must queue behind the pending work."""
+    target = "flash_registry_reentrant"
+    marker_file = str(tmp_path / "markers")
+    (tmp_path / f"{target}.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_deferred_target(target)
+    fired = []
+
+    try:
+
+        def first(module):
+            fired.append("A")
+            # registering during an active drain must not recurse or apply twice.
+            _arm(target, "C", marker_file, lambda m: fired.append("C"))
+
+        _arm(target, "A", marker_file, first)
+        _arm(target, "B", marker_file, lambda m: fired.append("B"))
+
+        importlib.import_module(target)
+
+        assert fired == ["A", "B", "C"]
+        assert Path(marker_file).read_text().splitlines() == ["A", "B", "C"]
+    finally:
+        _clear_deferred_target(target)
+
+
+def test_importing_the_target_inside_a_callback_does_not_recurse_or_apply_twice(
+    tmp_path, monkeypatch
+):
+    target = "flash_registry_selfimport"
+    marker_file = str(tmp_path / "markers")
+    (tmp_path / f"{target}.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_deferred_target(target)
+    fired = []
+
+    try:
+
+        def patch(module):
+            fired.append("applied")
+            # already in sys.modules, so this must be a plain lookup.
+            assert importlib.import_module(target) is module
+
+        _arm(target, "self-import", marker_file, patch)
+
+        importlib.import_module(target)
+
+        assert fired == ["applied"]
+        assert Path(marker_file).read_text().splitlines() == ["self-import"]
+    finally:
+        _clear_deferred_target(target)
+
+
+def test_a_real_loader_failure_keeps_the_queue_armed_and_records_no_marker(tmp_path, monkeypatch):
+    """a target that fails to execute must be retryable, and must not look patched."""
+    target = "flash_registry_badmodule"
+    marker_file = str(tmp_path / "markers")
+    module_file = tmp_path / f"{target}.py"
+    module_file.write_text("raise RuntimeError('boom')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_deferred_target(target)
+    fired = []
+
+    try:
+        _arm(target, "retry-me", marker_file, lambda m: fired.append("applied"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            importlib.import_module(target)
+
+        assert fired == []
+        assert not Path(marker_file).exists()
+        assert target in runtime._DEFERRED_FINDER.pending
+        assert runtime._DEFERRED_FINDER in sys.meta_path
+
+        module_file.write_text("VALUE = 'imported'\n")
+        importlib.invalidate_caches()
+        importlib.import_module(target)
+
+        assert fired == ["applied"]
+        assert Path(marker_file).read_text().splitlines() == ["retry-me"]
+    finally:
+        _clear_deferred_target(target)
+
+
+def test_an_optional_callback_failure_records_nothing_but_later_callbacks_still_run(
+    tmp_path, monkeypatch, capsys
+):
+    target = "flash_registry_optional"
+    marker_file = str(tmp_path / "markers")
+    (tmp_path / f"{target}.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_deferred_target(target)
+    fired = []
+
+    def explode(module):
+        raise RuntimeError("optional boom")
+
+    try:
+        _arm(target, "optional-bad", marker_file, explode, required=False)
+        _arm(target, "optional-good", marker_file, lambda m: fired.append("good"))
+
+        importlib.import_module(target)
+
+        assert fired == ["good"]
+        assert Path(marker_file).read_text().splitlines() == ["optional-good"]
+        assert "optional boom" in capsys.readouterr().err
+    finally:
+        _clear_deferred_target(target)
+
+
+def test_a_callback_returning_false_records_no_marker(tmp_path, monkeypatch):
+    target = "flash_registry_false"
+    marker_file = str(tmp_path / "markers")
+    (tmp_path / f"{target}.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_deferred_target(target)
+
+    try:
+        _arm(target, "declined", marker_file, lambda m: False)
+        _arm(target, "applied", marker_file, lambda m: None)
+
+        importlib.import_module(target)
+
+        assert Path(marker_file).read_text().splitlines() == ["applied"]
+    finally:
+        _clear_deferred_target(target)
+
+
+def test_duplicate_registrations_execute_and_mark_twice(tmp_path, monkeypatch):
+    """duplicate arming keeps its pre-existing semantics rather than silently deduplicating."""
+    target = "flash_registry_duplicate"
+    marker_file = str(tmp_path / "markers")
+    (tmp_path / f"{target}.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_deferred_target(target)
+    fired = []
+
+    try:
+        for _ in range(2):
+            _arm(target, "twice", marker_file, lambda m: fired.append("applied"))
+
+        importlib.import_module(target)
+
+        assert fired == ["applied", "applied"]
+        assert Path(marker_file).read_text().splitlines() == ["twice", "twice"]
+    finally:
+        _clear_deferred_target(target)
+
+
+def test_an_already_imported_target_applies_immediately_without_installing_a_finder(
+    tmp_path, monkeypatch
+):
+    target = "flash_registry_preloaded"
+    marker_file = str(tmp_path / "markers")
+    (tmp_path / f"{target}.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_deferred_target(target)
+    fired = []
+
+    try:
+        importlib.import_module(target)
+        _arm(target, "immediate", marker_file, lambda m: fired.append(m.VALUE))
+
+        assert fired == ["imported"]
+        assert Path(marker_file).read_text().splitlines() == ["immediate"]
+        assert target not in runtime._DEFERRED_FINDER.pending
+        assert runtime._DEFERRED_FINDER not in sys.meta_path
+    finally:
+        _clear_deferred_target(target)
+
+
+def test_a_callback_arming_a_different_unloaded_target_leaves_it_pending(tmp_path, monkeypatch):
+    loaded, other = "flash_registry_loaded", "flash_registry_other"
+    marker_file = str(tmp_path / "markers")
+    for target in (loaded, other):
+        (tmp_path / f"{target}.py").write_text("VALUE = 'imported'\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for target in (loaded, other):
+        _clear_deferred_target(target)
+    fired = []
+
+    try:
+
+        def patch(module):
+            fired.append(loaded)
+            _arm(other, "later", marker_file, lambda m: fired.append(other))
+
+        _arm(loaded, "first", marker_file, patch)
+
+        importlib.import_module(loaded)
+
+        assert fired == [loaded]
+        assert other in runtime._DEFERRED_FINDER.pending
+        assert runtime._DEFERRED_FINDER in sys.meta_path
+
+        importlib.import_module(other)
+
+        assert fired == [loaded, other]
+        assert runtime._DEFERRED_FINDER not in sys.meta_path
+    finally:
+        for target in (loaded, other):
+            _clear_deferred_target(target)
+
+
+def test_an_empty_checkpoint_schedule_never_imports_verl_to_build_a_passthrough(monkeypatch):
+    """an empty schedule keeps every save, so the wrapper would do nothing but force an import.
+
+    the import is the cost: install_checkpoint_handler_filter runs during child startup, and
+    pulling verl in early is exactly what the deferred design exists to avoid.
+    """
+    imported = []
+
+    real_import = builtins.__import__
+
+    def tracking_import(name, *args, **kwargs):
+        if name.startswith("verl"):
+            imported.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", tracking_import)
+
+    runtime.install_checkpoint_handler_filter((), 10)
+
+    assert imported == []
 
 
 def _install_fake_transformers_packages(monkeypatch, model_type: str):

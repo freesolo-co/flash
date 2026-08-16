@@ -947,7 +947,6 @@ from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
 from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     _VERL_METRIC_FIELDS,
     FLASH_CUDART_STUB_MARKER,
-    FLASH_FLASH_QLA_MARKER,
     FLASH_GDN_VARLEN_MARKER,
     FLASH_TF32_MARKER,
     FLASH_WANDB_LINK_MARKER,
