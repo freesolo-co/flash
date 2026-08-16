@@ -13,7 +13,9 @@ from flash._internal.channel import CLI_NAME
 from flash.core.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
 from flash.core.spec import (
     FIXED_SEED,
+    MANAGED_ENVIRONMENT_KEYS,
     MANAGED_GPU_KEYS,
+    MANAGED_TOP_LEVEL_KEYS,
     EnvironmentSpec,
     GpuSpec,
     JobSpec,
@@ -229,18 +231,14 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
 # at 16x-cost defaults. platform-managed fields (run_id; per-section hf_repo, gpu disk/volume,
 # environment resolved_sha) are assigned by the control plane, so to_dict() omits them and this
 # parser rejects a user who sets them.
-_TOP_LEVEL_KEYS = frozenset(
-    {
-        "model",
-        "algorithm",
-        "thinking",
-        "seed",
-        "environment",
-        "train",
-        "gpu",
-        "wandb",
-        "project",
-    }
+#
+# derived rather than listed, for the same reason the gpu key set already is: what a user may author
+# is exactly what the public payload carries, and `to_dict()` builds that by removing the managed
+# top-level registry. spelling the survivors out by hand made this a second copy of that
+# subtraction, and the two could disagree only by drifting -- a new managed field left off this list
+# is a field the parser invites a user to set and the serializer then silently drops.
+_TOP_LEVEL_KEYS = (
+    frozenset(item.name for item in dataclass_fields(JobSpec)) - MANAGED_TOP_LEVEL_KEYS
 )
 # keys that WERE user-authorable and are now rejected with their own targeted error. they are absent
 # from _TOP_LEVEL_KEYS, so the unknown-key check below would otherwise report them as a typo and bury
@@ -258,14 +256,14 @@ _GPU_KEYS = (
     - {"type_fallbacks"}
 )
 # [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
-# is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
+# is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha) and
+# named once in the managed environment registry rather than restated here.
 # pip is authorable: worker_pip_for_env returns only Flash's own worker requirement, so a scorer that
 # imports a third-party dependency has no other way to get it onto the worker, and the missing import
 # surfaces as a zero reward at training time. The submit paths append these to worker_pip_for_env
 # rather than replacing it, so the worker requirement cannot be displaced by an override.
-_ENV_MANAGED_KEYS = frozenset({"resolved_sha"})
 _ENVIRONMENT_KEYS = (
-    frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
+    frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - MANAGED_ENVIRONMENT_KEYS
 )
 TRAIN_KEY_MIN_VERSIONS = {
     item.name: str(item.metadata["introduced_in"])
