@@ -107,10 +107,15 @@ class _FakeSingleTurnEnv(_EnvironmentSingleTurn):
 
 
 class _FakeMultiTurnEnv(_EnvironmentMultiTurn):
+    def __init__(self):
+        self.step_tasks = []
+        self.score_tasks = []
+
     def start_episode(self, example, prompt_text):
         return [{"role": "user", "content": f"{prompt_text}:{example.input}"}]
 
     def step_episode(self, example, messages, assistant_response):
+        self.step_tasks.append(example)
         return _EnvironmentStepResult(
             done=True,
             messages=({"role": "user", "content": f"observed {assistant_response}"},),
@@ -119,6 +124,7 @@ class _FakeMultiTurnEnv(_EnvironmentMultiTurn):
         )
 
     def score_episodes(self, example, episodes):
+        self.score_tasks.append(example)
         return [
             _RewardResult(
                 score=0.5,
@@ -162,9 +168,12 @@ class _PerEpisodeImageEnv(_EnvironmentSingleTurn):
 
     def __init__(self, picks):
         self._picks = list(picks)
+        self.prompt_tasks = []
+        self.score_tasks = []
         self.graded_against = []
 
     def start_episode(self, example, prompt_text):
+        self.prompt_tasks.append(example)
         chosen = self._picks.pop(0)
         example.metadata["chosen_image"] = chosen
         return [
@@ -178,6 +187,7 @@ class _PerEpisodeImageEnv(_EnvironmentSingleTurn):
         ]
 
     def score_responses(self, example, response_texts):
+        self.score_tasks.append(example)
         chosen = example.metadata.get("chosen_image")
         self.graded_against.append(chosen)
         out = []
@@ -231,6 +241,7 @@ def test_start_episode_image_choice_reaches_single_turn_scoring(monkeypatch):
     # the model answered with what it was actually shown, so a grader that sees the same episode
     # must score 1.0. scoring 0.0 here means it graded a DIFFERENT episode.
     assert env.reward("it is red", row) == 1.0
+    assert sdk_env.prompt_tasks[0] is sdk_env.score_tasks[0]
     assert sdk_env.graded_against == ["pool/red.png"]
     # and the choice must not be re-rolled by the scoring call: a second start_episode would both
     # consume the next pick and grade against an episode that was never generated.
@@ -263,6 +274,110 @@ def test_per_episode_state_survives_every_single_turn_scoring_entry_point(monkey
     # every one of them graded the generated episode, and none re-ran start_episode.
     assert set(sdk_env.graded_against) == {"pool/red.png"}
     assert sdk_env._picks == []
+
+
+def test_sibling_rollouts_get_isolated_tasks(monkeypatch):
+    sdk_env = _FakeMultiTurnEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        sdk_env,
+        "owner/env",
+        source=[
+            {
+                "input": "browse",
+                "metadata": {"session": "original"},
+                "image": {"url": "original.png"},
+                "output": {"target": "original"},
+            }
+        ],
+        contract_text="",
+    )
+    (row,) = env.dataset()
+
+    first = env.new_rollout_state(row)
+    second = env.new_rollout_state(row)
+
+    assert first["task"] is not second["task"]
+    first["task"].metadata["session"] = "first"
+    first["task"].record["image"]["url"] = "first.png"
+    first["task"].output["target"] = "first"
+    assert second["task"].metadata == {"session": "original"}
+    assert second["task"].record["image"] == {"url": "original.png"}
+    assert second["task"].output == {"target": "original"}
+
+    env.record_model_turn(first, "click")
+    env.env_reply(first["messages"], first)
+    env.reward("ignored", row, first)
+    assert sdk_env.step_tasks[0] is first["task"]
+    assert sdk_env.score_tasks[0] is first["task"]
+
+
+def test_batched_scoring_uses_each_siblings_own_task(monkeypatch):
+    """Batched scoring must not score every sibling against the first sibling's task.
+
+    `_grouped_results` hands the scorer ONE task per group, so grouping siblings of a row on the
+    row value alone scores them all against whichever session came first. That is invisible while
+    siblings share a task object and becomes a reward-correctness bug once each rollout owns its
+    own. Driven through `rollout_rewards_many`, the door that actually reaches the grouped scorer.
+    """
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    class _SessionScoringEnv(_EnvironmentMultiTurn):
+        """Scores an episode by the session recorded on the task it is handed."""
+
+        def __init__(self):
+            self.scored_sessions = []
+
+        def start_episode(self, example, prompt_text):
+            return [{"role": "user", "content": str(example.input)}]
+
+        def step_episode(self, example, messages, assistant_response):
+            example.metadata["session"] = assistant_response
+            return _EnvironmentStepResult(
+                done=True,
+                messages=({"role": "user", "content": "ok"},),
+                final_response_text=assistant_response,
+            )
+
+        def score_episodes(self, example, episodes):
+            session = str(example.metadata.get("session") or "")
+            self.scored_sessions.append(session)
+            return [
+                _RewardResult(
+                    score=1.0 if session == "b" else 0.0,
+                    success=session == "b",
+                    metrics=(_RewardMetric("episode", 1.0),),
+                )
+                for _episode in episodes
+            ]
+
+    sdk_env = _SessionScoringEnv()
+    env = FreesoloEnvironment(
+        sdk_env,
+        "owner/env",
+        source=[{"input": "browse", "metadata": {}}],
+        contract_text="",
+    )
+    (row,) = env.dataset()
+
+    states = []
+    for turn in ("a", "b"):
+        state = env.new_rollout_state(row)
+        env.record_model_turn(state, turn)
+        env.env_reply(state["messages"], state)
+        states.append(state)
+
+    rewards = env.rollout_rewards_many([(row, state) for state in states])
+
+    # each sibling is scored against the session ITS OWN episode recorded, so the two disagree.
+    assert sorted(sdk_env.scored_sessions) == ["a", "b"]
+    assert [reward.episode for reward in rewards] == [0.0, 1.0]
+    assert env.reward_many([(row, state) for state in states]) == [0.0, 1.0]
 
 
 def test_each_row_keeps_its_own_episode_and_non_dataset_rows_are_not_retained(monkeypatch):
