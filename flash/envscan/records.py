@@ -1,6 +1,6 @@
 """Where one record of a multi-record stream ends, and how a two-marker pair is folded into it.
 
-Split out of `flash.env_patterns` to keep that module under the file-size limit. It holds the JSON
+Split out of `flash.envscan.patterns` to keep that module under the file-size limit. It holds the JSON
 record tokenizer and the per-record accumulation of a two-marker detector; the patterns themselves,
 and the matching over them, stay there. The dependency runs one way: this module knows nothing
 about which credentials exist, only about where a record begins and ends.
@@ -12,7 +12,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from flash.env_patterns import _TwoMarkers
+    from flash.envscan.patterns import _TwoMarkers
 
 # Where one record of a multi-record file ends: a top-level `}` closing back to depth zero. Below
 # the top level a `}` closes a nested member and does NOT end the record, which is what keeps a

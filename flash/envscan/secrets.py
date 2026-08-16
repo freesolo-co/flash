@@ -33,14 +33,14 @@ import zlib
 from pathlib import Path
 from typing import IO, NoReturn
 
-from flash.env_archive import (
+from flash.envscan.archive import (
     _looks_like_cpio_header,
     credential_in_ar,
     credential_in_cpio,
     credential_in_tar,
     credential_in_zip,
 )
-from flash.env_deflate import (
+from flash.envscan.deflate import (
     _PDF_SIGNATURE,
     _document_payloads,
     _DocumentDeadlineExceeded,
@@ -54,7 +54,7 @@ from flash.env_deflate import (
     _UnreachedStream,
     _UnreadableFilterChain,
 )
-from flash.env_formats import (
+from flash.envscan.formats import (
     _COMPRESSED_MAGIC,
     _MAX_ARCHIVE_MEMBERS,
     _OVERLAY_PROBE_BYTES,
@@ -78,19 +78,19 @@ from flash.env_formats import (
 # file-size limit. `_Unscannable` lives THERE because those walks raise it and this module imports
 # them, so the other direction would be a cycle. Re-exported because every other raise site and
 # every test still reads all three from here.
-from flash.env_keystores import (
+from flash.envscan.keystores import (
     _keystore_undecided,
     _openpgp_kind,
     _Unscannable,
 )
-from flash.env_names import exact_name_values
-from flash.env_opaque import OpaqueDeadlineExceeded, opaque_format
-from flash.env_openpgp import (
+from flash.envscan.names import exact_name_values
+from flash.envscan.opaque import OpaqueDeadlineExceeded, opaque_format
+from flash.envscan.openpgp import (
     _encrypted_text_format,
     _has_openpgp_message_armor,
     _unfinished_openpgp_message_armor,
 )
-from flash.env_patterns import (
+from flash.envscan.patterns import (
     _ASSIGNED_PATTERNS,
     _LITERAL_PATTERNS,
     _MAX_BODY,
@@ -98,9 +98,9 @@ from flash.env_patterns import (
     _match,
     _unfinished_private_key_armor,
 )
-from flash.env_png import _PNG_SIGNATURE
-from flash.env_policy import _unexpandable_format, _uninspectable_reason
-from flash.env_scanbuf import (
+from flash.envscan.png import _PNG_SIGNATURE
+from flash.envscan.policy import _unexpandable_format, _uninspectable_reason
+from flash.envscan.scanbuf import (
     _SCAN_CHUNK_BYTES,
     _blocks_of,
     _paired_markers_kind,
@@ -754,7 +754,7 @@ def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: i
 def _scan_member(handle: IO[bytes], deadline: float, depth: int) -> str | None:
     """One archive member's bytes, scanned as if they were a file.
 
-    Positional, because `flash.env_archive` names neither this module nor its keywords -- handing
+    Positional, because `flash.envscan.archive` names neither this module nor its keywords -- handing
     the scanner in is what lets the archive walk live there without importing the scan back.
     """
     return _scan_stream(handle, deadline=deadline, depth=depth)

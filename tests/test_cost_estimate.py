@@ -114,8 +114,12 @@ def test_runconfig_preserves_old_positional_constructor():
     assert order.index("opd_multi_turn") < order.index("opd_max_turns")
     assert order.index("opd_max_turns") < order.index("sft_retained_examples")
     # anything added later must be APPENDED, never slotted beside a related field: an old positional
-    # caller would silently bind its opd flag to the newcomer rather than fail.
-    assert order[-2:] == ["sft_retained_examples", "providers"], (
+    # caller would silently bind its opd flag to the newcomer rather than fail. asserted as a
+    # PREFIX rather than an exact tail so the guard keeps failing on an insertion while a correctly
+    # appended field does not have to edit it -- the previous exact-tail form failed either way,
+    # which makes the failure uninformative about which mistake was made.
+    appended_so_far = ["sft_retained_examples", "providers", "gpu_type_fallbacks"]
+    assert order[-len(appended_so_far) :] == appended_so_far, (
         "a new RunConfig field must be appended; inserting one shifts every later parameter and "
         "silently reinterprets old positional calls as different quantities"
     )

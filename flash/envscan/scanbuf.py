@@ -1,6 +1,6 @@
 """Bounded stream buffering and cross-window pairing state for the credential scan.
 
-Split out of `flash.env_secrets` to keep that module under the file-size limit. The dependency runs
+Split out of `flash.envscan.secrets` to keep that module under the file-size limit. The dependency runs
 one way: nothing here knows about packages, files or the scan orchestration.
 """
 
@@ -10,7 +10,7 @@ import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
-from flash.env_patterns import _PAIRED_PATTERNS, _RecordHalves, _RecordSplitter
+from flash.envscan.patterns import _PAIRED_PATTERNS, _RecordHalves, _RecordSplitter
 
 # How much of a stream is read into one scan window.
 _SCAN_CHUNK_BYTES = 1 << 20

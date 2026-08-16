@@ -17,8 +17,8 @@ import subprocess
 
 import pytest
 
-from flash.env_opaque import _BUNDLE_PREREQUISITE, opaque_format
-from flash.env_secrets import _Unscannable, credential_in_file
+from flash.envscan.opaque import _BUNDLE_PREREQUISITE, opaque_format
+from flash.envscan.secrets import _Unscannable, credential_in_file
 
 FREESOLO_KEY = "fslo_" + "A1bCdEfGhIjKlMnOpQrS"
 

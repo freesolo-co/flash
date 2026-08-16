@@ -14,7 +14,7 @@ import io
 import tarfile
 import zipfile
 
-from flash.env_secrets import _Unscannable, credential_in_file
+from flash.envscan.secrets import _Unscannable, credential_in_file
 
 FREESOLO_KEY = "fslo_" + "A1bCdEfGhIjKlMnOpQrS"
 SECRET_LINE = f"export FREESOLO_API_KEY={FREESOLO_KEY}"
@@ -108,7 +108,7 @@ def test_an_unreadable_tar_remainder_does_not_crash_the_publish(tmp_path, monkey
     `AttributeError` out of a validation check and aborted the publish, where every other
     unreadable region is a refusal.
     """
-    from flash import env_archive
+    from flash.envscan import archive as env_archive
 
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
