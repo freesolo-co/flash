@@ -18,6 +18,7 @@ from flash.providers._lifecycle.deadline import (
 from flash.providers._lifecycle.poll import (
     PollErrorTracker,
     _attempt_int,
+    heartbeat_progress_ts,
     is_training_heartbeat,
     make_say,
     surface_heartbeat,
@@ -25,11 +26,6 @@ from flash.providers._lifecycle.poll import (
 from flash.providers.base import PollResult
 from flash.providers.runpod import jobs as _jobs
 from flash.providers.runpod.resources import WEIGHT_CACHE_GROW_BUDGET_S
-from flash.providers.runpod.serverless import (
-    WORKER_SYSTEM_DEPS,
-    _train_body,
-    resolve_worker_deps,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -218,7 +214,7 @@ def deploy_train_endpoint(
     _jobs._patch_runpod_backoff()
     friendly = _jobs.canonical_gpu(friendly_gpu)
     name = _jobs.endpoint_name(friendly, name_suffix)
-    image = _jobs.worker_image_for_gpu(friendly, allow_default=True)
+    image = _jobs.worker_image_for_gpu(friendly)
     context = _DeployContext(deadline_at, spec, cache_volumes, set())
 
     def _deploy_once() -> tuple[object, str]:
@@ -241,11 +237,7 @@ def deploy_train_endpoint(
                 "execution_timeout_ms": execution_timeout_ms or _jobs.DEFAULT_EXECUTION_TIMEOUT_MS,
                 "workers": (0, 1),
             }
-            if image:
-                kwargs["image"] = image
-            else:
-                kwargs["dependencies"] = resolve_worker_deps()
-                kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+            kwargs["image"] = image
             # reconcile the selected account before attach because the SDK returns existing volumes
             # at their old size. do this once per account and preserve the later create allowance.
             if owning_key not in context.reconciled:
@@ -260,7 +252,6 @@ def deploy_train_endpoint(
                 override if override is not None else _jobs.weight_cache_endpoint_kwargs(spec)
             )
             ep = Endpoint(**kwargs)
-            ep._qb_target = _train_body
             config = ep._build_resource_config()
             _jobs.apply_disk_gb(config, disk_gb)
             rm = ResourceManager()
@@ -557,6 +548,20 @@ def _classify_queue_state(
     return None
 
 
+def _progress_ts(context: _PollContext, hb_key: tuple) -> float:
+    """The progress this heartbeat proves: its own ts, clamped to [launch, now].
+
+    The companion ``fresh`` flag is deliberately dropped. Its attempt half is already decided by the
+    caller, which returns early on any heartbeat that is not this attempt's, and its ts half is
+    already expressed in the clamp: a heartbeat stamped before launch cannot describe work this
+    attempt did, so it is worth exactly the launch anchor and no more. What remains is the
+    unusable-ts case, where the helper falls back to now; that matches the previous behaviour of
+    treating an untimestamped heartbeat as present-tense progress.
+    """
+    ts, _fresh = heartbeat_progress_ts(hb_key, context.launch_ts, context.current_attempt)
+    return ts
+
+
 def _update_heartbeat(context: _PollContext, state: _PollState) -> None:
     new_key, stage = surface_heartbeat(context.heartbeat_reader, state.last_hb_key, context.say)
     if new_key == state.last_hb_key:
@@ -585,17 +590,29 @@ def _update_heartbeat(context: _PollContext, state: _PollState) -> None:
     hb_ts = new_key[2]
     hb_step = new_key[1]
     is_training_hb = is_training_heartbeat(stage, hb_step)
+    # Credit the heartbeat's OWN timestamp, clamped to [launch, now], never the time we happened to
+    # read it. A heartbeat written long before a reattach and only seen now describes progress that
+    # already happened; paying it out at read time hands a wedged worker a full fresh stall window
+    # on every reattach. `_progress_ts` returns that clamped value, deliberately distinct from the
+    # raw `hb_ts` above, which stays the uploaded-ts bookkeeping the advance checks below compare.
+    # A heartbeat with no usable ts still clamps to now, preserving the existing behaviour that an
+    # untimestamped heartbeat counts as progress. It is computed only where it is used: this loop's
+    # clock is observable through `_jobs.time.time`, so an unused read would be a visible side effect.
+    #
+    # heartbeat ordering is independent of other progress sources. a queue exemption or status
+    # transition may already have advanced `last_progress` beyond this heartbeat's timestamp, so
+    # preserve the newer stall anchor while updating heartbeat-specific bookkeeping.
     if hb_attempt > state.last_hb_attempt:
         # fresh attempt: reset ts baseline and re-derive seen_training_hb so cold-start grace rearms.
         state.last_hb_attempt = hb_attempt
         state.last_hb_ts = hb_ts or 0.0
-        state.last_progress = _jobs.time.time()
+        state.last_progress = max(state.last_progress, _progress_ts(context, new_key))
         state.seen_training_hb = is_training_hb
     elif hb_attempt == state.last_hb_attempt and (hb_ts is None or hb_ts > state.last_hb_ts):
         # gate progress on ts advancing: a stale late upload must not buy a fresh stall window.
         if hb_ts is not None:
             state.last_hb_ts = hb_ts
-        state.last_progress = _jobs.time.time()
+        state.last_progress = max(state.last_progress, _progress_ts(context, new_key))
         if is_training_hb:
             state.seen_training_hb = True
 
@@ -712,7 +729,13 @@ def poll_job(
         last_hb_ts=0.0,
         # -1 sentinel < any real attempt; gates out prior-attempt leftover heartbeats
         last_hb_attempt=-1,
-        last_progress=_jobs.time.time(),
+        # Seed from the persisted LAUNCH, not this poll's start. A reattach has been billing since
+        # launch, so a worker already wedged before we attached must not be handed a fresh setup
+        # window by the mere act of looking at it -- that is what let a restart loop keep a dead
+        # worker alive to the absolute deadline. For a job queued from the start this value is
+        # overwritten anyway by the queued exemption in `_classify_stall`, which re-anchors on every
+        # pre-grant poll; it is the ALREADY-PLACED job at poll start where the difference is real.
+        last_progress=launch_ts,
         seen_training_hb=False,
         last_health_probe=0.0,
         unhealthy_timer=_jobs.GraceTimer(),
@@ -751,8 +774,13 @@ def poll_job(
             state.ever_saw_worker = True
         if status != state.last_status:
             say(f"job {handle.job_id}: {status}")
+            # A genuine TRANSITION is progress, so it moves the clock. The FIRST observation is not a
+            # transition -- `last_status` simply starts unset -- and crediting it would throw away the
+            # launch anchor on poll one, which is exactly how a delayed reattach used to win back a
+            # whole setup window before any evidence of progress had been seen.
+            if state.last_status is not None:
+                state.last_progress = _jobs.time.time()
             state.last_status = status
-            state.last_progress = _jobs.time.time()
         terminal = _classify_terminal_status(context, state, provider_status, status)
         if terminal is not None:
             return terminal

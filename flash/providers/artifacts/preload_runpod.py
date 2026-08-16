@@ -18,7 +18,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.jobs import (
     GraceTimer,
-    build_function_input,
     weight_cache_volume_name,
 )
 
@@ -216,7 +215,7 @@ def _preload_one_dc(
         }
         job_id = runpod_api.submit_job(
             endpoint_id,
-            build_function_input(payload),
+            payload,
             key_fingerprint=key_fingerprint,
             deadline_at=deadline_at,
         )

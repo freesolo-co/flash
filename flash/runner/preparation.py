@@ -16,10 +16,9 @@ import json
 import os
 import re
 from dataclasses import replace
-from typing import Any
 
-from flash.core.catalog import normalize_algorithm, samples_on_policy
 from flash.core.spec import JobSpec
+from flash.core.spec_persistence import VersionedPersistedSpecEnvelope
 
 
 def _runner():
@@ -298,126 +297,22 @@ def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
         )
 
 
-def _prepared_before_public_alpha(raw_public: object) -> bool:
-    """True when this run's PERSISTED public spec predates ``lora_alpha`` becoming authorable.
-
-    The discriminator is the stored bytes, not this build's serialization: a snapshot prepared
-    before the change hashed a public spec with no alpha key, and its digest can only be reproduced
-    the same way. status.spec is never rewritten, so this answer is stable for the run's life.
-
-    A warm-start spec is excluded even though it also omits alpha -- to_dict() strips rank and alpha
-    for those in every version, so absence there says nothing about when the run was prepared, and
-    treating it as legacy would drop a binding that costs nothing to keep.
-    """
-    if not isinstance(raw_public, dict):
-        return False
-    train = raw_public.get("train")
-    if not isinstance(train, dict) or "lora_alpha" in train:
-        return False
-    return not train.get("init_from_adapter")
-
-
-_ROLLOUT_BATCH_KEYS = ("batch_size", "prompts_per_step")
-
-
-def _stored_rollout_batch_spelling(raw_spec: object) -> dict[str, Any] | None:
-    """How a PERSISTED rollout spec spelled its optimizer batch, or None if it is not one.
-
-    Same discriminator style as ``_prepared_before_public_alpha``: the answer comes from the stored
-    bytes, which are never rewritten, so it is stable for the run's life.
-
-    ``JobSpec.from_dict`` MOVES the pre-1.1.43 ``batch_size`` onto ``prompts_per_step`` when
-    reparsing, so rehashing a persisted spec with today's parse can produce different bytes than
-    were hashed at persist time -- failing integrity validation for exactly the warm-start grpo/opd
-    runs this migration exists to rescue.
-
-    Both keys are reported, rather than just the value there is to migrate. Reporting only the
-    latter conflates snapshots that have nothing to move but still change shape: a mixed-version
-    payload storing both names (the migration drops the old one, so the stored ``batch_size`` still
-    has to be rehashed), one whose legacy value is non-positive (discarded by the parser), and a
-    modern payload (nothing to do). Replaying the stored spelling covers all of them uniformly.
-
-    A key merely holding null reports None; a key genuinely OMITTED is omitted from the reading too,
-    because the two hash differently. Every digest is taken over a serialized ``JobSpec``, which
-    emits both names, so a null was really hashed as null -- while 1.1.40 predates
-    ``prompts_per_step`` entirely and hashed no such key. Each half's reading therefore carries its
-    OWN absence rather than sharing one flag: after a re-persist the worker half is rewritten in the
-    modern shape while ``status.spec`` keeps the legacy one, so the halves genuinely disagree about
-    which keys exist and a single flag would misdescribe one of them.
-
-    This is not a way to forge a batch: the replayed values are the STORED ones, and the digest they
-    are compared against was computed over the ORIGINAL ones, so any tampering still mismatches.
-
-    Only a rollout algorithm is eligible: for sft ``batch_size`` is the current, un-migrated name,
-    which ``from_dict`` leaves alone.
-    """
-    if not isinstance(raw_spec, dict):
-        return None
-    if not samples_on_policy(normalize_algorithm(str(raw_spec.get("algorithm") or ""))):
-        return None
-    train = raw_spec.get("train")
-    if not isinstance(train, dict):
-        return None
-    stored = {key: train.get(key) for key in _ROLLOUT_BATCH_KEYS}
-    # the 1.1.40 shape, read off the bytes themselves: it carried the old name and no new one.
-    # a payload omitting BOTH says nothing about when it was written, and the serializer always
-    # emits both -- so treating that as absence would drop a key that WAS hashed.
-    if "batch_size" in train and "prompts_per_step" not in train:
-        del stored["prompts_per_step"]
-    return stored
-
-
-def _restore_rollout_batch_spelling(payload: dict, stored: dict | None) -> None:
-    """Put the optimizer-batch keys back exactly as the stored payload hashed them.
-
-    A key absent from ``stored`` was absent from the hashed bytes, so it is removed rather than
-    written -- that is the 1.1.40 shape, which predates ``prompts_per_step``.
-    """
-    if stored is None:
-        return
-    train = payload.get("train")
-    if not isinstance(train, dict):
-        return
-    for key in _ROLLOUT_BATCH_KEYS:
-        if key in stored:
-            train[key] = stored[key]
-        else:
-            train.pop(key, None)
-
-
 def _preparation_digest(
     public_spec: JobSpec,
     worker_spec: JobSpec,
     adapter_identity: dict | None,
     *,
-    legacy_keys: dict | None = None,
-    legacy_public_keys: dict | None = None,
-    legacy_public_alpha: bool = False,
-    stored_rollout_batch: dict | None = None,
-    stored_public_rollout_batch: dict | None = None,
+    persisted: VersionedPersistedSpecEnvelope | None = None,
 ) -> str:
+    persisted = persisted or VersionedPersistedSpecEnvelope()
     worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
-    # the rollout optimizer batch was renamed `batch_size` -> `prompts_per_step`, and from_dict now
-    # MOVES it when reparsing a persisted spec. Rehash under the spelling the snapshot actually
-    # stored -- including a key it did not have -- so a spec written before or across the rename
-    # still reproduces its digest. Same reason as the omissions and restorations below.
-    #
-    # Each half is restored from ITS OWN stored payload, exactly like legacy_keys vs
-    # legacy_public_keys below. Feeding the worker's spelling to both would overwrite whatever the
-    # public payload held before hashing -- and since the parse DROPS a superseded `batch_size`,
-    # `_validate_effective_spec` cannot see it either, so a tampered public value would be erased
-    # rather than caught. The two halves legitimately differ (the public spec is a stripped view),
-    # so they cannot share one reading -- including which keys they carry at all, which is why each
-    # reading holds its own absence instead of a shared flag. Re-persisting rewrites the worker half
-    # in the modern shape and leaves `status.spec` legacy, so from then on the halves disagree.
-    _restore_rollout_batch_spelling(worker_payload, stored_rollout_batch)
-    _restore_rollout_batch_spelling(public_payload, stored_public_rollout_batch)
     # ``[environment] pip`` became user-authorable, so to_dict() now emits it where it used to be
-    # stripped, and a pre-upgrade snapshot hashed an environment with no pip key at all. Dropping it
+    # stripped, and a pre-upgrade snapshot hashed an environment with no pip key at all. dropping it
     # when empty reproduces those bytes without needing to know when the run was prepared: absent
-    # and empty are the same install, so they must hash alike. An authored pip is non-empty and
-    # stays bound, so tampering with the persisted value is still caught.
+    # and empty are the same install, so they must hash alike. an authored pip is non-empty and
+    # stays bound, so tampering with the persisted value is still caught. unlike the rewinds below
+    # this needs no stored reading, which is why it is not part of one.
     if not public_payload["environment"].get("pip"):
         public_payload["environment"].pop("pip", None)
     # omit empty fields so existing version-1 snapshots keep their historical digest.
@@ -430,36 +325,9 @@ def _preparation_digest(
     ):
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
-    # Restore since-removed keys the STORED payload carried, for the same reason as the omissions
-    # above: the digest has to reproduce the bytes that were hashed, not today's serialization. A
-    # pre-upgrade snapshot hashed `model_policy` in (to_internal_dict was asdict, so it emitted the
-    # defaulted value), and the field no longer exists -- so rehashing without it mismatches and a
-    # still-valid warm-start or workload-profile run fails integrity validation on recovery. Only
-    # keys registered as historical public removals are honoured. Any field the dataclass still
-    # defines already comes from worker_spec, so replaying its identical stored value cannot forge it.
-    for key, value in (legacy_keys or {}).items():
-        if key in _runner()._DROPPED_TOP_LEVEL_KEYS:
-            worker_payload[key] = value
-    # a dropped key that was USER-AUTHORABLE was hashed on the public side too, not just the worker
-    # side. model_policy never was, so restoring only the worker payload was enough for it;
-    # model_revision and worker_env were, so a pre-upgrade public_spec carried them and the digest
-    # cannot reproduce without them.
-    for key, value in (legacy_public_keys or {}).items():
-        if key in _runner()._DROPPED_TOP_LEVEL_KEYS:
-            public_payload[key] = value
-    # ``lora_alpha`` became user-authorable, so to_dict() now emits it for non-warm-start runs. A
-    # snapshot prepared BEFORE that change hashed a public spec without alpha, so rehashing it with
-    # alpha would fail a still-valid run's integrity check on recovery -- same reason as the
-    # omissions and restorations above. That omission is scoped to those legacy snapshots only: a
-    # digest created from here on binds the public alpha, so tampering with the persisted public
-    # value is caught. Without that binding the two halves can disagree silently, because
-    # _runner()._validate_effective_spec() excludes lora_alpha from its structural comparison (the worker's
-    # warm-start-inherited alpha legitimately differs from the public one), leaving the digest as
-    # the only thing that could cover it.
-    if legacy_public_alpha:
-        public_payload["train"].pop("lora_alpha", None)
+    persisted.rewind(public_payload, worker_payload)
     payload = {
-        "version": 1,
+        "version": persisted.version,
         "public_spec": public_payload,
         "worker_spec": worker_payload,
         "adapter_identity": adapter_identity,
@@ -488,14 +356,10 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         "workload_profile",
     ):
         effective[managed_top] = public.get(managed_top)
-    # the pin value is stripped from every new public spec. a runner-assigned pin is asymmetric by
-    # design, as is an authored pin inherited by a new warm-start child after the public key's removal.
-    # exclude those two cases only. a historical authored source still carries its public revision and
-    # remains structurally compared. both asymmetric shapes are digest-protected: the marker triggers
-    # verification for auto pins, and every warm start verifies its complete preparation snapshot.
-    if not public.get("model_revision") and (
-        worker_spec.model_revision_auto or public.get("train", {}).get("init_from_adapter")
-    ):
+    # new public specs omit the pin, so their worker half legitimately carries the only copy. a
+    # historical public spec can still carry an authored pin; keep comparing that value because a
+    # plain source run reaches neither digest branch and this structural check is its only cover.
+    if not public.get("model_revision"):
         effective["model_revision"] = public.get("model_revision")
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])

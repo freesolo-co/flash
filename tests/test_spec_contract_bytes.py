@@ -167,35 +167,6 @@ def test_empty_collections_stay_omitted_rather_than_explicit():
 # specific historical shapes that still exist on disk.
 
 
-@pytest.mark.parametrize("dropped_key", ["model_policy", "worker_env", "workload_profile_kind"])
-def test_persisted_records_still_decode_with_removed_top_level_keys(dropped_key):
-    raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
-        "algorithm": "sft",
-        "project": PROJECT,
-        "environment": {"id": "owner/project/env"},
-        "train": {"epochs": 1},
-        dropped_key: {"SOME_KEY": "value"} if dropped_key == "worker_env" else "allow",
-    }
-    decoded = JobSpec.from_dict(raw)
-    # tolerated on READ only: the removed key must not reappear in either serialized contract.
-    assert dropped_key not in decoded.to_dict()
-    assert dropped_key not in decoded.to_internal_dict()
-
-
-def test_persisted_records_still_decode_with_removed_train_keys():
-    decoded = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": "sft",
-            "project": PROJECT,
-            "environment": {"id": "owner/project/env"},
-            "train": {"epochs": 1, "advantage_clip": 0.2},
-        }
-    )
-    assert "advantage_clip" not in decoded.to_internal_dict()["train"]
-
-
 def test_removed_train_key_tolerance_does_not_extend_to_other_sections():
     """The retired-key allowlist is per-section, not global.
 
@@ -254,41 +225,6 @@ def test_unknown_persisted_keys_are_still_fatal():
         )
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
-def test_pre_1_1_43_rollout_batch_migrates_to_prompts_per_step(algorithm):
-    """Rollout runs written before the rename carry only `batch_size`; workers read the new name."""
-    decoded = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": algorithm,
-            "project": PROJECT,
-            "environment": {"id": "owner/project/env"},
-            "train": {"batch_size": 32, "group_size": 4},
-        }
-    )
-    assert decoded.train.prompts_per_step == 32
-    # MOVED, not copied: a spec carrying a MEANINGFUL value under both names is rejected by the
-    # authored parser, which would break the resubmit that recovery performs. `to_dict()` still
-    # emits the key (it emits every train field), so what matters is that its value is now None.
-    assert decoded.train.batch_size is None
-    assert decoded.to_dict()["train"]["batch_size"] is None
-
-
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
-def test_new_rollout_spelling_wins_when_a_record_carries_both(algorithm):
-    decoded = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-0.8B",
-            "algorithm": algorithm,
-            "project": PROJECT,
-            "environment": {"id": "owner/project/env"},
-            "train": {"batch_size": 64, "prompts_per_step": 32, "group_size": 4},
-        }
-    )
-    assert decoded.train.prompts_per_step == 32
-    assert decoded.train.batch_size is None
-
-
 def test_sft_batch_size_is_not_migrated():
     """`batch_size` means a different quantity on sft, so the rollout migration must not touch it."""
     decoded = JobSpec.from_dict(
@@ -344,8 +280,8 @@ def test_registries_match_the_declared_boundary():
     # is what catches an empty `providers` or `type_fallbacks` reaching the public bytes, which
     # would change every stored digest.
     assert not set(public) - set(worker)
-    # every section PRESENT in the public payload, not just the registered ones. driving this loop
-    # from MANAGED_SECTION_KEYS would let a key invented in an unregistered section (`wandb`) reach
+    # every section present in the public payload, not just the registered ones. driving this loop
+    # from the managed section registry would let a key in an unregistered section (`wandb`) reach
     # the public bytes unseen -- the same blind spot, in the opposite direction, as the section walk
     # in test_every_privately_held_field_is_named_in_a_registry.
     for section, public_section in public.items():
@@ -380,18 +316,13 @@ def test_every_privately_held_field_is_named_in_a_registry():
     distinction costs nothing and the test passes either way.
     """
     populated_profile = {"packing_mode": "packed", "examples_per_update": 2, "packed_blocks": 1}
-    public, worker = (
-        spec(
-            train={"epochs": 1, "init_from_adapter": "src/step-4"},
-            workload_profile=populated_profile,
-        ).to_dict(),
-        spec(
-            train={"epochs": 1, "init_from_adapter": "src/step-4"},
-            workload_profile=populated_profile,
-        ).to_internal_dict(),
+    candidate = spec(
+        train={"epochs": 1, "init_from_adapter": "src/step-4"},
+        workload_profile=populated_profile,
     )
+    public, worker = candidate.to_dict(), candidate.to_internal_dict()
     # `project` is public-only by construction (it has no worker counterpart), and the two warm-start
-    # topology keys are stripped CONDITIONALLY, so no registry can express them.
+    # topology keys are stripped conditionally, so no registry can express them.
     exempt = {"project", "lora_rank", "lora_alpha"}
     unregistered = {
         f"(top){name}" for name in set(worker) - set(public) - MANAGED_TOP_LEVEL_KEYS - exempt

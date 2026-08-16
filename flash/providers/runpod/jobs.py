@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio  # noqa: F401
-import base64
 import contextlib
 import json
 import math
@@ -39,12 +38,9 @@ from flash.providers.runpod.serverless import (  # noqa: F401
     DEFAULT_EXECUTION_TIMEOUT_MS,
     FLASH_SDK_LOCK,
     WORKER_IMAGE,
-    WORKER_SYSTEM_DEPS,
     _patch_runpod_backoff,
-    _train_body,
     isolate_flash_state,
     min_cuda_for,
-    resolve_worker_deps,
     worker_image_for_gpu,
 )
 from flash.providers.runpod.serverless import (
@@ -64,7 +60,6 @@ __all__ = [
     "JobHandle",
     "PollResult",
     "apply_disk_gb",
-    "build_function_input",
     "capacity_escalation_note",
     "capacity_grace_multiplier",
     "decode_output",
@@ -216,24 +211,6 @@ def _is_balance_error(exc: Exception) -> bool:
     return "account balance" in str(exc).lower()
 
 
-def build_function_input(payload: dict) -> dict:
-    """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`."""
-    if WORKER_IMAGE:
-        return payload
-    from runpod_flash.runtime.serialization import serialize_args
-    from runpod_flash.stubs.live_serverless import get_function_source
-
-    source, _src_hash = get_function_source(_train_body)
-    return {
-        "function_name": "_train_body",
-        "function_code": source,
-        "args": serialize_args((payload,)),
-        "accelerate_downloads": True,
-        "dependencies": resolve_worker_deps(),
-        "system_dependencies": WORKER_SYSTEM_DEPS,
-    }
-
-
 def _safe_failure_text(value: object, limit: int = FAILURE_TEXT_LIMIT) -> str:
     """Redact credentials out of one part of a user-visible RunPod failure detail.
 
@@ -248,7 +225,7 @@ def _safe_failure_text(value: object, limit: int = FAILURE_TEXT_LIMIT) -> str:
 
 
 def decode_output(output) -> dict:
-    """Decode a queue-job output into the worker's metrics dict (handles live-function and baked-image shapes)."""
+    """Decode a queue-job output into the worker's metrics dict."""
     if isinstance(output, str):
         try:
             output = json.loads(output)
@@ -258,20 +235,6 @@ def decode_output(output) -> dict:
             ) from exc
     if not isinstance(output, dict):
         raise RuntimeError(f"unexpected job output type: {type(output)}")
-    if "success" in output or "result" in output:
-        if output.get("success") and output.get("result") is not None:
-            import cloudpickle
-
-            result = cloudpickle.loads(base64.b64decode(output["result"]))
-            if not isinstance(result, dict):
-                raise RuntimeError(f"flash job returned no metrics: {result!r}")
-            return result
-        err = output.get("error") or "unknown worker error"
-        stdout_tail = _safe_failure_text(output.get("stdout") or "")
-        raise RuntimeError(
-            f"Remote execution failed: {_safe_failure_text(err)}\n"
-            f"--- worker stdout tail ---\n{stdout_tail}"
-        )
     if output.get("error"):
         stdout_tail = _safe_failure_text(output.get("stdout") or "")
         msg = f"Remote execution failed: {_safe_failure_text(output['error'])}"
@@ -392,7 +355,7 @@ def submit_run(
         submitted_ts = time.time()
         job_id = runpod_api.submit_job(
             endpoint_id,
-            build_function_input(payload),
+            payload,
             key_fingerprint=key_fingerprint,
             **deadline_kwargs(runpod_api.submit_job, deadline_at),
         )

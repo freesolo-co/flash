@@ -18,7 +18,7 @@ import os
 import time
 
 import flash.runner as runner
-from flash.core.spec import _DROPPED_TOP_LEVEL_KEYS, JobSpec
+from flash.core.spec import JobSpec
 from flash.runner import RunStatus
 
 # every other collaborator is reached through `runner.` rather than bound here. `RUNS_DIR`,
@@ -68,20 +68,11 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     runner._validate_effective_spec(public_spec, worker_spec)
     expected = snapshot.get("adapter_identity")
     stored_digest = snapshot.get("preparation_digest")
-    # A pre-upgrade snapshot hashed since-removed keys into its digest, and `worker_spec` no longer
-    # carries them -- so reproducing that digest needs the values the STORED payload holds.
-    legacy_keys = {k: raw_worker[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_worker}
+    # a pre-upgrade snapshot hashed a different serialization than this build produces -- dropped
+    # top-level keys, the old rollout-batch spelling, a public half without lora_alpha. reproducing
+    # its digest means replaying the bytes it actually stored, read once from both halves.
     raw_public = status.spec if isinstance(status.spec, dict) else {}
-    legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
-    legacy_public_alpha = runner._prepared_before_public_alpha(raw_public)
-    # the rollout optimizer batch was renamed, and `from_dict` moves it -- so a snapshot has to be
-    # rehashed under the spelling it actually stored, including a key it did not carry. Each half is
-    # read from its OWN payload, like legacy_keys/legacy_public_keys above: reusing the worker's
-    # reading for the public half would overwrite the stored public value before hashing, and the
-    # parse drops a superseded `batch_size` so `_validate_effective_spec` cannot see it either --
-    # which would leave a tampered public batch neither bound nor compared.
-    stored_rollout_batch = runner._stored_rollout_batch_spelling(raw_worker)
-    stored_public_rollout_batch = runner._stored_rollout_batch_spelling(raw_public)
+    persisted_envelope = runner.VersionedPersistedSpecEnvelope.read(raw_worker, raw_public)
     has_workload_profile = bool(
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
@@ -111,14 +102,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
         not isinstance(stored_digest, str)
         or stored_digest
         != runner._preparation_digest(
-            public_spec,
-            worker_spec,
-            expected,
-            legacy_keys=legacy_keys,
-            legacy_public_keys=legacy_public_keys,
-            legacy_public_alpha=legacy_public_alpha,
-            stored_rollout_batch=stored_rollout_batch,
-            stored_public_rollout_batch=stored_public_rollout_batch,
+            public_spec, worker_spec, expected, persisted=persisted_envelope
         )
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
@@ -129,14 +113,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
                 "because its original artifact identity is unavailable"
             )
         if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
-            public_spec,
-            worker_spec,
-            expected,
-            legacy_keys=legacy_keys,
-            legacy_public_keys=legacy_public_keys,
-            legacy_public_alpha=legacy_public_alpha,
-            stored_rollout_batch=stored_rollout_batch,
-            stored_public_rollout_batch=stored_public_rollout_batch,
+            public_spec, worker_spec, expected, persisted=persisted_envelope
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:

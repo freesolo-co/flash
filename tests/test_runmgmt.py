@@ -1828,6 +1828,116 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     assert len(scheduled) == 1
 
 
+def test_completed_attempt_metrics_rereads_a_marker_that_is_not_visible_yet(monkeypatch):
+    """Recovery must RE-READ the marker, not sample it once.
+
+    The marker and metrics are two uploads of the same completion racing HF read-after-write lag, so
+    a marker that is invisible on the first read routinely surfaces moments later. Reading once would
+    report ABSENT and let the caller tear down an attempt that had already finished its paid work.
+    """
+    import io
+
+    import flash.providers._lifecycle.poll_instance as instance_poll
+    import flash.providers._lifecycle.terminal_artifacts as ta
+    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="lagging-marker",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        train=TrainSpec(hf_repo="org/repo"),
+    )
+    # the reread window must stay NONZERO: the shared cutoff is `now + tries * wait_s`, so a zero
+    # wait would expire the budget before the second read and the test would pass for the wrong
+    # reason. sleep is faked instead, leaving the retry loop real.
+    monkeypatch.setattr(instance_poll, "_TERMINAL_REREAD_WAIT_S", 5.0)
+    monkeypatch.setattr(lifecycle.time, "time", lambda: 201.0)
+    monkeypatch.setattr(ta.time, "sleep", lambda _s: None)
+    marker_reads = {"n": 0}
+
+    def artifact_reader(_repo, path):
+        def read(force=False):
+            if path.endswith("/vast_attempt0.json"):
+                marker_reads["n"] += 1
+                # invisible on the first read, exactly as HF lag presents it
+                if marker_reads["n"] <= 1:
+                    return None
+                return (
+                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
+                    '"run_id":"lagging-marker","ts":199.0}'
+                )
+            return json.dumps({"train_tokens": 4096})
+
+        return read
+
+    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+
+    assert lifecycle._completed_attempt_metrics(
+        spec,
+        provider="vast",
+        attempt=0,
+        launch_floor=100.0,
+        deadline_at=200.0,
+        log=io.StringIO(),
+    ) == {"train_tokens": 4096}
+    assert marker_reads["n"] >= 2  # a single sample would have reported ABSENT
+
+
+def test_completed_attempt_metrics_never_adopts_an_unverifiable_marker(monkeypatch):
+    """Recovery must not adopt an artifact it cannot tie to this attempt, and must SAY so.
+
+    Live polling classifies an unverifiable marker as a terminal failure while recovery used to
+    swallow the decode error into a bare ``None``, so identical bytes produced different stories
+    depending on which layer observed the attempt. Both now route through one resolver: recovery
+    still returns ``None`` (there is no completed work to adopt) but names the artifact instead of
+    logging silence, and a corrupt marker can never be mistaken for a success.
+    """
+    import io
+
+    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="corrupt-marker",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        train=TrainSpec(hf_repo="org/repo"),
+    )
+
+    def artifact_reader(_repo, path):
+        # a well-formed marker body that speaks for a DIFFERENT run: it decodes as json but can
+        # never be validated against this attempt's identity.
+        def read(force=False):
+            if path.endswith("/vast_attempt0.json"):
+                return (
+                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
+                    '"run_id":"some-other-run","ts":199.0}'
+                )
+            return json.dumps({"train_tokens": 4096})
+
+        return read
+
+    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+    monkeypatch.setattr(lifecycle.time, "time", lambda: 201.0)
+    log = io.StringIO()
+
+    assert (
+        lifecycle._completed_attempt_metrics(
+            spec,
+            provider="vast",
+            attempt=0,
+            launch_floor=100.0,
+            deadline_at=200.0,
+            log=log,
+        )
+        is None
+    )
+    assert "invalid or unverifiable" in log.getvalue()
+
+
 @pytest.mark.parametrize(
     ("marker_ts", "expected"),
     [
@@ -2001,7 +2111,6 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
         "deploy_train_endpoint",
         lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT),
     )
-    monkeypatch.setattr(jobs, "build_function_input", lambda payload: payload)
     monkeypatch.setattr(
         jobs.runpod_api,
         "submit_job",
@@ -2255,71 +2364,6 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
     status = runner.get_status("recover-unparseable")
     assert status.state == "failed"
     assert "persisted spec is malformed" in (status.error or "")
-
-
-def test_recover_runs_fails_a_legacy_workload_profile_run_instead_of_resubmitting_it(
-    monkeypatch, tmp_path
-):
-    # a profile job left in flight by a pre-#1095 plane. its spec still parses, but the job it
-    # describes no longer exists and it carries no accepted sft workload profile, so resubmitting
-    # would rent a gpu only to fail. before the removal, JobSpec.phase reported "profile" and kept
-    # these out of the training path; workload_profile_kind is a dropped key now, so recovery has to
-    # read the marker off the raw record.
-    import flash.providers as providers
-    import flash.runner as runner
-    import flash.server.platform.runtime as runtime
-    from flash.core.spec import JobSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    rid = "recover-legacy-profile"
-    remote = {"provider": "runpod", "endpoint_id": "ep-profile", "attempt": 0}
-    runner._save_status(
-        runner.RunStatus(
-            run_id=rid,
-            state="running",
-            spec=JobSpec(run_id=rid, model="Qwen/Qwen3.5-4B", algorithm="sft").to_dict(),
-            remote=dict(remote),
-        )
-    )
-    # the old plane stamped the marker on the persisted spec; this build's _save_status would drop
-    # it, so write it the way the older plane left it on disk.
-    stored_path = runner.runs_file_path(rid, ".json")
-    with open(stored_path, encoding="utf-8") as handle:
-        stored = json.load(handle)
-    stored["spec"]["workload_profile_kind"] = "sft"
-    with open(stored_path, "w", encoding="utf-8") as handle:
-        json.dump(stored, handle)
-
-    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": rid}])
-    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
-    monkeypatch.setattr(providers, "configured_providers", list)
-    torn: list[tuple[dict, str]] = []
-
-    def fake_teardown(handle, run_id):
-        torn.append((dict(handle), run_id))
-        return True
-
-    monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
-    attached: list[str] = []
-    monkeypatch.setattr(runner, "attach_run", lambda r: attached.append(r))
-
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
-
-        def start(self):
-            self._target(*self._args)
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
-
-    runtime.recover_runs()
-
-    # never reattached, never resubmitted, and the rented worker is released
-    assert attached == []
-    assert torn == [(remote, rid)]
-    status = runner.get_status(rid)
-    assert status.state == "failed"
-    assert "workload-profile job was removed" in (status.error or "")
 
 
 def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):

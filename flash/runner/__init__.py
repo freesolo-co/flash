@@ -28,12 +28,12 @@ from flash.adapters.artifacts import MAX_ATTEMPT_ID as MAX_ATTEMPT_ID
 # moved code reads them back through it. an autofix that drops them breaks those tests.
 from flash.core.catalog import ModelInfo, resolve_model  # noqa: F401
 from flash.core.spec import (  # noqa: F401
-    _DROPPED_TOP_LEVEL_KEYS,
     MANAGED_GPU_KEYS,
     TRAINER_BACKEND,
     GpuSpec,
     JobSpec,
 )
+from flash.core.spec_persistence import VersionedPersistedSpecEnvelope  # noqa: F401
 from flash.engine.plan.prompt_budget import PromptBudget
 from flash.providers._lifecycle.poll import _attempt_int as _attempt_int
 from flash.teacher.retry_contract import (
@@ -125,15 +125,15 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     if not raw_worker:
         return None
     # a workload-profile run recorded before #1095 removed the profile job has a managed hf_repo but
-    # never produced an adapter. its worker payload still carries the marker, which JobSpec.from_dict
+    # never produced an adapter. its worker payload still carries the marker, which jobspec.from_dict
     # now drops, so read it off the raw record rather than reviving the field.
     if isinstance(raw_worker, dict) and raw_worker.get("workload_profile_kind"):
         return None
     try:
         spec = _internal_spec_from_status(status)
     except Exception:
-        # a status json written by an OLDER plane can carry since-removed spec keys (e.g.
-        # ``gpu.exact_type`` pre-#670), and stored run records are never rewritten. JobSpec.from_dict
+        # a status json written by an older plane can carry since-removed spec keys (e.g.
+        # ``gpu.exact_type`` pre-#670), and stored run records are never rewritten. jobspec.from_dict
         # is strict, so parsing raises -- and one such record would 500 the whole runs list. same
         # operational tolerance as _runstatus_from_json: the record stays readable, it just shows no
         # adapter ref (its spec cannot name one we could resolve).
@@ -805,13 +805,11 @@ from flash.runner.preparation import (  # noqa: E402,F401
     _preparation_digest,
     _prepare_init_from_adapter,
     _prepare_init_from_adapter_inner,
-    _prepared_before_public_alpha,
     _profile_producer_version,
     _require_pinned_profile_environment,
     _require_sft_workload_profile,
     _require_supported_adapter_continuation,
     _resolve_model_revision,
-    _stored_rollout_batch_spelling,
     _validate_effective_spec,
     _warmstart_source_is_authorized,
 )

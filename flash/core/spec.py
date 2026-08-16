@@ -27,16 +27,8 @@ from uuid import UUID
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
-
-# `DROPPED_TOP_LEVEL_KEYS` keeps its historical private alias rather than being renamed at its 5 call
-# sites: `flash.runner` re-exports it as a package attribute and `preparation.py` reads it back through
-# `_runner()`, which is the seam the tests patch. Renaming it is a separate change from moving it, and
-# doing both at once would put a live recovery path's patch points inside a refactor whose whole claim
-# is that nothing behavioral moved.
 from flash.core.spec_persistence import (
-    DROPPED_TOP_LEVEL_KEYS as _DROPPED_TOP_LEVEL_KEYS,
-)
-from flash.core.spec_persistence import (
+    DROPPED_TOP_LEVEL_KEYS,
     REMOVED_PERSISTED_TRAIN_KEYS,
     announce_dropped_keys,
     migrated_optimizer_batch,
@@ -465,27 +457,27 @@ MANAGED_GPU_KEYS = frozenset(
     {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
 )
 
-# The other two halves of the same boundary. Together with MANAGED_GPU_KEYS these name every field
-# that separates the WORKER contract from the PUBLIC one -- which is the whole difference between
+# the other two halves of the same boundary. together with the managed gpu registry they name every field
+# that separates the worker contract from the public one -- which is the whole difference between
 # them, and is why `to_dict` can be a projection of `to_internal_dict` rather than a second
-# serializer. They were bare `data.pop(...)` calls, so the boundary existed only as a sequence of
+# serializer. they were bare `data.pop(...)` calls, so the boundary existed only as a sequence of
 # statements: nothing could enumerate it, and a field added to one serializer but not the other was
 # invisible until a submit round trip or a recovery digest failed.
 #
-# Order is irrelevant (the payload is canonicalized with sort_keys), but PRESENCE is a recovery
+# order is irrelevant (the payload is canonicalized with sort_keys), but presence is a recovery
 # contract: `_preparation_digest` hashes the public payload, so moving a name in or out of this set
 # invalidates the stored digest of every warm-start and workload-profile run in flight.
 #
-# NOT reused by `_validate_effective_spec`, which keeps its own near-identical list. The difference
+# not reused by `_validate_effective_spec`, which keeps its own near-identical list. the difference
 # is one name -- `model_revision` -- and it is deliberate there: the validator excludes it only
-# CONDITIONALLY, so a historical authored pin stays structurally compared between the two halves.
-# Substituting this set would widen that exclusion to every run and drop a real integrity check.
+# conditionally, so a historical authored pin stays structurally compared between the two halves.
+# substituting this set would widen that exclusion to every run and drop a real integrity check.
 MANAGED_TOP_LEVEL_KEYS = frozenset(
     {
         # server-assigned identity -- never authored in a config.
         "run_id",
-        # runner-managed, and no longer part of the public config or status spec. Internal round
-        # trips keep the value and marker through to_internal_dict(). Historical public specs that
+        # runner-managed, and no longer part of the public config or status spec. internal round
+        # trips keep the value and marker through to_internal_dict(). historical public specs that
         # emitted these are replayed only while verifying a stored preparation digest, from the
         # exact persisted bytes.
         "model_revision",
@@ -509,7 +501,7 @@ MANAGED_TRAIN_KEYS = frozenset({"hf_repo", "init_from_adapter_revision"})
 MANAGED_ENVIRONMENT_KEYS = frozenset({"resolved_sha"})
 
 # every managed section, so the public/worker boundary can be walked rather than restated. the two
-# things NOT here are the ones that are not removals: `train.lora_rank`/`lora_alpha` are stripped
+# things not here are the ones that are not removals: `train.lora_rank`/`lora_alpha` are stripped
 # only for a warm start, and `gpu.type_fallbacks` is respelled into `gpu.type` rather than dropped.
 MANAGED_SECTION_KEYS = (
     ("train", MANAGED_TRAIN_KEYS),
@@ -698,7 +690,7 @@ class JobSpec:
         if not isinstance(data, dict):
             raise TypeError("job spec must be an object")
         allowed_top_level = {item.name for item in fields(cls)}
-        unknown_top_level = sorted(set(data) - allowed_top_level - _DROPPED_TOP_LEVEL_KEYS)
+        unknown_top_level = sorted(set(data) - allowed_top_level - DROPPED_TOP_LEVEL_KEYS)
         if unknown_top_level:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
         announce_dropped_keys(data)

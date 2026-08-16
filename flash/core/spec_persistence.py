@@ -27,41 +27,42 @@ takes its allowed-key set as an argument instead of reading `fields(TrainSpec)` 
 What is deliberately NOT here: `_coerce_wandb` and `_parse_persisted_gpu_types` are also called only
 from `JobSpec.from_dict`, so they belong to this contract by usage -- but they construct `WandbSpec`
 and reach `_validated_gpu_type`, which `__post_init__` needs too. Moving them would make this module
-import the dataclasses that import it. The boundary is therefore drawn at "persisted-decoding logic
-that does not depend on the spec types themselves"; collapsing that seam properly is the job of the
-later split that gives the persisted record its own type, not of this move.
+import the dataclasses that import it. The boundary is therefore "persisted-record logic that does
+not depend on the spec types themselves"; `VersionedPersistedSpecEnvelope` follows that rule too.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
-from flash.core.catalog import samples_on_policy
+from flash.core.catalog import normalize_algorithm, samples_on_policy
 
-# Removed public top-level fields that a PERSISTED record can still carry. Stored run records are
+# removed public top-level fields that a persisted record can still carry. stored run records are
 # never rewritten, and effective_preparation.worker_spec is written with to_internal_dict() (asdict),
 # which emitted every field including the defaulted ones -- so every record written before a field
-# was dropped still names it. This registry also drives historical public-digest replay for
-# model_revision, which remains an internal field. Without it a still-running job can lose its
+# was dropped still names it. this registry also drives historical public-digest replay for
+# model_revision, which remains an internal field. without it a still-running job can lose its
 # recovery, deploy, and serving paths after the upgrade.
 #
-# Ignored on READ only. Most keys here no longer exist as JobSpec fields; model_revision remains an
-# internal runner field, but the public schema rejects it and to_dict omits it. Keeping it in this set
-# lets digest recovery identify the historical public key without weakening JobSpec.from_dict.
+# ignored on read only. most keys here no longer exist as jobspec fields; model_revision remains an
+# internal runner field, but the public schema rejects it and to_dict omits it. keeping it in this set
+# lets digest recovery identify the historical public key without weakening jobspec.from_dict.
 DROPPED_TOP_LEVEL_KEYS = frozenset(
     {"model_policy", "model_revision", "worker_env", "workload_profile_kind"}
 )
 
-# Tolerating a dropped key keeps a pre-upgrade run's recovery path, but the values behind it stop
+# tolerating a dropped key keeps a pre-upgrade run's recovery path, but the values behind it stop
 # being applied -- so a run that authored them now trains on managed defaults instead of what was
-# submitted. That is announced rather than silent. Only user-authorable keys qualify: model_policy
+# submitted. that is announced rather than silent. only user-authorable keys qualify: model_policy
 # was platform-managed (to_dict popped it), so its loss cannot change what a submitted config asked
-# for. The values are deliberately NOT forwarded -- doing so would reinstate the override table this
+# for. the values are deliberately not forwarded -- doing so would reinstate the override table this
 # removal exists to close, and would deliver it without the validation the deleted parser performed.
 _ANNOUNCED_DROPPED_KEYS = frozenset({"worker_env"})
 
-# Removed [train] keys a persisted record can still carry. Deliberately narrow: a key is listed only
+# removed [train] keys a persisted record can still carry. deliberately narrow: a key is listed only
 # once its behavior is gone, so an unlisted unknown key stays fatal rather than silently ignored.
 REMOVED_PERSISTED_TRAIN_KEYS = frozenset({"advantage_clip"})
 
@@ -225,3 +226,172 @@ def migrated_optimizer_batch(train: dict, algorithm: str) -> tuple[int | None, i
     if prompts_per_step is not None:
         return None, prompts_per_step
     return None, batch_size if batch_size is not None and batch_size >= 1 else None
+
+
+_PREPARATION_ENVELOPE_VERSION = 1
+
+
+def _prepared_before_public_alpha(raw_public: object) -> bool:
+    """True when this run's PERSISTED public spec predates ``lora_alpha`` becoming authorable.
+
+    The discriminator is the stored bytes, not this build's serialization: a snapshot prepared
+    before the change hashed a public spec with no alpha key, and its digest can only be reproduced
+    the same way. status.spec is never rewritten, so this answer is stable for the run's life.
+
+    A warm-start spec is excluded even though it also omits alpha -- to_dict() strips rank and alpha
+    for those in every version, so absence there says nothing about when the run was prepared, and
+    treating it as legacy would drop a binding that costs nothing to keep.
+    """
+    if not isinstance(raw_public, dict):
+        return False
+    train = raw_public.get("train")
+    if not isinstance(train, dict) or "lora_alpha" in train:
+        return False
+    return not train.get("init_from_adapter")
+
+
+_ROLLOUT_BATCH_KEYS = ("batch_size", "prompts_per_step")
+
+
+def _stored_rollout_batch_spelling(raw_spec: object) -> dict[str, Any] | None:
+    """How a PERSISTED rollout spec spelled its optimizer batch, or None if it is not one.
+
+    Same discriminator style as ``_prepared_before_public_alpha``: the answer comes from the stored
+    bytes, which are never rewritten, so it is stable for the run's life.
+
+    ``JobSpec.from_dict`` MOVES the pre-1.1.43 ``batch_size`` onto ``prompts_per_step`` when
+    reparsing, so rehashing a persisted spec with today's parse can produce different bytes than
+    were hashed at persist time -- failing integrity validation for exactly the warm-start grpo/opd
+    runs this migration exists to rescue.
+
+    Both keys are reported, rather than just the value there is to migrate. Reporting only the
+    latter conflates snapshots that have nothing to move but still change shape: a mixed-version
+    payload storing both names (the migration drops the old one, so the stored ``batch_size`` still
+    has to be rehashed), one whose legacy value is non-positive (discarded by the parser), and a
+    modern payload (nothing to do). Replaying the stored spelling covers all of them uniformly.
+
+    A key merely holding null reports None; a key genuinely OMITTED is omitted from the reading too,
+    because the two hash differently. Every digest is taken over a serialized ``JobSpec``, which
+    emits both names, so a null was really hashed as null -- while 1.1.40 predates
+    ``prompts_per_step`` entirely and hashed no such key. Each half's reading therefore carries its
+    OWN absence rather than sharing one flag: after a re-persist the worker half is rewritten in the
+    modern shape while ``status.spec`` keeps the legacy one, so the halves genuinely disagree about
+    which keys exist and a single flag would misdescribe one of them.
+
+    This is not a way to forge a batch: the replayed values are the STORED ones, and the digest they
+    are compared against was computed over the ORIGINAL ones, so any tampering still mismatches.
+
+    Only a rollout algorithm is eligible: for sft ``batch_size`` is the current, un-migrated name,
+    which ``from_dict`` leaves alone.
+    """
+    if not isinstance(raw_spec, dict):
+        return None
+    if not samples_on_policy(normalize_algorithm(str(raw_spec.get("algorithm") or ""))):
+        return None
+    train = raw_spec.get("train")
+    if not isinstance(train, dict):
+        return None
+    stored = {key: train.get(key) for key in _ROLLOUT_BATCH_KEYS}
+    # the 1.1.40 shape, read off the bytes themselves: it carried the old name and no new one.
+    # a payload omitting both says nothing about when it was written, and the serializer always
+    # emits both -- so treating that as absence would drop a key that was hashed.
+    if "batch_size" in train and "prompts_per_step" not in train:
+        del stored["prompts_per_step"]
+    return stored
+
+
+def _restore_rollout_batch_spelling(payload: dict, stored: dict | None) -> None:
+    """Put the optimizer-batch keys back exactly as the stored payload hashed them.
+
+    A key absent from ``stored`` was absent from the hashed bytes, so it is removed rather than
+    written -- that is the 1.1.40 shape, which predates ``prompts_per_step``.
+    """
+    if stored is None:
+        return
+    train = payload.get("train")
+    if not isinstance(train, dict):
+        return
+    for key in _ROLLOUT_BATCH_KEYS:
+        if key in stored:
+            train[key] = stored[key]
+        else:
+            train.pop(key, None)
+
+
+@dataclass(frozen=True)
+class VersionedPersistedSpecEnvelope:
+    """How a persisted snapshot's bytes were spelled when its digest was taken.
+
+    Every field here answers one question -- what did the STORED payload look like, not what does
+    this build serialize -- and each is read off bytes that are never rewritten, so the answers are
+    stable for the run's life. They were previously five keyword arguments threaded through three
+    call sites in lockstep; nothing ever passed a meaningful subset, because they are one reading.
+
+    Empty is the correct default for a snapshot written by this build: there is nothing to rewind,
+    so ``rewind()`` is a no-op and the digest is taken over today's serialization directly.
+    """
+
+    version: int = _PREPARATION_ENVELOPE_VERSION
+    worker_dropped_keys: Mapping[str, Any] = field(default_factory=dict)
+    public_dropped_keys: Mapping[str, Any] = field(default_factory=dict)
+    public_omits_lora_alpha: bool = False
+    worker_rollout_batch: dict[str, Any] | None = None
+    public_rollout_batch: dict[str, Any] | None = None
+
+    @classmethod
+    def read(cls, raw_worker: object, raw_public: object) -> VersionedPersistedSpecEnvelope:
+        """Read both halves from the bytes they were stored as.
+
+        Each half is read from ITS OWN payload and keeps its own answer. They genuinely differ: the
+        public spec is a stripped view, and after a re-persist the worker half is rewritten in the
+        modern shape while ``status.spec`` keeps the legacy one. Sharing one reading would overwrite
+        the stored public value before hashing -- and since the parse DROPS a superseded
+        ``batch_size``, ``_validate_effective_spec`` cannot see it either, so a tampered public value
+        would be erased rather than caught.
+        """
+        return cls(
+            worker_dropped_keys=_dropped_key_subset(raw_worker),
+            public_dropped_keys=_dropped_key_subset(raw_public),
+            public_omits_lora_alpha=_prepared_before_public_alpha(raw_public),
+            worker_rollout_batch=_stored_rollout_batch_spelling(raw_worker),
+            public_rollout_batch=_stored_rollout_batch_spelling(raw_public),
+        )
+
+    def rewind(self, public_payload: dict, worker_payload: dict) -> None:
+        """Rewind today's serialization to the bytes this snapshot actually hashed.
+
+        None of this can forge a value: every replayed key comes from the STORED payload, and the
+        digest it is compared against was computed over the ORIGINAL one, so tampering still
+        mismatches. Only keys registered as historical removals are honoured -- filtered HERE and
+        not just at ``read()``, because an instance can be built directly -- so a field the
+        dataclass still defines always comes from the spec itself.
+        """
+        # the rollout optimizer batch was renamed `batch_size` -> `prompts_per_step`, and from_dict
+        # moves it when reparsing -- so a spec written before or across the rename only reproduces
+        # its digest under the spelling it actually stored, including a key it did not have.
+        _restore_rollout_batch_spelling(worker_payload, self.worker_rollout_batch)
+        _restore_rollout_batch_spelling(public_payload, self.public_rollout_batch)
+        # a pre-upgrade snapshot hashed `model_policy` in (to_internal_dict was asdict, so it emitted
+        # the defaulted value) and the field no longer exists, so rehashing without it fails a
+        # still-valid run's integrity check on recovery.
+        worker_payload.update(_dropped_key_subset(self.worker_dropped_keys))
+        # a dropped key that was user-authorable was hashed on the public side too. model_policy
+        # never was, so the worker half sufficed for it; model_revision and worker_env were.
+        public_payload.update(_dropped_key_subset(self.public_dropped_keys))
+        # ``lora_alpha`` became user-authorable, so to_dict() now emits it for non-warm-start runs.
+        # scoped to legacy snapshots only: a digest created from here on binds the public alpha, and
+        # without that binding the two halves can disagree silently -- `_validate_effective_spec`
+        # excludes lora_alpha from its structural comparison, leaving the digest as the only cover.
+        if self.public_omits_lora_alpha:
+            public_payload["train"].pop("lora_alpha", None)
+
+
+def _dropped_key_subset(raw_spec: object) -> dict[str, Any]:
+    """The since-removed top-level keys a mapping carries, and nothing else.
+
+    Applied on the way in AND on the way out: a key the dataclass still defines must come from the
+    spec, never from a replayed reading, so the filter has to sit at the apply site too.
+    """
+    if not isinstance(raw_spec, Mapping):
+        return {}
+    return {key: raw_spec[key] for key in DROPPED_TOP_LEVEL_KEYS if key in raw_spec}
