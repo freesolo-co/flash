@@ -416,6 +416,20 @@ def test_registration_returns_before_queued_settlement_runs(client):
     assert client.app.state.spawn_queue == []
 
 
+def test_registration_rejects_thinking_with_structured_outputs_before_mutation(client):
+    body = {
+        **REGISTRATION,
+        "metadata": dict(REGISTRATION["metadata"]),
+        "thinking": True,
+        "structured_outputs": {"choice": ["yes", "no"]},
+    }
+    assert client.post("/adapters", json=body).status_code == 422
+    module = client.app.state.generated_module
+    assert module._record_key(REVISION) not in module.adapter_records
+    assert module._record_key(RUN_ID) not in module.adapter_records
+    assert client.app.state.spawn_queue == []
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

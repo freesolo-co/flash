@@ -138,6 +138,13 @@ def _registration_record(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             status.HTTP_409_CONFLICT,
             f"this app serves {BASE_MODEL}, not {payload.get('base_model')}",
         )
+    thinking = bool(payload.get("thinking"))
+    structured_outputs = payload.get("structured_outputs")
+    if thinking and structured_outputs:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "thinking and structured_outputs cannot be combined on this backend",
+        )
     parsed = _REVISION_ID_RE.fullmatch(adapter_id)
     if parsed is None:
         raise HTTPException(
@@ -183,9 +190,9 @@ def _registration_record(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         "subfolder": payload.get("subfolder"),
         "base_model": payload.get("base_model"),
         "checkpoint": payload.get("checkpoint"),
-        "thinking": bool(payload.get("thinking")),
+        "thinking": thinking,
         "org_id": payload.get("org_id"),
-        "structured_outputs": payload.get("structured_outputs"),
+        "structured_outputs": structured_outputs,
         "status": "registered",
         "metadata": canonical_metadata,
     }
