@@ -610,14 +610,9 @@ def _build_child_callbacks(
     )
 
     def liveness_fields() -> dict[str, object]:
-        work = bridge.parent_work.snapshot()
-        return {
-            **_opd_train.stall_tail_fields(
-                int(progress["step"] or 0), child_tail, staleness=tail_staleness
-            ),
-            "parent_work_completed": work.completed,
-            "parent_work_depth": work.depth,
-        }
+        return _opd_train.stall_tail_fields(
+            int(progress["step"] or 0), child_tail, staleness=tail_staleness
+        )
 
     return _ChildCallbacks(
         on_line,

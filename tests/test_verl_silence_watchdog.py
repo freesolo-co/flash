@@ -156,19 +156,6 @@ def test_parent_work_gauge_releases_depth_in_finally():
     assert gauge.snapshot().completed == 1
 
 
-def test_staleness_reports_ticks_and_monotonic_elapsed(monkeypatch):
-    clock = _Clock()
-    monkeypatch.setattr(diagnostics.time, "monotonic", clock)
-    staleness = diagnostics.ChildTailStaleness()
-    assert staleness.observe(1) == 0
-    clock.advance(3)
-    assert staleness.observe(1) == 1
-    assert staleness.elapsed == pytest.approx(3)
-    clock.advance(2)
-    assert staleness.observe(2) == 0
-    assert staleness.elapsed == 0
-
-
 def test_off_thread_field_sampling_continues_while_heartbeat_upload_blocks(monkeypatch):
     monkeypatch.setattr(heartbeat, "_LIVENESS_TICK_S", 0.01)
     monkeypatch.setattr(heartbeat, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.2)

@@ -186,30 +186,19 @@ class ChildTailStaleness:
     def __init__(self) -> None:
         self._written = -1
         self._since = 0
-        self._unchanged_at = time.monotonic()
-        self._elapsed = 0.0
 
     def observe(self, written: int) -> int:
         """record this tick's line count; return consecutive ticks with no new output.
 
         0 means the child spoke since the last observation. n>0 means it has been silent for n
-        ticks, which is the signal that separates a slow start from a wedge. ``elapsed`` carries the
-        same silence in seconds, so a caller does not have to infer it from the tick cadence.
+        ticks, which is the signal that separates a slow start from a wedge.
         """
-        now = time.monotonic()
         if written != self._written:
             self._written = written
             self._since = 0
-            self._unchanged_at = now
-            self._elapsed = 0.0
         else:
             self._since += 1
-            self._elapsed = max(0.0, now - self._unchanged_at)
         return self._since
-
-    @property
-    def elapsed(self) -> float:
-        return self._elapsed
 
 
 def stall_tail_fields(
@@ -236,7 +225,6 @@ def stall_tail_fields(
     fields: dict[str, object] = {"child_tail": recent}
     if staleness is not None:
         fields["child_tail_silent_ticks"] = staleness.observe(tail.written)
-        fields["child_tail_silent_seconds"] = staleness.elapsed
     return fields
 
 
