@@ -604,7 +604,11 @@ def _credential_in_pdf(source: Path | bytes, *, deadline: float, depth: int) -> 
 
 def _credential_in_compressed(source: Path | bytes, *, deadline: float, depth: int) -> str | None:
     """The kind of credential inside a gzip, bzip2, xz, lzma-alone or zlib stream, or None."""
-    head = source[:13] if isinstance(source, bytes) else source.open("rb").read(13)
+    if isinstance(source, bytes):
+        head = source[:13]
+    else:
+        with source.open("rb") as handle:
+            head = handle.read(13)
     opener = {b"BZh": bz2.open, b"\xfd7zXZ\x00": lzma.open}.get(
         next((magic for magic in (b"BZh", b"\xfd7zXZ\x00") if head.startswith(magic)), b""),
         gzip.open,
