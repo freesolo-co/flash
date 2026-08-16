@@ -1,8 +1,12 @@
 """Concrete collaborators for the deployment service, over the real repositories and serving.
 
-Each adapter is a thin binding onto an existing functional boundary. They resolve those functions
-through `flash.server.app` at call time (``_app.<name>``) rather than importing them by value,
-because the control plane's own tests and operators patch `app.<name>` to stand in a fake backend.
+Each adapter is a thin binding onto an existing functional boundary.
+
+Most bind straight to the module that owns the function. The exceptions go through
+`flash.server.app` at call time (``_app.<name>``) because the control plane's own tests and
+operators patch `app.<name>` to stand in a fake backend, and a by-value import would not see that
+patch. Route a call through `_app` only when something actually patches it there; otherwise import
+from the canonical module, so the indirection marks a real seam instead of decorating every call.
 
 This is the only place in the deployment path that knows those module-level seams exist; the
 service and the lifecycle see nothing but the protocols.
@@ -30,9 +34,9 @@ class AppRunRepository(RunRepository):
 
     @property
     def deployable_states(self) -> frozenset[str]:
-        from flash.server import app as _app
+        from flash.server.app import _DEPLOYABLE_STATES
 
-        return frozenset(_app._DEPLOYABLE_STATES)
+        return frozenset(_DEPLOYABLE_STATES)
 
     def manageable_run(self, run_id: str, key: dict, org_id, project_id) -> Any:
         from flash.server.platform.deps import manageable_run
@@ -150,9 +154,9 @@ class RemoteServingGateway(ServingGateway):
     """The serving backend: revision registration, alias activation, revocation, inference."""
 
     def deployment_record(self, *, run_id, model, adapter_prefix, state, checkpoint_step) -> Any:
-        from flash.server import app as _app
+        from flash.serve.deploy import deployment_record
 
-        return _app.deployment_record(
+        return deployment_record(
             run_id=run_id,
             model=model,
             adapter_prefix=adapter_prefix,

@@ -113,6 +113,52 @@ class ChatPlan:
     stream: bool
 
 
+@dataclass(frozen=True)
+class _ResolvedDeploy:
+    """A validated deploy, resolved to the revision the gateway will register.
+
+    Produced before anything is persisted, so a dry run can be answered from it directly.
+    """
+
+    effective_spec: JobSpec
+    current_deployment: dict
+    previous_deployment: dict | None
+    deploy_prefix: str
+    checkpoint_step: int | None
+    is_checkpoint: bool
+    prev_state: str
+    deploy_kwargs: dict
+
+
+class _HeldLock:
+    """A deploy lock this request holds, until the background job takes it over.
+
+    `transfer` must be called BEFORE handing the lock to the job, not after the handoff returns.
+    Starting a job is not atomic: it can launch the thread and then fail on its way out, and that
+    thread will release the lock when the lifecycle ends. Marking the transfer afterwards would
+    leave this request believing it still owns a lock the job is already releasing, and two
+    releases of one mutex let the next deploy for this run proceed while the previous lifecycle
+    still thinks it holds it.
+    """
+
+    __slots__ = ("_transferred", "lock")
+
+    def __init__(self, lock) -> None:
+        self.lock = lock
+        self._transferred = False
+
+    def transfer(self) -> None:
+        self._transferred = True
+
+    def reclaim(self) -> None:
+        """The job never ran, so this request owns the lock again and must release it."""
+        self._transferred = False
+
+    def release_unless_transferred(self) -> None:
+        if not self._transferred:
+            self.lock.release()
+
+
 class DeploymentService:
     """Commands over a run's deployment: read, deploy, undeploy, export, list, chat."""
 
@@ -194,23 +240,32 @@ class DeploymentService:
         deploy_lock = self._lock_provider(run_id)
         if not deploy_lock.acquire(blocking=False):
             self._reject_contended_deploy(run_id, command.caller)
-        # a list, not a return value: ownership must already have moved when an UNEXPECTED
-        # exception unwinds out of the body. the job may have started, and releasing a lock it
-        # is about to release again would corrupt the mutex for every later deploy.
-        ownership: list[bool] = [False]
+        held = _HeldLock(deploy_lock)
         try:
-            return self._deploy_locked(command, deploy_lock, ownership)
+            return self._deploy_locked(command, held)
         finally:
-            if not ownership[0]:
-                deploy_lock.release()
+            held.release_unless_transferred()
 
-    def _deploy_locked(self, command: DeployCommand, deploy_lock, ownership: list[bool]) -> dict:
-        """The deploy body, under the lock. Sets ``ownership[0]`` when the job takes the lock."""
+    def _deploy_locked(self, command: DeployCommand, held: _HeldLock) -> dict:
+        """The deploy body, under the lock. Transfers the lock when the job takes it."""
         run_id = command.run_id
         payload = command.payload
         status = self._manageable(run_id, command.caller)
         spec = JobSpec.from_dict(status.spec)
         dry_run = _require_bool(payload, "dry_run", False)
+        resolved = self._resolve_deploy(run_id, status, spec, payload, dry_run, command.caller.key)
+        if dry_run:
+            return self._dry_run(resolved.deploy_kwargs)
+        return self._queue_and_hand_off(run_id, status, spec, resolved, held)
+
+    def _resolve_deploy(
+        self, run_id: str, status, spec: JobSpec, payload: dict, dry_run: bool, caller_key: dict
+    ) -> _ResolvedDeploy:
+        """Validate the request and resolve it to the exact revision the gateway will register.
+
+        Everything here is refusal-or-resolution: nothing is persisted, reported, or started, so a
+        dry run can stop at the end of it.
+        """
         effective_spec, current_deployment = self._validate_deploy_request(
             run_id, status, spec, payload, dry_run
         )
@@ -232,7 +287,7 @@ class DeploymentService:
         # CAS guard: /cancel's worker + provider teardown runs outside this lock (only its status
         # write is lock-serialized), so capture state before deploy and re-verify it on the write.
         prev_state = status.state
-        deploy_org_id = self._deploy_org_id(status, command.caller.key)
+        deploy_org_id = self._deploy_org_id(status, caller_key)
         self._require_deploy_org(run_id, deploy_org_id)
         previous_deployment = None
         expected_adapter_revision = None
@@ -269,18 +324,31 @@ class DeploymentService:
             "checkpoint_step": checkpoint_step,
             "expected_adapter_revision": expected_adapter_revision,
         }
-        if dry_run:
-            return self._dry_run(deploy_kwargs)
+        return _ResolvedDeploy(
+            effective_spec=effective_spec,
+            current_deployment=current_deployment,
+            previous_deployment=previous_deployment,
+            deploy_prefix=deploy_prefix,
+            checkpoint_step=checkpoint_step,
+            is_checkpoint=is_checkpoint,
+            prev_state=prev_state,
+            deploy_kwargs=deploy_kwargs,
+        )
 
+    def _queue_and_hand_off(
+        self, run_id: str, status, spec: JobSpec, resolved: _ResolvedDeploy, held: _HeldLock
+    ) -> dict:
+        """Persist the `queued` record, then hand the rest of the attempt to a background job."""
+        prev_state = resolved.prev_state
         dep_dict = self._queued_deployment_record(
             run_id,
             spec,
-            effective_spec,
-            deploy_prefix,
-            checkpoint_step,
-            is_checkpoint,
-            current_deployment,
-            previous_deployment,
+            resolved.effective_spec,
+            resolved.deploy_prefix,
+            resolved.checkpoint_step,
+            resolved.is_checkpoint,
+            resolved.current_deployment,
+            resolved.previous_deployment,
         )
         marked = self._deployments.mark_pending(run_id, dep_dict, expect_state=prev_state)
         if marked.deployment != dep_dict:
@@ -290,20 +358,20 @@ class DeploymentService:
         job_kwargs = {
             "run_id": run_id,
             "spec_dict": status.spec,
-            "is_checkpoint": is_checkpoint,
-            "deploy_kwargs": deploy_kwargs,
+            "is_checkpoint": resolved.is_checkpoint,
+            "deploy_kwargs": resolved.deploy_kwargs,
             "deployment": dep_dict,
             "prev_state": prev_state,
-            "deploy_lock": deploy_lock,
+            "deploy_lock": held.lock,
         }
         # the job owns the lock from here on and releases it when the lifecycle ends, so a
         # booting replica's non-blocking probe keeps failing for the whole deploy. a start
         # failure means the job never ran, so ownership reverts to this request.
-        ownership[0] = True
+        held.transfer()
         try:
             ran_sync = self._jobs.start(self.lifecycle.finish_locked, **job_kwargs)
         except DeploymentJobStartError as exc:
-            ownership[0] = False
+            held.reclaim()
             self._record_unstarted_job(run_id, dep_dict, exc)
         if ran_sync:
             return public_deployment_view(self._runs.get_status(run_id).deployment or dep_dict)
