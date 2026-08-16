@@ -459,7 +459,7 @@ def _latest_error_artifact_name(repo: str, prefix: str, phase: str) -> str:
 
 
 def _attempt_of(name: str) -> int | None:
-    """The attempt an artifact filename is scoped to, or None for a legacy unscoped name."""
+    """The attempt an artifact filename is scoped to."""
     import re
 
     m = re.search(r"_attempt(\d+)\.txt$", name)
@@ -470,8 +470,8 @@ def _ray_log_name_for_attempt(phase: str, error_name: str) -> str | None:
     """Return ray logs for the same attempt as ``error_name`` when knowable.
 
     Ray logs exist only for ray failures, so choosing the newest independently can pair an old raylet
-    failure with a newer unrelated traceback. Unscoped errors return None. Build the name through
-    the writer's shared definition to prevent format drift.
+    failure with a newer unrelated traceback. Build the name through the writer's shared definition
+    to prevent format drift.
     """
     attempt = _attempt_of(error_name)
     if attempt is None:
@@ -525,19 +525,6 @@ def _worker_artifacts(spec) -> dict[str, str]:
         except Exception:
             continue  # file not uploaded yet / not produced for this phase
     return out
-
-
-def _is_legacy_workload_profile_run(status) -> bool:
-    """True for an in-flight sft workload-profile job recorded before #1095 removed that job.
-
-    The marker is a dropped spec key now, so it survives only on the raw persisted payloads. Read
-    both: the profile job was submitted with the marker on its public and worker specs alike, and a
-    row can be persisted before the worker spec exists.
-    """
-    payloads = [status.spec, (status.effective_preparation or {}).get("worker_spec")]
-    return any(
-        isinstance(payload, dict) and payload.get("workload_profile_kind") for payload in payloads
-    )
 
 
 def _teardown_unrecoverable_remote(status) -> None:
@@ -622,24 +609,6 @@ def _classify_recoverable_runs(
             target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
         ).start()
         if status.state not in _RECOVERABLE:
-            continue
-        if _is_legacy_workload_profile_run(status):
-            # a workload-profile job left in flight by a pre-#1095 plane. the job no longer exists,
-            # and its spec carries no accepted sft workload profile, so resubmitting it would rent a
-            # gpu only to fail. it also no longer reports phase "profile" (the marker is a dropped
-            # key now), so nothing downstream would recognize it. fail it visibly and tear down
-            # whatever it still holds, the same disposition as an unparseable spec.
-            detail = "unrecoverable: the workload-profile job was removed; resubmit the run"
-            _log.warning("marking run %s failed: legacy workload-profile job", status.run_id)
-            with contextlib.suppress(Exception):
-                _update(status.run_id, "failed", error=detail)
-            with contextlib.suppress(Exception):
-                _append_run_log(status.run_id, detail)
-            if status.remote:
-                _teardown_unrecoverable_remote(status)
-                threading.Thread(
-                    target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
-                ).start()
             continue
         if status.remote:
             # A spec this build can no longer parse cannot be reattached either: attach_run parses
