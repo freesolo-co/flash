@@ -16,6 +16,14 @@ import re
 import shutil
 import subprocess
 
+from flash.adapters.fused_experts import (
+    has_complete_fused_expert_tensors,
+    lora_target_parameters,
+    normalize_verl_fused_expert_export,
+    validate_fused_expert_adapter_config,
+)
+from flash.engine.worker.model.lora import _read_adapter_tensor_metadata
+
 
 class MergeDiskHeadroomError(RuntimeError):
     """the merged model this export must write does not fit beside the checkpoint it reads."""
@@ -225,13 +233,17 @@ def completed_checkpoint_step(local_dir: str) -> int:
         return 0
 
 
-def unprocessed_checkpoint_dirs(
-    local_dir: str, completed_step: int, processed_steps: set[int]
+def undiscovered_checkpoint_dirs(
+    local_dir: str, completed_step: int, discovered_steps: set[int]
 ) -> list[tuple[int, str]]:
-    """``(step, dir)`` for every completed ``global_step_N`` not yet in ``processed_steps``, ascending.
+    """``(step, dir)`` for every completed ``global_step_N`` not yet in ``discovered_steps``, ascending.
 
     Bounded by ``completed_step`` so a directory verl is still writing is never handed to a
-    publisher, and by ``processed_steps`` so each checkpoint is published exactly once.
+    publisher, and by ``discovered_steps`` so each checkpoint is handed over exactly once.
+
+    Discovery only. A returned step is one nobody has claimed yet; a filtered step was claimed, which
+    covers publishing it, intentionally skipping it, coalescing it away and crediting it from a
+    previous attempt. Callers must read durability from the lifecycle ledger, never from this filter.
     """
     found: list[tuple[int, str]] = []
     try:
@@ -244,7 +256,7 @@ def unprocessed_checkpoint_dirs(
             continue
         step = int(match.group(1))
         path = os.path.join(local_dir, name)
-        if step <= completed_step and step not in processed_steps and os.path.isdir(path):
+        if step <= completed_step and step not in discovered_steps and os.path.isdir(path):
             found.append((step, path))
     return sorted(found)
 
@@ -424,6 +436,10 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
 
     dir-based analogue of the in-memory peft-model provenance stamp: same validation + fields,
     applied to the json verl produced. raises if the adapter already names a different base.
+
+    also normalizes fused-expert targeting at the exporter boundary. this is the one call every
+    export path (sft and rl, final publish and per-step staging) already funnels through, so every
+    published adapter carries the current loadable config shape.
     """
     cfg_path = os.path.join(adapter_dir, "adapter_config.json")
     with open(cfg_path) as f:
@@ -438,5 +454,14 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
         raise RuntimeError("adapter base revision does not match the validated target commit")
     cfg["base_model_name_or_path"] = model_id
     cfg["revision"] = model_revision or None
+    normalize_verl_fused_expert_export(cfg, model_id)
+    validate_fused_expert_adapter_config(cfg, model_id)
+    if lora_target_parameters(model_id):
+        tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
+        if not has_complete_fused_expert_tensors(tensors, cfg, model_id):
+            raise RuntimeError(
+                f"exported adapter for {model_id} does not contain complete fused expert LoRA "
+                "weights; refusing to stamp it as warm-start compatible"
+            )
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)

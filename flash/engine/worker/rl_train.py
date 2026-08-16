@@ -25,6 +25,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     _TEARDOWN_GRACE_S,
     VERL_REQUIREMENT,
     ChildOutputTail,
+    VerlChildSilenceWatchdog,
     _ChildExitWatchdog,
     clamp_engine_len,
     export_peft_adapter,
@@ -35,9 +36,6 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     probe_verl_capabilities,
     raise_for_classified_verl_exit,
     reap_stragglers,
-    render_gdn_varlen_shim,
-    render_tf32_shim,
-    render_wandb_link_shim,
     require_gdn_boundary_resets,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
@@ -46,7 +44,6 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     stamp_adapter_dir_provenance,
     verl_declares_rollout_field,
     verl_device_capability,
-    wrap_shim_fragment,
 )
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
 
@@ -69,17 +66,7 @@ from flash.engine.worker.sft_train import (  # noqa: F401
 from flash.engine.worker.train.opd.gkd import (  # noqa: F401
     generation_eos_from_cached_config,
 )
-from flash.engine.worker.train.rl.shims import (  # noqa: F401
-    render_entropy_quantile_shim,
-    render_exact_save_steps_shim,
-    render_image_pad_ban_shim,
-    render_kl_ref_adapter_shim,
-    render_per_turn_credit_shim,
-    render_reentrant_checkpointing_shim,
-    render_reward_module,
-    render_stop_sequences_shim,
-    render_structured_outputs_shim,
-)
+from flash.engine.worker.train.rl.reward_module import render_reward_module  # noqa: F401
 
 DATA_SOURCE = "flash_env"
 
@@ -97,11 +84,12 @@ DATA_SOURCE = "flash_env"
 class _GrpoSubprocessStream:
     """one grpo child stream and the evidence latched from that same stream."""
 
-    def __init__(self, proc) -> None:
+    def __init__(self, proc, *, tail=None, silence_watchdog=None) -> None:
         self._proc = proc
         # the caller uses start_new_session, so the leader pid remains the group's stable identity.
         self._process_group_id = proc.pid
-        self._tail = ChildOutputTail()
+        self._tail = tail if tail is not None else ChildOutputTail()
+        self._silence_watchdog = silence_watchdog
         self._terminated = False
         self._orphaned_pipe = False
 
@@ -111,16 +99,27 @@ class _GrpoSubprocessStream:
         # inherits this same pipe, so a trainer that dies while it lives leaves a pipe nobody will
         # close and this loop would run forever on a paid gpu. the watchdog tears the group down,
         # which frees the cuda context AND closes the pipe, ending this loop.
-        with _ChildExitWatchdog(
-            self._proc, process_group_id=self._process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
-        ) as watchdog:
-            for line in self._proc.stdout:
-                # held ACROSS the yield. this is a generator, so the consumer's work for a line runs
-                # while suspended here -- counting only the arrival would make a consumer inside one
-                # long step look exactly like a reader blocked on a dead pipe.
-                with watchdog.handling_line():
-                    self._tail.record(line)
-                    yield line
+        if self._silence_watchdog is not None:
+            self._silence_watchdog.bind(
+                child_alive=lambda: self._proc.poll() is None,
+                teardown=self.terminate,
+            )
+            self._silence_watchdog.start()
+        try:
+            with _ChildExitWatchdog(
+                self._proc, process_group_id=self._process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
+            ) as watchdog:
+                for line in self._proc.stdout:
+                    # held across the yield. this is a generator, so the consumer's work for a line
+                    # runs while suspended here; counting only arrival makes a long callback look idle.
+                    with watchdog.handling_line():
+                        self._tail.record(line)
+                        if self._silence_watchdog is not None:
+                            self._silence_watchdog.observe_line(line)
+                        yield line
+        finally:
+            if self._silence_watchdog is not None:
+                self._silence_watchdog.stop()
         if watchdog.tore_down:
             self._orphaned_pipe = True
             # the group is already gone, so teardown must not be attempted a second time.
@@ -150,6 +149,8 @@ class _GrpoSubprocessStream:
             return_code = int(collected) if collected is not None else 1
         try:
             raise_for_classified_verl_exit(return_code, self._tail)
+            if self._silence_watchdog is not None:
+                self._silence_watchdog.raise_if_failed()
         except BaseException:
             self.terminate()
             raise
@@ -253,21 +254,17 @@ def _configure_rl_child(
             "support it. the worker image's baked interpreter predates the freesolo fork; "
             f"rebuild the worker image with '{VERL_REQUIREMENT}' installed."
         )
-    # the shim is appended here rather than with the shims above because the answer needs
-    # python_bin, resolved before this helper; sitecustomize has not been imported by the child yet.
-    # raises when a gdn child cannot honor resets: the padded fallback that used to handle that
-    # case cannot complete a step on verl's fsdp engine. see require_gdn_boundary_resets.
+    # raises when a gdn child cannot honor resets: the padded fallback cannot complete a step on
+    # verl's fsdp engine, so the final plugin config must carry the proven model type or stop here.
     gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
-    if gdn_reset_arch is not None:
-        # wrapped like the fragments _write_rl_shim composed: the marker prologue is already in
-        # the file, and an unpatched gdn child training across packed example boundaries is
-        # exactly the silent failure the wrapper exists to prevent.
-        with open(files["shim_py"], "a") as f:
-            f.write(wrap_shim_fragment("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
-        files["expected_shims"].append("gdn-varlen")
-
     expected_steps, loggers, project_name, experiment_name, cc_ok = _resolve_training_settings(
         inp, caps
+    )
+    _write_rl_plugin_config(
+        inp,
+        files,
+        gdn_reset_arch=gdn_reset_arch,
+        loggers=loggers,
     )
     # reuse the gdn answer resolved above rather than re-probing; see gdn_hybrid.
     fp8_kv = cc_ok and not gdn_hybrid
@@ -398,6 +395,7 @@ def run_rl_train():
             progress=_progress,
             fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
             progress_step=True,
+            sample_off_thread=True,
         ):
             rc = _execute_rl_child(
                 python_bin=python_bin,
@@ -497,6 +495,7 @@ from flash.engine.worker.rl_train_runner import (  # noqa: E402,F401
     _step_timing_fields,
     _StepMetricState,
     _validate_rl_child,
+    _write_rl_plugin_config,
     _write_rl_shim,
 )
 from flash.engine.worker.train.rl.checkpoints import (  # noqa: E402,F401
@@ -517,9 +516,9 @@ from flash.engine.worker.train.rl.multi_turn import (  # noqa: E402,F401
     _SINGLE_TURN_SCORE_BATCH_SIZE,
     _SINGLE_TURN_SCORE_FLUSH_WAIT_S,
     _SINGLE_TURN_SCORE_SHUTDOWN_WAIT_S,
-    MULTI_TURN_CHILD_MODULES,
+    GRPO_CHILD_MODULES,
     MultiTurnBridge,
-    copy_multi_turn_child_modules,
+    copy_grpo_child_modules,
     multi_turn_child_env,
     start_reward_server,
 )
