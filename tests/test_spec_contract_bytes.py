@@ -367,10 +367,22 @@ def test_every_privately_held_field_is_named_in_a_registry():
     `MANAGED_SECTION_KEYS`. Deriving them from the registry would make this test blind in exactly
     the direction it exists to cover: an inline strip inside an unregistered section (`wandb`) is
     the same defect as the `environment` one, and a registry-driven walk cannot see it.
+
+    A section the public payload drops WHOLE is skipped: `workload_profile` is named in
+    `MANAGED_TOP_LEVEL_KEYS`, so descending into it would re-report a strip the top-level check has
+    already accounted for. The profile below is populated on purpose -- with an empty one that
+    distinction costs nothing and the test passes either way.
     """
+    populated_profile = {"packing_mode": "packed", "examples_per_update": 2, "packed_blocks": 1}
     public, worker = (
-        spec(train={"epochs": 1, "init_from_adapter": "src/step-4"}).to_dict(),
-        spec(train={"epochs": 1, "init_from_adapter": "src/step-4"}).to_internal_dict(),
+        spec(
+            train={"epochs": 1, "init_from_adapter": "src/step-4"},
+            workload_profile=populated_profile,
+        ).to_dict(),
+        spec(
+            train={"epochs": 1, "init_from_adapter": "src/step-4"},
+            workload_profile=populated_profile,
+        ).to_internal_dict(),
     )
     # `project` is public-only by construction (it has no worker counterpart), and the two warm-start
     # topology keys are stripped CONDITIONALLY, so no registry can express them.
@@ -380,7 +392,7 @@ def test_every_privately_held_field_is_named_in_a_registry():
     }
     registered = dict(MANAGED_SECTION_KEYS)
     for section, worker_section in worker.items():
-        if not isinstance(worker_section, dict):
+        if not isinstance(worker_section, dict) or section not in public:
             continue
         public_section = public.get(section) or {}
         managed_keys = registered.get(section, frozenset())
