@@ -475,22 +475,36 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
 
-def test_runpod_backoff_no_overflow_on_long_runs():
-    """DEFECT: runpod_flash computed base*(2**attempt) then clamped, so a long poll loop
-    overflowed (~80 min in) and killed a healthy job. The patch caps the exponent first."""
+def test_runpod_backoff_preserves_strategies_cap_jitter_and_idempotence(monkeypatch):
     pytest.importorskip("runpod_flash")
     from flash.providers.runpod.serverless import _patch_runpod_backoff
 
     _patch_runpod_backoff()
+    from runpod_flash.core.resources import serverless
     from runpod_flash.core.utils import backoff
 
-    # Pre-patch this raised OverflowError; now it must return a clamped, finite delay.
-    delay = backoff.get_backoff_delay(5000, max_seconds=5)
-    assert delay <= 5 * 1.2 + 1e-9
-    # the serverless module's imported reference is patched too (that's the real call site)
-    from runpod_flash.core.resources import serverless
+    patched = backoff.get_backoff_delay
+    assert serverless.get_backoff_delay is patched
+    _patch_runpod_backoff()
+    assert backoff.get_backoff_delay is patched
+    assert serverless.get_backoff_delay is patched
 
-    assert serverless.get_backoff_delay(100000, max_seconds=5) <= 5 * 1.2 + 1e-9
+    jitter_bounds: list[tuple[float, float]] = []
+
+    def _uniform(low: float, high: float) -> float:
+        jitter_bounds.append((low, high))
+        return high
+
+    monkeypatch.setattr("random.uniform", _uniform)
+    strategy = backoff.BackoffStrategy
+    assert patched(5000, max_seconds=5, jitter=0) == 5
+    assert patched(3, base=0.5, max_seconds=10, jitter=0, strategy=strategy.LINEAR) == 2
+    assert patched(2, base=0.5, max_seconds=10, jitter=0, strategy=strategy.LOGARITHMIC) == 1
+    assert patched(1000, base=0.5, max_seconds=3, jitter=0, strategy=strategy.LINEAR) == 3
+    assert patched(1, base=1, max_seconds=10, jitter=0.2) == pytest.approx(2.4)
+    assert jitter_bounds[-1] == (0.8, 1.2)
+    with pytest.raises(ValueError, match="Unsupported backoff strategy"):
+        patched(1, strategy=object())
 
 
 def test_error_artifact_name_is_per_phase_and_attempt():
@@ -547,77 +561,63 @@ def test_worker_and_control_plane_agree_on_the_error_artifact_name():
             plane_name("sft", invalid)
 
 
-def test_train_body_imports_every_name_it_uses():
-    """Flash ships only _train_body's source to the worker, where module-level
-    imports are out of scope, so every stdlib/3p name it references must be
-    imported inside the function body (else NameError before training)."""
-    import ast
+def _unresolved_source_globals(source: str) -> set[str]:
     import builtins
+    import symtable
+
+    root = symtable.symtable(source, "<source>", "exec")
+    builtin_names = set(dir(builtins))
+    unresolved: set[str] = set()
+
+    def _visit(table) -> None:
+        if table.get_type() == "function":
+            unresolved.update(
+                symbol.get_name()
+                for symbol in table.get_symbols()
+                if symbol.is_referenced()
+                and symbol.is_global()
+                and symbol.get_name() not in builtin_names
+            )
+        for child in table.get_children():
+            _visit(child)
+
+    _visit(root)
+    return unresolved
+
+
+def test_train_body_imports_every_name_it_uses():
+    """the source-shipped handler must resolve without module globals."""
     import inspect
 
     from flash.providers.runpod import serverless as train
 
-    tree = ast.parse(inspect.getsource(train._train_body))
-    fn = tree.body[0]
-    imported = {
-        alias.asname or alias.name.split(".")[0]
-        for node in ast.walk(fn)
-        if isinstance(node, (ast.Import, ast.ImportFrom))
-        for alias in node.names
-    }
-    # Names that must be locally imported (regression: contextlib was missing; threading is used by
-    # the always-on console uploader).
-    for name in ("contextlib", "json", "os", "subprocess", "sys", "threading"):
-        assert name in imported, f"_train_body uses {name!r} without a local import"
-    assert "_CONSOLE_UPLOAD_INTERVAL_S" not in inspect.getsource(train._train_body)
+    source = inspect.getsource(train._train_body)
+    assert _unresolved_source_globals(source) == set()
+    assert "_CONSOLE_UPLOAD_INTERVAL_S" not in source
 
-    # a nested helper may only close over names bound in an ENCLOSING scope. reaching for one bound
-    # in a sibling function is a NameError at runtime, and unit tests that exec the helper against a
-    # hand-built namespace supply the name themselves, so they pass while the worker would die.
-    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
-    def _walk_scope(scope):
-        """Nodes belonging to ``scope`` itself, NOT to functions nested inside it.
-
-        ast.walk would descend into them, so a name bound only in a SIBLING helper would count as
-        bound here -- exactly the mistake this check exists to catch, silently passing.
-        """
-        stack = list(ast.iter_child_nodes(scope))
-        while stack:
-            node = stack.pop()
-            yield node
-            if not isinstance(node, scopes):
-                stack.extend(ast.iter_child_nodes(node))
-
-    def _bound(scope) -> set[str]:
-        names = {a.arg for a in ast.walk(scope.args) if isinstance(a, ast.arg)}
-        for node in _walk_scope(scope):
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                names.add(node.id)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                names |= {alias.asname or alias.name.split(".")[0] for alias in node.names}
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                names.add(node.name)
-            elif isinstance(node, ast.ExceptHandler) and node.name:
-                names.add(node.name)  # `except X as e` binds e for the handler's body
-            elif isinstance(node, ast.Global):
-                names |= set(node.names)
-        return names
-
-    builtin_names = set(dir(builtins))
-
-    def _check(scope, visible: set[str]) -> None:
-        inner = visible | _bound(scope)
-        for node in _walk_scope(scope):
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                assert node.id in inner or node.id in builtin_names, (
-                    f"{getattr(scope, 'name', '<lambda>')} reads {node.id!r}, "
-                    "bound in no enclosing scope"
-                )
-            elif isinstance(node, scopes):
-                _check(node, inner)
-
-    _check(fn, set())
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        pytest.param(
+            "def outer():\n    def sibling():\n        value = 1\n    def reader():\n        return value\n",
+            {"value"},
+            id="sibling-local-fails",
+        ),
+        pytest.param(
+            "def outer():\n    value = 1\n    def reader():\n        return value\n",
+            set(),
+            id="enclosing-local-succeeds",
+        ),
+        pytest.param(
+            "def outer(items):\n    return len(items)\n",
+            set(),
+            id="builtin-succeeds",
+        ),
+    ],
+)
+def test_source_global_check_sensitivity(source, expected):
+    assert _unresolved_source_globals(source) == expected
 
 
 def test_train_body_has_no_prime_install_path():
@@ -1082,887 +1082,331 @@ def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
 
 def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
     import flash.engine.worker as worker
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers._lifecycle import bootstrap as instance_bootstrap
     from flash.providers.runpod.serverless import endpoints
 
     assert endpoints._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
-    assert _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
+    assert instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
     steady_state_commits_per_hour = (
         3600.0 / worker._HB_MIN_INTERVAL_S + 3600.0 / endpoints._CONSOLE_UPLOAD_INTERVAL_S
     )
     assert steady_state_commits_per_hour <= 5.0
 
 
-def test_first_console_snapshot_precedes_the_stall_teardown():
-    """A wedged run must produce a console artifact before the stall classifier tears it down.
-
-    The hourly interval is longer than BOTH stall limits, so a periodic uploader that waits a full
-    interval for its first snapshot can never fire for a run that hangs -- which is exactly the run
-    whose console is the only evidence of why it hung. Multi-turn OPD wedges died this way: the
-    child hard-exits without a traceback, and the artifact that would have carried the stderr was
-    never uploaded because teardown always won the race.
-    """
+def test_first_console_snapshot_precedes_stall_teardown():
     import importlib
     import inspect
 
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers._lifecycle import bootstrap as instance_bootstrap
     from flash.providers.runpod.serverless import endpoints
 
-    # poll_job's stall defaults are the deadlines the first snapshot has to beat. `jobs` has to be
-    # imported first: it is mid-cycle with job_execution, so importing job_execution alone raises
-    # ImportError. done through importlib so import sorting cannot reorder the two.
     importlib.import_module("flash.providers.runpod.jobs")
     poll_job = importlib.import_module("flash.providers.runpod.job_execution").poll_job
-
-    stall_defaults = inspect.signature(poll_job).parameters
-    training_stall_s = stall_defaults["stall_after_s"].default
-    setup_grace_s = stall_defaults["setup_grace_s"].default
+    defaults = inspect.signature(poll_job).parameters
+    training_stall_s = defaults["stall_after_s"].default
+    setup_grace_s = defaults["setup_grace_s"].default
 
     for first_snapshot_s in (
         endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
-        _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
+        instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S,
     ):
         assert first_snapshot_s < training_stall_s
         assert first_snapshot_s < setup_grace_s
-        # the defect this guards: the steady interval alone outlives both deadlines.
-        assert setup_grace_s < endpoints._CONSOLE_UPLOAD_INTERVAL_S
-
-    # the poll is what actually beats the deadline: it is how soon after output stops the uploader
-    # can notice and commit. two polls is the worst case.
     for poll_s in (
         endpoints._CONSOLE_UPLOAD_POLL_S,
-        _instance_bootstrap._CONSOLE_UPLOAD_POLL_S,
+        instance_bootstrap._CONSOLE_UPLOAD_POLL_S,
     ):
         assert 2 * poll_s < training_stall_s
 
-    # _train_body ships as SOURCE to the worker, so it inlines these numbers rather than
-    # referencing the constants (test_train_body_imports_every_name_it_uses enforces that). pin the
-    # literals here so the shipped uploader cannot drift away from the deadlines above.
-    body = inspect.getsource(endpoints._train_body)
-    assert f"stop_upload.wait({endpoints._CONSOLE_UPLOAD_POLL_S})" in body
-    assert f"due_s, since, quiet_polls = {endpoints._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S}" in body
-    # a credit is spent only by a wedge snapshot that LANDED, and spending it disarms the latch
-    # until progress resumes.
-    assert "quiet_spent += 1 if wedged and ok else 0" in body
-    # the deadline advances only on a LANDED upload: resetting on a swallowed failure books a
-    # snapshot that reached no repo and puts the retry an interval out, past the stall teardown.
-    assert f"since, due_s = 0.0, {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
-    assert "if ok:" in body
-    # the latch is spent only on silence that bought an upload, not on an already-due snapshot.
-    assert "and not due" in body
-    # progress RE-ARMS the latch: without this a healthy slow stage spends the only credit and a
-    # genuine wedge later is torn down with no failure-era console. the credits bound the total, so
-    # the re-arm cannot turn into an unbounded commit rate.
-    assert "armed = armed and not (wedged and ok)" in body
-    # the shipped loop inlines the credit cap; the instance loop reads it from the constant, and
-    # they must agree or one provider detects a second wedge and the other does not.
-    assert f"quiet_spent < {_instance_bootstrap._CONSOLE_UPLOAD_CREDITS}" in body
-    # the sustained-silence threshold and the success-gated watermark, which keep a sparsely
-    # logging run inside the shared repo's commit budget and retry a swallowed upload failure.
-    assert f"quiet_polls >= {_instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS}" in body
-    # the latch arms only after real progress: a cold image is quiet through startup and would
-    # otherwise spend it on an empty console, leaving a later hang with no snapshot before teardown
-    # (test_..._keeps_its_wedge_credit_through_a_slow_startup covers the behavior on the twin loop).
-    assert "wedged = armed and quiet_polls" in body
-    assert "quiet_spent, armed, committed = -1, -1, 0, False, False" in body
-    assert "uploaded_size = size if ok else uploaded_size" in body
-    # the wedge signal is STAGED HEARTBEATS, not console bytes: a stuck worker still logs, so a
-    # size-based rule never fires for it (test_..._detects_a_wedge_that_keeps_logging).
-    assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
-    # the shipped parser advances through bounded chunks, retains only a bounded partial line, and
-    # drops overlong lines through their newline. eof stays separate from the parser offset so growth
-    # in an unterminated line still makes a snapshot eligible.
-    assert "while offset < eof:" in body
-    assert "chunk = handle.read(min(1_048_576, eof - offset))" in body
-    assert 'state["offset"] = offset' in body
-    assert 'state["partial"] = lines.pop()' in body
-    assert 'state.update(partial=b"", dropping=True)' in body
-    assert "return eof, committed, beats" in body
-    # each complete heartbeat is decoded independently and only top-level markers classify it.
-    assert 'line.startswith(b"HEARTBEAT ")' in body
-    assert 'json.loads(line[len(b"HEARTBEAT ") :])' in body
-    assert 'not payload.get("liveness")' in body
-    assert 'not {"pending", "throttled"} & set(payload)' in body
-    assert "if staged and not committed and since < due_s:" in body
-    assert f"due_s = {endpoints._CONSOLE_UPLOAD_INTERVAL_S}" in body
-    assert "committed = committed or bool(staged)" in body
-    assert "progress = staged if committed else beats" in body
-    assert "armed = armed or bool(progress)" in body
-    assert "quiet_polls = 0 if progress else quiet_polls + 1" in body
-    # a counting rule cannot go negative now that it counts whole matching lines instead of
-    # subtracting key occurrences, so the old floor is gone rather than silently dropped.
-    assert "max(0, buf.count" not in body
 
-
-def _drive_instance_upload_loop(
-    monkeypatch, sizes: list[int], cycles: int, *, succeed=True, staged=None, beats=None
-) -> tuple[list, list]:
-    """Run the real instance loop over a scripted console-size series. Returns (waits, uploads).
-
-    ``succeed`` is the upload result, either a bool or a predicate over the attempt number, so a
-    test can script an upload that fails the way hf_upload does: swallowed, returning falsy.
-
-    ``staged`` scripts the STAGED-heartbeat count seen at each poll, which is the progress signal
-    the loop keys on. It defaults to "a heartbeat whenever the console grew", the shape of a
-    healthy run, so a frozen console still reads as wedged. A test covering a worker that keeps
-    logging without making progress passes its own series.
-
-    ``beats`` scripts the ARMING count separately. The real ``_console_progress`` returns both
-    because they answer different questions: only a committed heartbeat resets the wedge timer,
-    but any heartbeat -- ``pending`` included -- proves the loop was reached and may arm it. It
-    defaults to ``staged``, so a test that does not care about the distinction sees the old
-    behaviour; a test covering failed heartbeat uploads scripts arming beats with zero staged.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    waits: list[float] = []
-    uploads: list[int] = []
-    clock = {"i": 0}
-
-    class _Stop:
-        def wait(self, seconds: float) -> bool:
-            waits.append(seconds)
-            return len(waits) > cycles
-
-    def _progress(_console: str, _offset: int) -> tuple[int, int, int]:
-        index = min(clock["i"], len(sizes) - 1)
-        clock["i"] += 1
-        if staged is not None:
-            progressed = staged[min(index, len(staged) - 1)]
-        else:  # grew since the previous poll -> one staged heartbeat
-            progressed = 1 if index == 0 or sizes[index] != sizes[index - 1] else 0
-        arming = progressed if beats is None else beats[min(index, len(beats) - 1)]
-        return sizes[index], progressed, arming
-
-    def _upload(_payload, _console, _mode) -> bool:
-        uploads.append(clock["i"])
-        return succeed(len(uploads)) if callable(succeed) else succeed
-
-    monkeypatch.setattr(_instance_bootstrap, "_console_progress", _progress)
-    monkeypatch.setattr(_instance_bootstrap, "_upload_console_snapshot", _upload)
-    _instance_bootstrap._console_upload_loop({}, "/tmp/console.txt", "train", 3600.0, _Stop())
-    return waits, uploads
-
-
-def _drive_serverless_upload_loop(statuses: list[str], *, succeed=True) -> list[int]:
+def _source_shipped_namespace(*names: str, namespace: dict | None = None) -> dict:
     import ast
-    import contextlib
     import inspect
-    import json
-    import os
     import textwrap
 
     from flash.providers.runpod.serverless import endpoints
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
     nodes = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name in {"_console_progress", "_upload_loop"}
+        next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+        for name in names
     ]
-    nodes.sort(key=lambda n: n.lineno)
-    mode = f"test_{os.getpid()}_{time.time_ns()}"
-    console = f"/tmp/console_{mode}.txt"
-    state = {"poll": 0}
-    uploads: list[int] = []
+    nodes.sort(key=lambda node: node.lineno)
+    result = dict(namespace or {})
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<handler>", "exec"), result)
+    return result
 
-    class _Stop:
-        def wait(self, _seconds: float) -> bool:
-            if state["poll"] >= len(statuses):
-                return True
-            status = statuses[state["poll"]]
-            state["poll"] += 1
-            payload = {"stage": "train", "step": state["poll"]}
-            if status in {"pending", "throttled"}:
-                payload[status] = True
-            elif status == "nested":
-                payload["sampled_completions"] = [
+
+def _source_shipped_console_progress(*, open_fn=None):
+    import json
+    import os
+
+    namespace = {"json": json, "os": os}
+    if open_fn is not None:
+        namespace["open"] = open_fn
+    return _source_shipped_namespace("_console_progress", namespace=namespace)["_console_progress"]
+
+
+@pytest.fixture(params=("instance", "source-shipped"))
+def console_progress_impl(request):
+    if request.param == "instance":
+        from flash.providers._lifecycle import bootstrap
+
+        return request.param, bootstrap._console_progress, bootstrap
+    progress = _source_shipped_console_progress()
+    return request.param, progress, progress.__globals__
+
+
+def _heartbeat_line(**fields) -> bytes:
+    import json
+
+    payload = {"stage": "train", "step": 1, **fields}
+    return f"HEARTBEAT {json.dumps(payload)}\n".encode()
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param(_heartbeat_line(), (1, 1), id="committed"),
+        pytest.param(_heartbeat_line(pending=True), (0, 1), id="pending"),
+        pytest.param(_heartbeat_line(throttled=True), (0, 1), id="throttled"),
+        pytest.param(_heartbeat_line(liveness=True), (0, 0), id="liveness"),
+        pytest.param(
+            _heartbeat_line(
+                sampled_completions=[
                     {
                         "liveness": 'model text: "liveness":',
                         "pending": 'model text: "pending":',
                         "throttled": 'model text: "throttled":',
                     }
                 ]
-            if status == "none":
-                line = f"worker chatter {state['poll']}\n"
-            elif status == "partial":
-                line = "x" * 100
-            else:
-                line = f"HEARTBEAT {json.dumps(payload)}\n"
-            with open(console, "a") as f:
-                f.write(line)
+            ),
+            (1, 1),
+            id="nested-marker-text-is-inert",
+        ),
+        pytest.param(
+            b"HEARTBEAT {not json}\n" + _heartbeat_line(step=2),
+            (1, 1),
+            id="malformed-line-isolation",
+        ),
+        pytest.param(
+            b'(raylet) {"stage":"train","pending":false}\n',
+            (0, 0),
+            id="non-heartbeat-json-is-inert",
+        ),
+    ],
+)
+def test_console_progress_parser_matrix(console_progress_impl, tmp_path, content, expected):
+    name, progress, _owner = console_progress_impl
+    console = tmp_path / f"console_{name}.txt"
+    console.write_bytes(content)
+    state = {"offset": 0, "partial": b"", "dropping": False}
+
+    assert progress(str(console), state) == (len(content), *expected), name
+    assert state["offset"] == len(content), name
+
+
+def _drive_console_cadence(monkeypatch, provider: str, progress, outcomes=True):
+    from flash.providers._lifecycle import bootstrap as instance_bootstrap
+
+    polls = {"count": 0}
+    waits: list[float] = []
+    attempts: list[int] = []
+
+    class _Stop:
+        def wait(self, seconds: float) -> bool:
+            waits.append(seconds)
+            if polls["count"] >= len(progress):
+                return True
+            polls["count"] += 1
             return False
 
-    def _upload(_mode: str) -> bool:
-        uploads.append(state["poll"])
-        return succeed(len(uploads)) if callable(succeed) else succeed
+    def _progress(_console, _state):
+        return progress[polls["count"] - 1]
 
-    namespace = {
-        "console": console,
-        "mode": mode,
-        "json": json,
-        "os": os,
-        "stop_upload": _Stop(),
-        "_upload_console": _upload,
-    }
-    try:
-        with open(console, "w"):
-            pass
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<handler>", "exec"), namespace)
-        namespace["_upload_loop"]()
-        return uploads
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(console)
+    def _outcome() -> bool:
+        if callable(outcomes):
+            return outcomes(len(attempts))
+        if isinstance(outcomes, list):
+            return outcomes[min(len(attempts) - 1, len(outcomes) - 1)]
+        return outcomes
 
+    if provider == "instance":
 
-def _source_shipped_console_progress():
-    import ast
-    import inspect
-    import json
-    import os
-    import textwrap
+        def _upload(_payload, _console, _mode):
+            attempts.append(polls["count"])
+            return _outcome()
 
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_console_progress"
-    )
-    namespace = {"json": json, "os": os}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    return namespace["_console_progress"]
-
-
-def test_instance_and_source_shipped_console_upload_loops_stay_in_parity(monkeypatch):
-    cases = [
-        (["committed"] * 31, True),
-        (["nested"] * 31, True),
-        (["none"] * 6, True),
-        (["committed"] + ["none"] * 6, True),
-        (["throttled"] * 14 + ["none"] * 6, True),
-        (["none"] * 7, lambda attempt: attempt > 1),
-        (["partial"] * 36, True),
-    ]
-    for statuses, succeed in cases:
-        staged = [int(status in {"committed", "nested"}) for status in statuses]
-        beats = [
-            int(status in {"committed", "nested", "pending", "throttled"}) for status in statuses
-        ]
-        sizes = [1000 * (n + 1) for n in range(len(statuses))]
-        _waits, instance_uploads = _drive_instance_upload_loop(
-            monkeypatch,
-            sizes,
-            cycles=len(statuses),
-            staged=staged,
-            beats=beats,
-            succeed=succeed,
+        monkeypatch.setattr(instance_bootstrap, "_console_progress", _progress)
+        monkeypatch.setattr(instance_bootstrap, "_upload_console_snapshot", _upload)
+        instance_bootstrap._console_upload_loop(
+            {}, "/tmp/console.txt", "train", instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S, _Stop()
         )
-        assert _drive_serverless_upload_loop(statuses, succeed=succeed) == instance_uploads
-
-
-def test_instance_console_upload_loop_promotes_healthy_run_to_hourly(monkeypatch):
-    """a committed heartbeat before 600s removes the routine fallback console write."""
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    interval_s = _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
-    cycles = int(2 * interval_s / poll_s) + 1
-    growing = [1000 * (n + 1) for n in range(cycles + 2)]
-    waits, uploads = _drive_instance_upload_loop(monkeypatch, growing, cycles=cycles)
-
-    assert waits[0] == poll_s
-    assert set(waits) == {poll_s}
-    assert len(uploads) == 2
-    assert uploads[0] * poll_s == interval_s
-    assert (uploads[1] - uploads[0]) * poll_s == interval_s
-
-
-def test_instance_console_upload_loop_keeps_600s_fallback_without_a_commit(monkeypatch):
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    cycles = int(first_s / poll_s) + 1
-    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
-
-    _waits, uploads = _drive_instance_upload_loop(
-        monkeypatch, sizes, cycles=cycles, staged=[0] * (cycles + 2), beats=[0] * (cycles + 2)
-    )
-
-    assert uploads == [int(first_s / poll_s)]
-
-
-def test_healthy_first_hour_uses_only_terminal_console_budget(monkeypatch):
-    import flash.engine.worker as worker
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    cycles = int(_instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S / poll_s) - 1
-    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
-    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles)
-
-    terminal_uploads = 1
-    heartbeat_uploads = int(3600.0 / worker._HB_MIN_INTERVAL_S)
-    assert uploads == []
-    assert heartbeat_uploads + terminal_uploads <= 5
-
-
-def test_instance_console_upload_loop_commits_when_a_wedged_run_goes_quiet(monkeypatch):
-    """a first commit promotes the cadence, but its later wedge still buys a timely snapshot."""
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
-    progress_polls = 2
-    cycles = progress_polls + quiet_polls + 4
-    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
-    staged = [1] * progress_polls + [0] * (cycles + 2 - progress_polls)
-    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles, staged=staged)
-
-    assert len(uploads) == 1
-    assert (uploads[0] - progress_polls) * poll_s < 1200.0
-    assert uploads[0] * poll_s < _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
-
-
-def test_instance_console_upload_loop_keeps_a_sparsely_logging_run_in_budget(monkeypatch):
-    """A healthy run that logs slower than the poll must not be mistaken for a wedge.
-
-    Momentary quiet is normal: a worker in a teacher call or a compile emits nothing for minutes at
-    a time. Treating ONE unchanged sample as the wedge signature commits on nearly every poll, so
-    the loop that exists to respect the shared repo's 5 commits/hour spends 10 by itself. Silence
-    has to be sustained, and the resulting snapshot spent once, or the rate is unbounded.
-
-    The budget governs the SUSTAINED rate, so that is what is asserted here: the scheduled cadence
-    over the run, plus at most one wedge commit for the whole run. Dividing every commit by a short
-    window instead would charge that one-off snapshot as if it recurred -- 1.5/hr over 2h for a
-    loop that converges to 1.0/hr -- and would fail a correct implementation for being measured
-    over too short a horizon.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    interval_s = _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
-    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
-    hours = 2
-    cycles = int(hours * 3600.0 / poll_s)
-    # alternating phases of sustained silence and output -- each silent phase is long enough to
-    # look wedged, so without the one-shot latch every cycle buys another commit.
-    phase = quiet_polls + 2
-    sizes = [1000 * (n // phase) for n in range(cycles + 2)]
-    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles)
-
-    import flash.engine.worker as worker
-
-    # the scheduled cadence is one per interval after the first snapshot; anything beyond that is
-    # the one-shot wedge credit, which the latch caps at one for the entire run.
-    scheduled = int(hours * 3600.0 / interval_s) + 1
-    assert len(uploads) <= scheduled + 1, f"{len(uploads)} commits exceeds the schedule plus one"
-
-    sustained = 3600.0 / interval_s
-    total = 3600.0 / worker._HB_MIN_INTERVAL_S + sustained
-    assert total <= 5.0, f"{sustained}/hr console + heartbeat = {total}/hr, budget is 5"
-
-
-def test_instance_console_upload_loop_saves_the_quiet_snapshot_for_a_real_wedge(monkeypatch):
-    """A brief healthy pause must not consume the one quiet snapshot the wedge case needs.
-
-    The quiet commit is taken once per run. If a single unchanged sample triggered it, an ordinary
-    pause between log lines would spend it early, and the hang that follows -- the failure this
-    whole path exists to capture -- would get no snapshot until the next hourly boundary, long
-    after the stall classifier tore the run down.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
-    grow_polls = int(first_s / poll_s) + 1
-    pause_polls = quiet_polls - 1  # a pause too short to be a wedge
-    wedge_at = grow_polls + pause_polls + 2
-    sizes = [1000 * (n + 1) for n in range(grow_polls)]
-    sizes += [1000 * grow_polls] * pause_polls  # brief pause, then output resumes
-    sizes += [1000 * (grow_polls + n + 1) for n in range(2)]
-    sizes += [1000 * (grow_polls + 2)] * (quiet_polls + 4)  # the real wedge
-    cycles = len(sizes)
-    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles)
-
-    after_wedge = [u for u in uploads if u > wedge_at]
-    assert after_wedge, "the brief pause consumed the snapshot the real wedge needed"
-    # and it lands inside the 1200s training stall, measured from when output actually stopped.
-    assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
-
-
-def test_instance_console_upload_loop_rearms_its_wedge_credit_after_progress_resumes(monkeypatch):
-    """A healthy quiet stage must not disarm wedge detection for the whole run.
-
-    A slow ``sft_model_load`` emits one staged transition and then only liveness pings, which
-    ``_console_progress`` subtracts -- so it reads as sustained silence and buys a wedge snapshot
-    even though nothing is wrong. With a single PERMANENT credit that run can never buy another, so
-    a genuine hang later waits for the hourly cadence and the box is torn down at 1200s with no
-    failure-era console: exactly the loss this loop exists to prevent, reached through the
-    detection built to prevent it.
-
-    Progress after a spent credit means the run RECOVERED, so the next quiet run is a different
-    stall and re-arms. The credits bound the total, which is what keeps the re-arm from becoming an
-    unbounded commit rate -- ``..._keeps_a_slow_starting_run_in_budget`` measures that ceiling.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
-    # one staged transition, a long healthy-but-quiet load that spends a credit, one more
-    # transition (the load finished), then a permanent wedge.
-    healthy_quiet = quiet_polls + 5
-    staged = [1] + [0] * healthy_quiet + [1]
-    wedge_at = len(staged)
-    staged += [0] * (quiet_polls + 8)
-    # the console keeps growing throughout: a wedged worker still prints ray warnings, so bytes
-    # never signal the stall and only the staged count can.
-    sizes = [1000 * (n + 1) for n in range(len(staged))]
-    _waits, uploads = _drive_instance_upload_loop(
-        monkeypatch, sizes, cycles=len(sizes), staged=staged
-    )
-
-    after_wedge = [u for u in uploads if u > wedge_at]
-    assert after_wedge, (
-        "the healthy quiet stage spent the only wedge credit, so the real hang got no snapshot"
-    )
-    # and it lands inside the 1200s training stall, measured from when progress actually stopped.
-    assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
-
-
-def test_instance_console_upload_loop_bounds_its_wedge_credits_over_a_flapping_run(monkeypatch):
-    """Re-arming must not become an unbounded commit rate.
-
-    The latch re-arms on progress, so a run that alternates a heartbeat with sustained silence
-    re-arms on every cycle. Without a cap that shape buys a wedge snapshot each time -- 6/hr
-    console plus the heartbeat's 4/hr, double the shared repo's hard 5.0 ceiling -- and the loop
-    written to respect the budget becomes the thing that blows it. The credits are what bound it,
-    and they are per RUN, so they never enter the sustained rate.
-    """
-    import flash.engine.worker as worker
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
-    interval_s = _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
-    hours = 4
-    cycles = int(hours * 3600.0 / poll_s)
-    # adversarial: one heartbeat, then just enough silence to look wedged, forever.
-    cycle = [1] + [0] * quiet_polls
-    staged = (cycle * (cycles // len(cycle) + 1))[:cycles]
-    sizes = [1000 * (n + 1) for n in range(cycles)]
-    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles, staged=staged)
-
-    # the BUDGET, not the credit constant: deriving the allowance from the value under test makes
-    # the assertion self-referential -- raising the credits raises the bar with it, so the test can
-    # never fail. (Measured: credits=999 commits 24 times at 10/hr and still "passes" that way.)
-    scheduled_per_hour = 3600.0 / interval_s
-    heartbeat_per_hour = 3600.0 / worker._HB_MIN_INTERVAL_S
-    assert scheduled_per_hour + heartbeat_per_hour <= 5.0, "the schedule alone must fit the budget"
-    # the credits are a fixed per-run addition, so the total is the scheduled cadence plus a
-    # constant -- never one commit per silent cycle, which is what an unbounded re-arm buys.
-    unbounded = cycles // len(cycle)
-    assert len(uploads) < unbounded, (
-        f"{len(uploads)} commits over {hours}h is the unbounded rate: every silent cycle bought one"
-    )
-    # and the whole run stays inside the ceiling once its one-off credits are amortized.
-    assert len(uploads) / hours + heartbeat_per_hour <= 5.0 + 1.0, (
-        f"console {len(uploads) / hours}/hr + heartbeat exceeds the 5.0/hr ceiling"
-    )
-
-
-def test_instance_console_upload_loop_does_not_spend_the_latch_on_a_due_snapshot(monkeypatch):
-    """A run quiet across its FIRST scheduled snapshot must keep its wedge credit.
-
-    At that poll the scheduled deadline and the sustained-silence rule are both true, so the upload
-    happens either way. Charging the one-shot latch there buys nothing and disarms wedge detection
-    for the rest of the run: if output resumes and the worker then truly hangs, the next snapshot is
-    a full interval away -- 4200s here, against a 1200s stall teardown -- so the hang is never
-    captured. The latch may only be spent when silence bought an upload that was not already due.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
-    # silent from the start, so the first scheduled snapshot and the wedge rule coincide.
-    silent_polls = int(first_s / poll_s)
-    assert silent_polls > quiet_polls, "the deadline must land after silence is already sustained"
-    sizes = [1000] * silent_polls
-    sizes += [1000 * (n + 2) for n in range(3)]  # output resumes
-    wedge_at = len(sizes)
-    sizes += [1000 * 4] * (quiet_polls + 6)  # then the run wedges for good
-    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=len(sizes))
-
-    after_wedge = [u for u in uploads if u > wedge_at]
-    assert after_wedge, "the overlapping scheduled snapshot consumed the real wedge's credit"
-    assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
-
-
-def test_instance_console_upload_loop_never_charges_a_credit_to_a_scheduled_snapshot(monkeypatch):
-    """Silence coinciding with a DUE snapshot must not spend a credit, even after re-arming.
-
-    The test above covers a run silent from the start, where the ``armed`` rule alone already
-    withholds the credit. This one arms the latch first, so only the ``not due`` guard can withhold
-    it. Progress re-arms the latch but never refunds ``spent``, so charging an upload that the
-    schedule was making anyway drains the per-run cap on snapshots that cost nothing to skip: two
-    such coincidences exhaust it, and the genuine wedge afterwards gets no console before the 1200s
-    stall teardown. Each scheduled boundary here is approached with output still flowing and goes
-    quiet only for exactly the wedge threshold, so no INDEPENDENT wedge fires -- the sole difference
-    between guarded and unguarded is what the due polls are charged.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    threshold = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
-    first_polls = int(_instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S / poll_s)
-    interval_polls = int(_instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S / poll_s)
-    # the run must be able to reach each deadline with output still flowing, or the silence that
-    # coincides with it is indistinguishable from a wedge that was already owed a snapshot.
-    assert first_polls > threshold, "the first deadline must land after the wedge threshold"
-
-    sizes: list[int] = []
-    staged: list[int] = []
-    size = [1000]
-
-    def _phase(progress: int, quiet: int) -> None:
-        for _ in range(progress):
-            size[0] += 1000
-            sizes.append(size[0])
-            staged.append(1)
-        for _ in range(quiet):
-            sizes.append(size[0])
-            staged.append(0)
-
-    # each deadline is met with quiet_polls at exactly the threshold: due and wedge coincide.
-    _phase(first_polls - threshold, threshold)
-    _phase(interval_polls - threshold, threshold)
-    _phase(1, 0)  # output resumes, re-arming the latch
-    wedge_at = len(sizes)
-    _phase(0, threshold + 6)  # then the run wedges for good, far from any deadline
-    _waits, uploads = _drive_instance_upload_loop(
-        monkeypatch, sizes, cycles=len(sizes), staged=staged
-    )
-
-    after_wedge = [u for u in uploads if u > wedge_at]
-    assert after_wedge, "the scheduled snapshots drained the credits the real wedge needed"
-    assert (after_wedge[0] - wedge_at) * poll_s < 1200.0, (
-        "the wedge snapshot landed after the stall teardown would have killed the box"
-    )
-
-
-def test_instance_console_upload_loop_keeps_a_slow_starting_run_in_budget(monkeypatch):
-    """A silent setup must not buy the run a faster sustained cadence.
-
-    A tempting fix for "a setup that never emits a heartbeat is torn down at 3000s with only its
-    600s snapshot" is to hold the first-snapshot cadence until progress starts. It does close that
-    gap -- and it costs one extra commit that lands in the SUSTAINED rate, because a real run has a
-    silent setup and then trains for hours: 4h with a 600s setup measures 1.25/hr console + 4/hr
-    heartbeat = 5.25/hr against a hard 5.0. The gap is left to the stall classifier instead. This
-    pins the rate so that fix cannot be reintroduced without buying rate somewhere else.
-    """
-    import flash.engine.worker as worker
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    interval_s = _instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S
-    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    hours = 4
-    cycles = int(hours * 3600.0 / poll_s)
-    # the realistic shape: a silent setup, then a healthy run that logs for hours.
-    setup_polls = int(first_s / poll_s)
-    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
-    staged = [0] * setup_polls + [1] * (cycles + 2 - setup_polls)
-    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles, staged=staged)
-
-    per_hour = len(uploads) / hours
-    total = per_hour + 3600.0 / worker._HB_MIN_INTERVAL_S
-    assert total <= 5.0, f"console {per_hour}/hr + heartbeat = {total}/hr, budget is 5"
-    # and the cadence must actually converge to the interval, not merely squeak under the cap.
-    assert (uploads[-1] - uploads[-2]) * poll_s == interval_s
-
-
-def test_instance_console_upload_loop_keeps_its_wedge_credit_through_a_slow_startup(monkeypatch):
-    """A cold image that imports for minutes before its first heartbeat must not spend the latch.
-
-    Startup is silent by nature -- pulling and importing the worker stack outruns QUIET_POLLS (480s)
-    before the first scheduled snapshot (600s) is even due -- so quiet accounting that begins at
-    process start reads it as a wedge. The commit that buys is an empty console: nothing has run
-    yet. Worse, spending the latch there also resets the scheduled deadline to a full interval, so
-    the next commit is ~4080s out. A real hang after startup then finds the latch gone AND the
-    schedule pushed away, and the 1200s stall teardown destroys the box with no console at all --
-    strictly worse than never having had wedge detection.
-
-    So the latch arms only once a staged heartbeat has actually been seen. A startup that never
-    reaches one is the stall classifier's 3000s setup grace, not this loop's case.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
-    # the startup must reach the wedge threshold STRICTLY BEFORE the first snapshot is due, or the
-    # `not due` guard already covers it and a passing test would prove nothing about this fix.
-    startup_polls = quiet_polls
-    assert startup_polls * poll_s < first_s, (
-        "startup must go quiet before the first snapshot is due"
-    )
-
-    healthy_polls = 10
-    wedge_at = startup_polls + healthy_polls
-    cycles = wedge_at + quiet_polls + 8
-    # the console GROWS throughout: banners during startup, ray chatter during the hang. Only the
-    # staged-heartbeat series distinguishes the three phases.
-    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
-    staged = [0] * startup_polls + [1] * healthy_polls
-    staged += [0] * (cycles + 2 - len(staged))
-    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles, staged=staged)
-
-    after_wedge = [u for u in uploads if u > wedge_at]
-    assert after_wedge, "the silent startup consumed the latch the post-startup wedge needed"
-    assert (after_wedge[0] - wedge_at) * poll_s < 1200.0
-    # and the startup must not have moved the scheduled snapshot either: pushing it out to a full
-    # interval is half the damage, and it survives even if the latch itself is later restored.
-    assert uploads[0] * poll_s == first_s, "a quiet startup delayed the first scheduled snapshot"
-
-
-def test_instance_console_upload_loop_detects_a_wedge_that_keeps_logging(monkeypatch):
-    """A worker stuck after its last staged heartbeat still prints -- and must still be caught.
-
-    Ray warnings, liveness pings and library chatter keep the console GROWING while no real work
-    happens, so a wedge rule keyed on console bytes never fires: every poll sees a new size. The
-    stall classifier does not care about bytes either -- it advances only on a staged heartbeat and
-    tears the run down on that clock. Keying on the same signal is what keeps the two agreeing.
-
-    Measured with a byte-based rule: snapshots at 600s and then 4200s, with teardown near 1800s --
-    no console for the hang at all.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    quiet_polls = _instance_bootstrap._CONSOLE_UPLOAD_QUIET_POLLS
-    healthy_polls = int(first_s / poll_s) + 1
-    cycles = healthy_polls + quiet_polls + 6
-    # the console never stops growing, so a size-based rule sees progress at every single poll.
-    sizes = [1000 * (n + 1) for n in range(cycles + 2)]
-    # but staged heartbeats stop after the healthy prefix: that is the wedge.
-    staged = [1] * healthy_polls + [0] * (cycles + 2 - healthy_polls)
-    _waits, uploads = _drive_instance_upload_loop(monkeypatch, sizes, cycles=cycles, staged=staged)
-
-    after_wedge = [u for u in uploads if u > healthy_polls]
-    assert after_wedge, "a wedged run that keeps logging produced no snapshot"
-    # and it lands inside the 1200s training stall, measured from when progress actually stopped.
-    assert (after_wedge[0] - healthy_polls) * poll_s < 1200.0
-
-
-def test_console_progress_counts_staged_heartbeats_incrementally(tmp_path):
-    """The wedge signal itself, unmocked: every loop test above patches _console_progress out.
-
-    Three properties, all load-bearing. It must count only heartbeats that REPRESENT progress: every
-    payload carries ``"stage"``, liveness pings included (``heartbeat.py`` adds ``"liveness": True``
-    to the same flat object), and those print every 30s from a daemon thread -- so a worker wedged
-    inside a liveness block would look busy forever. ``poll`` refuses to advance its stall key on
-    them for exactly this reason, and disagreeing means the run is torn down with no console. It
-    must count only lines a heartbeat actually WROTE, since ray, verl and any library are free to
-    emit structured json carrying the same key -- and a wedged worker keeps printing those. And it
-    must count only bytes past ``offset``: a console reaching hundreds of MB is rescanned every
-    poll otherwise, and a heartbeat from the healthy prefix would be recounted forever.
-    """
-    import json
-
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    def _hb(**kw) -> bytes:
-        # the real console line: heartbeat.py prints "HEARTBEAT " + json.dumps(payload).
-        payload = {"stage": "train", "ts": 1.0, "run_id": "r", "mode": "train", **kw}
-        return f"HEARTBEAT {json.dumps(payload)}\n".encode()
-
-    def _state(offset: int = 0) -> dict:
-        return {"offset": offset, "partial": b"", "dropping": False}
-
-    def _scan(path, state=None):
-        return _instance_bootstrap._console_progress(str(path), state or _state())
-
-    console = tmp_path / "console_train.txt"
-    progress = _hb(step=7)
-    pings = _hb(liveness=True) + b"ray warning: worker is idle\n"
-    console.write_bytes(progress + pings)
-
-    console_state = _state()
-    size, beats, _any = _scan(console, console_state)
-    assert (size, beats) == (len(progress) + len(pings), 1)
-
-    # the wedge: heartbeats keep arriving, but every one is a liveness ping.
-    with open(console, "ab") as f:
-        f.write(pings * 3)
-    size2, beats2, _any2 = _scan(console, console_state)
-    assert beats2 == 0, "liveness pings after the last real heartbeat must not read as progress"
-    assert size2 == size + len(pings) * 3
-
-    # a poll boundary can split a line, leaving a chunk that starts mid-payload. Neither half may
-    # read as progress on its own: the tail has the disqualifying key but no prefix, and the head
-    # has the prefix but not yet the key. The offsets are computed from the line, not guessed: a
-    # guessed one that happens to include both keys makes these assertions vacuous.
-    solo = tmp_path / "console_split.txt"
-    ping = _hb(liveness=True)
-    solo.write_bytes(ping)
-    cut = ping.index(b'"liveness":') - 5  # past "stage", before "liveness"
-    assert b'"stage":' not in ping[cut:]
-    assert b'"liveness":' in ping[cut:]
-    assert _scan(solo, _state(cut)) == (len(ping), 0, 0)
-
-    # an UNCOMMITTED heartbeat (upload attempted, did not land) is excluded for the same reason
-    # as a liveness ping: the provider's stall clock reads heartbeat.json from HF, so one that
-    # never reached HF is not progress it can observe. Counting it resets the wedge timer against a
-    # stall clock still anchored to the older committed heartbeat, and the snapshot this whole path
-    # exists to take gets scheduled after the teardown has already killed the box.
-    pend = tmp_path / "console_pending.txt"
-    pend.write_bytes(_hb(step=8, pending=True) * 2)
-    assert _scan(pend)[1] == 0
-    # but it DOES count toward arming, the third value: the line exists because a heartbeat was
-    # produced, so the training loop was reached. If arming used the progress count instead, a run
-    # whose heartbeat uploads all fail would never arm and could never buy a wedge snapshot -- the
-    # next scheduled one is an interval out, past the setup teardown, so the console is lost.
-    assert _scan(pend)[2] == 2
-
-    # local cadence suppression is uncommitted too, but remains available to arm pre-commit liveness.
-    throttled = tmp_path / "console_throttled.txt"
-    throttled.write_bytes(_hb(step=9, throttled=True) * 2)
-    assert _scan(throttled)[1:] == (0, 2)
-
-    mixed = tmp_path / "console_mixed.txt"
-    mixed.write_bytes(_hb(step=10) + _hb(step=11, pending=True) + _hb(step=12, throttled=True))
-    assert _scan(mixed)[1:] == (1, 3)
-
-    nested = tmp_path / "console_nested_markers.txt"
-    nested.write_bytes(
-        _hb(
-            step=13,
-            sampled_completions=[
-                {
-                    "liveness": 'model text: "liveness":',
-                    "pending": 'model text: "pending":',
-                    "throttled": 'model text: "throttled":',
-                }
+    else:
+
+        def _upload(_mode):
+            attempts.append(polls["count"])
+            return _outcome()
+
+        loop = _source_shipped_namespace(
+            "_upload_loop",
+            namespace={
+                "console": "/tmp/console.txt",
+                "mode": "train",
+                "stop_upload": _Stop(),
+                "_console_progress": _progress,
+                "_upload_console": _upload,
+            },
+        )["_upload_loop"]
+        loop()
+    return waits, attempts
+
+
+@pytest.mark.parametrize("provider", ["instance", "source-shipped"])
+@pytest.mark.parametrize(
+    ("progress", "outcomes", "expected"),
+    [
+        pytest.param(
+            [(1000 * (index + 1), 0, 0) for index in range(6)],
+            True,
+            [5],
+            id="600s-no-commit-fallback",
+        ),
+        pytest.param(
+            [(1000 * (index + 1), 1, 1) for index in range(29)],
+            True,
+            [],
+            id="healthy-first-hour-write-budget",
+        ),
+        pytest.param(
+            [(1000 * (index + 1), 1, 1) for index in range(31)],
+            True,
+            [30],
+            id="committed-promotion-hourly",
+        ),
+        pytest.param(
+            [(1000 * (index + 1), int(index < 2), int(index < 2)) for index in range(7)],
+            True,
+            [6],
+            id="pre-teardown-quiet-snapshot",
+        ),
+        pytest.param(
+            [(1000 * (index + 1), int(index == 4), int(index == 4)) for index in range(9)],
+            True,
+            [5, 9],
+            id="startup-does-not-spend-credit",
+        ),
+        pytest.param(
+            [
+                (1000 * (index + 1), int(index in {0, 5}), int(index in {0, 5}))
+                for index in range(10)
             ],
-        )
-    )
-    assert _scan(nested)[1:] == (1, 1)
-
-    # a liveness ping arms nothing: it prints from a daemon whether or not the training loop is
-    # alive, so unlike a pending heartbeat it is not evidence the run ever reached the loop.
-    lv_only = tmp_path / "console_liveness_only.txt"
-    lv_only.write_bytes(_hb(liveness=True) * 3)
-    assert _scan(lv_only)[1:] == (0, 0)
-
-    # a THIRD-PARTY line carrying "stage" is not a heartbeat and must not read as progress. ray,
-    # verl and any library are free to emit structured json, and a wedged worker keeps emitting it
-    # -- so a bare-substring count would see progress forever and the wedge would never fire. The
-    # `HEARTBEAT ` prefix names the producer instead of inferring it from a shared key.
-    foreign = tmp_path / "console_foreign.txt"
-    foreign.write_bytes(b'(raylet) {"ts":"t","level":"WARN","stage":"rollout","msg":"idle"}\n' * 5)
-    assert _scan(foreign)[1] == 0
-
-    # a line split by the poll boundary is counted EXACTLY ONCE, in whichever chunk carries its
-    # `HEARTBEAT` prefix. The old subtraction could see the tail half alone, count its "stage" and
-    # miss the "liveness" that qualified it; the anchor sits at the start of the line, so the half
-    # without it matches nothing rather than being judged on the keys it happens to carry.
-    split = tmp_path / "console_split_beat.txt"
-    beat = _hb(step=11)
-    split.write_bytes(beat[:20])
-    split_state = _state()
-    head_size, head_beats, _ = _scan(split, split_state)
-    with open(split, "ab") as f:
-        f.write(beat[20:])
-    tail_size, tail_beats, _ = _scan(split, split_state)
-    assert head_size == 20, "eof advances even while the valid heartbeat remains partial"
-    assert head_beats + tail_beats == 1, "a split heartbeat is counted once, not zero or twice"
-    assert tail_size == len(beat)
-    assert _scan(split, split_state)[1] == 0, "no recount"
-
-    # and the tail half of a split LIVENESS ping is never counted: the old rule saw its "stage"
-    # without the "liveness" that disqualified it, so a wedge read as progress forever.
-    lv_split = tmp_path / "console_split_liveness.txt"
-    ping = _hb(step=12, liveness=True)
-    cut = ping.index(b'"liveness":') - 5
-    lv_split.write_bytes(ping[:cut])
-    lv_state = _state()
-    lv_head = _scan(lv_split, lv_state)
-    with open(lv_split, "ab") as f:
-        f.write(ping[cut:])
-    lv_tail = _scan(lv_split, lv_state)
-    assert lv_head[1] + lv_tail[1] == 0, "a split liveness ping must never read as progress"
-
-    # eof and parser progress are distinct: the complete heartbeat is counted now, while the partial
-    # next line is retained in bounded state and its bytes still advance the upload watermark.
-    part = tmp_path / "console_partial.txt"
-    whole = _hb(step=3)
-    partial = _hb(step=4)[:20]
-    part.write_bytes(whole + partial)
-    part_state = _state()
-    assert _scan(part, part_state) == (len(whole) + len(partial), 1, 1)
-    assert part_state["offset"] == len(whole) + len(partial)
-    assert part_state["partial"] == partial
-
-    assert _scan(tmp_path / "absent.txt") == (-1, 0, 0)
+            True,
+            [5, 10],
+            id="progress-rearms-wedge-credit",
+        ),
+        pytest.param(
+            [
+                (1000 * (index + 1), int(index in {0, 5, 10}), int(index in {0, 5, 10}))
+                for index in range(15)
+            ],
+            True,
+            [5, 10],
+            id="two-credit-flapping-cap",
+        ),
+        pytest.param(
+            [
+                (
+                    1000 * (index + 1),
+                    int(index < 26 or index in {30, 35}),
+                    int(index < 26 or index in {30, 35}),
+                )
+                for index in range(40)
+            ],
+            True,
+            [30, 35, 40],
+            id="due-snapshot-does-not-spend-credit",
+        ),
+        pytest.param(
+            [
+                (1000 * (index + 1), int(index == 5), int(index in {0, 5, 6, 7, 8, 9}))
+                for index in range(10)
+            ],
+            True,
+            [5, 10],
+            id="pending-progress-only-before-first-commit",
+        ),
+        pytest.param(
+            [(1000, 0, 0) for _ in range(6)],
+            [False, True],
+            [5, 6],
+            id="failed-upload-retries-next-poll",
+        ),
+    ],
+)
+def test_console_upload_cadence_matrix(monkeypatch, provider, progress, outcomes, expected):
+    waits, attempts = _drive_console_cadence(monkeypatch, provider, progress, outcomes)
+    assert attempts == expected
+    assert set(waits) == {120.0}
 
 
-def test_console_progress_skips_malformed_lines_independently(tmp_path):
-    import json
+def test_console_upload_loop_never_waits_longer_than_interval():
+    from flash.providers._lifecycle import bootstrap
 
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    waits: list[float] = []
 
-    def _hb(step: int) -> bytes:
-        return f"HEARTBEAT {json.dumps({'stage': 'train', 'step': step})}\n".encode()
+    class _Stop:
+        def wait(self, seconds: float) -> bool:
+            waits.append(seconds)
+            return True
 
-    console = tmp_path / "console_malformed.txt"
-    valid_one = _hb(1)
-    valid_two = _hb(2)
-    malformed = b"HEARTBEAT {not json}\n"
-    console.write_bytes(malformed + valid_one + malformed + valid_two)
+    bootstrap._console_upload_loop({}, "/tmp/console.txt", "train", 30.0, _Stop())
+    assert waits == [30.0]
+
+
+def test_console_progress_split_boundaries(console_progress_impl, tmp_path):
+    name, progress, _owner = console_progress_impl
     state = {"offset": 0, "partial": b"", "dropping": False}
+    console = tmp_path / f"split_{name}.txt"
+    valid = _heartbeat_line(step=7)
+    console.write_bytes(valid[:20])
 
-    assert _instance_bootstrap._console_progress(str(console), state) == (
-        console.stat().st_size,
-        2,
-        2,
-    )
+    first = progress(str(console), state)
+    assert first == (20, 0, 0), name
+    assert state["offset"] == 20
+    assert state["partial"] == valid[:20]
+
+    with open(console, "ab") as handle:
+        handle.write(valid[20:] + _heartbeat_line(step=8)[:17])
+    second = progress(str(console), state)
+    assert second[1:] == (1, 1), name
+    assert second[0] == console.stat().st_size
     assert state["offset"] == console.stat().st_size
+    assert progress(str(console), state)[1:] == (0, 0), f"{name} recounted caught-up bytes"
+
+    liveness = _heartbeat_line(step=9, liveness=True)
+    live_console = tmp_path / f"liveness_{name}.txt"
+    live_state = {"offset": 0, "partial": b"", "dropping": False}
+    cut = liveness.index(b'"liveness":') - 5
+    live_console.write_bytes(liveness[:cut])
+    live_first = progress(str(live_console), live_state)
+    with open(live_console, "ab") as handle:
+        handle.write(liveness[cut:])
+    live_second = progress(str(live_console), live_state)
+    assert live_first[1] + live_second[1] == 0, name
+    assert live_first[2] + live_second[2] == 0, name
 
 
-def test_console_progress_keeps_oversized_managed_heartbeat_progress(tmp_path):
-    from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-    from flash.providers._lifecycle import bootstrap_secrets
+def test_console_progress_bounds_multi_chunk_reads(console_progress_impl, tmp_path, monkeypatch):
+    from flash.providers._lifecycle import bootstrap
 
-    snapshot = _console_heartbeat_snapshot(
-        {
-            "stage": "rl_step",
-            "step": 3,
-            "sampled_completions": [{"completion": "x" * 100_000}],
-        }
-    )
-    line = f"HEARTBEAT {snapshot}\n".encode()
-    assert len(line) <= bootstrap_secrets._CONSOLE_PROGRESS_LINE_LIMIT
-    assert '"sample_count": 1' in snapshot
-    console = tmp_path / "console_large_managed_heartbeat.txt"
-    console.write_bytes(line)
-    state = {"offset": 0, "partial": b"", "dropping": False}
-
-    assert _instance_bootstrap._console_progress(str(console), state)[1:] == (1, 1)
-
-
-def test_console_progress_bounds_reads_while_draining_each_poll(tmp_path, monkeypatch):
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-    from flash.providers._lifecycle import bootstrap_secrets
-
-    read_limit = bootstrap_secrets._CONSOLE_PROGRESS_READ_LIMIT
-    console = tmp_path / "console_unterminated.txt"
+    name, progress, owner = console_progress_impl
+    read_limit = bootstrap._CONSOLE_PROGRESS_READ_LIMIT
+    console = tmp_path / f"large_{name}.txt"
     console.write_bytes(b"x" * (2 * read_limit + 123))
     state = {"offset": 0, "partial": b"", "dropping": False}
     real_open = open
@@ -1979,64 +1423,58 @@ def test_console_progress_bounds_reads_while_draining_each_poll(tmp_path, monkey
         def __exit__(self, *args):
             return self.handle.__exit__(*args)
 
-        def __getattr__(self, name):
-            return getattr(self.handle, name)
+        def __getattr__(self, key):
+            return getattr(self.handle, key)
 
         def read(self, size=-1):
             read_sizes.append(size)
             return self.handle.read(size)
 
-    def _open(path, mode="r", *args, **kwargs):
-        handle = real_open(path, mode, *args, **kwargs)
-        return _TrackedFile(handle) if str(path) == str(console) and mode == "rb" else handle
+    def _open(file, mode="r", *args, **kwargs):
+        handle = real_open(file, mode, *args, **kwargs)
+        return _TrackedFile(handle) if str(file) == str(console) and mode == "rb" else handle
 
-    monkeypatch.setattr(bootstrap_secrets, "open", _open, raising=False)
-    assert _instance_bootstrap._console_progress(str(console), state) == (
-        console.stat().st_size,
-        0,
-        0,
-    )
-    assert read_sizes == [read_limit, read_limit, 123]
+    if isinstance(owner, dict):
+        monkeypatch.setitem(owner, "open", _open)
+    else:
+        monkeypatch.setattr(owner, "open", _open, raising=False)
+
+    result = progress(str(console), state)
+    assert result == (console.stat().st_size, 0, 0), name
+    assert read_sizes == [read_limit, read_limit, 123], name
     assert state == {"offset": console.stat().st_size, "partial": b"", "dropping": True}
+    assert progress(str(console), state)[1:] == (0, 0)
+    assert read_sizes == [read_limit, read_limit, 123], "caught-up bytes were reread"
 
-    assert _instance_bootstrap._console_progress(str(console), state)[1:] == (0, 0)
-    assert read_sizes == [read_limit, read_limit, 123], "a caught-up poll must not reread old bytes"
 
+def test_console_progress_recovers_after_overlong_line(console_progress_impl, tmp_path):
+    from flash.providers._lifecycle import bootstrap
 
-def test_console_progress_recovers_after_an_overlong_line_newline(tmp_path):
-    import json
-
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-    from flash.providers._lifecycle import bootstrap_secrets
-
-    console = tmp_path / "console_overlong.txt"
-    console.write_bytes(b"x" * (bootstrap_secrets._CONSOLE_PROGRESS_LINE_LIMIT + 1))
+    name, progress, _owner = console_progress_impl
+    console = tmp_path / f"overlong_{name}.txt"
+    console.write_bytes(b"x" * (bootstrap._CONSOLE_PROGRESS_LINE_LIMIT + 1))
     state = {"offset": 0, "partial": b"", "dropping": False}
-    assert _instance_bootstrap._console_progress(str(console), state)[1:] == (0, 0)
+
+    assert progress(str(console), state)[1:] == (0, 0)
     assert state["dropping"] is True
     assert state["partial"] == b""
-
-    valid = f"HEARTBEAT {json.dumps({'stage': 'train', 'step': 3})}\n".encode()
     with open(console, "ab") as handle:
-        handle.write(b"\n" + valid)
-
-    assert _instance_bootstrap._console_progress(str(console), state)[1:] == (1, 1)
+        handle.write(b"\n" + _heartbeat_line(step=3))
+    assert progress(str(console), state)[1:] == (1, 1), name
     assert state["dropping"] is False
 
 
-def test_console_progress_instance_and_source_shipped_parser_stay_in_parity(tmp_path):
-    import json
-
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+def test_console_progress_source_parity_across_writes(tmp_path):
+    from flash.providers._lifecycle import bootstrap
 
     source_progress = _source_shipped_console_progress()
-    console = tmp_path / "console_parser_parity.txt"
-    valid = f"HEARTBEAT {json.dumps({'stage': 'train', 'step': 1})}\n".encode()
-    pending = f"HEARTBEAT {json.dumps({'stage': 'train', 'step': 2, 'pending': True})}\n".encode()
+    console = tmp_path / "console_parity.txt"
+    valid = _heartbeat_line(step=1)
+    pending = _heartbeat_line(step=2, pending=True)
     writes = [
         b"HEARTBEAT {not json}\n" + valid[:17],
-        valid[17:] + b"HEARTBEAT {not json}\n" + pending,
-        b"x" * 1_048_577,
+        valid[17:] + pending,
+        b"x" * (bootstrap._CONSOLE_PROGRESS_READ_LIMIT + 1),
         b"\n" + valid,
     ]
     instance_state = {"offset": 0, "partial": b"", "dropping": False}
@@ -2046,658 +1484,104 @@ def test_console_progress_instance_and_source_shipped_parser_stay_in_parity(tmp_
     for chunk in writes:
         with open(console, "ab") as handle:
             handle.write(chunk)
-        assert _instance_bootstrap._console_progress(
-            str(console), instance_state
-        ) == source_progress(str(console), source_state)
+        assert bootstrap._console_progress(str(console), instance_state) == source_progress(
+            str(console), source_state
+        )
         assert instance_state == source_state
 
 
-def test_instance_console_upload_loop_uses_eof_growth_for_unterminated_output(
-    tmp_path, monkeypatch
-):
-    import os
-
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    console = tmp_path / "console_growing_partial.txt"
-    console.write_bytes(b"")
-    uploads: list[int] = []
-
-    class _Stop:
-        polls = 0
-
-        def wait(self, _seconds: float) -> bool:
-            if self.polls >= 5:
-                return True
-            self.polls += 1
-            with open(console, "ab") as handle:
-                handle.write(b"x" * 100)
-            return False
-
-    def _upload(_payload, path, _mode):
-        uploads.append(os.path.getsize(path))
-        return True
-
-    monkeypatch.setattr(_instance_bootstrap, "_upload_console_snapshot", _upload)
-    _instance_bootstrap._console_upload_loop({}, str(console), "train", 240.0, _Stop())
-
-    assert uploads == [200, 400]
-
-
-def test_instance_console_upload_loop_arms_on_a_heartbeat_whose_upload_failed(monkeypatch):
-    """A run whose heartbeat uploads all fail must still be able to buy a wedge snapshot.
-
-    Every heartbeat then prints ``"pending": true``, so the STAGED count is zero forever. Arming on
-    that count leaves the latch permanently false: no wedge snapshot is ever bought, and the only
-    other upload is the scheduled cadence -- an interval (3600s) after the 600s one, so 4200s, past
-    the 3000s no-heartbeat setup teardown. The console covering the hang is lost entirely.
-
-    So the counts are separate, and which one drives the timer depends on whether this run has EVER
-    committed a heartbeat. Until it has, a ``pending`` one counts: nothing else exists to contradict
-    it, and teardown is the fixed setup grace. Once one has committed, only committed ones count --
-    the provider's stall clock is anchored to that commit and already counting down, so treating a
-    later pending line as progress would push the snapshot past the box's own death.
-
-    Asserted in three directions, because the failure modes point opposite ways: the pending run
-    buys a wedge snapshot AFTER its hang (not burned on the healthy stretch before it); a run with
-    no heartbeat at all buys none; and a run that committed and then stopped still buys one.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    hang_polls = 14  # heartbeats stop here; the console keeps growing on ray chatter
-    cycles = hang_polls + 12
-    # the console never stops growing, so a size-only rule cannot separate these cases: the
-    # heartbeat counts are the whole signal.
-    sizes = [1000 * (i + 1) for i in range(cycles + 2)]
-    # scheduled snapshot at first_s, then an hour out -- past the 3000s setup teardown.
-    scheduled_at = {first_s}
-
-    # every heartbeat is pending (uploads all failing), then the worker hangs at hang_polls.
-    beats = [1] * hang_polls + [0] * (cycles - hang_polls)
-    _waits, uploads = _drive_instance_upload_loop(
-        monkeypatch, sizes, cycles=cycles, staged=[0] * cycles, beats=beats
-    )
-    at_s = {n * poll_s for n in uploads}
-    wedge_at = sorted(at_s - scheduled_at)
-    assert wedge_at, "a run whose heartbeat uploads all fail must still buy a wedge snapshot"
-    # and it must be bought AFTER the hang, not burned on the healthy stretch before it. That is
-    # the direction that makes the snapshot worth its credit: an early one shows a working run.
-    assert all(t > hang_polls * poll_s for t in wedge_at), wedge_at
-    assert all(t < 3000.0 for t in wedge_at), "must land before the setup teardown"
-
-    # the other direction: no heartbeat of ANY kind (liveness pings alone, or startup noise) must
-    # not arm, or a slow start spends a credit on a console that has nothing in it yet.
-    _w2, uploads2 = _drive_instance_upload_loop(
-        monkeypatch, sizes, cycles=cycles, staged=[0] * cycles, beats=[0] * cycles
-    )
-    assert {n * poll_s for n in uploads2} <= scheduled_at, "unarmed run bought a wedge snapshot"
-
-    # once a heartbeat has COMMITTED, pending ones must stop counting as progress: the provider's
-    # stall clock is anchored to that commit and is already counting down to a teardown, so a
-    # pending line must not reset this timer past the box's own death.
-    staged3 = [1] * 4 + [0] * (cycles - 4)
-    _w3, uploads3 = _drive_instance_upload_loop(
-        monkeypatch, sizes, cycles=cycles, staged=staged3, beats=[1] * cycles
-    )
-    assert sorted({n * poll_s for n in uploads3} - scheduled_at), (
-        "a run that stopped committing must still buy a wedge snapshot"
-    )
-
-
-def test_instance_console_upload_loop_retries_when_an_upload_fails(monkeypatch):
-    """hf_upload swallows its exception, so a failed snapshot returns normally.
-
-    Advancing the uploaded-bytes watermark on that return marks bytes as stored that reached no
-    repo. For a wedged run producing nothing further, every later poll then sees size == sent and
-    skips -- so one transient 500 costs the entire console, which is the only evidence of the hang.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    # the run must produce NO new bytes after the failed upload -- that is the suppressed case. a
-    # console still growing supplies a different size on the next poll, so the retry happens by
-    # accident and the test would pass with the watermark bug restored.
-    grow_polls = int(first_s / poll_s) + 1
-    sizes = [1000] * (grow_polls + 14)
-    cycles = len(sizes)
-    _waits, uploads = _drive_instance_upload_loop(
-        monkeypatch, sizes, cycles=cycles, succeed=lambda attempt: attempt > 1
-    )
-
-    assert len(uploads) > 1, "a swallowed upload failure must not suppress every later attempt"
-    # the retry must land inside the stall window, not at the next hourly boundary.
-    assert (uploads[1] - uploads[0]) * poll_s < 1200.0
-
-
-def test_instance_console_upload_loop_retries_a_failed_snapshot_before_any_progress(monkeypatch):
-    """A failed upload must not advance the DEADLINE either, including before progress starts.
-
-    The uploaded-bytes watermark is only half of it. hf_upload swallows its exception and returns
-    falsy, so resetting ``since`` on that return books a snapshot that reached no repo AND pushes
-    the next attempt a full interval out -- 4200s, past the 1200s stall and the 3000s setup grace.
-
-    Before any staged heartbeat the wedge path is disarmed by design (a wedge is progress that
-    STOPPED), so it cannot supply the retry the way it incidentally did when quiet accounting ran
-    from process start. That makes the deadline the ONLY thing standing between a transient 500 at
-    the first snapshot and a run that dies with no console at all. The series here never emits a
-    heartbeat and never grows, so a retry can only come from the deadline staying due.
-    """
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    poll_s = _instance_bootstrap._CONSOLE_UPLOAD_POLL_S
-    first_s = _instance_bootstrap._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    setup_grace_s = 3000.0  # poll.SETUP_GRACE_S: teardown for a run that never reaches a heartbeat
-    grow_polls = int(first_s / poll_s) + 1
-    # frozen console AND no heartbeat ever: neither the size change nor the wedge can buy the retry.
-    sizes = [1000] * (grow_polls + 20)
-    staged = [0] * len(sizes)
-    _waits, uploads = _drive_instance_upload_loop(
-        monkeypatch,
-        sizes,
-        cycles=len(sizes),
-        succeed=lambda attempt: attempt > 1,
-        staged=staged,
-    )
-
-    assert len(uploads) > 1, "a failed first snapshot was never retried before teardown"
-    assert uploads[1] * poll_s < setup_grace_s, "the retry landed after the setup teardown"
-    # one poll later, not one interval later -- the deadline must not have advanced on the failure.
-    assert (uploads[1] - uploads[0]) * poll_s <= poll_s
-
-
-def test_serverless_console_upload_serializes_the_periodic_and_final_snapshots():
-    """The final snapshot must be the last writer, even if a periodic one is still uploading.
-
-    The periodic uploader is a daemon thread joined with a 10s timeout, so a slow snapshot outlives
-    the join and races the final upload. Both write the same ``.tail`` file and commit to the same
-    repo path; if the older call landed last it would REPLACE the terminal console with bytes
-    captured before the failure -- destroying the evidence. Moving the first snapshot to 600s made
-    this reachable for an ordinary run, where the hourly-only cadence had made it rare.
-
-    Both callers pass the SAME ``mode``, as the loop and the terminal call sites do. Driving them
-    with different modes would be the easy mistake: ``console_{mode}.txt`` already differs, so the
-    scratch paths could never collide and the test would pass however the file is named.
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
-    )
-    order: list[str] = []
-    tails: list[str] = []
-    started = threading.Event()
-
-    def _upload_console_locked(_mode: str, _console: str, tail_path: str, _final: bool) -> bool:
-        started.set()
-        order.append(f"begin:{tail_path}")
-        tails.append(tail_path)
-        time.sleep(0.3)
-        order.append(f"end:{tail_path}")
-        return True
-
-    namespace: dict = {
-        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-        "console_upload_lock": threading.Lock(),
-        "console_teardown": threading.Event(),  # not set: teardown has not begun
-        # far from the wall deadline, so the lock wait clamp is not what this test exercises.
-        "_require_deadline_allowance": lambda: 86_400.0,
-        "_upload_console_locked": _upload_console_locked,
-    }
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    upload_console = namespace["_upload_console"]
-
-    periodic = threading.Thread(target=upload_console, args=("train",), daemon=True)
-    periodic.start()
-    started.wait(5.0)
-    upload_console("train", final=True)  # the terminal snapshot, racing the one in flight
-    periodic.join(timeout=5.0)
-
-    # never interleaved: each upload completes before the next begins, so the last call wins.
-    assert [entry.split(":")[0] for entry in order] == ["begin", "end", "begin", "end"]
-    # and each caller staged its own bytes: one shared .tail would let the periodic snapshot
-    # overwrite the file the final upload is reading, splicing pre-failure bytes into it.
-    assert len(set(tails)) == 2, f"both callers staged the same scratch file: {tails}"
-
-
-def test_serverless_terminal_console_upload_recommits_after_a_slow_holder_finishes():
-    """A periodic upload that outlives the acquire timeout must not be the last writer.
-
-    ``console_teardown`` is checked before the HF call, so it stops a periodic snapshot that has not
-    started -- but a request already inside ``upload_file`` cannot be recalled. If it held the lock
-    past 120s and completed afterwards, the terminal upload (which proceeds unsynchronized rather
-    than skip) commits FIRST and the older, pre-failure snapshot lands on top of it. That is the
-    exact evidence-destroying overwrite the serialization is for, arriving through the timeout.
-
-    So a terminal upload that ran without the lock re-acquires afterwards: getting it is proof the
-    slow request finished, and ``console_teardown`` blocks any later one, so one more commit ends
-    the sequence. The lock double here comes free on the second attempt, modelling a holder that
-    was slow rather than wedged (``..._never_yields_to_a_wedged_snapshot`` pins the wedged case,
-    where the re-commit must NOT fire).
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
-    )
-    order: list[str] = []
-
-    class _SlowHolder:
-        """Times out once (the holder is mid-``upload_file``), then frees."""
-
-        def __init__(self) -> None:
-            self.attempts = 0
-
-        def acquire(self, timeout: float) -> bool:
-            self.attempts += 1
-            if self.attempts == 1:
-                return False
-            order.append("holder finished")
-            return True
-
-        def release(self) -> None:
-            order.append("released")
-
-    def _locked(mode: str, _console: str, tail_path: str, final: bool) -> bool:
-        order.append(f"commit:{'final' if final else 'periodic'}:{tail_path}")
-        return True
-
-    lock = _SlowHolder()
-    namespace: dict = {
-        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-        "console_upload_lock": lock,
-        "console_teardown": threading.Event(),
-        # far from the wall deadline, so the lock wait clamp is not what this test exercises.
-        "_require_deadline_allowance": lambda: 86_400.0,
-        "_upload_console_locked": _locked,
-        "print": lambda *_a, **_k: None,
-    }
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-
-    assert namespace["_upload_console"]("train", final=True) is True
-    commits = [n for n, entry in enumerate(order) if entry.startswith("commit:")]
-    assert len(commits) == 2, f"the terminal upload must re-commit once the holder frees: {order}"
-    # positions, not values: both commits render identically, so comparing the strings would find
-    # the FIRST one and the assertion would hold however the calls were ordered. The re-commit must
-    # follow the holder freeing, or it is no better ordered than the first and the stale snapshot
-    # can still land last.
-    assert commits[1] > order.index("holder finished")
-
-
-def test_serverless_terminal_console_upload_never_yields_to_a_wedged_snapshot():
-    """``final=True`` must upload even when the lock never comes free.
-
-    ``upload_file`` takes no timeout, so a periodic snapshot wedged on a hung HF request holds the
-    lock past the acquire timeout and forever after. Skipping the terminal upload there is the worst
-    case, not a safe one: the run is failing, and the bytes explaining WHY are exactly the ones that
-    never reach the repo, leaving the pre-failure console as the only record. A periodic snapshot
-    still yields -- another is in flight and it has nothing new to say.
-
-    The wait is bounded, not skipped: a HEALTHY in-flight snapshot finishes inside the timeout and
-    the terminal one commits after it, which is what
-    ``test_serverless_console_upload_serializes_the_periodic_and_final_snapshots`` pins. So the lock
-    here is a double that reports the timeout expiring, rather than a real one held for 120s.
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
-    )
-    uploaded: list[str] = []
-    timeouts: list[float] = []
-
-    class _NeverFree:
-        """Acquire always times out; releasing a lock we never took would raise."""
-
-        def acquire(self, timeout: float) -> bool:
-            timeouts.append(timeout)
-            return False
-
-        def release(self) -> None:
-            raise AssertionError("released a lock that was never acquired")
-
-    namespace: dict = {
-        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-        "console_upload_lock": _NeverFree(),
-        "console_teardown": threading.Event(),
-        # far from the wall deadline, so the per-try 120s bound is what this test measures.
-        "_require_deadline_allowance": lambda: 86_400.0,
-        "_upload_console_locked": lambda mode, _c, _t, _f: uploaded.append(mode) or True,
-        "print": lambda *_a, **_k: None,
-    }
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    upload_console = namespace["_upload_console"]
-
-    assert upload_console("periodic") is False, "a periodic snapshot must yield to the holder"
-    assert upload_console("final", final=True) is True
-    # exactly one commit: the re-commit that makes an unsynchronized terminal upload last-writer
-    # is conditional on the lock coming free, and here it never does. a second commit would mean
-    # the re-commit fires blind, doubling every terminal upload on a genuinely wedged holder.
-    assert uploaded == ["final"], "the terminal snapshot must not be skipped for a held lock"
-    # bounded wait, so a wedged holder delays the terminal upload rather than suppressing it. the
-    # TOTAL is what bounds it: the compensating acquire retries, so per-try alone would pass with
-    # an unbounded loop that never returns against a holder that never frees.
-    assert timeouts
-    assert all(0 < t <= 120.0 for t in timeouts)
-    assert sum(timeouts) <= 600.0, f"the terminal path can wait at most 600s in total: {timeouts}"
-
-
-def test_serverless_terminal_console_upload_never_waits_past_the_run_wall_deadline():
-    """The lock wait must be clamped to the time left before the watchdog hard-exits.
-
-    ``_train_body`` arms ``threading.Timer(remaining, _deadline_exit)``, and ``_deadline_exit``
-    calls ``os._exit(124)``. A fixed 120s acquire therefore does not merely wait too long: a worker
-    with less than that left is KILLED mid-acquire, so the unsynchronized commit that could have
-    finished inside the window that remained never runs at all, and the terminal snapshot -- the
-    only record of why the run failed -- is lost. That is the same loss the whole terminal path
-    exists to prevent, arriving through the fix for it.
-
-    The clock advances by each wait, exactly as a real blocking acquire consumes wall time, so this
-    also pins the TOTAL: every retry re-reads the deadline, so the tries shrink to zero instead of
-    each being individually clamped and still summing past it.
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
-    )
-
-    class _NeverFree:
-        """A wedged holder; every acquire burns its full timeout, as a real one would."""
-
-        def __init__(self, clock: dict, asked: list[float]) -> None:
-            self.clock = clock
-            self.asked = asked
-
-        def acquire(self, timeout: float) -> bool:
-            self.asked.append(timeout)
-            self.clock["t"] += timeout
-            return False
-
-        def release(self) -> None:
-            raise AssertionError("released a lock that was never acquired")
-
-    def _run(allowance, clock: dict, asked: list[float]) -> tuple[bool, list[str]]:
-        """Exec the shipped closure against one deadline model. Args are passed, not closed
-        over, so each case binds its OWN state rather than the last loop iteration's."""
-        uploaded: list[str] = []
-        namespace: dict = {
-            "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-            "console_upload_lock": _NeverFree(clock, asked),
-            "console_teardown": threading.Event(),
-            "_upload_console_locked": lambda m, _c, _t, _f, _u=uploaded: _u.append(m) or True,
-            "print": lambda *_a, **_k: None,
-            "_require_deadline_allowance": allowance,
+def test_console_progress_keeps_compacted_managed_heartbeat(tmp_path):
+    from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
+    from flash.providers._lifecycle import bootstrap
+
+    snapshot = _console_heartbeat_snapshot(
+        {
+            "stage": "rl_step",
+            "step": 3,
+            "sampled_completions": [{"completion": "x" * 100_000}],
         }
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-        return namespace["_upload_console"]("train", final=True), uploaded
-
-    for remaining in (5.0, 45.0, 200.0, 600.0):
-        clock: dict = {"t": 0.0}
-        asked: list[float] = []
-        # re-read per call, like the real one: it closes over time.time(). bound as defaults so
-        # this case's own clock is captured.
-        ok, uploaded = _run(lambda _r=remaining, _c=clock: _r - _c["t"], clock, asked)
-
-        assert ok is True
-        # the commit still happens -- clamping must not turn into skipping.
-        assert uploaded == ["train"], f"terminal snapshot lost with {remaining}s left: {uploaded}"
-        # nothing waited past the deadline, so the watchdog never fires mid-acquire.
-        assert clock["t"] < remaining, (
-            f"waited {clock['t']}s of {remaining}s remaining; the watchdog would have killed the "
-            f"worker mid-acquire: {asked}"
-        )
-        # acquire() rejects a negative timeout, so the clamp must floor at zero rather than pass
-        # the negative straight through and raise out of the terminal path.
-        assert all(t >= 0 for t in asked), asked
-
-    # a deadline already blown must still poll and commit, not raise out of the terminal path.
-    def _blown() -> float:
-        raise TimeoutError("run wall deadline exceeded")
-
-    asked_blown: list[float] = []
-    ok, committed = _run(_blown, {"t": 0.0}, asked_blown)
-
-    assert ok is True
-    assert committed == ["train"], "a run past its deadline must still attempt the last snapshot"
-    assert asked_blown
-    assert all(t == 0 for t in asked_blown), asked_blown
-
-
-def test_serverless_terminal_console_upload_recommits_after_two_timeouts(monkeypatch):
-    """A holder slower than a SINGLE compensating wait must still not be the last writer.
-
-    The re-commit exists because a terminal upload forced through without the lock can be overtaken
-    by a periodic request already inside ``upload_file``. One compensating acquire only covers a
-    holder that frees within its timeout: an HF upload recovering after roughly 240s outlives both
-    the original acquire and that one retry, so the terminal path gave up, and the older pre-failure
-    snapshot then landed last -- restoring exactly the console the failure needed to replace.
-
-    So the compensating wait is split into several bounded tries. It must still TERMINATE against a
-    holder that never frees (``..._never_yields_to_a_wedged_snapshot`` pins that, and the total-wait
-    assertion there is what stops this becoming an unbounded loop).
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
     )
-
-    class _VerySlowHolder:
-        """Times out until ``free_at``, modelling an upload_file that recovers late."""
-
-        def __init__(self, free_at: int, log: list[str]) -> None:
-            self.attempts = 0
-            self.free_at = free_at
-            self.log = log
-
-        def acquire(self, timeout: float) -> bool:
-            self.attempts += 1
-            if self.attempts < self.free_at:
-                return False
-            self.log.append("holder finished")
-            return True
-
-        def release(self) -> None:
-            self.log.append("released")
-
-    def _commit(log: list[str]):
-        # bound as a default so the closure captures THIS iteration's log, not the loop variable.
-        return lambda _m, _c, _t, final, _log=log: (
-            _log.append(f"commit:{'final' if final else 'periodic'}") or True
-        )
-
-    for frees_on in (3, 4):
-        order: list[str] = []
-        namespace: dict = {
-            "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-            "console_upload_lock": _VerySlowHolder(frees_on, order),
-            "console_teardown": threading.Event(),
-            # far from the wall deadline, so the clamp never shortens these tries.
-            "_require_deadline_allowance": lambda: 86_400.0,
-            "_upload_console_locked": _commit(order),
-            "print": lambda *_a, **_k: None,
-        }
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-
-        assert namespace["_upload_console"]("train", final=True) is True
-        commits = [n for n, entry in enumerate(order) if entry.startswith("commit:")]
-        assert len(commits) == 2, (
-            f"holder freeing on acquire {frees_on} lost the re-commit: {order}"
-        )
-        # positions, not values: both commits render identically, so comparing strings would find
-        # the first and hold however the calls were ordered.
-        assert commits[1] > order.index("holder finished"), order
+    line = f"HEARTBEAT {snapshot}\n".encode()
+    assert len(line) <= bootstrap._CONSOLE_PROGRESS_LINE_LIMIT
+    assert '"sample_count": 1' in snapshot
+    assert "sampled_completions" not in snapshot
+    console = tmp_path / "console_large_managed_heartbeat.txt"
+    console.write_bytes(line)
+    state = {"offset": 0, "partial": b"", "dropping": False}
+    assert bootstrap._console_progress(str(console), state)[1:] == (1, 1)
 
 
-def test_serverless_periodic_console_upload_defers_once_teardown_begins():
-    """A periodic snapshot must not commit after the terminal one is under way.
-
-    ``final=True`` deliberately does not wait for the lock, so the two can run concurrently and the
-    periodic upload -- captured BEFORE the failure -- could land last and overwrite the terminal
-    console with pre-failure bytes, losing the diagnostic. The terminal call sets
-    ``console_teardown``, so a periodic snapshot that sees it drops its commit rather than racing.
-    """
-    import ast
-    import inspect
-    import textwrap
-    import threading
-    import types
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_upload_console"
-    )
-    uploaded: list[str] = []
-    console_teardown = threading.Event()
-    console_teardown.set()  # a terminal snapshot has begun
-
-    namespace: dict = {
-        "os": types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda _p: True)),
-        "console_upload_lock": threading.Lock(),  # free: only the teardown flag may defer
-        "console_teardown": console_teardown,
-        # far from the wall deadline, so the lock wait clamp is not what this test exercises.
-        "_require_deadline_allowance": lambda: 86_400.0,
-        "_upload_console_locked": lambda mode, _c, _t, _f: uploaded.append(mode) or True,
-        "print": lambda *_a, **_k: None,
-    }
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    upload_console = namespace["_upload_console"]
-
-    assert upload_console("train") is False, "a periodic snapshot must defer once teardown began"
-    assert uploaded == []
-    # the terminal snapshot is exactly the one teardown is running, so it must still commit.
-    assert upload_console("train", final=True) is True
-    assert uploaded == ["train"]
-
-
-def test_serverless_periodic_console_upload_drops_a_commit_started_before_teardown(
-    tmp_path, monkeypatch
-):
-    """Teardown can begin while a periodic snapshot is already staging its tail.
-
-    The pre-acquire gate cannot catch that one: it passed before teardown started. Without a
-    re-check immediately before the commit, the in-flight periodic upload lands AFTER the terminal
-    one and overwrites the failure console with bytes read before the failure -- the exact loss the
-    terminal upload exists to prevent. This drives the real ``_upload_console_locked``, since the
-    re-check lives there rather than in the caller.
-    """
-    import ast
-    import inspect
+def test_console_upload_uses_distinct_sanitized_live_and_terminal_artifacts(monkeypatch):
+    import contextlib
     import json
     import os
-    import textwrap
-    import threading
+    import re
 
-    from flash.providers.runpod.serverless import endpoints
+    import huggingface_hub
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    node = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_upload_console_locked"
-    )
-    console = tmp_path / "console_train.txt"
-    console.write_text("line one\nline two\n")
-    commits: list[str] = []
-    console_teardown = threading.Event()
+    mode = f"artifact_{os.getpid()}_{time.time_ns()}"
+    console = f"/tmp/console_{mode}.txt"
+    calls: list[dict] = []
+    deadline_checks: list[None] = []
 
     class _Api:
         def __init__(self, token=None):
-            pass
+            assert token == "hf-token"
 
-        def upload_file(self, *, path_in_repo: str, **_kw) -> None:
-            commits.append(path_in_repo)
-
-    # the function imports HfApi from huggingface_hub itself, so a namespace entry is ignored and
-    # the real client would make a LIVE network call. patch where it is looked up.
-    import huggingface_hub
+        def upload_file(self, **kwargs):
+            with open(kwargs["path_or_fileobj"], encoding="utf-8") as handle:
+                kwargs["payload"] = handle.read()
+            calls.append(kwargs)
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-
-    warnings: list[str] = []
-    namespace: dict = {
-        "os": os,
-        "json": json,
-        "input_data": {
-            "job_spec_json": json.dumps({"algorithm": "opd", "run_id": "r1"}),
-            "hf_repo": "org/repo",
-        },
-        "env": {},
-        "console_teardown": console_teardown,
-        "_require_deadline_allowance": lambda: None,
-        "_safe_detail": lambda text, _env, _limit=0: text,
-        "print": lambda *args, **_kw: warnings.append(" ".join(str(a) for a in args)),
+    env = {
+        "HF_TOKEN": "hf-token",
+        "DEPLOY_KEY": "secret-value-123",
+        "FLASH_SECRET_ENV_KEYS": "DEPLOY_KEY",
     }
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    upload_locked = namespace["_upload_console_locked"]
+    namespace = _source_shipped_namespace(
+        "_needles",
+        "_safe_detail",
+        "_upload_console",
+        namespace={
+            "json": json,
+            "os": os,
+            "re": re,
+            "env": env,
+            "input_data": {
+                "hf_repo": "org/runs",
+                "job_spec_json": json.dumps({"algorithm": "grpo", "run_id": "run-1"}),
+            },
+            "_require_deadline_allowance": lambda: deadline_checks.append(None) or 100.0,
+        },
+    )
+    upload = namespace["_upload_console"]
+    live_tail = console + ".live.tail"
+    terminal_tail = console + ".terminal.tail"
 
-    tail = str(tmp_path / "console_train.txt.tail")
-    assert upload_locked("train", str(console), tail, False) is True
-    assert commits == ["opd/r1/console_train_live.txt"]
-    commits.clear()
-    console_teardown.set()  # teardown began while the next periodic snapshot was staging its tail
-    assert upload_locked("train", str(console), tail, False) is False
-    assert commits == [], "a periodic upload must not commit once teardown has begun"
-    # the terminal snapshot still commits to a path no in-flight periodic writer can overwrite.
-    assert upload_locked("train", str(console), tail + ".final", True) is True
-    assert commits == ["opd/r1/console_train.txt"]
-    # a False from a swallowed error would satisfy the first assertion for the wrong reason.
-    assert not [w for w in warnings if "warn" in w], warnings
+    try:
+        with open(console, "w", encoding="utf-8") as handle:
+            handle.write("prefix\n" + "x" * 65_000 + "\nsecret-value-123 live root cause\n")
+        assert upload(mode) is True
+        with open(console, "a", encoding="utf-8") as handle:
+            handle.write("secret-value-123 terminal root cause\n")
+        assert upload(mode, final=True) is True
 
-
-def test_instance_console_upload_loop_never_waits_longer_than_the_interval():
-    """A caller passing an interval shorter than the first-snapshot delay must not be lengthened."""
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-
-    waits: list[float] = []
-
-    class _Stop:
-        def wait(self, seconds: float) -> bool:
-            waits.append(seconds)
-            return True  # stop immediately; only the first wait matters here
-
-    _instance_bootstrap._console_upload_loop({}, "/tmp/console.txt", "train", 30.0, _Stop())
-    assert waits == [30.0]
+        assert [call["path_or_fileobj"] for call in calls] == [live_tail, terminal_tail]
+        assert [call["path_in_repo"] for call in calls] == [
+            f"rl/run-1/console_{mode}_live.txt",
+            f"rl/run-1/console_{mode}.txt",
+        ]
+        assert all(len(call["payload"].encode()) <= 64_000 for call in calls)
+        assert all("secret-value-123" not in call["payload"] for call in calls)
+        assert all("<redacted>" in call["payload"] for call in calls)
+        assert "terminal root cause" not in calls[0]["payload"]
+        assert "terminal root cause" in calls[1]["payload"]
+        assert len(deadline_checks) == 4
+    finally:
+        for target in (console, live_tail, terminal_tail):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(target)
 
 
 def test_min_cuda_for_uses_the_gpu_class_floor():

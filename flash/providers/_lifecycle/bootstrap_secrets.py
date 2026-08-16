@@ -7,7 +7,6 @@ module locally (tests, tooling).
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import urllib.parse
@@ -23,8 +22,6 @@ _SECRET_RE = re.compile(
 # component lines are registered as needles too; the floor keeps a common fragment such as ``}``
 # from erasing innocent output. Mirrors flash._internal.diagnostics.
 _MIN_SECRET_COMPONENT = 8
-_CONSOLE_PROGRESS_READ_LIMIT = 1_048_576
-_CONSOLE_PROGRESS_LINE_LIMIT = 64_000
 
 
 def _bounded_pattern(needle: str) -> str:
@@ -123,10 +120,6 @@ def _safe_detail(
     root cause is the last thing written -- the end of a native stack, a json blob, or a progress
     stream -- and cutting the front is what preserves it. An unknown value raises rather than
     silently keeping the front: a typo would quietly cut the side the caller asked to keep.
-
-    Redaction happens on the WHOLE text first, so a credential cannot be split by this bound. The
-    zero case is spelled out because ``text[-0:]`` is ``text[0:]`` -- the whole string, the exact
-    opposite of a zero bound.
     """
     if keep not in ("start", "end"):
         raise ValueError(f"keep must be 'start' or 'end', got {keep!r}")
@@ -141,6 +134,9 @@ def _safe_detail(
     text = _redact_values(text, values)
     text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
     text = _SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
+    # redaction happens on the WHOLE text first, so a credential cannot be split by this bound.
+    # the zero case is spelled out because ``text[-0:]`` is ``text[0:]`` -- the whole string, the
+    # exact opposite of a zero bound.
     bound = max(0, int(limit))
     if not bound:
         return ""
@@ -179,53 +175,3 @@ def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> st
         return tail
     cut = tail.find("\n")
     return tail[cut + 1 :] if cut >= 0 else ""
-
-
-def _console_progress(path, state):
-    """return ``(eof size, committed beats, any beats)`` from one bounded incremental scan.
-
-    ``state`` owns the parser offset, a bounded partial line, and whether an overlong line is being
-    dropped. the returned size is the actual eof watermark, independent of parser progress, so an
-    unterminated line still makes a later snapshot eligible. complete heartbeat lines are decoded
-    independently; malformed and overlong lines are inert without hiding later valid lines.
-    """
-    committed = beats = 0
-    try:
-        with open(path, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            eof, offset = handle.tell(), state["offset"]
-            if eof < offset:
-                state.update(offset=0, partial=b"", dropping=False)
-                offset = 0
-            while offset < eof:
-                handle.seek(offset)
-                chunk = handle.read(min(_CONSOLE_PROGRESS_READ_LIMIT, eof - offset))
-                if not chunk:
-                    break
-                offset += len(chunk)
-                lines = (state["partial"] + chunk).split(b"\n")
-                state["partial"] = lines.pop()
-                if state["dropping"]:
-                    if not lines:
-                        state["partial"] = b""
-                        state["offset"] = offset
-                        continue
-                    state["dropping"], lines = False, lines[1:]
-                if len(state["partial"]) > _CONSOLE_PROGRESS_LINE_LIMIT:
-                    state.update(partial=b"", dropping=True)
-                for line in lines:
-                    if len(line) > _CONSOLE_PROGRESS_LINE_LIMIT or not line.startswith(
-                        b"HEARTBEAT "
-                    ):
-                        continue
-                    try:
-                        payload = json.loads(line[len(b"HEARTBEAT ") :])
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(payload, dict) and not payload.get("liveness"):
-                        beats += 1
-                        committed += not {"pending", "throttled"} & set(payload)
-                state["offset"] = offset
-    except OSError:
-        return -1, 0, 0
-    return eof, committed, beats

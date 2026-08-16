@@ -22,16 +22,13 @@ from email.utils import parsedate_to_datetime
 if __package__:
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
-        _console_progress,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
     )
 else:
-    # bare workers import the shipped sibling modules.
     import bootstrap_pip  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
-        _console_progress,
         _payload_secrets,
         _read_console_tail,
         _safe_detail,
@@ -40,6 +37,8 @@ else:
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
+_CONSOLE_PROGRESS_READ_LIMIT = 1_048_576
+_CONSOLE_PROGRESS_LINE_LIMIT = 64_000
 _CONSOLE_UPLOAD_FIRST_SNAPSHOT_S = 600.0
 _CONSOLE_UPLOAD_POLL_S = 120.0
 _CONSOLE_UPLOAD_QUIET_POLLS = 4
@@ -233,8 +232,7 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dic
 def hf_upload(
     payload: dict, local_path: str, repo_subpath: str, *, enforce_deadline: bool = True
 ) -> bool:
-    """Upload one artifact under the run's HF prefix; never raises. True only if it landed, so a
-    caller tracking what is stored cannot read a swallowed failure as success and skip its retry."""
+    """upload one artifact under the run's hf prefix and return whether it landed."""
     try:
         from huggingface_hub import HfApi
 
@@ -254,7 +252,6 @@ def hf_upload(
 
 
 def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> bool:
-    """Upload one console snapshot from an isolated process. True only if it landed."""
     tail_path = console + ".tail"
     secrets = _payload_secrets(payload)
     tail = _read_console_tail(console, 64_000, secrets=secrets) + extra
@@ -263,13 +260,50 @@ def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str 
     return hf_upload(payload, tail_path, f"console_{mode}.txt")
 
 
-def _console_upload_loop(job: dict, console: str, mode: str, interval: float, stop) -> None:
-    """snapshot hourly or after sustained heartbeat silence.
+def _console_progress(path, state):
+    committed = beats = 0
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            eof, offset = handle.tell(), state["offset"]
+            if eof < offset:
+                state.update(offset=0, partial=b"", dropping=False)
+                offset = 0
+            while offset < eof:
+                handle.seek(offset)
+                chunk = handle.read(min(_CONSOLE_PROGRESS_READ_LIMIT, eof - offset))
+                if not chunk:
+                    break
+                offset += len(chunk)
+                lines = (state["partial"] + chunk).split(b"\n")
+                state["partial"] = lines.pop()
+                if state["dropping"]:
+                    if not lines:
+                        state["partial"] = b""
+                        state["offset"] = offset
+                        continue
+                    state["dropping"], lines = False, lines[1:]
+                if len(state["partial"]) > _CONSOLE_PROGRESS_LINE_LIMIT:
+                    state.update(partial=b"", dropping=True)
+                for line in lines:
+                    if len(line) > _CONSOLE_PROGRESS_LINE_LIMIT or not line.startswith(
+                        b"HEARTBEAT "
+                    ):
+                        continue
+                    try:
+                        payload = json.loads(line[len(b"HEARTBEAT ") :])
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(payload, dict) and not payload.get("liveness"):
+                        beats += 1
+                        committed += not {"pending", "throttled"} & set(payload)
+                state["offset"] = offset
+    except OSError:
+        return -1, 0, 0
+    return eof, committed, beats
 
-    the 600s fallback remains until the first committed heartbeat. an earlier commit promotes the
-    deadline without resetting ``since``. wedge detection uses every non-liveness heartbeat before
-    that commit and only committed ones after it. failed uploads advance no watermark or deadline.
-    """
+
+def _console_upload_loop(job: dict, console: str, mode: str, interval: float, stop) -> None:
     poll = min(_CONSOLE_UPLOAD_POLL_S, interval)
     due_s = min(_CONSOLE_UPLOAD_FIRST_SNAPSHOT_S, interval)
     sent, size, since, quiet, armed, spent, ever = -1, -1, 0.0, 0.0, False, 0, False
