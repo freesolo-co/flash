@@ -330,6 +330,7 @@ def make_hf_failure_detail_reader(
     """Reader for worker-uploaded failure artifacts on HF (error/console txt); force-read after terminal failure."""
     # Attempt-scoped to match the worker's error_artifact_name(mode, attempt).
     err_name = error_artifact_name(phase, attempt)
+    live_console_name = attempt_scoped_artifact_name("console", phase, attempt)
     error_reader = make_hf_text_reader(
         hf_repo,
         f"{prefix}/{err_name}",
@@ -342,6 +343,12 @@ def make_hf_failure_detail_reader(
         min_interval_s,
         **deadline_kwargs(make_hf_text_reader, deadline_at),
     )
+    live_console_reader = make_hf_text_reader(
+        hf_repo,
+        f"{prefix}/{live_console_name}",
+        min_interval_s,
+        **deadline_kwargs(make_hf_text_reader, deadline_at),
+    )
 
     def read(force: bool = False) -> str | None:
         parts: list[str] = []
@@ -351,6 +358,9 @@ def make_hf_failure_detail_reader(
         console_text = console_reader(force=force)
         if console_text:
             parts.append(f"--- console_{phase}.txt ---\n{console_text}")
+        live_console_text = live_console_reader(force=force)
+        if live_console_text:
+            parts.append(f"--- {live_console_name} ---\n{live_console_text}")
         return "\n".join(parts) if parts else None
 
     return read

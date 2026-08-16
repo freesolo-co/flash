@@ -17,6 +17,7 @@ import time
 import traceback
 
 from flash._internal.diagnostics import sanitize_diagnostic
+from flash.adapters.fused_experts import lora_target_parameters
 from flash.core.spec import FIXED_SEED, load_job_spec_from_env
 from flash.engine.result.accounting import RunMetrics
 from flash.engine.worker.backend_common import collect_ray_failure_logs
@@ -56,9 +57,8 @@ from flash.engine.worker.io.wandb_log import (
 )
 from flash.engine.worker.model.adapter import (
     _download_adapter,
-    lora_target_parameters,
     make_lora,
-    validate_lora_target_parameters,
+    validate_warmstart_adapter,
 )
 from flash.engine.worker.model.decoding import (
     graded_text,
@@ -503,7 +503,7 @@ __all__ = [
     "think_token_count",
     "thinking_text",
     "upload_resume_checkpoint",
-    "validate_lora_target_parameters",
+    "validate_warmstart_adapter",
     "wait_for_gpu",
     "wandb_run_name",
     "write_base_model_provenance",
