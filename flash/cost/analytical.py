@@ -597,7 +597,15 @@ def _offline_preferred_gpu_shape(config: RunConfig) -> tuple[str, int, int, str,
                 quote[4] * quote[2] * sharded_step_seconds(config, quote[0], quote[2], quote[3])
             ),
         )
-    # preserve the existing unpinned diagnostic when no registered provider has a structural fit.
+    # every eligible provider has now been tried and none has a structural fit. dropping the
+    # restriction here to reach the unpinned `provider="auto"` diagnostic would rank the registered
+    # runpod pool regardless of credentials, quoting a shape this plane cannot rent -- the same
+    # defect the eligibility filter above exists to prevent, reintroduced at the last step. that
+    # quote would then pass affordability and only fail once live allocation runs, after the run is
+    # recorded. re-raise the eligible set's own failure instead, which names the real constraint.
+    if eligible:
+        return _offline_gpu_shape(replace(config, provider=eligible[0], providers=()))
+    # no provider is registered at all (an empty registry): keep the historical unpinned answer.
     return _offline_gpu_shape(replace(config, providers=()))
 
 

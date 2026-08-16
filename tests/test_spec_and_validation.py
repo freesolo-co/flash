@@ -1228,6 +1228,29 @@ def test_cost_quote_skips_a_preference_this_plane_cannot_provision(monkeypatch) 
     assert estimate_cost(config).provider == "lambda"
 
 
+def test_cost_quote_refuses_a_shape_no_configured_provider_can_rent(monkeypatch) -> None:
+    """Exhausting the eligible set must raise, not fall through to an unrestricted `auto` quote.
+
+    A vast-only plane cannot rent a B200. Ranking the registered RunPod pool anyway returns a quote
+    for hardware this plane has no credentials for, which then passes the affordability check and
+    only fails once live allocation runs -- after the run is recorded.
+    """
+    import flash.providers as providers_registry
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.spec import runconfig_from_spec
+
+    spec = spec_from_dict(_raw(**{"gpu.providers": ["vast"], "gpu.type": "B200"}))
+    config = runconfig_from_spec(spec)
+
+    monkeypatch.setattr(providers_registry, "available_providers", lambda: ("vast",))
+    with pytest.raises(ValueError, match="vast"):
+        estimate_cost(config)
+
+    # a plane that can actually rent the class still quotes it.
+    monkeypatch.setattr(providers_registry, "available_providers", lambda: ("runpod", "vast"))
+    assert estimate_cost(config).provider == "runpod"
+
+
 def test_soft_provider_preference_does_not_reject_an_ineligible_gpu_type_pair() -> None:
     spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"], "gpu.type": "RTX 4090"}))
 
