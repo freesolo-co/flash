@@ -172,7 +172,7 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
 def _resolve_warmstart_config(train_spec, model_id, adapter_path, lora_rank, lora_alpha):
     with open(os.path.join(adapter_path, "adapter_config.json")) as f:
         source_config = json.load(f)
-    _w.validate_lora_target_parameters(source_config, model_id)
+    _w.validate_warmstart_adapter(source_config, model_id, adapter_path)
     # a patterned adapter trains some modules at higher rank than the base `r`; verl allocates
     # one uniform rank, so it must cover the MAXIMUM prepared rank or the load truncates.
     ranks = [int(source_config.get("r", lora_rank))]

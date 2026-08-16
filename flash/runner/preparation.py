@@ -173,6 +173,7 @@ def _prepare_init_from_adapter_inner(
     ref = spec.train.init_from_adapter
     if not ref:
         return spec, spec, None, None
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
     from flash.adapters.lora_rank import (
         adapter_artifact_identity,
         load_hf_adapter_config,
@@ -255,6 +256,7 @@ def _prepare_init_from_adapter_inner(
         ),
     )
     config = load_hf_adapter_config(storage, token, revision)
+    validate_fused_expert_adapter_config(config, spec.model)
     metadata = preflight_init_adapter_lora_rank(
         worker_spec, token=token, config_loader=lambda _ref, _token, _revision: config
     )
