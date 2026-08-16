@@ -4453,7 +4453,7 @@ def _capability_env(*, multi_turn=False, is_tool_env=False, image_uri=None, exam
 
         # the four calls the multi-turn bridge drives an env through. defined unconditionally so a
         # test can delete one and assert the capability gate catches it.
-        def new_rollout_state(self, ex):
+        def new_rollout_state(self, ex, prepared_prompt):
             return {}
 
         def record_model_turn(self, state, text):
@@ -5003,14 +5003,15 @@ class _BridgeEnv:
         self.recorded: list[str] = []
         self.scored: list[dict] = []
 
-    def new_rollout_state(self, example):
-        # `messages` starts as a COPY of `prompt` and turns are appended onto it, matching
+    def new_rollout_state(self, example, prepared_prompt):
+        # `messages` starts as a copy of `prompt` and turns are appended onto it, matching
         # flash.envs.adapter.new_rollout_state. anything reading the transcript has to account
         # for that seeding rather than treating `messages` as turns-only.
+        prompt = [dict(message) for message in prepared_prompt]
         state: dict = {
             "example": example,
-            "prompt": list(self.prompt),
-            "messages": [dict(message) for message in self.prompt],
+            "prompt": prompt,
+            "messages": [dict(message) for message in prompt],
         }
         if self.max_episode_turns is not None:
             state["max_episode_turns"] = self.max_episode_turns
@@ -5079,37 +5080,26 @@ def test_bridge_start_lets_a_per_example_budget_lower_the_cap_but_never_raise_it
     ) == {"max_turns": 1}
 
 
-def test_bridge_start_adopts_the_datasets_prompt_over_a_second_start_episode():
-    # `new_rollout_state` calls `start_episode` a SECOND time; dataset preparation already called
-    # it to build the prompt the child generates against. an env that randomizes per episode hands
-    # back a DIFFERENT opening here, and the run would then score a response generated for prompt A
-    # against a reward computed for prompt B. the env below returns a fresh secret every call, the
-    # way a randomized env does.
-    class _RandomizingEnv(_BridgeEnv):
+def test_bridge_start_passes_the_index_aligned_prepared_prompt_into_state_creation():
+    class _RecordingEnv(_BridgeEnv):
         def __init__(self):
             super().__init__()
-            self.calls = 0
+            self.starts = []
 
-        def new_rollout_state(self, example):
-            self.calls += 1
-            return {
-                "example": example,
-                "prompt": [{"role": "user", "content": f"secret-{self.calls}"}],
-                "messages": [{"role": "user", "content": f"secret-{self.calls}"}],
-            }
+        def new_rollout_state(self, example, prepared_prompt):
+            self.starts.append((example, prepared_prompt))
+            return super().new_rollout_state(example, prepared_prompt)
 
-    env = _RandomizingEnv()
-    dataset_prompt = [{"role": "user", "content": "secret-0"}]
-    bridge = _bridge(env, examples=[{"index": 0}], env_prompts=[dataset_prompt])
+    env = _RecordingEnv()
+    example = {"index": 0}
+    prepared_prompt = [{"role": "user", "content": "prepared"}]
+    bridge = _bridge(env, examples=[example], env_prompts=[prepared_prompt])
     bridge.start({"index": 0, "session_id": "a"})
-    bridge.step({"session_id": "a", "completion_text": "answer"})
-    bridge.score({"session_id": "a", "turn_count": 1})
 
-    scored = env.scored[0]
-    assert scored["prompt"] == dataset_prompt, (
-        "the episode was scored against a prompt the model never saw"
-    )
-    assert scored["messages"][0] == dataset_prompt[0]
+    assert env.starts == [(example, prepared_prompt)]
+    state = bridge._sessions["a"]["state"]
+    assert state["prompt"] == prepared_prompt
+    assert state["messages"] == prepared_prompt
 
 
 def test_bridge_rejects_prompts_that_do_not_align_with_its_examples():
@@ -6744,8 +6734,8 @@ def test_multi_turn_bridge_returns_turns_only_under_per_turn_credit():
     class _Env:
         max_turns = 2
 
-        def new_rollout_state(self, example):
-            return {"prompt": [], "messages": []}
+        def new_rollout_state(self, example, prepared_prompt):
+            return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
         def rollout_rewards_many(self, items):
             from flash.envs.base import RolloutReward
@@ -6770,8 +6760,8 @@ def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
     class _Env:
         max_turns = 2
 
-        def new_rollout_state(self, example):
-            return {"prompt": [], "messages": []}
+        def new_rollout_state(self, example, prepared_prompt):
+            return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
         def rollout_rewards_many(self, items):
             from flash.envs.base import RolloutReward
@@ -6909,8 +6899,8 @@ class _SpanEnv:
     def __init__(self):
         self.recorded: list[str] = []
 
-    def new_rollout_state(self, example):
-        return {"prompt": [], "messages": []}
+    def new_rollout_state(self, example, prepared_prompt):
+        return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
     def record_model_turn(self, state, text):
         self.recorded.append(text)
