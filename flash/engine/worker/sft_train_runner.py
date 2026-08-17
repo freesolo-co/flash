@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
+from flash.adapters.targets import resolve_lora_targeting
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
 from flash.engine.worker import sft_train as _sft_train
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -84,6 +85,7 @@ class _SftModelSetup:
     lora_rank: int
     lora_alpha: int
     target_modules: object
+    exclude_modules: str | None
     warmstart_adapter: str | None
     fused_ce: bool
     train_batch_size: int
@@ -339,8 +341,11 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     # to resolve. same stage name, so the provider's setup-grace classification is unchanged.
     with liveness_heartbeat("sft_model_load"):
         lora_config = _w.make_lora(options.model_id)
+        targeting = resolve_lora_targeting(
+            options.model_id, algorithm="sft", multimodal=data.multimodal
+        )
         lora_rank = int(lora_config.r)
-        target_modules = lora_config.target_modules
+        target_modules = targeting.target_modules
         if isinstance(target_modules, set | frozenset):
             target_modules = sorted(target_modules)
         warmstart_adapter = _sft_train._warmstart_adapter_path(
@@ -402,6 +407,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
         lora_rank=lora_rank,
         lora_alpha=int(lora_config.lora_alpha),
         target_modules=target_modules,
+        exclude_modules=targeting.exclude_modules,
         warmstart_adapter=warmstart_adapter,
         fused_ce=fused_ce,
         train_batch_size=train_batch_size,
@@ -607,6 +613,7 @@ def _prepare_sft_child(
         "lora_rank": model.lora_rank,
         "lora_alpha": model.lora_alpha,
         "target_modules": model.target_modules,
+        "exclude_modules": model.exclude_modules,
         "target_parameters": _w.lora_target_parameters(options.model_id),
         "lora_adapter_path": model.warmstart_adapter,
         "ulysses_sp_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
@@ -664,6 +671,7 @@ def _prepare_sft_child(
         python_bin=capabilities.python_bin,
         model_id=options.model_id,
         model_revision=options.model_revision,
+        exclude_modules=model.exclude_modules,
         required_steps=options.save_at_steps,
     )
     # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded

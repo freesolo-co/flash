@@ -14,6 +14,7 @@ from flash.adapters.fused_experts import (
     validate_fused_expert_adapter_config,
 )
 from flash.adapters.lora_rank import resolve_adapter_ref
+from flash.adapters.targets import resolve_lora_targeting
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.worker.io.hf import (
     RetriableInfraError,
@@ -44,11 +45,11 @@ def validate_warmstart_adapter(config: Mapping[str, Any], model_id: str, adapter
         )
 
 
-def make_lora(model_id: str | None = None):
-    """build the model's complete serve-compatible lora target set."""
+def make_lora(model_id: str, *, algorithm: str = "sft", multimodal: bool = False):
+    """build the model's modality-correct serve-compatible lora target set."""
     from peft import LoraConfig
 
-    targets = "all-linear"
+    targeting = resolve_lora_targeting(model_id, algorithm=algorithm, multimodal=multimodal)
     rank = _w.JOB_SPEC.train.lora_rank if _w.JOB_SPEC else RECIPE.lora.rank
     alpha = _w.JOB_SPEC.train.lora_alpha if _w.JOB_SPEC else RECIPE.lora.alpha
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
@@ -56,12 +57,13 @@ def make_lora(model_id: str | None = None):
         "r": rank,
         "lora_alpha": alpha,
         "lora_dropout": RECIPE.lora.dropout,
-        "target_modules": targets,
+        "target_modules": targeting.target_modules,
+        "exclude_modules": targeting.exclude_modules,
         "task_type": "CAUSAL_LM",
         "revision": model_revision or None,
     }
-    if target_parameters := lora_target_parameters(model_id):
-        kwargs["target_parameters"] = target_parameters
+    if targeting.target_parameters:
+        kwargs["target_parameters"] = targeting.target_parameters
     # pissa removed: it mutates the base, so its adapter corrupts serve + warm-start on the unmodified base.
     kwargs["init_lora_weights"] = True
     print(

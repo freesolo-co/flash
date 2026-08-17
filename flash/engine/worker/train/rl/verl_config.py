@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import os
 
+from flash.adapters.targets import resolve_lora_targeting
 from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.backend_common import (
@@ -242,6 +243,7 @@ def _actor_model_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
+        f"actor_rollout_ref.model.exclude_modules={_hydra_val(cfg.get('exclude_modules'))}",
         *(
             ["++actor_rollout_ref.model.target_parameters=" + _hydra_val(cfg["target_parameters"])]
             if cfg.get("target_parameters")
@@ -584,6 +586,9 @@ def _build_verl_training_cfg(
 ) -> dict:
     engine_len = int(inp["engine_len"])
     sleep_unsupported = rollout_sleep_unsupported(inp["model_id"])
+    targeting = resolve_lora_targeting(
+        inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
+    )
     return {
         "fused_ce_backend": ce_backend,
         "train_files": train_files,
@@ -591,11 +596,11 @@ def _build_verl_training_cfg(
         "model_path": model_path,
         "lora_rank": inp["lora_rank"],
         "lora_alpha": inp["lora_alpha"],
-        "target_modules": "all-linear",
-        # the catalog id, never model_path: lora_target_parameters matches an exact hf repo id, so a
-        # snapshot dir yields None and leaves the fused routed-expert parameters unadapted on a run
-        # that otherwise looks healthy.
-        "target_parameters": _w.lora_target_parameters(inp["model_id"]),
+        "target_modules": targeting.target_modules,
+        "exclude_modules": targeting.exclude_modules,
+        # the catalog id, never model_path: fused routed-expert parameters are part of the same
+        # resolved target surface and must not be derived from the local snapshot path.
+        "target_parameters": targeting.target_parameters,
         "multimodal": bool(inp.get("multimodal")),
         "lr": inp["lr"],
         "group_size": inp["group_size"],

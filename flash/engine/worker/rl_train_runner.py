@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from flash.adapters.targets import resolve_lora_targeting
 from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.result.rollout_samples import sample_completion_text, sanitize_rollout_text
@@ -350,6 +351,9 @@ def _announce_training(t_start: float, cfg) -> tuple[float, float]:
 def _start_resume_uploader(
     *, local_dir, resume_step, inp, workdir, python_bin, preprocessor, adv_spread_history
 ):
+    targeting = resolve_lora_targeting(
+        inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
+    )
     resume_uploader = _rl_train()._VerlResumeUploader(
         local_dir,
         resume_step=resume_step,
@@ -358,6 +362,7 @@ def _start_resume_uploader(
         python_bin=python_bin,
         model_id=inp["model_id"],
         model_revision=inp["model_revision"],
+        exclude_modules=targeting.exclude_modules,
         preprocessor=preprocessor,
         # a resumed run's restored weights already carry the earlier steps' updates, so this
         # worker's own spread history cannot speak for them; let it publish as before and leave
@@ -639,5 +644,13 @@ def _export_final_adapter(actor_dir, adapter_dir, inp, python_bin):
     parent.export_peft_adapter(
         actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
     )
-    parent.stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
+    targeting = resolve_lora_targeting(
+        inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
+    )
+    parent.stamp_adapter_dir_provenance(
+        adapter_dir,
+        inp["model_id"],
+        inp["model_revision"],
+        exclude_modules=targeting.exclude_modules,
+    )
     _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])

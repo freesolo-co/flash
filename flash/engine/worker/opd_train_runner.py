@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from flash.adapters.targets import resolve_lora_targeting
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
 from flash.engine.worker.train.opd.reporting import (
@@ -358,7 +359,8 @@ def _prepare_workload(
     _opd_train._write_opd_parquet(rows, train_file)
     _opd_train._write_opd_parquet([rows[0]], val_file)
     lora_config = _opd_train._w.make_lora(request.model_id)
-    target_modules = lora_config.target_modules
+    targeting = resolve_lora_targeting(request.model_id, algorithm="opd", multimodal=multimodal)
+    target_modules = targeting.target_modules
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
     lora_rank = int(lora_config.r)
@@ -380,6 +382,7 @@ def _prepare_workload(
         lora_rank,
         int(lora_config.lora_alpha),
         target_modules,
+        targeting.exclude_modules,
         _opd_train._warmstart_adapter_path(request.model_id, request.model_revision, lora_rank),
     )
 
@@ -519,6 +522,7 @@ def _build_base_config(
         "lora_rank": workload.lora_rank,
         "lora_alpha": workload.lora_alpha,
         "target_modules": workload.target_modules,
+        "exclude_modules": workload.exclude_modules,
         "target_parameters": _opd_train._w.lora_target_parameters(request.model_id),
         "lora_adapter_path": workload.warmstart_adapter,
         "learning_rate": knobs.learning_rate,
@@ -762,6 +766,7 @@ def _build_checkpoint_watcher(
         model_id=request.model_id,
         model_revision=request.model_revision,
         required_steps=request.knobs.save_at_steps,
+        exclude_modules=workload.exclude_modules,
         seed=int(_opd_train._w.SEED),
         prompt_pool_fingerprint=workload.prompt_pool_fingerprint,
         prompts_per_step=workload.prompts_per_step,
@@ -891,6 +896,7 @@ def _export_and_upload_adapter(
         adapter_dir,
         model_id=request.model_id,
         model_revision=request.model_revision,
+        exclude_modules=workload.exclude_modules,
         python_bin=runtime.python_bin,
     )
     _opd_train._w.hf_upload_folder(adapter_dir, "adapter", required=True)

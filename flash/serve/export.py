@@ -441,6 +441,18 @@ def _normalize_adapter_key_namespace(adapter_dir: Path) -> str:
     return "text_only"
 
 
+def _normalize_export_targeting(adapter_dir: Path, namespace: str) -> None:
+    """drop the conditional-model exclusion after text keys enter the causal-lm namespace."""
+    if namespace != "text_only":
+        return
+    path = adapter_dir / "adapter_config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict) or "exclude_modules" not in config:
+        return
+    config.pop("exclude_modules")
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
 def _normalize_export_adapter_keys(adapter_dir: Path) -> str:
     """Rewrite exported adapter keys into the namespace vanilla peft and vLLM load.
 
@@ -677,6 +689,7 @@ def export_adapter(
             )
         _repair_export_metadata(adapter_dir, base_model, base_model_revision)
         namespace = _normalize_export_adapter_keys(adapter_dir)
+        _normalize_export_targeting(adapter_dir, namespace)
         api = HfApi(token=dest_token)
         try:
             # Always create private first so the repo is never transiently exposed empty/partial.

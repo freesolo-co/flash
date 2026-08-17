@@ -1225,6 +1225,7 @@ def _overrides_cfg(**over):
         "lora_rank": 32,
         "lora_alpha": 64,
         "target_modules": "all-linear",
+        "exclude_modules": None,
         "lr": 1e-5,
         "group_size": 8,
         "prompts_per_step": 16,
@@ -1908,7 +1909,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
     # and the override is scoped: an ordinary model keeps verl's own sleep/wake offload, which is
     # what lets a large rollout fit alongside the training weights.
     for key in ("free_cache_engine", "enable_sleep_mode"):
-        assert not [a for a in _argv("Qwen/Qwen3-4B") if key in a]
+        assert not [a for a in _argv("Qwen/Qwen3.5-4B") if key in a]
 
 
 def test_build_verl_training_cfg_derives_engine_len_and_budget():
@@ -1934,7 +1935,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "ppo_epochs": 1,
         "steps": 60,
         "warmstart_adapter": "",
-        "model_id": "Qwen/Qwen3-4B",
+        "model_id": "Qwen/Qwen3.5-4B",
         "verl_total_epochs": 2,
         "save_freq": 20,
         "ckpt_to_keep": 1,

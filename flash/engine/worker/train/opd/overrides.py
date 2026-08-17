@@ -118,6 +118,7 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         f"actor_rollout_ref.model.lora_rank={_hydra_val(config['lora_rank'])}",
         f"actor_rollout_ref.model.lora_alpha={_hydra_val(config['lora_alpha'])}",
         f"actor_rollout_ref.model.target_modules={_hydra_val(config['target_modules'])}",
+        f"actor_rollout_ref.model.exclude_modules={_hydra_val(config.get('exclude_modules'))}",
         *(
             [
                 "++actor_rollout_ref.model.target_parameters="

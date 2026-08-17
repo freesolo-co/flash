@@ -99,6 +99,9 @@ class ModelInfo:
     # download. REQUIRED: ``test_every_catalog_entry_sets_params_b`` asserts every entry sets it
     # > 0, so a new entry can never silently fall back to a parsed string again.
     params_b: float
+    # module prefix containing every language layer on the loaded conditional-generation model.
+    # required by text-only lora targeting; kept out of the public catalog rows below.
+    lora_language_prefix: str = ""
     quant: str = "bf16"
     recommended_gpu: str = DEFAULT_GPU
     # 0 => GRPO uses min_vram_gb like SFT; set when colocated vLLM rollout needs a bigger card.
@@ -177,6 +180,7 @@ class ModelInfo:
             "linear_key_head_dim",
             "linear_value_head_dim",
             "linear_conv_kernel_dim",
+            "lora_language_prefix",
             "lora_target_shapes",
             "lora_expert_count",
         ):
@@ -218,6 +222,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 0.8B",
         params="0.9B",
         params_b=0.9,
+        lora_language_prefix="model.language_model",
         vocab_size=248_320,
         num_layers=24,
         hidden_size=1024,
@@ -265,6 +270,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 2B",
         params="2.3B",
         params_b=2.3,
+        lora_language_prefix="model.language_model",
         vocab_size=248_320,
         num_layers=24,
         hidden_size=2048,
@@ -309,6 +315,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 4B",
         params="4.7B",
         params_b=4.7,
+        lora_language_prefix="model.language_model",
         vocab_size=248_320,
         num_layers=32,
         hidden_size=2560,
@@ -357,6 +364,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 9B",
         params="9.7B",
         params_b=9.7,
+        lora_language_prefix="model.language_model",
         vocab_size=248_320,
         num_layers=32,
         hidden_size=4096,
@@ -411,6 +419,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.6 27B",
         params="27B dense (multimodal VL, hybrid GDN)",
         params_b=27.0,
+        lora_language_prefix="model.language_model",
         num_layers=64,
         hidden_size=5120,
         vocab_size=248_320,
@@ -468,6 +477,7 @@ MODELS: dict[str, ModelInfo] = {
         params="35B total / ~3B active (MoE)",
         # 35.0 not 35.95: the marketing figure tips the SFT equation over the B200 budget (see test_sft_equation_covers_honest_peak_across_seq_boundary).
         params_b=35.0,
+        lora_language_prefix="model.language_model",
         active_params_b=3.0,
         # Geometry for the SFT GC-off activation estimate (config.json text_config): 40 decoder
         # layers x 2048 hidden (hybrid GatedDeltaNet + full-attention, 256 experts / 8 active).

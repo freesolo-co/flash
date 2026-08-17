@@ -1,0 +1,22 @@
+{
+  "model_id": "Qwen/Qwen3.5-0.8B",
+  "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "config": {
+    "architectures": ["Qwen3_5ForConditionalGeneration"],
+    "model_type": "qwen3_5",
+    "text_config": {
+      "model_type": "qwen3_5_text",
+      "mtp_num_hidden_layers": 1
+    },
+    "vision_config": {
+      "model_type": "qwen3_5"
+    }
+  },
+  "module_names": {
+    "language_linear": "model.language_model.layers.0.self_attn.q_proj",
+    "visual_linear": "model.visual.blocks.0.attn.proj",
+    "patch_linear": "model.visual.patch_embed.proj",
+    "projector_linear": "model.multi_modal_projector.linear",
+    "mtp_linear": "model.mtp.layers.0.proj"
+  }
+}

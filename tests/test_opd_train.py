@@ -5994,6 +5994,7 @@ def _config(**overrides):
         "lora_rank": 32,
         "lora_alpha": 64,
         "target_modules": "all-linear",
+        "exclude_modules": None,
         "learning_rate": 1e-5,
         "local_dir": "/w/checkpoints",
         "save_freq": 20,
@@ -6213,6 +6214,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
             lora_rank=32,
             lora_alpha=64,
             target_modules="all-linear",
+            exclude_modules=None,
             warmstart_adapter=None,
         ),
         runtime=SimpleNamespace(
@@ -6287,6 +6289,7 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
                 lora_rank=32,
                 lora_alpha=64,
                 target_modules="all-linear",
+                exclude_modules=None,
                 warmstart_adapter=None,
             ),
             runtime=SimpleNamespace(

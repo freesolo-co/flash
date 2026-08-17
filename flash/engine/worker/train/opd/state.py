@@ -49,6 +49,7 @@ class _WorkloadState:
     lora_rank: int
     lora_alpha: int
     target_modules: Any
+    exclude_modules: str | None
     warmstart_adapter: str | None
 
 

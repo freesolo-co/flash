@@ -558,11 +558,18 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         assert captured.get("use_rslora") is False
         assert captured.get("revision") == "a" * 40
         assert "target_parameters" not in captured
+        assert captured["exclude_modules"] == r"^(?!model\.language_model(?:\.|$)).*$"
+
+    captured.clear()
+    worker.make_lora("Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=True)
+    assert captured["target_modules"] == "all-linear"
+    assert captured["exclude_modules"] is None
 
     captured.clear()
     worker.make_lora("Qwen/Qwen3.6-35B-A3B")
     assert captured["r"] == 32
     assert captured["target_modules"] == "all-linear"
+    assert captured["exclude_modules"] == r"^(?!model\.language_model(?:\.|$)).*$"
     assert captured["target_parameters"] == [
         "mlp.experts.gate_up_proj",
         "mlp.experts.down_proj",

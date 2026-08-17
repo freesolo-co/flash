@@ -307,6 +307,7 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
             adapter_dir,
             model_id=self.model_id,
             model_revision=self.model_revision,
+            exclude_modules=self.exclude_modules,
             python_bin=self.python_bin,
         )
         _stage_retry_contract(

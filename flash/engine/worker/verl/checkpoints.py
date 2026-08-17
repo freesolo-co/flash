@@ -580,7 +580,13 @@ def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
             raise RuntimeError("exported text adapter has no nonzero composed LoRA delta")
 
 
-def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision: str = "") -> None:
+def stamp_adapter_dir_provenance(
+    adapter_dir: str,
+    model_id: str,
+    model_revision: str = "",
+    *,
+    exclude_modules: str | None = None,
+) -> None:
     """stamp the saved adapter's immutable base identity into adapter_config.json.
 
     dir-based analogue of the in-memory peft-model provenance stamp: same validation + fields,
@@ -603,6 +609,10 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
         raise RuntimeError("adapter base revision does not match the validated target commit")
     cfg["base_model_name_or_path"] = model_id
     cfg["revision"] = model_revision or None
+    if exclude_modules:
+        cfg["exclude_modules"] = exclude_modules
+    else:
+        cfg.pop("exclude_modules", None)
     normalize_verl_fused_expert_export(cfg, model_id)
     validate_fused_expert_adapter_config(cfg, model_id)
     if lora_target_parameters(model_id):

@@ -70,6 +70,7 @@ def _export_checkpoint_adapter(
     *,
     model_id: str,
     model_revision: str,
+    exclude_modules: str | None,
     python_bin: str,
 ) -> None:
     shutil.rmtree(adapter_dir, ignore_errors=True)
@@ -80,7 +81,9 @@ def _export_checkpoint_adapter(
         python_bin=python_bin,
     )
     _copy_processing_sidecars(actor_dir, adapter_dir)
-    stamp_adapter_dir_provenance(adapter_dir, model_id, model_revision)
+    stamp_adapter_dir_provenance(
+        adapter_dir, model_id, model_revision, exclude_modules=exclude_modules
+    )
     _w.write_base_model_provenance(adapter_dir, model_id, model_revision)
 
 
@@ -96,6 +99,7 @@ class _VerlCheckpointWatcher:
         model_id: str,
         model_revision: str,
         required_steps: tuple[int, ...],
+        exclude_modules: str | None = None,
     ) -> None:
         self.local_dir = local_dir
         self.export_root = export_root
@@ -105,6 +109,7 @@ class _VerlCheckpointWatcher:
         self.python_bin = python_bin
         self.model_id = model_id
         self.model_revision = model_revision
+        self.exclude_modules = exclude_modules
         self.required_steps = frozenset(required_steps)
         self.lifecycle = CheckpointLedger()
         self._error: BaseException | None = None
@@ -239,6 +244,7 @@ class _VerlCheckpointWatcher:
                 adapter_dir,
                 model_id=self.model_id,
                 model_revision=self.model_revision,
+                exclude_modules=self.exclude_modules,
                 python_bin=self.python_bin,
             )
             self.lifecycle.mark_staged(step)

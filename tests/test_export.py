@@ -355,6 +355,28 @@ def test_export_adapter_normalizes_lm_keys_with_inert_vision_weights(tmp_path):
     assert normalized_data == data
 
 
+def test_text_namespace_export_drops_the_training_only_language_exclusion(tmp_path):
+    from flash.serve import export
+
+    config_path = tmp_path / "adapter_config.json"
+    exclusion = r"^(?!model\.language_model(?:\.|$)).*$"
+    config_path.write_text(
+        json.dumps({"r": 1, "target_modules": "all-linear", "exclude_modules": exclusion}),
+        encoding="utf-8",
+    )
+
+    export._normalize_export_targeting(tmp_path, "text_only")
+
+    assert "exclude_modules" not in json.loads(config_path.read_text(encoding="utf-8"))
+
+    config_path.write_text(
+        json.dumps({"r": 1, "target_modules": "all-linear", "exclude_modules": exclusion}),
+        encoding="utf-8",
+    )
+    export._normalize_export_targeting(tmp_path, "multimodal")
+    assert json.loads(config_path.read_text(encoding="utf-8"))["exclude_modules"] == exclusion
+
+
 def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatch):
     # a genuinely multimodal adapter with nonzero vision lora_b must not be normalized:
     # stripping only its lm keys would leave a mixed namespace no transformers class loads.
