@@ -475,13 +475,13 @@ def _pinned_to_resume_width(allocation, resume_world_size: int | None):
     the one the attempt runs at: it refuses to train rather than restart from step 0, because the
     control-plane gate authorized this replacement only to continue from exactly that checkpoint.
     Allocation, though, re-ranks every retry from scratch -- capacity and live pricing move, and
-    2x/4x of a class are distinct rentable shapes -- so a 2-card attempt can legitimately be
-    re-ranked onto 4 cards and then permanently reject the only checkpoint it may resume from.
+    rentable shapes can carry more cards than the ranks that join the run. Comparing the checkpoint
+    width with the rented count can reject a loadable shape or admit one the worker cannot load.
 
-    Narrowing the candidates is what closes that gap, and it is done HERE rather than by passing a
+    Narrowing the candidates is what closes that gap, and it is done here rather than by passing a
     count into ``allocate()``: ``max_gpu_count`` is a ceiling, not an exact width, so a ceiling of 2
-    still admits a 1-card shape. Every candidate already carries its own ``gpu_count``, so the
-    exact-width rule is one filter over the ranked list, leaving the ranking itself untouched.
+    still admits a 1-card shape. Allocator-stamped candidates carry their executed rank count while
+    unstamped candidates fall back to their rented count. The filter leaves ranking and shapes intact.
 
     An empty result is left empty deliberately: the caller reports no-capacity and retries, which is
     the truthful outcome when the only loadable shape is unavailable. Restarting from step 0 instead
@@ -489,11 +489,17 @@ def _pinned_to_resume_width(allocation, resume_world_size: int | None):
     """
     if not resume_world_size:
         return allocation
-    loadable = tuple(
-        candidate
-        for candidate in allocation.candidates
-        if int(getattr(candidate, "gpu_count", 1)) == resume_world_size
-    )
+    loadable = []
+    for candidate in allocation.candidates:
+        executed_gpu_count = getattr(candidate, "executed_gpu_count", None)
+        width = (
+            executed_gpu_count
+            if type(executed_gpu_count) is int and executed_gpu_count > 0
+            else int(getattr(candidate, "gpu_count", 1))
+        )
+        if width == resume_world_size:
+            loadable.append(candidate)
+    loadable = tuple(loadable)
     if loadable == allocation.candidates:
         return allocation
     if not loadable:
@@ -520,16 +526,16 @@ def _build_candidate_plan(
     if not candidates:
         # an exhausted list has two causes and they need different words. attributing the pinned-
         # width one to OOM would send an operator to raise VRAM when the run is not out of memory
-        # at all: no fitting shape has the card count its resume checkpoint can be loaded on.
+        # at all: no fitting candidate executes at the resume checkpoint's world size.
         if prepared.resume_world_size and not allocation.candidates:
             width = prepared.resume_world_size
             ctx.last_detail = (
-                f"no fitting {width}-card shape is available, and this retry must resume from a "
-                f"checkpoint written at {width} cards"
+                f"no candidate executing at checkpoint world size {width} is available, and this "
+                "retry must preserve that executed rank width"
             )
             print(
-                f"seed={ctx.seed} no {width}-card candidate for the pinned OPD resume checkpoint; "
-                "not retrying",
+                f"seed={ctx.seed} no candidate executes at pinned OPD checkpoint world size "
+                f"{width}; not retrying",
                 file=ctx.log,
                 flush=True,
             )

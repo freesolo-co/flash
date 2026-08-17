@@ -412,6 +412,68 @@ def test_project_validation_blocks_before_environment_publication(api, monkeypat
     assert response.json()["detail"] == "project denied"
 
 
+def test_canonical_slug_resolution_blocks_before_environment_publication(api, monkeypatch) -> None:
+    import flash.server.domain.environment_registry as registry_mod
+    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.projects as projects_mod
+
+    importlib.reload(projects_mod)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
+    project_id = "11111111-1111-4111-8111-111111111111"
+    key = _login()
+    org_id = f"org-{key.removeprefix(_USER_PREFIX)}"
+    validation_calls: list[str] = []
+    publish_events: list[str] = []
+
+    class _Response:
+        status = 200
+
+        def __init__(self, body: dict):
+            self._body = json.dumps(body).encode()
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        method = request.get_method()
+        validation_calls.append(method)
+        if method == "GET":
+            return _Response({"id": project_id, "name": "Foo Bar"})
+        body = json.loads(request.data)
+        assert body == {"orgId": org_id, "projectId": project_id}
+        return _Response({"ok": True, **body})
+
+    monkeypatch.setattr(projects_mod.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        lambda **_kwargs: publish_events.append("published"),
+    )
+    monkeypatch.setattr(
+        registry_mod,
+        "record_published_environment",
+        lambda **_kwargs: publish_events.append("associated"),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(key),
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": project_id},
+    )
+
+    assert publish_events == []
+    assert response.status_code == 502
+    assert "canonical project slug" in response.json()["detail"]
+    assert validation_calls == ["GET", "POST"]
+
+
 def _install_real_internal_project_validation(monkeypatch):
     import flash.server.domain.projects as projects_mod
 
