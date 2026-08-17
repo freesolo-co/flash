@@ -2062,6 +2062,65 @@ def test_safe_detail_redacts_overlapping_secrets_longest_first():
     assert detail == "rejected: <redacted> and <redacted>"
 
 
+def test_safe_detail_preserves_punctuation_for_wordless_short_secret():
+    assert b._safe_detail("module.py: failed at /tmp/a.py", secrets={"PIN": "."}) == (
+        "module.py: failed at /tmp/a.py"
+    )
+
+
+def test_safe_detail_redacts_wordless_short_secret_in_keyed_syntax():
+    assert b._safe_detail("token=.", secrets={"PIN": "."}) == "token=<redacted>"
+
+
+def test_safe_detail_redacts_declared_wordless_values_by_exact_shape():
+    secrets = {"KEYED_PIN": ";", "BEARER_PIN": "!"}
+
+    assert b._safe_detail("token=;", secrets=secrets) == "token=<redacted>"
+    assert b._safe_detail("Bearer !", secrets=secrets) == "Bearer <redacted>"
+
+
+def test_safe_detail_protects_shape_before_overlapping_values():
+    detail = b._safe_detail("token=;", secrets={"KEY": "token", "PIN": ";"})
+    assert detail == "<redacted>"
+    assert ";" not in detail
+
+    detail = b._safe_detail("Bearer !", secrets={"KEY": "Bearer", "PIN": "!"})
+    assert detail == "<redacted>"
+    assert "!" not in detail
+
+
+def test_safe_detail_redacts_percent_octets_without_folding_literal_case():
+    for secret, encoded in ((".", "%2E"), ("-", "%2D"), ("~", "%7E"), ("/", "%2f")):
+        assert b._safe_detail(f"encoded {encoded}", secrets={"PIN": secret}) == (
+            "encoded <redacted>"
+        )
+
+    secrets = {"PIN": "A/B"}
+    assert b._safe_detail("encoded A%2fB", secrets=secrets) == "encoded <redacted>"
+    assert b._safe_detail("encoded a%2fb", secrets=secrets) == "encoded a%2fb"
+
+    for secret, case_variant in (
+        ("A%2FB", "A%2fB"),
+        ("literal%2Fsecret", "literal%2fsecret"),
+    ):
+        assert b._safe_detail(f"literal {secret}", secrets={"PIN": secret}) == (
+            "literal <redacted>"
+        )
+        assert b._safe_detail(f"literal {case_variant}", secrets={"PIN": secret}) == (
+            f"literal {case_variant}"
+        )
+
+
+def test_safe_detail_redacts_cross_group_encoded_overlap():
+    secrets = {"LONG_TOKEN": "a%2Fb%2B", "SHORT_TOKEN": "a/b+c&d"}
+
+    detail = b._safe_detail("fetch failed for a%2Fb%2Bc%26d", secrets=secrets)
+
+    assert detail == "fetch failed for <redacted>"
+    for secret in ("a%2Fb%2B", "c%26d", "a/b+c&d"):
+        assert secret not in detail
+
+
 def test_safe_detail_redacts_each_line_of_a_multiline_secret():
     """a PEM key never reaches a redactor whole: console tails are cut and the child's stdout is
     sanitized one line at a time, so only a component line is ever seen. the whole value alone as a
