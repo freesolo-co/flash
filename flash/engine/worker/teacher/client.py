@@ -598,8 +598,10 @@ class TeacherClient:
                 if (
                     code == "broker_http_error"
                     and not structured_error
-                    and (error.code in {408, 409, 429} or 500 <= error.code <= 599)
+                    and error.code in {409, 429}
                 ):
+                    # an unstructured 409 can be an in-progress replay and 429 proves rejection before
+                    # execution. 408 and 5xx are ambiguous after dispatch and must not spend twice.
                     classification = "transient"
                 retryable = classification == "transient"
                 provider_status_detail = (

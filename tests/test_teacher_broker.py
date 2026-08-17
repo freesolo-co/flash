@@ -424,7 +424,7 @@ def test_total_token_quota_is_reserved_before_dispatch_and_never_overshoots(brok
     assert db.teacher_capability_binding(token)["token_count"] == 74
 
 
-def test_stale_started_request_is_readmitted_only_within_the_attempt_bound(broker_db):
+def test_stale_started_request_becomes_terminal_after_broker_recovery(broker_db):
     token = _issue(limits=_limits(max_upstream_attempts=2))
     reservation = db.reserve_teacher_request(
         token=token,
@@ -451,26 +451,7 @@ def test_stale_started_request_is_readmitted_only_within_the_attempt_bound(broke
 
     assert recovered == {"retryable": 1, "outcome_unknown": 1}
     assert db.teacher_capability_binding(token)["token_count"] == 128
-    # the outcome_unknown row is readmitted without charging its token reservation again ...
-    readmitted = db.reserve_teacher_request(
-        token=token,
-        request_id="request-stale-000001",
-        request_fingerprint="a" * 64,
-        request_bytes=10,
-        score_items=1,
-        expected_run_id="run-1",
-        expected_attempt=2,
-    )
-    assert readmitted["request"]["state"] == "reserved"
-    assert db.teacher_capability_binding(token)["token_count"] == 128
-    # ... and the second dispatch spends the last budgeted attempt.
-    db.mark_teacher_request_started(capability_id, "request-stale-000001")
-
-    assert db.recover_teacher_request_ledger() == {"retryable": 0, "outcome_unknown": 1}
-    # the budget is now spent, so readmission itself refuses before touching any counter: the
-    # row must keep its terminal state and held reservation rather than bounce to 'retryable'
-    # and stay readmissible forever.
-    with pytest.raises(db.TeacherLedgerError, match="upstream_attempt_quota_exhausted"):
+    with pytest.raises(db.TeacherLedgerError, match="outcome_unknown"):
         db.reserve_teacher_request(
             token=token,
             request_id="request-stale-000001",
@@ -480,6 +461,7 @@ def test_stale_started_request_is_readmitted_only_within_the_attempt_bound(broke
             expected_run_id="run-1",
             expected_attempt=2,
         )
+    assert db.recover_teacher_request_ledger() == {"retryable": 0, "outcome_unknown": 0}
     connection = sqlite3.connect(broker_db)
     connection.row_factory = sqlite3.Row
     row = connection.execute(
@@ -488,7 +470,7 @@ def test_stale_started_request_is_readmitted_only_within_the_attempt_bound(broke
     ).fetchone()
     in_flight = connection.execute("SELECT in_flight FROM teacher_capabilities").fetchone()[0]
     connection.close()
-    assert (row["state"], row["upstream_attempt_count"]) == ("outcome_unknown", 2)
+    assert (row["state"], row["upstream_attempt_count"]) == ("outcome_unknown", 1)
     assert in_flight == 0
     assert db.teacher_capability_binding(token)["token_count"] == 128
 
@@ -813,16 +795,9 @@ def test_malformed_stored_provider_status_is_omitted_on_replay(
     assert len(dispatches) == 1
 
 
-@pytest.mark.parametrize("status", [408, 429, 500, 502, 503])
-def test_transient_provider_rejects_are_readmitted_and_dispatch_again(
-    broker_db, monkeypatch, status
-):
-    """408, 429 and 5xx are provider-side conditions a retry can outlive.
-
-    the ledger records the rejection with error_class 'transient' so the row stays readmissible,
-    the broker reports it retryable, and a follow-up call with the same request_id dispatches
-    upstream again under the max_upstream_attempts bound, settling and billing exactly once.
-    """
+def test_provider_429_is_readmitted_and_dispatches_again(broker_db, monkeypatch):
+    """a conventional 429 proves rejection before execution and is safe to redispatch."""
+    status = 429
     _service_ready(monkeypatch)
     token = _issue(limits=_limits(max_upstream_attempts=teacher_broker.MAX_UPSTREAM_ATTEMPTS))
     outcomes = [(status, b"upstream"), (200, _response())]
@@ -860,8 +835,101 @@ def test_transient_provider_rejects_are_readmitted_and_dispatch_again(
     token_count = connection.execute("SELECT token_count FROM teacher_capabilities").fetchone()[0]
     connection.close()
     assert row == ("succeeded", 2, 1, 1)
-    # billed once: the token reservation settles to the single succeeded call's actual usage.
+    # the rejected 429 did no provider work, so the single accepted call is the only billable one.
     assert token_count == 2
+
+
+@pytest.mark.parametrize("status", [408, 500, 502, 503])
+def test_ambiguous_provider_status_is_terminal_without_redispatch(broker_db, monkeypatch, status):
+    _service_ready(monkeypatch)
+    token = _issue(limits=_limits(max_upstream_attempts=teacher_broker.MAX_UPSTREAM_ATTEMPTS))
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return status, b"upstream"
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    request_id = "request-ambiguous-0001"
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as first:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+    assert first.value.code == "outcome_unknown"
+    assert first.value.retryable is False
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as replay:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+    assert replay.value.code == "outcome_unknown"
+    assert replay.value.retryable is False
+    assert len(dispatches) == 1
+
+    connection = sqlite3.connect(broker_db)
+    row = connection.execute(
+        "SELECT state, upstream_attempt_count, provider_status, error_class "
+        "FROM teacher_score_requests WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    connection.close()
+    assert row == ("outcome_unknown", 1, status, "permanent")
+
+
+def test_validated_response_with_failed_ledger_settlement_never_redispatches(
+    broker_db, monkeypatch
+):
+    _service_ready(monkeypatch)
+    token = _issue(limits=_limits(max_upstream_attempts=teacher_broker.MAX_UPSTREAM_ATTEMPTS))
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return 200, _response()
+
+    real_complete = db.complete_teacher_request
+
+    def fail_success_completion(capability_id, request_id, **kwargs):
+        if kwargs["state"] == "succeeded":
+            raise sqlite3.OperationalError("ledger write failed after provider success")
+        return real_complete(capability_id, request_id, **kwargs)
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    monkeypatch.setattr(db, "complete_teacher_request", fail_success_completion)
+    request_id = "request-settlement-0001"
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as first:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+    assert first.value.code == "outcome_unknown"
+    assert first.value.retryable is False
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as replay:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+    assert replay.value.code == "outcome_unknown"
+    assert replay.value.retryable is False
+    assert len(dispatches) == 1
+
+    connection = sqlite3.connect(broker_db)
+    row = connection.execute(
+        "SELECT state, upstream_attempt_count, error_class FROM teacher_score_requests "
+        "WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    connection.close()
+    assert row == ("outcome_unknown", 1, "ledger_completion_failed")
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
@@ -905,7 +973,7 @@ def test_upstream_attempts_are_bounded_even_for_transient_rejects(broker_db, mon
 
     def dispatch(*_args):
         dispatches.append(1)
-        return 503, b"unavailable"
+        return 429, b"rate limited"
 
     monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
 
@@ -1000,28 +1068,16 @@ def test_worker_reuses_one_logical_request_id_across_transport_retries(monkeypat
 
 
 @pytest.mark.parametrize("body", [b"", b"<html>bad gateway</html>", b'{"error":'])
-def test_worker_retries_unstructured_502_with_same_request_id(monkeypatch, body):
+def test_worker_keeps_unstructured_502_terminal(monkeypatch, body):
     import urllib.error
 
     from flash.engine.worker.teacher import client as worker_teacher
 
     request_ids = []
 
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self):
-            return _response()
-
     def urlopen(_transport, request, timeout=None):
         request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
-        if len(request_ids) == 1:
-            raise urllib.error.HTTPError(request.full_url, 502, "bad gateway", {}, io.BytesIO(body))
-        return Response()
+        raise urllib.error.HTTPError(request.full_url, 502, "bad gateway", {}, io.BytesIO(body))
 
     monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
@@ -1029,13 +1085,15 @@ def test_worker_retries_unstructured_502_with_same_request_id(monkeypatch, body)
         "capability-value", "https://broker.example", "parasail-glm-52"
     )
 
-    assert client.score("question", "answer")
-    assert len(request_ids) == 2
-    assert len(set(request_ids)) == 1
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert len(request_ids) == 1
 
 
-@pytest.mark.parametrize("status", [408, 409, 429, 500, 502, 599])
-def test_worker_retries_unstructured_transient_http_status(monkeypatch, status):
+@pytest.mark.parametrize("status", [409, 429])
+def test_worker_retries_unstructured_proven_pre_dispatch_http_status(monkeypatch, status):
     import urllib.error
 
     from flash.engine.worker.teacher import client as worker_teacher
@@ -1069,6 +1127,33 @@ def test_worker_retries_unstructured_transient_http_status(monkeypatch, status):
     assert client.score("question", "answer")
     assert len(request_ids) == 2
     assert len(set(request_ids)) == 1
+
+
+@pytest.mark.parametrize("status", [408, 500, 502, 599])
+def test_worker_keeps_unstructured_post_dispatch_ambiguity_terminal(monkeypatch, status):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    request_ids = []
+
+    def urlopen(_transport, request, timeout=None):
+        request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
+        raise urllib.error.HTTPError(
+            request.full_url, status, "broker failure", {}, io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert len(request_ids) == 1
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 413, 415, 422])

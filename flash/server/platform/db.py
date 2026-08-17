@@ -547,9 +547,9 @@ def revoke_teacher_capabilities_for_run(run_id: str, *, now: float | None = None
 def _readmit_teacher_request(conn, capability, existing, *, admitted_at, charge_tokens) -> dict:
     """Re-open one existing ledger row as 'reserved' inside the caller's transaction.
 
-    ``charge_tokens`` is True only for 'retryable' rows, whose token reservation was released
-    before dispatch. Transient terminal rows completed after dispatch, so their reservation is
-    still held and only in_flight is re-acquired.
+    ``charge_tokens`` is True only for failures proven to precede provider dispatch, whose token
+    reservation was released. A provider 429 keeps its existing reservation because the provider
+    rejected it before execution and only in_flight must be re-acquired.
     """
     if existing["upstream_attempt_count"] >= capability["max_upstream_attempts"]:
         # the upstream budget is spent, so readmission is refused before any counter moves: a
@@ -593,14 +593,10 @@ def _resume_existing_teacher_request(conn, capability, existing, *, admitted_at)
         )
     if state in {"reserved", "started"}:
         raise TeacherLedgerError("request_in_progress", retryable=True)
-    # transient terminal rows readmit for another upstream attempt, bounded by
-    # mark_teacher_request_started. 'provider_rejected' readmits only with the broker's
-    # error_class 'transient' (429/5xx); genuine 4xx stays terminal. 'outcome_unknown'
-    # always readmits, and billed usage lands only on the terminal 'succeeded'
-    # completion, so readmission cannot double-bill.
-    if state == "outcome_unknown" or (
-        state == "provider_rejected" and existing["error_class"] == "transient"
-    ):
+    # only a provider rejection proven to precede execution may dispatch again. currently that is a
+    # conventional 429 recorded as transient. outcome_unknown is terminal because flash has no
+    # upstream idempotency key and internal ledger accounting cannot prevent duplicate provider work.
+    if state == "provider_rejected" and existing["error_class"] == "transient":
         return _readmit_teacher_request(
             conn, capability, existing, admitted_at=admitted_at, charge_tokens=False
         )

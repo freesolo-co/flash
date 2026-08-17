@@ -1011,36 +1011,33 @@ def _ledger_row(request_id):
     return row
 
 
-def test_provider_500_then_success_retries_same_request_and_bills_once(broker_ledger, monkeypatch):
+def test_provider_500_is_terminal_and_never_redispatches(broker_ledger, monkeypatch):
     from flash.engine.worker.teacher import client as worker_teacher
     from flash.server.domain import teacher_broker
 
-    outcomes = [(500, b"provider incident"), (200, _parasail_success())]
     dispatches = []
 
     def dispatch(*_args):
         dispatches.append(1)
-        return outcomes[len(dispatches) - 1]
+        return 500, b"provider incident"
 
     monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
     sleeps = []
     monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
     client, transport = _ledger_client(broker_ledger)
 
-    scored = client.score("question", "answer")
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
 
-    assert scored.input_tokens == 1
-    assert scored.output_tokens == 1
-    assert len(dispatches) == 2
-    assert len(transport.request_ids) == 2
-    assert len(set(transport.request_ids)) == 1
-    assert sleeps == [2.0]
-    state, attempts, _status, _error, input_tokens, output_tokens = _ledger_row(
+    assert error.value.permanent is True
+    assert len(dispatches) == 1
+    assert len(transport.request_ids) == 1
+    assert sleeps == []
+    state, attempts, status, error_class, input_tokens, output_tokens = _ledger_row(
         transport.request_ids[0]
     )
-    assert (state, attempts) == ("succeeded", 2)
-    # billed once: usage is recorded only on the single terminal succeeded completion.
-    assert (input_tokens, output_tokens) == (1, 1)
+    assert (state, attempts, status, error_class) == ("outcome_unknown", 1, 500, "permanent")
+    assert (input_tokens, output_tokens) == (0, 0)
 
 
 def test_provider_429_is_retried_with_bounded_backoff(broker_ledger, monkeypatch):
@@ -1073,37 +1070,41 @@ def test_provider_429_is_retried_with_bounded_backoff(broker_ledger, monkeypatch
     assert (input_tokens, output_tokens) == (1, 1)
 
 
-def test_provider_429_with_stripped_broker_body_retries_and_bills_once(broker_ledger, monkeypatch):
+def test_stripped_502_cannot_prove_rate_limit_and_never_redispatches(broker_ledger, monkeypatch):
     from flash.engine.worker.teacher import client as worker_teacher
     from flash.server.domain import teacher_broker
 
-    outcomes = [(429, b"rate limited"), (200, _parasail_success())]
     dispatches = []
 
     def dispatch(*_args):
         dispatches.append(1)
-        return outcomes[len(dispatches) - 1]
+        return 429, b"rate limited"
 
     monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
     sleeps = []
     monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
     client, transport = _ledger_client(broker_ledger, strip_error_bodies=1)
 
-    scored = client.score("question", "answer")
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
 
-    assert (scored.input_tokens, scored.output_tokens) == (1, 1)
-    assert len(dispatches) == 2
-    assert len(transport.request_ids) == 2
-    assert len(set(transport.request_ids)) == 1
-    assert sleeps == [2.0]
-    state, attempts, _status, _error, input_tokens, output_tokens = _ledger_row(
+    assert error.value.permanent is True
+    assert len(dispatches) == 1
+    assert len(transport.request_ids) == 1
+    assert sleeps == []
+    state, attempts, status, error_class, input_tokens, output_tokens = _ledger_row(
         transport.request_ids[0]
     )
-    assert (state, attempts) == ("succeeded", 2)
-    assert (input_tokens, output_tokens) == (1, 1)
+    assert (state, attempts, status, error_class) == (
+        "provider_rejected",
+        1,
+        429,
+        "transient",
+    )
+    assert (input_tokens, output_tokens) == (0, 0)
 
 
-def test_ambiguous_provider_transport_failure_is_retried_and_billed_once(
+def test_ambiguous_provider_transport_failure_is_terminal_without_redispatch(
     broker_ledger, monkeypatch
 ):
     from flash.engine.worker.teacher import client as worker_teacher
@@ -1113,24 +1114,30 @@ def test_ambiguous_provider_transport_failure_is_retried_and_billed_once(
 
     def dispatch(*_args):
         dispatches.append(1)
-        if len(dispatches) == 1:
-            raise ConnectionResetError("provider connection dropped mid-call")
-        return 200, _parasail_success()
+        raise ConnectionResetError("provider connection dropped mid-call")
 
     monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
-    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    sleeps = []
+    monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
     client, transport = _ledger_client(broker_ledger)
 
-    scored = client.score("question", "answer")
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
 
-    assert scored.input_tokens == 1
-    assert len(dispatches) == 2
-    assert len(set(transport.request_ids)) == 1
-    state, attempts, _status, _error, input_tokens, output_tokens = _ledger_row(
+    assert error.value.permanent is True
+    assert len(dispatches) == 1
+    assert len(transport.request_ids) == 1
+    assert sleeps == []
+    state, attempts, status, error_class, input_tokens, output_tokens = _ledger_row(
         transport.request_ids[0]
     )
-    assert (state, attempts) == ("succeeded", 2)
-    assert (input_tokens, output_tokens) == (1, 1)
+    assert (state, attempts, status, error_class) == (
+        "outcome_unknown",
+        1,
+        None,
+        "provider_transport_ambiguous",
+    )
+    assert (input_tokens, output_tokens) == (0, 0)
 
 
 def test_lost_worker_response_replays_the_succeeded_result_without_a_second_bill(
