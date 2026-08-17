@@ -1,11 +1,8 @@
-"""unit tests for docker/bake_kernel_cache.py's pod-create retry.
+"""unit tests for docker/bake_kernel_cache.py's pod-create gpu walk.
 
-the bake rents a GPU of one arch, and RunPod picks the host at create time: a scarce class (sm86 /
-sm120) is regularly rejected with "This machine does not have the resources to deploy your pod". an
-unretried create therefore fails the whole arch ~30s in and ships a stale kernel cache against a
-fresh worker image. these tests pin the split: a capacity rejection must be retried, and a real
-error (auth, quota, bad image) must still fail on the first try instead of burning the attempt
-budget.
+the bake rents a gpu of one arch, and runpod picks the host at create time. a scarce type is regularly
+rejected for capacity even when another same-sm type is free. these tests pin the split: a capacity
+rejection must walk to the next type, and a real error must still fail immediately.
 
 docker/ is not a package, so import the module by path (same style as test_kernel_fingerprint.py).
 """
@@ -85,47 +82,84 @@ def test_real_errors_are_not_capacity(msg):
     assert not bake._is_capacity_error(RuntimeError(msg))
 
 
-def test_retries_capacity_rejection_then_succeeds(no_sleep):
+def test_walks_to_next_gpu_type_on_capacity_rejection(no_sleep):
     rp = _FakeRunpod([RuntimeError(CAPACITY_MSG), RuntimeError(CAPACITY_MSG)])
-    pod = bake._create_pod_with_retry(rp, gpu_type_id="NVIDIA RTX A6000", name="bake")
+    pod, selected = bake._create_pod_with_gpu_walk(
+        rp,
+        gpu_type_ids=("NVIDIA RTX A6000", "NVIDIA A40", "NVIDIA RTX A5000"),
+        name="bake",
+    )
     assert pod == {"id": "pod-1"}
+    assert selected == "NVIDIA RTX A5000"
     assert len(rp.calls) == 3
-    # every attempt re-asks for the same class; placement is server-side, so the retry itself is
-    # what moves the pod to another host.
-    assert {c["gpu_type_id"] for c in rp.calls} == {"NVIDIA RTX A6000"}
-    assert len(no_sleep) == 2
+    assert [c["gpu_type_id"] for c in rp.calls] == [
+        "NVIDIA RTX A6000",
+        "NVIDIA A40",
+        "NVIDIA RTX A5000",
+    ]
+    assert no_sleep == []
 
 
-def test_gives_up_after_the_attempt_budget(no_sleep):
-    rp = _FakeRunpod([RuntimeError(CAPACITY_MSG)] * bake.CREATE_ATTEMPTS)
-    with pytest.raises(RuntimeError, match="capacity after"):
-        bake._create_pod_with_retry(rp, gpu_type_id="NVIDIA B200")
-    assert len(rp.calls) == bake.CREATE_ATTEMPTS
-    # no trailing sleep after the last rejection.
-    assert len(no_sleep) == bake.CREATE_ATTEMPTS - 1
+def test_retries_the_full_walk_after_backoff(no_sleep):
+    rp = _FakeRunpod([RuntimeError(CAPACITY_MSG)] * 3)
+    pod, selected = bake._create_pod_with_gpu_walk(
+        rp,
+        gpu_type_ids=("NVIDIA H200", "NVIDIA H100 80GB HBM3"),
+        rounds=2,
+        backoff_s=(1,),
+    )
+    assert pod == {"id": "pod-1"}
+    assert selected == "NVIDIA H100 80GB HBM3"
+    assert [c["gpu_type_id"] for c in rp.calls] == [
+        "NVIDIA H200",
+        "NVIDIA H100 80GB HBM3",
+        "NVIDIA H200",
+        "NVIDIA H100 80GB HBM3",
+    ]
+    assert 1 <= no_sleep[0] <= 1.25
+
+
+def test_gives_up_after_the_round_budget(no_sleep):
+    gpu_type_ids = ("NVIDIA RTX A6000", "NVIDIA A40")
+    rp = _FakeRunpod([RuntimeError(CAPACITY_MSG)] * (bake.CREATE_ROUNDS * len(gpu_type_ids)))
+    with pytest.raises(RuntimeError, match="no capacity across gpu walk"):
+        bake._create_pod_with_gpu_walk(rp, gpu_type_ids=gpu_type_ids)
+    assert len(rp.calls) == bake.CREATE_ROUNDS * len(gpu_type_ids)
+    assert len(no_sleep) == bake.CREATE_ROUNDS - 1
 
 
 def test_non_capacity_error_fails_fast(no_sleep):
     rp = _FakeRunpod([RuntimeError("Unauthorized")])
     with pytest.raises(RuntimeError, match="Unauthorized"):
-        bake._create_pod_with_retry(rp, gpu_type_id="NVIDIA H200")
+        bake._create_pod_with_gpu_walk(rp, gpu_type_ids=("NVIDIA H200", "NVIDIA H100 80GB HBM3"))
     assert len(rp.calls) == 1
     assert no_sleep == []
 
 
 def test_backoff_grows_and_is_bounded(no_sleep):
     rp = _FakeRunpod([RuntimeError(CAPACITY_MSG)] * 3)
-    bake._create_pod_with_retry(rp, gpu_type_id="NVIDIA L40S", backoff_s=(1, 2))
-    # jitter adds up to 25%, and the last entry repeats for every further attempt.
+    bake._create_pod_with_gpu_walk(rp, gpu_type_ids=("NVIDIA L40S",), rounds=4, backoff_s=(1, 2))
+    # jitter adds up to 25%, and the last entry repeats for every further round.
     assert 1 <= no_sleep[0] <= 1.25
     assert 2 <= no_sleep[1] <= 2.5
     assert 2 <= no_sleep[2] <= 2.5
 
 
-def test_bake_goes_through_the_retrying_helper():
-    """the warm step runs this script, and its create must not bypass the retry."""
+def test_default_gpu_walk_covers_every_baked_arch():
+    from flash.providers._lifecycle.worker import BAKED_PER_SM_ARCHES
+
+    assert set(bake.GPU_WALK_BY_SM) == BAKED_PER_SM_ARCHES
+    assert all(len(types) == len(set(types)) for types in bake.GPU_WALK_BY_SM.values())
+    assert all(types for types in bake.GPU_WALK_BY_SM.values())
+    all_types = [gpu_type for types in bake.GPU_WALK_BY_SM.values() for gpu_type in types]
+    assert len(all_types) == len(set(all_types))
+
+
+def test_bake_goes_through_the_gpu_walk_helper():
+    """the warm step runs this script, and its create must not bypass the gpu walk."""
     wf = (ROOT / ".github" / "workflows" / "bake-kernel-cache.yml").read_text()
     assert "uv run python docker/bake_kernel_cache.py" in wf
+    assert "--gpu-type-id" not in wf
     body = BAKE_SCRIPT.read_text().split("def main()")[1]
-    assert "_create_pod_with_retry(" in body
+    assert "_create_pod_with_gpu_walk(" in body
     assert "runpod.create_pod(" not in body
