@@ -27,6 +27,7 @@ from uuid import UUID
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
+from flash.core.grpo import GRPO_NATIVE_THREAD_ENV, resolve_grpo_rollout_shape
 from flash.core.spec_persistence import (
     DROPPED_TOP_LEVEL_KEYS,
     REMOVED_PERSISTED_TRAIN_KEYS,
@@ -267,6 +268,7 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
         # by that list and fail at runtime. control-plane-owned, hence rejected at declaration.
         SECRET_ENV_KEYS_ENV,
         *MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
+        *GRPO_NATIVE_THREAD_ENV,
     }
 )
 
@@ -562,6 +564,11 @@ class JobSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
+        if str(self.algorithm or "").strip().lower() in {"grpo", "rl"}:
+            resolve_grpo_rollout_shape(
+                self.train.prompts_per_step,
+                self.train.group_size,
+            )
         # the marker qualifies a pin; it cannot outlive one. a spec carrying it with no revision
         # would let a later edit that clears model_revision leave a True marker behind, and the
         # deploy guard reads the pair.
@@ -715,6 +722,11 @@ class JobSpec:
             raise TypeError("project must be a string")
         project = require_project_id(project_raw) if project_raw.strip() else ""
         algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
+        if algorithm == "grpo":
+            persisted_prompts = train.get("prompts_per_step")
+            if persisted_prompts is None and "batch_size" in train:
+                persisted_prompts = train.get("batch_size")
+            resolve_grpo_rollout_shape(persisted_prompts, train.get("group_size"))
         # one reading of the optimizer batch for both keys: the rollout spelling changed in 1.1.43
         # and a persisted spec can still carry the old one.
         batch_size, prompts_per_step = migrated_optimizer_batch(train, algorithm)

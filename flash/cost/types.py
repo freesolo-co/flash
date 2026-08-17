@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from flash.core.catalog import normalize_algorithm, optimizer_batch_key, samples_on_policy
+from flash.core.grpo import resolve_grpo_rollout_shape
 from flash.core.spec import parse_positive_int_tuple
 from flash.engine.plan.recipe import RECIPE
 from flash.providers import PROVIDER_NAMES, validated_provider_preferences
@@ -70,6 +71,14 @@ class RunConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
+        if self.method == "grpo":
+            if (
+                isinstance(self.batch_size, int)
+                and not isinstance(self.batch_size, bool)
+                and self.batch_size < 1
+            ):
+                raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
+            resolve_grpo_rollout_shape(self.batch_size, self.group_size)
         # Normalize like the allocator (case/whitespace, empty -> "auto") and reject an unknown
         # substrate up front (else it filters out every candidate -> confusing "no GPU fits").
         prov = (self.provider or "auto").strip().lower() or "auto"
@@ -197,8 +206,13 @@ class RunConfig:
                 if self.seq_len is not None
                 else max(1024, rc.max_prompt_len + int(comp))
             )
-            batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
-            group = self.group_size if self.group_size is not None else rc.group_size
+            if self.is_grpo:
+                shape = resolve_grpo_rollout_shape(self.batch_size, self.group_size)
+                batch = shape.prompts_per_step
+                group = shape.group_size
+            else:
+                batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
+                group = self.group_size if self.group_size is not None else rc.group_size
         else:
             seq = self.seq_len
             if seq is None:

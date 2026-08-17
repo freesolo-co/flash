@@ -3188,9 +3188,11 @@ def test_the_grpo_success_path_drains_stragglers_too():
     """`kill_process_group` runs on exceptions alone in the grpo loop, so without a drain on the
     ordinary exit a worker whose later jobs all SUCCEED keeps a straggler zombie for life.
     """
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    finally_block = src[src.rindex("finally:") :]
-    assert "reap_stragglers()" in finally_block, (
+    entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    teardown = " ".join(inspect.getsource(rl_train._shutdown_rl_runtime).split())
+    finally_block = entry[entry.rindex("finally:") :]
+    assert "_shutdown_rl_runtime(" in finally_block
+    assert "reap_stragglers()" in teardown, (
         "the grpo teardown collects stragglers only when the run FAILS"
     )
 

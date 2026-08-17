@@ -141,6 +141,8 @@ def test_grpo_external_plugin_arms_without_importing_cuda_sensitive_targets(tmp_
     script = """
 import sys
 import flash_grpo_plugin
+import flash_verl_runtime
+config = flash_verl_runtime.load_plugin_config_file("FLASH_GRPO_PLUGIN_CONFIG_PATH")
 forbidden = sorted(
     name for name in sys.modules
     if name == "torch" or name == "verl" or name == "vllm"
@@ -153,11 +155,34 @@ finders = [
 ]
 assert len(finders) == 1, len(finders)
 pending = finders[0].pending
-assert "verl.single_controller.base.worker" in pending
-# maximal grpo registers 12 callbacks behind exactly one finder, four of which
-# share the agent_loop target.
-assert len(pending["verl.experimental.agent_loop.agent_loop"]) == 4
-assert sum(len(queue) for queue in pending.values()) == 12, pending
+expected_names = {
+    "rank-device-assert",
+    "nonempty-response-mask",
+    "exact-rollout-identity",
+    "reentrant-checkpointing",
+    "entropy-quantile",
+    "per-turn-credit",
+    "stop-sequences",
+    "image-pad-ban",
+    "structured-outputs",
+    "exact-save-steps",
+    "kl-ref-adapter",
+    "multi-turn-loop",
+    "lora-rollout-guard",
+    "gdn-varlen",
+}
+assert set(flash_grpo_plugin.required_patch_names(config)) == expected_names
+expected_target_counts = {
+    "verl.single_controller.base.worker": 1,
+    "verl.trainer.ppo.rollout_corr_helper": 1,
+    "verl.experimental.agent_loop.agent_loop": 5,
+    "verl.workers.engine.fsdp.transformer_impl": 2,
+    "verl.workers.utils.losses": 1,
+    "verl.trainer.ppo.ray_trainer": 2,
+    "verl.workers.rollout.vllm_rollout.vllm_async_server": 1,
+    "transformers.models.qwen3_next.modeling_qwen3_next": 1,
+}
+assert {target: len(queue) for target, queue in pending.items()} == expected_target_counts
 print("plugin-armed")
 """
     result = subprocess.run(

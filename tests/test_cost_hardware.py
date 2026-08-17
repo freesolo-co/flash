@@ -719,14 +719,14 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
     # here breaks the other. reading 1 for grpo under-credited it eightfold and REJECTED runs that fit.
     assert _executed_gpu_count("grpo", {"prompts_per_step": 1}, None, 8) == 8
     assert _executed_gpu_count("opd", {"prompts_per_step": 1}, None, 8) == 1
-    # an explicit group still wins over the default.
-    assert _executed_gpu_count("grpo", {"prompts_per_step": 1, "group_size": 1}, None, 8) == 1
+    # an explicit supported group still wins over the default.
+    assert _executed_gpu_count("grpo", {"prompts_per_step": 1, "group_size": 2}, None, 8) == 2
 
-    # the quote must agree on every one of those, or a shape it prices gets refused at submit.
+    # the quote must agree on every supported shape, or a shape it prices gets refused at submit.
     from flash.cost.analytical import executed_gpu_count
     from flash.cost.types import RunConfig
 
-    for method, prompts, group in (("grpo", 1, None), ("opd", 1, None), ("grpo", 1, 1)):
+    for method, prompts, group in (("grpo", 1, None), ("opd", 1, None), ("grpo", 1, 2)):
         train = {"prompts_per_step": prompts} | ({"group_size": group} if group else {})
         quoted = executed_gpu_count(
             RunConfig(

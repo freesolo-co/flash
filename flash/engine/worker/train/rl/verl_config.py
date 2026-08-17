@@ -209,6 +209,7 @@ def _data_overrides(cfg: dict) -> list[str]:
         # thread flash's thinking mode so the rollout sees the same prompt the retired trl path saw.
         f"+data.apply_chat_template_kwargs.enable_thinking={str(bool(cfg.get('thinking', False))).lower()}",
         f"data.seed={cfg['seed']}",
+        "data.dataloader_num_workers=0",
         # set the rollout seed through engine_kwargs: verl 0.8.0 has no RolloutConfig.seed, and
         # direct keys either fail hydra or the dataclass conversion. engine_kwargs is declared and
         # overrides verl's own vllm seed; `++` is required because this sub-key is absent.
@@ -226,8 +227,6 @@ def _data_overrides(cfg: dict) -> list[str]:
                 "data.return_multi_modal_inputs=false",
                 "data.filter_overlong_prompts=true",
                 "data.truncation=error",
-                # the processor's image loader is not fork-safe under verl's default workers.
-                "data.dataloader_num_workers=0",
                 "actor_rollout_ref.model.trust_remote_code=true",
             ]
             if cfg.get("multimodal")
@@ -681,6 +680,7 @@ def _build_verl_train_notes(
     wandb_id: str | None = None,
     reward_bridge_batching: bool = False,
     gdn_boundary_resets: bool | None = None,
+    host_census: dict[str, int] | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -737,6 +737,7 @@ def _build_verl_train_notes(
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
         "reward_bridge_batching": bool(reward_bridge_batching),
+        "host_census": dict(host_census or {}),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],

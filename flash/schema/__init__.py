@@ -11,6 +11,7 @@ from typing import Any
 
 from flash._internal.channel import CLI_NAME
 from flash.core.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.core.grpo import resolve_grpo_rollout_shape
 from flash.core.spec import (
     FIXED_SEED,
     MANAGED_ENVIRONMENT_KEYS,
@@ -598,6 +599,14 @@ def spec_from_dict(
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
     env_raw, environment_pip, environment_secrets = _validate_environment_section(raw)
     train_raw = _validate_train_section(raw, algorithm)
+    if algorithm == "grpo":
+        try:
+            resolve_grpo_rollout_shape(
+                train_raw.get("prompts_per_step"),
+                train_raw.get("group_size"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(str(exc)) from exc
     gpu_spec, gpu_count_auto = _validate_gpu_section(
         raw,
         model=model,
@@ -762,12 +771,11 @@ def _reject_inapplicable_train_knobs(spec: JobSpec) -> None:
 
 
 def _validate_grpo(spec: JobSpec) -> None:
-    """validate the grpo group-size and prompt-budget constraints."""
-    if spec.train.group_size is not None and spec.train.group_size < 2:
-        raise ConfigError(
-            "train.group_size must be >= 2 for GRPO (advantages are group-relative, so a "
-            "prompt needs at least two generations to compare against)"
-        )
+    """validate the grpo rollout shape and prompt-budget constraints."""
+    try:
+        resolve_grpo_rollout_shape(spec.train.prompts_per_step, spec.train.group_size)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
     _validate_on_policy_prompt_budget(spec, "grpo")
 
 

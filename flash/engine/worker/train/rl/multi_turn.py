@@ -205,6 +205,7 @@ class MultiTurnBridge:
         per_turn_credit: bool = False,
         on_episode_scored: Callable[[object, object, float], None] | None = None,
         parent_work: ParentWorkGauge | None = None,
+        identity_ledger=None,
         score_batch_size: int = _MULTI_TURN_SCORE_BATCH_SIZE,
         score_flush_wait_s: float = _MULTI_TURN_SCORE_FLUSH_WAIT_S,
         session_lease_s: float = _MULTI_TURN_SESSION_LEASE_S,
@@ -218,6 +219,7 @@ class MultiTurnBridge:
         self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
         self._parent_work = parent_work or ParentWorkGauge()
+        self._identity_ledger = identity_ledger
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
@@ -287,6 +289,11 @@ class MultiTurnBridge:
             )
         session_id = request_session_id(payload)
         example = self._examples[index]
+        identity = (
+            self._identity_ledger.validate_for_index(payload.get("identity"), index)
+            if self._identity_ledger is not None
+            else None
+        )
         with self._lock:
             # swept here rather than on a timer thread: a session is only ever abandoned by an
             # actor that stopped calling, and the actors that replace it announce themselves
@@ -298,6 +305,7 @@ class MultiTurnBridge:
             self._sessions[session_id] = {
                 "example": example,
                 "state": state,
+                "identity": identity,
                 "touched_at": time.monotonic(),
             }
         if reaped:
@@ -362,6 +370,15 @@ class MultiTurnBridge:
         with self._lock:
             session = self._session(payload)
             state = session["state"]
+            expected_identity = session.get("identity")
+        if self._identity_ledger is not None:
+            identity = self._identity_ledger.validate_for_index(
+                payload.get("identity"),
+                expected_identity.sample_index,
+            )
+            if identity != expected_identity:
+                raise ValueError("multi-turn GRPO score identity does not match its session")
+            self._identity_ledger.record(payload.get("identity"), expected_identity.sample_index)
         # queued OUTSIDE the lock so concurrent episodes can coalesce into one env call; the
         # batcher thread reacquires it to do the scoring. safe to read this session's state
         # unlocked because the episode is terminal -- the child sends /score only after its turn
@@ -484,6 +501,7 @@ def start_reward_server(
     multi_turn_bridge=None,
     rollout_batch: int = 0,
     score_batch=None,
+    identity_ledger=None,
 ):
     """start the localhost reward server and return ``(server, base_url)``.
 
@@ -511,6 +529,8 @@ def start_reward_server(
         if index < 0 or index >= example_count:
             raise _BadIndex(f"reward example index {index} is outside [0, {example_count})")
         solution_str = payload.get("solution_str", "")
+        if identity_ledger is not None:
+            identity_ledger.record(payload.get("identity"), index)
         if score_batcher is not None:
             return {"score": float(score_batcher.submit((index, solution_str)))}
         with score_lock:

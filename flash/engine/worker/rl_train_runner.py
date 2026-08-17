@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.result.rollout_samples import sample_completion_text, sanitize_rollout_text
 from flash.engine.worker.backend_common import (
@@ -38,6 +39,7 @@ from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.train.core.step_timing import StepTiming
 from flash.engine.worker.train.rl.child.plugin import required_patch_names
+from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
 from flash.engine.worker.train.rl.multi_turn import (
     MultiTurnBridge,
     copy_grpo_child_modules,
@@ -46,6 +48,7 @@ from flash.engine.worker.train.rl.multi_turn import (
 )
 from flash.engine.worker.train.rl.reward_module import render_reward_module
 from flash.engine.worker.train.rl.single_turn import score_single_turn, score_single_turn_batch
+from flash.engine.worker.verl.process_census import GrpoProcessCensus
 
 
 def _rl_train():
@@ -65,6 +68,7 @@ class _StepMetricState:
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
     metrics_last: list[dict] = field(default_factory=list)
     step_timing: StepTiming = field(default_factory=StepTiming)
+    host_census: dict[str, int] = field(default_factory=dict)
     sent_first_metrics: bool = False
     sent_first_timing: bool = False
 
@@ -72,6 +76,7 @@ class _StepMetricState:
 @dataclass
 class _RewardRuntime:
     observability: RewardObservabilityBuffer
+    identity_ledger: RolloutIdentityLedger
     wandb_link: dict[str, str | None]
     multi_turn_bridge: object
     server: object
@@ -235,6 +240,10 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
     observability = RewardObservabilityBuffer(
         generation_size=int(inp["prompts_per_step"]) * int(inp["group_size"]),
     )
+    identity_ledger = RolloutIdentityLedger(
+        int(inp["prompts_per_step"]),
+        int(inp["group_size"]),
+    )
 
     def _score_batch(requests: list[tuple[int, str]]) -> list[float]:
         # grade the whole batch before touching the observability lock. the env's scorer may block on
@@ -278,6 +287,7 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
             per_turn_credit=bool(inp["per_turn_credit"]),
             on_episode_scored=observability.record,
             parent_work=observability.parent_work,
+            identity_ledger=identity_ledger,
         )
         if inp["multi_turn"]
         else None
@@ -288,9 +298,11 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
         multi_turn_bridge=multi_turn_bridge,
         rollout_batch=int(inp["prompts_per_step"]) * int(inp["group_size"]),
         score_batch=None if inp["multi_turn"] else _score_batch,
+        identity_ledger=identity_ledger,
     )
     return _RewardRuntime(
         observability=observability,
+        identity_ledger=identity_ledger,
         # filled from the child's marker line; stays empty when wandb is off.
         wandb_link={},
         multi_turn_bridge=multi_turn_bridge,
@@ -382,6 +394,7 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
         env_for_verl.update(
             multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
         )
+    env_for_verl.update(GRPO_NATIVE_THREAD_ENV)
     return env_for_verl
 
 
@@ -405,6 +418,9 @@ def _ingest_step_metrics(
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]
+        step_metrics.update(
+            {f"host_census/{key}": value for key, value in state.host_census.items()}
+        )
         append_step_metrics(state.metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT)
         # the worker's error path reads this global, so a run that dies mid-training
         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
@@ -464,14 +480,19 @@ def _execute_rl_child(
     # reaped at teardown. this process is not pid 1 (the runpod handler is), so without it
     # every wait answers ChildProcessError for a zombie nobody will collect.
     adopt_orphaned_descendants()
-    proc = subprocess.Popen(
-        [python_bin, "-m", "flash_grpo_entry", *overrides],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env_for_verl,
-        start_new_session=True,
-    )
+    census = GrpoProcessCensus(os.getpid()).start()
+    try:
+        proc = subprocess.Popen(
+            [python_bin, "-m", "flash_grpo_entry", *overrides],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env_for_verl,
+            start_new_session=True,
+        )
+    except BaseException:
+        state.host_census = census.stop()
+        raise
     child_tail = _rl_train().ChildOutputTail()
     silence_watchdog = _rl_train().VerlChildSilenceWatchdog(
         child_tail,
@@ -497,6 +518,8 @@ def _execute_rl_child(
             if step_number is not None:
                 progress["step"] = step_number
                 silence_watchdog.observe_step(step_number)
+                census.sample_step()
+                state.host_census = census.summary()
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
                 # flash patch at all, so fail now rather than after the whole run is paid for. not
@@ -508,15 +531,15 @@ def _execute_rl_child(
                 if progress["step"] != last_dump_step[0]:
                     # the generation boundary: verl logs this line once its step is scored, so
                     # everything the reward bridge buffered since the last one is that step's
-                    # complete output. seal it before the preview reads `latest`, so both the log
-                    # line and the heartbeat describe the same generation.
+                    # complete output. seal exact identities before publishing any step output.
+                    reward_runtime.identity_ledger.seal(progress["step"])
                     reward_runtime.observability.close_generation(progress["step"])
+                    last_dump_step[0] = progress["step"]
                     # asks for THIS step's rows, not merely the newest: when the line is spent on a
                     # generation the queue already dropped, nothing is published and the previous
                     # generation's text would print under this step.
                     samp = reward_runtime.observability.latest_for_step(progress["step"])
                     if samp:
-                        last_dump_step[0] = progress["step"]
                         _, completion, reward = samp
                         text = sanitize_rollout_text(sample_completion_text(completion))
                         preview = " ".join(text[:300].split())
@@ -535,9 +558,25 @@ def _execute_rl_child(
         # for every later job on a reusable worker.
         child_stream.terminate()
         raise
+    finally:
+        state.host_census = census.stop()
+        if state.metrics_last:
+            state.metrics_last[-1].update(
+                {f"host_census/{key}": value for key, value in state.host_census.items()}
+            )
+            LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
 
 
-def _validate_rl_child(rc, state, resume_step, expected_steps, resume_uploader, *, files=None):
+def _validate_rl_child(
+    rc,
+    state,
+    resume_step,
+    expected_steps,
+    resume_uploader,
+    *,
+    files=None,
+    reward_runtime=None,
+):
     if rc == SHIM_FRAGMENT_FAILED_EXIT_CODE:
         # the wrapped fragment printed its traceback and named itself before exiting; classify
         # this as permanent, not retriable infra: the same interpreter fails identically on
@@ -552,6 +591,8 @@ def _validate_rl_child(rc, state, resume_step, expected_steps, resume_uploader, 
         raise RuntimeError(
             f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback"
         )
+    if reward_runtime is not None:
+        reward_runtime.identity_ledger.assert_idle()
     # belt and braces behind the first-step check in _execute_rl_child: a run that exits 0 without
     # printing a step line (a resume already at the horizon) still may not pass unverified.
     shim_markers = (files or {}).get("shim_markers")

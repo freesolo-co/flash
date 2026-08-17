@@ -910,6 +910,35 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
         assert response.json()["state"] == "dry_run"
 
 
+def test_grpo_rollout_shape_rejects_before_secrets_persistence_or_submission(
+    api, monkeypatch
+) -> None:
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        runs_route, "_runtime_secrets", lambda *_a, **_k: pytest.fail("secrets inspected")
+    )
+    monkeypatch.setattr(runs_route.db, "record_run", lambda *_a, **_k: pytest.fail("run persisted"))
+    monkeypatch.setattr(
+        runs_route._app, "submit_job", lambda *_a, **_k: pytest.fail("job submitted")
+    )
+    spec = {
+        **SPEC,
+        "train": {
+            **SPEC["train"],
+            "prompts_per_step": 65,
+            "group_size": 8,
+        },
+    }
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": False},
+    )
+    assert response.status_code == 400
+    assert "prompts_per_step * train.group_size must be <= 512" in response.json()["detail"]
+
+
 def test_unknown_authored_train_key_enriches_parser_rejection_once(api, monkeypatch) -> None:
     import flash.server.routes.runs as runs_route
     from flash.schema import train_schema_metadata

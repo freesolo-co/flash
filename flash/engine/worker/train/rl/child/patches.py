@@ -8,6 +8,68 @@ _STRUCTURED_OUTPUTS_MARKER = "[flash-verl] rollout structured outputs active"
 _EXACT_SAVE_STEPS_MARKER = "[flash-verl] exact save steps active"
 _IMAGE_PAD_BAN_MARKER = "[flash-verl] image-pad token banned from rollouts"
 _KL_REF_ADAPTER_MARKER = "[flash-verl] kl reference anchored to the warm-start adapter"
+_EXACT_ROLLOUT_IDENTITY_MARKER = "[flash-verl] exact rollout identity active"
+_PINNED_RUN_AGENT_LOOP_SHA256 = "46f1af635d13854a8955fc44b8595da127997c68e818aaa6d7bf28acc33902cf"
+
+
+def install_exact_rollout_identity() -> None:
+    """Attach a copied identity at the exact pinned Verl per-occurrence boundary."""
+    import hashlib
+    import inspect
+
+    from verl.experimental.agent_loop import agent_loop
+
+    original = agent_loop.AgentLoopWorker._run_agent_loop
+    if getattr(original, "_flash_exact_rollout_identity", False):
+        return
+    source_hash = hashlib.sha256(inspect.getsource(original).encode()).hexdigest()
+    if source_hash != _PINNED_RUN_AGENT_LOOP_SHA256:
+        raise RuntimeError(
+            "flash exact rollout identity boundary drifted from pinned Verl "
+            f"(got sha256 {source_hash})"
+        )
+
+    def exact_int(value, name):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RuntimeError(f"flash rollout trajectory {name} must be an integer")
+        return value
+
+    async def run_agent_loop(
+        self,
+        sampling_params,
+        trajectory,
+        *,
+        agent_name,
+        trace=True,
+        **kwargs,
+    ):
+        identity = {
+            "optimizer_step": exact_int(trajectory.get("step"), "step"),
+            "sample_index": exact_int(trajectory.get("sample_index"), "sample_index"),
+            "rollout_ordinal": exact_int(trajectory.get("rollout_n"), "rollout_n"),
+        }
+        extra_info = kwargs.get("extra_info")
+        if not isinstance(extra_info, dict):
+            raise RuntimeError("flash rollout trajectory is missing dictionary extra_info")
+        if "flash_rollout_identity" in extra_info or "flash_rollout_identity" in kwargs:
+            raise RuntimeError("flash rollout identity was already present before attachment")
+        forwarded = dict(kwargs)
+        forwarded_extra = dict(extra_info)
+        forwarded_extra["flash_rollout_identity"] = dict(identity)
+        forwarded["extra_info"] = forwarded_extra
+        forwarded["flash_rollout_identity"] = dict(identity)
+        return await original(
+            self,
+            sampling_params,
+            trajectory,
+            agent_name=agent_name,
+            trace=trace,
+            **forwarded,
+        )
+
+    run_agent_loop._flash_exact_rollout_identity = True
+    agent_loop.AgentLoopWorker._run_agent_loop = run_agent_loop
+    print(_EXACT_ROLLOUT_IDENTITY_MARKER, flush=True)
 
 
 def install_rank_device_assert(n_gpus: int) -> None:

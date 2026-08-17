@@ -20,6 +20,7 @@ from flash.content.structured_outputs import (
     describe_structured_outputs,
     parse_structured_outputs,
 )
+from flash.core.grpo import MAX_GRPO_COMPLETIONS_PER_STEP, resolve_grpo_rollout_shape
 from flash.core.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import (
@@ -127,12 +128,12 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
             "add actor_rollout_ref.model.lora_dropout support before setting it non-zero."
         )
     gcfg = _w.grpo_overrides()
-    prompts_per_step = int(
-        train_spec.prompts_per_step
-        if train_spec and train_spec.prompts_per_step is not None
-        else rl.prompts_per_step
+    shape = resolve_grpo_rollout_shape(
+        train_spec.prompts_per_step if train_spec else None,
+        gcfg.get("group_size"),
     )
-    group_size = int(gcfg.get("group_size") or rl.group_size)
+    prompts_per_step = shape.prompts_per_step
+    group_size = shape.group_size
     gcfg_temp = gcfg.get("temperature")
     temperature = float(gcfg_temp if gcfg_temp is not None else rl.sampling_temperature)
     think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
@@ -553,6 +554,11 @@ def _resolve_grpo_inputs():
     schedule = _resolve_grpo_schedule(
         _t, rl, prompts, options["prompts_per_step"], lengths, multi_turn
     )
+    retained_shape = resolve_grpo_rollout_shape(
+        schedule["prompts_per_step"],
+        options["group_size"],
+    )
+    assert retained_shape.completions_per_step <= MAX_GRPO_COMPLETIONS_PER_STEP
     pinned = {
         "entropy_quantile": entropy_quantile,
         # verl always checkpoints (enable_gradient_checkpointing=True) and always asks for

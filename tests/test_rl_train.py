@@ -433,6 +433,7 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
     assert [entry[0] for entry in registered] == [
         "rank-device-assert",
         "nonempty-response-mask",
+        "exact-rollout-identity",
         "reentrant-checkpointing",
         "entropy-quantile",
         "per-turn-credit",
@@ -446,7 +447,7 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
     assert registered[0][2] == "verl.single_controller.base.worker"
     assert registered[1][2] == "verl.trainer.ppo.rollout_corr_helper"
     assert registered[1][3] is verl_patches.install_nonempty_response_mask
-    assert [entry[2] for entry in registered[5:8]] == [
+    assert [entry[2] for entry in registered[6:9]] == [
         "verl.experimental.agent_loop.agent_loop",
         "verl.experimental.agent_loop.agent_loop",
         "verl.experimental.agent_loop.agent_loop",
@@ -503,6 +504,7 @@ def test_parent_and_child_share_required_patch_registry_and_preserve_zero_entrop
     assert expected == [
         "rank-device-assert",
         "nonempty-response-mask",
+        "exact-rollout-identity",
         "entropy-quantile",
         "multi-turn-loop",
         "lora-rollout-guard",
@@ -653,10 +655,19 @@ def test_nonempty_response_mask_patch_is_required_and_marker_wired(monkeypatch, 
             verl_patches.install_nonempty_response_mask,
             (),
             {},
-        )
+        ),
+        (
+            "exact-rollout-identity",
+            config["marker_file"],
+            "verl.experimental.agent_loop.agent_loop",
+            verl_patches.install_exact_rollout_identity,
+            (),
+            {},
+        ),
     ]
     assert grpo_plugin.required_patch_names(config) == [
         "nonempty-response-mask",
+        "exact-rollout-identity",
         child_runtime.LORA_ROLLOUT_GUARD_SHIM,
     ]
     assert not Path(config["marker_file"]).exists()
@@ -1642,9 +1653,9 @@ def test_text_overrides_omit_every_multimodal_key():
         "data.image_key",
         "data.return_raw_chat",
         "data.return_multi_modal_inputs",
-        "data.dataloader_num_workers",
     ):
         assert not any(x.startswith(key) for x in o), key
+    assert "data.dataloader_num_workers=0" in o
 
 
 def test_build_verl_training_cfg_carries_the_multimodal_flag():
@@ -2453,7 +2464,20 @@ def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
         ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
         assert (
-            ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": index}) == 3.0
+            ns["compute_score"](
+                "flash_env",
+                "answer",
+                "unused",
+                extra_info={
+                    "index": index,
+                    "flash_rollout_identity": {
+                        "optimizer_step": 1,
+                        "sample_index": 1,
+                        "rollout_ordinal": 0,
+                    },
+                },
+            )
+            == 3.0
         )
         assert scored == [(1, "answer")]
     finally:
@@ -2480,7 +2504,22 @@ def test_a_slow_env_call_is_not_cut_off_by_a_client_deadline(monkeypatch):
 
         monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", urlopen_recording_deadline)
         ns["_URL"] = url
-        assert ns["compute_score"]("env", "answer", "unused", extra_info={"index": 0}) == 7.0
+        assert (
+            ns["compute_score"](
+                "env",
+                "answer",
+                "unused",
+                extra_info={
+                    "index": 0,
+                    "flash_rollout_identity": {
+                        "optimizer_step": 1,
+                        "sample_index": 0,
+                        "rollout_ordinal": 0,
+                    },
+                },
+            )
+            == 7.0
+        )
         assert waited == [0]
         assert seen == [((), {})], f"reward client still carries a deadline: {seen!r}"
     finally:
@@ -2512,7 +2551,19 @@ def test_concurrent_scorers_are_serialized_for_the_env():
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(
                 pool.map(
-                    lambda i: ns["compute_score"]("env", "a", "u", extra_info={"index": i}),
+                    lambda i: ns["compute_score"](
+                        "env",
+                        "a",
+                        "u",
+                        extra_info={
+                            "index": i,
+                            "flash_rollout_identity": {
+                                "optimizer_step": 1,
+                                "sample_index": i,
+                                "rollout_ordinal": 0,
+                            },
+                        },
+                    ),
                     range(8),
                 )
             )
@@ -2971,7 +3022,14 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
                 "flash_env",
                 "answer",
                 "unused",
-                extra_info={"index": 99},
+                extra_info={
+                    "index": 99,
+                    "flash_rollout_identity": {
+                        "optimizer_step": 1,
+                        "sample_index": 99,
+                        "rollout_ordinal": 0,
+                    },
+                },
             )
     finally:
         server.shutdown()
@@ -3081,7 +3139,19 @@ def test_the_generated_single_turn_reward_module_surfaces_the_bridges_cause(monk
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
         ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
         with pytest.raises(RuntimeError) as exc_info:
-            ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": 0})
+            ns["compute_score"](
+                "flash_env",
+                "answer",
+                "unused",
+                extra_info={
+                    "index": 0,
+                    "flash_rollout_identity": {
+                        "optimizer_step": 1,
+                        "sample_index": 0,
+                        "rollout_ordinal": 0,
+                    },
+                },
+            )
         message = str(exc_info.value)
         assert "can't start new thread" in message, "the cause never reached the training loop"
         assert "could not serve" in message
@@ -5932,7 +6002,9 @@ def test_bridge_shutdown_stops_the_scoring_thread():
 def test_the_run_shuts_the_bridge_down_before_the_server_it_is_mounted_on():
     # ordering matters: the server's routes block on the scoring thread, so stopping the server
     # first would strand a scoring episode on an event nothing will ever set.
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    src = " ".join(inspect.getsource(rl_train._shutdown_rl_runtime).split())
+    assert "_shutdown_rl_runtime(resume_uploader, gpu_sampler, reward_runtime)" in entry
     assert "multi_turn_bridge.shutdown()" in src
     assert src.index("multi_turn_bridge.shutdown()") < src.index("server.shutdown()")
 
@@ -6051,7 +6123,7 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
         'env_prompts=[p["env_prompt"] for p in prompts], max_turns=int(inp["max_turns"]), '
         'per_turn_credit=bool(inp["per_turn_credit"]), '
         "on_episode_scored=observability.record, "
-        "parent_work=observability.parent_work, )" in src
+        "parent_work=observability.parent_work, identity_ledger=identity_ledger, )" in src
     )
     assert 'if inp["multi_turn"] else None' in src
 
@@ -6781,7 +6853,11 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     # sample and the heartbeat describe the same generation.
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
     stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = step_number') :]
+    assert 'reward_runtime.identity_ledger.seal(progress["step"])' in stdout_loop
     assert 'reward_runtime.observability.close_generation(progress["step"])' in stdout_loop
+    assert stdout_loop.index("identity_ledger.seal(") < stdout_loop.index(
+        "observability.close_generation("
+    )
     assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
         'samp = reward_runtime.observability.latest_for_step(progress["step"])'
     )
@@ -7141,6 +7217,8 @@ def _drive_multi_turn_episode(
     multi_modal_data=None,
     return_instance=False,
     raw_prompt=None,
+    identity_ledger=None,
+    rollout_ordinal=0,
 ):
     """run the real child loop end to end against a real bridge, returning its agent loop output.
 
@@ -7158,7 +7236,11 @@ def _drive_multi_turn_episode(
     monkeypatch.setenv("FLASH_VERL_MAX_COMPLETION_TOKENS", "4096")
 
     bridge = _bridge(
-        env, examples=[{"question": "q"}], max_turns=max_turns, per_turn_credit=per_turn_credit
+        env,
+        examples=[{"question": "q"}],
+        max_turns=max_turns,
+        per_turn_credit=per_turn_credit,
+        identity_ledger=identity_ledger,
     )
     routes = bridge.routes()
 
@@ -7252,6 +7334,11 @@ def _drive_multi_turn_episode(
                 raw_prompt if raw_prompt is not None else [{"role": "user", "content": "go"}]
             ),
             index=0,
+            flash_rollout_identity={
+                "optimizer_step": 1,
+                "sample_index": 0,
+                "rollout_ordinal": rollout_ordinal,
+            },
         )
 
     asyncio.run(_go())
@@ -7285,6 +7372,23 @@ class _SpanEnv:
         from flash.envs.base import RolloutReward
 
         return [RolloutReward(episode=1.0, turns=tuple(0.5 for _ in self.recorded)) for _ in items]
+
+
+def test_multi_turn_child_preserves_exact_identity_through_start_and_score(monkeypatch):
+    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+
+    ledger = RolloutIdentityLedger(1, 2)
+    for ordinal in range(2):
+        _drive_multi_turn_episode(
+            stop_reasons=[("answer", "completed")],
+            env=_SpanEnv(),
+            monkeypatch=monkeypatch,
+            max_turns=1,
+            identity_ledger=ledger,
+            rollout_ordinal=ordinal,
+        )
+    ledger.seal(1)
+    ledger.assert_idle()
 
 
 def test_an_image_prompt_reaches_media_extraction_and_the_rollout(monkeypatch):
@@ -7545,6 +7649,7 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
 
     assert files["expected_shims"] == [
         "nonempty-response-mask",
+        "exact-rollout-identity",
         "reentrant-checkpointing",
         "entropy-quantile",
         "stop-sequences",
@@ -7587,6 +7692,7 @@ def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_card
     assert files["expected_shims"] == [
         "rank-device-assert",
         "nonempty-response-mask",
+        "exact-rollout-identity",
         "reentrant-checkpointing",
         "lora-rollout-guard",
     ]

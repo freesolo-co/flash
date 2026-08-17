@@ -56,6 +56,15 @@ def required_patch_specs(config: dict) -> tuple[tuple, ...]:
             {},
         ),
         (
+            "exact-rollout-identity",
+            True,
+            "required",
+            "verl.experimental.agent_loop.agent_loop",
+            patches.install_exact_rollout_identity,
+            (),
+            {},
+        ),
+        (
             "reentrant-checkpointing",
             bool(config.get("reentrant_checkpointing")),
             "required",

@@ -9,6 +9,7 @@ from io import BytesIO
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash._internal.logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import (
     CONTROL_PLANE_OWNED_ENV_KEYS,
     MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
@@ -185,6 +186,8 @@ def build_worker_env(
             raise RuntimeError("managed opd control-panel teacher transport is missing")
         env[PUBLIC_URL_ENV] = public_url
         env[TEACHER_CAPABILITY_ENV] = capability
+    if str(getattr(spec, "algorithm", "")).lower() == "grpo":
+        env.update(GRPO_NATIVE_THREAD_ENV)
     # declared runtime secrets can carry any name, so their names are listed explicitly for the
     # redactors (flash._internal.diagnostics and the provider bootstraps): the name-shape
     # heuristic alone would let AWS_SECRET_ACCESS_KEY-style values through. set last so no
