@@ -159,6 +159,16 @@ def _compare_and_complete_remote(
             return False
         if not runner._expected_remote_matches(status.remote, expected_remote):
             return False
+    expected_attempt = (
+        expected_remote.get("attempt")
+        if isinstance(expected_remote, dict)
+        else runner._latest_reserved_attempt(run_id)
+    )
+    metrics, verified_attempt = runner.validate_terminal_source_metrics(
+        status,
+        metrics,
+        expected_attempt=expected_attempt,
+    )
     if expected_remote is not None and not runner._record_cleanup_remote(run_id, expected_remote):
         return False
     recovered_cost = runner._persist_metrics(spec, metrics)
@@ -173,6 +183,7 @@ def _compare_and_complete_remote(
         status.state = "done"
         status.cost_usd = charge_usd
         status.artifacts_dir = runner.artifacts_dir(spec)
+        status.source_verified_attempt = verified_attempt
         status.updated_at = time.time()
         if status.finished_at is None:
             status.finished_at = status.updated_at

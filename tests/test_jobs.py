@@ -13,8 +13,10 @@ from types import SimpleNamespace
 import pytest
 
 from tests._helpers.runner import provisioned_status
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _live_clock_handle(jobs):
@@ -1554,13 +1556,13 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
         PROVIDER.poll(JobHandle.from_dict(base), spec, spec.seed)
 
 
-def test_submit_run_payload_carries_code_prefix(monkeypatch):
+def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
     spec = JobSpec(
-        run_id="flash-code-prefix",
+        run_id="flash-source-snapshot",
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
@@ -1579,15 +1581,47 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
     )
     monkeypatch.setattr(jobs, "poll_job", lambda *a, **k: jobs.PollResult(True, metrics={}))
 
-    pinned_prefix = "code/0123456789abcdef0123456789abcdef/flash"
+    source_snapshot = valid_source_snapshot()
     assert jobs.submit_run(
         spec,
         seed=spec.seed,
-        code_prefix=pinned_prefix,
+        source_snapshot=source_snapshot,
         deadline_at=10_000_000_000.0,
     ).ok
     assert submitted["endpoint_id"] == "ep"
-    assert submitted["payload"]["code_prefix"] == pinned_prefix
+    assert submitted["payload"]["source_snapshot"] == source_snapshot
+    assert "code_prefix" not in submitted["payload"]
+
+
+def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.runpod import jobs
+    from flash.source_snapshot import SourceSnapshotError
+
+    spec = JobSpec(
+        run_id="flash-source-snapshot-invalid",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type=""),
+    )
+    deploy_calls = []
+    monkeypatch.setattr(
+        jobs,
+        "deploy_train_endpoint",
+        lambda *args, **kwargs: deploy_calls.append((args, kwargs)),
+    )
+    malformed = valid_source_snapshot()
+    malformed["archive_path"] = "source/wrong/flash-source.zip"
+
+    with pytest.raises(SourceSnapshotError, match="archive path"):
+        jobs.submit_run(
+            spec,
+            seed=spec.seed,
+            source_snapshot=malformed,
+            deadline_at=10_000_000_000.0,
+        )
+    assert deploy_calls == []
 
 
 def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkeypatch):
@@ -1620,7 +1654,11 @@ def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkey
             gpu=GpuSpec(type="H200", count=count),
         )
         assert jobs.submit_run(
-            spec, seed=spec.seed, on_last_gpu=True, deadline_at=10_000_000_000.0
+            spec,
+            seed=spec.seed,
+            on_last_gpu=True,
+            source_snapshot=_SOURCE_SNAPSHOT,
+            deadline_at=10_000_000_000.0,
         ).ok
         return captured["queue_grace_s"]
 
@@ -1667,6 +1705,7 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
             spec.seed,
             attempt=4,
             on_handle=handles.append,
+            source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=10_000_000_000.0,
         )
 
@@ -1715,6 +1754,7 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
             spec.seed,
             attempt=4,
             on_handle=handles.append,
+            source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=10_000_000_000.0,
         )
 
@@ -1806,7 +1846,12 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
 
     monkeypatch.setattr(jobs, "poll_job", fake_poll)
     provider = RunpodProvider()
-    assert provider.submit_run(spec, seed=spec.seed, _deadline_at=deadline_at).ok
+    assert provider.submit_run(
+        spec,
+        seed=spec.seed,
+        source_snapshot=_SOURCE_SNAPSHOT,
+        _deadline_at=deadline_at,
+    ).ok
     handle = JobHandle.from_dict(
         _runpod_handle_dict(
             jobs,
@@ -1854,7 +1899,7 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
     )
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        jobs.submit_run(spec, seed=spec.seed, deadline_at=200.0)
+        jobs.submit_run(spec, seed=spec.seed, source_snapshot=_SOURCE_SNAPSHOT, deadline_at=200.0)
 
     assert submitted == []
     assert deleted == ["ep"]
@@ -2830,6 +2875,12 @@ def _fresh_orchestrator(tmp, monkeypatch):
     monkeypatch.setattr(
         runpod_api, "delete_endpoint_for_fingerprint", lambda endpoint_id, _fingerprint: True
     )
+    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
+    monkeypatch.setattr(
+        runner,
+        "validate_terminal_source_metrics",
+        lambda _status, metrics, expected_attempt=None: (dict(metrics), expected_attempt),
+    )
     monkeypatch.setattr(
         rank_mod,
         "adapter_artifact_identity",
@@ -2981,14 +3032,14 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
                     spec,
                     spec.seed,
                     io.StringIO(),
-                    code_prefix="code/revision",
+                    source_snapshot=_SOURCE_SNAPSHOT,
                 )
         else:
             metrics = lifecycle._submit_seed_supervised(
                 spec,
                 spec.seed,
                 io.StringIO(),
-                code_prefix="code/revision",
+                source_snapshot=_SOURCE_SNAPSHOT,
             )
             assert metrics["trained_eval_acc"] == 0.9
         assert calls["n"] == 1
@@ -3002,12 +3053,11 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         import flash.providers.runpod.serverless as flash_train
 
         calls = {"n": 0}
-        code_prefixes: list[str | None] = []
-        uploaded: dict[str, str | None] = {}
+        source_snapshots: list[dict | None] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, code_prefix=None, **_):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, source_snapshot=None, **_):
             calls["n"] += 1
-            code_prefixes.append(code_prefix)
+            source_snapshots.append(source_snapshot)
             if on_handle:
                 on_handle(
                     {
@@ -3025,19 +3075,12 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code",
-            lambda repo=None, code_prefix=None: (
-                uploaded.setdefault("code_prefix", code_prefix) or "repo"
-            ),
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         orch.submit_job(_spec("retry-ok"), dry_run=False, background=False)
         st = orch.get_status("retry-ok")
         assert st.state == "done"
         assert calls["n"] == 2
-        assert code_prefixes == [uploaded["code_prefix"], uploaded["code_prefix"]]
-        assert re.fullmatch(r"code/[0-9a-f]{32}/flash", uploaded["code_prefix"] or "")
+        assert source_snapshots == [_SOURCE_SNAPSHOT, _SOURCE_SNAPSHOT]
         assert st.remote["job_id"] == "j2"  # latest handle persisted
 
 
@@ -3067,6 +3110,7 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={"worker_spec": source.to_internal_dict()},
             )
         )
@@ -3108,9 +3152,6 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
         monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config())
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         orch.submit_job(spec, dry_run=False, background=False)
@@ -3150,6 +3191,7 @@ def test_submit_rejects_cross_org_init_ref(monkeypatch):
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={"worker_spec": source.to_internal_dict()},
                 billing_context={"org_id": "org-a"},
             )
@@ -3190,6 +3232,7 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={"worker_spec": source.to_internal_dict()},
             )
         )
@@ -3248,6 +3291,7 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={"worker_spec": source.to_internal_dict()},
             )
         )
@@ -3315,6 +3359,7 @@ def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
                 run_id="source-run",
                 state="running",
                 spec=source.to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={"worker_spec": source.to_internal_dict()},
             )
         )
@@ -3350,6 +3395,7 @@ def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={"worker_spec": source.to_internal_dict()},
             )
         )
@@ -3390,6 +3436,7 @@ def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={"worker_spec": source.to_internal_dict()},
             )
         )
@@ -3432,6 +3479,7 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={"worker_spec": source.to_internal_dict()},
                 billing_context={"org_id": "org-a"},
             )
@@ -3479,6 +3527,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={"worker_spec": source.to_internal_dict()},
                 billing_context={"org_id": "org-a"},
             )
@@ -3554,6 +3603,7 @@ def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypa
                     "attempt": 0,
                     "started_ts": 1.0,
                 },
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={
                     "worker_spec": worker_spec.to_internal_dict(),
                     "adapter_identity": identity.to_dict(),
@@ -3647,6 +3697,7 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
                     "attempt": 0,
                     "started_ts": 1.0,
                 },
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={
                     "worker_spec": worker_spec.to_internal_dict(),
                     "adapter_identity": identity.to_dict(),
@@ -3667,7 +3718,6 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
             lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="stalled"),
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
-        monkeypatch.setattr("flash.providers._lifecycle.worker.upload_code", lambda *a, **k: "repo")
         monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
         monkeypatch.setattr(
             orch,
@@ -3735,6 +3785,7 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
                     "attempt": 0,
                     "started_ts": 1.0,
                 },
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={
                     "worker_spec": worker_dict,
                     "adapter_identity": original_identity,
@@ -3947,9 +3998,6 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         orch.submit_job(_spec("cancel-reap"), dry_run=False, background=False)
@@ -3990,9 +4038,6 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         orch.submit_job(_spec("cancel-retry"), dry_run=False, background=False)
         assert orch.get_status("cancel-retry").state == "done"
@@ -4014,9 +4059,6 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
             )
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         with pytest.raises(RuntimeError):
             orch.submit_job(_spec("fail-fast"), dry_run=False, background=False)
@@ -4043,9 +4085,6 @@ def test_supervisor_infra_failure_retries_up_to_floor(monkeypatch):
             return jobs.PollResult(False, failure="stalled", detail="GPU never became ready")
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         with pytest.raises(RuntimeError):
             orch.submit_job(_spec("infra-floor"), dry_run=False, background=False)  # max_retries=2
@@ -4070,9 +4109,6 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
             return jobs.PollResult(False, failure="stalled", detail="frozen")
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id="no-retry",
@@ -4103,9 +4139,6 @@ def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failur
             return jobs.PollResult(False, failure=failure, detail="cache-constrained failure")
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id=f"cache-zero-{failure}",
@@ -4154,9 +4187,6 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4255,9 +4285,6 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         import types
@@ -4313,9 +4340,6 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
             )
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4380,9 +4404,6 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4447,9 +4468,6 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4511,9 +4529,6 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4597,9 +4612,6 @@ def test_selected_quote_refresh_failure_retries_without_skipping_the_candidate(m
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
-        )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4720,6 +4732,7 @@ def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):
                 spec=public_spec.to_dict(),
                 billing_context={"org_id": "org-a"},
                 last_heartbeat={"stage": "rl_step", "step": 2},
+                source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={
                     "worker_spec": worker_dict,
                     "adapter_identity": identity,
@@ -5040,21 +5053,18 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
             "attempt": 1,
             "started_ts": 2.0,
         }
-        orch._save_status(
-            provisioned_status(
-                orch,
-                _spec(run_id),
-                state="running",
-                remote=stale_remote,
-            )
+        status = provisioned_status(
+            orch,
+            _spec(run_id),
+            state="running",
+            remote=stale_remote,
         )
+        status.source_snapshot = _SOURCE_SNAPSHOT
+        orch._save_status(status)
         monkeypatch.setattr(
             jobs,
             "poll_job",
             lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="redeploy"),
-        )
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo, *, code_prefix: repo
         )
 
         real_get_status = orch.get_status
@@ -5160,24 +5170,24 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
-        orch._save_status(
-            provisioned_status(
-                orch,
-                _spec("i1"),
-                state="running",
-                cost_usd=0.0,
-                remote={
-                    "provider": "runpod",
-                    "endpoint_id": "epA",
-                    "endpoint_name": "n",
-                    "key_fingerprint": _RUNPOD_FINGERPRINT,
-                    "job_id": "jA",
-                    "on_last_gpu": False,
-                    "attempt": 0,
-                    "started_ts": 1.0,
-                },
-            )
+        status = provisioned_status(
+            orch,
+            _spec("i1"),
+            state="running",
+            cost_usd=0.0,
+            remote={
+                "provider": "runpod",
+                "endpoint_id": "epA",
+                "endpoint_name": "n",
+                "key_fingerprint": _RUNPOD_FINGERPRINT,
+                "job_id": "jA",
+                "on_last_gpu": False,
+                "attempt": 0,
+                "started_ts": 1.0,
+            },
         )
+        status.source_snapshot = _SOURCE_SNAPSHOT
+        orch._save_status(status)
         # Poll reports a dead/abandoned job (the common redeploy-window outcome).
         monkeypatch.setattr(
             jobs,
@@ -5185,11 +5195,6 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
             lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="host vanished"),
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
-        uploads = []
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code",
-            lambda repo, *, code_prefix: uploads.append((repo, code_prefix)) or repo,
-        )
         seen = {}
 
         def fake_training(
@@ -5198,12 +5203,11 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
             *,
             prior_cost,
             runtime_secrets=None,
-            code_prefix=None,
+            source_snapshot=None,
             attempt_start,
         ):
             seen["remote"] = orch.get_status(spec.run_id).remote
-            seen["code_prefix"] = code_prefix
-            seen["hf_repo"] = spec.train.hf_repo
+            seen["source_snapshot"] = source_snapshot
             orch._update(spec.run_id, "done", cost_usd=prior_cost)
 
         monkeypatch.setattr(orch, "_run_training", fake_training)
@@ -5211,8 +5215,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         st = orch.attach_run("i1", log_stream=sys.stderr)
 
         assert seen["remote"] is None, "stale dead handle must be cleared before resuming"
-        assert re.fullmatch(r"code/[0-9a-f]{32}/flash", seen["code_prefix"] or "")
-        assert uploads == [(seen["hf_repo"], seen["code_prefix"])]
+        assert seen["source_snapshot"] == _SOURCE_SNAPSHOT
         assert st.state != "failed", "a job lost to the redeploy must be resumed, not failed"
         assert st.state == "done"
 
@@ -5262,32 +5265,31 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
         assert status.remote["endpoint_id"] == "epA"
 
 
-def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):
+def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
-        orch._save_status(
-            provisioned_status(
-                orch,
-                _spec("pinned-code"),
-                state="running",
-                cost_usd=0.25,
-                remote={
-                    "provider": "runpod",
-                    "endpoint_id": "epA",
-                    "endpoint_name": "n",
-                    "key_fingerprint": _RUNPOD_FINGERPRINT,
-                    "job_id": "jA",
-                    "on_last_gpu": False,
-                    "attempt": 0,
-                    "started_ts": 1.0,
-                    "code_prefix": "code/0123456789abcdef0123456789abcdef/flash",
-                },
-            )
+        status = provisioned_status(
+            orch,
+            _spec("pinned-code"),
+            state="running",
+            cost_usd=0.25,
+            remote={
+                "provider": "runpod",
+                "endpoint_id": "epA",
+                "endpoint_name": "n",
+                "key_fingerprint": _RUNPOD_FINGERPRINT,
+                "job_id": "jA",
+                "on_last_gpu": False,
+                "attempt": 0,
+                "started_ts": 1.0,
+            },
         )
+        status.source_snapshot = _SOURCE_SNAPSHOT
+        orch._save_status(status)
         monkeypatch.setattr(
             jobs,
             "poll_job",
@@ -5302,11 +5304,11 @@ def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):
             *,
             prior_cost,
             runtime_secrets=None,
-            code_prefix=None,
+            source_snapshot=None,
             attempt_start,
         ):
             seen["prior_cost"] = prior_cost
-            seen["code_prefix"] = code_prefix
+            seen["source_snapshot"] = source_snapshot
             seen["attempt_start"] = attempt_start
             orch._update(spec.run_id, "done", cost_usd=prior_cost)
 
@@ -5317,7 +5319,7 @@ def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):
         assert st.state == "done"
         assert seen == {
             "prior_cost": 0.25,
-            "code_prefix": "code/0123456789abcdef0123456789abcdef/flash",
+            "source_snapshot": _SOURCE_SNAPSHOT,
             "attempt_start": 1,
         }
 
@@ -5332,23 +5334,23 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
-        orch._save_status(
-            provisioned_status(
-                orch,
-                _spec("g1"),
-                state="running",
-                remote={
-                    "provider": "runpod",
-                    "endpoint_id": "epA",
-                    "endpoint_name": "n",
-                    "key_fingerprint": _RUNPOD_FINGERPRINT,
-                    "job_id": "jA",
-                    "on_last_gpu": False,
-                    "attempt": 0,
-                    "started_ts": 1.0,
-                },
-            )
+        status = provisioned_status(
+            orch,
+            _spec("g1"),
+            state="running",
+            remote={
+                "provider": "runpod",
+                "endpoint_id": "epA",
+                "endpoint_name": "n",
+                "key_fingerprint": _RUNPOD_FINGERPRINT,
+                "job_id": "jA",
+                "on_last_gpu": False,
+                "attempt": 0,
+                "started_ts": 1.0,
+            },
         )
+        status.source_snapshot = _SOURCE_SNAPSHOT
+        orch._save_status(status)
         monkeypatch.setattr(
             jobs,
             "poll_job",
@@ -5357,9 +5359,6 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             ),
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
-        monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo, *, code_prefix: repo
-        )
         monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
         resumed = {"called": False}
         replacement_remote = {
@@ -5379,9 +5378,10 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             *,
             prior_cost,
             runtime_secrets=None,
-            code_prefix=None,
+            source_snapshot=None,
             attempt_start,
         ):
+            assert source_snapshot == _SOURCE_SNAPSHOT
             # the training submit re-runs the run; a genuinely broken run fails there (matches
             # _submit_seed_supervised raising after a non-infra failure with no retries left).
             resumed["called"] = True
@@ -5660,7 +5660,6 @@ def _vast_recovery_remote(instance_id=101, attempt=0):
         "hourly_usd": 0.5,
         "attempt": attempt,
         "started_ts": 100.0,
-        "code_prefix": "code/revision",
     }
 
 
@@ -5687,7 +5686,7 @@ def test_attach_reconciliation_thread_start_failure_releases_guard(monkeypatch):
             remote,
             spec,
             1,
-            "code/revision",
+            _SOURCE_SNAPSHOT,
             io.StringIO(),
             "stalled: host vanished",
         )
@@ -5757,7 +5756,7 @@ def test_attach_reconciliation_cleans_endpoint_after_background_completion(monke
             remote,
             spec,
             1,
-            "code/revision",
+            _SOURCE_SNAPSHOT,
             io.StringIO(),
             "stalled: host vanished",
         )
@@ -5778,6 +5777,7 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
                 state="running",
                 spec=spec.to_dict(),
                 remote=remote,
+                source_snapshot=_SOURCE_SNAPSHOT,
             )
         )
 
@@ -5802,7 +5802,7 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
             remote,
             spec,
             1,
-            "code/revision",
+            _SOURCE_SNAPSHOT,
             io.StringIO(),
             "stalled: host vanished",
         )
@@ -5849,7 +5849,7 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
             remote,
             spec,
             1,
-            "code/revision",
+            _SOURCE_SNAPSHOT,
             io.StringIO(),
             "stalled: host vanished",
         )
@@ -5858,9 +5858,7 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
         assert len(calls) == 2
         assert status.state == "failed"
         assert status.remote == remote
-        assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [
-            {key: value for key, value in remote.items() if key != "code_prefix"}
-        ]
+        assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [remote]
 
 
 def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
@@ -5894,7 +5892,7 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
             remote,
             spec,
             1,
-            "code/revision",
+            _SOURCE_SNAPSHOT,
             io.StringIO(),
             "stalled: host vanished",
         )
@@ -5903,9 +5901,7 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
         assert status.state == "done"
         assert status.remote == remote
         assert status.error is None
-        assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [
-            {key: value for key, value in remote.items() if key != "code_prefix"}
-        ]
+        assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [remote]
 
 
 def test_attach_reconciler_caps_completed_adoption_retry_to_grace(monkeypatch):
@@ -5948,7 +5944,7 @@ def test_attach_reconciler_caps_completed_adoption_retry_to_grace(monkeypatch):
             remote,
             spec,
             1,
-            "code/revision",
+            _SOURCE_SNAPSHOT,
             io.StringIO(),
             "stalled: host vanished",
         )
@@ -6005,7 +6001,7 @@ def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monke
             remote,
             spec,
             1,
-            "code/revision",
+            _SOURCE_SNAPSHOT,
             io.StringIO(),
             "stalled: host vanished",
         )
@@ -6072,7 +6068,7 @@ def test_attach_reconciler_rate_limits_failed_terminal_cas_past_grace(monkeypatc
             remote,
             spec,
             1,
-            "code/revision",
+            _SOURCE_SNAPSHOT,
             io.StringIO(),
             "stalled: host vanished",
         )
@@ -6136,7 +6132,7 @@ def test_an_adopted_instance_run_is_still_priced_for_every_card_it_occupied(monk
             remote,
             spec,
             1,
-            "code/revision",
+            _SOURCE_SNAPSHOT,
             io.StringIO(),
             "stalled: host vanished",
         )
@@ -6187,7 +6183,7 @@ def test_attach_reconciler_does_not_clobber_newer_remote(monkeypatch):
             old_remote,
             spec,
             1,
-            "code/revision",
+            _SOURCE_SNAPSHOT,
             io.StringIO(),
             "stalled: host vanished",
         )

@@ -8,7 +8,7 @@ from flash.providers._lifecycle.worker import (  # noqa: F401
     _hf_call,
     build_worker_env,
     logger,
-    upload_code,
+    publish_source_snapshot,
     worker_image_for_gpu,
 )
 from flash.providers.runpod.serverless.endpoints import (  # noqa: F401

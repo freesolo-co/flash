@@ -156,19 +156,22 @@ def decode_terminal_marker(
     the caller allows. A marker that cannot be verified must never settle an attempt.
     """
     marker = json.loads(raw)
-    if not isinstance(marker, dict) or set(marker) != {
-        "attempt",
-        "error",
-        "ok",
-        "retriable",
-        "run_id",
-        "ts",
+    base_fields = {"attempt", "error", "ok", "retriable", "run_id", "ts"}
+    if not isinstance(marker, dict) or set(marker) not in {
+        frozenset(base_fields),
+        frozenset(base_fields | {"source_attestation"}),
     }:
         raise ValueError("invalid terminal marker schema")
     marker_attempt = marker["attempt"]
     ts = marker["ts"]
     error = marker["error"]
     now = time.time()
+    if "source_attestation" in marker:
+        from flash.source_snapshot import parse_attestation
+
+        attestation = parse_attestation(marker["source_attestation"])
+        if attestation["run_id"] != run_id or attestation["attempt"] != attempt:
+            raise ValueError("invalid terminal marker source identity")
     if (
         isinstance(launch_floor, bool)
         or not isinstance(launch_floor, (int, float))
@@ -258,4 +261,8 @@ def resolve_terminal_artifacts(
             marker=marker,
             metrics_unparseable=raw_metrics is not None,
         )
+    if "source_attestation" in marker:
+        from flash.source_snapshot import TERMINAL_ATTESTATION_KEY
+
+        metrics = {**metrics, TERMINAL_ATTESTATION_KEY: marker["source_attestation"]}
     return TerminalResolution(TerminalKind.SUCCESS, metrics=metrics, marker=marker)
