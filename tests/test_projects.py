@@ -375,40 +375,107 @@ def test_standalone_refuses_to_resolve_a_publish_slug(monkeypatch) -> None:
     assert "flash login" not in excinfo.value.detail
 
 
-def test_a_slug_is_derived_from_the_project_name(monkeypatch) -> None:
-    """The project directory stores no slug column, so the name is what resolves the destination.
-
-    This is the shape EVERY managed deployment returns: `platform.projects` has `id, name,
-    description, created_at` and nothing else, so requiring an explicit `projectSlug` made publish
-    impossible for every project in every org rather than for an unlucky one.
-    """
-    project_id = "11111111-1111-4111-8111-111111111111"
-
+def _install_project_validation_responses(
+    monkeypatch,
+    *,
+    public_payloads: list[dict[str, Any]],
+    internal_payloads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
-    monkeypatch.setattr(
-        "flash.server.domain.projects.urllib.request.urlopen",
-        lambda _req, timeout=None: _Response(
-            {"id": project_id, "name": "Alphabet Sort v2", "description": None}
-        ),
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "service-internal-key")
+    public = iter(public_payloads)
+    internal = iter(internal_payloads)
+    requests: list[dict[str, Any]] = []
+
+    def urlopen(req, timeout=None):
+        method = req.get_method()
+        requests.append(
+            {
+                "method": method,
+                "url": req.full_url,
+                "authorization": req.get_header("Authorization"),
+                "body": json.loads(req.data) if req.data else None,
+            }
+        )
+        if method == "GET":
+            return _Response(next(public))
+        return _Response(next(internal))
+
+    monkeypatch.setattr("flash.server.domain.projects.urllib.request.urlopen", urlopen)
+    return requests
+
+
+def test_public_name_only_response_uses_internal_canonical_slug(monkeypatch) -> None:
+    project_id = "11111111-1111-4111-8111-111111111111"
+    requests = _install_project_validation_responses(
+        monkeypatch,
+        public_payloads=[{"id": project_id, "name": "Foo Bar"}],
+        internal_payloads=[
+            {
+                "ok": True,
+                "orgId": "org-one",
+                "projectId": project_id,
+                "projectSlug": "foo-bar-2",
+            }
+        ],
     )
 
     assert require_project_access_slug(
         project_id=project_id,
         key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
         authorization="Bearer fslo-user",
-    ) == (project_id, "alphabet-sort-v2")
+    ) == (project_id, "foo-bar-2")
+    assert [request["method"] for request in requests] == ["GET", "POST"]
+    assert requests[1]["body"] == {"orgId": "org-one", "projectId": project_id}
 
 
-def test_an_explicit_slug_outranks_the_derived_one(monkeypatch) -> None:
-    """Deriving is the fallback, not the rule: a backend that sends a slug stays authoritative."""
+def test_colliding_project_names_keep_distinct_canonical_slugs(monkeypatch) -> None:
+    first_id = "11111111-1111-4111-8111-111111111111"
+    second_id = "22222222-2222-4222-8222-222222222222"
+    requests = _install_project_validation_responses(
+        monkeypatch,
+        public_payloads=[
+            {"id": first_id, "name": "Foo Bar"},
+            {"id": second_id, "name": "foo-bar"},
+        ],
+        internal_payloads=[
+            {
+                "ok": True,
+                "orgId": "org-one",
+                "projectId": first_id,
+                "projectSlug": "foo-bar",
+            },
+            {
+                "ok": True,
+                "orgId": "org-one",
+                "projectId": second_id,
+                "projectSlug": "foo-bar-2",
+            },
+        ],
+    )
+    key = {"auth_kind": "freesolo_api_key", "org_id": "org-one"}
+
+    first = require_project_access_slug(
+        project_id=first_id, key=key, authorization="Bearer fslo-user"
+    )
+    second = require_project_access_slug(
+        project_id=second_id, key=key, authorization="Bearer fslo-user"
+    )
+
+    assert first == (first_id, "foo-bar")
+    assert second == (second_id, "foo-bar-2")
+    assert first[1] != second[1]
+    assert [request["method"] for request in requests] == ["GET", "POST", "GET", "POST"]
+
+
+def test_explicit_public_slug_passes_through_without_internal_lookup(monkeypatch) -> None:
     project_id = "11111111-1111-4111-8111-111111111111"
-
-    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
-    monkeypatch.setattr(
-        "flash.server.domain.projects.urllib.request.urlopen",
-        lambda _req, timeout=None: _Response(
+    requests = _install_project_validation_responses(
+        monkeypatch,
+        public_payloads=[
             {"project": {"id": project_id, "slug": "checkout-bot", "name": "Something Else"}}
-        ),
+        ],
+        internal_payloads=[],
     )
 
     assert require_project_access_slug(
@@ -416,51 +483,167 @@ def test_an_explicit_slug_outranks_the_derived_one(monkeypatch) -> None:
         key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
         authorization="Bearer fslo-user",
     ) == (project_id, "checkout-bot")
+    assert [request["method"] for request in requests] == ["GET"]
 
 
-def test_an_unnormalizable_project_name_is_the_callers_to_fix(monkeypatch) -> None:
-    """A name with no usable character is a 400 the caller can act on, not an opaque 502.
-
-    Distinct from the standalone case (501, a permanent property of the deployment): renaming the
-    project fixes this one, so the message has to say that rather than blame the backend.
-    """
+def test_internal_key_canonical_slug_passes_through(monkeypatch) -> None:
     project_id = "11111111-1111-4111-8111-111111111111"
+    requests = _install_project_validation_responses(
+        monkeypatch,
+        public_payloads=[],
+        internal_payloads=[
+            {
+                "ok": True,
+                "orgId": "org-one",
+                "projectId": project_id,
+                "projectSlug": "checkout-bot",
+            }
+        ],
+    )
 
-    def urlopen(_req, timeout=None):
-        return _Response({"project": {"id": project_id, "orgId": "org-one", "name": "!!!"}})
+    assert require_project_access_slug(
+        project_id=project_id,
+        key={"auth_kind": "internal"},
+        authorization="Bearer incoming-internal-key",
+        org_id="org-one",
+    ) == (project_id, "checkout-bot")
+    assert [request["method"] for request in requests] == ["POST"]
+
+
+def test_public_authorization_failure_prevents_internal_lookup(monkeypatch) -> None:
+    project_id = "11111111-1111-4111-8111-111111111111"
+    calls: list[str] = []
+    error = urllib.error.HTTPError(
+        f"https://freesolo.test/api/projects/{project_id}",
+        404,
+        "not found",
+        {},
+        io.BytesIO(b"{}"),
+    )
+
+    def urlopen(req, timeout=None):
+        calls.append(req.get_method())
+        if req.get_method() != "GET":
+            pytest.fail("internal lookup must not run before public authorization succeeds")
+        raise error
 
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "service-internal-key")
     monkeypatch.setattr("flash.server.domain.projects.urllib.request.urlopen", urlopen)
 
-    key = {"auth_kind": "freesolo_api_key", "org_id": "org-one"}
     with pytest.raises(HTTPException) as excinfo:
         require_project_access_slug(
-            project_id=project_id, key=key, authorization="Bearer fslo-user"
+            project_id=project_id,
+            key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
+            authorization="Bearer fslo-user",
         )
-    assert excinfo.value.status_code == 400
-    assert "rename the project" in excinfo.value.detail
+    assert excinfo.value.status_code == 403
+    assert calls == ["GET"]
 
-    # the id-only entry point is unaffected: it never promised a slug.
-    assert (
-        require_project_access(project_id=project_id, key=key, authorization="Bearer fslo-user")
-        == project_id
+
+def test_missing_org_identity_fails_before_internal_lookup(monkeypatch) -> None:
+    project_id = "11111111-1111-4111-8111-111111111111"
+    requests = _install_project_validation_responses(
+        monkeypatch,
+        public_payloads=[{"id": project_id, "name": "Foo Bar"}],
+        internal_payloads=[],
     )
 
+    with pytest.raises(HTTPException) as excinfo:
+        require_project_access_slug(
+            project_id=project_id,
+            key={"auth_kind": "freesolo_api_key"},
+            authorization="Bearer fslo-user",
+        )
+    assert excinfo.value.status_code == 502
+    assert "organization id" in excinfo.value.detail
+    assert [request["method"] for request in requests] == ["GET"]
 
-def test_a_resolved_slug_still_passes_through(monkeypatch) -> None:
-    """The guard must reject only an ABSENT slug, not a present one."""
+
+def test_missing_internal_key_fails_after_public_authorization(monkeypatch) -> None:
     project_id = "11111111-1111-4111-8111-111111111111"
+    requests = _install_project_validation_responses(
+        monkeypatch,
+        public_payloads=[{"id": project_id, "name": "Foo Bar"}],
+        internal_payloads=[],
+    )
+    monkeypatch.delenv("FREESOLO_INTERNAL_KEY")
+
+    with pytest.raises(HTTPException) as excinfo:
+        require_project_access_slug(
+            project_id=project_id,
+            key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
+            authorization="Bearer fslo-user",
+        )
+    assert excinfo.value.status_code == 503
+    assert "FREESOLO_INTERNAL_KEY" in excinfo.value.detail
+    assert [request["method"] for request in requests] == ["GET"]
+
+
+@pytest.mark.parametrize(
+    ("ok", "expected_detail"),
+    [(True, "canonical project slug"), (False, "malformed response")],
+)
+def test_missing_or_malformed_internal_slug_response_fails_closed(
+    monkeypatch, ok, expected_detail
+) -> None:
+    project_id = "11111111-1111-4111-8111-111111111111"
+    requests = _install_project_validation_responses(
+        monkeypatch,
+        public_payloads=[{"id": project_id, "name": "Foo Bar"}],
+        internal_payloads=[{"ok": ok, "orgId": "org-one", "projectId": project_id}],
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        require_project_access_slug(
+            project_id=project_id,
+            key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
+            authorization="Bearer fslo-user",
+        )
+    assert excinfo.value.status_code == 502
+    assert expected_detail in excinfo.value.detail
+    assert [request["method"] for request in requests] == ["GET", "POST"]
+
+
+def test_internal_transport_failure_after_public_authorization_fails_closed(monkeypatch) -> None:
+    project_id = "11111111-1111-4111-8111-111111111111"
+    calls: list[str] = []
+
+    def urlopen(req, timeout=None):
+        calls.append(req.get_method())
+        if req.get_method() == "GET":
+            return _Response({"id": project_id, "name": "Foo Bar"})
+        raise urllib.error.URLError("offline")
 
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
-    monkeypatch.setattr(
-        "flash.server.domain.projects.urllib.request.urlopen",
-        lambda _req, timeout=None: _Response(
-            {"project": {"id": project_id, "orgId": "org-one", "slug": "checkout-bot"}}
-        ),
-    )
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "service-internal-key")
+    monkeypatch.setattr("flash.server.domain.projects.urllib.request.urlopen", urlopen)
 
-    assert require_project_access_slug(
-        project_id=project_id,
-        key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
-        authorization="Bearer fslo-user",
-    ) == (project_id, "checkout-bot")
+    with pytest.raises(HTTPException) as excinfo:
+        require_project_access_slug(
+            project_id=project_id,
+            key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
+            authorization="Bearer fslo-user",
+        )
+    assert excinfo.value.status_code == 503
+    assert calls == ["GET", "POST"]
+
+
+def test_id_only_project_access_does_not_require_canonical_slug(monkeypatch) -> None:
+    project_id = "11111111-1111-4111-8111-111111111111"
+    requests = _install_project_validation_responses(
+        monkeypatch,
+        public_payloads=[{"id": project_id, "name": "Foo Bar"}],
+        internal_payloads=[],
+    )
+    monkeypatch.delenv("FREESOLO_INTERNAL_KEY")
+
+    assert (
+        require_project_access(
+            project_id=project_id,
+            key={"auth_kind": "freesolo_api_key", "org_id": "org-one"},
+            authorization="Bearer fslo-user",
+        )
+        == project_id
+    )
+    assert [request["method"] for request in requests] == ["GET"]
