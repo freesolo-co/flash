@@ -187,6 +187,43 @@ def test_processor_digests_match_raw_and_qwen_sized_images(real_processor):
     assert processor_image_digests(_TextOnlyProcessor(), []) == []
 
 
+def test_processor_digest_separates_images_that_differ_only_by_grid(real_processor):
+    """a transposed solid image has identical pixel bytes but a different patch grid.
+
+    the digest must authenticate image_grid_thw, not pixel_values alone, or two
+    differently shaped observations collide and media identity stops binding order.
+    """
+    from flash.engine.worker.train.core.child.glue import parent_image_digests
+
+    portrait = mm.normalize_image_source(_image_bytes((56, 112), "red"), None)
+    landscape = mm.normalize_image_source(_image_bytes((112, 56), "red"), None)
+
+    encoded = []
+    for descriptor in (portrait, landscape):
+        decoded = mm.decode_image_descriptors([descriptor], None)
+        try:
+            fields = real_processor.image_processor(images=[decoded[0]], return_tensors="np")
+            encoded.append(
+                (
+                    fields["pixel_values"].shape,
+                    fields["pixel_values"].tobytes(order="C"),
+                    fields["image_grid_thw"].tolist(),
+                )
+            )
+        finally:
+            decoded[0].close()
+
+    # the collision must remain constructible, otherwise this test proves nothing.
+    assert encoded[0][0] == encoded[1][0]
+    assert encoded[0][1] == encoded[1][1]
+    assert encoded[0][2] != encoded[1][2]
+
+    assert (
+        parent_image_digests(real_processor, [portrait], None)[0]
+        != parent_image_digests(real_processor, [landscape], None)[0]
+    )
+
+
 def test_real_processor_drives_the_shared_dynamic_child_glue(real_processor):
     from flash.engine.worker.train.core.child.glue import (
         EnvGlueProcessor,
