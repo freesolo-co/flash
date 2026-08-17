@@ -34,13 +34,13 @@ def test_load_environment_requires_env_id() -> None:
         load_environment("")
 
 
-def test_env_setup_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> None:
-    """`flash env setup` must scaffold a Freesolo SDK env, not a BaseEnvironment subclass."""
-    from argparse import Namespace
-
-    from flash.cli import cmd_env_setup
+def _stub_env_setup_identity(monkeypatch) -> None:
     from flash.cli.commands.env import setup as env_setup_mod
 
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials",
+        lambda: ("https://flash.freesolo.co", "key"),
+    )
     monkeypatch.setattr(
         env_setup_mod,
         "_require_setup_project",
@@ -49,6 +49,15 @@ def test_env_setup_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> N
             "name": "Test",
         },
     )
+
+
+def test_env_setup_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> None:
+    """`flash env setup` must scaffold a Freesolo SDK env, not a BaseEnvironment subclass."""
+    from argparse import Namespace
+
+    from flash.cli import cmd_env_setup
+
+    _stub_env_setup_identity(monkeypatch)
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0
 
@@ -84,16 +93,8 @@ def test_scaffolded_env_scores_through_real_task_example(tmp_path, monkeypatch) 
     from freesolo.datasets.records import load_task_examples
 
     from flash.cli import cmd_env_setup
-    from flash.cli.commands.env import setup as env_setup_mod
 
-    monkeypatch.setattr(
-        env_setup_mod,
-        "_require_setup_project",
-        lambda _args, **_kwargs: {
-            "id": "11111111-1111-4111-8111-111111111111",
-            "name": "Test",
-        },
-    )
+    _stub_env_setup_identity(monkeypatch)
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0
 
