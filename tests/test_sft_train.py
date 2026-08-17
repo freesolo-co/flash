@@ -1656,6 +1656,61 @@ def _module(name, **attrs):
     return module
 
 
+def _load_generated_sft_plugin(tmp_path):
+    from flash.engine.worker import sft_train_runner
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    sft_train_runner._write_sft_child_shims(
+        SimpleNamespace(save_at_steps=()),
+        SimpleNamespace(update_horizon=1, reentrant_gradient_checkpointing=False),
+        shim_dir=str(shim_dir),
+        custom_dataset_path=str(shim_dir / "dataset.py"),
+        seed=43,
+        loggers=[],
+        gdn_reset_arch=None,
+    )
+    plugin_path = shim_dir / "flash_sft_plugin.py"
+    spec = importlib.util.spec_from_file_location("generated_flash_sft_plugin", plugin_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("with_validation", [False, True])
+def test_generated_sft_plugin_seeds_only_available_samplers(tmp_path, monkeypatch, with_validation):
+    class FakeTrainer:
+        def _build_dataloader(self):
+            self.train_sampler = SimpleNamespace(seed=None)
+            if with_validation:
+                self.val_sampler = SimpleNamespace(seed=None)
+            return "loader"
+
+    fake_sft_module = _module("verl.trainer.sft_trainer", SFTTrainer=FakeTrainer)
+    modules = {
+        "torch": _module("torch", manual_seed=lambda seed: None),
+        "numpy": _module("numpy", random=SimpleNamespace(seed=lambda seed: None)),
+        "verl": _module("verl"),
+        "verl.trainer": _module("verl.trainer", sft_trainer=fake_sft_module),
+        "verl.trainer.sft_trainer": fake_sft_module,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    generated_plugin = _load_generated_sft_plugin(tmp_path)
+    generated_plugin._install_seeded_dataloader(43)
+
+    trainer = FakeTrainer()
+    assert trainer._build_dataloader() == "loader"
+    assert trainer.train_sampler.seed == 43
+    if with_validation:
+        assert trainer.val_sampler.seed == 43
+    else:
+        assert not hasattr(trainer, "val_sampler")
+
+
 def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus(
     monkeypatch, capsys
 ):
