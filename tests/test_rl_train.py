@@ -7321,6 +7321,94 @@ def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(
         assert key not in child
 
 
+def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(monkeypatch, tmp_path):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+
+    declared = (
+        "CUDA_SECRET",
+        "FLA_CREDENTIAL",
+        "PYTHONPATH",
+        "WANDB_USER_SECRET",
+        "WANDB_API_KEY",
+    )
+    for name in declared:
+        monkeypatch.setenv(name, f"synthetic-{name.lower()}")
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, ",".join(declared))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("FLA_TILELANG", "0")
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    files = {
+        "shim_dir": str(tmp_path),
+        "rank_device_claims": str(tmp_path / "rank-device-claims"),
+        "plugin_config_path": str(tmp_path / "plugin-config.json"),
+    }
+    child = rl_train._build_rl_child_env(
+        {"multi_turn": False}, files, ["wandb"], "http://127.0.0.1:9/"
+    )
+
+    for name in declared:
+        if name not in {"PYTHONPATH", "WANDB_API_KEY"}:
+            assert name not in child
+    assert child["PYTHONPATH"] == files["shim_dir"]
+    assert SECRET_ENV_KEYS_ENV not in child
+    assert "WANDB_API_KEY" in child
+    assert child["WANDB_MODE"] == "offline"
+    assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert child["FLA_TILELANG"] == "0"
+    assert child["FLASH_VERL_REWARD_URL"] == "http://127.0.0.1:9/"
+    assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_grpo_plugin"
+    assert child["FLASH_GRPO_PLUGIN_CONFIG_PATH"] == files["plugin_config_path"]
+    assert child["FLASH_RANK_DEVICE_CLAIMS"] == files["rank_device_claims"]
+
+    captured = {}
+
+    class _EmptyChildStream:
+        def __init__(self, proc, **kwargs):
+            captured["stream_proc"] = proc
+
+        def __iter__(self):
+            return iter(())
+
+        def wait_and_classify(self):
+            return 0
+
+        def terminate(self):
+            raise AssertionError("the successful child should not be terminated")
+
+    process = SimpleNamespace()
+
+    def popen(*args, **kwargs):
+        captured["popen_env"] = kwargs["env"]
+        return process
+
+    monkeypatch.setattr(rl_train.subprocess, "Popen", popen)
+    monkeypatch.setitem(
+        rl_train._execute_rl_child.__globals__, "adopt_orphaned_descendants", lambda: None
+    )
+    monkeypatch.setattr(rl_train, "ChildOutputTail", lambda: object())
+    monkeypatch.setattr(rl_train, "VerlChildSilenceWatchdog", lambda *args, **kwargs: object())
+    monkeypatch.setattr(rl_train, "_GrpoSubprocessStream", _EmptyChildStream)
+    reward_runtime = SimpleNamespace(
+        observability=SimpleNamespace(parent_work=object()), wandb_link={}
+    )
+
+    assert (
+        rl_train._execute_rl_child(
+            python_bin="python",
+            overrides=[],
+            env_for_verl=child,
+            inp={},
+            state=rl_train._StepMetricState(),
+            reward_runtime=reward_runtime,
+            _reward_observability=dict,
+        )
+        == 0
+    )
+    assert captured["popen_env"] is child
+    assert captured["popen_env"]["PYTHONPATH"] == files["shim_dir"]
+    assert captured["stream_proc"] is process
+
+
 def test_grpo_finalization_carries_the_completed_step():
     """Regression (rl_train.py): write_train_meta emits `<phase>_train_done` and then the
     terminal `done`. Called without `step`, both land stepless and overwrite the stepped `rl_trained`

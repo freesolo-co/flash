@@ -236,31 +236,54 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     assert "UNDECLARED_API_KEY" not in env
 
 
-def test_build_worker_env_lists_declared_secret_names_for_the_redactors():
-    """declared runtime secrets can carry any name (AWS_SECRET_ACCESS_KEY, ...), so the redactors
-    cannot rely on the name-shape heuristic; the env carries the applied names explicitly."""
+def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypatch, tmp_path):
+    """the producer's exact applied-name metadata is also the verl child scrub contract."""
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.engine.worker.sft_train import _build_verl_child_env
     from flash.providers.runpod.serverless import build_worker_env
 
+    declared = (
+        "AWS_SECRET_ACCESS_KEY",
+        "CUDA_SECRET",
+        "FLA_CREDENTIAL",
+        "PYTHONPATH",
+        "WANDB_USER_SECRET",
+    )
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        environment=EnvironmentSpec(id="owner/env", secrets=("AWS_SECRET_ACCESS_KEY",)),
+        environment=EnvironmentSpec(id="owner/env", secrets=declared),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
-
-    env = build_worker_env(
-        spec,
-        0,
-        runtime_secrets={"AWS_SECRET_ACCESS_KEY": "aws-user", "WANDB_API_KEY": "user-wb"},
-    )
+    supplied = {name: f"synthetic-{name.lower()}" for name in declared}
+    supplied["WANDB_API_KEY"] = "synthetic-wandb-key"
+    env = build_worker_env(spec, 0, runtime_secrets=supplied)
 
     listed = set(env[SECRET_ENV_KEYS_ENV].split(","))
-    assert listed == {"AWS_SECRET_ACCESS_KEY", "WANDB_API_KEY"}
+    assert listed == {*declared, "WANDB_API_KEY"}
+    for name in listed:
+        assert name in env
     # a run with no applied secrets carries no list at all.
     assert SECRET_ENV_KEYS_ENV not in build_worker_env(_spec(), 0)
+
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("FLA_TILELANG", "0")
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    child = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=True)
+
+    for name in declared:
+        if name != "PYTHONPATH":
+            assert name not in child
+    assert child["PYTHONPATH"] == str(tmp_path)
+    assert SECRET_ENV_KEYS_ENV not in child
+    assert "WANDB_API_KEY" in child
+    assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert child["FLA_TILELANG"] == "0"
+    assert child["WANDB_MODE"] == "offline"
 
 
 def test_the_redactor_metadata_name_is_reserved_from_declared_secrets():
@@ -326,7 +349,7 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
     # os/re come from _train_body's own local imports, which the handler makes at the top of its
     # body; urllib.parse it imports itself.
     namespace: dict = {"os": os, "re": re}
-    for name in ("_needles", "_safe_detail"):
+    for name in ("_percent_pattern", "_needles", "_safe_detail"):
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
         exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
     safe_detail = namespace["_safe_detail"]
@@ -358,6 +381,181 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
     # and requiring a non-word character beyond it would leak "/a" out of "https://host/a/repo".
     path_like = {"S": "/a", "FLASH_SECRET_ENV_KEYS": "S"}
     assert safe_detail("https://host/a/repo", path_like) == "https://host<redacted>/repo"
+    punctuation = {"PIN": ".", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("module.py: failed at /tmp/a.py", punctuation) == (
+        "module.py: failed at /tmp/a.py"
+    )
+    assert safe_detail("token=.", punctuation) == "token=<redacted>"
+    shaped = {
+        "KEYED_PIN": ";",
+        "BEARER_PIN": "!",
+        "FLASH_SECRET_ENV_KEYS": "KEYED_PIN,BEARER_PIN",
+    }
+    assert safe_detail("token=;", shaped) == "token=<redacted>"
+    assert safe_detail("Bearer !", shaped) == "Bearer <redacted>"
+    overlapping_shape = {"KEY": "token", "PIN": ";", "FLASH_SECRET_ENV_KEYS": "KEY,PIN"}
+    detail = safe_detail("token=;", overlapping_shape)
+    assert detail == "<redacted>"
+    assert ";" not in detail
+    overlapping_shape.update({"KEY": "Bearer", "PIN": "!"})
+    detail = safe_detail("Bearer !", overlapping_shape)
+    assert detail == "<redacted>"
+    assert "!" not in detail
+    for secret, encoded in ((".", "%2E"), ("-", "%2D"), ("~", "%7E"), ("/", "%2f")):
+        mapping = {"PIN": secret, "FLASH_SECRET_ENV_KEYS": "PIN"}
+        assert safe_detail(f"encoded {encoded}", mapping) == "encoded <redacted>"
+    literal_case = {"PIN": "A/B", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("encoded A%2fB", literal_case) == "encoded <redacted>"
+    assert safe_detail("encoded a%2fb", literal_case) == "encoded a%2fb"
+    for secret, case_variant in (
+        ("A%2FB", "A%2fB"),
+        ("literal%2Fsecret", "literal%2fsecret"),
+    ):
+        mapping = {"PIN": secret, "FLASH_SECRET_ENV_KEYS": "PIN"}
+        assert safe_detail(f"literal {secret}", mapping) == "literal <redacted>"
+        assert safe_detail(f"literal {case_variant}", mapping) == f"literal {case_variant}"
+    overlap = {
+        "LONG_TOKEN": "a%2Fb%2B",
+        "SHORT_TOKEN": "a/b+c&d",
+        "FLASH_SECRET_ENV_KEYS": "LONG_TOKEN,SHORT_TOKEN",
+    }
+    detail = safe_detail("fetch failed for a%2Fb%2Bc%26d", overlap)
+    assert detail == "fetch failed for <redacted>"
+    for secret in ("a%2Fb%2B", "c%26d", "a/b+c&d"):
+        assert secret not in detail
+
+
+def test_all_worker_redactors_share_the_same_secret_corpus(monkeypatch):
+    """the canonical, bootstrap, and source-shipped redactors must stay behaviorally identical."""
+    import ast
+    import inspect
+    import os
+    import re
+    import textwrap
+
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+    from flash.providers._lifecycle.bootstrap_secrets import _safe_detail as bootstrap_safe_detail
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    namespace: dict = {"os": os, "re": re}
+    for name in ("_percent_pattern", "_needles", "_safe_detail"):
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    handler_safe_detail = namespace["_safe_detail"]
+
+    def canonical_safe_detail(text: str, secrets: dict[str, str]) -> str:
+        with monkeypatch.context() as environment:
+            environment.setenv(SECRET_ENV_KEYS_ENV, ",".join(secrets))
+            for key, secret in secrets.items():
+                environment.setenv(key, secret)
+            return sanitize_diagnostic(text, limit=1000)
+
+    multiline_secret = (
+        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
+    )
+    redacted_prefix = "token=<redacted> "
+    cases = [
+        (
+            "comma-delimited-semicolon",
+            "token=;, next",
+            {"PIN_SECRET": ";"},
+            "token=<redacted>, next",
+        ),
+        (
+            "comma-delimited-comma",
+            "token=,, next",
+            {"PIN_SECRET": ","},
+            "token=<redacted>, next",
+        ),
+        (
+            "comma-delimited-bearer",
+            "Bearer !, next",
+            {"PIN_SECRET": "!"},
+            "Bearer <redacted>, next",
+        ),
+        (
+            "semicolon-delimited-keyed",
+            "token=;; next",
+            {"PIN_SECRET": ";"},
+            "token=<redacted>; next",
+        ),
+        (
+            "semicolon-delimited-bearer",
+            "Bearer !; next",
+            {"PIN_SECRET": "!"},
+            "Bearer <redacted>; next",
+        ),
+        ("non-delimited-keyed", "token=;next", {"PIN_SECRET": ";"}, "token=;next"),
+        ("non-delimited-comma", "token=,next", {"PIN_SECRET": ","}, "token=,next"),
+        ("non-delimited-bearer", "Bearer !next", {"PIN_SECRET": "!"}, "Bearer !next"),
+        ("keyed-punctuation", "token=;", {"PIN_SECRET": ";"}, "token=<redacted>"),
+        ("bearer-punctuation", "Bearer !", {"PIN_SECRET": "!"}, "Bearer <redacted>"),
+        (
+            "ordinary-punctuation",
+            "module.py: values a,b; failed at /tmp/a.py",
+            {"PIN_SECRET": "."},
+            "module.py: values a,b; failed at /tmp/a.py",
+        ),
+        (
+            "encoded-literal-case",
+            "literal A%2FB",
+            {"PIN_SECRET": "A%2FB"},
+            "literal <redacted>",
+        ),
+        (
+            "encoded-literal-case-control",
+            "literal A%2fB",
+            {"PIN_SECRET": "A%2FB"},
+            "literal A%2fB",
+        ),
+        (
+            "encoded-raw-case",
+            "encoded A%2fB",
+            {"PIN_SECRET": "A/B"},
+            "encoded <redacted>",
+        ),
+        (
+            "encoded-raw-case-control",
+            "encoded a%2fb",
+            {"PIN_SECRET": "A/B"},
+            "encoded a%2fb",
+        ),
+        (
+            "multiline-component",
+            "ssh auth: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+            {"DEPLOY_SECRET": multiline_secret},
+            "ssh auth: <redacted>",
+        ),
+        (
+            "long-bounded-output",
+            "token=; " + "x" * 1200,
+            {"PIN_SECRET": ";"},
+            redacted_prefix + "x" * (1000 - len(redacted_prefix)),
+        ),
+    ]
+    for label, secret, encoded in (
+        ("dot", ".", "%2E"),
+        ("dash", "-", "%2D"),
+        ("tilde", "~", "%7E"),
+        ("slash", "/", "%2f"),
+    ):
+        cases.append(
+            (
+                f"generated-percent-{label}",
+                f"encoded {encoded}",
+                {"PIN_SECRET": secret},
+                "encoded <redacted>",
+            )
+        )
+
+    for label, text, secrets, expected in cases:
+        actual = (
+            canonical_safe_detail(text, secrets),
+            bootstrap_safe_detail(text, limit=1000, secrets=secrets),
+            handler_safe_detail(text, secrets, 1000),
+        )
+        assert actual == (expected, expected, expected), label
 
 
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
