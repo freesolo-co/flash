@@ -910,7 +910,7 @@ def test_validated_response_with_failed_ledger_settlement_never_redispatches(
             raw_body=_body(),
         )
     assert first.value.code == "outcome_unknown"
-    assert first.value.retryable is False
+    assert first.value.retryable is True
 
     with pytest.raises(teacher_broker.TeacherBrokerError) as replay:
         teacher_broker.complete_teacher_request(
@@ -930,6 +930,80 @@ def test_validated_response_with_failed_ledger_settlement_never_redispatches(
     ).fetchone()
     connection.close()
     assert row == ("outcome_unknown", 1, "ledger_completion_failed")
+
+
+def test_worker_retries_committed_success_settlement_exception_without_redispatch(
+    broker_db, monkeypatch
+):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    _service_ready(monkeypatch)
+    token = _issue(limits=_limits(max_upstream_attempts=teacher_broker.MAX_UPSTREAM_ATTEMPTS))
+    dispatches = []
+    request_ids = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return 200, _response()
+
+    real_complete = db.complete_teacher_request
+    raised_after_commit = False
+
+    def commit_then_raise(capability_id, request_id, **kwargs):
+        nonlocal raised_after_commit
+        result = real_complete(capability_id, request_id, **kwargs)
+        if kwargs["state"] == "succeeded" and not raised_after_commit:
+            raised_after_commit = True
+            raise sqlite3.OperationalError("ledger response lost after commit")
+        return result
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.body
+
+    def urlopen(_transport, request, timeout=None):
+        headers = {name.lower(): value for name, value in request.header_items()}
+        request_id = headers["x-flash-teacher-request-id"]
+        request_ids.append(request_id)
+        capability_token = headers["authorization"].removeprefix("Bearer ")
+        try:
+            result = teacher_broker.complete_teacher_request(
+                capability_token=capability_token,
+                request_id=request_id,
+                raw_body=request.data,
+            )
+        except teacher_broker.TeacherBrokerError as error:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                error.status_code,
+                error.code,
+                {},
+                io.BytesIO(json.dumps(error.payload()).encode()),
+            ) from error
+        return Response(json.dumps(result).encode())
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    monkeypatch.setattr(db, "complete_teacher_request", commit_then_raise)
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(token, "https://broker.example", "parasail-glm-52")
+
+    assert client.score("question", "answer")
+    assert raised_after_commit is True
+    assert len(request_ids) == 2
+    assert len(set(request_ids)) == 1
+    assert len(dispatches) == 1
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 422])

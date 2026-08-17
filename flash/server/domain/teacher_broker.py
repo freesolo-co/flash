@@ -799,6 +799,7 @@ def _settle_teacher_response(
         raise TeacherBrokerError(
             "outcome_unknown",
             status_code=503,
+            retryable=True,
             request_id=request_id,
         ) from exc
     return response.body
