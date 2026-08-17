@@ -814,7 +814,7 @@ def _write_training_guide(training: Path, project_id: str) -> None:
         )
 
 
-def _resolve_setup_identity(args) -> tuple[str | None, str, str, str, str]:
+def _resolve_setup_identity(args) -> tuple[str, str, str, str, str]:
     """Resolve the credential, project, and folder identity used by every setup phase."""
     from flash.client import ClientError
     from flash.client.config import load_credentials
