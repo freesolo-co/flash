@@ -274,6 +274,15 @@ def _smoke_answer(
     return content, finish, answer
 
 
+def _smoke_lora_request_adapter(result: dict, adapter_revision: str) -> str:
+    attested = result.get("_freesolo_lora_request_adapter")
+    if not attested:
+        raise ServingError("image deployment smoke omitted LoRA request adapter attestation")
+    if attested != adapter_revision:
+        raise ServingError("image deployment smoke returned the wrong LoRA request adapter")
+    return str(attested)
+
+
 def _thinking_tag_is_guaranteed(spec) -> bool:
     """Whether the catalog vouches that this model's chat template opens a thinking block.
 
@@ -463,7 +472,9 @@ def _run_deployment_smoke(
         expected_checkpoint=expected_checkpoint,
     )
     verify_turns = 1
+    attested_adapter_revision: str | None = None
     if image_capable:
+        attested_adapter_revision = _smoke_lora_request_adapter(result, serving_model)
         if answer.strip().upper() != "RED":
             raise ServingError("image deployment smoke did not identify the trusted red square")
         if constraint:
@@ -483,6 +494,7 @@ def _run_deployment_smoke(
                 serving_model=serving_model,
                 expected_checkpoint=expected_checkpoint,
             )
+            _smoke_lora_request_adapter(structured_result, serving_model)
             _validate_structured_smoke(
                 structured_answer,
                 constraint,
@@ -495,7 +507,7 @@ def _run_deployment_smoke(
         _validate_structured_smoke(answer, constraint, deadline=deadline, budget_s=budget_s)
     if time.monotonic() > deadline:
         raise _smoke_timeout_error(budget_s)
-    return {
+    smoke_result = {
         "verified_at": time.time(),
         "verify_kind": "fixed_image" if image_capable else "fixed_prompt",
         "verify_turns": verify_turns,
@@ -504,6 +516,9 @@ def _run_deployment_smoke(
         "thinking_tag": "<think>" in content or "</think>" in content,
         "verify_sample": answer[:160],
     }
+    if attested_adapter_revision is not None:
+        smoke_result["verify_lora_request_adapter"] = attested_adapter_revision
+    return smoke_result
 
 
 def _alias_reasoning_content(result: dict, run_id: str, adapter_revision: str) -> str:

@@ -910,6 +910,9 @@ def chat(
                 "checkpoint": resp.headers.get("X-Freesolo-Checkpoint"),
                 "hf_revision": resp.headers.get("X-Freesolo-HF-Revision"),
             }
+            payload["_freesolo_lora_request_adapter"] = resp.headers.get(
+                "X-Freesolo-LoRA-Request-Adapter"
+            )
         return payload
 
 

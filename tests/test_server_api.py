@@ -3494,6 +3494,8 @@ def test_deployment_transitions_report_persisted_states_and_skip_dry_run(api, mo
         "reconciling",
         "ready",
     ]
+    assert calls[-1].deployment["verify_kind"] == "fixed_image"
+    assert calls[-1].deployment["verify_lora_request_adapter"] == revision
 
 
 def test_deployment_reporting_skips_failed_cas_and_reports_failure(api, monkeypatch):
@@ -9863,6 +9865,7 @@ def _smoke_chat_result(
             "checkpoint": checkpoint,
             "hf_revision": hf_revision,
         },
+        "_freesolo_lora_request_adapter": revision,
     }
 
 

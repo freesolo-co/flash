@@ -580,11 +580,12 @@ def _smoke_response(
     finish_reason: str = "stop",
     *,
     reasoning_content: object = _MISSING_REASONING,
+    request_adapter: str | None = _SMOKE_REVISION,
 ) -> dict:
     message = {"content": content}
     if reasoning_content is not _MISSING_REASONING:
         message["reasoning_content"] = reasoning_content
-    return {
+    response = {
         "choices": [{"message": message, "finish_reason": finish_reason}],
         "freesolo": {
             "adapter_revision": _SMOKE_REVISION,
@@ -597,6 +598,9 @@ def _smoke_response(
             "hf_revision": "a" * 40,
         },
     }
+    if request_adapter is not None:
+        response["_freesolo_lora_request_adapter"] = request_adapter
+    return response
 
 
 def _run_smoke(spec, *, budget_s: float = 600.0):
@@ -665,10 +669,27 @@ def test_image_deployment_smoke_uses_valid_trusted_image_without_persisting_it(m
 
     assert out["verify_kind"] == "fixed_image"
     assert out["verify_turns"] == 1
+    assert out["verify_lora_request_adapter"] == _SMOKE_REVISION
     assert calls[0]["messages"] == serving_smoke._SMOKE_IMAGE_MESSAGES
     assert calls[0]["expected_checkpoint"] == "run-1"
     assert calls[0]["expected_adapter_revision"] == _SMOKE_REVISION
     assert serving_smoke._SMOKE_IMAGE_DATA_URI not in json.dumps(out)
+
+
+def test_image_deployment_smoke_rejects_missing_lora_request_attestation(monkeypatch):
+    response = _smoke_response("RED", request_adapter=None)
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+
+    with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+
+def test_image_deployment_smoke_rejects_mismatched_lora_request_adapter(monkeypatch):
+    response = _smoke_response("RED", request_adapter="run-1@final." + "b" * 40)
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+
+    with pytest.raises(ServingError, match="wrong LoRA request adapter"):
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
 
 
 def test_image_deployment_smoke_still_rejects_wrong_provenance(monkeypatch):
@@ -712,6 +733,39 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
     assert calls[0]["messages"] == serving_smoke._SMOKE_IMAGE_MESSAGES
     assert calls[1]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
     assert validated == [('{"answer":"4"}', {"json_object": True})]
+
+
+@pytest.mark.parametrize(
+    ("request_adapter", "error"),
+    [
+        (None, "omitted LoRA request adapter attestation"),
+        ("run-1@final." + "b" * 40, "wrong LoRA request adapter"),
+    ],
+)
+def test_image_structured_smoke_requires_attestation_on_second_request(
+    monkeypatch, request_adapter, error
+):
+    calls = 0
+
+    def fake_serve_chat(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _smoke_response("RED")
+        return _smoke_response('{"answer":"4"}', request_adapter=request_adapter)
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+
+    with pytest.raises(ServingError, match=error):
+        _run_smoke(
+            _smoke_spec(
+                thinking=False,
+                model="Qwen/Qwen3.5-4B",
+                constraint={"json_object": True},
+            )
+        )
+
+    assert calls == 2
 
 
 def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
@@ -952,6 +1006,43 @@ def test_chat_body_carries_stop_sequences(monkeypatch):
     sent.clear()
     _deploy.chat("run-1", [{"role": "user", "content": "hi"}])
     assert "stop" not in sent
+
+
+def test_chat_captures_lora_request_adapter_attestation_for_smoke(monkeypatch):
+    from flash.serve import deploy as _deploy
+
+    class _Resp:
+        status_code = 200
+        headers: ClassVar[dict[str, str]] = {
+            "X-Freesolo-Adapter-Revision": _SMOKE_REVISION,
+            "X-Freesolo-Checkpoint": "run-1",
+            "X-Freesolo-HF-Revision": "a" * 40,
+            "X-Freesolo-LoRA-Request-Adapter": _SMOKE_REVISION,
+        }
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "RED"}, "finish_reason": "stop"}]}
+
+    class _Client:
+        def post(self, url, json=None, headers=None, timeout=None):
+            return _Resp()
+
+    monkeypatch.setattr(_deploy, "serving_openai_base_url", lambda: "https://serving.example/v1")
+    monkeypatch.setattr(_deploy, "_internal_key_header", dict)
+    monkeypatch.setattr(_deploy, "_chat_http_client", _Client)
+
+    out = _deploy.chat(
+        _SMOKE_REVISION,
+        [{"role": "user", "content": "hi"}],
+        expected_checkpoint="run-1",
+        expected_adapter_revision=_SMOKE_REVISION,
+    )
+
+    assert out["choices"][0]["message"]["content"] == "RED"
+    assert out["_freesolo_lora_request_adapter"] == _SMOKE_REVISION
 
 
 def test_zero_completion_budget_resolves_to_thinking_recipe_default():
