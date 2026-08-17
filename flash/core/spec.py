@@ -567,6 +567,9 @@ class JobSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
+        for field_name in ("model_revision_auto", "model_revision_force_pin"):
+            if not isinstance(getattr(self, field_name), bool):
+                raise TypeError(f"{field_name} must be a boolean")
         if self.model_revision_force_pin:
             revision = self.model_revision
             if not self.model_revision_auto:

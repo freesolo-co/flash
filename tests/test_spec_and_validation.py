@@ -1512,6 +1512,75 @@ def test_model_revision_force_pin_is_internal_only_and_round_trips() -> None:
         spec_from_dict(_raw(model_revision_force_pin=True))
 
 
+@pytest.mark.parametrize("field_name", ["model_revision_auto", "model_revision_force_pin"])
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, 1.0, (), []])
+def test_model_revision_markers_require_bool_for_direct_construction_and_replace(
+    field_name, value
+) -> None:
+    revision = "a" * 40
+    constructor_kwargs = {"model_revision": revision}
+    if field_name == "model_revision_force_pin":
+        constructor_kwargs["model_revision_auto"] = True
+    constructor_kwargs[field_name] = value
+
+    with pytest.raises(TypeError, match=rf"{field_name} must be a boolean"):
+        JobSpec(**constructor_kwargs)
+
+    valid = JobSpec(model_revision=revision, model_revision_auto=True)
+    with pytest.raises(TypeError, match=rf"{field_name} must be a boolean"):
+        replace(valid, **{field_name: value})
+
+
+@pytest.mark.parametrize(
+    ("model_revision_auto", "model_revision_force_pin"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_model_revision_markers_accept_valid_bool_states(
+    model_revision_auto, model_revision_force_pin
+) -> None:
+    spec = JobSpec(
+        model_revision="a" * 40,
+        model_revision_auto=model_revision_auto,
+        model_revision_force_pin=model_revision_force_pin,
+    )
+
+    assert spec.model_revision_auto is model_revision_auto
+    assert spec.model_revision_force_pin is model_revision_force_pin
+    assert replace(spec) == spec
+
+
+@pytest.mark.parametrize(
+    ("auto_raw", "force_raw", "expected"),
+    [
+        ("true", "false", (True, False)),
+        (1, 0, (True, False)),
+        (0, 0, (False, False)),
+        ("true", "true", (True, True)),
+    ],
+)
+def test_model_revision_marker_from_dict_coercion_and_roundtrip_are_unchanged(
+    auto_raw, force_raw, expected
+) -> None:
+    payload = JobSpec(model_revision="a" * 40).to_internal_dict()
+    payload.update(model_revision_auto=auto_raw, model_revision_force_pin=force_raw)
+
+    restored = JobSpec.from_dict(payload)
+
+    assert (restored.model_revision_auto, restored.model_revision_force_pin) == expected
+    assert JobSpec.from_dict(restored.to_internal_dict()) == restored
+
+
+def test_historical_internal_model_revision_marker_roundtrip_without_force_pin() -> None:
+    payload = JobSpec(model_revision="a" * 40, model_revision_auto=True).to_internal_dict()
+    payload.pop("model_revision_force_pin")
+
+    restored = JobSpec.from_dict(payload)
+
+    assert restored.model_revision_auto is True
+    assert restored.model_revision_force_pin is False
+    assert JobSpec.from_dict(restored.to_internal_dict()) == restored
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

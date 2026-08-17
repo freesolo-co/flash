@@ -496,10 +496,11 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
     # record who chose the pin, not just its value. a forced pin is supplied by the internal runner,
     # so it retains auto provenance while the one-shot verification request is cleared before any
     # prepared public or worker spec is persisted. an authored pin remains authored.
+    auto_assigned = True if spec.model_revision_force_pin else not authored
     return replace(
         spec,
         model_revision=resolved,
-        model_revision_auto=spec.model_revision_force_pin or not authored,
+        model_revision_auto=auto_assigned,
         model_revision_force_pin=False,
     )
 
