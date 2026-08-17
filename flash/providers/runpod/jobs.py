@@ -307,7 +307,8 @@ def submit_run(
     attempt: int = 0,
     runtime_secrets: dict[str, str] | None = None,
     on_last_gpu: bool = False,
-    source_snapshot: dict | None = None,
+    *,
+    source_snapshot: dict,
     deadline_at: float | None = None,
 ) -> PollResult:
     """Deploy, submit, persist handle via ``on_handle``, and poll to completion."""
@@ -319,6 +320,7 @@ def submit_run(
     attempt_id = _attempt_int(attempt)
     if attempt_id is None:
         raise ValueError("RunPod attempt identity is invalid")
+    source_descriptor = parse_descriptor(source_snapshot)
     timeout_s = int(require_create_allowance(deadline_at))
     # Per-attempt suffix so a retry lands on a fresh endpoint, not the same throttled/sick host.
     suffix = _run_suffix(spec.run_id)
@@ -349,7 +351,7 @@ def submit_run(
         "seed": spec.seed,
         "env": worker_env,
         "extra_pip": extra_pip,
-        "source_snapshot": parse_descriptor(source_snapshot).to_dict(),
+        "source_snapshot": source_descriptor.to_dict(),
         "deadline_at": deadline_at,
     }
     try:

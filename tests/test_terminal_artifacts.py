@@ -18,16 +18,10 @@ from flash.providers._lifecycle.terminal_artifacts import (
     read_within,
     resolve_terminal_artifacts,
 )
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 IDENTITY = AttemptIdentity(run_id="run-1", attempt=0, launch_floor=100.0)
-SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _marker(**overrides) -> str:

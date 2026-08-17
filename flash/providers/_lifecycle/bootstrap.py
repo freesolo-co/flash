@@ -547,9 +547,6 @@ def build_worker_env(payload: dict) -> dict:
     env["ATTEMPT"] = str(attempt)
     # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
-    descriptor = _source_descriptor(payload)
-    env["FLASH_SOURCE_SHA256"] = descriptor.sha256
-    env["FLASH_SOURCE_FORMAT_VERSION"] = str(_source_snapshot.FORMAT_VERSION)
     code_dir = _code_dir(payload)
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return env
@@ -594,8 +591,11 @@ def fetch_code(payload: dict) -> None:
             else RuntimeError
         )
         raise error_type("failed to fetch the pinned flash source snapshot") from None
-    archive = _source_snapshot.read_archive_file(archive_path, descriptor)
-    _source_snapshot.materialize_verified_archive(archive, descriptor, _code_dir(payload))
+    _source_snapshot.materialize_verified_archive_file(
+        archive_path,
+        descriptor,
+        _code_dir(payload),
+    )
 
 
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:

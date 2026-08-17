@@ -17,17 +17,11 @@ import io
 import pytest
 
 from flash.core.spec import JobSpec
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _SHA = "a" * 40
 _NEWER_SHA = "b" * 40
-_SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _env_spec(resolved_sha: str = "", **extra) -> JobSpec:

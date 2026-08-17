@@ -35,6 +35,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from flash.client.http import ApiClient, ApiError
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 # A representative managed-run spec -- the shape the freesolo bridge / SDK
 # submits: catalog model, Freesolo environment id, and an HF repo for artifacts.
@@ -48,14 +49,7 @@ SPEC = {
 }
 
 _USER_PREFIX = "fslo-user-"
-_SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 _counter = itertools.count()
 
 

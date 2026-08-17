@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-import hashlib
 import io
-import json
 import stat
 import zipfile
 from pathlib import Path
 
 import pytest
 
+import flash.source_snapshot as source_snapshot
 from flash.source_snapshot import (
-    MANIFEST_NAME,
+    SourceSnapshotDescriptor,
     SourceSnapshotError,
     attempt_materialization_path,
     build_source_archive,
     descriptor_for_archive,
-    materialize_verified_archive,
+    materialize_verified_archive_file,
+    parse_descriptor,
     read_verified_archive,
 )
 
@@ -36,40 +36,42 @@ def _package(tmp_path: Path) -> Path:
     return package
 
 
-def _payload(archive: bytes) -> dict[str, bytes]:
-    with zipfile.ZipFile(io.BytesIO(archive)) as source:
-        return {info.filename: source.read(info.filename) for info in source.infolist()}
-
-
-def _archive(entries: list[tuple[str, bytes, int | None]]) -> bytes:
+def _archive(
+    entries: list[tuple[str, bytes, int | None]],
+    *,
+    compression: int = zipfile.ZIP_DEFLATED,
+) -> bytes:
     output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as target:
+    with zipfile.ZipFile(output, "w", compression, compresslevel=9) as target:
         for name, data, mode in entries:
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.create_system = 3
             info.external_attr = (mode if mode is not None else stat.S_IFREG | 0o644) << 16
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = compression
             target.writestr(info, data)
     return output.getvalue()
 
 
-def _repack(payload: dict[str, bytes]) -> bytes:
-    return _archive([(name, data, None) for name, data in sorted(payload.items())])
+def _payload(archive: bytes) -> dict[str, bytes]:
+    with zipfile.ZipFile(io.BytesIO(archive)) as source:
+        return {info.filename: source.read(info) for info in source.infolist()}
 
 
-def test_archive_is_deterministic_and_manifest_is_canonical(tmp_path: Path) -> None:
+def test_archive_is_deterministic_and_contains_only_canonical_package_files(tmp_path: Path) -> None:
     package = _package(tmp_path)
     first = build_source_archive(package_dir=package)
     second = build_source_archive(package_dir=package)
     assert first == second
 
-    payload = _payload(first)
-    manifest = json.loads(payload[MANIFEST_NAME])
-    assert [member["path"] for member in manifest["members"]] == [
-        "flash/__init__.py",
-        "flash/worker.py",
-    ]
-    assert payload[MANIFEST_NAME].endswith(b"\n")
+    with zipfile.ZipFile(io.BytesIO(first)) as archive:
+        infos = archive.infolist()
+        assert [info.filename for info in infos] == ["flash/__init__.py", "flash/worker.py"]
+        assert all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in infos)
+        assert all(stat.S_ISREG(info.external_attr >> 16) for info in infos)
+    assert read_verified_archive(first, descriptor_for_archive(first, REVISION)) == {
+        "flash/__init__.py": b"value = 1\n",
+        "flash/worker.py": b"def run():\n    return 1\n",
+    }
 
 
 @pytest.mark.parametrize("mutation", ["same_length", "truncated"])
@@ -86,46 +88,10 @@ def test_external_digest_rejects_byte_mutation(tmp_path: Path, mutation: str) ->
         read_verified_archive(sabotaged, descriptor)
 
 
-def test_member_set_rejects_missing_and_extra(tmp_path: Path) -> None:
-    archive = build_source_archive(package_dir=_package(tmp_path))
-    payload = _payload(archive)
-    descriptor = descriptor_for_archive(archive, REVISION)
-
-    missing = dict(payload)
-    missing.pop("flash/worker.py")
-    missing_archive = _repack(missing)
-    with pytest.raises(SourceSnapshotError):
-        read_verified_archive(
-            missing_archive,
-            descriptor_for_archive(missing_archive, REVISION),
-        )
-
-    extra = dict(payload)
-    extra["flash/extra.py"] = b"extra = True\n"
-    extra_archive = _repack(extra)
-    with pytest.raises(SourceSnapshotError):
-        read_verified_archive(extra_archive, descriptor_for_archive(extra_archive, REVISION))
-
-    assert descriptor.sha256 == hashlib.sha256(archive).hexdigest()
-
-
-def test_consistent_archive_and_manifest_replacement_fails_external_digest(tmp_path: Path) -> None:
-    archive = build_source_archive(package_dir=_package(tmp_path))
-    descriptor = descriptor_for_archive(archive, REVISION)
-    payload = _payload(archive)
-    replacement = b"value = 2\n"
-    payload["flash/__init__.py"] = replacement
-    manifest = json.loads(payload[MANIFEST_NAME])
-    for member in manifest["members"]:
-        if member["path"] == "flash/__init__.py":
-            member["size"] = len(replacement)
-            member["sha256"] = hashlib.sha256(replacement).hexdigest()
-    payload[MANIFEST_NAME] = (
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode()
-    replaced = _repack(payload)
-    with pytest.raises(SourceSnapshotError, match="digest mismatch"):
-        read_verified_archive(replaced, descriptor)
+def test_empty_archive_is_rejected() -> None:
+    archive = _archive([])
+    with pytest.raises(SourceSnapshotError, match="no members"):
+        read_verified_archive(archive, descriptor_for_archive(archive, REVISION))
 
 
 @pytest.mark.parametrize(
@@ -134,30 +100,59 @@ def test_consistent_archive_and_manifest_replacement_fails_external_digest(tmp_p
         ("../escape.py", None),
         ("/absolute.py", None),
         ("flash\\alias.py", None),
+        ("outside.py", None),
         ("flash/dir/", stat.S_IFDIR | 0o755),
         ("flash/link.py", stat.S_IFLNK | 0o777),
+        ("flash/device", stat.S_IFCHR | 0o600),
     ],
 )
-def test_unsafe_directory_and_symlink_members_are_rejected(
-    tmp_path: Path, name: str, mode: int | None
+def test_unsafe_outside_directory_symlink_and_nonregular_members_are_rejected(
+    name: str,
+    mode: int | None,
 ) -> None:
-    archive = build_source_archive(package_dir=_package(tmp_path))
-    payload = _payload(archive)
-    entries = [(member, data, None) for member, data in sorted(payload.items())]
-    entries.append((name, b"target", mode))
-    sabotaged = _archive(entries)
+    archive = _archive([("flash/worker.py", b"ok", None), (name, b"target", mode)])
     with pytest.raises(SourceSnapshotError):
-        read_verified_archive(sabotaged, descriptor_for_archive(sabotaged, REVISION))
+        read_verified_archive(archive, descriptor_for_archive(archive, REVISION))
 
 
-def test_duplicate_archive_member_is_rejected(tmp_path: Path) -> None:
-    archive = build_source_archive(package_dir=_package(tmp_path))
-    payload = _payload(archive)
-    entries = [(member, data, None) for member, data in sorted(payload.items())]
-    entries.append(("flash/worker.py", payload["flash/worker.py"], None))
-    duplicate = _archive(entries)
+def test_duplicate_archive_member_is_rejected() -> None:
+    archive = _archive(
+        [
+            ("flash/worker.py", b"first", None),
+            ("flash/worker.py", b"second", None),
+        ]
+    )
     with pytest.raises(SourceSnapshotError, match="duplicate"):
-        read_verified_archive(duplicate, descriptor_for_archive(duplicate, REVISION))
+        read_verified_archive(archive, descriptor_for_archive(archive, REVISION))
+
+
+def test_member_crc_is_verified() -> None:
+    archive = _archive(
+        [("flash/worker.py", b"payload", None)],
+        compression=zipfile.ZIP_STORED,
+    )
+    with zipfile.ZipFile(io.BytesIO(archive)) as source:
+        info = source.infolist()[0]
+        data_offset = info.header_offset + len(info.FileHeader())
+    corrupted = bytearray(archive)
+    corrupted[data_offset] ^= 1
+    corrupted_archive = bytes(corrupted)
+    with pytest.raises(SourceSnapshotError, match="readable zip"):
+        read_verified_archive(
+            corrupted_archive,
+            descriptor_for_archive(corrupted_archive, REVISION),
+        )
+
+
+def test_typed_descriptors_use_strict_validation() -> None:
+    invalid = SourceSnapshotDescriptor(
+        archive_path="source/not-the-digest/flash-source.zip",
+        sha256="a" * 64,
+        size=123,
+        revision="b" * 40,
+    )
+    with pytest.raises(SourceSnapshotError, match="archive path"):
+        parse_descriptor(invalid)
 
 
 def test_materialization_path_binds_run_and_attempt() -> None:
@@ -175,15 +170,32 @@ def test_materialization_path_binds_run_and_attempt() -> None:
             attempt_materialization_path("/runcode", "run-a", attempt)
 
 
-def test_materialization_is_atomic_and_leaves_no_partial_tree(tmp_path: Path) -> None:
+def test_file_materialization_verifies_once_and_leaves_no_partial_tree(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     archive = build_source_archive(package_dir=_package(tmp_path))
     descriptor = descriptor_for_archive(archive, REVISION)
+    archive_path = tmp_path / "source.zip"
+    archive_path.write_bytes(archive)
     destination = tmp_path / "materialized"
-    materialize_verified_archive(archive, descriptor, destination)
+    verify_calls = 0
+    original_verify = source_snapshot.read_verified_archive
+
+    def counted_verify(data, parsed_descriptor):
+        nonlocal verify_calls
+        verify_calls += 1
+        return original_verify(data, parsed_descriptor)
+
+    monkeypatch.setattr(source_snapshot, "read_verified_archive", counted_verify)
+    materialize_verified_archive_file(archive_path, descriptor, destination)
+    assert verify_calls == 1
     assert (destination / "flash" / "worker.py").read_text().startswith("def run")
 
+    broken_path = tmp_path / "broken.zip"
+    broken_path.write_bytes(archive + b"extra")
     broken_destination = tmp_path / "broken"
-    with pytest.raises(SourceSnapshotError):
-        materialize_verified_archive(archive[:-1], descriptor, broken_destination)
+    with pytest.raises(SourceSnapshotError, match="size mismatch"):
+        materialize_verified_archive_file(broken_path, descriptor, broken_destination)
     assert not broken_destination.exists()
     assert not list(tmp_path.glob(".flash-source-*"))

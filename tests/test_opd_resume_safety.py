@@ -20,16 +20,10 @@ from flash.teacher.retry_contract import (
     validate_opd_resume_state_metadata,
 )
 from tests._helpers.runner import provisioned_status
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
-_SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 @pytest.fixture(autouse=True)

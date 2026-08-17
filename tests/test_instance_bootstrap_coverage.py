@@ -25,15 +25,9 @@ import pytest
 
 from flash.providers._lifecycle import bootstrap as b
 from flash.providers._lifecycle.deadline import deadline_kwargs
+from tests._helpers.source_snapshot import valid_source_snapshot
 
-SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _sleeping_upload_child():
@@ -492,7 +486,7 @@ def _source_payload() -> dict:
     }
 
 
-def test_fetch_code_uses_exact_revision_and_verifies_before_materializing(monkeypatch):
+def test_fetch_code_uses_exact_revision_and_verified_file_materialization(monkeypatch):
     seen = {}
     events = []
 
@@ -504,14 +498,9 @@ def test_fetch_code_uses_exact_revision_and_verifies_before_materializing(monkey
     _install_fake_hf(monkeypatch, hf_hub_download=download)
     monkeypatch.setattr(
         b._source_snapshot,
-        "read_archive_file",
-        lambda path, descriptor: events.append(("verify", path, descriptor.revision)) or b"archive",
-    )
-    monkeypatch.setattr(
-        b._source_snapshot,
-        "materialize_verified_archive",
-        lambda archive, descriptor, destination: events.append(
-            ("materialize", archive, descriptor.sha256, destination)
+        "materialize_verified_archive_file",
+        lambda path, descriptor, destination: events.append(
+            ("materialize", path, descriptor.sha256, destination)
         ),
     )
 
@@ -519,9 +508,10 @@ def test_fetch_code_uses_exact_revision_and_verifies_before_materializing(monkey
 
     assert seen["filename"] == SOURCE_SNAPSHOT["archive_path"]
     assert seen["revision"] == SOURCE_SNAPSHOT["revision"]
-    assert events[0] == "download"
-    assert events[1][0] == "verify"
-    assert events[2][0] == "materialize"
+    assert events == [
+        "download",
+        ("materialize", "/tmp/archive.zip", SOURCE_SNAPSHOT["sha256"], "/runcode/run-1-attempt-0"),
+    ]
 
 
 def test_fetch_code_distinguishes_transport_from_integrity_failure(monkeypatch):
@@ -537,7 +527,7 @@ def test_fetch_code_distinguishes_transport_from_integrity_failure(monkeypatch):
     monkeypatch.setattr(b, "_hf_call", lambda call, *_args, **_kwargs: call())
     monkeypatch.setattr(
         b._source_snapshot,
-        "read_archive_file",
+        "materialize_verified_archive_file",
         lambda *_args: (_ for _ in ()).throw(
             b._source_snapshot.SourceSnapshotError("integrity failed")
         ),

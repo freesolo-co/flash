@@ -14,6 +14,8 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from tests._helpers.source_snapshot import valid_source_snapshot
+
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
@@ -26,14 +28,7 @@ SPEC = {
 }
 
 _USER_PREFIX = "fslo-user-"
-_SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _identity_for_token(token: str) -> dict[str, str]:

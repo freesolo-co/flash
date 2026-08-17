@@ -18,15 +18,9 @@ import time
 import pytest
 
 from flash.core.spec import JobSpec
+from tests._helpers.source_snapshot import valid_source_snapshot
 
-SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _capsule_member(member: str) -> str:
@@ -894,16 +888,15 @@ def test_bootstrap_fetch_code_uses_pinned_verified_archive(monkeypatch, tmp_path
         events.append(("download", kwargs))
         return str(archive_path)
 
-    def fake_read(path, descriptor):
-        events.append(("verify", path, descriptor.to_dict()))
-        return b"verified-archive"
-
-    def fake_materialize(archive, descriptor, destination):
-        events.append(("materialize", archive, descriptor.to_dict(), destination))
+    def fake_materialize(path, descriptor, destination):
+        events.append(("verify-materialize", path, descriptor.to_dict(), destination))
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
-    monkeypatch.setattr(lb._source_snapshot, "read_archive_file", fake_read)
-    monkeypatch.setattr(lb._source_snapshot, "materialize_verified_archive", fake_materialize)
+    monkeypatch.setattr(
+        lb._source_snapshot,
+        "materialize_verified_archive_file",
+        fake_materialize,
+    )
     created_at = time.time()
 
     lb.fetch_code(
@@ -929,10 +922,9 @@ def test_bootstrap_fetch_code_uses_pinned_verified_archive(monkeypatch, tmp_path
             "token": "tok",
         },
     )
-    assert events[1][0] == "verify"
-    assert events[2] == (
-        "materialize",
-        b"verified-archive",
+    assert events[1] == (
+        "verify-materialize",
+        str(archive_path),
         SOURCE_SNAPSHOT,
         str(tmp_path / "run-1-attempt-2"),
     )

@@ -21,17 +21,11 @@ from types import SimpleNamespace
 import pytest
 
 from tests._helpers.profile import satisfy_sft_profile
+from tests._helpers.source_snapshot import valid_source_snapshot
 from tests._helpers.teacher import configure_managed_teacher
 
 _PROVIDERS = ("runpod", "lambda", "vast")
-_SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 # the only managed class all three providers stock. a parity test needs one class every provider can
 # actually provision, or the spec is rejected on catalog grounds before parity is ever exercised.
 _TRI_PROVIDER_GPU = "H100"

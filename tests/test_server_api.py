@@ -20,15 +20,9 @@ import pytest
 
 from flash import runner as _orch
 from flash.server.platform import db as _db_mod
+from tests._helpers.source_snapshot import valid_source_snapshot
 
-_SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient

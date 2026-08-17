@@ -23,19 +23,13 @@ import pytest
 
 from flash.core.spec import JobSpec
 from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 # Infra-shaped failure categories the retry loop resumes on (see lifecycle._submit_seed_supervised).
 # Mirrors the literal tuple in the source; this test is the guard that the set doesn't silently drift.
 INFRA_SHAPED = ("stalled", "no_capacity", "poll_error", "job_preempted")
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
-_SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 class _RecordingHfApi:

@@ -10,14 +10,9 @@ import tempfile
 
 import pytest
 
-SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+from tests._helpers.source_snapshot import valid_source_snapshot
+
+SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def test_run_job_persists_flash_metrics(monkeypatch):

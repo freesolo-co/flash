@@ -9,16 +9,10 @@ import tempfile
 import pytest
 
 from tests._helpers.runner import provisioned_status
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
-_SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
@@ -179,6 +173,7 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda spec: spec)
+    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
 
     seen: dict[str, float] = {}
 

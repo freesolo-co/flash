@@ -16,15 +16,9 @@ import pytest
 from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 from flash.server.domain import teacher_broker
 from flash.server.platform import db
+from tests._helpers.source_snapshot import valid_source_snapshot
 
-_SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 @pytest.fixture(autouse=True)

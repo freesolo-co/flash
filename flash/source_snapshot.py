@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import os
 import re
 import shutil
@@ -16,7 +15,6 @@ from pathlib import Path
 
 KIND = "flash-source-snapshot"
 FORMAT_VERSION = 1
-MANIFEST_NAME = "flash_source_snapshot.json"
 ATTESTATION_KIND = "flash-source-attestation"
 ATTESTATION_FORMAT_VERSION = 1
 PUBLIC_PROVENANCE_KEY = "source_provenance"
@@ -25,8 +23,6 @@ TERMINAL_ATTESTATION_KEY = "_flash_source_attestation"
 _DESCRIPTOR_FIELDS = frozenset(
     {"kind", "format_version", "archive_path", "sha256", "size", "revision"}
 )
-_MANIFEST_FIELDS = frozenset({"kind", "format_version", "members"})
-_MEMBER_FIELDS = frozenset({"path", "size", "sha256"})
 _ATTESTATION_FIELDS = frozenset(
     {"kind", "format_version", "sha256", "revision", "run_id", "attempt"}
 )
@@ -59,13 +55,6 @@ _TRANSIENT_NETWORK_ERROR_NAMES = frozenset(
 
 class SourceSnapshotError(RuntimeError):
     """A source snapshot failed strict construction or verification."""
-
-
-@dataclass(frozen=True)
-class SourceMember:
-    path: str
-    size: int
-    sha256: str
 
 
 @dataclass(frozen=True)
@@ -151,7 +140,7 @@ def canonical_archive_path(digest: str) -> str:
 
 def parse_descriptor(raw: object) -> SourceSnapshotDescriptor:
     if isinstance(raw, SourceSnapshotDescriptor):
-        return raw
+        raw = raw.to_dict()
     if not isinstance(raw, dict):
         raise SourceSnapshotError("source snapshot descriptor must be an object")
     if set(raw) != _DESCRIPTOR_FIELDS:
@@ -295,15 +284,6 @@ def _enumerate_package_files(package_dir: Path) -> dict[str, bytes]:
     return contents
 
 
-def _manifest_bytes(contents: dict[str, bytes]) -> bytes:
-    members = [
-        {"path": path, "size": len(data), "sha256": sha256_bytes(data)}
-        for path, data in sorted(contents.items())
-    ]
-    payload = {"kind": KIND, "format_version": FORMAT_VERSION, "members": members}
-    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-
-
 def _zip_bytes(payload: dict[str, bytes]) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
@@ -319,50 +299,7 @@ def _zip_bytes(payload: dict[str, bytes]) -> bytes:
 def build_source_archive(*, package_dir: Path | None = None) -> bytes:
     if package_dir is None:
         package_dir = Path(__file__).resolve().parent
-    contents = _enumerate_package_files(package_dir)
-    payload = dict(contents)
-    payload[MANIFEST_NAME] = _manifest_bytes(contents)
-    return _zip_bytes(payload)
-
-
-def _parse_manifest(raw: bytes) -> tuple[SourceMember, ...]:
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise SourceSnapshotError("source snapshot manifest is not valid utf-8 json") from exc
-    if not isinstance(payload, dict) or set(payload) != _MANIFEST_FIELDS:
-        raise SourceSnapshotError("source snapshot manifest schema is invalid")
-    if payload["kind"] != KIND or payload["format_version"] != FORMAT_VERSION:
-        raise SourceSnapshotError("unsupported source snapshot manifest protocol")
-    raw_members = payload["members"]
-    if not isinstance(raw_members, list) or not raw_members:
-        raise SourceSnapshotError("source snapshot manifest has no members")
-    members: list[SourceMember] = []
-    seen: set[str] = set()
-    for raw_member in raw_members:
-        if not isinstance(raw_member, dict) or set(raw_member) != _MEMBER_FIELDS:
-            raise SourceSnapshotError("source snapshot manifest member schema is invalid")
-        path = validate_member_path(raw_member["path"])
-        if path == MANIFEST_NAME or path in seen:
-            raise SourceSnapshotError(f"source snapshot manifest duplicates {path!r}")
-        if not path.startswith("flash/"):
-            raise SourceSnapshotError(
-                f"source snapshot member is outside the flash package: {path!r}"
-            )
-        seen.add(path)
-        size = raw_member["size"]
-        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
-            raise SourceSnapshotError(f"source snapshot member {path!r} has an invalid size")
-        members.append(
-            SourceMember(
-                path=path,
-                size=size,
-                sha256=_require_digest(raw_member["sha256"], label=f"member {path!r} digest"),
-            )
-        )
-    if [member.path for member in members] != sorted(member.path for member in members):
-        raise SourceSnapshotError("source snapshot manifest members are not canonically ordered")
-    return tuple(members)
+    return _zip_bytes(_enumerate_package_files(package_dir))
 
 
 def read_verified_archive(
@@ -377,47 +314,36 @@ def read_verified_archive(
     try:
         with zipfile.ZipFile(io.BytesIO(archive)) as source_zip:
             infos = source_zip.infolist()
+            if not infos:
+                raise SourceSnapshotError("source snapshot archive contains no members")
             names = [info.filename for info in infos]
             if len(names) != len(set(names)):
                 raise SourceSnapshotError("source snapshot archive contains duplicate members")
+            payload: dict[str, bytes] = {}
             for info in infos:
-                validate_member_path(info.filename)
+                name = validate_member_path(info.filename)
+                if not name.startswith("flash/"):
+                    raise SourceSnapshotError(
+                        f"source snapshot member is outside the flash package: {name!r}"
+                    )
                 mode = info.external_attr >> 16
                 if info.is_dir():
                     raise SourceSnapshotError(
-                        f"source snapshot archive contains a directory entry: {info.filename!r}"
+                        f"source snapshot archive contains a directory entry: {name!r}"
                     )
                 if stat.S_ISLNK(mode):
                     raise SourceSnapshotError(
-                        f"source snapshot archive contains a symlink: {info.filename!r}"
+                        f"source snapshot archive contains a symlink: {name!r}"
                     )
                 if mode and not stat.S_ISREG(mode):
                     raise SourceSnapshotError(
-                        f"source snapshot archive contains a non-regular member: {info.filename!r}"
+                        f"source snapshot archive contains a non-regular member: {name!r}"
                     )
-            if MANIFEST_NAME not in names:
-                raise SourceSnapshotError("source snapshot archive has no manifest")
-            payload = {name: source_zip.read(name) for name in names}
+                payload[name] = source_zip.read(info)
     except (zipfile.BadZipFile, RuntimeError) as exc:
         if isinstance(exc, SourceSnapshotError):
             raise
         raise SourceSnapshotError("source snapshot archive is not a readable zip") from exc
-    members = _parse_manifest(payload.pop(MANIFEST_NAME))
-    declared = {member.path for member in members}
-    present = set(payload)
-    if declared != present:
-        missing = sorted(declared - present)
-        extra = sorted(present - declared)
-        detail = []
-        if missing:
-            detail.append(f"missing {', '.join(missing)}")
-        if extra:
-            detail.append(f"extra {', '.join(extra)}")
-        raise SourceSnapshotError("source snapshot member set mismatch: " + "; ".join(detail))
-    for member in members:
-        data = payload[member.path]
-        if len(data) != member.size or sha256_bytes(data) != member.sha256:
-            raise SourceSnapshotError(f"source snapshot member integrity mismatch: {member.path!r}")
     return payload
 
 
@@ -429,12 +355,7 @@ def attempt_materialization_path(root: Path | str, run_id: str, attempt: int) ->
     return Path(root) / f"{run_id}-attempt-{attempt}"
 
 
-def materialize_verified_archive(
-    archive: bytes,
-    descriptor: SourceSnapshotDescriptor | dict,
-    destination: Path | str,
-) -> Path:
-    contents = read_verified_archive(archive, descriptor)
+def _materialize_contents(contents: dict[str, bytes], destination: Path | str) -> Path:
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
@@ -453,11 +374,14 @@ def materialize_verified_archive(
     return destination
 
 
-def read_archive_file(path: Path | str, descriptor: SourceSnapshotDescriptor | dict) -> bytes:
+def materialize_verified_archive_file(
+    path: Path | str,
+    descriptor: SourceSnapshotDescriptor | dict,
+    destination: Path | str,
+) -> Path:
     parsed = parse_descriptor(descriptor)
     with open(path, "rb") as source:
         archive = source.read(parsed.size + 1)
     if len(archive) != parsed.size:
         raise SourceSnapshotError("source snapshot archive size mismatch")
-    read_verified_archive(archive, parsed)
-    return archive
+    return _materialize_contents(read_verified_archive(archive, parsed), destination)

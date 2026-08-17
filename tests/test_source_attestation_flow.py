@@ -9,15 +9,9 @@ from flash.source_snapshot import (
     TERMINAL_ATTESTATION_KEY,
     source_attestation,
 )
+from tests._helpers.source_snapshot import valid_source_snapshot
 
-SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _status(*, attempt: int = 2, source_snapshot: dict | None = SOURCE_SNAPSHOT):

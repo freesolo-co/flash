@@ -519,7 +519,6 @@ def _train_body(input_data: dict) -> dict:
                     else RuntimeError
                 )
                 raise error_type("failed to fetch the pinned flash source snapshot") from None
-            archive = _source_snapshot.read_archive_file(archive_path, descriptor)
             destination = str(
                 _source_snapshot.attempt_materialization_path(
                     "/runcode",
@@ -527,7 +526,11 @@ def _train_body(input_data: dict) -> dict:
                     input_data.get("attempt"),
                 )
             )
-            _source_snapshot.materialize_verified_archive(archive, descriptor, destination)
+            _source_snapshot.materialize_verified_archive_file(
+                archive_path,
+                descriptor,
+                destination,
+            )
             return destination
 
         descriptor = _source_descriptor()
@@ -561,8 +564,6 @@ def _train_body(input_data: dict) -> dict:
         env["PHASE"] = input_data["phase"]
         env["SEED"] = str(input_data["seed"])
         env["ATTEMPT"] = str(input_data["attempt"])
-        env["FLASH_SOURCE_SHA256"] = descriptor.sha256
-        env["FLASH_SOURCE_FORMAT_VERSION"] = str(_source_snapshot.FORMAT_VERSION)
         env["PYTHONPATH"] = code_dir + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )

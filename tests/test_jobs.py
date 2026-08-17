@@ -13,16 +13,10 @@ from types import SimpleNamespace
 import pytest
 
 from tests._helpers.runner import provisioned_status
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
-_SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _live_clock_handle(jobs):
@@ -1587,14 +1581,7 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
     )
     monkeypatch.setattr(jobs, "poll_job", lambda *a, **k: jobs.PollResult(True, metrics={}))
 
-    source_snapshot = {
-        "kind": "flash-source-snapshot",
-        "format_version": 1,
-        "archive_path": f"source/{'a' * 64}/flash-source.zip",
-        "sha256": "a" * 64,
-        "size": 123,
-        "revision": "b" * 40,
-    }
+    source_snapshot = valid_source_snapshot()
     assert jobs.submit_run(
         spec,
         seed=spec.seed,
@@ -1604,6 +1591,37 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
     assert submitted["endpoint_id"] == "ep"
     assert submitted["payload"]["source_snapshot"] == source_snapshot
     assert "code_prefix" not in submitted["payload"]
+
+
+def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.runpod import jobs
+    from flash.source_snapshot import SourceSnapshotError
+
+    spec = JobSpec(
+        run_id="flash-source-snapshot-invalid",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type=""),
+    )
+    deploy_calls = []
+    monkeypatch.setattr(
+        jobs,
+        "deploy_train_endpoint",
+        lambda *args, **kwargs: deploy_calls.append((args, kwargs)),
+    )
+    malformed = valid_source_snapshot()
+    malformed["archive_path"] = "source/wrong/flash-source.zip"
+
+    with pytest.raises(SourceSnapshotError, match="archive path"):
+        jobs.submit_run(
+            spec,
+            seed=spec.seed,
+            source_snapshot=malformed,
+            deadline_at=10_000_000_000.0,
+        )
+    assert deploy_calls == []
 
 
 def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkeypatch):

@@ -12,14 +12,9 @@ import time
 
 import pytest
 
-SOURCE_SNAPSHOT = {
-    "kind": "flash-source-snapshot",
-    "format_version": 1,
-    "archive_path": f"source/{'a' * 64}/flash-source.zip",
-    "sha256": "a" * 64,
-    "size": 123,
-    "revision": "b" * 40,
-}
+from tests._helpers.source_snapshot import valid_source_snapshot
+
+SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _spec():
@@ -854,8 +849,10 @@ def _extra_pip_input(monkeypatch) -> dict:
     import huggingface_hub
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: "/source.zip")
-    monkeypatch.setattr("flash.source_snapshot.read_archive_file", lambda *_args: b"archive")
-    monkeypatch.setattr("flash.source_snapshot.materialize_verified_archive", lambda *_args: None)
+    monkeypatch.setattr(
+        "flash.source_snapshot.materialize_verified_archive_file",
+        lambda *_args: None,
+    )
     monkeypatch.setattr("importlib.util.spec_from_file_location", lambda *_args: None)
     return {
         "phase": "sft",
@@ -879,7 +876,7 @@ def test_train_body_source_verification_failure_prevents_pip(monkeypatch):
     pip_calls = []
     monkeypatch.setattr(
         source_snapshot,
-        "read_archive_file",
+        "materialize_verified_archive_file",
         lambda *_args: (_ for _ in ()).throw(
             source_snapshot.SourceSnapshotError("source verification failed")
         ),
@@ -1248,7 +1245,7 @@ def test_train_body_uploads_console_on_missing_metrics(
         download_calls.append(kwargs)
         return str(tmp_path / "source.zip")
 
-    def materialize(_archive, _descriptor, destination):
+    def materialize(_archive_path, _descriptor, destination):
         target = run_code / "flash-test-run-attempt-7"
         assert destination == str(target)
         console = target / "flash/providers/_lifecycle/bootstrap_console.py"
@@ -1271,16 +1268,13 @@ def test_train_body_uploads_console_on_missing_metrics(
         )
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
-    monkeypatch.setattr(
-        "flash.source_snapshot.read_archive_file", lambda *_args: b"verified-archive"
-    )
 
     def materialization_path(root, run_id, attempt):
         assert root == "/runcode"
         return run_code / f"{run_id}-attempt-{attempt}"
 
     monkeypatch.setattr("flash.source_snapshot.attempt_materialization_path", materialization_path)
-    monkeypatch.setattr("flash.source_snapshot.materialize_verified_archive", materialize)
+    monkeypatch.setattr("flash.source_snapshot.materialize_verified_archive_file", materialize)
 
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
