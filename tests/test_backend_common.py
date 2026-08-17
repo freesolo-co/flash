@@ -24,7 +24,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pytest
+from safetensors.numpy import save
 
 from flash.engine.worker import backend_common as vc
 from flash.engine.worker import rl_train
@@ -291,6 +293,15 @@ def test_resolve_verl_loggers_treats_an_unanswerable_probe_as_no_wandb(monkeypat
 def test_stamp_adapter_dir_provenance_sets_base_and_revision(tmp_path):
     cfg = tmp_path / "adapter_config.json"
     cfg.write_text(json.dumps({"base_model_name_or_path": None, "r": 16}))
+    prefix = "base_model.model.layers.0.self_attn.q_proj"
+    (tmp_path / "adapter_model.safetensors").write_bytes(
+        save(
+            {
+                f"{prefix}.lora_A.default.weight": np.ones((1, 2), dtype=np.float16),
+                f"{prefix}.lora_B.default.weight": np.ones((2, 1), dtype=np.float16),
+            }
+        )
+    )
     vc.stamp_adapter_dir_provenance(str(tmp_path), "org/model", "deadbeef")
     out = json.loads(cfg.read_text())
     assert out["base_model_name_or_path"] == "org/model"

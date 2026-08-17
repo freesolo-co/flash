@@ -70,15 +70,58 @@ def _write_small_safetensors(path, tensors=None):
     path.write_bytes(save(arrays))
 
 
-def _write_expert_adapter(directory, *, config, tensor_mode="complete"):
+def _text_pair(module, factor_a, factor_b):
+    prefix = f"base_model.model.layers.0.{module}"
+    return {
+        f"{prefix}.lora_A.default.weight": np.asarray(factor_a, dtype=np.float16),
+        f"{prefix}.lora_B.default.weight": np.asarray(factor_b, dtype=np.float16),
+    }
+
+
+def _text_adapter_tensors(mode, rank=1):
+    zero_a = np.zeros((rank, 2), dtype=np.float16)
+    zero_b = np.zeros((2, rank), dtype=np.float16)
+    nonzero_a = zero_a.copy()
+    nonzero_b = zero_b.copy()
+    nonzero_a[0, 0] = 1.0
+    nonzero_b[0, 0] = 1.0
+    zero_pair = _text_pair("self_attn.q_proj", zero_a, zero_b)
+    nonzero_pair = _text_pair("self_attn.v_proj", nonzero_a, nonzero_b)
+    if mode == "mixed":
+        return {**zero_pair, **nonzero_pair}
+    if mode == "orphan_a":
+        key = "base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
+        return {key: np.ones((rank, 2), dtype=np.float16)}
+    if mode == "orphan_b":
+        key = "base_model.model.layers.0.self_attn.q_proj.lora_B.default.weight"
+        return {key: np.ones((2, rank), dtype=np.float16)}
+    if mode == "nonfinite":
+        nonfinite_a = nonzero_a.copy()
+        nonfinite_a[0, 0] = np.nan
+        return _text_pair("self_attn.q_proj", nonfinite_a, nonzero_b)
+    if mode == "all_zero":
+        return zero_pair
+    if mode == "vision":
+        return {
+            **nonzero_pair,
+            **_text_pair("visual.patch_embed.proj", nonzero_a, nonzero_b),
+        }
+    raise AssertionError(f"unknown text tensor mode {mode}")
+
+
+def _write_expert_adapter(directory, *, config, tensor_mode="complete", text_rank=1):
     """Write config plus a physically valid small artifact or a deliberate corruption."""
     if tensor_mode == "complete":
         _write_small_safetensors(directory / "adapter_model.safetensors")
     elif tensor_mode == "incomplete":
-        key = "base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
         _write_small_safetensors(
             directory / "adapter_model.safetensors",
-            {key: np.zeros((1, 1), dtype=np.float16)},
+            _text_adapter_tensors("orphan_a", text_rank),
+        )
+    elif tensor_mode in {"mixed", "orphan_a", "orphan_b", "nonfinite", "all_zero", "vision"}:
+        _write_small_safetensors(
+            directory / "adapter_model.safetensors",
+            _text_adapter_tensors(tensor_mode, text_rank),
         )
     elif tensor_mode == "unreadable":
         (directory / "adapter_model.safetensors").write_bytes(b"bad")
@@ -230,72 +273,108 @@ def test_export_rejects_direct_parameter_only_config_without_writing(tmp_path):
     assert config_path.read_bytes() == before
 
 
-def test_non_moe_export_canonicalizes_targeting_without_changing_other_fields(tmp_path):
+@pytest.mark.parametrize(
+    ("rank", "alpha", "dropout", "use_rslora"),
+    [
+        (1, 1, 0.0, False),
+        (2, 4, 0.05, True),
+        (4, 16, 0.1, False),
+    ],
+)
+def test_non_moe_export_canonicalizes_targeting_without_changing_other_fields(
+    tmp_path, rank, alpha, dropout, use_rslora
+):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 
     config = {
         "peft_type": "LORA",
-        "r": 32,
-        "lora_alpha": 64,
+        "r": rank,
+        "lora_alpha": alpha,
+        "lora_dropout": dropout,
+        "use_rslora": use_rslora,
         "target_modules": ["q_proj", "v_proj"],
-        "rank_pattern": {"q_proj": 16},
+        "rank_pattern": {"q_proj": rank},
         "flash_provenance": {"source": "verl"},
     }
-    _write_expert_adapter(tmp_path, config=config, tensor_mode="incomplete")
+    _write_expert_adapter(tmp_path, config=config, tensor_mode="mixed", text_rank=rank)
 
     stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
-    assert saved["r"] == 32
-    assert saved["lora_alpha"] == 64
-    assert saved["rank_pattern"] == {"q_proj": 16}
+    assert saved["r"] == rank
+    assert saved["lora_alpha"] == alpha
+    assert saved["lora_dropout"] == dropout
+    assert saved["use_rslora"] is use_rslora
+    assert saved["rank_pattern"] == {"q_proj": rank}
     assert saved["base_model_name_or_path"] == "Qwen/Qwen3.5-9B"
     assert saved["revision"] == "d" * 40
     assert saved["flash_provenance"] == {"source": "verl"}
     assert "target_parameters" not in saved
 
 
-def _peft_load_boundary_tensor_count(config):
-    topology = [
-        *((f"model.layers.{index}.proj", "linear") for index in range(236)),
-        ("visual.patch_embed.proj", "conv3d"),
-    ]
-    targets = config["target_modules"]
-    if targets == "all-linear":
-        selected = [name for name, module_type in topology if module_type == "linear"]
-    else:
-        selected = [
-            name
-            for name, _module_type in topology
-            if any(name == target or name.endswith(f".{target}") for target in targets)
-        ]
-    return len(selected) * 2
-
-
-def test_exported_targeting_preserves_training_topology_at_peft_load_boundary(tmp_path):
+@pytest.mark.parametrize("rank", [1, 4])
+@pytest.mark.parametrize(
+    ("tensor_mode", "message"),
+    [
+        ("orphan_a", "no orphan factors"),
+        ("orphan_b", "no orphan factors"),
+        ("nonfinite", "contains non-finite values"),
+        ("all_zero", "no nonzero composed LoRA delta"),
+        ("vision", "contains vision LoRA tensors"),
+    ],
+)
+def test_non_moe_export_rejects_invalid_actual_tensor_artifacts(
+    tmp_path, tensor_mode, message, rank
+):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 
     config = {
         "peft_type": "LORA",
-        "r": 32,
-        "target_modules": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            "proj",
-        ],
+        "r": rank,
+        "lora_alpha": rank * 2,
+        "target_modules": ["q_proj", "v_proj"],
     }
-    _write_expert_adapter(tmp_path, config=config, tensor_mode="incomplete")
+    _write_expert_adapter(tmp_path, config=config, tensor_mode=tensor_mode, text_rank=rank)
+    config_path = tmp_path / "adapter_config.json"
+    before = config_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match=message):
+        stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+
+    assert config_path.read_bytes() == before
+
+
+def test_exported_targeting_validates_the_actual_mixed_delta_artifact(tmp_path):
+    from safetensors import safe_open
+
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    config = {
+        "peft_type": "LORA",
+        "r": 2,
+        "lora_alpha": 8,
+        "target_modules": ["q_proj", "v_proj"],
+    }
+    _write_expert_adapter(tmp_path, config=config, tensor_mode="mixed", text_rank=2)
 
     stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
-    assert _peft_load_boundary_tensor_count(saved) == 472
+    assert saved["target_modules"] == "all-linear"
+    with safe_open(tmp_path / "adapter_model.safetensors", framework="numpy") as weights:
+        keys = set(weights.keys())
+        a_keys = sorted(key for key in keys if ".lora_A." in key)
+        assert len(a_keys) == 2
+        nonzero = []
+        for a_key in a_keys:
+            b_key = a_key.replace(".lora_A.", ".lora_B.", 1)
+            assert b_key in keys
+            delta = weights.get_tensor(b_key) @ weights.get_tensor(a_key)
+            assert np.isfinite(delta).all()
+            nonzero.append(bool(np.count_nonzero(delta)))
+        assert sorted(nonzero) == [False, True]
+        assert not any("visual" in key or "patch_embed" in key for key in keys)
 
 
 def test_strict_worker_accepts_current_config_without_changing_memory_or_disk(

@@ -9,6 +9,7 @@ Split out of `flash.engine.worker.backend_common` to keep that module under the 
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
@@ -431,6 +432,100 @@ def export_peft_adapter(
         shutil.rmtree(merge_out, ignore_errors=True)
 
 
+def _is_vision_lora_tensor(key: str) -> bool:
+    module_path = key.split(".lora_", 1)[0].lower()
+    segments = set(module_path.split("."))
+    return bool(
+        segments
+        & {
+            "visual",
+            "vision_encoder",
+            "vision_model",
+            "vision_tower",
+            "patch_embed",
+        }
+    )
+
+
+def _validate_text_adapter_tensors(adapter_dir: str) -> None:
+    """Validate the actual non-moe LoRA payload before canonicalizing its config."""
+    from flash.adapters.artifacts import loadable_adapter_weight_files
+
+    try:
+        metadata = _read_adapter_tensor_metadata(adapter_dir) or {}
+    except ValueError as exc:
+        raise RuntimeError("exported text adapter tensor artifact is invalid") from exc
+    a_keys = {key for key in metadata if ".lora_A." in key}
+    b_keys = {key for key in metadata if ".lora_B." in key}
+    paired_a = {key for key in a_keys if key.replace(".lora_A.", ".lora_B.", 1) in b_keys}
+    orphan_a = sorted(a_keys - paired_a)
+    paired_b = {key.replace(".lora_A.", ".lora_B.", 1) for key in paired_a}
+    orphan_b = sorted(b_keys - paired_b)
+    if orphan_a or orphan_b or not paired_a:
+        raise RuntimeError(
+            "exported text adapter must contain at least one complete LoRA A/B pair and no orphan "
+            f"factors; orphan_a={orphan_a[:4]}, orphan_b={orphan_b[:4]}"
+        )
+    vision_keys = sorted(key for key in a_keys | b_keys if _is_vision_lora_tensor(key))
+    if vision_keys:
+        raise RuntimeError(f"exported text adapter contains vision LoRA tensors {vision_keys[:4]}")
+
+    selected = loadable_adapter_weight_files(os.listdir(adapter_dir))
+    import torch
+    from safetensors import safe_open
+
+    with contextlib.ExitStack() as stack:
+        sources = {}
+        for name in selected:
+            path = os.path.join(adapter_dir, name)
+            if name.endswith(".safetensors"):
+                handle = stack.enter_context(safe_open(path, framework="pt", device="cpu"))
+                tensor_keys = handle.keys()
+                sources.update({key: (handle, key) for key in tensor_keys})
+            else:
+                state = torch.load(path, map_location="cpu", weights_only=True)
+                sources.update(state)
+        if sources.keys() != metadata.keys():
+            raise RuntimeError("exported text adapter tensor sources disagree with their metadata")
+
+        def tensor(key: str):
+            source = sources[key]
+            return source[0].get_tensor(source[1]) if isinstance(source, tuple) else source
+
+        for key in metadata:
+            value = tensor(key)
+            if not torch.isfinite(value).all().item():
+                raise RuntimeError(
+                    f"exported text adapter tensor {key!r} contains non-finite values"
+                )
+
+        any_nonzero_delta = False
+        for a_key in sorted(paired_a):
+            b_key = a_key.replace(".lora_A.", ".lora_B.", 1)
+            factor_a = tensor(a_key)
+            factor_b = tensor(b_key)
+            if factor_a.ndim != 2 or factor_b.ndim != 2 or factor_b.shape[1] != factor_a.shape[0]:
+                raise RuntimeError(
+                    f"exported text adapter LoRA pair {a_key!r}, {b_key!r} cannot compose B @ A"
+                )
+            factor_a_float = factor_a.to(dtype=torch.float32)
+            rows_per_chunk = max(1, (1 << 20) // max(1, factor_a.shape[1]))
+            for start in range(0, factor_b.shape[0], rows_per_chunk):
+                delta = (
+                    factor_b[start : start + rows_per_chunk].to(dtype=torch.float32)
+                    @ factor_a_float
+                )
+                if not torch.isfinite(delta).all().item():
+                    raise RuntimeError(
+                        f"exported text adapter LoRA pair {a_key!r}, {b_key!r} has a non-finite "
+                        "composed delta"
+                    )
+                if torch.count_nonzero(delta).item():
+                    any_nonzero_delta = True
+        if not any_nonzero_delta:
+            raise RuntimeError("exported text adapter has no nonzero composed LoRA delta")
+
+
 def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision: str = "") -> None:
     """stamp the saved adapter's immutable base identity into adapter_config.json.
 
@@ -463,6 +558,8 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
                 f"exported adapter for {model_id} does not contain complete fused expert LoRA "
                 "weights; refusing to stamp it as warm-start compatible"
             )
+    else:
+        _validate_text_adapter_tensors(adapter_dir)
     cfg["target_modules"] = "all-linear"
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
