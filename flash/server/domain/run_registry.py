@@ -74,6 +74,10 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         project_id = require_project_id(spec.get("project"))
     except (TypeError, ValueError):
         return False
+    heartbeat = status.last_heartbeat
+    if isinstance(heartbeat, dict) and "source_provenance" in heartbeat:
+        heartbeat = dict(heartbeat)
+        heartbeat.pop("source_provenance", None)
     body = {
         "orgId": org_id,
         "runId": status.run_id,
@@ -93,7 +97,7 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "error": status.error,
         "spec": spec,
         "deployment": status.deployment,
-        "lastHeartbeat": status.last_heartbeat,
+        "lastHeartbeat": heartbeat,
         "gpuStatus": status.gpu_status,
         "createdAt": _iso_from_epoch(status.created_at),
         "updatedAt": _iso_from_epoch(status.updated_at),

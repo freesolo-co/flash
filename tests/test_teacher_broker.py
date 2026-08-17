@@ -17,6 +17,15 @@ from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 from flash.server.domain import teacher_broker
 from flash.server.platform import db
 
+_SOURCE_SNAPSHOT = {
+    "kind": "flash-source-snapshot",
+    "format_version": 1,
+    "archive_path": f"source/{'a' * 64}/flash-source.zip",
+    "sha256": "a" * 64,
+    "size": 123,
+    "revision": "b" * 40,
+}
+
 
 @pytest.fixture(autouse=True)
 def stub_worker_teacher_tokenizer(monkeypatch):
@@ -1628,9 +1637,21 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     deadline = time.time() + 3600
 
     lambda_payload = build_lambda_payload(
-        spec, 42, 0, runtime_secrets=runtime, deadline_at=deadline
+        spec,
+        42,
+        0,
+        runtime_secrets=runtime,
+        source_snapshot=_SOURCE_SNAPSHOT,
+        deadline_at=deadline,
     )
-    vast_payload = build_vast_payload(spec, 42, 0, runtime_secrets=runtime, deadline_at=deadline)
+    vast_payload = build_vast_payload(
+        spec,
+        42,
+        0,
+        runtime_secrets=runtime,
+        source_snapshot=_SOURCE_SNAPSHOT,
+        deadline_at=deadline,
+    )
     captured = {}
     monkeypatch.setattr(
         runpod_jobs,
@@ -1653,6 +1674,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
         42,
         attempt=0,
         runtime_secrets=runtime,
+        source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=deadline,
     )
 

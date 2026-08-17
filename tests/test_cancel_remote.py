@@ -18,6 +18,14 @@ from flash.providers.runpod.serverless import _run_suffix, _select_endpoint_reso
 from tests._helpers.runner import provisioned_status
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_SOURCE_SNAPSHOT = {
+    "kind": "flash-source-snapshot",
+    "format_version": 1,
+    "archive_path": f"source/{'a' * 64}/flash-source.zip",
+    "sha256": "a" * 64,
+    "size": 123,
+    "revision": "b" * 40,
+}
 
 
 def _remote(endpoint_id, job_id, attempt):
@@ -836,6 +844,7 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-recover-active"})
     st = provisioned_status(orch, spec, state="running", remote=_remote("ep-1", "job-1", 0))
+    st.source_snapshot = _SOURCE_SNAPSHOT
     orch._save_status(st)
 
     training_calls = {"n": 0}
@@ -844,10 +853,6 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
         "_run_training",
         lambda *a, **k: training_calls.__setitem__("n", training_calls["n"] + 1),
     )
-    monkeypatch.setattr(
-        "flash.providers._lifecycle.worker.upload_code", lambda repo, *, code_prefix: repo
-    )
-
     from flash.providers.base import PollResult
 
     _make_poll_provider(
@@ -886,7 +891,12 @@ def test_run_training_bails_on_terminal_before_paid_work(tmp_path, monkeypatch):
     import pytest
 
     with pytest.raises(orch._RunCancelled):
-        orch._run_training(spec, io.StringIO(), prior_cost=0.0)
+        orch._run_training(
+            spec,
+            io.StringIO(),
+            prior_cost=0.0,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
     assert submitted["n"] == 0, "no paid GPU work may be submitted for an already-terminal run"
     assert orch.get_status(spec.run_id).state == "failed", "the terminal state must be untouched"
 

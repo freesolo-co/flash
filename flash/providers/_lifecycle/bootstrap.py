@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 if __package__:
+    from flash import source_snapshot as _source_snapshot
     from flash.providers._lifecycle import bootstrap_console as _bootstrap_console
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
@@ -32,6 +33,7 @@ else:
     # same directory, and the script directory leads sys.path.
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
+    import source_snapshot as _source_snapshot  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,
@@ -139,38 +141,22 @@ def _arm(payload: dict) -> str:
     return str(payload.get("flash_arm") or "instance")
 
 
-def _code_prefix(payload: dict) -> str:
-    raw = payload.get("code_prefix")
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("missing code_prefix")
-    prefix = raw.strip().strip("/")
-    parts = prefix.split("/")
-    digest = parts[1] if len(parts) == 3 else ""
-    if (
-        len(parts) != 3
-        or parts[0] != "code"
-        or parts[2] != "flash"
-        or len(digest) != 32
-        or any(c not in "0123456789abcdef" for c in digest)
-    ):
-        raise ValueError(f"invalid code_prefix: {prefix!r}")
-    return prefix
+def _source_descriptor(payload: dict):
+    return _source_snapshot.parse_descriptor(payload.get("source_snapshot"))
 
 
 def _code_dir(payload: dict) -> str:
-    raw = payload.get("code_prefix")
-    if not isinstance(raw, str) or not raw.strip():
-        return os.path.join(CODE_ROOT, "code")
-    return os.path.join(CODE_ROOT, os.path.dirname(_code_prefix(payload)))
+    return str(
+        _source_snapshot.attempt_materialization_path(
+            CODE_ROOT,
+            payload.get("run_id"),
+            payload.get("attempt"),
+        )
+    )
 
 
 def _hf_status_code(exc: BaseException) -> int | None:
-    response = getattr(exc, "response", None)
-    code = getattr(response, "status_code", None)
-    try:
-        return int(code)
-    except (TypeError, ValueError):
-        return None
+    return _source_snapshot.response_status_code(exc)
 
 
 def _hf_retry_after(exc: BaseException) -> float | None:
@@ -208,7 +194,7 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dic
         try:
             return call()
         except Exception as exc:
-            if _hf_status_code(exc) not in _HF_TRANSIENT_STATUS_CODES or attempt >= len(
+            if not _source_snapshot.is_transient_fetch_error(exc) or attempt >= len(
                 _HF_RETRY_DELAYS_S
             ):
                 raise
@@ -561,6 +547,9 @@ def build_worker_env(payload: dict) -> dict:
     env["ATTEMPT"] = str(attempt)
     # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
+    descriptor = _source_descriptor(payload)
+    env["FLASH_SOURCE_SHA256"] = descriptor.sha256
+    env["FLASH_SOURCE_FORMAT_VERSION"] = str(_source_snapshot.FORMAT_VERSION)
     code_dir = _code_dir(payload)
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return env
@@ -580,45 +569,33 @@ def install_extra_pip(payload: dict) -> None:
 
 
 def fetch_code(payload: dict) -> None:
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import hf_hub_download
 
     deadline_at = require_deadline_at(payload)
-    prefix = _code_prefix(payload)
+    descriptor = _source_descriptor(payload)
     token = (payload.get("env") or {}).get("HF_TOKEN")
-    api = HfApi(token=token)
-    files = [
-        entry.path
-        for entry in _hf_call(
-            lambda: list(
-                api.list_repo_tree(
-                    repo_id=payload["hf_repo"],
-                    repo_type="dataset",
-                    path_in_repo=prefix,
-                    recursive=True,
-                    token=token,
-                )
-            ),
-            f"list flash code under {payload['hf_repo']}:{prefix}",
-            deadline_at=deadline_at,
-            secrets=_payload_secrets(payload),
-        )
-        if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
-    ]
-    if not files:
-        raise RuntimeError(f"no flash code files found under {payload['hf_repo']}:{prefix}")
-    for filename in files:
-        _hf_call(
-            lambda filename=filename: hf_hub_download(
+    try:
+        archive_path = _hf_call(
+            lambda: hf_hub_download(
                 repo_id=payload["hf_repo"],
                 repo_type="dataset",
-                filename=filename,
-                local_dir=CODE_ROOT,
+                filename=descriptor.archive_path,
+                revision=descriptor.revision,
                 token=token,
             ),
-            f"download flash code file {payload['hf_repo']}:{filename}",
+            "download pinned flash source snapshot",
             deadline_at=deadline_at,
             secrets=_payload_secrets(payload),
         )
+    except Exception as exc:
+        error_type = (
+            RetriableBootstrapError
+            if _source_snapshot.is_transient_fetch_error(exc)
+            else RuntimeError
+        )
+        raise error_type("failed to fetch the pinned flash source snapshot") from None
+    archive = _source_snapshot.read_archive_file(archive_path, descriptor)
+    _source_snapshot.materialize_verified_archive(archive, descriptor, _code_dir(payload))
 
 
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
@@ -780,6 +757,12 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
         "run_id": run_id,
         "ts": now,
     }
+    if ok:
+        marker["source_attestation"] = _source_snapshot.source_attestation(
+            _source_descriptor(payload),
+            run_id=run_id,
+            attempt=attempt,
+        )
     p = "/tmp/attempt_marker.json"
     with open(p, "w") as f:
         json.dump(marker, f)
@@ -924,13 +907,9 @@ def main() -> int:
             error = "model preload failed" if not ok else ""
             return 0 if ok else 1
         deadline_watchdog = arm_deadline_watchdog(deadline, payload)
+        # fetch and verify the pinned archive before pip, downloaded imports, path mutation, or child.
+        fetch_code(payload)
         install_extra_pip(payload)
-        # Pre-worker HF fetch of the run's own code (control plane uploaded it before submit), same
-        # infra-shaped class as fetch_spec_from_hf above: a transient HF blip must retry, not fail.
-        try:
-            fetch_code(payload)
-        except Exception:
-            raise RetriableBootstrapError("failed to fetch run code from HF") from None
         env = build_worker_env(payload)
         phase = payload["phase"]
         for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):

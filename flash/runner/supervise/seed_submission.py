@@ -26,7 +26,7 @@ class _SubmitContext:
     seed: int
     log: object
     runtime_secrets: dict[str, str] | None
-    code_prefix: str
+    source_snapshot: dict
     attempt_start: int
     infra_budget: int
     retry_budget: object
@@ -83,7 +83,6 @@ class _SubmitContext:
                 # after a control-plane restart prices its wall as a single card.
                 "allocated_gpu_count": self.current_gpu.get("count"),
                 "on_last_gpu": bool(self.current_on_last_gpu),
-                "code_prefix": self.code_prefix,
             }
             if _update(self.spec.run_id, "running", remote=persisted_handle):
                 return
@@ -201,12 +200,15 @@ def _build_context(
     seed: int,
     log,
     runtime_secrets: dict[str, str] | None,
-    code_prefix: str | None,
+    source_snapshot: dict | None,
     attempt_start: int,
 ) -> _SubmitContext:
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME, flash_code_prefix
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME, get_status, source_snapshot_from_status
+    from flash.source_snapshot import parse_descriptor
 
-    code_prefix = code_prefix or flash_code_prefix()
+    source_snapshot = parse_descriptor(
+        source_snapshot or source_snapshot_from_status(get_status(spec.run_id), required=True)
+    ).to_dict()
     attempt_start = max(0, int(attempt_start))
     max_retries = int(spec.gpu.max_retries)
     infra_budget = max(max_retries, _lifecycle.INFRA_RETRY_FLOOR) if max_retries else 0
@@ -228,7 +230,7 @@ def _build_context(
         seed=seed,
         log=log,
         runtime_secrets=runtime_secrets,
-        code_prefix=code_prefix,
+        source_snapshot=source_snapshot,
         attempt_start=attempt_start,
         infra_budget=infra_budget,
         retry_budget=retry_budget,
@@ -659,7 +661,7 @@ def _submit_provider(
                 "on_handle": ctx.on_handle,
                 "attempt": prepared.attempt,
                 "on_last_gpu": plan.on_last_gpu,
-                "code_prefix": ctx.code_prefix,
+                "source_snapshot": ctx.source_snapshot,
                 # bounded, not the raw run deadline: while a profile is unarmed the
                 # persisted one still carries the queue allowance, and the bootstrap
                 # enforces whatever absolute deadline it is handed regardless of
@@ -926,11 +928,17 @@ def submit_seed_supervised(
     seed: int,
     log,
     runtime_secrets: dict[str, str] | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     attempt_start: int = 0,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures."""
-    ctx = _build_context(spec, seed, log, runtime_secrets, code_prefix, attempt_start)
+    if spec.algorithm == "opd":
+        from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+
+        # policy and plane configuration are spec-level gates and must fail before durable run state
+        # or source identity is consulted. the deadline-dependent gate still runs after context load.
+        preflight_validate_managed_teacher(spec)
+    ctx = _build_context(spec, seed, log, runtime_secrets, source_snapshot, attempt_start)
     _require_opd_configuration(ctx)
     for local_attempt in range(ctx.retry_budget.max_attempts):
         preparation = _prepare_attempt(ctx, local_attempt)

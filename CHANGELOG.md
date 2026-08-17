@@ -21,6 +21,7 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- Managed attempts now pin, verify, and report one immutable Flash source archive across retries and recovery.
 - Multi-turn GRPO now clones each sibling rollout from the task state that produced its prepared
   prompt. Environments that record randomized episode choices on the task during `start_episode`
   are stepped and scored against the same episode the model saw, without sharing mutable state

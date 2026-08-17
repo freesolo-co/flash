@@ -24,6 +24,14 @@ from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.teacher import configure_managed_teacher
 
 _PROVIDERS = ("runpod", "lambda", "vast")
+_SOURCE_SNAPSHOT = {
+    "kind": "flash-source-snapshot",
+    "format_version": 1,
+    "archive_path": f"source/{'a' * 64}/flash-source.zip",
+    "sha256": "a" * 64,
+    "size": 123,
+    "revision": "b" * 40,
+}
 # the only managed class all three providers stock. a parity test needs one class every provider can
 # actually provision, or the spec is rejected on catalog grounds before parity is ever exercised.
 _TRI_PROVIDER_GPU = "H100"
@@ -546,6 +554,7 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
             spec,
             seed=spec.seed,
             instances=[_inst("us-east-1")],
+            source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=9_999_999_999.0,
         )
     finally:
@@ -597,6 +606,7 @@ def test_vast_capacity_refresh_keeps_the_allocated_card_count():
             spec,
             seed=spec.seed,
             offers=[_offer(1)],
+            source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=9_999_999_999.0,
         )
     finally:
@@ -639,6 +649,7 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
                 spec,
                 seed=spec.seed,
                 instances=[inst],
+                source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,
             )
         finally:
@@ -669,6 +680,7 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
                 spec,
                 seed=spec.seed,
                 offers=[offer],
+                source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,
             )
         finally:

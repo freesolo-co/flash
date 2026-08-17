@@ -20,6 +20,15 @@ import pytest
 
 from flash.core.spec import JobSpec
 
+SOURCE_SNAPSHOT = {
+    "kind": "flash-source-snapshot",
+    "format_version": 1,
+    "archive_path": f"source/{'a' * 64}/flash-source.zip",
+    "sha256": "a" * 64,
+    "size": 123,
+    "revision": "b" * 40,
+}
+
 
 def _spec(gpu_type="RTX 4090", **gpu_kw) -> JobSpec:
     gpu = {"type": gpu_type, "max_wall_seconds": 3600, **gpu_kw}
@@ -43,18 +52,21 @@ def _deadline_at() -> float:
 def _build_payload(builders, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
+    kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
     return builders.build_payload(*args, **kwargs)
 
 
 def _deploy(vast, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
+    kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
     return vast.deploy_and_submit(*args, **kwargs)
 
 
 def _submit(vast, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
+    kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
     return vast.submit_run_vast(*args, **kwargs)
 
 
@@ -358,16 +370,21 @@ def test_build_payload_sets_vast_arm():
     """build_payload stamps flash_arm='vast' so the metrics record attributes the substrate, and the
     shared bootstrap turns it into FLASH_ARM."""
     from flash.providers._lifecycle import bootstrap as ib
-    from flash.providers.vast.jobs.builders import build_payload
+    from flash.providers.vast.jobs import builders
 
-    assert build_payload(_spec(), 0, 0, deadline_at=_deadline_at())["flash_arm"] == "vast"
+    payload = _build_payload(builders, _spec(), 0, 0, deadline_at=_deadline_at())
+    assert payload["flash_arm"] == "vast"
+    assert payload["source_snapshot"] == SOURCE_SNAPSHOT
+    assert "code_prefix" not in payload
     env = ib.build_worker_env(
         {
             "job_spec_json": "{}",
             "phase": "sft",
             "seed": 0,
             "attempt": 0,
+            "run_id": "run-1",
             "env": {},
+            "source_snapshot": SOURCE_SNAPSHOT,
             "flash_arm": "vast",
         }
     )
@@ -2062,7 +2079,7 @@ def _wire_submit(monkeypatch, poll_result=None, poll_raises=None):
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None, deadline_at=None: (
             _handle()
         ),
     )
@@ -2101,7 +2118,7 @@ def _offered_machines(monkeypatch, vast, market=None) -> list[frozenset[int]]:
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None, deadline_at=None: (
             seen.append(frozenset(o.machine_id for o in offers)) or _handle()
         ),
     )
@@ -2297,7 +2314,7 @@ def test_a_fully_blacklisted_first_page_widens_the_search_before_giving_up(monke
         monkeypatch.setattr(
             vast,
             "deploy_and_submit",
-            lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+            lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None, deadline_at=None: (
                 seen.append(frozenset(o.machine_id for o in offers)) or _handle()
             ),
         )
@@ -2357,7 +2374,7 @@ def test_submit_teardown_warns_on_unconfirmed_destroy_without_raising(monkeypatc
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None, deadline_at=None: (
             _handle()
         ),
     )
@@ -2388,7 +2405,7 @@ def test_submit_unconfirmed_teardown_escalates_to_run_scoped_reap(monkeypatch):
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None, deadline_at=None: (
             _handle()
         ),
     )
@@ -2415,7 +2432,7 @@ def test_submit_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None, deadline_at=None: (
             _handle()
         ),
     )
@@ -2491,7 +2508,7 @@ def test_submit_teardown_cleanup_baseexception_preserves_original_and_still_reap
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: (
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None: (
             _handle()
         ),
     )
@@ -2526,7 +2543,7 @@ def test_submit_teardown_cleanup_baseexception_reraised_when_no_original(monkeyp
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: (
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None: (
             _handle()
         ),
     )

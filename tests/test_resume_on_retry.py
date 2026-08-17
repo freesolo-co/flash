@@ -28,6 +28,14 @@ from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 # Mirrors the literal tuple in the source; this test is the guard that the set doesn't silently drift.
 INFRA_SHAPED = ("stalled", "no_capacity", "poll_error", "job_preempted")
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_SOURCE_SNAPSHOT = {
+    "kind": "flash-source-snapshot",
+    "format_version": 1,
+    "archive_path": f"source/{'a' * 64}/flash-source.zip",
+    "sha256": "a" * 64,
+    "size": 123,
+    "revision": "b" * 40,
+}
 
 
 class _RecordingHfApi:
@@ -671,7 +679,14 @@ def orch(monkeypatch, tmp_path):
 
 
 def _seed_status(orch, spec):
-    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict()))
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+    )
 
 
 @pytest.mark.parametrize("failure", INFRA_SHAPED)

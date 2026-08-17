@@ -8,6 +8,17 @@ import logging
 import os
 import tempfile
 
+import pytest
+
+SOURCE_SNAPSHOT = {
+    "kind": "flash-source-snapshot",
+    "format_version": 1,
+    "archive_path": f"source/{'a' * 64}/flash-source.zip",
+    "sha256": "a" * 64,
+    "size": 123,
+    "revision": "b" * 40,
+}
+
 
 def test_run_job_persists_flash_metrics(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
@@ -19,17 +30,25 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         # Storage roots are fixed constants now; redirect via monkeypatch (auto-restored).
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
-        # _run_job_inner uploads the run code before training; stub it (no HF).
+        publication_events = []
         monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "mock/repo"
+            runner,
+            "publish_source_snapshot",
+            lambda _repo: publication_events.append("published") or SOURCE_SNAPSHOT,
         )
         from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
         captured = {}
 
         def fake_submit(spec, seed, log=None, **kwargs):
+            from flash.source_snapshot import TERMINAL_ATTESTATION_KEY, source_attestation
+
             captured["gpu"] = spec.gpu.type
             captured["seed"] = seed
+            captured["source_snapshot"] = kwargs["source_snapshot"]
+            persisted = runner.get_status(spec.run_id)
+            assert persisted.source_snapshot == SOURCE_SNAPSHOT
+            attempt = runner._reserve_attempt(spec.run_id)
             return {
                 "arm": "runpod",
                 "phase": spec.phase,
@@ -40,6 +59,11 @@ def test_run_job_persists_flash_metrics(monkeypatch):
                 "cost_usd": 0.0,
                 "allocated_gpu": "RTX 4090",
                 "notes": {},
+                TERMINAL_ATTESTATION_KEY: source_attestation(
+                    SOURCE_SNAPSHOT,
+                    run_id=spec.run_id,
+                    attempt=attempt,
+                ),
             }
 
         # Stub the submit/poll path (the seam that used to be the in-process
@@ -62,8 +86,11 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         # We charge the QUOTE (flash.cost estimate); the measured 1h-on-a-4090 cost lands in metrics.json.
         assert status.cost_usd == runner.charge_usd_for_spec(spec), status.cost_usd
+        assert publication_events == ["published"]
         assert captured["gpu"] == ""
         assert captured["seed"] == 123
+        assert captured["source_snapshot"] == SOURCE_SNAPSHOT
+        assert status.source_verified_attempt == 0
 
         # Metrics are namespaced by run id so same-phase runs cannot collide.
         metrics_path = os.path.join(tmp, "results", "runpod", "rl", status.run_id, "metrics.json")
@@ -75,198 +102,166 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         assert m["notes"]["gpu"] == "RTX 4090"
 
 
-def test_upload_code_forces_private_on_reused_repo(monkeypatch):
-    """Run artifact repos are ALWAYS private. Existing repos must be flipped private without calling
-    create_repo, so reused environment repos do not consume the HF repository-creation budget."""
+def test_source_publication_failure_is_generic_at_submission_and_api_boundary(monkeypatch, caplog):
+    import flash.runner as runner
+    from flash.core.spec import JobSpec, TrainSpec
+    from flash.server.routes.runs import _submit_failure_http_error
+
+    spec = JobSpec(
+        run_id="source-publication-failure",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(hf_repo="private-org/private-run-repo"),
+    )
+    prepared = runner.PreparedJob(public_spec=spec, worker_spec=spec, estimated_cost_usd=1.0)
+    secret = "hf_private_token_123456"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    monkeypatch.setattr(
+        runner,
+        "publish_source_snapshot",
+        lambda _repo: (_ for _ in ()).throw(
+            RuntimeError(
+                f"403 from https://resolver.internal/private-org/private-run-repo "
+                f"at source/{'a' * 64}/flash-source.zip?token={secret} revision={'b' * 40}"
+            )
+        ),
+    )
+
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(runner.SourceSnapshotPublicationError) as raised,
+    ):
+        runner.submit_job(spec, prepared_job=prepared)
+
+    public_error = _submit_failure_http_error(raised.value)
+    assert public_error.status_code == 503
+    assert public_error.detail == "managed source publication failed; retry the submission later"
+    rendered = str(raised.value) + str(public_error.detail)
+    for private_value in (
+        "private-org/private-run-repo",
+        "resolver.internal",
+        "flash-source.zip",
+        "b" * 40,
+        secret,
+        "403",
+    ):
+        assert private_value not in rendered
+    assert secret not in caplog.text
+    assert "managed source publication failed" in caplog.text
+
+
+def _install_snapshot_hub(monkeypatch, api_type, download):
     import sys
     import types
 
-    calls = {"info": [], "create": [], "settings": [], "upload": [], "marker": []}
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = api_type
+    fake_hub.hf_hub_download = download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
 
-    class _FakeApi:
+
+def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch, tmp_path):
+    import hashlib
+    import types
+
+    from flash.providers._lifecycle import worker
+
+    archive = b"deterministic-source-archive"
+    archive_file = tmp_path / "archive.zip"
+    archive_file.write_bytes(archive)
+    calls = {"info": 0, "settings": [], "upload": []}
+
+    class _Missing(Exception):
+        response = types.SimpleNamespace(status_code=404)
+
+    class _Api:
         def __init__(self, token=None):
             pass
 
-        def repo_info(self, **kw):
-            calls["info"].append(kw)
-            return types.SimpleNamespace(private=False)
+        def repo_info(self, **kwargs):
+            calls["info"] += 1
+            return types.SimpleNamespace(sha="1" * 40, private=False)
 
-        def create_repo(self, repo, **kw):
-            calls["create"].append((repo, kw))
+        def update_repo_settings(self, **kwargs):
+            calls["settings"].append(kwargs)
 
-        def update_repo_settings(self, **kw):
-            calls["settings"].append(kw)
+        def upload_file(self, **kwargs):
+            calls["upload"].append(kwargs)
+            return types.SimpleNamespace(oid="c" * 40)
 
-        def file_exists(self, **kw):
-            return False
+    def download(*, revision, **_kwargs):
+        if revision == "1" * 40:
+            raise _Missing("absent")
+        assert revision == "c" * 40
+        return str(archive_file)
 
-        def upload_folder(self, **kw):
-            calls["upload"].append(kw)
+    _install_snapshot_hub(monkeypatch, _Api, download)
+    monkeypatch.setattr("flash.source_snapshot.build_source_archive", lambda **_kwargs: archive)
+    monkeypatch.setattr(
+        "flash.source_snapshot.read_verified_archive", lambda data, _desc: {"ok": data}
+    )
 
-        def upload_file(self, **kw):
-            calls["marker"].append(kw)
+    descriptor = worker.publish_source_snapshot("owner/run-artifacts")
 
-    fake_hub = types.ModuleType("huggingface_hub")
-    fake_hub.HfApi = _FakeApi
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
-
-    import flash.providers.runpod.serverless as flash_train
-
-    assert flash_train.upload_code("owner/run-artifacts") == "owner/run-artifacts"
-
-    assert calls["info"], "repo_info should verify whether the repo already exists"
-    assert calls["create"] == [], "existing repos must not hit the repository-creation endpoint"
-    assert calls["settings"], "update_repo_settings was not called — reused public repo can leak"
-    assert calls["settings"][0].get("private") is True
-    assert calls["settings"][0].get("repo_id") == "owner/run-artifacts"
+    assert descriptor["sha256"] == hashlib.sha256(archive).hexdigest()
+    assert descriptor["revision"] == "c" * 40
+    assert calls["settings"][0]["private"] is True
+    assert len(calls["upload"]) == 1
+    assert calls["upload"][0]["path_in_repo"] == descriptor["archive_path"]
 
 
-def test_upload_code_creates_repo_only_when_missing(monkeypatch):
-    import sys
+def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
     import types
 
-    calls = {"info": [], "create": [], "settings": [], "upload": [], "marker": []}
+    from flash.providers._lifecycle import worker
 
-    class _NotFound(Exception):
+    archive = b"archive"
+    archive_file = tmp_path / "archive.zip"
+    archive_file.write_bytes(archive)
+    calls = {"info": 0, "create": [], "settings": []}
+
+    class _RepositoryNotFoundError(Exception):
         pass
 
-    _NotFound.__name__ = "RepositoryNotFoundError"
+    _RepositoryNotFoundError.__name__ = "RepositoryNotFoundError"
 
-    class _FakeApi:
+    class _MissingEntry(Exception):
+        response = types.SimpleNamespace(status_code=404)
+
+    class _Api:
         def __init__(self, token=None):
             pass
 
-        def repo_info(self, **kw):
-            calls["info"].append(kw)
-            if len(calls["info"]) == 1:
-                raise _NotFound("missing")
-            return types.SimpleNamespace(private=True)
+        def repo_info(self, **kwargs):
+            calls["info"] += 1
+            if calls["info"] == 1:
+                raise _RepositoryNotFoundError("missing")
+            return types.SimpleNamespace(sha="1" * 40, private=True)
 
-        def create_repo(self, repo, **kw):
-            calls["create"].append((repo, kw))
+        def create_repo(self, repo, **kwargs):
+            calls["create"].append((repo, kwargs))
 
-        def update_repo_settings(self, **kw):
-            calls["settings"].append(kw)
+        def update_repo_settings(self, **kwargs):
+            calls["settings"].append(kwargs)
 
-        def file_exists(self, **kw):
-            return False
+        def upload_file(self, **_kwargs):
+            return types.SimpleNamespace(oid="c" * 40)
 
-        def upload_folder(self, **kw):
-            calls["upload"].append(kw)
+    def download(*, revision, **_kwargs):
+        if revision == "1" * 40:
+            raise _MissingEntry("absent")
+        return str(archive_file)
 
-        def upload_file(self, **kw):
-            calls["marker"].append(kw)
+    _install_snapshot_hub(monkeypatch, _Api, download)
+    monkeypatch.setattr("flash.source_snapshot.build_source_archive", lambda **_kwargs: archive)
+    monkeypatch.setattr("flash.source_snapshot.read_verified_archive", lambda *_args: {})
 
-    fake_hub = types.ModuleType("huggingface_hub")
-    fake_hub.HfApi = _FakeApi
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+    worker.publish_source_snapshot("owner/new-env-artifacts")
 
-    import flash.providers.runpod.serverless as flash_train
-
-    flash_train.upload_code("owner/new-env-artifacts")
-    flash_train.upload_code("owner/new-env-artifacts")
-
-    assert len(calls["info"]) == 2
-    assert len(calls["create"]) == 1
-    assert calls["create"][0][1]["private"] is True
-    assert len(calls["settings"]) == 2
-    assert len(calls["upload"]) == 2
-    assert len(calls["marker"]) == 2
-
-
-def test_upload_code_rechecks_privacy_on_each_submit(monkeypatch):
-    import sys
-    import types
-
-    calls = {"info": [], "settings": [], "upload": [], "marker": []}
-
-    class _FakeApi:
-        def __init__(self, token=None):
-            pass
-
-        def repo_info(self, **kw):
-            calls["info"].append(kw)
-            return types.SimpleNamespace(private=len(calls["info"]) == 1)
-
-        def create_repo(self, repo, **kw):
-            raise AssertionError("existing repo should not be created")
-
-        def update_repo_settings(self, **kw):
-            calls["settings"].append(kw)
-
-        def file_exists(self, **kw):
-            return False
-
-        def upload_folder(self, **kw):
-            calls["upload"].append(kw)
-
-        def upload_file(self, **kw):
-            calls["marker"].append(kw)
-
-    fake_hub = types.ModuleType("huggingface_hub")
-    fake_hub.HfApi = _FakeApi
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
-
-    import flash.providers.runpod.serverless as flash_train
-
-    flash_train.upload_code("owner/rechecked-env-artifacts")
-    flash_train.upload_code("owner/rechecked-env-artifacts")
-
-    assert len(calls["info"]) == 2
-    assert len(calls["settings"]) == 2
-    assert len(calls["upload"]) == 2
-    assert len(calls["marker"]) == 2
-
-
-def test_upload_code_retries_transient_repo_settings(monkeypatch):
-    import sys
-    import types
-
-    calls = {"settings": 0, "upload": [], "marker": []}
-
-    class _Response:
-        status_code = 504
-
-    class _Transient(Exception):
-        response = _Response()
-
-    class _FakeApi:
-        def __init__(self, token=None):
-            pass
-
-        def repo_info(self, **kw):
-            return types.SimpleNamespace(private=True)
-
-        def create_repo(self, repo, **kw):
-            raise AssertionError("existing repo should not be created")
-
-        def update_repo_settings(self, **kw):
-            calls["settings"] += 1
-            if calls["settings"] == 1:
-                raise _Transient("gateway timeout")
-
-        def file_exists(self, **kw):
-            return False
-
-        def upload_folder(self, **kw):
-            calls["upload"].append(kw)
-
-        def upload_file(self, **kw):
-            calls["marker"].append(kw)
-
-    fake_hub = types.ModuleType("huggingface_hub")
-    fake_hub.HfApi = _FakeApi
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
-
-    import flash.providers.runpod.serverless as flash_train
-
-    monkeypatch.setattr("flash.providers._lifecycle.worker.time.sleep", lambda _delay: None)
-
-    flash_train.upload_code("owner/transient-settings")
-
-    assert calls["settings"] == 2
-    assert calls["upload"]
-    assert calls["marker"]
+    assert calls["create"] == [
+        ("owner/new-env-artifacts", {"repo_type": "dataset", "exist_ok": True, "private": True})
+    ]
+    assert calls["settings"][0]["private"] is True
 
 
 def test_hf_call_honors_retry_after(monkeypatch):
@@ -329,152 +324,83 @@ def test_hf_call_caps_http_date_retry_after(monkeypatch):
     assert sleeps == [60.0]
 
 
-def test_upload_code_uses_content_addressed_prefix(monkeypatch):
-    """Code uploads are additive under immutable content-addressed prefixes, so different package
-    snapshots cannot overwrite or delete one another inside the shared environment repo."""
-    import os
-    import re
-    import sys
+def test_publish_source_snapshot_reuses_verified_archive_at_exact_head(monkeypatch, tmp_path):
     import types
 
-    import flash
+    from flash.providers._lifecycle import worker
 
-    calls = {"upload": [], "marker": []}
+    archive = b"same-archive"
+    archive_file = tmp_path / "archive.zip"
+    archive_file.write_bytes(archive)
+    calls = {"downloads": [], "uploads": 0}
 
-    class _FakeApi:
+    class _Api:
         def __init__(self, token=None):
             pass
 
-        def repo_info(self, **kw):
+        def repo_info(self, **_kwargs):
+            return types.SimpleNamespace(sha="d" * 40, private=True)
+
+        def update_repo_settings(self, **_kwargs):
             pass
 
-        def create_repo(self, repo, **kw):
-            pass
+        def upload_file(self, **_kwargs):
+            calls["uploads"] += 1
+            raise AssertionError("verified content-addressed archives must be reused")
 
-        def update_repo_settings(self, **kw):
-            pass
+    def download(**kwargs):
+        calls["downloads"].append(kwargs)
+        return str(archive_file)
 
-        def file_exists(self, **kw):
-            return False
+    _install_snapshot_hub(monkeypatch, _Api, download)
+    monkeypatch.setattr("flash.source_snapshot.build_source_archive", lambda **_kwargs: archive)
+    monkeypatch.setattr("flash.source_snapshot.read_verified_archive", lambda *_args: {})
 
-        def upload_folder(self, **kw):
-            calls["upload"].append(kw)
+    descriptor = worker.publish_source_snapshot("owner/run-artifacts")
 
-        def upload_file(self, **kw):
-            calls["marker"].append(kw)
-
-    fake_hub = types.ModuleType("huggingface_hub")
-    fake_hub.HfApi = _FakeApi
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
-
-    import flash.providers.runpod.serverless as flash_train
-
-    flash_train.upload_code("owner/run-artifacts")
-    assert calls["upload"], "upload_folder was not called"
-    up = calls["upload"][0]
-    assert re.fullmatch(r"code/[0-9a-f]{32}/flash", up["path_in_repo"])
-    assert "delete_patterns" not in up
-    # still uploads from the real (symlink-collapsed) package dir, and skips bytecode
-    assert up["folder_path"] == os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
-    assert "*.pyc" in up.get("ignore_patterns", [])
-    assert "*.pyo" in up.get("ignore_patterns", [])
-    assert (
-        calls["marker"][0]["path_in_repo"] == f"{up['path_in_repo']}/.flash-code-snapshot-complete"
-    )
+    assert descriptor["revision"] == "d" * 40
+    assert calls["uploads"] == 0
+    assert calls["downloads"][0]["revision"] == "d" * 40
 
 
-def test_upload_code_skips_existing_content_prefix(monkeypatch):
-    import sys
+def test_publish_source_snapshot_rereads_concurrent_winner(monkeypatch, tmp_path):
     import types
 
-    calls = {"file_exists": [], "upload": []}
+    from flash.providers._lifecycle import worker
 
-    class _FakeApi:
+    archive = b"same-archive"
+    archive_file = tmp_path / "archive.zip"
+    archive_file.write_bytes(archive)
+    heads = iter(["1" * 40, "e" * 40])
+
+    class _Missing(Exception):
+        response = types.SimpleNamespace(status_code=404)
+
+    class _Api:
         def __init__(self, token=None):
             pass
 
-        def repo_info(self, **kw):
-            return types.SimpleNamespace(private=True)
+        def repo_info(self, **_kwargs):
+            return types.SimpleNamespace(sha=next(heads), private=True)
 
-        def create_repo(self, repo, **kw):
-            raise AssertionError("existing repo should not be created")
-
-        def update_repo_settings(self, **kw):
+        def update_repo_settings(self, **_kwargs):
             pass
 
-        def file_exists(self, **kw):
-            calls["file_exists"].append(kw)
-            return True
+        def upload_file(self, **_kwargs):
+            raise RuntimeError("concurrent commit conflict")
 
-        def upload_folder(self, **kw):
-            calls["upload"].append(kw)
+    def download(*, revision, **_kwargs):
+        if revision == "1" * 40:
+            raise _Missing("absent")
+        assert revision == "e" * 40
+        return str(archive_file)
 
-    fake_hub = types.ModuleType("huggingface_hub")
-    fake_hub.HfApi = _FakeApi
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+    _install_snapshot_hub(monkeypatch, _Api, download)
+    monkeypatch.setattr("flash.source_snapshot.build_source_archive", lambda **_kwargs: archive)
+    monkeypatch.setattr("flash.source_snapshot.read_verified_archive", lambda *_args: {})
 
-    import flash.providers.runpod.serverless as flash_train
-
-    prefix = "code/0123456789abcdef0123456789abcdef/flash"
-    flash_train.upload_code("owner/run-artifacts", code_prefix=prefix)
-
-    assert calls["file_exists"] == [
-        {
-            "repo_id": "owner/run-artifacts",
-            "filename": f"{prefix}/.flash-code-snapshot-complete",
-            "repo_type": "dataset",
-        }
-    ]
-    assert calls["upload"] == []
-
-
-def test_upload_code_reuploads_when_completion_marker_missing(monkeypatch):
-    import sys
-    import types
-
-    calls = {"file_exists": [], "upload": [], "marker": []}
-
-    class _FakeApi:
-        def __init__(self, token=None):
-            pass
-
-        def repo_info(self, **kw):
-            return types.SimpleNamespace(private=True)
-
-        def create_repo(self, repo, **kw):
-            raise AssertionError("existing repo should not be created")
-
-        def update_repo_settings(self, **kw):
-            pass
-
-        def file_exists(self, **kw):
-            calls["file_exists"].append(kw)
-            return False
-
-        def upload_folder(self, **kw):
-            calls["upload"].append(kw)
-
-        def upload_file(self, **kw):
-            calls["marker"].append(kw)
-
-    fake_hub = types.ModuleType("huggingface_hub")
-    fake_hub.HfApi = _FakeApi
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
-
-    import flash.providers.runpod.serverless as flash_train
-
-    prefix = "code/0123456789abcdef0123456789abcdef/flash"
-    flash_train.upload_code("owner/run-artifacts", code_prefix=prefix)
-
-    assert calls["file_exists"] == [
-        {
-            "repo_id": "owner/run-artifacts",
-            "filename": f"{prefix}/.flash-code-snapshot-complete",
-            "repo_type": "dataset",
-        }
-    ]
-    assert calls["upload"], "missing completion marker must force a fresh folder upload"
-    assert calls["marker"][0]["path_in_repo"] == f"{prefix}/.flash-code-snapshot-complete"
+    descriptor = worker.publish_source_snapshot("owner/run-artifacts")
+    assert descriptor["revision"] == "e" * 40
 
 
 def test_run_job_background_swallows_exception(monkeypatch):

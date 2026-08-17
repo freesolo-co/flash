@@ -22,6 +22,14 @@ from flash.teacher.retry_contract import (
 from tests._helpers.runner import provisioned_status
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_SOURCE_SNAPSHOT = {
+    "kind": "flash-source-snapshot",
+    "format_version": 1,
+    "archive_path": f"source/{'a' * 64}/flash-source.zip",
+    "sha256": "a" * 64,
+    "size": 123,
+    "revision": "b" * 40,
+}
 
 
 @pytest.fixture(autouse=True)
@@ -110,14 +118,14 @@ def _save_status(
     next_attempt=0,
     remote=None,
     contracted=True,
+    source_snapshot=None,
 ):
     kwargs = {"_next_attempt": next_attempt}
     if contracted:
         kwargs["_opd_retry_contract_version"] = OPD_RETRY_CONTRACT_VERSION
-    runner._save_status(
-        provisioned_status(runner, spec, state=state, remote=remote),
-        **kwargs,
-    )
+    status = provisioned_status(runner, spec, state=state, remote=remote)
+    status.source_snapshot = source_snapshot
+    runner._save_status(status, **kwargs)
 
 
 def test_status_initialization_stamps_opd_contract_only_when_explicit(monkeypatch, tmp_path):
@@ -608,7 +616,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     private_hf = _FakePrivateHf(tmp_path)
     private_hf.install(monkeypatch)
     spec = _opd_spec("automatic-retry-absent")
-    _save_status(runner, spec, next_attempt=0)
+    _save_status(runner, spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
     monkeypatch.setattr(
         allocator,
@@ -682,7 +690,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
     private_hf = _FakePrivateHf(tmp_path)
     private_hf.install(monkeypatch)
     spec = _opd_spec("automatic-retry-pinned")
-    _save_status(runner, spec, next_attempt=0)
+    _save_status(runner, spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
     monkeypatch.setattr(
         allocator,
@@ -783,7 +791,13 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
         run_id=spec.run_id, attempt=0, seed=42
     )
     private_hf.install(monkeypatch)
-    _save_status(runner, spec, next_attempt=1, remote=_remote(attempt=0))
+    _save_status(
+        runner,
+        spec,
+        next_attempt=1,
+        remote=_remote(attempt=0),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
     events = []
 
     class Provider:
@@ -830,7 +844,13 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
         run_id=spec.run_id, attempt=0, seed=42
     )
     private_hf.install(monkeypatch)
-    _save_status(runner, spec, state="provisioning", next_attempt=1)
+    _save_status(
+        runner,
+        spec,
+        state="provisioning",
+        next_attempt=1,
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
     started = []
     monkeypatch.setattr(runner, "_run_job_background", lambda *_args: started.append(True))
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
@@ -889,7 +909,7 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
     private_hf.install(monkeypatch)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("ambiguous-upload")
-    _save_status(runner, spec, next_attempt=1)
+    _save_status(runner, spec, next_attempt=1, source_snapshot=_SOURCE_SNAPSHOT)
     monkeypatch.setattr(
         allocator,
         "allocate",

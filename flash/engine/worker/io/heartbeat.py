@@ -229,6 +229,15 @@ def heartbeat(
         **({"liveness": True} if liveness else {}),
         **kw,
     }
+    source_sha256 = os.environ.get("FLASH_SOURCE_SHA256") or ""
+    source_format = os.environ.get("FLASH_SOURCE_FORMAT_VERSION") or ""
+    if len(source_sha256) == 64 and source_format.isdecimal():
+        payload["source_provenance"] = {
+            "format_version": int(source_format),
+            "sha256": source_sha256,
+            "verified": True,
+            "verified_attempt": _w.ATTEMPT,
+        }
     if genuine_progress:
         payload["progress_age_s"] = 0.0
     elif latest_progress_ts:
