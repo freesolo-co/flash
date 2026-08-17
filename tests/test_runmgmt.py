@@ -1479,9 +1479,7 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     assert raw["remote"] == confirmed
 
 
-def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(
-    monkeypatch, tmp_path
-):
+def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypatch, tmp_path):
     import flash.runner as runner
     from flash.core.spec import JobSpec
     from flash.providers.runpod import api as runpod_api
@@ -1500,13 +1498,19 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(
         key_fingerprint=other_fingerprint,
         started_ts=2.0,
     )
-    different_job_attempt = _runpod_remote(
+    different_job = _runpod_remote(
         "endpoint-shared",
         "job-other",
-        attempt=2,
+        attempt=1,
         started_ts=3.0,
     )
-    for remote in (confirmed, different_owner, different_job_attempt):
+    different_attempt = _runpod_remote(
+        "endpoint-shared",
+        "job-confirmed",
+        attempt=2,
+        started_ts=4.0,
+    )
+    for remote in (confirmed, different_owner, different_job, different_attempt):
         assert runner._preserve_cleanup_remote(spec.run_id, remote) is True
 
     monkeypatch.setattr(
@@ -1537,15 +1541,21 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(
     assert attempted == {
         ("runpod", 1, "endpoint-shared", "job-confirmed", _RUNPOD_FINGERPRINT),
         ("runpod", 1, "endpoint-shared", "job-confirmed", other_fingerprint),
-        ("runpod", 2, "endpoint-shared", "job-other", _RUNPOD_FINGERPRINT),
+        ("runpod", 1, "endpoint-shared", "job-other", _RUNPOD_FINGERPRINT),
+        ("runpod", 2, "endpoint-shared", "job-confirmed", _RUNPOD_FINGERPRINT),
     }
     assert exact_lookups == [
         ("endpoint-shared", _RUNPOD_FINGERPRINT),
         ("endpoint-shared", other_fingerprint),
         ("endpoint-shared", _RUNPOD_FINGERPRINT),
+        ("endpoint-shared", _RUNPOD_FINGERPRINT),
     ]
     raw = runner._load_status_json(spec.run_id)
-    assert raw[runner._CLEANUP_REMOTES_KEY] == [different_owner, different_job_attempt]
+    assert raw[runner._CLEANUP_REMOTES_KEY] == [
+        different_owner,
+        different_job,
+        different_attempt,
+    ]
     assert raw["remote"] == confirmed
 
 
