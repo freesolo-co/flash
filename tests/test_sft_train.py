@@ -1656,6 +1656,65 @@ def _module(name, **attrs):
     return module
 
 
+@pytest.mark.parametrize(
+    "original_error",
+    [RuntimeError("original failure"), AttributeError("original failure")],
+)
+def test_seeded_dataloader_handles_missing_and_present_validation_sampler(
+    monkeypatch, original_error
+):
+    missing = object()
+
+    class FakeTrainer:
+        def __init__(self, val_sampler=missing, error=None):
+            self._val_sampler = val_sampler
+            self._error = error
+
+        def _build_dataloader(self):
+            if self._error is not None:
+                raise self._error
+            self.train_sampler = SimpleNamespace(seed=None)
+            if self._val_sampler is not missing:
+                self.val_sampler = self._val_sampler
+            return "loader"
+
+    probe = FakeTrainer()
+    assert FakeTrainer._build_dataloader(probe) == "loader"
+    with pytest.raises(AttributeError, match="val_sampler"):
+        _ = probe.val_sampler
+
+    fake_sft_module = _module("verl.trainer.sft_trainer", SFTTrainer=FakeTrainer)
+    monkeypatch.setitem(sys.modules, "torch", _module("torch", manual_seed=lambda seed: None))
+    monkeypatch.setitem(
+        sys.modules,
+        "numpy",
+        _module("numpy", random=SimpleNamespace(seed=lambda seed: None)),
+    )
+    monkeypatch.setitem(sys.modules, "verl", _module("verl"))
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.trainer",
+        _module("verl.trainer", sft_trainer=fake_sft_module),
+    )
+
+    sft_plugin._install_seeded_dataloader(43)
+
+    trainer_without_validation = FakeTrainer()
+    assert trainer_without_validation._build_dataloader() == "loader"
+    assert trainer_without_validation.train_sampler.seed == 43
+    assert not hasattr(trainer_without_validation, "val_sampler")
+
+    validation_sampler = SimpleNamespace(seed=None)
+    trainer_with_validation = FakeTrainer(val_sampler=validation_sampler)
+    assert trainer_with_validation._build_dataloader() == "loader"
+    assert trainer_with_validation.train_sampler.seed == 43
+    assert validation_sampler.seed == 43
+
+    with pytest.raises(type(original_error), match="original failure") as exc_info:
+        FakeTrainer(error=original_error)._build_dataloader()
+    assert exc_info.value is original_error
+
+
 def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus(
     monkeypatch, capsys
 ):
