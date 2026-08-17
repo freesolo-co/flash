@@ -284,8 +284,8 @@ def submit_job(
         deadline_at=deadline_at,
     )
     job_id = out.get("id") if isinstance(out, dict) else None
-    if not job_id:
-        raise RunpodApiError("submit_job: response did not contain a job id")
+    if not isinstance(job_id, str) or not job_id:
+        raise RunpodApiError("submit_job: response did not contain a valid job id")
     return job_id
 
 

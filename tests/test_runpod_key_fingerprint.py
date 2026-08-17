@@ -160,19 +160,37 @@ def test_fingerprint_helpers_resolve_to_the_owning_key(monkeypatch):
         api.delete_endpoint_for_fingerprint("ep-1", "rpk-" + "0" * 64)  # no pool key matches
 
 
-def test_submit_job_missing_id_never_exposes_provider_response(monkeypatch):
+@pytest.mark.parametrize(
+    "job_id",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("", id="empty-string"),
+        pytest.param({"nested": "private"}, id="dict"),
+        pytest.param(["private"], id="list"),
+        pytest.param(b"job-private-bytes", id="bytes"),
+        pytest.param(True, id="bool"),
+        pytest.param(7, id="integer"),
+        pytest.param(7.5, id="float"),
+    ],
+)
+def test_submit_job_rejects_invalid_id_without_exposing_provider_response(monkeypatch, job_id):
     from flash.providers.runpod import api
 
     key = "secretA"
     private_canary = "provider-private-response-canary"
+    response = {"private": private_canary}
+    if job_id is not None:
+        response["id"] = job_id
     monkeypatch.setattr(api._keys, "keys", lambda: [key])
     monkeypatch.setattr(
         api._CLIENT,
         "request_with_retries_for_key",
-        lambda *_args, **_kwargs: {"error": private_canary, "nested": {"token": private_canary}},
+        lambda *_args, **_kwargs: response,
     )
 
-    with pytest.raises(api.RunpodApiError, match="response did not contain a job id") as exc_info:
+    with pytest.raises(
+        api.RunpodApiError, match="submit_job: response did not contain a valid job id"
+    ) as exc_info:
         api.submit_job(
             "ep-1",
             {"x": 1},
@@ -180,7 +198,30 @@ def test_submit_job_missing_id_never_exposes_provider_response(monkeypatch):
             deadline_at=4_000_000_000.0,
         )
 
+    assert str(exc_info.value) == "submit_job: response did not contain a valid job id"
     assert private_canary not in str(exc_info.value)
+
+
+def test_submit_job_returns_nonempty_string_id(monkeypatch):
+    from flash.providers.runpod import api
+
+    key = "secretA"
+    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+    monkeypatch.setattr(
+        api._CLIENT,
+        "request_with_retries_for_key",
+        lambda *_args, **_kwargs: {"id": "job-1"},
+    )
+
+    assert (
+        api.submit_job(
+            "ep-1",
+            {"x": 1},
+            key_fingerprint=api.key_fingerprint(key),
+            deadline_at=4_000_000_000.0,
+        )
+        == "job-1"
+    )
 
 
 def test_submit_status_cancel_and_delete_keep_owning_key_after_rotation(monkeypatch):
