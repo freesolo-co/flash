@@ -54,8 +54,9 @@ def _install_seeded_dataloader(seed: int) -> None:
     def seeded_build_dataloader(self):
         result = original(self)
         self.train_sampler.seed = seed
-        if getattr(self, "val_sampler", None) is not None:
-            self.val_sampler.seed = seed
+        val_sampler = getattr(self, "val_sampler", None)
+        if val_sampler is not None:
+            val_sampler.seed = seed
         return result
 
     seeded_build_dataloader._flash_seeded_dataloader = True
