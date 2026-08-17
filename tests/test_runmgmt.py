@@ -1479,7 +1479,7 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     assert raw["remote"] == confirmed
 
 
-def test_cleanup_collection_removes_only_authoritatively_absent_runpod_record(
+def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(
     monkeypatch, tmp_path
 ):
     import flash.runner as runner
@@ -1491,31 +1491,62 @@ def test_cleanup_collection_removes_only_authoritatively_absent_runpod_record(
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
     )
-    absent = _runpod_remote("endpoint-absent", None, attempt=1)
-    present = _runpod_remote("endpoint-present", None, attempt=2, started_ts=2.0)
-    for remote in (absent, present):
+    other_fingerprint = "rpk-fedcba987654"
+    confirmed = _runpod_remote("endpoint-shared", "job-confirmed", attempt=1)
+    different_owner = _runpod_remote(
+        "endpoint-shared",
+        "job-confirmed",
+        attempt=1,
+        key_fingerprint=other_fingerprint,
+        started_ts=2.0,
+    )
+    different_job_attempt = _runpod_remote(
+        "endpoint-shared",
+        "job-other",
+        attempt=2,
+        started_ts=3.0,
+    )
+    for remote in (confirmed, different_owner, different_job_attempt):
         assert runner._preserve_cleanup_remote(spec.run_id, remote) is True
 
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kwargs: {
+            "id": job_id,
+            "status": "CANCELLED",
+        },
+    )
     monkeypatch.setattr(
         runpod_api,
         "delete_endpoint_for_fingerprint",
         lambda _endpoint_id, _fingerprint: False,
     )
-    monkeypatch.setattr(
-        runpod_api,
-        "list_endpoints_by_key",
-        lambda: ({_RUNPOD_FINGERPRINT: [{"id": "endpoint-present"}]}, []),
-    )
+    exact_lookups = []
+
+    def exact_lookup(endpoint_id, fingerprint):
+        exact_lookups.append((endpoint_id, fingerprint))
+        if len(exact_lookups) == 1:
+            return True
+        raise runpod_api.RunpodApiError("exact endpoint lookup unconfirmed")
+
+    monkeypatch.setattr(runpod_api, "endpoint_absent_for_fingerprint", exact_lookup)
 
     attempted = runner._drain_cleanup_remotes(spec.run_id)
 
     assert attempted == {
-        ("runpod", 1, "endpoint-absent", None, _RUNPOD_FINGERPRINT),
-        ("runpod", 2, "endpoint-present", None, _RUNPOD_FINGERPRINT),
+        ("runpod", 1, "endpoint-shared", "job-confirmed", _RUNPOD_FINGERPRINT),
+        ("runpod", 1, "endpoint-shared", "job-confirmed", other_fingerprint),
+        ("runpod", 2, "endpoint-shared", "job-other", _RUNPOD_FINGERPRINT),
     }
+    assert exact_lookups == [
+        ("endpoint-shared", _RUNPOD_FINGERPRINT),
+        ("endpoint-shared", other_fingerprint),
+        ("endpoint-shared", _RUNPOD_FINGERPRINT),
+    ]
     raw = runner._load_status_json(spec.run_id)
-    assert raw[runner._CLEANUP_REMOTES_KEY] == [present]
-    assert raw["remote"] == absent
+    assert raw[runner._CLEANUP_REMOTES_KEY] == [different_owner, different_job_attempt]
+    assert raw["remote"] == confirmed
 
 
 def test_next_attempt_requires_persisted_integer_identity():

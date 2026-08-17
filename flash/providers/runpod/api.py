@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+import urllib.error
 from typing import Any
 
 from flash._internal.logging import get_logger
@@ -23,12 +24,14 @@ def key_fingerprint(key: str) -> str:
 
 
 def _key_for_fingerprint(fingerprint: str) -> str:
-    """Resolve a key_fingerprint back to its raw pool key."""
-    pool = _keys.keys()
-    for key in pool:
-        if key_fingerprint(key) == fingerprint:
-            return key
-    raise RunpodApiError(f"no RunPod pool key matches fingerprint {fingerprint}")
+    """Resolve a key_fingerprint back to its unique raw pool key."""
+    configured_keys = _keys.keys()
+    matches = [key for key in configured_keys if key_fingerprint(key) == fingerprint]
+    if len(matches) != 1:
+        raise RunpodApiError(
+            "expected exactly one RunPod pool key for the persisted fingerprint"
+        )
+    return matches[0]
 
 
 class RunpodApiError(RuntimeError):
@@ -150,6 +153,27 @@ def endpoint_health_for_key(
 def delete_endpoint_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
     """delete_endpoint_for_key addressed by fingerprint; raw key resolved internally."""
     return delete_endpoint_for_key(endpoint_id, _key_for_fingerprint(fingerprint))
+
+
+def endpoint_absent_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
+    """Confirm absence only from an exact owner-authenticated endpoint lookup returning 404."""
+    key = _key_for_fingerprint(fingerprint)
+    try:
+        _CLIENT.request_with_retries_for_key(
+            key,
+            f"{REST_BASE}/endpoints/{endpoint_id}",
+            retries=2,
+        )
+    except Exception as exc:
+        cause = getattr(exc, "__cause__", None)
+        if isinstance(cause, urllib.error.HTTPError) and cause.code == 404:
+            return True
+        raise RunpodApiError(
+            f"runpod endpoint lookup failed for {endpoint_id}; cleanup unconfirmed"
+        ) from None
+    raise RunpodApiError(
+        f"runpod endpoint {endpoint_id} still exists; cleanup unconfirmed"
+    )
 
 
 def endpoint_health_for_fingerprint(

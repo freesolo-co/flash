@@ -29,6 +29,32 @@ def test_key_fingerprint_is_stable_and_non_revealing():
     assert api.key_fingerprint("a-different-key") != fp  # distinguishes accounts
 
 
+def test_key_lookup_rejects_unknown_fingerprint_without_leaking_credentials(monkeypatch):
+    from flash.providers.runpod import api
+
+    keys = ["secretA", "secretB"]
+    monkeypatch.setattr(api._keys, "keys", lambda: keys)
+
+    with pytest.raises(api.RunpodApiError, match="exactly one") as exc_info:
+        api._key_for_fingerprint("rpk-no-such-account")
+
+    assert all(key not in str(exc_info.value) for key in keys)
+
+
+def test_key_lookup_rejects_colliding_configured_fingerprints(monkeypatch):
+    from flash.providers.runpod import api
+
+    keys = ["secretA", "secretB"]
+    fingerprint = "rpk-aaaaaaaaaaaa"
+    monkeypatch.setattr(api._keys, "keys", lambda: keys)
+    monkeypatch.setattr(api, "key_fingerprint", lambda _key: fingerprint)
+
+    with pytest.raises(api.RunpodApiError, match="exactly one") as exc_info:
+        api._key_for_fingerprint(fingerprint)
+
+    assert all(key not in str(exc_info.value) for key in keys)
+
+
 def test_list_endpoints_by_key_returns_fingerprints_not_raw_keys(monkeypatch):
     from flash.providers.runpod import api
 

@@ -195,13 +195,9 @@ class RunpodProvider:
         ):
             return
 
-        endpoints_by_fingerprint, failed_fingerprints = runpod_api.list_endpoints_by_key()
-        owner_endpoints = endpoints_by_fingerprint.get(strict.key_fingerprint)
-        if (
-            strict.key_fingerprint in failed_fingerprints
-            or owner_endpoints is None
-            or any(endpoint.get("id") == strict.endpoint_id for endpoint in owner_endpoints)
-        ):
+        if runpod_api.endpoint_absent_for_fingerprint(
+            strict.endpoint_id, strict.key_fingerprint
+        ) is not True:
             raise runpod_api.RunpodApiError(
                 f"runpod delete_endpoint({strict.endpoint_id}) unconfirmed; endpoint may still bill"
             )

@@ -334,11 +334,12 @@ def test_provider_cancel_destroy_dispatch(monkeypatch):
     assert deleted == ["ep"]
 
 
-def test_runpod_destroy_accepts_authoritative_owner_absence(monkeypatch):
+def test_runpod_destroy_accepts_exact_owner_404_confirmation(monkeypatch):
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
     from flash.providers.runpod import api as rp_api
 
+    lookups = []
     monkeypatch.setattr(
         rp_api,
         "delete_endpoint_for_fingerprint",
@@ -346,8 +347,8 @@ def test_runpod_destroy_accepts_authoritative_owner_absence(monkeypatch):
     )
     monkeypatch.setattr(
         rp_api,
-        "list_endpoints_by_key",
-        lambda: ({_RUNPOD_FINGERPRINT: [{"id": "ep-unconfirmed-other"}]}, []),
+        "endpoint_absent_for_fingerprint",
+        lambda endpoint_id, fingerprint: lookups.append((endpoint_id, fingerprint)) or True,
     )
     handle = JobHandle(
         "runpod",
@@ -363,19 +364,10 @@ def test_runpod_destroy_accepts_authoritative_owner_absence(monkeypatch):
 
     get_provider("runpod").destroy(handle)
 
+    assert lookups == [("ep-unconfirmed", _RUNPOD_FINGERPRINT)]
 
-@pytest.mark.parametrize(
-    ("endpoints_by_fingerprint", "failed_fingerprints"),
-    [
-        ({_RUNPOD_FINGERPRINT: [{"id": "ep-unconfirmed"}]}, []),
-        ({}, [_RUNPOD_FINGERPRINT]),
-        ({"rpk-fedcba987654": []}, []),
-    ],
-    ids=["endpoint-present", "owner-list-failed", "wrong-account-absent"],
-)
-def test_runpod_destroy_rejects_unconfirmed_owner_state(
-    monkeypatch, endpoints_by_fingerprint, failed_fingerprints
-):
+
+def test_runpod_destroy_rejects_non_authoritative_absence_result(monkeypatch):
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
     from flash.providers.runpod import api as rp_api
@@ -387,8 +379,8 @@ def test_runpod_destroy_rejects_unconfirmed_owner_state(
     )
     monkeypatch.setattr(
         rp_api,
-        "list_endpoints_by_key",
-        lambda: (endpoints_by_fingerprint, failed_fingerprints),
+        "endpoint_absent_for_fingerprint",
+        lambda endpoint_id, fingerprint: False,
     )
     handle = JobHandle(
         "runpod",
