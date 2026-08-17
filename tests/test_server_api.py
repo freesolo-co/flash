@@ -5492,7 +5492,7 @@ def test_deploy_fails_when_the_activated_alias_serves_no_reasoning(api, monkeypa
             return _smoke_chat_result(
                 revision,
                 run_id,
-                "<think>2+2 is 4</think>4",
+                "<think>2+2 is 4</think>RED",
                 reasoning_content="2+2 is 4",
             )
         return _smoke_chat_result(revision, run_id, "4")
@@ -5559,7 +5559,7 @@ def test_deploy_persists_ordinary_post_activation_probe_failures(api, monkeypatc
         lambda **_kwargs: _smoke_chat_result(
             revision,
             run_id,
-            "<think>2+2 is 4</think>4",
+            "<think>2+2 is 4</think>RED",
             reasoning_content="2+2 is 4",
         ),
     )
@@ -5642,7 +5642,7 @@ def test_deploy_records_alias_thinking_on_a_healthy_thinking_deployment(api, mon
         lambda **kwargs: _smoke_chat_result(
             revision,
             run_id,
-            "<think>2+2 is 4</think>4",
+            "<think>2+2 is 4</think>RED",
             reasoning_content="2+2 is 4",
         ),
     )
@@ -9842,7 +9842,7 @@ _MISSING_SMOKE_REASONING = object()
 def _smoke_chat_result(
     revision: str,
     checkpoint: str,
-    content: str = "4",
+    content: str = "RED",
     *,
     reasoning_content: object = _MISSING_SMOKE_REASONING,
 ) -> dict:

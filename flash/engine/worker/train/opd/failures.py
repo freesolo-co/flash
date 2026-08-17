@@ -308,6 +308,7 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
             model_id=self.model_id,
             model_revision=self.model_revision,
             python_bin=self.python_bin,
+            preprocessor=self.preprocessor,
         )
         _stage_retry_contract(
             checkpoint_dir,

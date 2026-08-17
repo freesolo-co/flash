@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import base64
-import binascii
 import io
 import json
-import re
 import urllib.parse
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from flash.content import image_descriptors as _image_descriptors
+from flash.content.image_descriptors import ValidatedImageDescriptor
 
 MAX_IMAGES_PER_EXAMPLE = 4
 MAX_IMAGE_SOURCE_BYTES = 8 * 1024 * 1024
@@ -29,35 +29,6 @@ _IMAGE_TARGET_BLOCK_TYPES = frozenset({*_IMAGE_BLOCK_TYPES, "output_image"})
 _TEXT_BLOCK_TYPES = frozenset({"text", "input_text"})
 _IMAGE_DETAIL_VALUES = frozenset({"auto", "low", "high"})
 _ALLOWED_MESSAGE_ROLES = frozenset({"system", "user", "assistant", "tool"})
-_EXIF_ORIENTATION_TAG = 274
-_EXIF_TRANSPOSED_ORIENTATIONS = frozenset({5, 6, 7, 8})
-_MIME_TO_FORMAT = {
-    "image/jpeg": "JPEG",
-    "image/png": "PNG",
-    "image/webp": "WEBP",
-}
-_FORMAT_TO_MIME = {image_format: mime for mime, image_format in _MIME_TO_FORMAT.items()}
-_DATA_URI_RE = re.compile(r"\Adata:(image/[^;,]+);base64,(.*)\Z", re.DOTALL)
-_MODE_BYTES_PER_PIXEL = {
-    "1": 1,
-    "L": 1,
-    "P": 1,
-    "I;16": 2,
-    "I;16B": 2,
-    "I;16L": 2,
-    "LA": 2,
-    "La": 2,
-    "RGB": 3,
-    "YCbCr": 3,
-    "LAB": 3,
-    "HSV": 3,
-    "RGBA": 4,
-    "RGBa": 4,
-    "CMYK": 4,
-    "I": 4,
-    "F": 4,
-}
-_RGB_BYTES_PER_PIXEL = 3
 IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
 # the model's real image-expansion token, as opposed to the placeholder above. one definition so
 # the renderer's rejection and the teacher client's drop guard cannot drift apart.
@@ -71,17 +42,25 @@ class NormalizedImages:
 
 
 @dataclass(frozen=True)
-class ValidatedImageDescriptor:
-    data: bytes
-    data_uri: str
-    source_bytes: int
-    decoded_peak_bytes: int
-    width: int
-    height: int
+class NormalizedEnvironmentReply:
+    messages: list[dict]
+    descriptors: tuple[str, ...]
+    data_uris: tuple[str, ...]
 
-    @property
-    def pixels(self) -> int:
-        return self.width * self.height
+
+def _image_limits() -> _image_descriptors.ImageDescriptorLimits:
+    return _image_descriptors.ImageDescriptorLimits(
+        max_images=MAX_IMAGES_PER_EXAMPLE,
+        max_source_bytes=MAX_IMAGE_SOURCE_BYTES,
+        max_total_source_bytes=MAX_TOTAL_IMAGE_SOURCE_BYTES,
+        max_width=MAX_IMAGE_WIDTH,
+        max_height=MAX_IMAGE_HEIGHT,
+        max_pixels=MAX_IMAGE_PIXELS,
+        max_total_pixels=MAX_TOTAL_IMAGE_PIXELS,
+        max_total_decoded_bytes=MAX_TOTAL_DECODED_BYTES,
+        max_data_uri_header_bytes=MAX_DATA_URI_HEADER_BYTES,
+        max_descriptor_bytes=MAX_IMAGE_DESCRIPTOR_BYTES,
+    )
 
 
 def _is_pil_image(value: object) -> bool:
@@ -94,164 +73,40 @@ def _is_pil_image(value: object) -> bool:
 
 
 def _descriptor_size(value: str) -> int:
-    return len(value.encode("utf-8"))
-
-
-def _check_descriptor_size(descriptor: str) -> None:
-    size = _descriptor_size(descriptor)
-    if size > MAX_IMAGE_DESCRIPTOR_BYTES:
-        raise ValueError(
-            f"encoded image descriptor exceeds the {MAX_IMAGE_DESCRIPTOR_BYTES}-byte limit "
-            f"({size} bytes)"
-        )
+    return _image_descriptors.descriptor_size(value)
 
 
 def _descriptor(kind: str, value: str) -> str:
-    descriptor = json.dumps({"kind": kind, "value": value}, separators=(",", ":"), sort_keys=True)
-    _check_descriptor_size(descriptor)
-    return descriptor
+    return _image_descriptors.descriptor(
+        kind,
+        value,
+        max_descriptor_bytes=MAX_IMAGE_DESCRIPTOR_BYTES,
+    )
 
 
 def _parse_descriptor(raw: str) -> tuple[str, str]:
-    try:
-        value = json.loads(raw)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("invalid internal image descriptor") from exc
-    if not isinstance(value, dict) or set(value) != {"kind", "value"}:
-        raise ValueError("invalid internal image descriptor")
-    kind = value["kind"]
-    payload = value["value"]
-    if not isinstance(kind, str) or not isinstance(payload, str):
-        raise ValueError("invalid internal image descriptor")
-    return kind, payload
+    return _image_descriptors.parse_descriptor(raw)
 
 
 def _decode_data_uri(uri: str) -> tuple[bytes, str]:
-    comma = uri.find(",")
-    header = uri if comma < 0 else uri[:comma]
-    if len(header.encode("utf-8")) > MAX_DATA_URI_HEADER_BYTES:
-        raise ValueError(
-            f"image data URI header exceeds the {MAX_DATA_URI_HEADER_BYTES}-byte limit"
-        )
-    match = _DATA_URI_RE.fullmatch(uri)
-    if match is None:
-        if not uri.startswith("data:"):
-            raise ValueError("image source must use a data URI")
-        if ";base64," not in uri:
-            raise ValueError("image data URI must use base64 encoding")
-        raise ValueError("image data URI must use the exact data:image/...;base64,... format")
-    mime, payload = match.groups()
-    expected_format = _MIME_TO_FORMAT.get(mime)
-    if expected_format is None:
-        raise ValueError(f"image data URI uses unsupported MIME type {mime!r}")
-    max_encoded_size = ((MAX_IMAGE_SOURCE_BYTES + 2) // 3) * 4
-    if len(payload) > max_encoded_size:
-        _check_source_size(MAX_IMAGE_SOURCE_BYTES + 1)
-    try:
-        data = base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("image data URI contains invalid base64 data") from exc
-    _check_source_size(len(data))
-    return data, expected_format
-
-
-def _data_uri_bytes(uri: str) -> bytes:
-    return _decode_data_uri(uri)[0]
+    return _image_descriptors.decode_data_uri(uri, _image_limits())
 
 
 def _check_source_size(size: int) -> None:
-    if size > MAX_IMAGE_SOURCE_BYTES:
-        raise ValueError(
-            f"image source exceeds the {MAX_IMAGE_SOURCE_BYTES}-byte limit ({size} bytes)"
-        )
+    _image_descriptors.check_source_size(size, max_source_bytes=MAX_IMAGE_SOURCE_BYTES)
 
 
 def _package_image_path(value: str, package_root: Path | None) -> Path:
-    if package_root is None:
-        raise ValueError("relative image paths require an extracted environment package root")
-    candidate = Path(value)
-    if candidate.is_absolute():
-        raise ValueError("image paths must be relative to the environment package root")
-    root = package_root.resolve()
-    dataset_root = (root / "dataset").resolve()
-    resolved = (root / candidate).resolve()
-    if resolved != dataset_root and dataset_root not in resolved.parents:
-        raise ValueError("image paths must stay inside the environment package dataset/ directory")
-    if not resolved.is_file():
-        raise ValueError(f"image path does not exist: {value!r}")
-    _check_source_size(resolved.stat().st_size)
-    return resolved
+    return _image_descriptors.package_image_path(value, package_root, _image_limits())
 
 
 def _validate_dimensions(width: int, height: int) -> int:
-    if width <= 0 or height <= 0:
-        raise ValueError("image width and height must be positive")
-    if width > MAX_IMAGE_WIDTH or height > MAX_IMAGE_HEIGHT:
-        raise ValueError(
-            f"image dimensions {width}x{height} exceed the {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT} limit"
-        )
-    pixels = width * height
-    if pixels > MAX_IMAGE_PIXELS:
-        raise ValueError(f"image has {pixels} pixels, exceeding the {MAX_IMAGE_PIXELS}-pixel limit")
-    return pixels
-
-
-def _decoded_peak_bytes(mode: str, pixels: int) -> int:
-    return pixels * (_MODE_BYTES_PER_PIXEL.get(mode, 4) + 2 * _RGB_BYTES_PER_PIXEL)
-
-
-def _oriented_dimensions(image: Any, width: int, height: int) -> tuple[int, int]:
-    try:
-        orientation = image.getexif().get(_EXIF_ORIENTATION_TAG)
-    except (AttributeError, TypeError, ValueError, SyntaxError):
-        orientation = None
-    if orientation in _EXIF_TRANSPOSED_ORIENTATIONS:
-        return height, width
-    return width, height
-
-
-def _inspect_image_metadata(
-    data: bytes, *, expected_format: str | None = None
-) -> tuple[int, int, int, str]:
-    try:
-        from PIL import Image
-    except ImportError as exc:
-        raise RuntimeError("Pillow is required for multimodal image training") from exc
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(data)) as image:
-                image_format = str(image.format or "").upper()
-                if image_format not in _FORMAT_TO_MIME:
-                    raise ValueError("image source must be a static PNG, JPEG, or WebP image")
-                if expected_format is not None and image_format != expected_format:
-                    raise ValueError(
-                        f"image data URI MIME type does not match its {image_format} format"
-                    )
-                if getattr(image, "n_frames", 1) != 1:
-                    raise ValueError("image source must be a static single-frame image")
-                stored_width, stored_height = image.size
-                pixels = _validate_dimensions(stored_width, stored_height)
-                decoded_peak_bytes = _decoded_peak_bytes(image.mode, pixels)
-                image.verify()
-            with Image.open(io.BytesIO(data)) as orientation_probe:
-                width, height = _oriented_dimensions(
-                    orientation_probe,
-                    stored_width,
-                    stored_height,
-                )
-                _validate_dimensions(width, height)
-            return decoded_peak_bytes, width, height, image_format
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError("image source is not a valid image") from exc
+    return _image_descriptors.validate_dimensions(width, height, _image_limits())
 
 
 def inspect_image_bytes(data: bytes) -> tuple[int, int, int]:
-    """Validate one image and return its (decoded_peak_bytes, width, height)."""
-    decoded_peak_bytes, width, height, _image_format = _inspect_image_metadata(data)
-    return decoded_peak_bytes, width, height
+    """validate one image and return its decoded peak bytes, width, and height."""
+    return _image_descriptors.inspect_image_bytes(data, _image_limits())
 
 
 def _inspect_image_bytes(data: bytes) -> int:
@@ -270,10 +125,7 @@ def _pil_descriptor(image: object) -> str:
 
 
 def _canonical_data_uri(data: bytes, image_format: str) -> str:
-    media_type = _FORMAT_TO_MIME.get(image_format)
-    if media_type is None:
-        raise ValueError("image source must be a static PNG, JPEG, or WebP image")
-    return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
+    return _image_descriptors.canonical_data_uri(data, image_format)
 
 
 def normalize_image_source(
@@ -666,56 +518,50 @@ def normalize_prompt_images(
     return NormalizedImages(normalized, descriptors)
 
 
+def normalize_environment_reply(
+    messages: list[dict],
+    package_root: str | Path | None,
+    cumulative_descriptors: list[str] | tuple[str, ...],
+) -> NormalizedEnvironmentReply:
+    """normalize one visible environment reply and validate its cumulative image context."""
+    normalized = normalize_prompt_images({}, messages, package_root, defer_validation=True)
+    descriptors = tuple(normalized.descriptors)
+    cumulative = [*cumulative_descriptors, *descriptors]
+    validated = validate_image_descriptors(cumulative, package_root)
+    data_uris = tuple(item.data_uri for item in validated[len(cumulative_descriptors) :])
+    messages_out = (
+        normalized.messages if descriptors else text_only_prompt_messages(normalized.messages)
+    )
+    return NormalizedEnvironmentReply(messages_out, descriptors, data_uris)
+
+
 def _descriptor_source_size(descriptor: str, package_root: str | Path | None) -> int:
-    kind, value = _parse_descriptor(descriptor)
-    if kind == "bytes":
-        return len(base64.b64decode(value, validate=True))
-    if kind == "data_uri":
-        return len(_data_uri_bytes(value))
-    if kind == "path":
-        return (
-            _package_image_path(value, Path(package_root) if package_root else None).stat().st_size
-        )
-    raise ValueError("invalid internal image descriptor kind")
+    return _image_descriptors.descriptor_source_size(
+        descriptor,
+        package_root,
+        _image_limits(),
+    )
 
 
 def read_descriptor_source(descriptor: str, package_root: str | Path | None) -> bytes:
-    """Read one descriptor's raw source bytes under the per-source size limit."""
-    kind, value = _parse_descriptor(descriptor)
-    if kind == "bytes":
-        try:
-            data = base64.b64decode(value, validate=True)
-        except binascii.Error as exc:
-            raise ValueError("invalid internal byte image descriptor") from exc
-    elif kind == "data_uri":
-        data = _data_uri_bytes(value)
-    elif kind == "path":
-        data = _package_image_path(value, Path(package_root) if package_root else None).read_bytes()
-    else:
-        raise ValueError("invalid internal image descriptor kind")
-    _check_source_size(len(data))
-    return data
+    """read one descriptor's raw source bytes under the per-source size limit."""
+    return _image_descriptors.read_descriptor_source(
+        descriptor,
+        package_root,
+        _image_limits(),
+    )
 
 
 def validate_image_descriptor_data(
     descriptor: str, data: bytes, *, decode_pixels: bool = True
 ) -> ValidatedImageDescriptor:
-    """Validate bytes already read from one normalized descriptor."""
-    kind, value = _parse_descriptor(descriptor)
-    expected_format = _decode_data_uri(value)[1] if kind == "data_uri" else None
-    decoded_peak_bytes, width, height, image_format = _inspect_image_metadata(
+    """validate bytes already read from one normalized descriptor."""
+    return _image_descriptors.validate_image_descriptor_data(
+        descriptor,
         data,
-        expected_format=expected_format,
-    )
-    if decode_pixels:
-        decode_descriptor_pixels(data)
-    return ValidatedImageDescriptor(
-        data=data,
-        data_uri=_canonical_data_uri(data, image_format),
-        source_bytes=len(data),
-        decoded_peak_bytes=decoded_peak_bytes,
-        width=width,
-        height=height,
+        _image_limits(),
+        decode_pixels=decode_pixels,
+        pixel_decoder=decode_descriptor_pixels,
     )
 
 
@@ -725,50 +571,32 @@ def validate_image_descriptor(
     *,
     decode_pixels: bool = True,
 ) -> ValidatedImageDescriptor:
-    """Validate one normalized descriptor and return its canonical data URI metadata."""
-    data = read_descriptor_source(descriptor, package_root)
-    return validate_image_descriptor_data(descriptor, data, decode_pixels=decode_pixels)
+    """validate one normalized descriptor and return its canonical data uri metadata."""
+    return _image_descriptors.validate_image_descriptor(
+        descriptor,
+        package_root,
+        _image_limits(),
+        decode_pixels=decode_pixels,
+        pixel_decoder=decode_descriptor_pixels,
+    )
 
 
 def validate_image_descriptors(
     descriptors: list[str] | tuple[str, ...], package_root: str | Path | None
 ) -> list[ValidatedImageDescriptor]:
-    """Validate one cumulative descriptor set under the shared image admission limits."""
-    if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
-        raise ValueError(
-            f"example contains {len(descriptors)} images, exceeding the "
-            f"{MAX_IMAGES_PER_EXAMPLE}-image limit"
-        )
-    validated: list[ValidatedImageDescriptor] = []
-    source_bytes = 0
-    prior_pixels = 0
-    for descriptor in descriptors:
-        item = validate_image_descriptor(descriptor, package_root, decode_pixels=False)
-        source_bytes += item.source_bytes
-        if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
-            raise ValueError(
-                f"example image sources exceed the {MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit"
-            )
-        if prior_pixels + item.pixels > MAX_TOTAL_IMAGE_PIXELS:
-            raise ValueError(
-                f"example images exceed the {MAX_TOTAL_IMAGE_PIXELS}-pixel total limit"
-            )
-        decoded_bytes = _RGB_BYTES_PER_PIXEL * prior_pixels + item.decoded_peak_bytes
-        if decoded_bytes > MAX_TOTAL_DECODED_BYTES:
-            raise ValueError(
-                f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
-            )
-        prior_pixels += item.pixels
-        validated.append(item)
-    for item in validated:
-        decode_descriptor_pixels(item.data)
-    return validated
+    """validate one cumulative descriptor set under the shared image admission limits."""
+    return _image_descriptors.validate_image_descriptors(
+        descriptors,
+        package_root,
+        _image_limits(),
+        pixel_decoder=decode_descriptor_pixels,
+    )
 
 
 def image_descriptors_to_data_uris(
     descriptors: list[str] | tuple[str, ...], package_root: str | Path | None
 ) -> list[str]:
-    """Convert normalized descriptors to canonical data URIs under aggregate limits."""
+    """convert normalized descriptors to canonical data uris under aggregate limits."""
     return [item.data_uri for item in validate_image_descriptors(descriptors, package_root)]
 
 
@@ -1062,13 +890,4 @@ def preflight_validate_image_opd(spec, *, scan_packaged_environment: bool = True
                 "opd",
                 getattr(train, "teacher_model", None),
             )
-            # only `multi_turn` is a preflight signal. the authoritative source is the env CLASS
-            # (adapter.py sets multi_turn from isinstance(sdk_env, EnvironmentMultiTurn)), which
-            # this path deliberately cannot see: it reads the dataset file rather than importing
-            # user environment code before allocation. so a class-based multi-turn env is caught
-            # by the worker's fail-closed guard instead. `max_turns` must NOT reject here -- it is
-            # a turn CAP that single-turn envs may legitimately carry, and rejecting on it fails
-            # jobs the worker would happily run.
-            if params.get("multi_turn") is True:
-                raise ValueError("multi-turn image-bearing opd is not supported")
             return

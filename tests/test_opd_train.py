@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from flash.engine.worker import backend_common, opd_train, rl_train, score_batcher
@@ -880,8 +881,8 @@ def test_processor_expanded_prompt_ids_enforce_visual_token_budget(tmp_path):
 
 _IMAGE_DATA_URI = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n1c"
-    "AAAAASUVORK5CYII="
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLv"
+    "AAAAAElFTkSuQmCC"
 )
 _OTHER_IMAGE_DATA_URI = (
     "data:image/png;base64,"
@@ -2691,13 +2692,48 @@ class _MultiTurnBridgeTokenizer(_BridgeTokenizer):
     """``_BridgeTokenizer`` plus the chat-template surface the env-glue tokenizer needs."""
 
     def apply_chat_template(self, messages, **_kwargs):
-        return "".join(str(message.get("content", "")) for message in messages)
+        rendered = []
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, str):
+                rendered.append(content)
+                continue
+            rendered.extend(
+                "<image>" if block["type"] == "image" else block["text"] for block in content
+            )
+        return "".join(rendered)
 
     def __call__(self, text, **_kwargs):
         return {"input_ids": [ord(char) % 64 for char in text]}
 
 
-def _multiturn_bridge(env, *, max_turns=4):
+class _MultiTurnProcessor:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.image_counts = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        return self.tokenizer.apply_chat_template(messages, **kwargs)
+
+    def image_processor(self, *, images, return_tensors):
+        assert return_tensors == "np"
+        source = images[0]
+        if hasattr(source, "convert"):
+            image = np.asarray(source.convert("RGB"), dtype=np.uint8)
+        else:
+            width, height = source.size
+            image = np.frombuffer(source.tobytes(), dtype=np.uint8).reshape(height, width, 3)
+        return {
+            "pixel_values": image,
+            "image_grid_thw": np.asarray([[1, image.shape[0], image.shape[1]]], dtype=np.int64),
+        }
+
+    def __call__(self, *, text, images, videos, return_tensors, **kwargs):
+        self.image_counts.append(len(images))
+        return {"input_ids": [[ord(character) % 64 for character in text[0]]]}
+
+
+def _multiturn_bridge(env, *, max_turns=4, processor=None, teacher=None):
     return _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
@@ -2706,11 +2742,12 @@ def _multiturn_bridge(env, *, max_turns=4):
                 prompt_ids=(10, 11),
                 image_descriptors=(),
                 package_root=None,
-                example=object(),
+                example={},
             )
         ],
+        processor=processor,
         tokenizer=_MultiTurnBridgeTokenizer(),
-        teacher=object(),
+        teacher=teacher or object(),
         thinking_prefill="",
         eos_token_ids=frozenset({99}),
         stop_sequences=(),
@@ -2789,6 +2826,69 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
 
     assert env.recorded == ["A"]
     assert response["terminal"] is False
+
+
+def test_terminal_reply_images_never_enter_actor_or_teacher_context(monkeypatch):
+    class _TerminalImageEnv(_RecordingEnv):
+        def __init__(self):
+            super().__init__()
+            self.signed_off = False
+
+        def env_reply(self, _messages, state):
+            self.signed_off = True
+            reply = [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": "https://example.invalid/terminal.png"}],
+                }
+            ]
+            state["messages"].extend(reply)
+            return reply
+
+        def rollout_done(self, _state, _turn_limit):
+            return self.signed_off
+
+    env = _TerminalImageEnv()
+    bridge = _multiturn_bridge(env)
+    bridge.processor = _MultiTurnProcessor(bridge.tokenizer)
+    bridge.start_multiturn(
+        index=0,
+        session_id="terminal-image",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
+    )
+    monkeypatch.setattr(
+        "flash.engine.worker.train.opd.bridge.normalize_environment_reply",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("terminal reply was normalized")
+        ),
+    )
+
+    response = bridge.step_multiturn(
+        {
+            "session_id": "terminal-image",
+            "turn_ordinal": 0,
+            "accepted_prefix": [10, 11],
+            "image_count": 0,
+            "image_digests": [],
+            "raw_response_ids": [65],
+            "response_ids": [65],
+            "completion_text": "A",
+            "termination": "stop",
+            "stop_reason": "stop",
+            "max_tokens": 8,
+            "truncated": False,
+            "skip_reason": "",
+        }
+    )
+
+    assert response["terminal"] is True
+    assert response["messages"] == []
+    assert response["image_count"] == 0
+    turn = bridge._sessions["terminal-image"]["turns"][0]
+    assert turn["image_descriptors"] == ()
+    assert turn["image_digests"] == ()
 
 
 def test_multimodal_bridge_scores_frozen_images_through_structured_teacher_messages(
@@ -3250,6 +3350,47 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
     assert step == 2
     assert restored == state
     assert (local_dir / "global_step_2" / "payload.bin").read_bytes() == b"checkpoint"
+
+
+def test_opd_checkpoint_watcher_forwards_processor_to_every_export(monkeypatch, tmp_path):
+    from flash.engine.worker.train.opd import failures as opd_failures
+
+    checkpoint_dir = tmp_path / "global_step_1"
+    (checkpoint_dir / "actor").mkdir(parents=True)
+    processor = object()
+    captured = []
+    monkeypatch.setattr(
+        opd_failures,
+        "_export_checkpoint_adapter",
+        lambda *args, **kwargs: captured.append(kwargs),
+    )
+    monkeypatch.setattr(opd_failures, "_stage_retry_contract", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        opd_failures._w,
+        "upload_resume_checkpoint",
+        lambda _step, _path, **kwargs: (kwargs["before_upload"](), kwargs["after_upload"](), True)[
+            2
+        ],
+    )
+    watcher = _OpdVerlCheckpointWatcher(
+        local_dir=str(tmp_path),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+        preprocessor=processor,
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=2,
+        group_size=3,
+        accounting_state=lambda _step: _resume_accounting(1),
+    )
+
+    watcher._publish(1, str(checkpoint_dir))
+
+    assert len(captured) == 1
+    assert captured[0]["preprocessor"] is processor
 
 
 def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(monkeypatch, tmp_path):
@@ -4667,6 +4808,7 @@ def test_multiturn_teacher_scores_are_issued_in_one_wave_and_ordered(monkeypatch
                 "response_ids": [65, 66],
                 "completion_text": "AB",
                 "context_messages": [{"role": "user", "content": "question"}],
+                "image_descriptors": (),
                 "truncated": False,
                 "skip_reason": "",
             }
@@ -4747,6 +4889,7 @@ def test_image_multiturn_teacher_scores_structured_histories_in_one_ordered_batc
                 "response_ids": [65, 66],
                 "completion_text": "AB",
                 "context_messages": history,
+                "image_descriptors": prompt.image_descriptors,
                 "truncated": False,
                 "skip_reason": "",
             }
@@ -5943,6 +6086,7 @@ def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horiz
         tokenizer=object(),
         teacher=object(),
         thinking_prefill="",
+        processor=None,
     )
     workload = SimpleNamespace(
         prompts_per_step=64,
@@ -6059,7 +6203,7 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["data.return_multi_modal_inputs"] == "false"
     # `++`-prefixed: these keys are absent from the composed node, so a bare assignment would abort
     # the run at hydra composition. see build_opd_overrides for the per-key reasoning.
-    assert overrides["++actor_rollout_ref.rollout.limit_images"] == "8"
+    assert overrides["++actor_rollout_ref.rollout.limit_images"] == "4"
     assert overrides["++actor_rollout_ref.rollout.engine_kwargs.vllm.seed"] == "42"
     assert "actor_rollout_ref.rollout.seed" not in overrides
     assert overrides["actor_rollout_ref.rollout.load_format"] == "safetensors"
@@ -7942,7 +8086,13 @@ def _drive_opd_multi_turn_episode(
             return {"max_turns": len(turns)}
         if path.endswith("/step"):
             reply = replies.pop(0)
-            return {"messages": reply["messages"], "terminal": reply["terminal"]}
+            return {
+                "messages": reply["messages"],
+                "terminal": reply["terminal"],
+                "image_data_uris": reply.get("image_data_uris", []),
+                "image_count": reply.get("image_count", payload["image_count"]),
+                "image_digests": reply.get("image_digests", payload["image_digests"]),
+            }
         if path.endswith("/score"):
             # one scored row per EMITTED turn: the loop rejects any other count, and the emitted
             # count is what it decided, not what this stub assumed.
@@ -7971,13 +8121,27 @@ def _drive_opd_multi_turn_episode(
             return [ord(c) for c in text]
 
         def apply_chat_template(self, messages, **kwargs):
-            return "".join(str(m.get("content") or "") for m in messages)
+            rendered = []
+            for message in messages:
+                content = message.get("content")
+                if isinstance(content, str):
+                    rendered.append(content)
+                    continue
+                rendered.extend(
+                    "<image>" if block["type"] == "image" else block["text"]
+                    for block in content or ()
+                )
+            return "".join(rendered)
+
+    tokenizer = _Tokenizer()
+    processor = _MultiTurnProcessor(tokenizer)
 
     class _Base:
         """mirrors the parts of verl's AgentLoopBase the OPD loop actually calls."""
 
         def __init__(self):
-            self.tokenizer = _Tokenizer()
+            self.tokenizer = tokenizer
+            self.processor = processor
             self.rollout_config = SimpleNamespace(response_length=256)
             self.server_manager = self
             self._sent = list(turns)
@@ -7989,6 +8153,23 @@ def _drive_opd_multi_turn_episode(
             return {"flash_probe": True}
 
         async def process_multi_modal_info(self, messages):
+            data_uris = [
+                block["image"]
+                for message in messages
+                if isinstance(message.get("content"), list)
+                for block in message["content"]
+                if block.get("type") == "image"
+                and isinstance(block.get("image"), str)
+                and block["image"].startswith("data:image/")
+            ]
+            if data_uris:
+                from flash.content.multimodal import (
+                    decode_image_descriptors,
+                    normalize_image_source,
+                )
+
+                descriptors = [normalize_image_source(uri, None) for uri in data_uris]
+                return {"images": decode_image_descriptors(descriptors, None)}
             return dict(multi_modal_data or {})
 
         async def apply_chat_template(self, messages, **kwargs):
@@ -8076,7 +8257,15 @@ _IMAGE_BLOCK_PROMPT = [
 _TEXT_PROMPT = [{"role": "user", "content": "describe"}]
 
 
-_PIXELS = ["pixels"]
+class _TestPixels:
+    mode = "RGB"
+    size = (1, 1)
+
+    def tobytes(self):
+        return b"\x01\x02\x03"
+
+
+_PIXELS = [_TestPixels()]
 
 
 @pytest.mark.parametrize(
@@ -8131,6 +8320,70 @@ def test_a_multi_turn_opd_episode_carries_its_frozen_media_on_every_turn(
     )
 
 
+def test_dynamic_opd_media_snapshots_are_cumulative_ordered_and_immutable(monkeypatch):
+    from flash.content.multimodal import normalize_image_source
+    from flash.engine.worker.train.core.child.glue import (
+        parent_image_digests,
+        processor_image_digests,
+    )
+
+    processor = _MultiTurnProcessor(_MultiTurnBridgeTokenizer())
+    descriptors = [
+        normalize_image_source(_IMAGE_DATA_URI, None),
+        normalize_image_source(_OTHER_IMAGE_DATA_URI, None),
+    ]
+    digests = parent_image_digests(processor, descriptors, None)
+
+    def image_message(label):
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": label},
+                    {"type": "image"},
+                ],
+            }
+        ]
+
+    replies = [
+        {
+            "messages": image_message("first"),
+            "terminal": False,
+            "image_data_uris": [_IMAGE_DATA_URI],
+            "image_count": 1,
+            "image_digests": digests[:1],
+        },
+        {
+            "messages": image_message("second"),
+            "terminal": False,
+            "image_data_uris": [_OTHER_IMAGE_DATA_URI],
+            "image_count": 2,
+            "image_digests": digests,
+        },
+        {"messages": [], "terminal": True, "image_count": 2, "image_digests": digests},
+    ]
+    instance, outputs, _posted = _drive_opd_multi_turn_episode(
+        monkeypatch=monkeypatch,
+        turns=[("A", "completed"), ("B", "completed"), ("C", "completed")],
+        env_replies=replies,
+        raw_prompt=_TEXT_PROMPT,
+    )
+
+    assert [None if media is None else len(media) for media in instance.generate_media] == [
+        None,
+        1,
+        2,
+    ]
+    snapshots = [output["multi_modal_data"] for output in outputs]
+    assert snapshots[0] is None
+    assert [len(snapshot["images"]) for snapshot in snapshots[1:]] == [1, 2]
+    assert processor_image_digests(instance.processor, snapshots[1]["images"]) == digests[:1]
+    assert processor_image_digests(instance.processor, snapshots[2]["images"]) == digests
+    for output in outputs:
+        for image in (output["multi_modal_data"] or {}).get("images", []):
+            image.close()
+
+
 class _StructuredImageEnv(_RecordingEnv):
     def __init__(self, initial_messages):
         super().__init__()
@@ -8157,9 +8410,11 @@ def _image_prompt(image_source=_IMAGE_DATA_URI, *, image_first: bool = False):
 
 def _structured_image_bridge(env, initial_messages):
     from flash.content.multimodal import image_teacher_prompt_messages, normalize_prompt_images
+    from flash.engine.worker.train.core.child.glue import parent_image_digests
 
     normalized = normalize_prompt_images({}, initial_messages, None)
-    bridge = _multiturn_bridge(env)
+    processor = _MultiTurnProcessor(_MultiTurnBridgeTokenizer())
+    bridge = _multiturn_bridge(env, processor=processor)
     bridge.prompts[0] = _BridgePrompt(
         student_messages=normalized.messages,
         teacher_messages=image_teacher_prompt_messages(
@@ -8169,6 +8424,7 @@ def _structured_image_bridge(env, initial_messages):
         image_descriptors=tuple(normalized.descriptors),
         package_root=None,
         example={},
+        image_digests=tuple(parent_image_digests(processor, normalized.descriptors, None)),
     )
     return bridge, normalized
 
@@ -8205,6 +8461,7 @@ def test_multiturn_start_authenticates_parquet_text_block_canonicalization():
         prompt_ids=[10, 11],
         raw_prompt=reconstructed,
         image_count=1,
+        image_digests=list(bridge.prompts[0].image_digests),
     )
 
     assert bridge._sessions["canonical"]["messages"] == [
@@ -8232,6 +8489,7 @@ def test_multiturn_start_rejects_rehydrated_media_placement_drift_at_same_count(
             prompt_ids=[10, 11],
             raw_prompt=normalized.messages,
             image_count=1,
+            image_digests=list(bridge.prompts[0].image_digests),
         )
 
 
@@ -8254,6 +8512,7 @@ def test_multiturn_start_rejects_same_structure_with_different_fresh_descriptor(
             prompt_ids=[10, 11],
             raw_prompt=normalized.messages,
             image_count=1,
+            image_digests=list(bridge.prompts[0].image_digests),
         )
 
 
@@ -8268,6 +8527,7 @@ def test_valid_image_prompt_reaches_environment_with_media_placement_intact():
         prompt_ids=[10, 11],
         raw_prompt=normalized.messages,
         image_count=1,
+        image_digests=list(bridge.prompts[0].image_digests),
     )
     bridge.step_multiturn(
         {
@@ -8304,3 +8564,115 @@ def test_text_only_multiturn_start_keeps_flat_transcript_state():
     )
 
     assert bridge._sessions["text"]["messages"] == [{"role": "user", "content": "q"}]
+
+
+def test_fifth_opd_image_fails_before_processor_glue_or_teacher_scoring():
+    initial = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": uri}
+                for uri in (
+                    _IMAGE_DATA_URI,
+                    _OTHER_IMAGE_DATA_URI,
+                    _IMAGE_DATA_URI,
+                    _OTHER_IMAGE_DATA_URI,
+                )
+            ],
+        }
+    ]
+
+    class _FifthImageEnv(_StructuredImageEnv):
+        def env_reply(self, messages, state):
+            reply = [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": _IMAGE_DATA_URI}],
+                }
+            ]
+            state["messages"].extend(reply)
+            return reply
+
+    env = _FifthImageEnv(initial)
+    bridge, normalized = _structured_image_bridge(env, initial)
+    processor = _MultiTurnProcessor(bridge.tokenizer)
+    bridge.processor = processor
+    bridge.start_multiturn(
+        index=0,
+        session_id="fifth",
+        prompt_ids=[10, 11],
+        raw_prompt=normalized.messages,
+        image_count=4,
+        image_digests=list(bridge.prompts[0].image_digests),
+    )
+    with pytest.raises(ValueError, match="4-image limit"):
+        bridge.step_multiturn(
+            {
+                "session_id": "fifth",
+                "turn_ordinal": 0,
+                "accepted_prefix": [10, 11],
+                "image_count": 4,
+                "image_digests": list(bridge.prompts[0].image_digests),
+                "raw_response_ids": [65],
+                "response_ids": [65],
+                "completion_text": "A",
+                "termination": "stop",
+                "stop_reason": "stop",
+                "max_tokens": 8,
+                "truncated": False,
+                "skip_reason": "",
+            }
+        )
+    assert processor.image_counts == []
+    assert bridge._sessions["fifth"]["turns"] == []
+
+
+def test_opd_media_digest_order_sabotage_fails_before_environment_mutation():
+    initial = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": _IMAGE_DATA_URI},
+                {"type": "image", "image": _OTHER_IMAGE_DATA_URI},
+            ],
+        }
+    ]
+    env = _StructuredImageEnv(initial)
+    bridge, normalized = _structured_image_bridge(env, initial)
+    digests = list(bridge.prompts[0].image_digests)
+    with pytest.raises(ValueError, match="media does not match"):
+        bridge.start_multiturn(
+            index=0,
+            session_id="wrong-start",
+            prompt_ids=[10, 11],
+            raw_prompt=normalized.messages,
+            image_count=2,
+            image_digests=list(reversed(digests)),
+        )
+    bridge.start_multiturn(
+        index=0,
+        session_id="wrong-step",
+        prompt_ids=[10, 11],
+        raw_prompt=normalized.messages,
+        image_count=2,
+        image_digests=digests,
+    )
+    with pytest.raises(ValueError, match="authenticated environment context"):
+        bridge.step_multiturn(
+            {
+                "session_id": "wrong-step",
+                "turn_ordinal": 0,
+                "accepted_prefix": [10, 11],
+                "image_count": 2,
+                "image_digests": list(reversed(digests)),
+                "raw_response_ids": [65],
+                "response_ids": [65],
+                "completion_text": "A",
+                "termination": "stop",
+                "stop_reason": "stop",
+                "max_tokens": 8,
+                "truncated": False,
+                "skip_reason": "",
+            }
+        )
+    assert env.recorded == []

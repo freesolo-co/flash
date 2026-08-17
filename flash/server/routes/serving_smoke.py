@@ -49,6 +49,23 @@ def _serving():
 
 
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
+_SMOKE_IMAGE_PROMPT = (
+    "Look at the square in the attached image. What color is it? Reply with one color word."
+)
+_SMOKE_IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+"
+    "nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg=="
+)
+_SMOKE_IMAGE_MESSAGES = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": _SMOKE_IMAGE_PROMPT},
+            {"type": "image_url", "image_url": {"url": _SMOKE_IMAGE_DATA_URI}},
+        ],
+    }
+]
 # hard wall-clock budget for the trusted fixed-prompt generation and validation.
 # it remains below the deployment stale threshold.
 _SMOKE_BUDGET_SECONDS = 600.0
@@ -239,6 +256,24 @@ def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> t
     return content, finish
 
 
+def _smoke_answer(
+    result: dict,
+    spec: JobSpec,
+    *,
+    serving_model: str,
+    expected_checkpoint: str,
+) -> tuple[str, object, str]:
+    content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
+    if spec.thinking and finish == "length":
+        raise ServingError("smoke generation was truncated at the maximum token length")
+    answer = (
+        _thinking_answer(content, require_tag=_thinking_tag_is_guaranteed(spec))
+        if spec.thinking
+        else content.strip()
+    )
+    return content, finish, answer
+
+
 def _thinking_tag_is_guaranteed(spec) -> bool:
     """Whether the catalog vouches that this model's chat template opens a thinking block.
 
@@ -345,6 +380,8 @@ def _bounded_smoke_chat(
     serving_model: str,
     thinking: bool,
     expected_checkpoint: str,
+    messages: list[dict] | None = None,
+    structured_outputs: dict | None = None,
     expected_adapter_revision: str,
     max_tokens: int,
     stop_sequences: list[str] | None,
@@ -359,18 +396,25 @@ def _bounded_smoke_chat(
         try:
 
             def _chat_call(timeout_s: float = remaining):
-                return _app.serve_chat(
-                    run_id=serving_model,
-                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
-                    temperature=0.0,
-                    max_tokens=max_tokens,
-                    thinking=thinking,
-                    expected_checkpoint=expected_checkpoint,
-                    expected_adapter_revision=expected_adapter_revision,
-                    timeout_s=timeout_s,
-                    retry_unavailable=True,
-                    stop=stop_sequences,
-                )
+                chat_kwargs = {
+                    "run_id": serving_model,
+                    "messages": (
+                        messages
+                        if messages is not None
+                        else [{"role": "user", "content": _SMOKE_PROMPT}]
+                    ),
+                    "temperature": 0.0,
+                    "max_tokens": max_tokens,
+                    "thinking": thinking,
+                    "expected_checkpoint": expected_checkpoint,
+                    "expected_adapter_revision": expected_adapter_revision,
+                    "timeout_s": timeout_s,
+                    "retry_unavailable": True,
+                    "stop": stop_sequences,
+                }
+                if structured_outputs is not None:
+                    chat_kwargs["structured_outputs"] = structured_outputs
+                return _app.serve_chat(**chat_kwargs)
 
             return _bounded_call(_chat_call, deadline=deadline, budget_s=budget_s)
         except RetryableServingUnavailable as exc:
@@ -397,35 +441,64 @@ def _run_deployment_smoke(
     started = time.monotonic()
     deadline = started + budget_s
     constraint, max_tokens, stop_sequences = _smoke_request_settings(spec)
+    from flash.core.catalog import supports_image_training
+
+    image_capable = supports_image_training(spec.model)
     result = _bounded_smoke_chat(
         serving_model=serving_model,
         thinking=spec.thinking,
         expected_checkpoint=expected_checkpoint,
         expected_adapter_revision=serving_model,
+        messages=_SMOKE_IMAGE_MESSAGES if image_capable else None,
+        structured_outputs={} if image_capable and constraint is not None else None,
         max_tokens=max_tokens,
         stop_sequences=stop_sequences,
         deadline=deadline,
         budget_s=budget_s,
     )
-    content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
-    # truncation is a thinking-budget failure whether or not a grammar is configured: serving
-    # returns the reasoning in reasoning_content, so a run cut off mid-thought still arrives with a
-    # balanced <think>...</think> and passes the empty-content check carrying a non-answer.
-    if spec.thinking and finish == "length":
-        raise ServingError("smoke generation was truncated at the maximum token length")
-    answer = (
-        _thinking_answer(content, require_tag=_thinking_tag_is_guaranteed(spec))
-        if spec.thinking
-        else content.strip()
+    content, finish, answer = _smoke_answer(
+        result,
+        spec,
+        serving_model=serving_model,
+        expected_checkpoint=expected_checkpoint,
     )
-    if constraint:
+    verify_turns = 1
+    if image_capable:
+        if answer.strip().upper() != "RED":
+            raise ServingError("image deployment smoke did not identify the trusted red square")
+        if constraint:
+            structured_result = _bounded_smoke_chat(
+                serving_model=serving_model,
+                thinking=spec.thinking,
+                expected_checkpoint=expected_checkpoint,
+                expected_adapter_revision=serving_model,
+                max_tokens=max_tokens,
+                stop_sequences=stop_sequences,
+                deadline=deadline,
+                budget_s=budget_s,
+            )
+            structured_content, _structured_finish, structured_answer = _smoke_answer(
+                structured_result,
+                spec,
+                serving_model=serving_model,
+                expected_checkpoint=expected_checkpoint,
+            )
+            _validate_structured_smoke(
+                structured_answer,
+                constraint,
+                deadline=deadline,
+                budget_s=budget_s,
+            )
+            content = f"{content}\n{structured_content}"
+            verify_turns = 2
+    elif constraint:
         _validate_structured_smoke(answer, constraint, deadline=deadline, budget_s=budget_s)
     if time.monotonic() > deadline:
         raise _smoke_timeout_error(budget_s)
     return {
         "verified_at": time.time(),
-        "verify_kind": "fixed_prompt",
-        "verify_turns": 1,
+        "verify_kind": "fixed_image" if image_capable else "fixed_prompt",
+        "verify_turns": verify_turns,
         "verify_latency_s": time.monotonic() - started,
         "verify_finish_reason": finish,
         "thinking_tag": "<think>" in content or "</think>" in content,

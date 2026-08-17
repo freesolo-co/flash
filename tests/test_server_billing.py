@@ -640,30 +640,9 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
     unsupported_spec = {
         **SPEC,
-        # image-bearing OPD is single-turn only, so a multi-turn environment carrying an image
-        # record can never launch regardless of the org's balance.
-        "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
-        "environment": {
-            **SPEC["environment"],
-            "params": {
-                # multi_turn rides in params, not as an [environment] key: the spec schema rejects
-                # unknown top-level environment keys, and the validator reads either.
-                "multi_turn": True,
-                "records": [
-                    {
-                        "input": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
-                                ],
-                            }
-                        ]
-                    }
-                ],
-            },
-        },
+        # sft continuation is rejected statically and can never launch regardless of balance.
+        "algorithm": "sft",
+        "train": {**SPEC["train"], "init_from_adapter": "source-run"},
     }
     res = api.post(
         "/v1/runs",
@@ -672,7 +651,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     )
 
     assert res.status_code == 400, res.text
-    assert "multi-turn image-bearing opd is not supported" in res.text
+    assert "SFT adapter continuation is not supported" in res.text
     assert "insufficient" not in res.text
 
 

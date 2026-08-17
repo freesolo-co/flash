@@ -2894,6 +2894,54 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     )
 
 
+@pytest.mark.parametrize("multimodal", [True, False])
+def test_sft_runner_carries_the_prepared_processor_to_every_export(monkeypatch, multimodal):
+    from flash.engine.worker import sft_train
+
+    captured = {}
+
+    class Watcher:
+        def __init__(self, **kwargs):
+            captured["watcher_preprocessor"] = kwargs["preprocessor"]
+            self.required_steps = frozenset(kwargs["required_steps"])
+            self.lifecycle = CheckpointLedger()
+
+        def start(self):
+            return None
+
+        def stop(self, *, require_complete):
+            assert require_complete is True
+
+        def raise_if_failed(self):
+            return None
+
+    spec, _run_capture = _stub_sft_run(monkeypatch, watcher_cls=Watcher)
+    processor = object() if multimodal else None
+    prepare_workload = sft_train.prepare_sft_workload
+
+    def prepare_with_processor(*args, **kwargs):
+        prepared = prepare_workload(*args, **kwargs)
+        return replace(prepared, multimodal=multimodal, processor=processor)
+
+    def fake_export(_actor_dir, _adapter_dir, **kwargs):
+        captured["final_preprocessor"] = kwargs["preprocessor"]
+
+    def fake_training(_command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        return 0
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", prepare_with_processor)
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+
+    assert captured["watcher_preprocessor"] is processor
+    assert captured["final_preprocessor"] is processor
+
+
 def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypatch):
     """the seed has to happen in the runner, before the watcher's thread takes its first sweep."""
     from flash.engine.worker import sft_train
@@ -2984,6 +3032,7 @@ def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
     data = sft_train_runner._SftData(
         rows=[{}] * 800,
         multimodal=False,
+        processor=None,
         profile=SimpleNamespace(examples_per_update=64, authoritative_steps=horizon),
         max_length=1024,
         realized_max_length=128,

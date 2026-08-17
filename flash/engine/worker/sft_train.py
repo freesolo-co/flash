@@ -614,6 +614,7 @@ def run_sft_train(spec=None) -> None:
             model_id=options.model_id,
             model_revision=options.model_revision,
             python_bin=child.python_bin,
+            preprocessor=data.processor,
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
         # only a durably published adapter may suppress the final publish. the seeded resume step no

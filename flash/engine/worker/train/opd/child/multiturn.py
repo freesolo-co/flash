@@ -11,7 +11,7 @@ from uuid import uuid4
 
 if __name__ == "flash_opd_multiturn":
     from flash_multiturn_glue import (
-        EnvGlueTokenizer,
+        EnvGlueProcessor,
         dedup_seam_terminator,
         normalize_token_ids,
         prepare_assistant_turn,
@@ -19,11 +19,10 @@ if __name__ == "flash_opd_multiturn":
         run_executor_call,
         sum_preemptions,
         validate_glue_template,
-        validate_transcript_messages,
     )
 else:
     from flash.engine.worker.train.core.child.glue import (
-        EnvGlueTokenizer,
+        EnvGlueProcessor,
         dedup_seam_terminator,
         normalize_token_ids,
         prepare_assistant_turn,
@@ -31,11 +30,10 @@ else:
         run_executor_call,
         sum_preemptions,
         validate_glue_template,
-        validate_transcript_messages,
     )
 
 __all__ = [
-    "EnvGlueTokenizer",
+    "EnvGlueProcessor",
     "build_flash_multi_turn_agent_loop",
     "dedup_seam_terminator",
     "normalize_token_ids",
@@ -44,7 +42,6 @@ __all__ = [
     "run_executor_call",
     "sum_preemptions",
     "validate_glue_template",
-    "validate_transcript_messages",
 ]
 
 
@@ -123,7 +120,7 @@ def _opd_turn_output_fields(
     turn_ordinal: int,
     generated_seconds: float,
     num_preempted: int,
-    multi_modal_data,
+    media_snapshot,
     mm_processor_kwargs,
 ) -> dict:
     """the fields one OPD turn contributes to its own AgentLoopOutput.
@@ -131,16 +128,15 @@ def _opd_turn_output_fields(
     OPD emits one output per turn rather than one per episode, so the prompt is the prefix this turn
     conditioned on and the whole response is model-generated (mask all ones).
 
-    every turn's prefix still contains the episode's image placeholders, so every turn's output
-    carries the same frozen media: the actor forward re-tokenizes this prompt and would otherwise
-    see placeholders with no pixels to expand. text-only rows pass None and are unchanged.
+    every turn carries an immutable snapshot of the cumulative media present in its prefix. the
+    actor forward re-tokenizes that prompt and must see exactly the same pixels as generation.
     """
     return {
         "prompt_ids": list(prefix_ids),
         "response_ids": list(response_ids),
         "response_mask": [1] * len(response_ids),
         "response_logprobs": response_logprobs,
-        "multi_modal_data": multi_modal_data or None,
+        "multi_modal_data": media_snapshot or None,
         "mm_processor_kwargs": mm_processor_kwargs,
         "num_turns": turn_ordinal + 1,
         "metrics": {
@@ -151,6 +147,30 @@ def _opd_turn_output_fields(
         },
         "extra_fields": dict(generated.extra_fields or {}),
     }
+
+
+def _close_reply_images(images) -> None:
+    for image in images:
+        with contextlib.suppress(Exception):
+            image.close()
+
+
+def _validate_opd_reply_media(prompt, reply_glue, step) -> None:
+    expected_digests = [*prompt.image_digests, *reply_glue.image_digests]
+    try:
+        returned_count = int(step["image_count"])
+        returned_digests = list(step["image_digests"])
+    except (KeyError, TypeError, ValueError) as error:
+        _close_reply_images(reply_glue.images)
+        raise RuntimeError(
+            "multi-turn OPD bridge returned invalid cumulative media identity"
+        ) from error
+    if returned_count != len(expected_digests) or returned_digests != expected_digests:
+        _close_reply_images(reply_glue.images)
+        raise RuntimeError(
+            "multi-turn OPD bridge returned cumulative media that does not match the decoded "
+            "environment reply"
+        )
 
 
 class _OpdEpisodeSettings:
@@ -227,6 +247,7 @@ async def _opd_run(
                     "prompt_ids": prompt_ids,
                     "raw_prompt": raw_prompt,
                     "image_count": prompt.image_count(),
+                    "image_digests": list(prompt.image_digests),
                 },
             ),
         )
@@ -315,7 +336,7 @@ async def _opd_run_turns(
     max_model_len = settings.max_model_len
     stop_sequences = settings.stop_sequences
     eos_token_ids = settings.eos_token_ids
-    glue_tokenizer = EnvGlueTokenizer(self.tokenizer, thinking=settings.thinking)
+    glue_processor = EnvGlueProcessor(self, thinking=settings.thinking)
     generated_seconds = 0.0
     num_preempted = -1
     prefix_ids = list(prompt.prompt_ids)
@@ -341,16 +362,19 @@ async def _opd_run_turns(
             stop_sequences=stop_sequences,
             eos_token_ids=eos_token_ids,
         )
+        accepted_prefix = list(prefix_ids)
+        accepted_image_count = prompt.image_count()
+        accepted_image_digests = list(prompt.image_digests)
+        turn_media_snapshot = prompt.media_snapshot()
         request_started = time.perf_counter()
-        # the media rides along on EVERY turn, not just the first: each turn re-sends the whole
-        # prefix, whose placeholder tokens still need their pixels to expand.
+        # every turn receives an immutable view of the exact cumulative media in its prefix.
         generated = await self.server_manager.generate(
             request_id=uuid4().hex,
             prompt_ids=prefix_ids,
             sampling_params=params,
-            image_data=prompt.images,
-            video_data=prompt.videos,
-            audio_data=prompt.audios,
+            image_data=list(prompt.images) or None,
+            video_data=list(prompt.videos) or None,
+            audio_data=list(prompt.audios) or None,
             mm_processor_kwargs=prompt.mm_processor_kwargs,
         )
         generated_seconds += time.perf_counter() - request_started
@@ -369,7 +393,7 @@ async def _opd_run_turns(
             response_logprobs = list(response_logprobs[: len(response_ids)])
         step = await run_executor_call(
             self.loop,
-            lambda turn_ordinal=turn_ordinal, prefix_ids=list(prefix_ids), turn=dict(turn): (
+            lambda turn_ordinal=turn_ordinal, accepted_prefix=accepted_prefix, accepted_image_count=accepted_image_count, accepted_image_digests=accepted_image_digests, turn=dict(turn): (
                 post_json(
                     bridge_url,
                     bridge_token,
@@ -377,7 +401,9 @@ async def _opd_run_turns(
                     {
                         "session_id": session_id,
                         "turn_ordinal": turn_ordinal,
-                        "accepted_prefix": prefix_ids,
+                        "accepted_prefix": accepted_prefix,
+                        "image_count": accepted_image_count,
+                        "image_digests": accepted_image_digests,
                         "raw_response_ids": turn["raw_response_ids"],
                         "response_ids": turn["response_ids"],
                         "completion_text": turn["completion_text"],
@@ -400,7 +426,7 @@ async def _opd_run_turns(
                     turn_ordinal=turn_ordinal,
                     generated_seconds=generated_seconds,
                     num_preempted=num_preempted,
-                    multi_modal_data=prompt.multi_modal_data,
+                    media_snapshot=turn_media_snapshot,
                     mm_processor_kwargs=prompt.mm_processor_kwargs,
                 )
             )
@@ -408,15 +434,19 @@ async def _opd_run_turns(
         if turn["truncated"] or turn["skip_reason"] or step["terminal"]:
             break
         prefix_ids.extend(response_ids)
-        env_messages = validate_transcript_messages(step["messages"], source="environment reply")
+        env_messages = step["messages"]
         if not env_messages:
             break
-        glue_ids = dedup_seam_terminator(response_ids, glue_tokenizer(env_messages))
+        reply_glue = await glue_processor(env_messages, step.get("image_data_uris"))
+        _validate_opd_reply_media(prompt, reply_glue, step)
+        glue_ids = dedup_seam_terminator(response_ids, reply_glue.token_ids)
         # stop while at least a minimal generation window remains: gluing right up to
         # max_model_len leaves the next turn zero tokens to generate (the engine would
         # immediately truncate), so reserve a small slack for the next model turn.
         if len(prefix_ids) + len(glue_ids) + 8 > max_model_len:
+            _close_reply_images(reply_glue.images)
             break
+        prompt.append_images(reply_glue.images, reply_glue.image_digests)
         prefix_ids.extend(glue_ids)
 
 

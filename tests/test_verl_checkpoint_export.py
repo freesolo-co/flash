@@ -12,6 +12,73 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_checkpoint_export_saves_complete_processor_sidecars(monkeypatch, tmp_path):
+    from flash.engine.worker.train.sft import checkpoints
+
+    actor_dir = tmp_path / "actor"
+    actor_dir.mkdir()
+    adapter_dir = tmp_path / "adapter"
+
+    def export(_actor, target, **_kwargs):
+        os.makedirs(target)
+        (adapter_dir / "adapter_config.json").write_text("{}")
+
+    class Processor:
+        def save_pretrained(self, target):
+            (adapter_dir / "preprocessor_config.json").write_text(
+                '{"image_processor_type":"QwenVLImageProcessor"}'
+            )
+            (adapter_dir / "processor_config.json").write_text(
+                '{"processor_class":"QwenVLProcessor"}'
+            )
+
+    monkeypatch.setattr(checkpoints, "export_peft_adapter", export)
+    monkeypatch.setattr(checkpoints, "stamp_adapter_dir_provenance", lambda *args: None)
+    monkeypatch.setattr(checkpoints._w, "write_base_model_provenance", lambda *args: None)
+
+    checkpoints._export_checkpoint_adapter(
+        str(actor_dir),
+        str(adapter_dir),
+        model_id="org/model",
+        model_revision="commit",
+        python_bin="/verl/python",
+        preprocessor=Processor(),
+    )
+
+    assert (adapter_dir / "preprocessor_config.json").read_text() == (
+        '{"image_processor_type":"QwenVLImageProcessor"}'
+    )
+    assert (adapter_dir / "processor_config.json").read_text() == (
+        '{"processor_class":"QwenVLProcessor"}'
+    )
+
+
+def test_text_checkpoint_export_does_not_invent_processor_sidecars(monkeypatch, tmp_path):
+    from flash.engine.worker.train.sft import checkpoints
+
+    actor_dir = tmp_path / "actor"
+    actor_dir.mkdir()
+    adapter_dir = tmp_path / "adapter"
+
+    def export(_actor, target, **_kwargs):
+        os.makedirs(target)
+        (adapter_dir / "adapter_config.json").write_text("{}")
+
+    monkeypatch.setattr(checkpoints, "export_peft_adapter", export)
+    monkeypatch.setattr(checkpoints, "stamp_adapter_dir_provenance", lambda *args: None)
+    monkeypatch.setattr(checkpoints._w, "write_base_model_provenance", lambda *args: None)
+
+    checkpoints._export_checkpoint_adapter(
+        str(actor_dir),
+        str(adapter_dir),
+        model_id="org/model",
+        model_revision="commit",
+        python_bin="/verl/python",
+    )
+
+    assert sorted(path.name for path in adapter_dir.iterdir()) == ["adapter_config.json"]
+
+
 def _has_libc() -> bool:
     try:
         ctypes.CDLL("libc.so.6", use_errno=True)

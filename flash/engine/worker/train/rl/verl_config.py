@@ -306,6 +306,8 @@ def _rollout_overrides(cfg: dict) -> list[str]:
     return [
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
+        # hydra's composed rollout node omits this real rollout config field.
+        "++actor_rollout_ref.rollout.limit_images=4",
         # verl 0.8.0 chunks the rollout batch across agent workers with exact divisibility
         # (agent_loop.py:1111 -> protocol.py:874). choose the largest divisor of
         # prompts_per_step * group_size up to 8, so small or final short batches cannot abort.

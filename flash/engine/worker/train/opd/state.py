@@ -28,6 +28,7 @@ class _PromptState:
     prompt_budget: int
     prompts: list[Any]
     dropped_long: int
+    processor: Any = None
 
 
 @dataclass(frozen=True)

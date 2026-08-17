@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 from typing import Any
 from uuid import uuid4
@@ -195,10 +196,10 @@ def _tokenize_text(tokenizer, text: str) -> list[int]:
 
 
 def _unique_glue_probe(messages: list[dict]) -> str:
-    contents = [message["content"] for message in messages]
+    serialized = json.dumps(messages, sort_keys=True, separators=(",", ":"))
     while True:
         probe = f"{_PROBE_PREFIX}-{uuid4().hex}"
-        if all(probe not in content for content in contents):
+        if probe not in serialized:
             return probe
 
 
@@ -242,6 +243,261 @@ class EnvGlueTokenizer:
             self.cache.pop(next(iter(self.cache)))
         self.cache[key] = list(glue_ids)
         return glue_ids
+
+
+def _hash_framed(digest, name: str, value: bytes) -> None:
+    encoded_name = name.encode("ascii")
+    digest.update(len(encoded_name).to_bytes(4, "big"))
+    digest.update(encoded_name)
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def _hash_processor_field(digest, field_name: str, value) -> None:
+    if (
+        not hasattr(value, "dtype")
+        or not hasattr(value, "shape")
+        or not callable(getattr(value, "tobytes", None))
+    ):
+        raise ValueError(
+            f"processor image output {field_name!r} must expose dtype, shape, and tobytes"
+        )
+    if bool(getattr(value.dtype, "hasobject", False)):
+        raise ValueError(f"processor image output {field_name!r} cannot use object dtype")
+    try:
+        shape = tuple(int(dimension) for dimension in value.shape)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"processor image output {field_name!r} has an invalid shape") from error
+    if any(dimension < 0 for dimension in shape):
+        raise ValueError(f"processor image output {field_name!r} has an invalid shape")
+    try:
+        data = value.tobytes(order="C")
+    except (TypeError, ValueError, AttributeError) as error:
+        raise ValueError(
+            f"processor image output {field_name!r} cannot provide C-contiguous bytes"
+        ) from error
+    if not isinstance(data, bytes):
+        raise ValueError(f"processor image output {field_name!r} returned non-bytes from tobytes")
+    shape_bytes = len(shape).to_bytes(4, "big") + b"".join(
+        dimension.to_bytes(8, "big") for dimension in shape
+    )
+    _hash_framed(digest, f"{field_name}.dtype", str(value.dtype).encode("ascii"))
+    _hash_framed(digest, f"{field_name}.shape", shape_bytes)
+    _hash_framed(digest, f"{field_name}.data", data)
+
+
+def processor_image_digest(processor, image) -> str:
+    """hash one image's exact model-facing processor output."""
+    image_processor = getattr(processor, "image_processor", None)
+    if not callable(image_processor):
+        raise ValueError("image media requires a processor with an image_processor")
+    try:
+        model_inputs = image_processor(images=[image], return_tensors="np")
+    except Exception as error:
+        raise ValueError("processor image preprocessing failed") from error
+    digest = hashlib.sha256()
+    digest.update(b"flash-processor-image-v1\0")
+    for field_name in ("pixel_values", "image_grid_thw"):
+        try:
+            value = model_inputs[field_name]
+        except (KeyError, TypeError, AttributeError) as error:
+            raise ValueError(
+                f"processor image output is missing required field {field_name!r}"
+            ) from error
+        _hash_processor_field(digest, field_name, value)
+    return digest.hexdigest()
+
+
+def processor_image_digests(processor, images) -> list[str]:
+    images = list(images or ())
+    if not images:
+        return []
+    return [processor_image_digest(processor, image) for image in images]
+
+
+def bind_image_data_uris(messages: list[dict], image_data_uris: list[str]) -> list[dict]:
+    """bind ordered data uris to source-free image blocks for child-side decoding."""
+    uri_iter = iter(image_data_uris)
+    prepared = []
+    for message in validate_structured_messages(messages, source="environment reply"):
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                copied_block = dict(block)
+                if copied_block.get("type") == "image":
+                    try:
+                        uri = next(uri_iter)
+                    except StopIteration as error:
+                        raise ValueError(
+                            "environment reply has more image blocks than transported image data"
+                        ) from error
+                    if not isinstance(uri, str) or not uri.startswith("data:image/"):
+                        raise ValueError("environment reply image transport must use data uris")
+                    copied_block["image"] = uri
+                blocks.append(copied_block)
+            copied["content"] = blocks
+        prepared.append(copied)
+    try:
+        next(uri_iter)
+    except StopIteration:
+        return prepared
+    raise ValueError("environment reply transported image data without a matching image block")
+
+
+def _processor_glue_ids(
+    processor,
+    tokenizer,
+    messages: list[dict],
+    images: list,
+    *,
+    apply_chat_template_kwargs: dict,
+    mm_processor_kwargs: dict,
+) -> list[int]:
+    """derive exact append-only glue with the processor that expands the new images."""
+    structured = validate_structured_messages(messages, source="environment reply")
+    probe = _unique_glue_probe(structured)
+    rendered = processor.apply_chat_template(
+        [{"role": "assistant", "content": probe}, *structured],
+        tokenize=False,
+        add_generation_prompt=True,
+        **apply_chat_template_kwargs,
+    )
+    first = rendered.find(probe)
+    if first < 0 or rendered.find(probe, first + len(probe)) >= 0:
+        raise ValueError(
+            "multi-turn rollout could not uniquely locate the assistant-content probe in the "
+            "processor chat template; exact inter-turn glue cannot be recovered"
+        )
+    suffix = rendered[first + len(probe) :]
+    model_inputs = processor(
+        text=[suffix],
+        images=images,
+        videos=None,
+        return_tensors=None,
+        **mm_processor_kwargs,
+    )
+    return normalize_token_ids(model_inputs)
+
+
+def parent_image_digests(
+    processor,
+    image_descriptors: list[str] | tuple[str, ...],
+    package_root: str | None,
+) -> list[str]:
+    from flash.content.multimodal import decode_image_descriptors
+
+    images = decode_image_descriptors(list(image_descriptors), package_root)
+    try:
+        return processor_image_digests(processor, images)
+    finally:
+        for image in images:
+            image.close()
+
+
+def parent_environment_glue(
+    processor,
+    tokenizer,
+    messages: list[dict],
+    image_descriptors: list[str] | tuple[str, ...],
+    package_root: str | None,
+    *,
+    thinking: bool,
+) -> tuple[list[int], list[str]]:
+    """derive the authenticated parent copy of one reply's glue and ordered image digests."""
+    structured = validate_structured_messages(messages, source="environment reply")
+    if not image_descriptors:
+        transcript = validate_transcript_messages(
+            structured,
+            source="environment reply",
+            allow_content_blocks=True,
+        )
+        return EnvGlueTokenizer(tokenizer, thinking=thinking)(transcript), []
+    if processor is None:
+        raise ValueError("environment reply carries images but the parent has no processor")
+    from flash.content.multimodal import decode_image_descriptors
+
+    images = decode_image_descriptors(list(image_descriptors), package_root)
+    try:
+        token_ids = _processor_glue_ids(
+            processor,
+            tokenizer,
+            structured,
+            images,
+            apply_chat_template_kwargs={"enable_thinking": bool(thinking)},
+            mm_processor_kwargs={},
+        )
+        return token_ids, processor_image_digests(processor, images)
+    finally:
+        for image in images:
+            image.close()
+
+
+class EnvironmentReplyGlue:
+    __slots__ = ("image_digests", "images", "token_ids")
+
+    def __init__(self, token_ids: list[int], images: list, image_digests: list[str]) -> None:
+        self.token_ids = list(token_ids)
+        self.images = list(images)
+        self.image_digests = list(image_digests)
+
+
+class EnvGlueProcessor:
+    """derive text or processor-aware environment glue and decode only newly transported images."""
+
+    def __init__(self, loop_self, *, thinking: bool) -> None:
+        self.loop_self = loop_self
+        self.text = EnvGlueTokenizer(loop_self.tokenizer, thinking=thinking)
+        self.apply_chat_template_kwargs = dict(
+            getattr(loop_self, "apply_chat_template_kwargs", {}) or {}
+        )
+        self.apply_chat_template_kwargs["enable_thinking"] = bool(thinking)
+
+    async def __call__(
+        self,
+        messages: list[dict],
+        image_data_uris: list[str] | None = None,
+    ) -> EnvironmentReplyGlue:
+        image_data_uris = list(image_data_uris or ())
+        structured = validate_structured_messages(messages, source="environment reply")
+        if not image_data_uris:
+            text_messages = validate_transcript_messages(
+                structured,
+                source="environment reply",
+                allow_content_blocks=True,
+            )
+            return EnvironmentReplyGlue(self.text(text_messages), [], [])
+        processor = getattr(self.loop_self, "processor", None)
+        if processor is None:
+            raise ValueError("environment reply carries images but the rollout has no processor")
+        prepared = bind_image_data_uris(structured, image_data_uris)
+        multi_modal_data = await self.loop_self.process_multi_modal_info(prepared)
+        images = list((multi_modal_data or {}).get("images") or ())
+        if len(images) != len(image_data_uris):
+            raise ValueError(
+                "environment reply decoded image count does not match its transported image data"
+            )
+        if (multi_modal_data or {}).get("videos") or (multi_modal_data or {}).get("audios"):
+            raise ValueError("environment reply image glue cannot carry video or audio media")
+        try:
+            mm_processor_kwargs = self.loop_self._get_mm_processor_kwargs(None)
+            token_ids = _processor_glue_ids(
+                processor,
+                self.loop_self.tokenizer,
+                structured,
+                images,
+                apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+            return EnvironmentReplyGlue(
+                token_ids, images, processor_image_digests(processor, images)
+            )
+        except Exception:
+            for image in images:
+                with contextlib.suppress(Exception):
+                    image.close()
+            raise
 
 
 def validate_glue_template(tokenizer, *, thinking: bool) -> None:
@@ -409,45 +665,48 @@ def multi_modal_image_count(multi_modal_data) -> int:
 
 
 class EpisodePrompt:
-    """the tokenized initial prompt plus the decoded media every generate call must carry.
-
-    an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. both
-    apply_chat_template and every generate call need the decoded media alongside the ids, or the
-    engine sees placeholders it cannot expand and the rollout either dies on a feature/placeholder
-    mismatch or conditions on nothing. text-only prompts yield {}.
-
-    the media is frozen at episode start and resent unchanged on every turn. later environment
-    replies never add to it: a mid-episode image would change the placeholder/pixel correspondence
-    the prompt ids were built against, which is why both loops reject one upstream.
-    """
+    """the tokenized prompt plus cumulative decoded media used by every generation."""
 
     __slots__ = (
         "audios",
+        "image_digests",
         "images",
         "mm_processor_kwargs",
-        "multi_modal_data",
         "prompt_ids",
         "structured_messages",
         "videos",
     )
 
-    def __init__(self, multi_modal_data, mm_processor_kwargs, prompt_ids, structured_messages):
-        self.multi_modal_data = multi_modal_data
-        self.mm_processor_kwargs = mm_processor_kwargs
-        self.prompt_ids = prompt_ids
+    def __init__(
+        self, processor, multi_modal_data, mm_processor_kwargs, prompt_ids, structured_messages
+    ):
+        multi_modal_data = dict(multi_modal_data or {})
+        self.mm_processor_kwargs = dict(mm_processor_kwargs or {})
+        self.prompt_ids = list(prompt_ids)
         self.structured_messages = structured_messages
-        self.images = multi_modal_data.get("images")
-        self.videos = multi_modal_data.get("videos")
-        self.audios = multi_modal_data.get("audios")
+        self.images = list(multi_modal_data.get("images") or ())
+        self.videos = list(multi_modal_data.get("videos") or ())
+        self.audios = list(multi_modal_data.get("audios") or ())
+        self.image_digests = processor_image_digests(processor, self.images)
 
     def image_count(self) -> int:
-        """how many images the engine actually decoded for this prompt.
+        return len(self.images)
 
-        the bridge authenticates this against the frozen parent prompt, so it counts what the child
-        will condition on rather than what the transcript appears to mention. it must agree with the
-        count the single-turn path reports, hence the shared counter rather than a second one.
-        """
-        return multi_modal_image_count(self.multi_modal_data)
+    def append_images(self, images: list, image_digests: list[str]) -> None:
+        if len(images) != len(image_digests):
+            raise ValueError("new image count does not match its digest count")
+        self.images.extend(images)
+        self.image_digests.extend(image_digests)
+
+    def media_snapshot(self) -> dict:
+        snapshot = {}
+        if self.images:
+            snapshot["images"] = list(self.images)
+        if self.videos:
+            snapshot["videos"] = list(self.videos)
+        if self.audios:
+            snapshot["audios"] = list(self.audios)
+        return snapshot
 
 
 async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
@@ -471,4 +730,10 @@ async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
         mm_processor_kwargs=mm_processor_kwargs,
     )
     structured = validate_structured_messages(messages, source="initial prompt")
-    return EpisodePrompt(multi_modal_data, mm_processor_kwargs, prompt_ids, structured)
+    return EpisodePrompt(
+        getattr(loop_self, "processor", None),
+        multi_modal_data,
+        mm_processor_kwargs,
+        prompt_ids,
+        structured,
+    )

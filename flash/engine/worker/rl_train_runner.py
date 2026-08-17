@@ -275,6 +275,12 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
             # index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order.
             env_prompts=[p["env_prompt"] for p in prompts],
             max_turns=int(inp["max_turns"]),
+            prompt_ids=[p["prompt_ids"] for p in prompts],
+            prompt_descriptors=[p.get("images", ()) for p in prompts],
+            package_root=inp["package_root"],
+            processor=inp["processor"],
+            tokenizer=tok,
+            thinking=bool(_w.THINKING),
             per_turn_credit=bool(inp["per_turn_credit"]),
             on_episode_scored=observability.record,
             parent_work=observability.parent_work,

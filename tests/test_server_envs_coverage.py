@@ -27,6 +27,7 @@ from fastapi import HTTPException
 
 import flash.server.routes.serving as serving
 import flash.server.routes.serving_completion as serving_completion
+import flash.server.routes.serving_smoke as serving_smoke
 from flash.engine.plan.recipe import RECIPE
 from flash.serve.deploy import AliasThinkingSilent, ServingError
 
@@ -555,9 +556,10 @@ def _smoke_spec(
     max_context_tokens: int | None = None,
     algorithm: str = "grpo",
     stop_sequences: tuple[str, ...] = (),
+    model: str = "some-org/text-only-model",
 ):
     return types.SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
+        model=model,
         algorithm=algorithm,
         thinking=thinking,
         train=types.SimpleNamespace(
@@ -637,6 +639,79 @@ def test_run_deployment_smoke_uses_only_trusted_fixed_prompt(monkeypatch):
     assert calls[0]["expected_checkpoint"] == "run-1"
     assert calls[0]["timeout_s"] <= 10.0
     assert calls[0]["retry_unavailable"] is True
+
+
+def test_image_deployment_smoke_uses_valid_trusted_image_without_persisting_it(monkeypatch):
+    import base64
+    import io
+
+    from PIL import Image
+
+    encoded = serving_smoke._SMOKE_IMAGE_DATA_URI.split(",", 1)[1]
+    image = Image.open(io.BytesIO(base64.b64decode(encoded, validate=True)))
+    image.load()
+    assert image.size == (32, 32)
+    assert image.convert("RGB").getpixel((0, 0)) == (255, 0, 0)
+    image.close()
+    assert "red" not in serving_smoke._SMOKE_IMAGE_PROMPT.lower()
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("RED")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+    assert out["verify_kind"] == "fixed_image"
+    assert out["verify_turns"] == 1
+    assert calls[0]["messages"] == serving_smoke._SMOKE_IMAGE_MESSAGES
+    assert calls[0]["expected_checkpoint"] == "run-1"
+    assert calls[0]["expected_adapter_revision"] == _SMOKE_REVISION
+    assert serving_smoke._SMOKE_IMAGE_DATA_URI not in json.dumps(out)
+
+
+def test_image_deployment_smoke_still_rejects_wrong_provenance(monkeypatch):
+    response = _smoke_response("RED")
+    response["freesolo"]["checkpoint"] = "wrong"
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+
+    with pytest.raises(ServingError, match="wrong checkpoint"):
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+
+def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(monkeypatch):
+    calls = []
+    validated = []
+    validate_structured_smoke = serving_smoke._validate_structured_smoke
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            assert kwargs["structured_outputs"] == {}
+            return _smoke_response("RED")
+        assert "structured_outputs" not in kwargs
+        return _smoke_response('{"answer":"4"}')
+
+    def capture_validation(answer, constraint, **kwargs):
+        validated.append((answer, constraint))
+        return validate_structured_smoke(answer, constraint, **kwargs)
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_smoke, "_validate_structured_smoke", capture_validation)
+    out = _run_smoke(
+        _smoke_spec(
+            thinking=False,
+            model="Qwen/Qwen3.5-4B",
+            constraint={"json_object": True},
+        )
+    )
+
+    assert out["verify_kind"] == "fixed_image"
+    assert out["verify_turns"] == 2
+    assert calls[0]["messages"] == serving_smoke._SMOKE_IMAGE_MESSAGES
+    assert calls[1]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
+    assert validated == [('{"answer":"4"}', {"json_object": True})]
 
 
 def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
@@ -1122,7 +1197,7 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
         lambda **_k: _smoke_response("<think>still reasoning"),
     )
     with pytest.raises(ServingError, match="never closed its reasoning"):
-        _run_smoke(_smoke_spec(thinking=True))
+        _run_smoke(_smoke_spec(thinking=True, model="Qwen/Qwen3.5-4B"))
 
     monkeypatch.setattr(
         serving._app,
@@ -1196,7 +1271,7 @@ def test_thinking_smoke_accepts_a_tagless_answer_only_for_an_uncataloged_model(m
     """
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("4"))
 
-    strict = _smoke_spec(thinking=True)
+    strict = _smoke_spec(thinking=True, model="Qwen/Qwen3.5-4B")
     with pytest.raises(ServingError, match="never closed its reasoning"):
         _run_smoke(strict)
 
@@ -1516,13 +1591,21 @@ def test_structured_json_rejects_nonfinite_constants(monkeypatch, constant, cons
 def test_thinking_structured_smoke_rejects_invalid_output(
     monkeypatch, constraint, content, finish_reason, match
 ):
-    monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
-        lambda **_k: _smoke_response(content, finish_reason),
+    responses = iter(
+        [
+            _smoke_response("<think>vision</think>RED"),
+            _smoke_response(content, finish_reason),
+        ]
     )
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: next(responses))
     with pytest.raises(ServingError, match=match):
-        _run_smoke(_smoke_spec(thinking=True, constraint=constraint))
+        _run_smoke(
+            _smoke_spec(
+                thinking=True,
+                constraint=constraint,
+                model="Qwen/Qwen3.5-4B",
+            )
+        )
 
 
 def test_nonthinking_structured_smoke_validates_whole_stripped_content(monkeypatch):
@@ -1582,21 +1665,32 @@ def test_alias_thinking_verification_matches_the_smoke_request_shape(monkeypatch
         constraint={"json_object": True},
         max_completion_tokens=40000,
         stop_sequences=("</answer>",),
+        model="Qwen/Qwen3.5-4B",
     )
     calls = []
+    responses = iter(
+        [
+            _smoke_response("<think>vision</think>RED", reasoning_content="vision"),
+            _smoke_response(
+                '<think>2+2 is 4</think>{"answer":"4"}',
+                reasoning_content="2+2 is 4",
+            ),
+            _smoke_response(
+                '<think>2+2 is 4</think>{"answer":"4"}',
+                reasoning_content="2+2 is 4",
+            ),
+        ]
+    )
 
     def fake_serve_chat(**kwargs):
         calls.append(kwargs)
-        return _smoke_response(
-            '<think>2+2 is 4</think>{"answer":"4"}',
-            reasoning_content="2+2 is 4",
-        )
+        return next(responses)
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
     _run_smoke(spec)
     serving._verify_alias_thinking("run-1", spec, _SMOKE_REVISION, "run-1")
 
-    smoke_call, alias_call = calls
+    _image_call, smoke_call, alias_call = calls
     assert alias_call["stop"] == smoke_call["stop"] == ["</answer>"]
     assert alias_call["max_tokens"] == smoke_call["max_tokens"] == 32512
     assert alias_call["messages"] == smoke_call["messages"]

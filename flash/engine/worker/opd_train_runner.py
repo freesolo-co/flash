@@ -102,7 +102,9 @@ def _render_prompt_rows(request: _OpdRequest) -> tuple[list[tuple[Any, Any]], bo
         for example in train:
             prompt_rows.append((example, request.env.prompt_messages(example)))
             scanned[0] += 1
-    multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
+    multimodal = bool(getattr(request.env, "image_observations", False)) or any(
+        record_has_images(example, messages) for example, messages in prompt_rows
+    )
     # shuffle cached rendered rows, not examples: prompt_messages may be stateful and a second
     # render could change multimodal classification. the same seeded permutation preserves resume order.
     random.Random(_opd_train._w.SEED).shuffle(prompt_rows)
@@ -158,6 +160,7 @@ def _prepare_prompts(
 ) -> _PromptState:
     from flash.content.multimodal import image_teacher_prompt_messages
     from flash.engine.worker.teacher.client import TeacherClient
+    from flash.engine.worker.train.core.child.glue import parent_image_digests
 
     teacher = TeacherClient(capability, control_panel_url, request.knobs.teacher_model)
     processor = None
@@ -259,6 +262,9 @@ def _prepare_prompts(
                     image_descriptors=image_descriptors,
                     package_root=package_root,
                     example=example if request.multi_turn else None,
+                    image_digests=tuple(
+                        parent_image_digests(processor, image_descriptors, package_root)
+                    ),
                 )
             )
     return _PromptState(
@@ -269,6 +275,7 @@ def _prepare_prompts(
         prompt_budget,
         prompts,
         dropped_long,
+        processor,
     )
 
 
@@ -410,6 +417,7 @@ def _materialize_child_files(
     )
     bridge = _opd_train._TeacherAlignmentBridge(
         prompts=prompt_state.prompts,
+        processor=prompt_state.processor,
         tokenizer=prompt_state.tokenizer,
         teacher=prompt_state.teacher,
         thinking_prefill=prompt_state.thinking_prefill,
@@ -746,6 +754,7 @@ def _build_checkpoint_watcher(
         model_id=request.model_id,
         model_revision=request.model_revision,
         required_steps=request.knobs.save_at_steps,
+        preprocessor=runtime.bridge.processor,
         seed=int(_opd_train._w.SEED),
         prompt_pool_fingerprint=workload.prompt_pool_fingerprint,
         prompts_per_step=workload.prompts_per_step,
@@ -876,6 +885,7 @@ def _export_and_upload_adapter(
         model_id=request.model_id,
         model_revision=request.model_revision,
         python_bin=runtime.python_bin,
+        preprocessor=runtime.bridge.processor,
     )
     _opd_train._w.hf_upload_folder(adapter_dir, "adapter", required=True)
     return adapter_dir

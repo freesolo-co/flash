@@ -71,6 +71,7 @@ class _SftOptions:
 class _SftData:
     rows: list[dict]
     multimodal: bool
+    processor: object | None
     profile: object
     max_length: int
     realized_max_length: int
@@ -314,6 +315,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     return _SftData(
         rows=rows,
         multimodal=prepared_workload.multimodal,
+        processor=prepared_workload.processor,
         profile=profile,
         max_length=max_length,
         realized_max_length=realized_max_length,
@@ -665,6 +667,7 @@ def _prepare_sft_child(
         model_id=options.model_id,
         model_revision=options.model_revision,
         required_steps=options.save_at_steps,
+        preprocessor=data.processor,
     )
     # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded
     # watcher re-merges it and re-uploads full state hf already has, holding the resume-upload
