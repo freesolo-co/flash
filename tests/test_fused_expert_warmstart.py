@@ -73,8 +73,8 @@ def _write_small_safetensors(path, tensors=None):
 def _text_pair(module, factor_a, factor_b):
     prefix = f"base_model.model.layers.0.{module}"
     return {
-        f"{prefix}.lora_A.default.weight": np.asarray(factor_a, dtype=np.float16),
-        f"{prefix}.lora_B.default.weight": np.asarray(factor_b, dtype=np.float16),
+        f"{prefix}.lora_A.weight": np.asarray(factor_a, dtype=np.float16),
+        f"{prefix}.lora_B.weight": np.asarray(factor_b, dtype=np.float16),
     }
 
 
@@ -90,11 +90,11 @@ def _text_adapter_tensors(mode, rank=1):
     if mode == "mixed":
         return {**zero_pair, **nonzero_pair}
     if mode == "orphan_a":
-        key = "base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
-        return {key: np.ones((rank, 2), dtype=np.float16)}
+        key = "base_model.model.layers.0.self_attn.q_proj.lora_A.weight"
+        return {**nonzero_pair, key: np.ones((rank, 2), dtype=np.float16)}
     if mode == "orphan_b":
-        key = "base_model.model.layers.0.self_attn.q_proj.lora_B.default.weight"
-        return {key: np.ones((2, rank), dtype=np.float16)}
+        key = "base_model.model.layers.0.self_attn.q_proj.lora_B.weight"
+        return {**nonzero_pair, key: np.ones((2, rank), dtype=np.float16)}
     if mode == "nonfinite":
         nonfinite_a = nonzero_a.copy()
         nonfinite_a[0, 0] = np.nan
@@ -105,6 +105,61 @@ def _text_adapter_tensors(mode, rank=1):
         return {
             **nonzero_pair,
             **_text_pair("visual.patch_embed.proj", nonzero_a, nonzero_b),
+        }
+    if mode == "vision_saved":
+        return {
+            **nonzero_pair,
+            "base_model.model.visual.proj.modules_to_save.default.weight": np.ones(
+                (2, 2), dtype=np.float16
+            ),
+        }
+    if mode == "projector_lora":
+        return {
+            **nonzero_pair,
+            **_text_pair("multi_modal_projector.linear", nonzero_a, nonzero_b),
+        }
+    if mode == "mtp_saved":
+        return {
+            **nonzero_pair,
+            "base_model.model.mtp.proj.modules_to_save.default.weight": np.ones(
+                (2, 2), dtype=np.float16
+            ),
+        }
+    if mode == "text_saved":
+        return {
+            **nonzero_pair,
+            "base_model.model.layers.0.embed_tokens.modules_to_save.default.weight": np.ones(
+                (2, 2), dtype=np.float16
+            ),
+        }
+    if mode == "legacy_default_leaf":
+        return {
+            key.replace(".lora_A.weight", ".lora_A.default.weight").replace(
+                ".lora_B.weight", ".lora_B.default.weight"
+            ): value
+            for key, value in nonzero_pair.items()
+        }
+    if mode == "bias_leaf":
+        return {key.replace(".weight", ".bias"): value for key, value in nonzero_pair.items()}
+    if mode == "arbitrary_namespace":
+        return {
+            "attacker.layers.0.q_proj.lora_A.weight": nonzero_a,
+            "attacker.layers.0.q_proj.lora_B.weight": nonzero_b,
+        }
+    if mode == "rank_mismatch":
+        return _text_pair(
+            "self_attn.q_proj",
+            np.ones((rank + 1, 2), dtype=np.float16),
+            np.ones((2, rank + 1), dtype=np.float16),
+        )
+    if mode == "zero_dimension":
+        return {
+            **nonzero_pair,
+            **_text_pair(
+                "self_attn.q_proj",
+                np.ones((rank, 0), dtype=np.float16),
+                np.ones((2, rank), dtype=np.float16),
+            ),
         }
     raise AssertionError(f"unknown text tensor mode {mode}")
 
@@ -118,7 +173,23 @@ def _write_expert_adapter(directory, *, config, tensor_mode="complete", text_ran
             directory / "adapter_model.safetensors",
             _text_adapter_tensors("orphan_a", text_rank),
         )
-    elif tensor_mode in {"mixed", "orphan_a", "orphan_b", "nonfinite", "all_zero", "vision"}:
+    elif tensor_mode in {
+        "arbitrary_namespace",
+        "all_zero",
+        "bias_leaf",
+        "legacy_default_leaf",
+        "mixed",
+        "mtp_saved",
+        "nonfinite",
+        "orphan_a",
+        "orphan_b",
+        "projector_lora",
+        "rank_mismatch",
+        "text_saved",
+        "vision",
+        "vision_saved",
+        "zero_dimension",
+    }:
         _write_small_safetensors(
             directory / "adapter_model.safetensors",
             _text_adapter_tensors(tensor_mode, text_rank),
@@ -313,6 +384,32 @@ def test_non_moe_export_canonicalizes_targeting_without_changing_other_fields(
     assert "target_parameters" not in saved
 
 
+def test_non_moe_export_enforces_applicable_rank_pattern(tmp_path):
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    q_a = np.ones((1, 2), dtype=np.float16)
+    q_b = np.ones((2, 1), dtype=np.float16)
+    v_a = np.ones((3, 2), dtype=np.float16)
+    v_b = np.ones((2, 3), dtype=np.float16)
+    tensors = {
+        **_text_pair("self_attn.q_proj", q_a, q_b),
+        **_text_pair("self_attn.v_proj", v_a, v_b),
+    }
+    config = {
+        "peft_type": "LORA",
+        "r": 1,
+        "rank_pattern": {"v_proj": 3},
+        "target_modules": ["q_proj", "v_proj"],
+    }
+    _write_small_safetensors(tmp_path / "adapter_model.safetensors", tensors)
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["rank_pattern"] == {"v_proj": 3}
+
+
 @pytest.mark.parametrize("rank", [1, 4])
 @pytest.mark.parametrize(
     ("tensor_mode", "message"),
@@ -321,7 +418,16 @@ def test_non_moe_export_canonicalizes_targeting_without_changing_other_fields(
         ("orphan_b", "no orphan factors"),
         ("nonfinite", "contains non-finite values"),
         ("all_zero", "no nonzero composed LoRA delta"),
-        ("vision", "contains vision LoRA tensors"),
+        ("vision", "contains non-language tensor"),
+        ("vision_saved", "contains non-language tensor"),
+        ("projector_lora", "contains non-language tensor"),
+        ("mtp_saved", "contains non-language tensor"),
+        ("text_saved", "non-canonical tensor key"),
+        ("legacy_default_leaf", "non-canonical tensor key"),
+        ("bias_leaf", "non-canonical tensor key"),
+        ("arbitrary_namespace", "non-canonical tensor key"),
+        ("rank_mismatch", "disagrees with its configured LoRA rank"),
+        ("zero_dimension", "not positive and 2-D"),
     ],
 )
 def test_non_moe_export_rejects_invalid_actual_tensor_artifacts(
@@ -345,6 +451,20 @@ def test_non_moe_export_rejects_invalid_actual_tensor_artifacts(
     assert config_path.read_bytes() == before
 
 
+def test_non_moe_export_rejects_declared_multimodal_projector_lora(tmp_path):
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    config = {
+        "peft_type": "LORA",
+        "r": 2,
+        "target_modules": ["v_proj", "multi_modal_projector.linear"],
+    }
+    _write_expert_adapter(tmp_path, config=config, tensor_mode="projector_lora", text_rank=2)
+
+    with pytest.raises(RuntimeError, match="contains non-language tensor"):
+        stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+
+
 def test_exported_targeting_validates_the_actual_mixed_delta_artifact(tmp_path):
     from safetensors import safe_open
 
@@ -366,6 +486,8 @@ def test_exported_targeting_validates_the_actual_mixed_delta_artifact(tmp_path):
         keys = set(weights.keys())
         a_keys = sorted(key for key in keys if ".lora_A." in key)
         assert len(a_keys) == 2
+        assert all(key.endswith(".lora_A.weight") for key in a_keys)
+        assert not any(".default.weight" in key for key in keys)
         nonzero = []
         for a_key in a_keys:
             b_key = a_key.replace(".lora_A.", ".lora_B.", 1)

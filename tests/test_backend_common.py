@@ -292,13 +292,15 @@ def test_resolve_verl_loggers_treats_an_unanswerable_probe_as_no_wandb(monkeypat
 
 def test_stamp_adapter_dir_provenance_sets_base_and_revision(tmp_path):
     cfg = tmp_path / "adapter_config.json"
-    cfg.write_text(json.dumps({"base_model_name_or_path": None, "r": 16}))
+    cfg.write_text(
+        json.dumps({"base_model_name_or_path": None, "r": 1, "target_modules": ["q_proj"]})
+    )
     prefix = "base_model.model.layers.0.self_attn.q_proj"
     (tmp_path / "adapter_model.safetensors").write_bytes(
         save(
             {
-                f"{prefix}.lora_A.default.weight": np.ones((1, 2), dtype=np.float16),
-                f"{prefix}.lora_B.default.weight": np.ones((2, 1), dtype=np.float16),
+                f"{prefix}.lora_A.weight": np.ones((1, 2), dtype=np.float16),
+                f"{prefix}.lora_B.weight": np.ones((2, 1), dtype=np.float16),
             }
         )
     )
@@ -307,7 +309,7 @@ def test_stamp_adapter_dir_provenance_sets_base_and_revision(tmp_path):
     assert out["base_model_name_or_path"] == "org/model"
     assert out["revision"] == "deadbeef"
     # untouched fields survive the stamp.
-    assert out["r"] == 16
+    assert out["r"] == 1
 
 
 def test_stamp_adapter_dir_provenance_rejects_base_mismatch(tmp_path):
