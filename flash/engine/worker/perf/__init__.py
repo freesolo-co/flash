@@ -28,7 +28,7 @@ from flash.engine.worker.perf.lifecycle import (
     RetriableInfraError,
     free_vram_gb,
     is_cuda_oom,
-    preflight_free_vram,
+    preflight_gpu_occupancy,
     total_vram_gb,
     wait_for_gpu,
 )
@@ -403,7 +403,7 @@ __all__ = [
     "grad_checkpointing_on",
     "grpo_use_reentrant",
     "is_cuda_oom",
-    "preflight_free_vram",
+    "preflight_gpu_occupancy",
     "total_vram_gb",
     "wait_for_gpu",
 ]

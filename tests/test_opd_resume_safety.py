@@ -1116,42 +1116,117 @@ def test_nested_shards_do_not_count_toward_checkpoint_completeness(monkeypatch, 
         _run_gate()
 
 
-def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width():
-    """A pinned resume drops every shape whose card count the checkpoint cannot be loaded on.
-
-    This is the defect: allocation re-ranks each retry from scratch, so a 2-card attempt could be
-    re-ranked onto 4 cards, and the worker -- which fails closed on a width mismatch for a PINNED
-    resume -- would then permanently refuse the only checkpoint it is authorized to continue from.
-    """
+@pytest.mark.parametrize(
+    ("resume_world_size", "survivor_indexes", "headline"),
+    [
+        pytest.param(2, (0, 1), ("runpod", "h100", 1.0, 4), id="accept-four-cards-two-ranks"),
+        pytest.param(4, (2,), ("modal", "b200", 3.0, 4), id="reject-four-cards-two-ranks"),
+    ],
+)
+def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
+    resume_world_size, survivor_indexes, headline
+):
+    """a pinned resume admits only candidates that execute at the checkpoint width."""
     from flash.providers.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import _pinned_to_resume_width
 
-    def candidate(gpu: str, count: int) -> Candidate:
-        return Candidate(provider="runpod", gpu=gpu, hourly_usd=1.0, vram_gb=80, gpu_count=count)
-
-    four, two, one = candidate("h100", 4), candidate("h100", 2), candidate("h200", 1)
+    candidates = (
+        Candidate("runpod", "h100", 1.0, 80, 4, 2),
+        Candidate("vast", "h200", 2.0, 141, 2, 2),
+        Candidate("modal", "b200", 3.0, 180, 4, 4),
+    )
     allocation = Allocation(
         provider="runpod",
         gpu="h100",
         hourly_usd=1.0,
         min_vram_gb=80,
-        candidates=(four, two, one),
+        candidates=candidates,
         gpu_count=4,
     )
 
-    pinned = _pinned_to_resume_width(allocation, 2)
-    assert pinned.candidates == (two,)
-    # the headline shape follows the surviving candidate, or the run would be submitted at a count
-    # no remaining candidate offers.
-    assert (pinned.gpu_count, pinned.gpu) == (2, "h100")
+    pinned = _pinned_to_resume_width(allocation, resume_world_size)
+    expected = tuple(candidates[index] for index in survivor_indexes)
+    assert pinned.candidates == expected
+    assert all(
+        survivor is candidate
+        for survivor, candidate in zip(pinned.candidates, expected, strict=True)
+    )
+    assert (pinned.provider, pinned.gpu, pinned.hourly_usd, pinned.gpu_count) == headline
+    assert [(candidate.gpu_count, candidate.executed_gpu_count) for candidate in candidates] == [
+        (4, 2),
+        (2, 2),
+        (4, 4),
+    ]
 
-    # no pin (nothing mutated, or an unreadable width) leaves the ranking completely untouched.
     assert _pinned_to_resume_width(allocation, None) is allocation
     assert _pinned_to_resume_width(allocation, 0) is allocation
-
-    # no loadable shape: empty rather than silently resuming on a width that cannot load, which
-    # would burn the retry and reject the checkpoint.
     assert _pinned_to_resume_width(allocation, 8).candidates == ()
+
+
+def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
+    """a filtered rental reports the incompatible execution width, not its card count."""
+    from flash.providers.base import Allocation, Candidate
+    from flash.runner.supervise.seed_submission import (
+        _build_candidate_plan,
+        _pinned_to_resume_width,
+    )
+
+    rented_two_executes_one = Candidate("runpod", "h100", 1.0, 80, 2, 1)
+    allocation = Allocation("runpod", "h100", 1.0, 80, (rented_two_executes_one,), gpu_count=2)
+    filtered = _pinned_to_resume_width(allocation, 2)
+    ctx = SimpleNamespace(oom_vram_floor=0.0, last_detail=None, seed=42, log=io.StringIO())
+    prepared = SimpleNamespace(resume_world_size=2)
+
+    assert filtered.candidates == ()
+    assert _build_candidate_plan(ctx, prepared, filtered) is None
+    assert ctx.last_detail == (
+        "no candidate executing at checkpoint world size 2 is available, and this retry must "
+        "preserve that executed rank width"
+    )
+    assert ctx.log.getvalue() == (
+        "seed=42 no candidate executes at pinned OPD checkpoint world size 2; not retrying\n"
+    )
+
+
+class _IntSubclass(int):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("executed_present", "executed_gpu_count", "wrong_width"),
+    [
+        pytest.param(False, None, 2, id="absent"),
+        pytest.param(True, None, 2, id="none"),
+        pytest.param(True, 0, 2, id="zero"),
+        pytest.param(True, -1, -1, id="negative"),
+        pytest.param(True, True, 1, id="boolean-true"),
+        pytest.param(True, False, 2, id="boolean-false"),
+        pytest.param(True, _IntSubclass(2), 2, id="int-subclass"),
+        pytest.param(True, 2.0, 2, id="float"),
+        pytest.param(True, "2", 2, id="string"),
+        pytest.param(True, object(), 2, id="opaque"),
+    ],
+)
+def test_retry_allocation_falls_back_for_unusable_executed_width(
+    executed_present, executed_gpu_count, wrong_width
+):
+    """absent and malformed executed widths fall back to the rented card count."""
+    from flash.providers.base import Allocation, Candidate
+    from flash.runner.supervise.seed_submission import _pinned_to_resume_width
+
+    if executed_present:
+        candidate = Candidate("runpod", "h100", 1.0, 80, 4, executed_gpu_count)
+    else:
+        candidate = SimpleNamespace(
+            provider="runpod", gpu="h100", hourly_usd=1.0, vram_gb=80, gpu_count=4
+        )
+    allocation = Allocation("runpod", "h100", 1.0, 80, (candidate,), gpu_count=4)
+
+    fallback = _pinned_to_resume_width(allocation, 4)
+    assert fallback.candidates == (candidate,)
+    assert fallback.candidates[0] is candidate
+    assert fallback.gpu_count == 4
+    assert _pinned_to_resume_width(allocation, wrong_width).candidates == ()
 
 
 @pytest.mark.parametrize(

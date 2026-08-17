@@ -1972,6 +1972,87 @@ def test_sanitize_diagnostic_redacts_a_very_short_declared_secret_at_word_bounda
     )
 
 
+def test_sanitize_diagnostic_preserves_punctuation_for_wordless_short_secret(monkeypatch):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PIN")
+    monkeypatch.setenv("PIN", ".")
+
+    assert sanitize_diagnostic("module.py: failed at /tmp/a.py") == "module.py: failed at /tmp/a.py"
+
+
+def test_sanitize_diagnostic_redacts_wordless_short_secret_in_keyed_syntax(monkeypatch):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PIN")
+    monkeypatch.setenv("PIN", ".")
+
+    assert sanitize_diagnostic("token=.") == "token=<redacted>"
+
+
+def test_sanitize_diagnostic_redacts_declared_wordless_values_by_exact_shape(monkeypatch):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "KEYED_PIN,BEARER_PIN")
+    monkeypatch.setenv("KEYED_PIN", ";")
+    monkeypatch.setenv("BEARER_PIN", "!")
+
+    assert sanitize_diagnostic("token=;") == "token=<redacted>"
+    assert sanitize_diagnostic("Bearer !") == "Bearer <redacted>"
+
+
+def test_sanitize_diagnostic_protects_shape_before_overlapping_values(monkeypatch):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "KEY,PIN")
+    monkeypatch.setenv("KEY", "token")
+    monkeypatch.setenv("PIN", ";")
+    detail = sanitize_diagnostic("token=;")
+    assert detail == "<redacted>"
+    assert ";" not in detail
+
+    monkeypatch.setenv("KEY", "Bearer")
+    monkeypatch.setenv("PIN", "!")
+    detail = sanitize_diagnostic("Bearer !")
+    assert detail == "<redacted>"
+    assert "!" not in detail
+
+
+def test_sanitize_diagnostic_redacts_percent_octets_without_folding_literal_case(monkeypatch):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PIN")
+    for secret, encoded in ((".", "%2E"), ("-", "%2D"), ("~", "%7E"), ("/", "%2f")):
+        monkeypatch.setenv("PIN", secret)
+        assert sanitize_diagnostic(f"encoded {encoded}") == "encoded <redacted>"
+
+    monkeypatch.setenv("PIN", "A/B")
+    assert sanitize_diagnostic("encoded A%2fB") == "encoded <redacted>"
+    assert sanitize_diagnostic("encoded a%2fb") == "encoded a%2fb"
+
+    for secret, case_variant in (
+        ("A%2FB", "A%2fB"),
+        ("literal%2Fsecret", "literal%2fsecret"),
+    ):
+        monkeypatch.setenv("PIN", secret)
+        assert sanitize_diagnostic(f"literal {secret}") == "literal <redacted>"
+        assert sanitize_diagnostic(f"literal {case_variant}") == f"literal {case_variant}"
+
+
+def test_sanitize_diagnostic_redacts_cross_group_encoded_overlap(monkeypatch):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "LONG_TOKEN,SHORT_TOKEN")
+    monkeypatch.setenv("LONG_TOKEN", "a%2Fb%2B")
+    monkeypatch.setenv("SHORT_TOKEN", "a/b+c&d")
+
+    detail = sanitize_diagnostic("fetch failed for a%2Fb%2Bc%26d")
+
+    assert detail == "fetch failed for <redacted>"
+    for secret in ("a%2Fb%2B", "c%26d", "a/b+c&d"):
+        assert secret not in detail
+
+
 # ---------------------- child teardown escalates to SIGKILL ----------------------
 # these real-process tests require fork, /proc group membership, and libc subreaper support.
 # guard on those capabilities rather than platform names.
