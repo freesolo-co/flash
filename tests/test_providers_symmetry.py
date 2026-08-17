@@ -334,7 +334,7 @@ def test_provider_cancel_destroy_dispatch(monkeypatch):
     assert deleted == ["ep"]
 
 
-def test_runpod_destroy_rejects_unconfirmed_delete(monkeypatch):
+def test_runpod_destroy_accepts_authoritative_owner_absence(monkeypatch):
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
     from flash.providers.runpod import api as rp_api
@@ -343,6 +343,52 @@ def test_runpod_destroy_rejects_unconfirmed_delete(monkeypatch):
         rp_api,
         "delete_endpoint_for_fingerprint",
         lambda endpoint_id, _fingerprint: False,
+    )
+    monkeypatch.setattr(
+        rp_api,
+        "list_endpoints_by_key",
+        lambda: ({_RUNPOD_FINGERPRINT: [{"id": "ep-unconfirmed-other"}]}, []),
+    )
+    handle = JobHandle(
+        "runpod",
+        {
+            "endpoint_id": "ep-unconfirmed",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "j",
+            "attempt": 0,
+            "started_ts": 1.0,
+        },
+    )
+
+    get_provider("runpod").destroy(handle)
+
+
+@pytest.mark.parametrize(
+    ("endpoints_by_fingerprint", "failed_fingerprints"),
+    [
+        ({_RUNPOD_FINGERPRINT: [{"id": "ep-unconfirmed"}]}, []),
+        ({}, [_RUNPOD_FINGERPRINT]),
+        ({"rpk-fedcba987654": []}, []),
+    ],
+    ids=["endpoint-present", "owner-list-failed", "wrong-account-absent"],
+)
+def test_runpod_destroy_rejects_unconfirmed_owner_state(
+    monkeypatch, endpoints_by_fingerprint, failed_fingerprints
+):
+    from flash.providers import get_provider
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as rp_api
+
+    monkeypatch.setattr(
+        rp_api,
+        "delete_endpoint_for_fingerprint",
+        lambda endpoint_id, _fingerprint: False,
+    )
+    monkeypatch.setattr(
+        rp_api,
+        "list_endpoints_by_key",
+        lambda: (endpoints_by_fingerprint, failed_fingerprints),
     )
     handle = JobHandle(
         "runpod",

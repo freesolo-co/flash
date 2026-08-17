@@ -40,6 +40,18 @@ def test_delete_endpoint_404_reports_success(monkeypatch):
     assert runpod_api.delete_endpoint_for_key("ep-gone", "rk-test") is True
 
 
+def test_delete_endpoint_empty_success_response_reports_success(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+
+    monkeypatch.setattr(
+        runpod_api._CLIENT,
+        "request_with_retries_for_key",
+        lambda *_args, **_kwargs: None,
+    )
+
+    assert runpod_api.delete_endpoint_for_key("ep-deleted", "rk-test") is True
+
+
 def test_delete_endpoint_other_error_reports_failure(monkeypatch):
     from flash.providers.runpod import api as runpod_api
 

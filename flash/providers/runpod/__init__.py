@@ -190,8 +190,17 @@ class RunpodProvider:
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
 
         strict = RunpodJobHandle.from_dict(handle.to_dict())
-        if not runpod_api.delete_endpoint_for_fingerprint(
+        if runpod_api.delete_endpoint_for_fingerprint(
             strict.endpoint_id, strict.key_fingerprint
+        ):
+            return
+
+        endpoints_by_fingerprint, failed_fingerprints = runpod_api.list_endpoints_by_key()
+        owner_endpoints = endpoints_by_fingerprint.get(strict.key_fingerprint)
+        if (
+            strict.key_fingerprint in failed_fingerprints
+            or owner_endpoints is None
+            or any(endpoint.get("id") == strict.endpoint_id for endpoint in owner_endpoints)
         ):
             raise runpod_api.RunpodApiError(
                 f"runpod delete_endpoint({strict.endpoint_id}) unconfirmed; endpoint may still bill"

@@ -1479,6 +1479,45 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     assert raw["remote"] == confirmed
 
 
+def test_cleanup_collection_removes_only_authoritatively_absent_runpod_record(
+    monkeypatch, tmp_path
+):
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+    from flash.providers.runpod import api as runpod_api
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cleanup-absent", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner._save_status(
+        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
+    )
+    absent = _runpod_remote("endpoint-absent", None, attempt=1)
+    present = _runpod_remote("endpoint-present", None, attempt=2, started_ts=2.0)
+    for remote in (absent, present):
+        assert runner._preserve_cleanup_remote(spec.run_id, remote) is True
+
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda _endpoint_id, _fingerprint: False,
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({_RUNPOD_FINGERPRINT: [{"id": "endpoint-present"}]}, []),
+    )
+
+    attempted = runner._drain_cleanup_remotes(spec.run_id)
+
+    assert attempted == {
+        ("runpod", 1, "endpoint-absent", None, _RUNPOD_FINGERPRINT),
+        ("runpod", 2, "endpoint-present", None, _RUNPOD_FINGERPRINT),
+    }
+    raw = runner._load_status_json(spec.run_id)
+    assert raw[runner._CLEANUP_REMOTES_KEY] == [present]
+    assert raw["remote"] == absent
+
+
 def test_next_attempt_requires_persisted_integer_identity():
     import flash.runner as runner
 
