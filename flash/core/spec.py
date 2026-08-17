@@ -482,6 +482,7 @@ MANAGED_TOP_LEVEL_KEYS = frozenset(
         # exact persisted bytes.
         "model_revision",
         "model_revision_auto",
+        "model_revision_force_pin",
         # the provenance marker only. gpu.count=1 stays in the public [gpu] object for digest
         # stability; internal round trips carry the marker verbatim.
         "gpu_count_auto",
@@ -542,6 +543,10 @@ class JobSpec:
     # from the internal worker spec under `effective_preparation` instead (see
     # `_internal_spec_from_status`), which carries it verbatim.
     model_revision_auto: bool = False
+    # transient internal request for the runner to verify an exact auto-managed immutable pin instead
+    # of resolving the model's current default head. preparation clears it after successful
+    # verification, so persisted worker specs carry false rather than a reusable verification request.
+    model_revision_force_pin: bool = False
     # platform-managed marker: true when the author omitted both gpu.type and gpu.count and the stored
     # integer 1 is only the digest-stable public placeholder. allocation reads this marker as
     # "auto-size"; a type pin or authored count=1 leaves it false and remains a hard ceiling.
@@ -562,6 +567,14 @@ class JobSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
+        if self.model_revision_force_pin:
+            revision = self.model_revision
+            if not self.model_revision_auto:
+                raise ValueError("model_revision_force_pin requires model_revision_auto=True")
+            if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+                raise ValueError(
+                    "model_revision_force_pin requires a full lowercase immutable model_revision"
+                )
         # the marker qualifies a pin; it cannot outlive one. a spec carrying it with no revision
         # would let a later edit that clears model_revision leave a True marker behind, and the
         # deploy guard reads the pair.
@@ -781,6 +794,7 @@ class JobSpec:
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
             model_revision_auto=coerce_bool(data.get("model_revision_auto", False)),
+            model_revision_force_pin=coerce_bool(data.get("model_revision_force_pin", False)),
             gpu_count_auto=coerce_bool(data.get("gpu_count_auto", False)),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
             workload_profile_producer_version=str(

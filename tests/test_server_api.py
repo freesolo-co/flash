@@ -3147,9 +3147,11 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
     # `_validate_effective_spec` rejecting the real one -- a 409 that leaves auto-pinned runs just
     # as undeployable as the 400 did.
     assert "model_revision_auto" not in status.spec, status.spec
+    assert "model_revision_force_pin" not in status.spec, status.spec
     assert not status.spec.get("model_revision"), status.spec
     snapshot = status.effective_preparation
     assert isinstance(snapshot, dict), snapshot
+    assert snapshot["worker_spec"]["model_revision_force_pin"] is False
     snapshot["worker_spec"]["model_revision"] = "a" * 40
     snapshot["worker_spec"]["model_revision_auto"] = True
     # re-digest the way submit does. the marker is a privilege input the deploy guard reads, so it

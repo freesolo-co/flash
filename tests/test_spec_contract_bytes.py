@@ -75,6 +75,7 @@ WORKER_ONLY_TOP_LEVEL = {
     "gpu_count_auto",
     "model_revision",
     "model_revision_auto",
+    "model_revision_force_pin",
     "run_id",
     "workload_profile",
     "workload_profile_input_digest",

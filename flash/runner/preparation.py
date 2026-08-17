@@ -318,6 +318,7 @@ def _preparation_digest(
     # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
         "model_revision_auto",
+        "model_revision_force_pin",
         "gpu_count_auto",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
@@ -462,10 +463,16 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
 
 
 def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec:
-    # a pin already marked runner-assigned (inherited from a warm-start source) is not authored,
-    # even though it is present. reading presence alone would relabel it as the author's and hand
-    # deploy a pin it refuses -- the exact failure the marker exists to prevent.
-    authored = "" if spec.model_revision_auto else spec.model_revision
+    # a forced pin is runner-managed even though it is present. otherwise a pin already marked
+    # runner-assigned (inherited from a warm-start source) is not authored either: reading presence
+    # alone would relabel it as the author's and hand deploy a pin it refuses.
+    authored = (
+        spec.model_revision
+        if spec.model_revision_force_pin
+        else ""
+        if spec.model_revision_auto
+        else spec.model_revision
+    )
     if not authored and not required:
         return spec
     try:
@@ -475,19 +482,26 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
             spec.model,
             revision=authored or None,
         )
-        resolved = str(getattr(info, "sha", "") or "").strip().lower()
+        reported = str(getattr(info, "sha", "") or "").strip()
+        resolved = reported.lower()
         if re.fullmatch(r"[0-9a-f]{40}", resolved) is None:
             raise ValueError("resolved revision is not an immutable commit")
+        if spec.model_revision_force_pin and reported != spec.model_revision:
+            raise ValueError("resolved revision does not match the forced immutable pin")
     except Exception as exc:
         raise ValueError(
             f"could not resolve model_revision for model {spec.model!r}; "
             "verify that the revision exists and the operator token can access it"
         ) from exc
-    # record WHO chose the pin, not just its value. `authored` is empty exactly when the caller
-    # asked for a pin the user never wrote (SFT, required=True), and that is the only case deploy
-    # may relax: serving resolves the base by name, so an auto pin asks nothing of it, while an
-    # authored one is a request serving cannot honour and must still be refused.
-    return replace(spec, model_revision=resolved, model_revision_auto=not authored)
+    # record who chose the pin, not just its value. a forced pin is supplied by the internal runner,
+    # so it retains auto provenance while the one-shot verification request is cleared before any
+    # prepared public or worker spec is persisted. an authored pin remains authored.
+    return replace(
+        spec,
+        model_revision=resolved,
+        model_revision_auto=spec.model_revision_force_pin or not authored,
+        model_revision_force_pin=False,
+    )
 
 
 def _profile_producer_version() -> str:

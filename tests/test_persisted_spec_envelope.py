@@ -23,6 +23,7 @@ from flash.core.spec_persistence import (
 
 _MANAGED_DIGEST_KEYS = (
     "model_revision_auto",
+    "model_revision_force_pin",
     "gpu_count_auto",
     "workload_profile_input_digest",
     "workload_profile_producer_version",
