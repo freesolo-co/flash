@@ -4768,6 +4768,23 @@ def test_multimodal_prompts_carry_descriptors_and_rendered_text(monkeypatch):
     assert {"type": "image"} in blocks
 
 
+def test_top_level_record_image_reaches_actor_and_environment_prompts():
+    from flash.engine.worker.train.rl import inputs as rl_inputs
+
+    prompts = rl_inputs._build_grpo_prompts(
+        [{"image": _capability_image_uri()}],
+        [[{"role": "user", "content": "question"}]],
+        True,
+        _CapabilityProcessor(),
+        _CapabilityTokenizer(),
+        None,
+        32,
+    )
+
+    assert any(block == {"type": "image"} for block in prompts[0]["prompt"][0]["content"])
+    assert any(block == {"type": "image"} for block in prompts[0]["env_prompt"][0]["content"])
+
+
 def test_multimodal_budget_filter_measures_the_expanded_prompt(monkeypatch):
     # verl RAISES on an over-budget multimodal prompt instead of truncating, so this filter is the
     # only thing between a long image prompt and a dead run. the tokenizer says 1 token; the
