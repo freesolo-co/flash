@@ -326,7 +326,7 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
     # os/re come from _train_body's own local imports, which the handler makes at the top of its
     # body; urllib.parse it imports itself.
     namespace: dict = {"os": os, "re": re}
-    for name in ("_needles", "_safe_detail"):
+    for name in ("_percent_pattern", "_needles", "_safe_detail"):
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
         exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
     safe_detail = namespace["_safe_detail"]
@@ -358,6 +358,48 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
     # and requiring a non-word character beyond it would leak "/a" out of "https://host/a/repo".
     path_like = {"S": "/a", "FLASH_SECRET_ENV_KEYS": "S"}
     assert safe_detail("https://host/a/repo", path_like) == "https://host<redacted>/repo"
+    punctuation = {"PIN": ".", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("module.py: failed at /tmp/a.py", punctuation) == (
+        "module.py: failed at /tmp/a.py"
+    )
+    assert safe_detail("token=.", punctuation) == "token=<redacted>"
+    shaped = {
+        "KEYED_PIN": ";",
+        "BEARER_PIN": "!",
+        "FLASH_SECRET_ENV_KEYS": "KEYED_PIN,BEARER_PIN",
+    }
+    assert safe_detail("token=;", shaped) == "token=<redacted>"
+    assert safe_detail("Bearer !", shaped) == "Bearer <redacted>"
+    overlapping_shape = {"KEY": "token", "PIN": ";", "FLASH_SECRET_ENV_KEYS": "KEY,PIN"}
+    detail = safe_detail("token=;", overlapping_shape)
+    assert detail == "<redacted>"
+    assert ";" not in detail
+    overlapping_shape.update({"KEY": "Bearer", "PIN": "!"})
+    detail = safe_detail("Bearer !", overlapping_shape)
+    assert detail == "<redacted>"
+    assert "!" not in detail
+    for secret, encoded in ((".", "%2E"), ("-", "%2D"), ("~", "%7E"), ("/", "%2f")):
+        mapping = {"PIN": secret, "FLASH_SECRET_ENV_KEYS": "PIN"}
+        assert safe_detail(f"encoded {encoded}", mapping) == "encoded <redacted>"
+    literal_case = {"PIN": "A/B", "FLASH_SECRET_ENV_KEYS": "PIN"}
+    assert safe_detail("encoded A%2fB", literal_case) == "encoded <redacted>"
+    assert safe_detail("encoded a%2fb", literal_case) == "encoded a%2fb"
+    for secret, case_variant in (
+        ("A%2FB", "A%2fB"),
+        ("literal%2Fsecret", "literal%2fsecret"),
+    ):
+        mapping = {"PIN": secret, "FLASH_SECRET_ENV_KEYS": "PIN"}
+        assert safe_detail(f"literal {secret}", mapping) == "literal <redacted>"
+        assert safe_detail(f"literal {case_variant}", mapping) == f"literal {case_variant}"
+    overlap = {
+        "LONG_TOKEN": "a%2Fb%2B",
+        "SHORT_TOKEN": "a/b+c&d",
+        "FLASH_SECRET_ENV_KEYS": "LONG_TOKEN,SHORT_TOKEN",
+    }
+    detail = safe_detail("fetch failed for a%2Fb%2Bc%26d", overlap)
+    assert detail == "fetch failed for <redacted>"
+    for secret in ("a%2Fb%2B", "c%26d", "a/b+c&d"):
+        assert secret not in detail
 
 
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):

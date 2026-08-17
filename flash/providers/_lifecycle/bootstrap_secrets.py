@@ -22,6 +22,22 @@ _SECRET_RE = re.compile(
 # component lines are registered as needles too; the floor keeps a common fragment such as ``}``
 # from erasing innocent output. Mirrors flash._internal.diagnostics.
 _MIN_SECRET_COMPONENT = 8
+_PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
+
+
+def _percent_pattern(needle: str) -> str:
+    """Regex for ``needle`` with only percent-escape hex digits matched case-insensitively."""
+    parts: list[str] = []
+    offset = 0
+    for match in _PERCENT_ESCAPE_RE.finditer(needle):
+        parts.append(re.escape(needle[offset : match.start()]))
+        parts.append("%")
+        parts.extend(
+            f"[{char.lower()}{char.upper()}]" if char.isalpha() else char for char in match.group(1)
+        )
+        offset = match.end()
+    parts.append(re.escape(needle[offset:]))
+    return "".join(parts)
 
 
 def _bounded_pattern(needle: str) -> str:
@@ -39,37 +55,86 @@ def _bounded_pattern(needle: str) -> str:
     return f"{left}{escaped}{right}"
 
 
-def _needles(values: set[str]) -> tuple[set[str], set[str]]:
-    """The ``(plain, bounded)`` needle sets for ``values``.
+_ValueMatcher = tuple[str, bool, bool]
 
-    plain = replaced as a substring. bounded = values under the floor, replaced only where not
-    adjacent to a word character: dropping them leaked them verbatim, and replacing them plainly
-    would rewrite innocent text (``ati`` inside ``authentication``). encoded forms are registered
-    too. component lines of a MULTILINE value keep the floor as a hard skip -- a short one is
+
+def _needles(values: set[str]) -> tuple[set[_ValueMatcher], set[str]]:
+    """The typed value matchers and shape-only needles for ``values``.
+
+    each value matcher carries ``(needle, bounded, encoded)`` metadata. plain needles are replaced as
+    substrings. bounded needles are values under the floor, replaced only where not adjacent to a word
+    character. a short raw candidate with no alphanumeric or underscore character is shape-only
+    because it is indistinguishable from ordinary punctuation; explicit percent-octet forms remain
+    bounded. component lines of a multiline value keep the floor as a hard skip: a short one is
     punctuation such as ``}``, not a credential.
     """
-    plain: set[str] = set()
-    bounded: set[str] = set()
+    matchers: set[_ValueMatcher] = set()
+    shaped: set[str] = set()
     for secret in values:
-        target = plain if len(secret) >= _MIN_SECRET_COMPONENT else bounded
-        target.update({secret, urllib.parse.quote(secret, safe="")})
+        candidates = {(secret, False)}
+        encoded = urllib.parse.quote(secret, safe="")
+        if encoded != secret:
+            candidates.add((encoded, True))
+        if len(secret) < _MIN_SECRET_COMPONENT and not any(
+            char.isalnum() or char == "_" for char in secret
+        ):
+            candidates.add(("".join(f"%{byte:02X}" for byte in secret.encode()), True))
+        if len(secret) >= _MIN_SECRET_COMPONENT:
+            matchers.update((candidate, False, is_encoded) for candidate, is_encoded in candidates)
+        else:
+            for candidate, is_encoded in candidates:
+                if any(char.isalnum() or char == "_" for char in candidate):
+                    matchers.add((candidate, True, is_encoded))
+                else:
+                    shaped.add(candidate)
         if "\n" in secret:
             for raw in secret.splitlines():
                 if len(line := raw.strip()) >= _MIN_SECRET_COMPONENT:
-                    plain.update({line, urllib.parse.quote(line, safe="")})
-    return plain, bounded
+                    matchers.add((line, False, False))
+                    encoded_line = urllib.parse.quote(line, safe="")
+                    if encoded_line != line:
+                        matchers.add((encoded_line, False, True))
+    return matchers, shaped
 
 
 def _redact_values(text: str, values: set[str]) -> str:
     """Replace every credential value in ``text``; see ``_needles`` for how each form is matched.
 
-    Longest-first, so one secret containing another cannot leave a suffix of the longer one behind.
+    Longest-first across both matcher types, so one secret containing another cannot leave a suffix
+    of the longer one behind.
     """
-    plain, bounded = _needles(values)
-    for needle in sorted(plain, key=len, reverse=True):
-        text = text.replace(needle, "<redacted>")
-    for needle in sorted(bounded, key=len, reverse=True):
-        text = re.sub(_bounded_pattern(needle), "<redacted>", text)
+    matchers, shaped = _needles(values)
+    # protect exact punctuation credentials before a separate value can erase their syntax.
+    for needle in sorted(shaped, key=len, reverse=True):
+        escaped = re.escape(needle)
+        text = re.sub(
+            rf"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)(\s*[:=]\s*)(?:bearer\s+)?{escaped}(?=\s|$)",
+            lambda match: (
+                "<redacted>"
+                if match.group(1) in values
+                else f"{match.group(1)}{match.group(2)}<redacted>"
+            ),
+            text,
+        )
+        text = re.sub(
+            rf"(?i)\b(bearer)\s+{escaped}(?=\s|$)",
+            lambda match: "<redacted>" if match.group(1) in values else "Bearer <redacted>",
+            text,
+        )
+    for needle, is_bounded, is_encoded in sorted(
+        matchers, key=lambda item: len(item[0]), reverse=True
+    ):
+        if is_encoded:
+            pattern = _percent_pattern(needle)
+            if is_bounded:
+                left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
+                right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
+                pattern = f"{left}{pattern}{right}"
+            text = re.sub(pattern, "<redacted>", text)
+        elif is_bounded:
+            text = re.sub(_bounded_pattern(needle), "<redacted>", text)
+        else:
+            text = text.replace(needle, "<redacted>")
     return text
 
 
