@@ -1,5 +1,7 @@
 """HTTP client for the managed Flash control plane (used by the CLI)."""
 
+from collections.abc import Mapping
+
 from flash._internal.channel import CLI_NAME
 from flash.client.config import load_credentials, save_credentials
 from flash.client.http import (
@@ -20,8 +22,10 @@ from flash.client.http import (
 from flash.core.spec import require_project_id
 
 
-def resolve_project_id(project_id: str, api_key: str, api_url: str | None = None) -> str:
-    """Resolve one project id, turning "not yours / not there" into the actionable CLI refusal.
+def resolve_project(
+    project_id: str, api_key: str, api_url: str | None = None
+) -> Mapping[str, object]:
+    """Resolve one project, turning "not yours / not there" into the actionable CLI refusal.
 
     403 and 404 are the same answer to a CLI user -- this project is not one you can record against
     -- and neither is distinguishable from a typo, so they collapse into one message naming the way
@@ -48,9 +52,9 @@ def resolve_project_id(project_id: str, api_key: str, api_url: str | None = None
     at call time, which is the binding the CLI tests patch.
     """
     if api_url is not None and not has_freesolo_backend(api_url):
-        return require_project_id(project_id)
+        return {"id": require_project_id(project_id)}
     try:
-        return str(get_project(project_id, api_key)["id"])
+        return get_project(project_id, api_key)
     except ApiError as exc:
         if exc.status not in {403, 404}:
             raise
@@ -58,6 +62,11 @@ def resolve_project_id(project_id: str, api_key: str, api_url: str | None = None
             f"project {project_id!r} is not accessible; run `{CLI_NAME} projects list` "
             "and pass a project UUID from the current organization"
         ) from exc
+
+
+def resolve_project_id(project_id: str, api_key: str, api_url: str | None = None) -> str:
+    """Resolve and return one canonical project id."""
+    return str(resolve_project(project_id, api_key, api_url)["id"])
 
 
 __all__ = [
@@ -72,6 +81,7 @@ __all__ = [
     "list_projects",
     "list_trace_projects",
     "load_credentials",
+    "resolve_project",
     "resolve_project_id",
     "save_credentials",
     "upload_eval_run",

@@ -44,7 +44,10 @@ def test_env_setup_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(
         env_setup_mod,
         "_require_setup_project",
-        lambda _args: "11111111-1111-4111-8111-111111111111",
+        lambda _args, **_kwargs: {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "name": "Test",
+        },
     )
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0
@@ -86,7 +89,10 @@ def test_scaffolded_env_scores_through_real_task_example(tmp_path, monkeypatch) 
     monkeypatch.setattr(
         env_setup_mod,
         "_require_setup_project",
-        lambda _args: "11111111-1111-4111-8111-111111111111",
+        lambda _args, **_kwargs: {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "name": "Test",
+        },
     )
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0

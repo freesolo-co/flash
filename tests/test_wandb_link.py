@@ -23,6 +23,7 @@ import types
 import pytest
 
 from flash.engine.worker.backend_common import parse_wandb_link
+from flash.engine.worker.train.core.child import runtime as child_runtime
 from flash.engine.worker.train.core.child.runtime import install_wandb_link_reporting
 
 _URL = "https://wandb.ai/acme/flash/runs/abc123"
@@ -35,7 +36,60 @@ class _Run:
     id = _ID
 
 
-def _exec_shim(init_impl):
+class _ExitStack:
+    def __init__(self):
+        self.callbacks: list[tuple[object, tuple]] = []
+
+    def register(self, callback, *args):
+        self.callbacks.append((callback, args))
+        return callback
+
+    def close(self) -> None:
+        for callback, args in reversed(self.callbacks):
+            callback(*args)
+
+
+class _FinishingRun(_Run):
+    def __init__(
+        self,
+        service: dict[str, bool],
+        *,
+        active: dict[str, object] | None = None,
+        fail: bool = False,
+        transient_failures: int = 0,
+    ):
+        self.service = service
+        self.active = active
+        self.fail = fail
+        self.transient_failures = transient_failures
+        self.finish_calls = 0
+        self.finished = False
+
+    def finish(self, *, exit_code: int):
+        self.finish_calls += 1
+        assert exit_code == 0
+        if self.finished:
+            return
+        if self.transient_failures:
+            self.transient_failures -= 1
+            raise RuntimeError("transient finish failure")
+        if self.fail:
+            raise RuntimeError("finish failed")
+        if not self.service["open"]:
+            raise RuntimeError("wandb service is already closed")
+        self.finished = True
+        if self.active is not None and self.active.get("run") is self:
+            self.active["run"] = None
+
+
+def _exec_shim(
+    init_impl,
+    *,
+    exit_stack: _ExitStack | None = None,
+    finish_impl=None,
+    init_calls: int = 1,
+    module_out: dict[str, object] | None = None,
+):
     """run the shim the way the CHILD interpreter would, and return what it printed.
 
     the shim is a source fragment destined for another interpreter, so reading the rendered string
@@ -44,19 +98,28 @@ def _exec_shim(init_impl):
     """
     fake = types.ModuleType("wandb")
     fake.init = init_impl
-    saved = sys.modules.get("wandb")
+    if finish_impl is not None:
+        fake.finish = finish_impl
+    if module_out is not None:
+        module_out["wandb"] = fake
+    saved_wandb = sys.modules.get("wandb")
+    saved_atexit = child_runtime.atexit
     sys.modules["wandb"] = fake
+    if exit_stack is not None:
+        child_runtime.atexit = types.SimpleNamespace(register=exit_stack.register)
     try:
         install_wandb_link_reporting()
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            returned = sys.modules["wandb"].init(project="flash")
+            for _ in range(init_calls):
+                returned = sys.modules["wandb"].init(project="flash")
         return buffer.getvalue(), returned
     finally:
-        if saved is None:
+        child_runtime.atexit = saved_atexit
+        if saved_wandb is None:
             sys.modules.pop("wandb", None)
         else:
-            sys.modules["wandb"] = saved
+            sys.modules["wandb"] = saved_wandb
 
 
 def test_child_shim_reports_a_link_the_parent_can_parse():
@@ -66,7 +129,7 @@ def test_child_shim_reports_a_link_the_parent_can_parse():
 
 
 def test_child_shim_returns_the_real_run_and_forwards_arguments():
-    # the shim WRAPS wandb.init; swallowing the run object or its arguments would break verl's own
+    # the shim wraps wandb.init; swallowing the run object or its arguments would break verl's own
     # logging, turning an observability fix into a training-path regression.
     run = _Run()
     seen: dict = {}
@@ -78,6 +141,100 @@ def test_child_shim_returns_the_real_run_and_forwards_arguments():
     _, returned = _exec_shim(_init)
     assert returned is run
     assert seen["kwargs"] == {"project": "flash"}
+
+
+def test_child_shim_finishes_before_wandb_service_teardown():
+    stack = _ExitStack()
+    service = {"open": True}
+    active: dict[str, object] = {"run": None}
+    run = _FinishingRun(service, active=active)
+
+    def _teardown():
+        service["open"] = False
+
+    def _init(*_args, **_kwargs):
+        stack.register(_teardown)
+        active["run"] = run
+        return run
+
+    def _module_finish():
+        active_run = active["run"]
+        if active_run is not None:
+            active_run.finish(exit_code=0)
+
+    module_out: dict[str, object] = {}
+    _exec_shim(
+        _init,
+        exit_stack=stack,
+        finish_impl=_module_finish,
+        module_out=module_out,
+    )
+    stack.close()
+
+    assert run.finished is True
+    assert run.finish_calls == 1
+    assert active["run"] is None
+    assert service["open"] is False
+    # verl tracking.__del__ calls module-level wandb.finish after the service callback stack.
+    fake_wandb = module_out["wandb"]
+    assert isinstance(fake_wandb, types.ModuleType)
+    fake_wandb.finish()
+    assert run.finish_calls == 1
+
+
+def test_child_shim_registers_one_effective_finish_for_a_reused_run():
+    stack = _ExitStack()
+    service = {"open": True}
+    run = _FinishingRun(service)
+    stack.register(lambda: service.update(open=False))
+
+    _exec_shim(lambda *_a, **_k: run, exit_stack=stack, init_calls=2)
+    assert len(stack.callbacks) == 3
+    stack.close()
+
+    assert run.finished is True
+    assert run.finish_calls == 1
+
+
+def test_child_shim_retries_a_transient_finish_for_a_reused_run():
+    stack = _ExitStack()
+    service = {"open": True}
+    run = _FinishingRun(service, transient_failures=1)
+    stack.register(lambda: service.update(open=False))
+
+    _exec_shim(lambda *_a, **_k: run, exit_stack=stack, init_calls=2)
+    stack.close()
+
+    assert run.finished is True
+    assert run.finish_calls == 2
+    assert service["open"] is False
+
+
+def test_child_shim_finishes_each_distinct_run():
+    stack = _ExitStack()
+    service = {"open": True}
+    runs = [_FinishingRun(service), _FinishingRun(service)]
+    pending = iter(runs)
+    stack.register(lambda: service.update(open=False))
+
+    _exec_shim(lambda *_a, **_k: next(pending), exit_stack=stack, init_calls=2)
+    stack.close()
+
+    assert [run.finished for run in runs] == [True, True]
+    assert [run.finish_calls for run in runs] == [1, 1]
+
+
+def test_child_shim_treats_finish_failure_as_nonfatal():
+    stack = _ExitStack()
+    service = {"open": True}
+    run = _FinishingRun(service, fail=True)
+    stack.register(lambda: service.update(open=False))
+
+    _exec_shim(lambda *_a, **_k: run, exit_stack=stack)
+    stack.close()
+
+    assert run.finish_calls == 1
+    assert service["open"] is False
 
 
 def test_child_shim_stays_silent_when_the_run_has_no_url():
