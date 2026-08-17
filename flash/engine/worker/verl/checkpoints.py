@@ -463,5 +463,6 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
                 f"exported adapter for {model_id} does not contain complete fused expert LoRA "
                 "weights; refusing to stamp it as warm-start compatible"
             )
+    cfg["target_modules"] = "all-linear"
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)

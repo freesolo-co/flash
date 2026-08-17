@@ -121,15 +121,24 @@ def _patch_worker_metadata(monkeypatch):
     )
 
 
-def test_verl_export_normalizes_fused_targets_without_reordering_other_modules(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    "target_modules",
+    [
+        ["v_proj", "experts", "q_proj", "v_proj", "base_layer"],
+        ["base_layer", "q_proj", "experts", "v_proj"],
+    ],
+)
+def test_verl_fused_export_canonicalizes_suffix_order_to_all_linear(
+    monkeypatch, tmp_path, target_modules
 ):
     stamp_adapter_dir_provenance = _patch_export_metadata(monkeypatch)
     config = {
         "peft_type": "LORA",
         "r": 32,
-        "target_modules": ["v_proj", "experts", "q_proj", "v_proj", "base_layer"],
+        "lora_alpha": 64,
+        "target_modules": target_modules,
         "target_parameters": None,
+        "flash_provenance": {"source": "verl"},
     }
     _write_expert_adapter(tmp_path, config=config)
 
@@ -137,9 +146,12 @@ def test_verl_export_normalizes_fused_targets_without_reordering_other_modules(
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_parameters"] == _TARGETS
-    assert saved["target_modules"] == ["v_proj", "q_proj", "v_proj"]
+    assert saved["target_modules"] == "all-linear"
+    assert saved["r"] == 32
+    assert saved["lora_alpha"] == 64
     assert saved["base_model_name_or_path"] == _MODEL_ID
     assert saved["revision"] == "c" * 40
+    assert saved["flash_provenance"] == {"source": "verl"}
 
 
 def test_export_refuses_incomplete_expert_weights_before_changing_config(tmp_path):
@@ -218,17 +230,72 @@ def test_export_rejects_direct_parameter_only_config_without_writing(tmp_path):
     assert config_path.read_bytes() == before
 
 
-def test_non_moe_export_keeps_adapter_targeting_unchanged(tmp_path):
+def test_non_moe_export_canonicalizes_targeting_without_changing_other_fields(tmp_path):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 
-    config = {"peft_type": "LORA", "r": 32, "target_modules": ["q_proj", "v_proj"]}
+    config = {
+        "peft_type": "LORA",
+        "r": 32,
+        "lora_alpha": 64,
+        "target_modules": ["q_proj", "v_proj"],
+        "rank_pattern": {"q_proj": 16},
+        "flash_provenance": {"source": "verl"},
+    }
     _write_expert_adapter(tmp_path, config=config, tensor_mode="incomplete")
 
     stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
-    assert saved["target_modules"] == ["q_proj", "v_proj"]
+    assert saved["target_modules"] == "all-linear"
+    assert saved["r"] == 32
+    assert saved["lora_alpha"] == 64
+    assert saved["rank_pattern"] == {"q_proj": 16}
+    assert saved["base_model_name_or_path"] == "Qwen/Qwen3.5-9B"
+    assert saved["revision"] == "d" * 40
+    assert saved["flash_provenance"] == {"source": "verl"}
     assert "target_parameters" not in saved
+
+
+def _peft_load_boundary_tensor_count(config):
+    topology = [
+        *((f"model.layers.{index}.proj", "linear") for index in range(236)),
+        ("visual.patch_embed.proj", "conv3d"),
+    ]
+    targets = config["target_modules"]
+    if targets == "all-linear":
+        selected = [name for name, module_type in topology if module_type == "linear"]
+    else:
+        selected = [
+            name
+            for name, _module_type in topology
+            if any(name == target or name.endswith(f".{target}") for target in targets)
+        ]
+    return len(selected) * 2
+
+
+def test_exported_targeting_preserves_training_topology_at_peft_load_boundary(tmp_path):
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    config = {
+        "peft_type": "LORA",
+        "r": 32,
+        "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "proj",
+        ],
+    }
+    _write_expert_adapter(tmp_path, config=config, tensor_mode="incomplete")
+
+    stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert _peft_load_boundary_tensor_count(saved) == 472
 
 
 def test_strict_worker_accepts_current_config_without_changing_memory_or_disk(
