@@ -1030,6 +1030,48 @@ def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> No
     assert seen == {"selected": project_id, "api_key": "key-1", "api_url": api_url}
 
 
+def test_env_setup_interactive_retains_the_selected_project_name(monkeypatch, tmp_path) -> None:
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    project_id = "11111111-1111-4111-8111-111111111111"
+    project_name = "Interactive Project"
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "key-1")
+    )
+    monkeypatch.setattr(env_setup, "_setup_interactive", lambda _args: True)
+    monkeypatch.setattr(
+        "flash.client.list_projects", lambda _key: [{"id": project_id, "name": project_name}]
+    )
+    monkeypatch.setattr(env_setup.render, "select_required", lambda _prompt, _options: project_id)
+    monkeypatch.setattr(env_setup.render, "select", lambda *_a, **_k: env_setup._SKIP_TRACES)
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda selected, _key: {"id": selected, "name": project_name},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        env_setup.cmd_env_setup(
+            Namespace(
+                project="",
+                yes=False,
+                turn_mode="single",
+                reasoning=False,
+                from_traces=None,
+                trace=None,
+                force=False,
+            )
+        )
+        == 0
+    )
+
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
+        assert parsed["wandb"]["project"] == project_name
+
+
 def test_login_shows_who_you_are(monkeypatch, capsys) -> None:
     # Verify + store are stubbed; login should still surface the identity card itself so the
     # user sees who they are without a separate `flash whoami`. The card is built from the
@@ -1961,6 +2003,14 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "platform-managed" in opd_text
     # single-turn opd runs fine, so it carries NO multi-turn "fails fast" warning
     assert "fail fast" not in opd_text
+    for name, suffix in (("sft.toml", "sft"), ("rl.toml", "grpo"), ("opd.toml", "opd")):
+        parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
+        assert parsed["wandb"] == {
+            "project": "Test",
+            "run_name": f"{tmp_path.name}-{suffix}",
+        }
+        assert "wandb" not in parsed.get("train", {}), name
+        assert "wandb" not in parsed.get("environment", {}), name
     training = tmp_path / "TRAINING.md"
     assert training.is_file()
     training_text = training.read_text(encoding="utf-8")
@@ -1992,6 +2042,67 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "configs/rl.toml" in out
     assert "configs/opd.toml" in out
     assert "TRAINING.md" in out
+
+
+def test_env_setup_wandb_metadata_escapes_project_and_folder_names(monkeypatch, tmp_path) -> None:
+    project_name = 'Project "quoted" 🚀\nsecond line'
+    folder = tmp_path / 'environment "quoted" 🧪'
+    folder.mkdir()
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda project_id, _api_key: {"id": project_id, "name": project_name},
+    )
+    monkeypatch.chdir(folder)
+
+    assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 0
+
+    for name, suffix in (("sft.toml", "sft"), ("rl.toml", "grpo"), ("opd.toml", "opd")):
+        config_text = (folder / "configs" / name).read_text()
+        assert "🚀" in config_text
+        assert "🧪" in config_text
+        parsed = tomllib.loads(config_text)
+        assert parsed["wandb"] == {
+            "project": project_name,
+            "run_name": f"{folder.name}-{suffix}",
+        }
+
+
+@pytest.mark.parametrize("project_name", ["invalid/project", "x" * 129])
+def test_env_setup_falls_back_to_project_id_for_invalid_wandb_project_names(
+    monkeypatch, tmp_path, project_name
+) -> None:
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda project_id, _api_key: {"id": project_id, "name": project_name},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 0
+
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
+        assert parsed["wandb"]["project"] == _SCAFFOLD_PROJECT
+
+
+def test_env_setup_does_not_backfill_wandb_into_existing_configs(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", _SCAFFOLD_PROJECT]
+    assert _run(["env", "setup", *project]) == 0
+
+    retained = {}
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        path = tmp_path / "configs" / name
+        before, rest = path.read_text().split("[wandb]\n", 1)
+        _, after = rest.split("[environment]\n", 1)
+        retained[name] = before + "[environment]\n" + after
+        path.write_text(retained[name])
+
+    assert _run(["env", "setup", *project]) == 0
+
+    for name, expected in retained.items():
+        path = tmp_path / "configs" / name
+        assert path.read_text() == expected
+        assert "wandb" not in tomllib.loads(expected)
 
 
 def test_env_setup_does_not_overwrite_existing_evaluations(monkeypatch, tmp_path) -> None:
@@ -2463,6 +2574,42 @@ def test_env_setup_yes_requires_project_before_creating_files(
     monkeypatch.chdir(tmp_path)
     assert _run(["env", "setup", "--yes"]) == 1
     assert "--project PROJECT_UUID is required" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("project_name", [None, "", "   "])
+def test_env_setup_rejects_missing_project_name_before_writes(
+    monkeypatch, tmp_path, capsys, project_name
+) -> None:
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda project_id, _api_key: {"id": project_id, "name": project_name},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 1
+
+    assert "has no nonblank canonical name" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_env_setup_rejects_blank_folder_name_before_writes(monkeypatch, tmp_path, capsys) -> None:
+    from flash.cli.commands.env import setup as env_setup
+
+    class _BlankCwd:
+        name = "   "
+
+    class _Path:
+        @staticmethod
+        def cwd():
+            return _BlankCwd()
+
+    monkeypatch.setattr(env_setup, "Path", _Path)
+    monkeypatch.chdir(tmp_path)
+
+    assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 1
+
+    assert "environment folder name must be nonblank" in capsys.readouterr().err
     assert list(tmp_path.iterdir()) == []
 
 

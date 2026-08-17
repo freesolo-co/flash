@@ -54,6 +54,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- Completed verl children now finish each captured W&B run before the W&B service shuts down,
+  avoiding teardown tracebacks, and `flash env setup` now gives every starter config explicit W&B
+  project and folder-derived run metadata.
+
 - An ordered `[gpu] type` list is now priced over every class it declares acceptable, not just the
   first. Allocation cost-ranks the whole set, so quoting the head alone priced a shape the run may
   never be given — an authored `["B200", "H100"]` quoted roughly 3x the H100 the allocator would

@@ -13,6 +13,7 @@ from flash.cli.commands.env.retained import (
     _warn_if_environment_form_disagrees,
     _warn_if_retained_starter_files_describe_another_plane,
 )
+from flash.cli.commands.env.setup_wandb import _require_setup_project_name, _wandb_block
 from flash.cli.scaffold import TRAINING_MD
 from flash.cli.ui import render
 from flash.envs.evaluations import _DEFAULT_EVALUATIONS_PATH
@@ -692,6 +693,7 @@ def _write_rl_config(
     rl: Path,
     project_line: str,
     thinking_line: str,
+    wandb_block: str,
     env_comment: str,
     max_examples_line: str,
     rl_reasoning_train: str,
@@ -704,6 +706,7 @@ def _write_rl_config(
             'algorithm = "grpo"\n'
             f"{thinking_line}"
             "\n"
+            f"{wandb_block}"
             f"{env_comment}"
             "[train]\n"
             "epochs = 1\n"
@@ -722,6 +725,7 @@ def _write_sft_config(
     sft: Path,
     project_line: str,
     thinking_line: str,
+    wandb_block: str,
     env_comment: str,
     max_examples_line: str,
     sft_reasoning_note: str,
@@ -734,6 +738,7 @@ def _write_sft_config(
             'algorithm = "sft"\n'
             f"{thinking_line}"
             "\n"
+            f"{wandb_block}"
             f"{env_comment}"
             "[train]\n"
             "epochs = 1\n"
@@ -766,6 +771,7 @@ def _write_opd_config(
     project_line: str,
     project_id: str,
     thinking_line: str,
+    wandb_block: str,
     max_examples_line: str,
     *,
     can_publish: bool = True,
@@ -788,6 +794,7 @@ def _write_opd_config(
             'algorithm = "opd"   # on-policy distillation from a managed parasail teacher (default glm 5.2)\n'
             f"{thinking_line}"
             "\n"
+            f"{wandb_block}"
             + _environment_comment(
                 project_id,
                 can_publish=can_publish,
@@ -817,7 +824,13 @@ def _write_training_guide(training: Path, project_id: str) -> None:
 
 
 def cmd_env_setup(args) -> int:
+    from flash.client import ClientError
+
     project_id = _require_setup_project(args)
+    project_name = _require_setup_project_name(project_id)
+    folder_name = Path.cwd().name
+    if not folder_name.strip():
+        raise ClientError("the current environment folder name must be nonblank")
     _validate_existing_config_projects(project_id)
     starter_env = Path("environment.py")
     starter_evaluations = Path(_DEFAULT_EVALUATIONS_PATH)
@@ -908,6 +921,7 @@ def cmd_env_setup(args) -> int:
         rl,
         project_line,
         thinking_line,
+        _wandb_block(project_name, f"{folder_name}-grpo"),
         env_comment,
         max_examples_line,
         rl_reasoning_train,
@@ -916,6 +930,7 @@ def cmd_env_setup(args) -> int:
         sft,
         project_line,
         thinking_line,
+        _wandb_block(project_name, f"{folder_name}-sft"),
         env_comment,
         max_examples_line,
         sft_reasoning_note,
@@ -927,6 +942,7 @@ def cmd_env_setup(args) -> int:
         project_line,
         project_id,
         thinking_line,
+        _wandb_block(project_name, f"{folder_name}-opd"),
         max_examples_line,
         can_publish=can_publish,
     )
