@@ -814,7 +814,8 @@ def _write_training_guide(training: Path, project_id: str) -> None:
         )
 
 
-def cmd_env_setup(args) -> int:
+def _resolve_setup_identity(args) -> tuple[str | None, str, str, str, str]:
+    """Resolve the credential, project, and folder identity used by every setup phase."""
     from flash.client import ClientError
     from flash.client.config import load_credentials
 
@@ -826,10 +827,14 @@ def cmd_env_setup(args) -> int:
         )
     project = _require_setup_project(args, api_url=api_url, api_key=api_key)
     project_id = str(project["id"])
-    project_name = _wandb_project(project)
     folder_name = Path.cwd().name
     if not folder_name.strip():
         raise ClientError("the current environment folder name must be nonblank")
+    return api_url, api_key, project_id, _wandb_project(project), folder_name
+
+
+def cmd_env_setup(args) -> int:
+    api_url, api_key, project_id, project_name, folder_name = _resolve_setup_identity(args)
     _validate_existing_config_projects(project_id)
     starter_env = Path("environment.py")
     starter_evaluations = Path(_DEFAULT_EVALUATIONS_PATH)
