@@ -14,6 +14,11 @@ import pytest
 
 import flash.cli as cli
 from flash.cli.commands.env.push import _human_bytes, _UploadProgress
+from flash.envs.package.direct_tokens import (
+    _CHUNK_SIZE,
+    _OVERLAP,
+    package_contains_direct_token,
+)
 
 
 def _fake_client(capture: dict, *, slug: str = "acme/environment"):
@@ -49,6 +54,199 @@ def _args(
     path, *, name: str = "my-env", project: str | None = "11111111-1111-4111-8111-111111111111"
 ):
     return argparse.Namespace(path=str(path), name=name, project=project)
+
+
+def _token_body(prefix: str, length: int) -> str:
+    seed = (
+        "aB3_dE5-fG7hJ9kL2mN4pQ6rS8tUvW0xY1zC"
+        if prefix == "fslo_"
+        else "aB3dE5fG7hJ9kL2mN4pQ6rS8tUvW0xY1zC"
+    )
+    return (seed * 2)[:length]
+
+
+def _issued_token(prefix: str) -> str:
+    body_length = {"fslo_": 45, "hf_": 34, "pit_": 64}[prefix]
+    body = _token_body(prefix, body_length)
+    if prefix == "fslo_":
+        assert {"_", "-"} <= set(body)
+    return prefix + body
+
+
+def _deny_archive_and_upload(monkeypatch, calls: list[str]) -> None:
+    def deny_archive(_pkg):
+        calls.append("archive")
+        raise AssertionError("archive must not be created")
+
+    monkeypatch.setattr("flash.cli.commands.env.push._tar_b64", deny_archive)
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: calls.append("upload") or pytest.fail("upload must not start"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "relative", "content"),
+    [
+        ("fslo_", "scripts/launch.sh", lambda token: f"#!/bin/sh\nexport API_KEY={token}\n"),
+        ("hf_", "helper.py", lambda token: f"TOKEN = {token!r}\n"),
+        ("pit_", "environment.py", lambda token: f"TOKEN = {token!r}\n"),
+    ],
+    ids=["freesolo-shell", "hugging-face-python", "prime-entrypoint"],
+)
+def test_push_rejects_direct_tokens_before_archive_or_upload(
+    monkeypatch, tmp_path, capsys, prefix, relative, content
+):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    target = env_dir / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    token = _issued_token(prefix)
+    target.write_text(content(token))
+    calls: list[str] = []
+    _deny_archive_and_upload(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+
+    error = capsys.readouterr().err
+    assert "direct access token" in error
+    assert token not in error
+    assert relative not in error
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("prefix", "body_length"),
+    [("fslo_", 45), ("hf_", 34), ("pit_", 64)],
+    ids=["freesolo", "hugging-face", "prime"],
+)
+@pytest.mark.parametrize("delta", [-1, 1], ids=["minus-one", "plus-one"])
+def test_direct_token_neighbor_body_lengths_are_clean(tmp_path, prefix, body_length, delta):
+    package = tmp_path / "package"
+    package.mkdir()
+    value = prefix + _token_body(prefix, body_length + delta)
+    (package / "data.bin").write_bytes(b" " + value.encode() + b" ")
+
+    assert package_contains_direct_token(package) is False
+
+
+@pytest.mark.parametrize(
+    "token_start",
+    [_CHUNK_SIZE - 3, _CHUNK_SIZE - _OVERLAP - 3],
+    ids=["read-boundary", "overlap-cutoff"],
+)
+def test_push_rejects_direct_token_across_chunk_boundary(
+    monkeypatch, tmp_path, capsys, token_start
+):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    token = _issued_token("hf_").encode()
+    (env_dir / "opaque.bin").write_bytes(b" " * token_start + token + b"\x00" * 256)
+    calls: list[str] = []
+    _deny_archive_and_upload(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+
+    error = capsys.readouterr().err
+    assert "direct access token" in error
+    assert token.decode() not in error
+    assert "opaque.bin" not in error
+    assert calls == []
+
+
+def test_push_allows_clean_binary_placeholders_and_embedded_direct_token_shapes(
+    monkeypatch, tmp_path
+):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    embedded = _issued_token("pit_")
+    placeholders = [
+        "fslo_" + "your_api_token_here".ljust(45, "_"),
+        "hf_" + "x" * 34,
+        "pit_" + "0" * 64,
+    ]
+    (env_dir / "environment.py").write_text(
+        "def load_environment(**k):\n    return None\n" + "\n".join(placeholders)
+    )
+    (env_dir / "notes.txt").write_text(
+        "ordinary text without credentials\n"
+        "hf_resume_checkpoint\n"
+        "fslo_retry_after_close\n"
+        "pit_environment_identifier\n"
+    )
+    (env_dir / "opaque.bin").write_bytes(b"\x00\xffclean\x80binary\x00")
+    (env_dir / "embedded-left.bin").write_bytes(("left" + embedded + " ").encode())
+    (env_dir / "overlong.bin").write_bytes((" pit_" + "aB3" * 22 + " ").encode())
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    assert cap["package_b64"]
+
+
+def test_push_allows_direct_token_shape_with_invalid_left_at_retained_boundary(
+    monkeypatch, tmp_path
+):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    token = _issued_token("pit_").encode()
+    prefix_padding = b" " * (_CHUNK_SIZE - _OVERLAP - 1)
+    payload = prefix_padding + b"z" + token + b"\x00" + b"next chunk"
+    (env_dir / "retained-boundary.bin").write_bytes(payload)
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    assert cap["package_b64"]
+
+
+def test_direct_token_scan_error_drops_oserror_details(tmp_path):
+    from flash.envs.package.direct_tokens import DirectTokenScanError, package_contains_direct_token
+
+    missing = tmp_path / "sensitive-package-path"
+    with pytest.raises(DirectTokenScanError) as excinfo:
+        package_contains_direct_token(missing)
+
+    assert str(excinfo.value) == "package scan failed"
+    assert excinfo.value.__context__ is None
+    assert str(missing) not in str(excinfo.value)
+
+
+def test_push_fails_closed_when_direct_token_scan_sees_unexpected_member(
+    monkeypatch, tmp_path, capsys
+):
+    from flash.cli.commands.env import push as envpush
+
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    outside = tmp_path / "outside"
+    outside.write_text("clean\n")
+    real_copy = envpush._copy_env_sidecars
+
+    def copy_with_link(env_root, dest, *, entrypoint, include_full_tree):
+        real_copy(
+            env_root,
+            dest,
+            entrypoint=entrypoint,
+            include_full_tree=include_full_tree,
+        )
+        (dest / "unexpected-link").symlink_to(outside)
+
+    monkeypatch.setattr(envpush, "_copy_env_sidecars", copy_with_link)
+    calls: list[str] = []
+    _deny_archive_and_upload(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+
+    error = capsys.readouterr().err
+    assert "could not be scanned safely" in error
+    assert "unexpected-link" not in error
+    assert str(outside) not in error
+    assert calls == []
 
 
 def test_push_single_py_module_is_packaged(monkeypatch, tmp_path, capsys):

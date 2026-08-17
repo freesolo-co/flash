@@ -16,6 +16,7 @@ import urllib.parse
 from pathlib import Path
 
 from flash.envs.loader import _github_token
+from flash.envs.package.direct_tokens import DirectTokenScanError, package_contains_direct_token
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
     ARCHIVE_SCAN_MEMBER_LIMIT,
@@ -480,6 +481,14 @@ def publish_package(
     with tempfile.TemporaryDirectory(prefix="flash-env-publish-") as tmp:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)
+        try:
+            contains_direct_token = package_contains_direct_token(dest)
+        except DirectTokenScanError:
+            raise EnvPublishError("env package could not be scanned safely") from None
+        if contains_direct_token:
+            raise EnvPublishError(
+                "env package contains a direct access token; remove it before publishing"
+            )
         return _github_publish(dest, name=name, key=key, project_slug=project_slug)
 
 

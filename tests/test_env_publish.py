@@ -74,6 +74,93 @@ def _pkg_b64(files: dict[str, str]) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def _issued_token(prefix: str) -> str:
+    body_length = {"fslo_": 45, "hf_": 34, "pit_": 64}[prefix]
+    seed = (
+        "qR2_sT4-uV6wX8yZ0aB1cD3eF5gHjK7mN9pL"
+        if prefix == "fslo_"
+        else "qR2sT4uV6wX8yZ0aB1cD3eF5gHjK7mN9pL"
+    )
+    body = (seed * 2)[:body_length]
+    if prefix == "fslo_":
+        assert {"_", "-"} <= set(body)
+    return prefix + body
+
+
+def test_publish_rejects_direct_token_archive_before_github_publish(monkeypatch):
+    token = _issued_token("fslo_")
+    path = "scripts/bootstrap.sh"
+    package = {**_MINIMAL, path: f"#!/bin/sh\nexport FREESOLO_API_KEY={token}\n"}
+    calls: list[str] = []
+    monkeypatch.setattr(
+        envs,
+        "_github_publish",
+        lambda *_args, **_kwargs: calls.append("github") or pytest.fail("github must not start"),
+    )
+
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.publish_package(
+            package_b64=_pkg_b64(package),
+            name="direct-bypass",
+            key={"org_slug": "acme"},
+            project_slug="checkout-bot",
+        )
+
+    assert excinfo.value.status == 400
+    error = str(excinfo.value)
+    assert "direct access token" in error
+    assert token not in error
+    assert path not in error
+    assert calls == []
+
+
+def test_publish_direct_token_scan_failure_is_safe_400(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        envs,
+        "package_contains_direct_token",
+        lambda _dest: (_ for _ in ()).throw(envs.DirectTokenScanError()),
+    )
+    monkeypatch.setattr(
+        envs,
+        "_github_publish",
+        lambda *_args, **_kwargs: calls.append("github") or pytest.fail("github must not start"),
+    )
+
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL),
+            name="scan-failure",
+            key={"org_slug": "acme"},
+            project_slug="checkout-bot",
+        )
+
+    assert excinfo.value.status == 400
+    assert str(excinfo.value) == "env package could not be scanned safely"
+    assert calls == []
+
+
+def test_publish_direct_token_clean_control_reaches_github_publish(monkeypatch):
+    calls: list[str] = []
+
+    def fake_publish(dest, *, name, key, project_slug):
+        calls.append("github")
+        assert (dest / "environment.py").is_file()
+        return f"{key['org_slug']}/{project_slug}/{name}"
+
+    monkeypatch.setattr(envs, "_github_publish", fake_publish)
+
+    result = envs.publish_package(
+        package_b64=_pkg_b64({**_MINIMAL, "assets/data.bin": "clean opaque bytes"}),
+        name="clean-control",
+        key={"org_slug": "acme"},
+        project_slug="checkout-bot",
+    )
+
+    assert result == "acme/checkout-bot/clean-control"
+    assert calls == ["github"]
+
+
 def test_namespace_uses_org_slug():
     assert envs.namespace_for({"org_slug": "acme"}) == "acme"
     assert envs.namespace_for({"org": {"slug": "freesolo-co"}}) == "freesolo-co"
