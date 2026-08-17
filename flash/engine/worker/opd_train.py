@@ -493,6 +493,7 @@ from flash.engine.worker.train.opd.overrides import (  # noqa: E402,F401
 # re-exported because `run_opd_train` above and the opd tests both reach them here.
 from flash.engine.worker.train.opd.prompts import (  # noqa: E402,F401
     _normalize_prompt_ids,
+    _processor_expanded_prompt,
     _processor_expanded_prompt_ids,
     _prompt_pool_fingerprint,
     _trim_response_and_forced,

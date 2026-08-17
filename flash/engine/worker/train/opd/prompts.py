@@ -58,14 +58,14 @@ def _normalize_prompt_ids(value) -> tuple[int, ...]:
     )
 
 
-def _processor_expanded_prompt_ids(
+def _processor_expanded_prompt(
     processor,
     messages: list[dict],
     image_descriptors: tuple[str, ...],
     package_root: str | None,
     *,
     enable_thinking: bool,
-) -> tuple[int, ...]:
+) -> tuple[tuple[int, ...], str]:
     from flash.content.multimodal import decode_image_descriptors
 
     images = decode_image_descriptors(list(image_descriptors), package_root)
@@ -82,7 +82,25 @@ def _processor_expanded_prompt_ids(
         videos=None,
         return_tensors="pt",
     )
-    return _normalize_prompt_ids(model_inputs)
+    return _normalize_prompt_ids(model_inputs), raw_prompt
+
+
+def _processor_expanded_prompt_ids(
+    processor,
+    messages: list[dict],
+    image_descriptors: tuple[str, ...],
+    package_root: str | None,
+    *,
+    enable_thinking: bool,
+) -> tuple[int, ...]:
+    prompt_ids, _raw_prompt = _processor_expanded_prompt(
+        processor,
+        messages,
+        image_descriptors,
+        package_root,
+        enable_thinking=enable_thinking,
+    )
+    return prompt_ids
 
 
 def encode_shifted_group_metadata(

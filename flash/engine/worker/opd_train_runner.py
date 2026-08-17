@@ -205,6 +205,7 @@ def _prepare_prompts(
     package_root_value = getattr(request.env, "package_root", None)
     package_root = str(Path(package_root_value).resolve()) if package_root_value else None
     prepped = [0]
+    thinking_semantics_set = False
     with _opd_train.liveness_heartbeat("opd_image_prep", progress=lambda: prepped[0]):
         for example, messages in prompt_rows:
             prepped[0] += 1
@@ -219,7 +220,7 @@ def _prepare_prompts(
                 teacher_messages = image_teacher_prompt_messages(
                     student_messages, len(image_descriptors)
                 )
-                prompt_ids = _opd_train._processor_expanded_prompt_ids(
+                prompt_ids, rendered_prompt = _opd_train._processor_expanded_prompt(
                     processor,
                     student_messages,
                     image_descriptors,
@@ -229,10 +230,10 @@ def _prepare_prompts(
             else:
                 teacher_messages = student_messages
                 if processor is not None:
-                    # mixed job: the verl child tokenizes EVERY row through the multimodal dataset
+                    # mixed job: the verl child tokenizes every row through the multimodal dataset
                     # path (the processor), so text-only rows must freeze via the same path or the
                     # bridge's exact prompt-id check trips on tokenizer-vs-processor differences.
-                    prompt_ids = _opd_train._processor_expanded_prompt_ids(
+                    prompt_ids, rendered_prompt = _opd_train._processor_expanded_prompt(
                         processor,
                         student_messages,
                         (),
@@ -240,6 +241,12 @@ def _prepare_prompts(
                         enable_thinking=bool(_opd_train._w.THINKING),
                     )
                 else:
+                    rendered_prompt = tokenizer.apply_chat_template(
+                        student_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=_opd_train._w.THINKING,
+                    )
                     prompt_ids = _opd_train._normalize_prompt_ids(
                         tokenizer.apply_chat_template(
                             student_messages,
@@ -248,6 +255,15 @@ def _prepare_prompts(
                             enable_thinking=_opd_train._w.THINKING,
                         )
                     )
+            if not thinking_semantics_set:
+                thinking = bool(_opd_train._w.THINKING)
+                if hasattr(request.env, "thinking"):
+                    request.env.thinking = thinking
+                if hasattr(request.env, "prompt_opens_thinking"):
+                    request.env.prompt_opens_thinking = (
+                        thinking and _opd_train._w.prompt_opens_thinking(rendered_prompt)
+                    )
+                thinking_semantics_set = True
             if len(prompt_ids) > prompt_budget:
                 dropped_long += 1
                 continue

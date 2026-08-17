@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import importlib.metadata
@@ -2789,6 +2790,103 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
 
     assert env.recorded == ["A"]
     assert response["terminal"] is False
+
+
+def test_nested_model_eos_multiturn_response_reaches_teacher_scoring():
+    from flash.engine.worker.train.opd.gkd import _generation_eos_ids
+
+    nested_eos = 248044
+    tokenizer_eos = 248046
+
+    class _NestedEosTokenizer(_MultiTurnBridgeTokenizer):
+        eos_token_id = tokenizer_eos
+
+        def decode(self, token_ids, *, skip_special_tokens):
+            visible = [
+                token_id for token_id in token_ids if token_id not in {nested_eos, tokenizer_eos}
+            ]
+            text = super().decode(visible, skip_special_tokens=skip_special_tokens)
+            if skip_special_tokens:
+                return text
+            suffix = "".join(
+                "<eos>" for token_id in token_ids if token_id in {nested_eos, tokenizer_eos}
+            )
+            return text + suffix
+
+    class _Teacher:
+        def __init__(self):
+            self.items = []
+
+        def score_many(self, items):
+            self.items.extend(items)
+            return [
+                _teacher_score([TeacherToken(text="A", logprob=-0.4, start=0, end=1)])
+                for _item in items
+            ]
+
+    tokenizer = _NestedEosTokenizer()
+    eos_token_ids = _generation_eos_ids(
+        SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(eos_token_id=nested_eos),
+            )
+        ),
+        tokenizer,
+    )
+    assert eos_token_ids == frozenset({nested_eos, tokenizer_eos})
+
+    env = _RecordingEnv()
+    teacher = _Teacher()
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[{"role": "user", "content": "q"}],
+                teacher_messages=[{"role": "user", "content": "q"}],
+                prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
+                example=object(),
+            )
+        ],
+        tokenizer=tokenizer,
+        teacher=teacher,
+        thinking_prefill="",
+        eos_token_ids=eos_token_ids,
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+        active_env=env,
+        multi_turn=True,
+        max_turns=1,
+    )
+    bridge.start_multiturn(
+        index=0,
+        session_id="nested-eos",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
+    )
+
+    response = bridge.step_multiturn(
+        {
+            "session_id": "nested-eos",
+            "turn_ordinal": 0,
+            "accepted_prefix": [10, 11],
+            "raw_response_ids": [65, nested_eos],
+            "response_ids": [65, nested_eos],
+            "completion_text": "A",
+            "termination": "eos",
+            "stop_reason": "eos",
+            "truncated": False,
+            "skip_reason": "",
+        }
+    )
+    scored = bridge.score_multiturn("nested-eos")
+
+    assert response["terminal"] is True
+    assert env.recorded == ["A"]
+    assert bridge.truncated_rollouts == 0
+    assert teacher.items == [("User: q\nAssistant: ", "A")]
+    assert scored["turns"][0]["teacher_ids"] != [-1] * 4
 
 
 def test_multimodal_bridge_scores_frozen_images_through_structured_teacher_messages(
@@ -7569,6 +7667,93 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
 
     with pytest.raises(RuntimeError, match="managed teacher control-panel transport is missing"):
         opd_mod.run_opd_train()
+
+
+@pytest.mark.parametrize(
+    ("thinking", "rendered_prompt", "expected_opened"),
+    [
+        (True, "<|im_start|>assistant\n<think>\n", True),
+        (True, "<|im_start|>assistant\n", False),
+        (False, "<|im_start|>assistant\n<think>\n", False),
+        (False, "<|im_start|>assistant\n", False),
+    ],
+)
+def test_opd_preparation_propagates_derived_thinking_semantics(
+    monkeypatch, thinking, rendered_prompt, expected_opened
+):
+    from flash.engine.worker import opd_train as opd_mod
+    from flash.engine.worker import opd_train_runner
+    from flash.engine.worker.model.decoding import prompt_opens_thinking
+    from flash.engine.worker.train.opd.state import _OpdRequest
+
+    class _Tokenizer:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+
+        def apply_chat_template(
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+        ):
+            assert messages == [{"role": "user", "content": "question"}]
+            assert add_generation_prompt is True
+            assert enable_thinking is thinking
+            return [10, 11] if tokenize else rendered_prompt
+
+    class _TeacherClient:
+        def __init__(self, capability, control_panel_url, teacher_model):
+            assert (capability, control_panel_url, teacher_model) == (
+                "capability",
+                "https://control.invalid",
+                "teacher",
+            )
+
+    env = SimpleNamespace(thinking=None, prompt_opens_thinking=None, package_root=None)
+    tokenizer = _Tokenizer()
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(
+            THINKING=thinking,
+            load_tokenizer=lambda model_id, revision: tokenizer,
+            prompt_opens_thinking=prompt_opens_thinking,
+        ),
+    )
+    monkeypatch.setattr(opd_mod, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(opd_mod, "clamp_engine_len", lambda requested, _limit: requested)
+    monkeypatch.setattr(opd_mod, "model_max_position_embeddings", lambda *_args: None)
+    monkeypatch.setattr(opd_mod, "validate_glue_template", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        opd_mod,
+        "liveness_heartbeat",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
+    )
+    import flash.engine.worker.teacher.client as teacher_client
+
+    monkeypatch.setattr(teacher_client, "TeacherClient", _TeacherClient)
+    request = _OpdRequest(
+        spec=None,
+        env=env,
+        multi_turn=True,
+        max_turns=2,
+        knobs=SimpleNamespace(
+            teacher_model="teacher",
+            max_length=128,
+            max_completion=8,
+        ),
+        model_id="model",
+        model_revision="revision",
+    )
+
+    state = opd_train_runner._prepare_prompts(
+        request,
+        [({}, [{"role": "user", "content": "question"}])],
+        False,
+        "capability",
+        "https://control.invalid",
+    )
+
+    assert len(state.prompts) == 1
+    assert env.thinking is thinking
+    assert env.prompt_opens_thinking is expected_opened
 
 
 def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice():
