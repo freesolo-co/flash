@@ -30,6 +30,27 @@ def _data_uri(data: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
 
 
+def _oriented_jpeg_bytes() -> bytes:
+    image_module = pytest.importorskip("PIL.Image")
+    source = image_module.new("RGB", (3, 2))
+    source.putdata(
+        [
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (255, 255, 0),
+            (255, 0, 255),
+            (0, 255, 255),
+        ]
+    )
+    exif = image_module.Exif()
+    exif[274] = 6
+    out = io.BytesIO()
+    source.save(out, format="JPEG", quality=100, subsampling=0, exif=exif)
+    source.close()
+    return out.getvalue()
+
+
 def _package(tmp_path):
     root = tmp_path / "env"
     dataset = root / "dataset"
@@ -53,10 +74,9 @@ def test_normalizes_openai_blocks_and_top_level_images_without_mutating_record(t
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "first"},
+                {"type": "input_text", "text": "first"},
                 {"type": "image", "image": data},
-                {"type": "image_url", "image_url": {"url": _data_uri(data), "detail": "low"}},
-                {"type": "input_image", "image_url": _data_uri(data)},
+                {"type": "input_image", "input_image": _data_uri(data), "detail": "low"},
                 {"type": "image"},
                 {"type": "image"},
             ],
@@ -66,10 +86,9 @@ def test_normalizes_openai_blocks_and_top_level_images_without_mutating_record(t
     normalized = mm.normalize_prompt_images(record, messages, root)
 
     assert record == original
-    assert len(normalized.descriptors) == 5
+    assert len(normalized.descriptors) == 4
     assert [block["type"] for block in normalized.messages[0]["content"]] == [
         "text",
-        "image",
         "image",
         "image",
         "image",
@@ -119,8 +138,12 @@ def test_supported_source_forms_decode_from_arrow_safe_descriptors(tmp_path):
 
     assert all(isinstance(value, str) for value in descriptors)
     assert all(set(json.loads(value)) == {"kind", "value"} for value in descriptors)
-    decoded = mm.decode_image_descriptors(descriptors, root)
-    assert [image.size for image in decoded] == [(2, 2)] * len(sources)
+    decoded = [mm.decode_image_descriptors([descriptor], root)[0] for descriptor in descriptors]
+    try:
+        assert [image.size for image in decoded] == [(2, 2)] * len(sources)
+    finally:
+        for image in decoded:
+            image.close()
 
 
 def test_image_descriptors_convert_to_base64_data_uris_without_paths(tmp_path):
@@ -142,17 +165,121 @@ def test_image_descriptors_convert_to_base64_data_uris_without_paths(tmp_path):
     ]
 
 
-def test_data_uri_preserves_base64_and_percent_encoded_images(tmp_path):
+def test_cumulative_descriptor_validation_and_canonical_messages_are_immutable(tmp_path):
+    root, _image = _package(tmp_path)
+    first = mm.normalize_prompt_images(
+        {},
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "first"},
+                    {"type": "input_image", "input_image": _data_uri(_png_bytes())},
+                ],
+            }
+        ],
+        root,
+    )
+    snapshot = json.loads(json.dumps(first.messages))
+    second = mm.normalize_prompt_images(
+        {},
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "url": _data_uri(_png_bytes((0, 255, 0)))},
+                    {"type": "text", "text": "second"},
+                ],
+            }
+        ],
+        root,
+    )
+    descriptors = [*first.descriptors, *second.descriptors]
+
+    validated = mm.validate_image_descriptors(descriptors, root)
+    messages = mm.messages_with_image_data_uris(
+        [*first.messages, {"role": "assistant", "content": "ok"}, *second.messages],
+        descriptors,
+        root,
+    )
+
+    assert first.messages == snapshot
+    assert [item.pixels for item in validated] == [4, 4]
+    assert [
+        block["image_url"]["url"]
+        for message in messages
+        for block in message.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "image_url"
+    ] == [item.data_uri for item in validated]
+
+
+def test_data_uri_requires_strict_base64_and_mime_format_agreement(tmp_path):
     root, _image = _package(tmp_path)
     data = _png_bytes()
     percent_uri = "data:image/png," + urllib.parse.quote_from_bytes(data)
 
-    descriptors = [
-        mm.normalize_image_source(_data_uri(data), root),
-        mm.normalize_image_source(percent_uri, root),
-    ]
+    with pytest.raises(ValueError, match="base64 encoding"):
+        mm.normalize_image_source(percent_uri, root)
+    with pytest.raises(ValueError, match="invalid base64"):
+        mm.normalize_image_source("data:image/png;base64,a G==", root)
+    with pytest.raises(ValueError, match="unsupported MIME"):
+        mm.normalize_image_source(
+            "data:image/jpg;base64," + base64.b64encode(data).decode("ascii"), root
+        )
+    with pytest.raises(ValueError, match="MIME type does not match"):
+        mm.normalize_image_source(
+            "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii"), root
+        )
 
-    assert [image.size for image in mm.decode_image_descriptors(descriptors, root)] == [(2, 2)] * 2
+
+@pytest.mark.parametrize("padding", [" ", "\n"])
+def test_data_uri_rejects_leading_and_trailing_whitespace(tmp_path, padding):
+    root, _image = _package(tmp_path)
+    uri = _data_uri(_png_bytes())
+
+    with pytest.raises(ValueError, match="data URI"):
+        mm.normalize_image_source(padding + uri, root)
+    with pytest.raises(ValueError, match=r"base64|exact data"):
+        mm.normalize_image_source(uri + padding, root)
+
+
+@pytest.mark.parametrize(
+    ("image_format", "mime"),
+    [("PNG", "image/png"), ("JPEG", "image/jpeg"), ("WEBP", "image/webp")],
+)
+def test_data_uri_accepts_exact_serving_formats(tmp_path, image_format, mime):
+    image_module = pytest.importorskip("PIL.Image")
+    root, _image = _package(tmp_path)
+    out = io.BytesIO()
+    image_module.new("RGB", (2, 2), "red").save(out, format=image_format)
+    uri = f"data:{mime};base64," + base64.b64encode(out.getvalue()).decode("ascii")
+
+    descriptor = mm.normalize_image_source(uri, root)
+
+    assert mm.image_descriptors_to_data_uris([descriptor], root)[0].startswith(
+        f"data:{mime};base64,"
+    )
+
+
+def test_decode_applies_exif_orientation_and_reports_canonical_dimensions(tmp_path):
+    image_module = pytest.importorskip("PIL.Image")
+    image_ops = pytest.importorskip("PIL.ImageOps")
+    root, _image = _package(tmp_path)
+    data = _oriented_jpeg_bytes()
+    uri = "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+    descriptor = mm.normalize_image_source(uri, root)
+
+    validated = mm.validate_image_descriptors([descriptor], root)[0]
+    decoded = mm.decode_image_descriptors([descriptor], root)[0]
+    with image_module.open(io.BytesIO(data)) as encoded:
+        expected = image_ops.exif_transpose(encoded).convert("RGB")
+    try:
+        assert (validated.width, validated.height) == (2, 3)
+        assert decoded.size == (2, 3)
+        assert decoded.tobytes() == expected.tobytes()
+    finally:
+        decoded.close()
+        expected.close()
 
 
 def test_data_uri_rejects_oversized_header_before_descriptor_storage(tmp_path):
@@ -223,7 +350,7 @@ def test_malformed_blocks_fail_clearly(tmp_path):
         mm.normalize_prompt_images({}, [{"role": "user", "content": ["bad"]}], root)
     with pytest.raises(ValueError, match="missing text"):
         mm.normalize_prompt_images({}, [{"role": "user", "content": [{"type": "text"}]}], root)
-    with pytest.raises(ValueError, match="missing image source"):
+    with pytest.raises(ValueError, match="exactly one image source"):
         mm.normalize_prompt_images({}, [{"role": "user", "content": [{"type": "image_url"}]}], root)
     with pytest.raises(ValueError, match="unsupported content block"):
         mm.normalize_prompt_images(
@@ -231,10 +358,155 @@ def test_malformed_blocks_fail_clearly(tmp_path):
         )
 
 
+_SDK_IMAGE_SOURCE_FORMS = [
+    pytest.param("image_url", "image_url", id="image-url"),
+    pytest.param("input_image", "image_url", id="input-image-image-url"),
+    pytest.param("input_image", "input_image", id="input-image-input-image"),
+    pytest.param("input_image", "image", id="input-image-image"),
+    pytest.param("input_image", "url", id="input-image-url"),
+    pytest.param("image", "image", id="image-image"),
+    pytest.param("image", "image_url", id="image-image-url"),
+    pytest.param("image", "url", id="image-url-key"),
+]
+_SDK_IMAGE_TARGET_FORMS = [
+    *_SDK_IMAGE_SOURCE_FORMS,
+    pytest.param("output_image", "image_url", id="output-image"),
+]
+
+
+@pytest.mark.parametrize(("block_type", "source_key"), _SDK_IMAGE_SOURCE_FORMS)
+@pytest.mark.parametrize("object_source", [False, True], ids=["string", "object"])
+def test_accepts_every_freesolo_041_image_source_spelling(block_type, source_key, object_source):
+    uri = _data_uri(_png_bytes())
+    source = {"url": uri, "detail": "auto"} if object_source else uri
+    block = {"type": block_type, source_key: source}
+    if block_type == "input_image":
+        block["detail"] = "high"
+
+    normalized = mm.normalize_prompt_images(
+        {},
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe"},
+                    block,
+                ],
+            }
+        ],
+        None,
+    )
+
+    assert normalized.messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image"},
+            ],
+        }
+    ]
+    assert len(normalized.descriptors) == 1
+
+
+@pytest.mark.parametrize("role", ["system", "assistant", "tool"])
+def test_restricts_image_blocks_to_user_messages(role):
+    with pytest.raises(ValueError, match="only in user messages"):
+        mm.normalize_prompt_images(
+            {},
+            [
+                {
+                    "role": role,
+                    "content": [{"type": "image_url", "image_url": _data_uri(_png_bytes())}],
+                }
+            ],
+            None,
+        )
+
+
+def test_developer_role_is_canonicalized_to_system():
+    normalized = mm.normalize_prompt_images(
+        {},
+        [
+            {"role": "developer", "content": "be concise"},
+            {"role": "user", "content": "answer"},
+        ],
+        None,
+    )
+
+    assert normalized.messages == [
+        {"role": "system", "content": [{"type": "text", "text": "be concise"}]},
+        {"role": "user", "content": [{"type": "text", "text": "answer"}]},
+    ]
+
+
+def test_developer_role_cannot_carry_images():
+    with pytest.raises(ValueError, match="only in user messages"):
+        mm.normalize_prompt_images(
+            {},
+            [
+                {
+                    "role": "developer",
+                    "content": [{"type": "image_url", "image_url": _data_uri(_png_bytes())}],
+                }
+            ],
+            None,
+        )
+
+
+@pytest.mark.parametrize("role", [" user ", "User", "", "moderator", None])
+def test_rejects_noncanonical_or_unsupported_roles(role):
+    with pytest.raises(ValueError, match="role must be system, user, assistant, or tool"):
+        mm.normalize_prompt_images(
+            {},
+            [{"role": role, "content": "hello"}],
+            None,
+        )
+
+
+def test_rejects_ambiguous_or_invalid_sdk_image_sources():
+    uri = _data_uri(_png_bytes())
+    with pytest.raises(ValueError, match="exactly one image source"):
+        mm.normalize_prompt_images(
+            {},
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": uri,
+                            "input_image": uri,
+                        }
+                    ],
+                }
+            ],
+            None,
+        )
+    with pytest.raises(ValueError, match="detail must"):
+        mm.normalize_prompt_images(
+            {},
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_image", "input_image": uri, "detail": "tiny"}],
+                }
+            ],
+            None,
+        )
+
+
 def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
     root, _image = _package(tmp_path)
     data = _png_bytes()
     messages = [{"role": "user", "content": "what color?"}]
+
+    assert mm.MAX_IMAGES_PER_EXAMPLE == 4
+    assert mm.MAX_IMAGE_SOURCE_BYTES == 8 * 1024 * 1024
+    assert mm.MAX_TOTAL_IMAGE_SOURCE_BYTES == 16 * 1024 * 1024
+    assert mm.MAX_IMAGE_PIXELS == 16_777_216
+    assert mm.MAX_TOTAL_IMAGE_PIXELS == 33_554_432
+    assert mm.MAX_TOTAL_DECODED_BYTES == 64 * 1024 * 1024
 
     monkeypatch.setattr(mm, "MAX_IMAGES_PER_EXAMPLE", 1)
     with pytest.raises(ValueError, match="image limit"):
@@ -248,13 +520,13 @@ def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="source exceeds"):
         mm.normalize_image_source(_data_uri(b"four"), root)
 
-    monkeypatch.setattr(mm, "MAX_IMAGE_SOURCE_BYTES", 20 * 1024 * 1024)
-    monkeypatch.setattr(mm, "MAX_IMAGES_PER_EXAMPLE", 8)
+    monkeypatch.setattr(mm, "MAX_IMAGE_SOURCE_BYTES", 8 * 1024 * 1024)
+    monkeypatch.setattr(mm, "MAX_IMAGES_PER_EXAMPLE", 4)
     monkeypatch.setattr(mm, "MAX_TOTAL_IMAGE_SOURCE_BYTES", len(data))
     with pytest.raises(ValueError, match="image sources total"):
         mm.normalize_prompt_images({"images": [data, data]}, messages, root)
 
-    monkeypatch.setattr(mm, "MAX_TOTAL_IMAGE_SOURCE_BYTES", 32 * 1024 * 1024)
+    monkeypatch.setattr(mm, "MAX_TOTAL_IMAGE_SOURCE_BYTES", 16 * 1024 * 1024)
     monkeypatch.setattr(mm, "MAX_IMAGE_WIDTH", 1)
     with pytest.raises(ValueError, match="dimensions"):
         mm.normalize_image_source(data, root)
@@ -264,7 +536,12 @@ def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="pixel limit"):
         mm.normalize_image_source(data, root)
 
-    monkeypatch.setattr(mm, "MAX_IMAGE_PIXELS", 40_000_000)
+    monkeypatch.setattr(mm, "MAX_IMAGE_PIXELS", 16_777_216)
+    monkeypatch.setattr(mm, "MAX_TOTAL_IMAGE_PIXELS", 3)
+    with pytest.raises(ValueError, match="pixel total"):
+        mm.normalize_prompt_images({"images": [data, data]}, messages, root)
+
+    monkeypatch.setattr(mm, "MAX_TOTAL_IMAGE_PIXELS", 33_554_432)
     monkeypatch.setattr(mm, "MAX_TOTAL_DECODED_BYTES", 1)
     descriptor = mm.normalize_image_source(data, root)
     with pytest.raises(ValueError, match="decoded images"):
@@ -370,6 +647,49 @@ def test_sft_rejects_image_completion_when_prompt_is_text_only():
 
     with pytest.raises(ValueError, match="image-bearing SFT completions are not supported"):
         _reject_image_completion(completion, image_bearing=False)
+
+
+@pytest.mark.parametrize(("block_type", "source_key"), _SDK_IMAGE_TARGET_FORMS)
+@pytest.mark.parametrize("image_bearing", [False, True], ids=["text-prompt", "image-prompt"])
+def test_sft_rejects_every_sdk_image_target_spelling(block_type, source_key, image_bearing):
+    from flash.engine.worker.entry.sft import _reject_image_completion
+
+    completion = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "input_text", "text": "answer"},
+                {"type": block_type, source_key: _data_uri(_png_bytes())},
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="image-bearing SFT completions are not supported"):
+        _reject_image_completion(completion, image_bearing=image_bearing)
+
+
+def test_user_image_prompt_with_text_assistant_target_is_accepted():
+    from flash.engine.worker.entry.sft import _reject_image_completion
+
+    normalized = mm.normalize_prompt_images(
+        {},
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe"},
+                    {"type": "input_image", "input_image": _data_uri(_png_bytes())},
+                ],
+            }
+        ],
+        None,
+    )
+    completion = [{"role": "assistant", "content": [{"type": "input_text", "text": "red"}]}]
+
+    _reject_image_completion(completion, image_bearing=True)
+
+    assert len(normalized.descriptors) == 1
+    assert mm.text_only_prompt_messages(completion) == [{"role": "assistant", "content": "red"}]
 
 
 def test_sft_mixed_text_completion_shapes_are_arrow_safe():

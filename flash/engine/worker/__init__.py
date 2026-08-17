@@ -187,6 +187,11 @@ def _load_active_env():
     env = load_environment(
         env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
     )
+    from flash.content.multimodal import validate_image_observation_environment
+
+    # this capability classifies a future dynamic-image environment only. full per-turn media wiring
+    # remains separate; the guard makes an incompatible model or opd teacher fail before model work.
+    validate_image_observation_environment(env, JOB_SPEC)
     # tell the env whether this run samples <think> blocks, so the multi-turn scoring path strips
     # reasoning exactly like the single-turn path does (see FreesoloEnvironment.record_model_turn).
     if hasattr(env, "thinking"):

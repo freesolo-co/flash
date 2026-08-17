@@ -6,22 +6,58 @@ import base64
 import binascii
 import io
 import json
+import re
 import urllib.parse
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-MAX_IMAGES_PER_EXAMPLE = 8
-MAX_IMAGE_SOURCE_BYTES = 20 * 1024 * 1024
-MAX_TOTAL_IMAGE_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_IMAGES_PER_EXAMPLE = 4
+MAX_IMAGE_SOURCE_BYTES = 8 * 1024 * 1024
+MAX_TOTAL_IMAGE_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_WIDTH = 8192
 MAX_IMAGE_HEIGHT = 8192
-MAX_IMAGE_PIXELS = 40_000_000
-MAX_TOTAL_DECODED_BYTES = 128 * 1024 * 1024
+MAX_IMAGE_PIXELS = 16_777_216
+MAX_TOTAL_IMAGE_PIXELS = 33_554_432
+MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
 MAX_DATA_URI_HEADER_BYTES = 1024
 MAX_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 _IMAGE_BLOCK_TYPES = frozenset({"image", "image_url", "input_image"})
+_IMAGE_TARGET_BLOCK_TYPES = frozenset({*_IMAGE_BLOCK_TYPES, "output_image"})
+_TEXT_BLOCK_TYPES = frozenset({"text", "input_text"})
+_IMAGE_DETAIL_VALUES = frozenset({"auto", "low", "high"})
+_ALLOWED_MESSAGE_ROLES = frozenset({"system", "user", "assistant", "tool"})
+_EXIF_ORIENTATION_TAG = 274
+_EXIF_TRANSPOSED_ORIENTATIONS = frozenset({5, 6, 7, 8})
+_MIME_TO_FORMAT = {
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+    "image/webp": "WEBP",
+}
+_FORMAT_TO_MIME = {image_format: mime for mime, image_format in _MIME_TO_FORMAT.items()}
+_DATA_URI_RE = re.compile(r"\Adata:(image/[^;,]+);base64,(.*)\Z", re.DOTALL)
+_MODE_BYTES_PER_PIXEL = {
+    "1": 1,
+    "L": 1,
+    "P": 1,
+    "I;16": 2,
+    "I;16B": 2,
+    "I;16L": 2,
+    "LA": 2,
+    "La": 2,
+    "RGB": 3,
+    "YCbCr": 3,
+    "LAB": 3,
+    "HSV": 3,
+    "RGBA": 4,
+    "RGBa": 4,
+    "CMYK": 4,
+    "I": 4,
+    "F": 4,
+}
+_RGB_BYTES_PER_PIXEL = 3
 IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
 # the model's real image-expansion token, as opposed to the placeholder above. one definition so
 # the renderer's rejection and the teacher client's drop guard cannot drift apart.
@@ -32,6 +68,20 @@ IMAGE_PAD_TOKEN = "<|image_pad|>"
 class NormalizedImages:
     messages: list[dict]
     descriptors: list[str]
+
+
+@dataclass(frozen=True)
+class ValidatedImageDescriptor:
+    data: bytes
+    data_uri: str
+    source_bytes: int
+    decoded_peak_bytes: int
+    width: int
+    height: int
+
+    @property
+    def pixels(self) -> int:
+        return self.width * self.height
 
 
 def _is_pil_image(value: object) -> bool:
@@ -76,32 +126,37 @@ def _parse_descriptor(raw: str) -> tuple[str, str]:
     return kind, payload
 
 
-def _data_uri_bytes(uri: str) -> bytes:
+def _decode_data_uri(uri: str) -> tuple[bytes, str]:
     comma = uri.find(",")
-    if comma < 0:
-        raise ValueError("image data URI must use an image media type")
-    header = uri[:comma]
+    header = uri if comma < 0 else uri[:comma]
     if len(header.encode("utf-8")) > MAX_DATA_URI_HEADER_BYTES:
         raise ValueError(
             f"image data URI header exceeds the {MAX_DATA_URI_HEADER_BYTES}-byte limit"
         )
-    if not header.lower().startswith("data:image/"):
-        raise ValueError("image data URI must use an image media type")
-    payload = uri[comma + 1 :]
+    match = _DATA_URI_RE.fullmatch(uri)
+    if match is None:
+        if not uri.startswith("data:"):
+            raise ValueError("image source must use a data URI")
+        if ";base64," not in uri:
+            raise ValueError("image data URI must use base64 encoding")
+        raise ValueError("image data URI must use the exact data:image/...;base64,... format")
+    mime, payload = match.groups()
+    expected_format = _MIME_TO_FORMAT.get(mime)
+    if expected_format is None:
+        raise ValueError(f"image data URI uses unsupported MIME type {mime!r}")
+    max_encoded_size = ((MAX_IMAGE_SOURCE_BYTES + 2) // 3) * 4
+    if len(payload) > max_encoded_size:
+        _check_source_size(MAX_IMAGE_SOURCE_BYTES + 1)
     try:
-        if ";base64" in header.lower():
-            max_encoded_size = ((MAX_IMAGE_SOURCE_BYTES + 2) // 3) * 4
-            if len(payload) > max_encoded_size:
-                _check_source_size(MAX_IMAGE_SOURCE_BYTES + 1)
-            data = base64.b64decode(payload, validate=True)
-        else:
-            if len(payload) > MAX_IMAGE_SOURCE_BYTES * 3:
-                _check_source_size(MAX_IMAGE_SOURCE_BYTES + 1)
-            data = urllib.parse.unquote_to_bytes(payload)
-    except binascii.Error as exc:
-        raise ValueError("malformed image data URI") from exc
+        data = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("image data URI contains invalid base64 data") from exc
     _check_source_size(len(data))
-    return data
+    return data, expected_format
+
+
+def _data_uri_bytes(uri: str) -> bytes:
+    return _decode_data_uri(uri)[0]
 
 
 def _check_source_size(size: int) -> None:
@@ -138,29 +193,65 @@ def _validate_dimensions(width: int, height: int) -> int:
     pixels = width * height
     if pixels > MAX_IMAGE_PIXELS:
         raise ValueError(f"image has {pixels} pixels, exceeding the {MAX_IMAGE_PIXELS}-pixel limit")
-    return pixels * 3
+    return pixels
 
 
-def inspect_image_bytes(data: bytes) -> tuple[int, int, int]:
-    """Validate one image's header and return its (decoded_rgb_bytes, width, height).
+def _decoded_peak_bytes(mode: str, pixels: int) -> int:
+    return pixels * (_MODE_BYTES_PER_PIXEL.get(mode, 4) + 2 * _RGB_BYTES_PER_PIXEL)
 
-    Reads the header only: the pixels are not decoded here.
-    """
+
+def _oriented_dimensions(image: Any, width: int, height: int) -> tuple[int, int]:
+    try:
+        orientation = image.getexif().get(_EXIF_ORIENTATION_TAG)
+    except (AttributeError, TypeError, ValueError, SyntaxError):
+        orientation = None
+    if orientation in _EXIF_TRANSPOSED_ORIENTATIONS:
+        return height, width
+    return width, height
+
+
+def _inspect_image_metadata(
+    data: bytes, *, expected_format: str | None = None
+) -> tuple[int, int, int, str]:
     try:
         from PIL import Image
     except ImportError as exc:
         raise RuntimeError("Pillow is required for multimodal image training") from exc
     try:
-        with Image.open(io.BytesIO(data)) as image:
-            return (
-                _validate_dimensions(image.width, image.height),
-                image.width,
-                image.height,
-            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                image_format = str(image.format or "").upper()
+                if image_format not in _FORMAT_TO_MIME:
+                    raise ValueError("image source must be a static PNG, JPEG, or WebP image")
+                if expected_format is not None and image_format != expected_format:
+                    raise ValueError(
+                        f"image data URI MIME type does not match its {image_format} format"
+                    )
+                if getattr(image, "n_frames", 1) != 1:
+                    raise ValueError("image source must be a static single-frame image")
+                stored_width, stored_height = image.size
+                pixels = _validate_dimensions(stored_width, stored_height)
+                decoded_peak_bytes = _decoded_peak_bytes(image.mode, pixels)
+                image.verify()
+            with Image.open(io.BytesIO(data)) as orientation_probe:
+                width, height = _oriented_dimensions(
+                    orientation_probe,
+                    stored_width,
+                    stored_height,
+                )
+                _validate_dimensions(width, height)
+            return decoded_peak_bytes, width, height, image_format
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError("image source is not a valid image") from exc
+
+
+def inspect_image_bytes(data: bytes) -> tuple[int, int, int]:
+    """Validate one image and return its (decoded_peak_bytes, width, height)."""
+    decoded_peak_bytes, width, height, _image_format = _inspect_image_metadata(data)
+    return decoded_peak_bytes, width, height
 
 
 def _inspect_image_bytes(data: bytes) -> int:
@@ -176,6 +267,13 @@ def _pil_descriptor(image: object) -> str:
     data = out.getvalue()
     _check_source_size(len(data))
     return _descriptor("bytes", base64.b64encode(data).decode("ascii"))
+
+
+def _canonical_data_uri(data: bytes, image_format: str) -> str:
+    media_type = _FORMAT_TO_MIME.get(image_format)
+    if media_type is None:
+        raise ValueError("image source must be a static PNG, JPEG, or WebP image")
+    return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def normalize_image_source(
@@ -196,21 +294,23 @@ def normalize_image_source(
         source = bytes(source)
     if isinstance(source, bytes):
         _check_source_size(len(source))
+        descriptor = _descriptor("bytes", base64.b64encode(source).decode("ascii"))
         if not defer_validation:
-            _inspect_image_bytes(source)
-        return _descriptor("bytes", base64.b64encode(source).decode("ascii"))
+            validate_image_descriptor_data(descriptor, source)
+        return descriptor
     if _is_pil_image(source):
         return _pil_descriptor(source)
     if not isinstance(source, str) or not source.strip():
-        raise ValueError("image source must be a data URI, bytes, PIL image, relative path, or URL")
-    value = source.strip()
-    parsed = urllib.parse.urlparse(value)
-    scheme = parsed.scheme.lower()
-    if scheme == "data":
-        data = _data_uri_bytes(value)
+        raise ValueError("image source must be a data URI, bytes, PIL image, or relative path")
+    stripped = source.strip()
+    if stripped.startswith("data:"):
+        data, expected_format = _decode_data_uri(source)
+        descriptor = _descriptor("data_uri", _canonical_data_uri(data, expected_format))
         if not defer_validation:
-            _inspect_image_bytes(data)
-        return _descriptor("data_uri", value)
+            validate_image_descriptor_data(descriptor, data)
+        return descriptor
+    parsed = urllib.parse.urlparse(stripped)
+    scheme = parsed.scheme.lower()
     if scheme in {"http", "https"}:
         # flash never fetches a user-supplied URL server-side. download the image ahead of time
         # and reference it as a relative path in the environment package, or embed it as a data
@@ -223,35 +323,43 @@ def normalize_image_source(
         raise ValueError("file:// image URLs are not supported")
     if scheme:
         raise ValueError(f"unsupported image URL scheme: {scheme}")
-    path = _package_image_path(value, root)
+    path = _package_image_path(stripped, root)
     descriptor = _descriptor("path", path.relative_to(root.resolve()).as_posix())
     if not defer_validation:
-        _inspect_image_bytes(path.read_bytes())
+        validate_image_descriptor_data(descriptor, path.read_bytes())
     return descriptor
+
+
+def _validate_image_detail(value: object, block_type: str) -> None:
+    if value is not None and value not in _IMAGE_DETAIL_VALUES:
+        raise ValueError(f"malformed {block_type} block: detail must be 'auto', 'low', or 'high'")
 
 
 def _image_source_from_block(block: dict) -> object | None:
     block_type = block.get("type")
-    if block_type == "image":
-        value = next(
-            (block[key] for key in ("image", "source", "image_url", "url") if key in block),
-            None,
-        )
-    elif block_type == "image_url":
-        value = block.get("image_url", block.get("url"))
-    elif block_type == "input_image":
-        value = block.get("image_url", block.get("image", block.get("url")))
-    else:
+    source_keys = {
+        "image_url": ("image_url",),
+        "input_image": ("image_url", "input_image", "image", "url"),
+        # source is a package-local authoring form retained for existing environments.
+        "image": ("image", "image_url", "url", "source"),
+    }.get(block_type)
+    if source_keys is None:
         return None
+    _validate_image_detail(block.get("detail"), str(block_type))
+    candidates = [block[key] for key in source_keys if key in block and block[key] is not None]
+    if not candidates and block_type == "image":
+        return None
+    if len(candidates) != 1:
+        raise ValueError(f"malformed {block_type} block: expected exactly one image source")
+    value = candidates[0]
     if isinstance(value, dict):
         extra = set(value) - {"url", "detail"}
-        if extra or "url" not in value:
+        if extra or "url" not in value or not isinstance(value["url"], str):
             raise ValueError(
                 f"malformed {block_type} block: expected image URL object with a url field"
             )
+        _validate_image_detail(value.get("detail"), str(block_type))
         value = value["url"]
-    if value is None and block_type != "image":
-        raise ValueError(f"malformed {block_type} block: missing image source")
     return value
 
 
@@ -284,13 +392,24 @@ def record_has_images(record: dict, messages: list[dict] | None = None) -> bool:
 
 
 def content_has_images(content: object) -> bool:
-    """Whether one message's ``content`` carries an image block.
-
-    The single definition of "this message shows the model an image", so a path that cannot carry
-    media (the multi-turn GRPO bridge) recognises exactly what the paths that can do.
-    """
+    """Whether one message's ``content`` carries a prompt image block."""
     return isinstance(content, list) and any(
         isinstance(block, dict) and block.get("type") in _IMAGE_BLOCK_TYPES for block in content
+    )
+
+
+def completion_has_images(messages: object) -> bool:
+    """Whether an sft completion contains any sdk input or output image block spelling."""
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(message, dict)
+        and isinstance(message.get("content"), list)
+        and any(
+            isinstance(block, dict) and block.get("type") in _IMAGE_TARGET_BLOCK_TYPES
+            for block in message["content"]
+        )
+        for message in messages
     )
 
 
@@ -305,7 +424,7 @@ def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
                 block["text"]
                 for block in content
                 if isinstance(block, dict)
-                and block.get("type") == "text"
+                and block.get("type") in _TEXT_BLOCK_TYPES
                 and isinstance(block.get("text"), str)
             )
         stripped.append(copied)
@@ -365,7 +484,7 @@ def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -
                         "expected an object"
                     )
                 block_type = block.get("type")
-                if block_type == "text" and isinstance(block.get("text"), str):
+                if block_type in _TEXT_BLOCK_TYPES and isinstance(block.get("text"), str):
                     _reject_literal_image_placeholder(block["text"], message_index)
                     text_run.append(block["text"])
                     parts.append(block["text"])
@@ -394,6 +513,14 @@ def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -
             f"{descriptor_count} normalized image descriptor(s)"
         )
     return rendered
+
+
+def _canonical_message_role(role: object, message_index: int) -> str:
+    if role == "developer":
+        return "system"
+    if role not in _ALLOWED_MESSAGE_ROLES:
+        raise ValueError(f"message {message_index} role must be system, user, assistant, or tool")
+    return str(role)
 
 
 def normalize_prompt_images(
@@ -426,7 +553,9 @@ def normalize_prompt_images(
         descriptor = normalize_image_source(
             source,
             package_root,
-            defer_validation=defer_validation,
+            # the finished descriptor list is validated once below so aggregate limits and
+            # mime/format agreement are checked over the exact cumulative image set.
+            defer_validation=True,
         )
         descriptor_bytes += _descriptor_size(descriptor)
         if descriptor_bytes > MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES:
@@ -447,7 +576,9 @@ def normalize_prompt_images(
     saw_image_block = False
     for message_index, message in enumerate(messages):
         copied = dict(message)
-        if str(copied.get("role") or "").lower() == "user" and first_user is None:
+        role = _canonical_message_role(copied.get("role"), message_index)
+        copied["role"] = role
+        if role == "user" and first_user is None:
             first_user = message_index
         content = copied.get("content")
         if isinstance(content, str):
@@ -469,7 +600,7 @@ def normalize_prompt_images(
                     f"malformed content block at message {message_index}, index {block_index}: expected an object"
                 )
             block_type = block.get("type")
-            if block_type == "text":
+            if block_type in _TEXT_BLOCK_TYPES:
                 if not isinstance(block.get("text"), str):
                     raise ValueError(
                         f"malformed text block at message {message_index}, index {block_index}: missing text"
@@ -480,6 +611,8 @@ def normalize_prompt_images(
                 raise ValueError(
                     f"unsupported content block type {block_type!r} at message {message_index}, index {block_index}"
                 )
+            if role != "user":
+                raise ValueError("image blocks are allowed only in user messages")
             saw_image_block = True
             source = _image_source_from_block(block)
             if source is None:
@@ -528,6 +661,8 @@ def normalize_prompt_images(
             _reject_literal_image_placeholder("".join(text_run), message_index, (IMAGE_PAD_TOKEN,))
             text_run = []
         _reject_literal_image_placeholder("".join(text_run), message_index, (IMAGE_PAD_TOKEN,))
+    if not defer_validation:
+        validate_image_descriptors(descriptors, package_root)
     return NormalizedImages(normalized, descriptors)
 
 
@@ -562,59 +697,117 @@ def read_descriptor_source(descriptor: str, package_root: str | Path | None) -> 
     return data
 
 
-def _base64_image_data_uri(data: bytes) -> tuple[str, int]:
-    try:
-        from PIL import Image
-    except ImportError as exc:
-        raise RuntimeError("Pillow is required for multimodal image training") from exc
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            decoded_bytes = _validate_dimensions(image.width, image.height)
-            media_type = Image.MIME.get(str(image.format or "").upper())
-            if not media_type:
-                media_type = image.get_format_mimetype()
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError("image source is not a valid image") from exc
-    if not isinstance(media_type, str) or not media_type.startswith("image/"):
-        raise ValueError("image source has an unsupported media type")
-    encoded = base64.b64encode(data).decode("ascii")
-    return f"data:{media_type};base64,{encoded}", decoded_bytes
+def validate_image_descriptor_data(
+    descriptor: str, data: bytes, *, decode_pixels: bool = True
+) -> ValidatedImageDescriptor:
+    """Validate bytes already read from one normalized descriptor."""
+    kind, value = _parse_descriptor(descriptor)
+    expected_format = _decode_data_uri(value)[1] if kind == "data_uri" else None
+    decoded_peak_bytes, width, height, image_format = _inspect_image_metadata(
+        data,
+        expected_format=expected_format,
+    )
+    if decode_pixels:
+        decode_descriptor_pixels(data)
+    return ValidatedImageDescriptor(
+        data=data,
+        data_uri=_canonical_data_uri(data, image_format),
+        source_bytes=len(data),
+        decoded_peak_bytes=decoded_peak_bytes,
+        width=width,
+        height=height,
+    )
 
 
-def image_descriptors_to_data_uris(
+def validate_image_descriptor(
+    descriptor: str,
+    package_root: str | Path | None,
+    *,
+    decode_pixels: bool = True,
+) -> ValidatedImageDescriptor:
+    """Validate one normalized descriptor and return its canonical data URI metadata."""
+    data = read_descriptor_source(descriptor, package_root)
+    return validate_image_descriptor_data(descriptor, data, decode_pixels=decode_pixels)
+
+
+def validate_image_descriptors(
     descriptors: list[str] | tuple[str, ...], package_root: str | Path | None
-) -> list[str]:
-    """Convert normalized descriptors to image data URIs under existing aggregate limits."""
+) -> list[ValidatedImageDescriptor]:
+    """Validate one cumulative descriptor set under the shared image admission limits."""
     if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
         raise ValueError(
             f"example contains {len(descriptors)} images, exceeding the "
             f"{MAX_IMAGES_PER_EXAMPLE}-image limit"
         )
-    uris: list[str] = []
+    validated: list[ValidatedImageDescriptor] = []
     source_bytes = 0
-    decoded_bytes = 0
+    prior_pixels = 0
     for descriptor in descriptors:
-        data = read_descriptor_source(descriptor, package_root)
-        source_bytes += len(data)
+        item = validate_image_descriptor(descriptor, package_root, decode_pixels=False)
+        source_bytes += item.source_bytes
         if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError(
                 f"example image sources exceed the {MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit"
             )
-        uri, image_decoded_bytes = _base64_image_data_uri(data)
-        decoded_bytes += image_decoded_bytes
+        if prior_pixels + item.pixels > MAX_TOTAL_IMAGE_PIXELS:
+            raise ValueError(
+                f"example images exceed the {MAX_TOTAL_IMAGE_PIXELS}-pixel total limit"
+            )
+        decoded_bytes = _RGB_BYTES_PER_PIXEL * prior_pixels + item.decoded_peak_bytes
         if decoded_bytes > MAX_TOTAL_DECODED_BYTES:
             raise ValueError(
                 f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
             )
-        uris.append(uri)
-    return uris
+        prior_pixels += item.pixels
+        validated.append(item)
+    for item in validated:
+        decode_descriptor_pixels(item.data)
+    return validated
+
+
+def image_descriptors_to_data_uris(
+    descriptors: list[str] | tuple[str, ...], package_root: str | Path | None
+) -> list[str]:
+    """Convert normalized descriptors to canonical data URIs under aggregate limits."""
+    return [item.data_uri for item in validate_image_descriptors(descriptors, package_root)]
+
+
+def messages_with_image_data_uris(
+    messages: list[dict],
+    descriptors: list[str] | tuple[str, ...],
+    package_root: str | Path | None,
+) -> list[dict]:
+    """Bind descriptors to normalized image blocks as canonical data-URI image_url blocks."""
+    uri_iter = iter(image_descriptors_to_data_uris(descriptors, package_root))
+    prepared: list[dict] = []
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                copied_block = dict(block)
+                if copied_block.get("type") == "image":
+                    try:
+                        uri = next(uri_iter)
+                    except StopIteration as exc:
+                        raise ValueError(
+                            "normalized messages contain more image blocks than descriptors"
+                        ) from exc
+                    copied_block = {"type": "image_url", "image_url": {"url": uri}}
+                blocks.append(copied_block)
+            copied["content"] = blocks
+        prepared.append(copied)
+    try:
+        next(uri_iter)
+    except StopIteration:
+        return prepared
+    raise ValueError("normalized image descriptors contain no matching image block")
 
 
 def _decode_image_bytes(data: bytes):
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
     except ImportError as exc:
         raise RuntimeError("Pillow is required for multimodal image training") from exc
     converted = None
@@ -622,6 +815,8 @@ def _decode_image_bytes(data: bytes):
         with Image.open(io.BytesIO(data)) as image:
             _validate_dimensions(image.width, image.height)
             image.load()
+            ImageOps.exif_transpose(image, in_place=True)
+            _validate_dimensions(image.width, image.height)
             converted = image.convert("RGB")
             converted.load()
             return converted
@@ -680,22 +875,8 @@ def decode_image_descriptors(
         raise ValueError(
             f"example contains {len(descriptors)} images, exceeding the {MAX_IMAGES_PER_EXAMPLE}-image limit"
         )
-    prepared: list[bytes] = []
-    source_bytes = 0
-    decoded_bytes = 0
-    for descriptor in descriptors:
-        data = read_descriptor_source(descriptor, package_root)
-        source_bytes += len(data)
-        if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
-            raise ValueError(
-                f"example image sources exceed the {MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit"
-            )
-        decoded_bytes += _inspect_image_bytes(data)
-        if decoded_bytes > MAX_TOTAL_DECODED_BYTES:
-            raise ValueError(
-                f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
-            )
-        prepared.append(data)
+    validated = validate_image_descriptors(descriptors, package_root)
+    prepared = [item.data for item in validated]
     images: list[Any] = []
     try:
         images.extend(_decode_image_bytes(data) for data in prepared)
@@ -756,6 +937,18 @@ def validate_multimodal_training(model_id: str, algorithm: str, teacher_model: s
             )
 
 
+def validate_image_observation_environment(env: object, spec: object) -> None:
+    """Require image-capable training inputs for an env that can emit image observations."""
+    if not bool(getattr(env, "image_observations", False)):
+        return
+    train = getattr(spec, "train", None)
+    validate_multimodal_training(
+        str(getattr(spec, "model", "")),
+        str(getattr(spec, "algorithm", "")),
+        getattr(train, "teacher_model", None),
+    )
+
+
 def message_content_text(content: object) -> str:
     """The text of one message's ``content``: the string itself, or its openai-style text blocks.
 
@@ -769,7 +962,7 @@ def message_content_text(content: object) -> str:
         return "".join(
             str(block.get("text") or "")
             for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
+            if isinstance(block, dict) and block.get("type") in _TEXT_BLOCK_TYPES
         )
     return ""
 
