@@ -25,6 +25,8 @@ from flash.serve.runtime.prompt import PromptPreparer, resolve_thinking
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}}
+MODEL_REVISION = "a" * 40
+TOKENIZER_REVISION = "b" * 40
 
 
 def test_runtime_imports_without_heavy_serving_packages() -> None:
@@ -68,8 +70,105 @@ def test_engine_config_rejects_runtime_owned_engine_args() -> None:
         EngineConfig(model="model", engine_args={"model": "other"})
     with pytest.raises(RuntimeConfigurationError, match="max_cpu_loras"):
         EngineConfig(model="model", max_loras=4, max_cpu_loras=2)
-    with pytest.raises(RuntimeConfigurationError, match="runtime-owned"):
-        EngineConfig(model="model", tokenizer_kwargs={"token": "other"})
+    for kwargs_name in ("tokenizer_kwargs", "processor_kwargs"):
+        with pytest.raises(RuntimeConfigurationError, match="runtime-owned"):
+            EngineConfig(model="model", **{kwargs_name: {"token": "other"}})
+
+
+def test_engine_config_uses_first_class_exact_revisions() -> None:
+    legacy_positional = EngineConfig("model", "served/model", "tokenizer/model")
+    assert legacy_positional.model_revision is None
+    assert legacy_positional.tokenizer_revision is None
+    assert legacy_positional.effective_served_model == "served/model"
+    assert legacy_positional.effective_tokenizer_model == "tokenizer/model"
+
+    pinned = EngineConfig(
+        model="model",
+        model_revision=MODEL_REVISION,
+        tokenizer_revision=TOKENIZER_REVISION,
+    )
+    assert pinned.model_revision == MODEL_REVISION
+    assert pinned.tokenizer_revision == TOKENIZER_REVISION
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"engine_args": {"revision": MODEL_REVISION}},
+        {"engine_args": {"tokenizer_revision": TOKENIZER_REVISION}},
+        {"tokenizer_kwargs": {"revision": TOKENIZER_REVISION}},
+        {"processor_kwargs": {"revision": TOKENIZER_REVISION}},
+    ],
+)
+def test_engine_config_rejects_revision_keys_in_arbitrary_mappings(kwargs) -> None:
+    with pytest.raises(RuntimeConfigurationError, match=r"runtime-owned.*revision"):
+        EngineConfig(model="model", **kwargs)
+
+
+def test_engine_config_recursively_detaches_and_freezes_runtime_mappings() -> None:
+    engine_nested = {"mapping": {"value": 1}, "list": [2]}
+    tokenizer_nested = {"mapping": {"value": 3}, "tuple": (4,)}
+    processor_nested = {"set": {5}, "frozenset": frozenset({6})}
+    config = EngineConfig(
+        model="model",
+        engine_args={"nested": engine_nested},
+        tokenizer_kwargs={"nested": tokenizer_nested},
+        processor_kwargs={"nested": processor_nested},
+    )
+
+    engine_nested["mapping"]["value"] = 10
+    engine_nested["list"].append(20)
+    tokenizer_nested["mapping"]["value"] = 30
+    processor_nested["set"].add(50)
+    assert config.engine_args["nested"]["mapping"]["value"] == 1
+    assert tuple(config.engine_args["nested"]["list"]) == (2,)
+    assert config.tokenizer_kwargs["nested"]["mapping"]["value"] == 3
+    assert config.processor_kwargs["nested"]["set"] == frozenset({5})
+
+    for mapping in (config.engine_args, config.tokenizer_kwargs, config.processor_kwargs):
+        with pytest.raises(TypeError):
+            mapping["new"] = True
+        with pytest.raises(TypeError):
+            mapping["nested"]["new"] = True
+    with pytest.raises(AttributeError):
+        config.engine_args["nested"]["list"].append(3)
+    with pytest.raises(AttributeError):
+        config.processor_kwargs["nested"]["set"].add(7)
+    frozen_sets = (
+        config.processor_kwargs["nested"]["set"],
+        config.processor_kwargs["nested"]["frozenset"],
+    )
+    for frozen in frozen_sets:
+        assert not hasattr(frozen, "__dict__")
+        with pytest.raises(AttributeError):
+            object.__setattr__(frozen, "writable_state", True)
+
+
+def test_engine_config_rejects_recursive_and_mutable_runtime_values() -> None:
+    recursive: dict[str, object] = {}
+    recursive["self"] = recursive
+    with pytest.raises(RuntimeConfigurationError, match="recursive containers"):
+        EngineConfig(model="model", engine_args=recursive)
+
+    class CopyableMutableLeaf:
+        def __deepcopy__(self, _memo):
+            return CopyableMutableLeaf()
+
+    mutable_values = (bytearray(b"mutable"), CopyableMutableLeaf())
+    for field_name in ("engine_args", "tokenizer_kwargs", "processor_kwargs"):
+        for value in mutable_values:
+            with pytest.raises(RuntimeConfigurationError, match="immutable scalar"):
+                EngineConfig(model="model", **{field_name: {"value": value}})
+
+
+@pytest.mark.parametrize(
+    "revision",
+    ["main", "release", "A" * 40, "a" * 39, "a" * 41, " " + "a" * 40, "a" * 40 + " "],
+)
+def test_engine_config_rejects_mutable_or_noncanonical_revisions(revision: str) -> None:
+    for field_name in ("model_revision", "tokenizer_revision"):
+        with pytest.raises(RuntimeConfigurationError, match="40-character lowercase hex"):
+            EngineConfig(model="model", **{field_name: revision})
 
 
 @pytest.mark.parametrize(

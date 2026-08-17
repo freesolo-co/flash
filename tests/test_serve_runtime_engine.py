@@ -25,6 +25,8 @@ from flash.serve.runtime import (
 )
 
 SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}}
+MODEL_REVISION = "a" * 40
+TOKENIZER_REVISION = "b" * 40
 
 
 class _Tokenizer:
@@ -70,7 +72,9 @@ class _Processor:
 @dataclass
 class _AsyncEngineArgs:
     model: str = ""
+    revision: str | None = None
     tokenizer: str = ""
+    tokenizer_revision: str | None = None
     trust_remote_code: bool = False
     enable_lora: bool = False
     max_loras: int = 0
@@ -84,6 +88,7 @@ class _AsyncEngineArgs:
     quantization: str | None = None
     kv_cache_dtype: str | None = None
     max_model_len: int | None = None
+    nested: Any = None
 
 
 class _LoRARequest:
@@ -238,6 +243,8 @@ def test_exact_engine_args_and_processor_construction() -> None:
             served_model="served/model",
             tokenizer_model="tokenizer/model",
             hf_token="secret",
+            model_revision=MODEL_REVISION,
+            tokenizer_revision=TOKENIZER_REVISION,
             trust_remote_code=True,
             max_loras=6,
             max_lora_rank=128,
@@ -250,14 +257,15 @@ def test_exact_engine_args_and_processor_construction() -> None:
                 "kv_cache_dtype": "fp8",
                 "max_model_len": 32768,
             },
-            processor_kwargs={"revision": "processor-sha"},
         )
     )
     asyncio.run(runtime.start())
 
     assert _Engine.args == _AsyncEngineArgs(
         model="served/model",
+        revision=MODEL_REVISION,
         tokenizer="tokenizer/model",
+        tokenizer_revision=TOKENIZER_REVISION,
         trust_remote_code=True,
         enable_lora=True,
         max_loras=6,
@@ -278,13 +286,94 @@ def test_exact_engine_args_and_processor_construction() -> None:
             {
                 "token": "secret",
                 "trust_remote_code": True,
-                "revision": "processor-sha",
+                "revision": TOKENIZER_REVISION,
             },
         )
     ]
     assert _Tokenizer.calls == []
     assert runtime.health().served_model == "served/model"
     asyncio.run(runtime.close())
+
+
+def test_text_tokenizer_receives_exact_revision() -> None:
+    runtime = VllmLoraRuntime(
+        EngineConfig(
+            model="served/model",
+            model_revision=MODEL_REVISION,
+            tokenizer_revision=TOKENIZER_REVISION,
+            tokenizer_kwargs={"use_fast": True},
+        )
+    )
+    asyncio.run(runtime.start())
+
+    assert _Tokenizer.calls == [
+        (
+            "served/model",
+            {
+                "token": None,
+                "trust_remote_code": False,
+                "revision": TOKENIZER_REVISION,
+                "use_fast": True,
+            },
+        )
+    ]
+    assert _Processor.calls == []
+    assert _Engine.args is not None
+    assert _Engine.args.revision == MODEL_REVISION
+    assert _Engine.args.tokenizer_revision == TOKENIZER_REVISION
+    asyncio.run(runtime.close())
+
+
+def test_runtime_mappings_thaw_to_detached_shape_preserving_builtin_containers() -> None:
+    nested = {
+        "mapping": {"value": 1},
+        "list": [2],
+        "tuple": (3,),
+        "set": {4},
+        "frozenset": frozenset({5}),
+    }
+    text_runtime = VllmLoraRuntime(
+        EngineConfig(
+            model="model",
+            engine_args={"nested": nested},
+            tokenizer_kwargs={"nested": nested},
+        )
+    )
+    asyncio.run(text_runtime.start())
+
+    assert _Engine.args is not None
+    engine_nested = _Engine.args.nested
+    tokenizer_nested = _Tokenizer.calls[0][1]["nested"]
+    for thawed in (engine_nested, tokenizer_nested):
+        assert type(thawed) is dict
+        assert type(thawed["mapping"]) is dict
+        assert type(thawed["list"]) is list
+        assert type(thawed["tuple"]) is tuple
+        assert type(thawed["set"]) is set
+        assert type(thawed["frozenset"]) is frozenset
+    engine_nested["mapping"]["value"] = 10
+    engine_nested["list"].append(20)
+    assert text_runtime.config.engine_args["nested"]["mapping"]["value"] == 1
+    assert tuple(text_runtime.config.engine_args["nested"]["list"]) == (2,)
+    asyncio.run(text_runtime.close())
+
+    image_runtime = VllmLoraRuntime(
+        EngineConfig(
+            model="model",
+            image_limit=1,
+            processor_kwargs={"nested": nested},
+        )
+    )
+    asyncio.run(image_runtime.start())
+    processor_nested = _Processor.calls[0][1]["nested"]
+    assert type(processor_nested) is dict
+    assert type(processor_nested["list"]) is list
+    assert type(processor_nested["tuple"]) is tuple
+    assert type(processor_nested["set"]) is set
+    assert type(processor_nested["frozenset"]) is frozenset
+    processor_nested["set"].add(40)
+    assert image_runtime.config.processor_kwargs["nested"]["set"] == frozenset({4})
+    asyncio.run(image_runtime.close())
 
 
 def test_nonstream_generation_binds_thinking_structured_outputs_and_accounting(

@@ -26,6 +26,7 @@ from .types import (
     StreamEvent,
     StreamFinished,
     StreamReady,
+    thaw_mapping,
 )
 
 EngineDeathCallback = Callable[[RuntimeHealth], Awaitable[None] | None]
@@ -352,11 +353,13 @@ class VllmLoraRuntime:
         from transformers import AutoProcessor, AutoTokenizer
 
         common = {"token": self.config.hf_token, "trust_remote_code": self.config.trust_remote_code}
+        if self.config.tokenizer_revision is not None:
+            common["revision"] = self.config.tokenizer_revision
         if self.config.image_limit is not None:
             processor = AutoProcessor.from_pretrained(
                 self.config.effective_tokenizer_model,
                 **common,
-                **self.config.processor_kwargs,
+                **thaw_mapping(self.config.processor_kwargs, "processor_kwargs"),
             )
             tokenizer = getattr(processor, "tokenizer", None)
             if tokenizer is None:
@@ -366,7 +369,7 @@ class VllmLoraRuntime:
             tokenizer = AutoTokenizer.from_pretrained(
                 self.config.effective_tokenizer_model,
                 **common,
-                **self.config.tokenizer_kwargs,
+                **thaw_mapping(self.config.tokenizer_kwargs, "tokenizer_kwargs"),
             )
         if (
             getattr(tokenizer, "pad_token", None) is None
@@ -392,8 +395,12 @@ class VllmLoraRuntime:
             "max_loras": self.config.max_loras,
             "max_lora_rank": self.config.max_lora_rank,
             "max_cpu_loras": self.config.max_cpu_loras,
-            **self.config.engine_args,
+            **thaw_mapping(self.config.engine_args, "engine_args"),
         }
+        if self.config.model_revision is not None:
+            kwargs["revision"] = self.config.model_revision
+        if self.config.tokenizer_revision is not None:
+            kwargs["tokenizer_revision"] = self.config.tokenizer_revision
         if self.config.reasoning_parser is not None:
             kwargs["reasoning_parser"] = self.config.reasoning_parser
         if self.config.image_limit is not None:

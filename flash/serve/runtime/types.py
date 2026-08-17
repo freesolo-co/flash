@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal
 
 from .errors import RuntimeConfigurationError
 from .structured_outputs import normalize_structured_outputs
 
-_RESERVED_MODEL_LOAD_KWARGS = frozenset({"token", "trust_remote_code"})
+_REVISION_RE = re.compile(r"[0-9a-f]{40}")
+_RESERVED_MODEL_LOAD_KWARGS = frozenset({"revision", "token", "trust_remote_code"})
 _RESERVED_ENGINE_ARGS = frozenset(
     {
         "model",
+        "revision",
         "tokenizer",
+        "tokenizer_revision",
         "trust_remote_code",
         "enable_lora",
         "max_loras",
@@ -26,6 +31,76 @@ _RESERVED_ENGINE_ARGS = frozenset(
         "enable_tower_connector_lora",
     }
 )
+
+
+class _FrozenList(tuple):
+    __slots__ = ()
+
+
+class _FrozenTuple(tuple):
+    __slots__ = ()
+
+
+class _FrozenSet(frozenset):
+    __slots__ = ()
+
+
+class _FrozenFrozenSet(frozenset):
+    __slots__ = ()
+
+
+def _freeze_value(value: Any, name: str, active: set[int]) -> Any:
+    if isinstance(value, Mapping | list | tuple | set | frozenset):
+        identity = id(value)
+        if identity in active:
+            raise RuntimeConfigurationError(f"{name} must not contain recursive containers")
+        active.add(identity)
+        try:
+            if isinstance(value, Mapping):
+                frozen: dict[str, Any] = {}
+                for key, nested in value.items():
+                    if type(key) is not str:
+                        raise RuntimeConfigurationError(f"{name} keys must be strings")
+                    frozen[key] = _freeze_value(nested, name, active)
+                return MappingProxyType(frozen)
+            if isinstance(value, list):
+                return _FrozenList(_freeze_value(nested, name, active) for nested in value)
+            if isinstance(value, tuple):
+                return _FrozenTuple(_freeze_value(nested, name, active) for nested in value)
+            if isinstance(value, set):
+                return _FrozenSet(_freeze_value(nested, name, active) for nested in value)
+            return _FrozenFrozenSet(_freeze_value(nested, name, active) for nested in value)
+        finally:
+            active.remove(identity)
+    if type(value) in {bool, float, int, str, type(None)}:
+        return value
+    raise RuntimeConfigurationError(
+        f"{name} values must use immutable scalar or supported built-in container types"
+    )
+
+
+def _thaw_value(value: Any, name: str) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_value(nested, name) for key, nested in value.items()}
+    if isinstance(value, _FrozenList):
+        return [_thaw_value(nested, name) for nested in value]
+    if isinstance(value, _FrozenTuple):
+        return tuple(_thaw_value(nested, name) for nested in value)
+    if isinstance(value, _FrozenSet):
+        return {_thaw_value(nested, name) for nested in value}
+    if isinstance(value, _FrozenFrozenSet):
+        return frozenset(_thaw_value(nested, name) for nested in value)
+    if type(value) in {bool, float, int, str, type(None)}:
+        return value
+    raise RuntimeConfigurationError(
+        f"{name} values must use immutable scalar or supported built-in container types"
+    )
+
+
+def thaw_mapping(value: Mapping[str, Any], name: str) -> dict[str, Any]:
+    """return a detached mutable copy for one third-party call boundary."""
+
+    return {key: _thaw_value(nested, name) for key, nested in value.items()}
 
 
 def _nonempty(value: str, name: str) -> str:
@@ -41,6 +116,24 @@ def _mapping_copy(value: Mapping[str, Any], name: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise RuntimeConfigurationError(f"{name} must be a mapping")
     return dict(value)
+
+
+def _frozen_mapping(value: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RuntimeConfigurationError(f"{name} must be a mapping")
+    frozen = _freeze_value(value, name, set())
+    assert isinstance(frozen, MappingProxyType)
+    return frozen
+
+
+def _revision(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str or _REVISION_RE.fullmatch(value) is None:
+        raise RuntimeConfigurationError(
+            f"{name} must be an exact 40-character lowercase hex revision"
+        )
+    return value
 
 
 def _require_bool(value: Any, name: str, *, optional: bool = False) -> bool | None:
@@ -99,6 +192,8 @@ class EngineConfig:
     engine_args: Mapping[str, Any] = field(default_factory=dict)
     tokenizer_kwargs: Mapping[str, Any] = field(default_factory=dict)
     processor_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    model_revision: str | None = None
+    tokenizer_revision: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model", _nonempty(self.model, "model"))
@@ -138,15 +233,26 @@ class EngineConfig:
         if liveness_interval <= 0:
             raise RuntimeConfigurationError("liveness_interval_seconds must be positive")
         object.__setattr__(self, "liveness_interval_seconds", liveness_interval)
-        engine_args = _mapping_copy(self.engine_args, "engine_args")
+
+        object.__setattr__(
+            self,
+            "model_revision",
+            _revision(self.model_revision, "model_revision"),
+        )
+        object.__setattr__(
+            self,
+            "tokenizer_revision",
+            _revision(self.tokenizer_revision, "tokenizer_revision"),
+        )
+
+        engine_args = _frozen_mapping(self.engine_args, "engine_args")
+        tokenizer_kwargs = _frozen_mapping(self.tokenizer_kwargs, "tokenizer_kwargs")
+        processor_kwargs = _frozen_mapping(self.processor_kwargs, "processor_kwargs")
         reserved = sorted(_RESERVED_ENGINE_ARGS & engine_args.keys())
         if reserved:
             raise RuntimeConfigurationError(
                 "engine_args cannot override runtime-owned keys: " + ", ".join(reserved)
             )
-        object.__setattr__(self, "engine_args", engine_args)
-        tokenizer_kwargs = _mapping_copy(self.tokenizer_kwargs, "tokenizer_kwargs")
-        processor_kwargs = _mapping_copy(self.processor_kwargs, "processor_kwargs")
         for name, kwargs in (
             ("tokenizer_kwargs", tokenizer_kwargs),
             ("processor_kwargs", processor_kwargs),
@@ -156,6 +262,7 @@ class EngineConfig:
                 raise RuntimeConfigurationError(
                     f"{name} cannot override runtime-owned keys: " + ", ".join(reserved_load)
                 )
+        object.__setattr__(self, "engine_args", engine_args)
         object.__setattr__(self, "tokenizer_kwargs", tokenizer_kwargs)
         object.__setattr__(self, "processor_kwargs", processor_kwargs)
 
