@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import json
 import os
 import sys
@@ -200,9 +202,22 @@ def install_wandb_link_reporting() -> None:
         if getattr(wandb.init, "_flash_wandb_reporting", False):
             return
         original_init = wandb.init
+        finished_run_ids: set[int] = set()
+
+        def finish_run(run) -> None:
+            run_id = id(run)
+            if run_id in finished_run_ids:
+                return
+            try:
+                run.finish(exit_code=0)
+            except Exception:
+                return
+            finished_run_ids.add(run_id)
 
         def init_reporting(*args, **kwargs):
             run = original_init(*args, **kwargs)
+            with contextlib.suppress(Exception):
+                atexit.register(finish_run, run)
             try:
                 url = getattr(run, "url", None)
                 run_id = getattr(run, "id", None)

@@ -77,8 +77,8 @@ def fetch_records(
 ) -> dict:
     """A project's traces in the requested shape, converted server-side.
 
-    Omitting `api_key` reads the stored credential, which is right for `env_setup`'s call: it holds
-    no snapshot this key has to agree with.
+    Omitting `api_key` reads the stored credential. Callers that already resolved configuration
+    should pass the key from that snapshot so a concurrent login cannot change the request identity.
     """
     key = _require_api_key(api_key or load_credentials()[1])
     return export_trace_records(project_id, key, export_format=export_format)
