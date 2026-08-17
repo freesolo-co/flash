@@ -98,7 +98,7 @@ def build_payload(
     cache_host_mount: str | None = None,
     mode: str | None = None,
     models: list | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> dict:
     """Build the Lambda bootstrap payload (arm='lambda')."""
@@ -111,7 +111,7 @@ def build_payload(
         cache_host_mount=cache_host_mount,
         mode=mode,
         models=models,
-        code_prefix=code_prefix,
+        source_snapshot=source_snapshot,
         deadline_at=deadline_at,
     )
 

@@ -18,8 +18,10 @@ from flash.providers._lifecycle.terminal_artifacts import (
     read_within,
     resolve_terminal_artifacts,
 )
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 IDENTITY = AttemptIdentity(run_id="run-1", attempt=0, launch_floor=100.0)
+SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _marker(**overrides) -> str:
@@ -85,6 +87,18 @@ def test_success_marker_with_metrics_is_success():
     resolution = _resolve(_marker(), json.dumps({"train_tokens": 4096}))
     assert resolution.kind is TerminalKind.SUCCESS
     assert resolution.metrics == {"train_tokens": 4096}
+
+
+def test_success_marker_carries_trusted_source_attestation_into_metrics():
+    from flash.source_snapshot import TERMINAL_ATTESTATION_KEY, source_attestation
+
+    attestation = source_attestation(SOURCE_SNAPSHOT, run_id="run-1", attempt=0)
+    resolution = _resolve(
+        _marker(source_attestation=attestation),
+        json.dumps({"train_tokens": 4096}),
+    )
+    assert resolution.kind is TerminalKind.SUCCESS
+    assert resolution.metrics[TERMINAL_ATTESTATION_KEY] == attestation
 
 
 @pytest.mark.parametrize(

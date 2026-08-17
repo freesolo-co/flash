@@ -81,7 +81,7 @@ class RunpodProvider:
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
-        code_prefix: str | None = None,
+        source_snapshot: dict | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
         from flash.core.spec import require_matching_seed
@@ -93,7 +93,7 @@ class RunpodProvider:
             "on_handle": on_handle,
             "attempt": attempt,
             "on_last_gpu": on_last_gpu,
-            "code_prefix": code_prefix,
+            "source_snapshot": source_snapshot,
             **deadline_kwargs(submit_run, _deadline_at),
         }
         if runtime_secrets:

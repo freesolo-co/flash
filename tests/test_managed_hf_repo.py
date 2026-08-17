@@ -9,7 +9,6 @@ with) cannot create a dataset under a user-chosen namespace like ``freesolo-foun
 from __future__ import annotations
 
 import os
-import re
 import tempfile
 
 from flash.core.spec import JobSpec
@@ -96,7 +95,8 @@ def test_managed_hf_repo_reuses_repo_for_same_environment():
     )
 
 
-def test_flash_code_prefix_is_content_addressed():
-    from flash import runner
+def test_source_archive_path_is_content_addressed():
+    from flash.source_snapshot import canonical_archive_path
 
-    assert re.fullmatch(r"code/[0-9a-f]{32}/flash", runner.flash_code_prefix())
+    digest = "a" * 64
+    assert canonical_archive_path(digest) == f"source/{digest}/flash-source.zip"

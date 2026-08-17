@@ -20,6 +20,9 @@ import pytest
 
 from flash import runner as _orch
 from flash.server.platform import db as _db_mod
+from tests._helpers.source_snapshot import valid_source_snapshot
+
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
@@ -8187,13 +8190,9 @@ def test_deploy_lock_is_usable_and_weakly_cleaned():
     assert "run-xyz" not in dict(app_mod._DEPLOY_LOCKS)
 
 
-def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
-    # A recoverable run with no persisted handle (crash in the submit->on_handle window,
-    # before any worker was provisioned) must NOT be lost on a control-plane restart: its
-    # reconstructable RunPod endpoint is GC'd (so it doesn't hold worker quota), then the run
-    # is RESUBMITTED from scratch — there is no remote work to reattach to, so a fresh job is
-    # the only way to preserve the session.
-    import threading
+def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
+    # a pre-feature run with neither a handle nor persisted source identity cannot be replaced safely.
+    # recovery still reaps possible provider remnants, then fails it without starting another worker.
 
     import flash.runner as runner
     import flash.server.platform.db as db_mod
@@ -8220,16 +8219,8 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-1"}])
     gced = []
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: gced.append(s.run_id))
-    # Capture the resubmit instead of provisioning a real GPU; recover_runs resolves _run_job
-    # via a function-local `from flash.runner import _run_job`, so patching the package attr wins.
     resubmitted = []
-    done = threading.Event()
-
-    def fake_run_job(s):
-        resubmitted.append(s.run_id)
-        done.set()
-
-    monkeypatch.setattr(runner, "_run_job", fake_run_job)
+    monkeypatch.setattr(runner, "_run_job", lambda s: resubmitted.append(s.run_id))
 
     # a handle-less run may have left a phantom instance from a non-idempotent create (Vast PUT
     # /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label across
@@ -8252,14 +8243,16 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
 
     app_mod.recover_runs()
 
-    assert done.wait(timeout=5), "no-handle recovery must launch a resubmit thread"
-    assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint first"
-    assert resubmitted == ["nohandle-1"], "no-handle run must be resubmitted, not failed"
-    assert reaped == ["nohandle-1"], (
-        "must force-reap the run's instance-provider label before resubmit"
+    assert gced == ["nohandle-1"]
+    assert reaped == ["nohandle-1"]
+    assert resubmitted == []
+    recovered = runner.get_status("nohandle-1")
+    assert recovered.state == "failed"
+    assert recovered.error == (
+        "managed source identity is unavailable; descriptor-less attempts cannot be replaced"
     )
-    # The resubmit GC's the orphaned endpoint and re-runs the job; the run is NOT failed.
-    assert runner.get_status("nohandle-1").state != "failed"
+    assert recovered.source_verified_attempt is None
+    assert "source_provenance" not in recovered.to_dict()
 
 
 def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_path):
@@ -8332,6 +8325,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
             state="provisioning",
             spec=spec.to_dict(),
             created_at=created_at,
+            source_snapshot=_SOURCE_SNAPSHOT,
             # run_id is platform-managed and stripped from the public spec; a provisioned run always
             # carries the internal worker-spec carrier, which is where recovery resolves its identity.
             effective_preparation={
@@ -8506,6 +8500,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
             state="queued",  # never provisioned -> no create attempted -> no phantom possible
             spec=spec,
             remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
             submitted_instance_providers=["vast"],  # Vast configured at submit, creds now gone
         )
     )
@@ -8574,6 +8569,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
             state="provisioning",
             spec=spec,
             remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
             submitted_instance_providers=[],  # no instance provider was available at submit
         )
     )
@@ -8625,6 +8621,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
             state="provisioning",
             spec=spec,
             remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
             submitted_instance_providers=[],
         )
     )
@@ -8682,7 +8679,13 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
         "run_id": "retry-1",
     }
     runner._save_status(
-        runner.RunStatus(run_id="retry-1", state="provisioning", spec=spec, remote=None)
+        runner.RunStatus(
+            run_id="retry-1",
+            state="provisioning",
+            spec=spec,
+            remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "retry-1"}])
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
@@ -8743,7 +8746,13 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
         "run_id": "clear-1",
     }
     runner._save_status(
-        runner.RunStatus(run_id="clear-1", state="provisioning", spec=spec, remote=None)
+        runner.RunStatus(
+            run_id="clear-1",
+            state="provisioning",
+            spec=spec,
+            remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "clear-1"}])
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
@@ -8830,6 +8839,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
             state="provisioning",
             spec=public_spec,
             remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
             effective_preparation={
                 "worker_spec": worker_spec,
                 "adapter_identity": identity.to_dict(),
@@ -9009,7 +9019,13 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     with open(runner.runs_file_path("bad-1", ".json"), "w") as file:
         json.dump(bad_raw, file)
     runner._save_status(
-        runner.RunStatus(run_id="good-2", state="provisioning", spec=good_spec, remote=None)
+        runner.RunStatus(
+            run_id="good-2",
+            state="provisioning",
+            spec=good_spec,
+            remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
     )
     # Order matters: the bad run is iterated FIRST, so an unguarded parse would abort here.
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}])

@@ -246,6 +246,8 @@ def _submit_failure_http_error(exc: Exception) -> HTTPException:
     Everything reaching here is a bad request by default. Submit-time errors may opt into 503 with
     a truthy ``plane_fault`` attribute when the submitter cannot fix the failure by changing the spec.
     """
+    if isinstance(exc, _runner.SourceSnapshotPublicationError):
+        return HTTPException(status_code=503, detail=str(exc))
     if (
         isinstance(exc, (ImageGeometryUnavailable, TeacherBrokerConfigurationError))
         and exc.plane_fault
@@ -477,12 +479,13 @@ def run_logs(
                     status_code=400, detail=f"invalid log offset {offset}: {exc}"
                 ) from exc
             end = f.tell()
+    public_status = status.to_dict()
     return {
         "run_id": run_id,
         "logs": chunk,
         "offset": end,
         "state": status.state,
-        "last_heartbeat": status.last_heartbeat,
+        "last_heartbeat": public_status.get("last_heartbeat"),
         "gpu_status": status.gpu_status,
     }
 
