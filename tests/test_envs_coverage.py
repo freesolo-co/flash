@@ -49,6 +49,9 @@ def test_env_setup_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> N
             "name": "Test",
         },
     )
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "key")
+    )
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0
 
@@ -93,6 +96,9 @@ def test_scaffolded_env_scores_through_real_task_example(tmp_path, monkeypatch) 
             "id": "11111111-1111-4111-8111-111111111111",
             "name": "Test",
         },
+    )
+    monkeypatch.setattr(
+        "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "key")
     )
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0
