@@ -290,7 +290,7 @@ class MultiTurnBridge:
         session_id = request_session_id(payload)
         example = self._examples[index]
         identity = (
-            self._identity_ledger.validate_for_index(payload.get("identity"), index)
+            self._identity_ledger.require_registered(payload.get("identity"), index)
             if self._identity_ledger is not None
             else None
         )
@@ -524,6 +524,15 @@ def start_reward_server(
         else None
     )
 
+    def _register_identities(payload: dict) -> dict:
+        if identity_ledger is None:
+            raise RuntimeError("GRPO identity registration is not configured")
+        identities = _request_field(payload, "identities")
+        if not isinstance(identities, list):
+            raise _BadRequest("field 'identities' must be a list")
+        step = identity_ledger.register(identities)
+        return {"optimizer_step": step, "registered": len(identities)}
+
     def _score_route(payload: dict) -> dict:
         index = request_int(payload, "index")
         if index < 0 or index >= example_count:
@@ -536,7 +545,7 @@ def start_reward_server(
         with score_lock:
             return {"score": float(score_by_index(index, solution_str))}
 
-    routes = {"/score": _score_route}
+    routes = {"/identity/register": _register_identities, "/score": _score_route}
     if multi_turn_bridge is not None:
         routes.update(multi_turn_bridge.routes())
 

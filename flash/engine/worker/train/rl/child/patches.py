@@ -10,30 +10,138 @@ _IMAGE_PAD_BAN_MARKER = "[flash-verl] image-pad token banned from rollouts"
 _KL_REF_ADAPTER_MARKER = "[flash-verl] kl reference anchored to the warm-start adapter"
 _EXACT_ROLLOUT_IDENTITY_MARKER = "[flash-verl] exact rollout identity active"
 _PINNED_RUN_AGENT_LOOP_SHA256 = "46f1af635d13854a8955fc44b8595da127997c68e818aaa6d7bf28acc33902cf"
+_PINNED_WORKER_GENERATE_SHA256 = "3b359e9034375860464368b4990e7d2178dde9bbd35d7513652d295820b53f65"
+_PINNED_MANAGER_GENERATE_SHA256 = "3ea1e08ea29b6162d20ea8dd765abcccc233088f1c4b7f7716096c43d0a82ebb"
 
 
-def install_exact_rollout_identity() -> None:
-    """Attach a copied identity at the exact pinned Verl per-occurrence boundary."""
+def _guard_exact_identity_boundary(function, expected_hash, label, snippets) -> None:
     import hashlib
     import inspect
 
-    from verl.experimental.agent_loop import agent_loop
-
-    original = agent_loop.AgentLoopWorker._run_agent_loop
-    if getattr(original, "_flash_exact_rollout_identity", False):
-        return
-    source_hash = hashlib.sha256(inspect.getsource(original).encode()).hexdigest()
-    if source_hash != _PINNED_RUN_AGENT_LOOP_SHA256:
+    source = inspect.getsource(function)
+    source_hash = hashlib.sha256(source.encode()).hexdigest()
+    if source_hash != expected_hash or any(source.count(snippet) != 1 for snippet in snippets):
         raise RuntimeError(
-            "flash exact rollout identity boundary drifted from pinned Verl "
+            f"flash exact rollout identity {label} boundary drifted from pinned Verl "
             f"(got sha256 {source_hash})"
         )
 
-    def exact_int(value, name):
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise RuntimeError(f"flash rollout trajectory {name} must be an integer")
-        return value
 
+def _trajectory_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError(f"flash rollout trajectory {name} must be an integer")
+    return value
+
+
+def _trajectory_bool(value, name):
+    if not isinstance(value, bool):
+        raise RuntimeError(f"flash rollout trajectory {name} must be a boolean")
+    return value
+
+
+def _identity_from_trajectory(trajectory):
+    return {
+        "optimizer_step": _trajectory_int(trajectory.get("step"), "step"),
+        "sample_index": _trajectory_int(trajectory.get("sample_index"), "sample_index"),
+        "rollout_ordinal": _trajectory_int(trajectory.get("rollout_n"), "rollout_n"),
+        "validate": _trajectory_bool(trajectory.get("validate"), "validate"),
+    }
+
+
+def _build_worker_identity_wrappers(original_worker_generate, original_trajectory_info):
+    import contextvars
+
+    sidecar = contextvars.ContextVar("flash_rollout_identity_sidecar", default=None)
+
+    async def exact_trajectory_info(step, index, validate):
+        identities = sidecar.get()
+        if identities is None:
+            return await original_trajectory_info(step, index, validate)
+        if len(identities) != len(index):
+            raise RuntimeError("flash rollout identity sidecar length does not match worker batch")
+        trajectories = []
+        for position, (identity, sample_index) in enumerate(zip(identities, index, strict=True)):
+            if identity["optimizer_step"] != _trajectory_int(step, "step"):
+                raise RuntimeError(
+                    "flash rollout identity sidecar step does not match worker batch"
+                )
+            if identity["sample_index"] != _trajectory_int(sample_index, "sample_index"):
+                raise RuntimeError(
+                    f"flash rollout identity sidecar index mismatch at position {position}"
+                )
+            if identity["validate"] is not _trajectory_bool(validate, "validate"):
+                raise RuntimeError(
+                    "flash rollout identity sidecar validate flag does not match batch"
+                )
+            trajectories.append(
+                {
+                    "step": identity["optimizer_step"],
+                    "sample_index": identity["sample_index"],
+                    "rollout_n": identity["rollout_ordinal"],
+                    "validate": identity["validate"],
+                }
+            )
+        return trajectories
+
+    async def generate_sequences_with_identities(self, batch, identities):
+        token = sidecar.set(tuple(dict(identity) for identity in identities))
+        try:
+            return await original_worker_generate(self, batch)
+        finally:
+            sidecar.reset(token)
+
+    return exact_trajectory_info, generate_sequences_with_identities
+
+
+def _build_manager_identity_wrapper(agent_loop, original_trajectory_info, post_json):
+    import os
+
+    async def manager_generate_sequences(self, prompts):
+        index = prompts.non_tensor_batch.get("index")
+        indexes = list(range(len(prompts))) if index is None else index.tolist()
+        trajectories = await original_trajectory_info(
+            prompts.meta_info.get("global_steps", -1),
+            indexes,
+            prompts.meta_info.get("validate", False),
+        )
+        identities = [_identity_from_trajectory(trajectory) for trajectory in trajectories]
+        url = os.environ.get("FLASH_VERL_REWARD_URL", "")
+        if not url:
+            raise RuntimeError(
+                "flash reward bridge url is not configured for identity registration"
+            )
+        post_json(
+            url,
+            "/identity/register",
+            {"identities": [dict(identity) for identity in identities]},
+            error_style="reward",
+        )
+        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        identity_chunks = []
+        offset = 0
+        for chunk in chunkes:
+            identity_chunks.append(identities[offset : offset + len(chunk)])
+            offset += len(chunk)
+        if offset != len(identities):
+            raise RuntimeError("flash rollout identity sidecar did not cover the manager batch")
+        outputs = await agent_loop.asyncio.gather(
+            *[
+                worker.generate_sequences_with_flash_identities.remote(chunk, identity_chunk)
+                for worker, chunk, identity_chunk in zip(
+                    self.agent_loop_workers, chunkes, identity_chunks, strict=True
+                )
+            ]
+        )
+        output = agent_loop.DataProto.concat(outputs)
+        metrics = [item.meta_info.pop("metrics") for item in outputs]
+        timing = self._performance_metrics(metrics, output)
+        output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        return output
+
+    return manager_generate_sequences
+
+
+def _build_run_identity_wrapper(original_run):
     async def run_agent_loop(
         self,
         sampling_params,
@@ -43,11 +151,7 @@ def install_exact_rollout_identity() -> None:
         trace=True,
         **kwargs,
     ):
-        identity = {
-            "optimizer_step": exact_int(trajectory.get("step"), "step"),
-            "sample_index": exact_int(trajectory.get("sample_index"), "sample_index"),
-            "rollout_ordinal": exact_int(trajectory.get("rollout_n"), "rollout_n"),
-        }
+        identity = _identity_from_trajectory(trajectory)
         extra_info = kwargs.get("extra_info")
         if not isinstance(extra_info, dict):
             raise RuntimeError("flash rollout trajectory is missing dictionary extra_info")
@@ -58,7 +162,7 @@ def install_exact_rollout_identity() -> None:
         forwarded_extra["flash_rollout_identity"] = dict(identity)
         forwarded["extra_info"] = forwarded_extra
         forwarded["flash_rollout_identity"] = dict(identity)
-        return await original(
+        return await original_run(
             self,
             sampling_params,
             trajectory,
@@ -67,8 +171,53 @@ def install_exact_rollout_identity() -> None:
             **forwarded,
         )
 
+    return run_agent_loop
+
+
+def install_exact_rollout_identity() -> None:
+    """Register and attach exact identities at pinned Verl occurrence boundaries."""
+    from flash_grpo_multiturn import post_json
+    from verl.experimental.agent_loop import agent_loop
+
+    original_run = agent_loop.AgentLoopWorker._run_agent_loop
+    if getattr(original_run, "_flash_exact_rollout_identity", False):
+        return
+    original_worker_generate = agent_loop.AgentLoopWorker.generate_sequences
+    original_manager_generate = agent_loop.AgentLoopManager.generate_sequences
+    original_trajectory_info = agent_loop.get_trajectory_info
+    _guard_exact_identity_boundary(
+        original_run,
+        _PINNED_RUN_AGENT_LOOP_SHA256,
+        "occurrence",
+        ('trajectory["rollout_n"]', "self._agent_loop_postprocess"),
+    )
+    _guard_exact_identity_boundary(
+        original_worker_generate,
+        _PINNED_WORKER_GENERATE_SHA256,
+        "worker generation",
+        ("trajectory_info = await get_trajectory_info", "self._run_agent_loop("),
+    )
+    _guard_exact_identity_boundary(
+        original_manager_generate,
+        _PINNED_MANAGER_GENERATE_SHA256,
+        "manager generation",
+        ("chunkes = prompts.chunk", "worker.generate_sequences.remote(chunk)"),
+    )
+    exact_trajectory_info, worker_generate = _build_worker_identity_wrappers(
+        original_worker_generate, original_trajectory_info
+    )
+    manager_generate = _build_manager_identity_wrapper(
+        agent_loop, original_trajectory_info, post_json
+    )
+    run_agent_loop = _build_run_identity_wrapper(original_run)
     run_agent_loop._flash_exact_rollout_identity = True
+    manager_generate = agent_loop.auto_await(manager_generate)
+    manager_generate._flash_exact_rollout_identity = True
+    manager_generate._flash_pinned_source_sha256 = _PINNED_MANAGER_GENERATE_SHA256
+    agent_loop.get_trajectory_info = exact_trajectory_info
+    agent_loop.AgentLoopWorker.generate_sequences_with_flash_identities = worker_generate
     agent_loop.AgentLoopWorker._run_agent_loop = run_agent_loop
+    agent_loop.AgentLoopManager.generate_sequences = manager_generate
     print(_EXACT_ROLLOUT_IDENTITY_MARKER, flush=True)
 
 

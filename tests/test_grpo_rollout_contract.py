@@ -244,6 +244,16 @@ def test_sft_worker_env_does_not_gain_grpo_native_policy():
     assert not (set(env) & set(GRPO_NATIVE_THREAD_ENV))
 
 
+def test_training_guide_describes_authored_admission_and_retained_execution_clamp():
+    from pathlib import Path
+
+    guide = (Path(__file__).parents[1] / "flash/cli/scaffold/TRAINING.md").read_text()
+    assert "preserves the authored positive integer in the job spec and admission checks" in guide
+    assert "effective value clamps to the number of retained valid prompts" in guide
+    assert "`group_size` is never changed" in guide
+    assert "A later retained-data clamp cannot rescue an oversized authored shape" in guide
+
+
 def test_worker_option_resolver_rejects_before_dataset_loading(monkeypatch):
     from flash.engine.worker.train.rl import inputs
 

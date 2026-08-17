@@ -2474,6 +2474,7 @@ def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
                         "optimizer_step": 1,
                         "sample_index": 1,
                         "rollout_ordinal": 0,
+                        "validate": False,
                     },
                 },
             )
@@ -2515,6 +2516,7 @@ def test_a_slow_env_call_is_not_cut_off_by_a_client_deadline(monkeypatch):
                         "optimizer_step": 1,
                         "sample_index": 0,
                         "rollout_ordinal": 0,
+                        "validate": False,
                     },
                 },
             )
@@ -2561,6 +2563,7 @@ def test_concurrent_scorers_are_serialized_for_the_env():
                                 "optimizer_step": 1,
                                 "sample_index": i,
                                 "rollout_ordinal": 0,
+                                "validate": False,
                             },
                         },
                     ),
@@ -3028,6 +3031,7 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
                         "optimizer_step": 1,
                         "sample_index": 99,
                         "rollout_ordinal": 0,
+                        "validate": False,
                     },
                 },
             )
@@ -3149,6 +3153,7 @@ def test_the_generated_single_turn_reward_module_surfaces_the_bridges_cause(monk
                         "optimizer_step": 1,
                         "sample_index": 0,
                         "rollout_ordinal": 0,
+                        "validate": False,
                     },
                 },
             )
@@ -7338,6 +7343,7 @@ def _drive_multi_turn_episode(
                 "optimizer_step": 1,
                 "sample_index": 0,
                 "rollout_ordinal": rollout_ordinal,
+                "validate": False,
             },
         )
 
@@ -7378,6 +7384,17 @@ def test_multi_turn_child_preserves_exact_identity_through_start_and_score(monke
     from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
 
     ledger = RolloutIdentityLedger(1, 2)
+    ledger.register(
+        [
+            {
+                "optimizer_step": 1,
+                "sample_index": 0,
+                "rollout_ordinal": ordinal,
+                "validate": False,
+            }
+            for ordinal in range(2)
+        ]
+    )
     for ordinal in range(2):
         _drive_multi_turn_episode(
             stop_reasons=[("answer", "completed")],
