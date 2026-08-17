@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import re
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any
 
 from flash.adapters.lora_rank import (
     _rank_for_module,
-    declared_lora_ranks,
     lora_tensor_rank_disagrees,
+    strict_declared_lora_ranks,
 )
 from flash.core.catalog import get_model
 
@@ -65,9 +64,7 @@ def validate_fused_expert_adapter_config(config: Mapping[str, Any], model_id: st
             f"adapter for {model_id} must declare exactly the fused expert targets {required}"
         )
 
-    rank_pattern = config.get("rank_pattern")
-    _validate_rank_pattern(rank_pattern, model_id)
-    declared = declared_lora_ranks(config)
+    declared = strict_declared_lora_ranks(config, source=f"adapter for {model_id}")
     unresolved = [target for target in required if _rank_for_module(target, declared) is None]
     if unresolved:
         raise ValueError(
@@ -105,31 +102,6 @@ def validate_fused_expert_adapter_config(config: Mapping[str, Any], model_id: st
             f"adapter for {model_id} has no resolved LoRA rank for ordinary target_modules "
             f"{unresolved}"
         )
-
-
-def _validate_rank_pattern(rank_pattern: Any, model_id: str) -> None:
-    """Validate positive ranks and PEFT's anchored regex pattern syntax."""
-    message = (
-        f"adapter for {model_id} rank_pattern must map valid non-empty string patterns "
-        "to positive integer ranks"
-    )
-    if rank_pattern is None:
-        return
-    if not isinstance(rank_pattern, Mapping):
-        raise ValueError(message)
-    for pattern, rank in rank_pattern.items():
-        if (
-            not isinstance(pattern, str)
-            or not pattern.strip()
-            or not isinstance(rank, int)
-            or isinstance(rank, bool)
-            or rank <= 0
-        ):
-            raise ValueError(message)
-        try:
-            re.compile(rf"(.*\.)?({pattern})$")
-        except re.error as exc:
-            raise ValueError(message) from exc
 
 
 def _targets_fused_expert_wrapper(module: str) -> bool:
@@ -216,7 +188,7 @@ def _expected_fused_expert_rungs(
     if catalog_dimensions != Counter(_QWEN36_FUSED_TARGET_DIMENSIONS.values()):
         return None
 
-    declared = declared_lora_ranks(config)
+    declared = strict_declared_lora_ranks(config)
     expected: dict[str, dict[str, _LoraPair]] = {}
     for target in targets:
         rank = _rank_for_module(target, declared)
@@ -320,7 +292,7 @@ def _has_ordinary_evidence(
     if not groups or (not all_linear and evidence != set(targets)):
         return False
 
-    declared = declared_lora_ranks(config)
+    declared = strict_declared_lora_ranks(config)
     for module_path, namespaces in groups.items():
         if len(namespaces) != 1 or _rank_for_module(module_path, declared) is None:
             return False

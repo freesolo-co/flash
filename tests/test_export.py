@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 BASE_MODEL = "Qwen/Qwen3.5-0.8B"
+_PLAIN_CONFIG = json.dumps({"r": 1})
 
 
 class _FakeHfHubHTTPError(OSError):
@@ -101,7 +102,7 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
         # Materialize the adapter folder exactly where export_adapter looks for it.
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         (adapter / "adapter_model.safetensors").write_bytes(_PLAIN_WEIGHTS)
         return str(local_dir)
 
@@ -215,7 +216,7 @@ def test_export_adapter_normalizes_safetensors_keys_for_vanilla_peft(monkeypatch
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         (adapter / "adapter_model.safetensors").write_bytes(source_bytes)
         return str(local_dir)
 
@@ -286,7 +287,7 @@ def test_export_adapter_key_collision_fails_the_export(monkeypatch):
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         (adapter / "adapter_model.safetensors").write_bytes(source_bytes)
         return str(local_dir)
 
@@ -337,6 +338,7 @@ def test_export_adapter_normalizes_lm_keys_with_inert_vision_weights(tmp_path):
         vision_b: {"dtype": "F16", "shape": [1], "data_offsets": [6, 8]},
     }
     data = b"\x01\x02\x03\x04\x05\x06\x00\x00"
+    (tmp_path / "adapter_config.json").write_text(_PLAIN_CONFIG)
     path = tmp_path / "adapter_model.safetensors"
     path.write_bytes(_safetensors_bytes(header, data))
 
@@ -374,7 +376,7 @@ def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatc
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         (adapter / "adapter_model.safetensors").write_bytes(source_bytes)
         return str(local_dir)
 
@@ -577,6 +579,7 @@ def test_export_adapter_normalizes_only_the_representation_peft_loads(tmp_path, 
     from flash.serve import export
 
     infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    (tmp_path / "adapter_config.json").write_text(_PLAIN_CONFIG)
     stale = tmp_path / "adapter_model.bin"
     _write_fake_bin(stale, {infixed: [9.0]})
     before = stale.read_bytes()
@@ -622,7 +625,7 @@ def test_export_adapter_normalizes_sharded_safetensors_and_index(monkeypatch):
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         for name, contents in zip(shard_names, shard_bytes, strict=True):
             (adapter / name).write_bytes(contents)
         (adapter / "adapter_model.safetensors.index.json").write_text(
@@ -696,6 +699,7 @@ def test_stale_shards_left_by_a_shorter_retry_are_not_scanned(tmp_path):
 
     live_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
     stale_visual = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
+    (tmp_path / "adapter_config.json").write_text(_PLAIN_CONFIG)
     live_names = ("adapter_model-00001-of-00002.safetensors",)
     (tmp_path / live_names[0]).write_bytes(
         _safetensors_bytes(
@@ -726,6 +730,7 @@ def test_index_rewrite_leaves_the_unselected_representation_alone(tmp_path):
     from flash.serve import export
 
     infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    (tmp_path / "adapter_config.json").write_text(_PLAIN_CONFIG)
     shard = "adapter_model-00001-of-00001.safetensors"
     (tmp_path / shard).write_bytes(
         _safetensors_bytes(
@@ -780,6 +785,7 @@ def test_export_adapter_with_unrecognized_non_lm_tensor_is_unchanged(tmp_path):
 
     lm_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
     vision_saved = "base_model.model.model.visual.proj.modules_to_save.default.weight"
+    (tmp_path / "adapter_config.json").write_text(_PLAIN_CONFIG)
     source_bytes = _safetensors_bytes(
         {
             lm_key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
@@ -801,7 +807,7 @@ def test_export_adapter_without_safetensors_still_exports(monkeypatch):
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         (adapter / "adapter_model.bin").write_bytes(bin_weights)
         return str(local_dir)
 
@@ -967,7 +973,7 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         (adapter / "adapter_model.safetensors").write_bytes(_PLAIN_WEIGHTS)
         return str(local_dir)
 
@@ -1023,7 +1029,7 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         (adapter / "adapter_model.safetensors").write_bytes(_PLAIN_WEIGHTS)
         return str(local_dir)
 
@@ -1068,7 +1074,7 @@ def test_export_private_is_enforced_before_upload(monkeypatch):
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         (adapter / "adapter_model.safetensors").write_bytes(_PLAIN_WEIGHTS)
         return str(local_dir)
 
@@ -1112,7 +1118,7 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
         seen["token"] = token
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         (adapter / "adapter_model.safetensors").write_bytes(_PLAIN_WEIGHTS)
         return str(local_dir)
 
@@ -1178,7 +1184,7 @@ def test_export_rejects_source_with_config_but_no_adapter_weight(monkeypatch):
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")  # config only, no weight
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)  # config only, no weight
         return str(local_dir)
 
     class FakeHfApi:
@@ -1449,6 +1455,18 @@ def test_export_reads_rank_pattern_overrides_rather_than_refusing_them(tmp_path)
     assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
 
 
+def test_export_preserves_overlapping_rank_pattern_first_match(tmp_path):
+    from flash.serve import export
+
+    header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"r": 8, "rank_pattern": {"up_proj": 16, ".*up_proj": 32}})
+    )
+
+    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+
+
 def test_export_accepts_modules_the_rank_pattern_did_not_override(tmp_path):
     """A `rank_pattern` adapter carries BOTH ranks: the overridden module at 64 and every other
     module at the `r: 32` default. Checking against one summary number (the max, which is what
@@ -1523,16 +1541,38 @@ def test_export_ignores_shapes_that_cannot_report_a_rank(tmp_path):
     assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
 
 
-def test_export_without_a_readable_declared_rank_still_exports(tmp_path):
-    """Every pre-existing fixture and any PEFT save without `r` has no rank to disagree with.
-    The check needs both halves, so a config that declares none leaves export exactly as it was."""
+def test_export_rejects_tensors_without_a_resolved_declared_rank(tmp_path):
     from flash.serve import export
 
     header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
     (tmp_path / "adapter_config.json").write_text("{}")
 
-    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
+    with pytest.raises(ValueError, match="do not carry the rank configured"):
+        export._normalize_export_adapter_keys(tmp_path)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 16.0, "16"])
+def test_export_strictly_rejects_invalid_scalar_rank_declarations(tmp_path, value):
+    from flash.serve import export
+
+    header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": value}))
+
+    with pytest.raises(ValueError, match="r must be a positive integer"):
+        export._normalize_export_adapter_keys(tmp_path)
+
+
+def test_export_strictly_rejects_malformed_rank_pattern_regex(tmp_path):
+    from flash.serve import export
+
+    header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
+    (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "rank_pattern": {"(": 32}}))
+
+    with pytest.raises(ValueError, match="invalid regex"):
+        export._normalize_export_adapter_keys(tmp_path)
 
 
 def test_export_checks_ranks_across_every_shard_not_just_the_first(tmp_path):
@@ -1650,7 +1690,7 @@ def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypat
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
         (adapter / "adapter_model.safetensors").write_bytes(_PLAIN_WEIGHTS)
         return str(local_dir)
 

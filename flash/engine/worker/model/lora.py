@@ -6,10 +6,49 @@ module has no package cycle or eager gpu stack import.
 
 from __future__ import annotations
 
+import contextlib
+from dataclasses import dataclass
+
 # a safetensors header is small even for huge models (a few hundred kb at most); 100 mb is a wildly
 # generous ceiling that still refuses a corrupt or hostile file declaring a multi-gb header length
 # before safetensors parses it.
 _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _SafetensorsTensorDescriptor:
+    dtype: str
+    shape: tuple[int, ...]
+    data_start: int
+    start: int
+    end: int
+
+
+class _SafetensorsNumpyAccessor:
+    def __init__(self, path: str, tensors, descriptors: dict[str, _SafetensorsTensorDescriptor]):
+        self._path = path
+        self._tensors = tensors
+        self._descriptors = descriptors
+
+    def keys(self) -> list[str]:
+        return list(self._descriptors)
+
+    def get_tensor(self, key: str):
+        descriptor = self._descriptors[key]
+        if descriptor.dtype != "BF16":
+            return self._tensors.get_tensor(key)
+
+        import numpy as np
+
+        byte_count = descriptor.end - descriptor.start
+        with open(self._path, "rb") as source:
+            source.seek(descriptor.data_start + descriptor.start)
+            payload = source.read(byte_count)
+        if len(payload) != byte_count:
+            raise ValueError(f"{self._path}: BF16 tensor {key!r} data is truncated")
+        raw = np.frombuffer(payload, dtype="<u2")
+        widened = raw.astype("<u4") << 16
+        return widened.view("<f4").reshape(descriptor.shape)
 
 
 def _read_adapter_tensor_metadata(adir: str) -> dict[str, tuple[int, ...]] | None:
@@ -102,10 +141,18 @@ def _read_sharded_weight_map(adir: str, selected: list[str]) -> dict[str, str] |
     return weight_map
 
 
-def _read_safetensors_tensor_metadata(st_path: str) -> dict[str, tuple[int, ...]]:
-    """return names and shapes after safetensors validates the complete file structure."""
+def _read_safetensors_tensor_descriptors(
+    st_path: str,
+) -> dict[str, _SafetensorsTensorDescriptor]:
+    """return authenticated bounded descriptors for one safetensors shard."""
+    import json
+    import math
     import os
     import struct
+
+    from safetensors import safe_open
+
+    from flash._internal.fileio import reject_duplicate_keys
 
     file_size = os.path.getsize(st_path)
     with open(st_path, "rb") as tensor_file:
@@ -118,23 +165,84 @@ def _read_safetensors_tensor_metadata(st_path: str) -> dict[str, tuple[int, ...]
                 f"{st_path}: declared safetensors header length {header_length} is implausible "
                 f"(file is {file_size} bytes)"
             )
+        header_bytes = tensor_file.read(header_length)
+        if len(header_bytes) != header_length:
+            raise ValueError(f"{st_path}: safetensors header is truncated")
 
+    duplicate_guard = reject_duplicate_keys(
+        lambda key: ValueError(f"{st_path}: duplicate safetensors header key {key!r}")
+    )
     try:
-        from safetensors import safe_open
+        header = json.loads(header_bytes, object_pairs_hook=duplicate_guard)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{st_path}: invalid safetensors structure ({exc})") from exc
+    if not isinstance(header, dict):
+        raise ValueError(f"{st_path}: invalid safetensors structure (header is not an object)")
 
+    data_start = 8 + header_length
+    data_size = file_size - data_start
+    descriptors: dict[str, _SafetensorsTensorDescriptor] = {}
+    try:
         with safe_open(st_path, framework="numpy") as tensors:
-            metadata: dict[str, tuple[int, ...]] = {}
             tensor_keys = tensors.keys()
+            header_keys = [key for key in header if key != "__metadata__"]
+            if set(tensor_keys) != set(header_keys):
+                raise ValueError("header keys disagree with the authenticated tensor namespace")
             for key in tensor_keys:
+                raw = header.get(key)
+                if not isinstance(raw, dict):
+                    raise ValueError(f"descriptor for {key!r} is not an object")
+                dtype = raw.get("dtype")
                 shape = tensors.get_slice(key).get_shape()
+                offsets = raw.get("data_offsets")
+                if not isinstance(dtype, str) or not dtype:
+                    raise ValueError(f"descriptor dtype for {key!r} is invalid")
                 if not isinstance(shape, list) or any(
                     not isinstance(dim, int) or isinstance(dim, bool) or dim < 0 for dim in shape
                 ):
                     raise ValueError(f"invalid tensor shape for {key!r}")
-                metadata[key] = tuple(shape)
-            return metadata
+                if (
+                    not isinstance(offsets, list)
+                    or len(offsets) != 2
+                    or any(
+                        not isinstance(offset, int) or isinstance(offset, bool)
+                        for offset in offsets
+                    )
+                ):
+                    raise ValueError(f"descriptor offsets for {key!r} are invalid")
+                start, end = offsets
+                if start < 0 or end < start or end > data_size:
+                    raise ValueError(f"descriptor offsets for {key!r} are outside the data section")
+                if dtype == "BF16" and end - start != math.prod(shape) * 2:
+                    raise ValueError(f"BF16 descriptor byte length for {key!r} is invalid")
+                descriptors[key] = _SafetensorsTensorDescriptor(
+                    dtype=dtype,
+                    shape=tuple(shape),
+                    data_start=data_start,
+                    start=start,
+                    end=end,
+                )
     except Exception as exc:
         raise ValueError(f"{st_path}: invalid safetensors structure ({exc})") from exc
+    return descriptors
+
+
+def _read_safetensors_tensor_metadata(st_path: str) -> dict[str, tuple[int, ...]]:
+    """return names and shapes after safetensors validates the complete file structure."""
+    return {
+        key: descriptor.shape
+        for key, descriptor in _read_safetensors_tensor_descriptors(st_path).items()
+    }
+
+
+@contextlib.contextmanager
+def _open_safetensors_numpy(st_path: str):
+    """open one shard with bounded BF16 materialization and normal NumPy tensors otherwise."""
+    from safetensors import safe_open
+
+    descriptors = _read_safetensors_tensor_descriptors(st_path)
+    with safe_open(st_path, framework="numpy") as tensors:
+        yield _SafetensorsNumpyAccessor(st_path, tensors, descriptors)
 
 
 def _read_bin_tensor_metadata(bin_path: str) -> dict[str, tuple[int, ...]]:

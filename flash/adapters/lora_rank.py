@@ -296,26 +296,9 @@ class DeclaredLoraRanks:
         return self.default is not None or bool(self.by_module)
 
 
-def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
-    """Read the per-module LoRA rank structure out of ``adapter_config.json``."""
-    if not isinstance(config, Mapping):
-        return DeclaredLoraRanks()
-    try:
-        default = _positive_int(config["r"], source="adapter_config.json", field="r")
-    except (KeyError, ValueError):
-        default = None
-
-    by_module: dict[str, int] = {}
-    pattern = config.get("rank_pattern")
-    if isinstance(pattern, Mapping):
-        for module, value in pattern.items():
-            try:
-                by_module[str(module)] = _positive_int(
-                    value, source="adapter_config.json", field="rank_pattern"
-                )
-            except ValueError:
-                continue
-
+def _declared_lora_rank_context(
+    config: Mapping[str, Any], *, default: int | None, by_module: Mapping[str, int]
+) -> DeclaredLoraRanks:
     stacked_rank_modules: list[str] = []
     targets = config.get("target_parameters")
     if isinstance(targets, list):
@@ -333,6 +316,63 @@ def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
         stacked_rank_modules=tuple(stacked_rank_modules),
         stacked_rank_multiplier=lora_expert_count(base_model),
     )
+
+
+def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
+    """read rank declarations tolerantly for non-authoritative inspection paths."""
+    if not isinstance(config, Mapping):
+        return DeclaredLoraRanks()
+    try:
+        default = _positive_int(config["r"], source="adapter_config.json", field="r")
+    except (KeyError, ValueError):
+        default = None
+
+    by_module: dict[str, int] = {}
+    pattern = config.get("rank_pattern")
+    if isinstance(pattern, Mapping):
+        for module, value in pattern.items():
+            try:
+                by_module[str(module)] = _positive_int(
+                    value, source="adapter_config.json", field="rank_pattern"
+                )
+            except ValueError:
+                continue
+    return _declared_lora_rank_context(config, default=default, by_module=by_module)
+
+
+def strict_declared_lora_ranks(
+    config: Mapping[str, Any], *, source: str = "adapter_config.json"
+) -> DeclaredLoraRanks:
+    """validate and preserve PEFT rank declarations for an authoritative load boundary."""
+    if not isinstance(config, Mapping):
+        raise ValueError(f"{source} must be an object")
+
+    default = None
+    if "r" in config:
+        value = config["r"]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{source} r must be a positive integer")
+        default = value
+
+    by_module: dict[str, int] = {}
+    if "rank_pattern" in config:
+        pattern = config["rank_pattern"]
+        if not isinstance(pattern, Mapping):
+            raise ValueError(f"{source} rank_pattern must be an object")
+        for module, value in pattern.items():
+            if not isinstance(module, str) or not module.strip():
+                raise ValueError(f"{source} rank_pattern keys must be non-empty strings")
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{source} rank_pattern values must be positive integers")
+            try:
+                re.compile(rf"(.*\.)?({module})$")
+            except re.error as exc:
+                raise ValueError(
+                    f"{source} rank_pattern contains invalid regex {module!r}"
+                ) from exc
+            by_module[module] = value
+
+    return _declared_lora_rank_context(config, default=default, by_module=by_module)
 
 
 def _rank_for_module(module_path: str, declared: DeclaredLoraRanks) -> int | None:

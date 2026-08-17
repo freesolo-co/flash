@@ -76,6 +76,58 @@ def test_read_adapter_metadata_reads_valid_safetensors_shape(tmp_path):
     assert lora._read_adapter_tensor_metadata(str(adir)) == {VL_KEYS[0]: (2, 3)}
 
 
+def test_bf16_accessor_reads_only_the_requested_tensor_interval(monkeypatch, tmp_path):
+    import builtins
+
+    import flash.engine.worker.model.lora as lora
+
+    path = tmp_path / "adapter_model.safetensors"
+    prefix = b"p" * 4096
+    encoded = np.array([0x3F80, 0x4000], dtype="<u2").tobytes()
+    path.write_bytes(prefix + encoded + b"s" * 4096)
+    descriptor = lora._SafetensorsTensorDescriptor(
+        dtype="BF16",
+        shape=(2,),
+        data_start=0,
+        start=len(prefix),
+        end=len(prefix) + len(encoded),
+    )
+
+    class UnusedBackend:
+        def get_tensor(self, key):
+            pytest.fail(f"NumPy backend materialized BF16 tensor {key}")
+
+    reads = []
+    real_open = builtins.open
+
+    class TrackingFile:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def seek(self, offset, whence=0):
+            return self._handle.seek(offset, whence)
+
+        def read(self, size=-1):
+            reads.append((self._handle.tell(), size))
+            return self._handle.read(size)
+
+    def tracking_open(candidate, *args, **kwargs):
+        handle = real_open(candidate, *args, **kwargs)
+        return TrackingFile(handle) if candidate == str(path) else handle
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    accessor = lora._SafetensorsNumpyAccessor(str(path), UnusedBackend(), {"tensor": descriptor})
+
+    np.testing.assert_array_equal(accessor.get_tensor("tensor"), [1.0, 2.0])
+    assert reads == [(len(prefix), len(encoded))]
+
+
 @pytest.mark.parametrize(
     ("header", "payload"),
     [

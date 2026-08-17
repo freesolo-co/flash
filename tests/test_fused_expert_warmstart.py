@@ -1,6 +1,7 @@
 """Fused-expert LoRA export and strict warm-start validation tests."""
 
 import copy
+import ctypes
 import json
 import sys
 
@@ -68,6 +69,45 @@ def _complete_expert_tensors(
 def _write_small_safetensors(path, tensors=None):
     arrays = tensors or {"placeholder": np.zeros((1,), dtype=np.float16)}
     path.write_bytes(save(arrays))
+
+
+def _write_bf16_safetensors(path, tensors):
+    from safetensors import TensorSpec, serialize
+
+    buffers = []
+    specs = {}
+    for key, value in tensors.items():
+        array = np.asarray(value, dtype=np.float32)
+        raw = (array.view(np.uint32) >> 16).astype("<u2").tobytes()
+        buffer = ctypes.create_string_buffer(raw)
+        buffers.append(buffer)
+        specs[key] = TensorSpec(
+            dtype="bfloat16",
+            shape=list(array.shape),
+            data_ptr=ctypes.addressof(buffer),
+            data_len=len(raw),
+        )
+    path.write_bytes(serialize(specs))
+
+
+def _write_sharded_bf16_text_adapter(directory, factor_a, factor_b, *, config=None):
+    pair = _text_pair("self_attn.q_proj", factor_a, factor_b)
+    a_key, b_key = pair
+    first = "adapter_model-00001-of-00002.safetensors"
+    second = "adapter_model-00002-of-00002.safetensors"
+    _write_bf16_safetensors(directory / first, {a_key: pair[a_key]})
+    _write_bf16_safetensors(directory / second, {b_key: pair[b_key]})
+    (directory / "adapter_model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {a_key: first, b_key: second}}), encoding="utf-8"
+    )
+    adapter_config = config or {
+        "peft_type": "LORA",
+        "r": 1,
+        "lora_alpha": 2,
+        "target_modules": ["q_proj"],
+    }
+    (directory / "adapter_config.json").write_text(json.dumps(adapter_config), encoding="utf-8")
+    return (directory / first, directory / second)
 
 
 def _text_pair(module, factor_a, factor_b):
@@ -410,6 +450,34 @@ def test_non_moe_export_enforces_applicable_rank_pattern(tmp_path):
     assert saved["rank_pattern"] == {"v_proj": 3}
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"r": "1"}, id="numeric-string-scalar"),
+        pytest.param({"rank_pattern": {"q_proj": "1"}}, id="applicable-string-override"),
+    ],
+)
+def test_non_moe_export_uses_strict_shared_rank_declarations(tmp_path, overrides):
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    config = {
+        "peft_type": "LORA",
+        "r": 1,
+        "target_modules": ["q_proj", "v_proj"],
+        **overrides,
+    }
+    _write_expert_adapter(tmp_path, config=config, tensor_mode="mixed", text_rank=1)
+    config_path = tmp_path / "adapter_config.json"
+    before_config = config_path.read_bytes()
+    before_weights = (tmp_path / "adapter_model.safetensors").read_bytes()
+
+    with pytest.raises(RuntimeError, match="positive integer"):
+        stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+
+    assert config_path.read_bytes() == before_config
+    assert (tmp_path / "adapter_model.safetensors").read_bytes() == before_weights
+
+
 @pytest.mark.parametrize("rank", [1, 4])
 @pytest.mark.parametrize(
     ("tensor_mode", "message"),
@@ -497,6 +565,57 @@ def test_exported_targeting_validates_the_actual_mixed_delta_artifact(tmp_path):
             nonzero.append(bool(np.count_nonzero(delta)))
         assert sorted(nonzero) == [False, True]
         assert not any("visual" in key or "patch_embed" in key for key in keys)
+
+
+def test_non_moe_export_accepts_sharded_bf16_without_torch(monkeypatch, tmp_path):
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    factor_a = np.array([[1.0, 0.0]], dtype=np.float32)
+    factor_b = np.array([[1.0], [0.0]], dtype=np.float32)
+    weight_paths = _write_sharded_bf16_text_adapter(tmp_path, factor_a, factor_b)
+    before_weights = [path.read_bytes() for path in weight_paths]
+    monkeypatch.setitem(sys.modules, "torch", None)
+
+    stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["target_modules"] == "all-linear"
+    assert [path.read_bytes() for path in weight_paths] == before_weights
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+def test_non_moe_export_rejects_nonfinite_bf16_without_writing(tmp_path, bad_value):
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    factor_a = np.array([[bad_value, 1.0]], dtype=np.float32)
+    factor_b = np.array([[1.0], [0.0]], dtype=np.float32)
+    weight_paths = _write_sharded_bf16_text_adapter(tmp_path, factor_a, factor_b)
+    config_path = tmp_path / "adapter_config.json"
+    before_config = config_path.read_bytes()
+    before_weights = [path.read_bytes() for path in weight_paths]
+
+    with pytest.raises(RuntimeError, match="contains non-finite values"):
+        stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+
+    assert config_path.read_bytes() == before_config
+    assert [path.read_bytes() for path in weight_paths] == before_weights
+
+
+def test_non_moe_export_rejects_zero_bf16_delta_without_writing(tmp_path):
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    factor_a = np.zeros((1, 2), dtype=np.float32)
+    factor_b = np.ones((2, 1), dtype=np.float32)
+    weight_paths = _write_sharded_bf16_text_adapter(tmp_path, factor_a, factor_b)
+    config_path = tmp_path / "adapter_config.json"
+    before_config = config_path.read_bytes()
+    before_weights = [path.read_bytes() for path in weight_paths]
+
+    with pytest.raises(RuntimeError, match="no nonzero composed LoRA delta"):
+        stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+
+    assert config_path.read_bytes() == before_config
+    assert [path.read_bytes() for path in weight_paths] == before_weights
 
 
 def test_strict_worker_accepts_current_config_without_changing_memory_or_disk(
@@ -848,6 +967,33 @@ def test_tensor_analyzer_rejects_ordinary_rank_mismatch():
     tensors = _complete_expert_tensors(include_ordinary=False)
     tensors.update(_ordinary_tensors(pair=((16, 2048), (2048, 16))))
     assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        pytest.param(
+            {"r": True},
+            "r must be a positive integer",
+            id="invalid-scalar",
+        ),
+        pytest.param(
+            {"rank_pattern": []},
+            "rank_pattern must be an object",
+            id="invalid-pattern-container",
+        ),
+        pytest.param(
+            {"rank_pattern": {"(": 16}},
+            "rank_pattern contains invalid regex",
+            id="invalid-pattern-regex",
+        ),
+    ],
+)
+def test_fused_config_uses_strict_shared_rank_declarations(overrides, message):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match=message):
+        validate_fused_expert_adapter_config(_valid_config(**overrides), _MODEL_ID)
 
 
 def test_tensor_analyzer_accepts_per_target_fused_rank_overrides():

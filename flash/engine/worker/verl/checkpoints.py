@@ -23,8 +23,15 @@ from flash.adapters.fused_experts import (
     normalize_verl_fused_expert_export,
     validate_fused_expert_adapter_config,
 )
-from flash.adapters.lora_rank import declared_lora_ranks, lora_tensor_rank_disagrees
-from flash.engine.worker.model.lora import _read_adapter_tensor_metadata
+from flash.adapters.lora_rank import (
+    _rank_for_module,
+    lora_tensor_rank_disagrees,
+    strict_declared_lora_ranks,
+)
+from flash.engine.worker.model.lora import (
+    _open_safetensors_numpy,
+    _read_adapter_tensor_metadata,
+)
 
 
 class MergeDiskHeadroomError(RuntimeError):
@@ -454,7 +461,6 @@ _NON_LANGUAGE_ADAPTER_SEGMENTS = frozenset(
 def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
     """validate the actual non-moe LoRA payload before canonicalizing its config."""
     import numpy as np
-    from safetensors import safe_open
 
     from flash.adapters.artifacts import loadable_adapter_weight_files
 
@@ -473,9 +479,10 @@ def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
             "exported text adapter must declare the concrete non-empty target_modules list emitted "
             "by the Verl merger"
         )
-    declared = declared_lora_ranks(config)
-    if not declared:
-        raise RuntimeError("exported text adapter has no valid configured LoRA rank")
+    try:
+        declared = strict_declared_lora_ranks(config)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     pairs: dict[str, dict[str, str]] = {}
     for key, shape in metadata.items():
@@ -499,6 +506,10 @@ def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
             )
         ):
             raise RuntimeError(f"exported text adapter tensor {key!r} is not positive and 2-D")
+        if _rank_for_module(module, declared) is None:
+            raise RuntimeError(
+                f"exported text adapter tensor module {module!r} has no configured LoRA rank"
+            )
         if lora_tensor_rank_disagrees(key, shape, declared):
             raise RuntimeError(
                 f"exported text adapter tensor {key!r} disagrees with its configured LoRA rank"
@@ -518,7 +529,7 @@ def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
         for name in selected:
             path = os.path.join(adapter_dir, name)
             if name.endswith(".safetensors"):
-                handle = stack.enter_context(safe_open(path, framework="numpy"))
+                handle = stack.enter_context(_open_safetensors_numpy(path))
                 tensor_keys = handle.keys()
                 sources.update({key: (handle, key) for key in tensor_keys})
             else:

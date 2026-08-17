@@ -29,8 +29,9 @@ from flash.adapters.artifacts import (
 )
 from flash.adapters.lora_rank import (
     DeclaredLoraRanks,
-    declared_lora_ranks,
+    _rank_for_module,
     lora_tensor_rank_disagrees,
+    strict_declared_lora_ranks,
 )
 from flash.serve.deploy import ServingError
 
@@ -485,7 +486,12 @@ def _declared_export_ranks(adapter_dir: Path) -> DeclaredLoraRanks:
         config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return DeclaredLoraRanks()
-    return declared_lora_ranks(config) if isinstance(config, dict) else DeclaredLoraRanks()
+    if not isinstance(config, dict):
+        return DeclaredLoraRanks()
+    try:
+        return strict_declared_lora_ranks(config)
+    except ValueError as exc:
+        raise _AdapterRankMismatch(str(exc)) from exc
 
 
 def _verify_export_tensor_ranks(adapter_dir: Path, scans: list[_WeightScan]) -> None:
@@ -506,15 +512,23 @@ def _verify_export_tensor_ranks(adapter_dir: Path, scans: list[_WeightScan]) -> 
     and paying that cost is not warranted for a representation the trainer no longer writes.
     """
     declared = _declared_export_ranks(adapter_dir)
-    if not declared:
-        return
+
+    def rank_is_invalid(key: str, descriptor: object) -> bool:
+        if not isinstance(descriptor, dict):
+            return False
+        infix = ".lora_A." if ".lora_A." in key else ".lora_B." if ".lora_B." in key else None
+        if infix is None:
+            return False
+        module = key.partition(infix)[0]
+        return _rank_for_module(module, declared) is None or lora_tensor_rank_disagrees(
+            key, descriptor.get("shape"), declared
+        )
+
     mismatched = [
         f"{key} has shape {descriptor.get('shape')}"
         for scan in scans
         for key, descriptor in (scan.header or {}).items()
-        if key != "__metadata__"
-        and isinstance(descriptor, dict)
-        and lora_tensor_rank_disagrees(key, descriptor.get("shape"), declared)
+        if key != "__metadata__" and rank_is_invalid(key, descriptor)
     ]
     if not mismatched:
         return
