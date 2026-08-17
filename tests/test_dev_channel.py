@@ -266,8 +266,11 @@ def test_scaffolded_files_follow_flash_cli_invocation(tmp_path, monkeypatch):
             importlib.reload(channel)
             importlib.reload(retained_module)
             env_setup = importlib.reload(setup_module)
-            monkeypatch.setattr(env_setup, "_require_setup_project", lambda _args: project)
-            monkeypatch.setattr(env_setup, "_require_setup_project_name", lambda _project: "Test")
+            monkeypatch.setattr(
+                env_setup,
+                "_require_setup_project",
+                lambda _args, **_kwargs: {"id": project, "name": "Test"},
+            )
             monkeypatch.setattr(
                 "flash.client.config.load_credentials",
                 lambda: ("https://flash.freesolo.co", "key"),
