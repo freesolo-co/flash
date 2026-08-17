@@ -432,6 +432,7 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
 
     assert [entry[0] for entry in registered] == [
         "rank-device-assert",
+        "nonempty-response-mask",
         "reentrant-checkpointing",
         "entropy-quantile",
         "per-turn-credit",
@@ -443,7 +444,9 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
         "multi-turn-loop",
     ]
     assert registered[0][2] == "verl.single_controller.base.worker"
-    assert [entry[2] for entry in registered[4:7]] == [
+    assert registered[1][2] == "verl.trainer.ppo.rollout_corr_helper"
+    assert registered[1][3] is verl_patches.install_nonempty_response_mask
+    assert [entry[2] for entry in registered[5:8]] == [
         "verl.experimental.agent_loop.agent_loop",
         "verl.experimental.agent_loop.agent_loop",
         "verl.experimental.agent_loop.agent_loop",
@@ -499,11 +502,164 @@ def test_parent_and_child_share_required_patch_registry_and_preserve_zero_entrop
     assert installed == expected
     assert expected == [
         "rank-device-assert",
+        "nonempty-response-mask",
         "entropy-quantile",
         "multi-turn-loop",
         "lora-rollout-guard",
         "gdn-varlen",
     ]
+
+
+def _truncated_thinking_response_mask(monkeypatch):
+    monkeypatch.setenv("FLASH_VERL_MULTITURN_URL", "http://bridge.invalid")
+    monkeypatch.setenv("FLASH_VERL_MAX_TURNS", "1")
+    monkeypatch.setenv("FLASH_VERL_MAX_MODEL_LEN", "512")
+    monkeypatch.setenv("FLASH_VERL_MAX_COMPLETION_TOKENS", "32")
+    monkeypatch.setenv("FLASH_VERL_THINKING", "1")
+    settings = grpo_multiturn._EpisodeSettings()
+    episode = grpo_multiturn._EpisodeTranscript(
+        [7] * 53,
+        response_capacity=459,
+        max_model_len=512,
+    )
+    max_tokens = episode.turn_budget(settings.max_completion_tokens)
+    tokenizer = SimpleNamespace(decode=lambda ids, skip_special_tokens=False: "x" * len(ids))
+    turn = grpo_multiturn.prepare_assistant_turn(
+        tokenizer,
+        list(range(32)),
+        stop_reason="completed",
+        max_tokens=max_tokens,
+        eos_token_ids=frozenset(),
+        stop_sequences=(),
+    )
+    episode.append_model_turn(turn, [0.0] * 32)
+    padded_mask = episode.response_mask + [0] * (
+        episode.response_capacity - len(episode.response_mask)
+    )
+    return settings, episode, turn, np.asarray(padded_mask, dtype=np.int64)
+
+
+def test_thinking_rollout_at_the_authored_32_token_cap_is_fully_masked(monkeypatch):
+    settings, episode, turn, response_mask = _truncated_thinking_response_mask(monkeypatch)
+
+    assert settings.thinking is True
+    assert settings.max_completion_tokens == 32
+    assert episode.response_capacity == 459
+    assert turn["max_tokens"] == 32
+    assert turn["truncated"] is True
+    assert len(episode.response_ids) == 32
+    assert len(response_mask) == 459
+    assert not response_mask.any(), "truncated response tokens became trainable"
+
+
+def _install_rollout_corr_test_module(monkeypatch, original):
+    helper = types.ModuleType("verl.trainer.ppo.rollout_corr_helper")
+    helper.compute_rollout_correction_and_add_to_batch = original
+    ppo = types.ModuleType("verl.trainer.ppo")
+    ppo.rollout_corr_helper = helper
+    trainer = types.ModuleType("verl.trainer")
+    trainer.ppo = ppo
+    verl = types.ModuleType("verl")
+    verl.trainer = trainer
+    for name, module in {
+        "verl": verl,
+        "verl.trainer": trainer,
+        "verl.trainer.ppo": ppo,
+        "verl.trainer.ppo.rollout_corr_helper": helper,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return helper
+
+
+def test_nonempty_response_mask_guard_blocks_the_all_empty_batch_before_verl(monkeypatch):
+    calls = []
+
+    def poison_original(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("poison original was called")
+
+    helper = _install_rollout_corr_test_module(monkeypatch, poison_original)
+    _, _, _, empty = _truncated_thinking_response_mask(monkeypatch)
+    batch = SimpleNamespace(batch={"response_mask": np.stack([empty, empty])})
+    verl_patches.install_nonempty_response_mask()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        helper.compute_rollout_correction_and_add_to_batch(batch, {"rollout_is": "token"})
+
+    assert str(exc_info.value) == (
+        "flash: no trainable response tokens remain in this batch: every rollout was truncated or "
+        "unusable, so no optimizer update will run. increase train.max_completion_tokens or disable "
+        "thinking. child context: FLASH_VERL_THINKING=1, "
+        "FLASH_VERL_MAX_COMPLETION_TOKENS=32."
+    )
+    assert calls == []
+
+
+def test_nonempty_response_mask_guard_delegates_a_mixed_batch_exactly_once(monkeypatch):
+    calls = []
+    sentinel = object()
+
+    def original(batch, rollout_corr_config):
+        calls.append((batch, rollout_corr_config))
+        return sentinel
+
+    helper = _install_rollout_corr_test_module(monkeypatch, original)
+    _, _, _, empty = _truncated_thinking_response_mask(monkeypatch)
+    mixed = np.stack([empty, empty.copy()])
+    mixed[1, 31] = 1
+    batch = SimpleNamespace(batch={"response_mask": mixed})
+    config = {"rollout_is": "token"}
+    verl_patches.install_nonempty_response_mask()
+
+    result = helper.compute_rollout_correction_and_add_to_batch(batch, config)
+
+    assert result is sentinel
+    assert calls == [(batch, config)]
+
+
+def test_nonempty_response_mask_installer_is_idempotent(monkeypatch):
+    helper = _install_rollout_corr_test_module(monkeypatch, lambda batch, config: (batch, config))
+
+    verl_patches.install_nonempty_response_mask()
+    installed = helper.compute_rollout_correction_and_add_to_batch
+    verl_patches.install_nonempty_response_mask()
+
+    assert helper.compute_rollout_correction_and_add_to_batch is installed
+    assert installed._flash_nonempty_response_mask is True
+
+
+def test_nonempty_response_mask_patch_is_required_and_marker_wired(monkeypatch, tmp_path):
+    config = {
+        "marker_file": str(tmp_path / "markers"),
+        "dp_cards": 1,
+        "total_steps": 1,
+    }
+    registered = []
+
+    def register(name, marker_file, target, installer, *args, **kwargs):
+        registered.append((name, marker_file, target, installer, args, kwargs))
+
+    monkeypatch.setattr(child_runtime, "load_plugin_config_file", lambda _name: config)
+    monkeypatch.setattr(child_runtime, "install_deferred_required", register)
+    monkeypatch.setattr(child_runtime, "install_deferred_lora_rollout_guard", lambda _path: None)
+
+    grpo_plugin.install()
+
+    assert registered == [
+        (
+            "nonempty-response-mask",
+            config["marker_file"],
+            "verl.trainer.ppo.rollout_corr_helper",
+            verl_patches.install_nonempty_response_mask,
+            (),
+            {},
+        )
+    ]
+    assert grpo_plugin.required_patch_names(config) == [
+        "nonempty-response-mask",
+        child_runtime.LORA_ROLLOUT_GUARD_SHIM,
+    ]
+    assert not Path(config["marker_file"]).exists()
 
 
 def _install_entropy_test_modules(monkeypatch, observed):
@@ -7388,6 +7544,7 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
     rl_train._write_rl_plugin_config(inp, files, gdn_reset_arch=None, loggers=[])
 
     assert files["expected_shims"] == [
+        "nonempty-response-mask",
         "reentrant-checkpointing",
         "entropy-quantile",
         "stop-sequences",
@@ -7429,6 +7586,7 @@ def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_card
 
     assert files["expected_shims"] == [
         "rank-device-assert",
+        "nonempty-response-mask",
         "reentrant-checkpointing",
         "lora-rollout-guard",
     ]

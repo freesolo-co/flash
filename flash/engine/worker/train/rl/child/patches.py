@@ -100,6 +100,42 @@ def install_rank_device_assert(n_gpus: int) -> None:
     worker.Worker.__init__ = init
 
 
+def install_nonempty_response_mask() -> None:
+    import os
+
+    from verl.trainer.ppo import rollout_corr_helper
+
+    original = rollout_corr_helper.compute_rollout_correction_and_add_to_batch
+    if getattr(original, "_flash_nonempty_response_mask", False):
+        return
+
+    def compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config):
+        response_mask = batch.batch.get("response_mask")
+        if response_mask is not None and not bool(response_mask.any()):
+            message = (
+                "flash: no trainable response tokens remain in this batch: every rollout was "
+                "truncated or unusable, so no optimizer update will run. increase "
+                "train.max_completion_tokens or disable thinking."
+            )
+            context = [
+                f"{name}={os.environ[name]}"
+                for name in (
+                    "FLASH_VERL_THINKING",
+                    "FLASH_VERL_MAX_COMPLETION_TOKENS",
+                )
+                if name in os.environ
+            ]
+            if context:
+                message += " child context: " + ", ".join(context) + "."
+            raise RuntimeError(message)
+        return original(batch, rollout_corr_config)
+
+    compute_rollout_correction_and_add_to_batch._flash_nonempty_response_mask = True
+    rollout_corr_helper.compute_rollout_correction_and_add_to_batch = (
+        compute_rollout_correction_and_add_to_batch
+    )
+
+
 def install_kl_ref_adapter() -> None:
     from contextlib import contextmanager
 

@@ -47,6 +47,15 @@ def required_patch_specs(config: dict) -> tuple[tuple, ...]:
             {},
         ),
         (
+            "nonempty-response-mask",
+            True,
+            "required",
+            "verl.trainer.ppo.rollout_corr_helper",
+            patches.install_nonempty_response_mask,
+            (),
+            {},
+        ),
+        (
             "reentrant-checkpointing",
             bool(config.get("reentrant_checkpointing")),
             "required",
