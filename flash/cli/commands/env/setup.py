@@ -360,18 +360,10 @@ _REASONING_OPTIONS = [
 _SKIP_TRACES = ""  # sentinel option value: scaffold the starter rows instead of importing
 
 
-def _require_setup_project(
-    args, *, api_url: str | None, api_key: str | None
-) -> Mapping[str, object]:
+def _require_setup_project(args, *, api_url: str | None, api_key: str) -> Mapping[str, object]:
     """Resolve and validate the one explicit project used by the whole scaffold."""
     from flash.client import ClientError, list_projects, resolve_project
     from flash.client.http import has_freesolo_backend
-
-    if not api_key:
-        raise ClientError(
-            f"not logged in. Run `{CLI_NAME} login` before `{CLI_NAME} env setup` "
-            "so the project can be validated"
-        )
 
     supplied = str(getattr(args, "project", "") or "").strip()
     if supplied:
@@ -553,7 +545,7 @@ def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
     return next(iter(found.values()), None)
 
 
-def _traces_dataset(args, project_id: str) -> str | None:
+def _traces_dataset(args, project_id: str, api_key: str) -> str | None:
     """Optionally export traces from the already-selected project."""
     if not _setup_interactive(args):
         return None
@@ -568,7 +560,7 @@ def _traces_dataset(args, project_id: str) -> str | None:
     if use_traces == _SKIP_TRACES:
         return None
     try:
-        exported = traces.fetch_records(project_id)
+        exported = traces.fetch_records(project_id, api_key)
     except Exception as exc:  # trace import is optional after project validation succeeds
         _warn(f"could not export traces from {project_id} ({exc}); using the starter dataset")
         return None
@@ -827,6 +819,11 @@ def cmd_env_setup(args) -> int:
     from flash.client.config import load_credentials
 
     api_url, api_key = load_credentials()
+    if not api_key:
+        raise ClientError(
+            f"not logged in. Run `{CLI_NAME} login` before `{CLI_NAME} env setup` "
+            "so the project can be validated"
+        )
     project = _require_setup_project(args, api_url=api_url, api_key=api_key)
     project_id = str(project["id"])
     project_name = _wandb_project(project)
@@ -839,7 +836,7 @@ def cmd_env_setup(args) -> int:
     dataset = Path("dataset/train.jsonl")
     # trace import is optional and can only read the selected project. an existing dataset is never
     # overwritten, so importing into it would be a silently discarded download.
-    traces_jsonl = None if dataset.exists() else _traces_dataset(args, project_id)
+    traces_jsonl = None if dataset.exists() else _traces_dataset(args, project_id, api_key)
     multi_turn, starter_env_exists = _resolve_turn_mode(args, starter_env, dataset)
 
     rl = Path("configs/rl.toml")

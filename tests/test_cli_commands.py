@@ -1086,7 +1086,7 @@ def test_env_setup_interactive_retains_the_selected_project_name(monkeypatch, tm
 
     project_id = "11111111-1111-4111-8111-111111111111"
     project_name = "Interactive Project"
-    calls = {"load_credentials": 0, "get_project": 0}
+    calls = {"load_credentials": 0, "get_project": 0, "fetch_records": 0}
 
     def _load_credentials():
         calls["load_credentials"] += 1
@@ -1096,14 +1096,20 @@ def test_env_setup_interactive_retains_the_selected_project_name(monkeypatch, tm
         calls["get_project"] += 1
         return {"id": selected, "name": project_name}
 
+    def _fetch_records(selected, api_key):
+        calls["fetch_records"] += 1
+        assert (selected, api_key) == (project_id, "key-1")
+        return {"records": [{"input": "trace input", "output": "trace output"}]}
+
     monkeypatch.setattr("flash.client.config.load_credentials", _load_credentials)
     monkeypatch.setattr(env_setup, "_setup_interactive", lambda _args: True)
     monkeypatch.setattr(
         "flash.client.list_projects", lambda _key: [{"id": project_id, "name": "Listed Name"}]
     )
     monkeypatch.setattr(env_setup.render, "select_required", lambda _prompt, _options: project_id)
-    monkeypatch.setattr(env_setup.render, "select", lambda *_a, **_k: env_setup._SKIP_TRACES)
+    monkeypatch.setattr(env_setup.render, "select", lambda *_a, **_k: "yes")
     monkeypatch.setattr("flash.client.get_project", _get_project)
+    monkeypatch.setattr(env_setup.traces, "fetch_records", _fetch_records)
     monkeypatch.chdir(tmp_path)
 
     assert (
@@ -1121,7 +1127,11 @@ def test_env_setup_interactive_retains_the_selected_project_name(monkeypatch, tm
         == 0
     )
 
-    assert calls == {"load_credentials": 1, "get_project": 1}
+    assert calls == {"load_credentials": 1, "get_project": 1, "fetch_records": 1}
+    assert json.loads((tmp_path / "dataset/train.jsonl").read_text()) == {
+        "input": "trace input",
+        "output": "trace output",
+    }
     for name in ("sft.toml", "rl.toml", "opd.toml"):
         parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
         assert parsed["wandb"]["project"] == project_name
