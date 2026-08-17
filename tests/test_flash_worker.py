@@ -402,6 +402,139 @@ def test_the_handlers_inline_redactor_covers_multiline_secret_components():
         assert secret not in detail
 
 
+def test_all_worker_redactors_share_the_same_secret_corpus(monkeypatch):
+    """the canonical, bootstrap, and source-shipped redactors must stay behaviorally identical."""
+    import ast
+    import inspect
+    import os
+    import re
+    import textwrap
+
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
+    from flash.providers._lifecycle.bootstrap_secrets import _safe_detail as bootstrap_safe_detail
+    from flash.providers.runpod.serverless import endpoints
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
+    namespace: dict = {"os": os, "re": re}
+    for name in ("_percent_pattern", "_needles", "_safe_detail"):
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
+    handler_safe_detail = namespace["_safe_detail"]
+
+    def canonical_safe_detail(text: str, secrets: dict[str, str]) -> str:
+        with monkeypatch.context() as environment:
+            environment.setenv(SECRET_ENV_KEYS_ENV, ",".join(secrets))
+            for key, secret in secrets.items():
+                environment.setenv(key, secret)
+            return sanitize_diagnostic(text, limit=1000)
+
+    multiline_secret = (
+        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
+    )
+    redacted_prefix = "token=<redacted> "
+    cases = [
+        (
+            "comma-delimited-semicolon",
+            "token=;, next",
+            {"PIN_SECRET": ";"},
+            "token=<redacted>, next",
+        ),
+        (
+            "comma-delimited-comma",
+            "token=,, next",
+            {"PIN_SECRET": ","},
+            "token=<redacted>, next",
+        ),
+        (
+            "comma-delimited-bearer",
+            "Bearer !, next",
+            {"PIN_SECRET": "!"},
+            "Bearer <redacted>, next",
+        ),
+        (
+            "semicolon-delimited-keyed",
+            "token=;; next",
+            {"PIN_SECRET": ";"},
+            "token=<redacted>; next",
+        ),
+        (
+            "semicolon-delimited-bearer",
+            "Bearer !; next",
+            {"PIN_SECRET": "!"},
+            "Bearer <redacted>; next",
+        ),
+        ("non-delimited-keyed", "token=;next", {"PIN_SECRET": ";"}, "token=;next"),
+        ("non-delimited-comma", "token=,next", {"PIN_SECRET": ","}, "token=,next"),
+        ("non-delimited-bearer", "Bearer !next", {"PIN_SECRET": "!"}, "Bearer !next"),
+        ("keyed-punctuation", "token=;", {"PIN_SECRET": ";"}, "token=<redacted>"),
+        ("bearer-punctuation", "Bearer !", {"PIN_SECRET": "!"}, "Bearer <redacted>"),
+        (
+            "ordinary-punctuation",
+            "module.py: values a,b; failed at /tmp/a.py",
+            {"PIN_SECRET": "."},
+            "module.py: values a,b; failed at /tmp/a.py",
+        ),
+        (
+            "encoded-literal-case",
+            "literal A%2FB",
+            {"PIN_SECRET": "A%2FB"},
+            "literal <redacted>",
+        ),
+        (
+            "encoded-literal-case-control",
+            "literal A%2fB",
+            {"PIN_SECRET": "A%2FB"},
+            "literal A%2fB",
+        ),
+        (
+            "encoded-raw-case",
+            "encoded A%2fB",
+            {"PIN_SECRET": "A/B"},
+            "encoded <redacted>",
+        ),
+        (
+            "encoded-raw-case-control",
+            "encoded a%2fb",
+            {"PIN_SECRET": "A/B"},
+            "encoded a%2fb",
+        ),
+        (
+            "multiline-component",
+            "ssh auth: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+            {"DEPLOY_SECRET": multiline_secret},
+            "ssh auth: <redacted>",
+        ),
+        (
+            "long-bounded-output",
+            "token=; " + "x" * 1200,
+            {"PIN_SECRET": ";"},
+            redacted_prefix + "x" * (1000 - len(redacted_prefix)),
+        ),
+    ]
+    for label, secret, encoded in (
+        ("dot", ".", "%2E"),
+        ("dash", "-", "%2D"),
+        ("tilde", "~", "%7E"),
+        ("slash", "/", "%2f"),
+    ):
+        cases.append(
+            (
+                f"generated-percent-{label}",
+                f"encoded {encoded}",
+                {"PIN_SECRET": secret},
+                "encoded <redacted>",
+            )
+        )
+
+    for label, text, secrets, expected in cases:
+        actual = (
+            canonical_safe_detail(text, secrets),
+            bootstrap_safe_detail(text, limit=1000, secrets=secrets),
+            handler_safe_detail(text, secrets, 1000),
+        )
+        assert actual == (expected, expected, expected), label
+
+
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
     """The worker console is ALWAYS uploaded — live (periodic) while the worker runs and once more
     when it exits — so every print reaches `flash runs log`, not just a post-mortem tail on

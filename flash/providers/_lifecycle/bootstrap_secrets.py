@@ -108,7 +108,7 @@ def _redact_values(text: str, values: set[str]) -> str:
     for needle in sorted(shaped, key=len, reverse=True):
         escaped = re.escape(needle)
         text = re.sub(
-            rf"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)(\s*[:=]\s*)(?:bearer\s+)?{escaped}(?=\s|$)",
+            rf"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)(\s*[:=]\s*)(?:bearer\s+)?{escaped}(?=[\s,;]|$)",
             lambda match: (
                 "<redacted>"
                 if match.group(1) in values
@@ -117,7 +117,7 @@ def _redact_values(text: str, values: set[str]) -> str:
             text,
         )
         text = re.sub(
-            rf"(?i)\b(bearer)\s+{escaped}(?=\s|$)",
+            rf"(?i)\b(bearer)\s+{escaped}(?=[\s,;]|$)",
             lambda match: "<redacted>" if match.group(1) in values else "Bearer <redacted>",
             text,
         )

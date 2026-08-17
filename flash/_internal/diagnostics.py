@@ -125,7 +125,7 @@ def sanitize_diagnostic(value: Any, *, limit: int = 2000) -> str:
     for secret in sorted(shaped, key=len, reverse=True):
         escaped = re.escape(secret)
         text = re.sub(
-            rf"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token|secret|password)(\s*[:=]\s*)(?:bearer\s+)?{escaped}(?=\s|$)",
+            rf"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token|secret|password)(\s*[:=]\s*)(?:bearer\s+)?{escaped}(?=[\s,;]|$)",
             lambda match: (
                 "<redacted>"
                 if match.group(1) in raw_values
@@ -134,7 +134,7 @@ def sanitize_diagnostic(value: Any, *, limit: int = 2000) -> str:
             text,
         )
         text = re.sub(
-            rf"(?i)\b(bearer)\s+{escaped}(?=\s|$)",
+            rf"(?i)\b(bearer)\s+{escaped}(?=[\s,;]|$)",
             lambda match: "<redacted>" if match.group(1) in raw_values else "Bearer <redacted>",
             text,
         )
