@@ -50,9 +50,7 @@ from flash.content.multimodal import (  # noqa: E402
 class TeacherError(RuntimeError):
     """A classified managed-teacher failure."""
 
-    def __init__(
-        self, *args, permanent: bool = False, provider_status: int | None = None
-    ) -> None:
+    def __init__(self, *args, permanent: bool = False, provider_status: int | None = None) -> None:
         super().__init__(*args)
         self.permanent = permanent
         self.provider_status = validated_provider_status(provider_status)
@@ -572,10 +570,12 @@ class TeacherClient:
                 code = "broker_http_error"
                 classification = "permanent"
                 provider_status = None
+                structured_error = False
                 try:
                     payload = json.loads(error.read(64 * 1024 + 1).decode("utf-8"))
                     broker_error = payload.get("error") if isinstance(payload, dict) else None
                     if isinstance(broker_error, dict):
+                        structured_error = True
                         raw_code = broker_error.get("code")
                         raw_classification = broker_error.get("classification")
                         provider_status = validated_provider_status(
@@ -595,6 +595,12 @@ class TeacherClient:
                     http.client.IncompleteRead,
                 ):
                     pass
+                if (
+                    code == "broker_http_error"
+                    and not structured_error
+                    and (error.code in {408, 409, 429} or 500 <= error.code <= 599)
+                ):
+                    classification = "transient"
                 retryable = classification == "transient"
                 provider_status_detail = (
                     f" provider_status={provider_status}" if provider_status is not None else ""

@@ -899,9 +899,10 @@ class _StaticResponse:
 class _LedgerBrokerTransport:
     """Drive the worker client through the real broker and sqlite ledger in-process."""
 
-    def __init__(self, token, *, drop_responses=0):
+    def __init__(self, token, *, drop_responses=0, strip_error_bodies=0):
         self.token = token
         self.drop_responses = drop_responses
+        self.strip_error_bodies = strip_error_bodies
         self.request_ids = []
 
     def urlopen(self, request, *, timeout):
@@ -917,12 +918,16 @@ class _LedgerBrokerTransport:
                 raw_body=request.data,
             )
         except teacher_broker.TeacherBrokerError as error:
+            body = json.dumps(error.payload()).encode()
+            if self.strip_error_bodies > 0:
+                self.strip_error_bodies -= 1
+                body = b""
             raise urllib.error.HTTPError(
                 request.full_url,
                 error.status_code,
                 error.code,
                 {},
-                io.BytesIO(json.dumps(error.payload()).encode()),
+                io.BytesIO(body),
             ) from None
         if self.drop_responses > 0:
             self.drop_responses -= 1
@@ -977,14 +982,18 @@ def broker_ledger(monkeypatch, tmp_path):
     )
 
 
-def _ledger_client(token, *, drop_responses=0):
+def _ledger_client(token, *, drop_responses=0, strip_error_bodies=0):
     client = TeacherClient(
         token,
         "https://plane.example",
         "parasail-glm-52",
         tokenizer=_WholeTextTokenizer(),
     )
-    transport = _LedgerBrokerTransport(token, drop_responses=drop_responses)
+    transport = _LedgerBrokerTransport(
+        token,
+        drop_responses=drop_responses,
+        strip_error_bodies=strip_error_bodies,
+    )
     client._transport = transport
     return client, transport
 
@@ -1061,6 +1070,36 @@ def test_provider_429_is_retried_with_bounded_backoff(broker_ledger, monkeypatch
         transport.request_ids[0]
     )
     assert (state, attempts) == ("succeeded", 3)
+    assert (input_tokens, output_tokens) == (1, 1)
+
+
+def test_provider_429_with_stripped_broker_body_retries_and_bills_once(broker_ledger, monkeypatch):
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+
+    outcomes = [(429, b"rate limited"), (200, _parasail_success())]
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return outcomes[len(dispatches) - 1]
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    sleeps = []
+    monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
+    client, transport = _ledger_client(broker_ledger, strip_error_bodies=1)
+
+    scored = client.score("question", "answer")
+
+    assert (scored.input_tokens, scored.output_tokens) == (1, 1)
+    assert len(dispatches) == 2
+    assert len(transport.request_ids) == 2
+    assert len(set(transport.request_ids)) == 1
+    assert sleeps == [2.0]
+    state, attempts, _status, _error, input_tokens, output_tokens = _ledger_row(
+        transport.request_ids[0]
+    )
+    assert (state, attempts) == ("succeeded", 2)
     assert (input_tokens, output_tokens) == (1, 1)
 
 

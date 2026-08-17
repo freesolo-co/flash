@@ -999,6 +999,106 @@ def test_worker_reuses_one_logical_request_id_across_transport_retries(monkeypat
     assert len(set(request_ids)) == 1
 
 
+@pytest.mark.parametrize("body", [b"", b"<html>bad gateway</html>", b'{"error":'])
+def test_worker_retries_unstructured_502_with_same_request_id(monkeypatch, body):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    request_ids = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return _response()
+
+    def urlopen(_transport, request, timeout=None):
+        request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
+        if len(request_ids) == 1:
+            raise urllib.error.HTTPError(request.full_url, 502, "bad gateway", {}, io.BytesIO(body))
+        return Response()
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    assert client.score("question", "answer")
+    assert len(request_ids) == 2
+    assert len(set(request_ids)) == 1
+
+
+@pytest.mark.parametrize("status", [408, 409, 429, 500, 502, 599])
+def test_worker_retries_unstructured_transient_http_status(monkeypatch, status):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    request_ids = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return _response()
+
+    def urlopen(_transport, request, timeout=None):
+        request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
+        if len(request_ids) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, status, "broker failure", {}, io.BytesIO(b"")
+            )
+        return Response()
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    assert client.score("question", "answer")
+    assert len(request_ids) == 2
+    assert len(set(request_ids)) == 1
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 413, 415, 422])
+def test_worker_keeps_unstructured_permanent_4xx_terminal(monkeypatch, status):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    request_ids = []
+
+    def urlopen(_transport, request, timeout=None):
+        request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
+        raise urllib.error.HTTPError(
+            request.full_url, status, "broker rejection", {}, io.BytesIO(b"<html>rejected</html>")
+        )
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert "broker_http_error (permanent)" in str(error.value)
+    assert len(request_ids) == 1
+
+
 def test_worker_retries_body_ingress_timeout_with_same_request_id(monkeypatch):
     import urllib.error
 
@@ -1116,6 +1216,19 @@ def test_worker_fails_closed_on_nontransient_broker_classification(monkeypatch, 
     assert "provider_rejected (permanent)" in str(error.value)
     assert "provider_status=" not in str(error.value)
     assert len(request_ids) == 1
+
+
+def test_opd_batch_error_preserves_provider_status():
+    from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.batching import _teacher_batch_error
+
+    wrapped = _teacher_batch_error(
+        TeacherError("rate limited", permanent=False, provider_status=429)
+    )
+
+    assert isinstance(wrapped, TeacherError)
+    assert wrapped.permanent is False
+    assert wrapped.provider_status == 429
 
 
 def test_worker_renders_provider_status_without_leaking_broker_payload(monkeypatch):
