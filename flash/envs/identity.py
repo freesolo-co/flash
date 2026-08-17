@@ -91,6 +91,18 @@ def is_freesolo_environment_id(value: str) -> bool:
     return is_managed_environment_slug(value) or is_github_environment_ref(value)
 
 
+def canonical_environment_id(value: str) -> str:
+    """Return the stable identity spelling for a managed slug or GitHub reference."""
+    text = (value or "").strip()
+    managed = canonical_managed_environment_slug(text)
+    if managed is not None:
+        return managed
+    parsed = _parse_github_environment_ref(text)
+    if parsed is None:
+        raise ValueError(f"not a Freesolo environment id: {value!r}")
+    return parsed.canonical()
+
+
 def managed_slug_to_github_ref(value: str) -> str:
     parsed = _parse_managed_environment_slug(value)
     if parsed is None:

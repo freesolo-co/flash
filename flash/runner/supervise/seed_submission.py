@@ -217,12 +217,7 @@ def _build_context(
     )
     cache_fallback_attempts = 1 if started_with_shared_cache and max_retries > 0 else 0
     retry_budget = _lifecycle._RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
-    # pin the environment ref once, here, before any attempt runs -- not per attempt. submit's pin
-    # is best-effort, so a github blip there leaves resolved_sha empty, and a managed slug points at
-    # environment-hub@main, which moves. attempt_start > 0 means a previous invocation already ran an
-    # attempt (post-restart recovery), so resolving now could pin a commit different from the one
-    # that attempt used; _pin_environment_for_run fails closed on that.
-    spec = _lifecycle._pin_environment_for_run(spec, log, attempt_started=attempt_start > 0)
+    # environment transport is already pinned and staged by the controller before allocation.
     return _SubmitContext(
         spec=spec,
         seed=seed,
@@ -578,12 +573,6 @@ def _build_candidate_plan(
     effective_spec = _spec_with_gpu(ctx.spec, chosen.gpu, getattr(chosen, "gpu_count", 1))
     if ctx.drop_weight_cache:
         effective_spec = _lifecycle._drop_weight_cache(effective_spec)
-    # carry the run's one pin (resolved above the loop) onto this attempt's spec. _spec_with_gpu
-    # and _drop_weight_cache rebuild the spec, so the pin has to be re-applied, but it is never
-    # re-resolved: every attempt is handed the same commit.
-    effective_spec = _lifecycle._spec_with_resolved_env_sha(
-        effective_spec, ctx.spec.environment.resolved_sha
-    )
     try:
         run_spec = _spec_with_remaining_wall(effective_spec, require_provider_minimum=True)
     except RuntimeError:

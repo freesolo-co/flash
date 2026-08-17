@@ -92,7 +92,7 @@ MANAGED_GPU_FIELDS = {
     "max_retries",
     "max_wall_seconds",
 }
-MANAGED_ENVIRONMENT_FIELDS = {"resolved_sha"}
+MANAGED_ENVIRONMENT_FIELDS = {"package", "resolved_sha"}
 
 
 def test_public_payload_emits_exactly_the_authorable_keys():

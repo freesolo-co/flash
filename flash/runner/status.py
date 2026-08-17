@@ -76,6 +76,11 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     has_workload_profile = bool(
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
+    from flash.envs.identity import is_freesolo_environment_id
+
+    requires_staged_environment = is_freesolo_environment_id(public_spec.environment.id)
+    if requires_staged_environment and worker_spec.environment.package is None:
+        raise ValueError("persisted effective preparation failed integrity validation")
     # the auto-pin marker is excluded from the structural compare (the public half always reads
     # False by construction), so nothing else here would catch a forged worker-half marker. deploy
     # reads it to decide whether to relax the authored-pin rejection, which makes it a privilege
@@ -98,7 +103,9 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     # MAX_COMBINATION_CARDS, and unlike `model_revision_auto` it cannot relax a deploy-time
     # rejection -- a forged marker only widens the allocator's ceiling, which the VRAM fit check and
     # the geometry cap still constrain.
-    if (has_workload_profile or worker_spec.model_revision_auto) and (
+    if (
+        has_workload_profile or requires_staged_environment or worker_spec.model_revision_auto
+    ) and (
         not isinstance(stored_digest, str)
         or stored_digest
         != runner._preparation_digest(

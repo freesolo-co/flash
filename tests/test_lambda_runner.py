@@ -274,9 +274,21 @@ def test_build_worker_env_exports_attempt():
     # rejected as mismatched, potentially losing valid retriable evidence.
     from flash.providers._lifecycle import bootstrap as lb
 
-    payload = {"phase": "sft", "seed": 0, "flash_arm": "vast", "attempt": 2, "job_spec_json": "{}"}
+    payload = {
+        "phase": "sft",
+        "seed": 0,
+        "flash_arm": "vast",
+        "attempt": 2,
+        "job_spec_json": "{}",
+        "env": {
+            "GITHUB_TOKEN": "ghp-private-vcs",
+            "GIT_ASKPASS": "/tmp/payload-askpass",
+        },
+    }
     env = lb.build_worker_env(payload)
     assert env["ATTEMPT"] == "2"  # exported from the payload attempt, as a str (worker reads a str)
+    assert "GITHUB_TOKEN" not in env
+    assert "GIT_ASKPASS" not in env
     payload.pop("attempt")
     with pytest.raises(RuntimeError, match="attempt identity is invalid"):
         lb.build_worker_env(payload)
@@ -370,7 +382,11 @@ class _FakePipProc:
 
 def _pip_payload(**extra) -> dict:
     return {
-        "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
+        "env": {
+            "GITHUB_TOKEN": "ghp-secret",
+            "GIT_ASKPASS": "/tmp/payload-askpass",
+            "PYTHONPATH": "",
+        },
         "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
         **extra,
     }
@@ -393,7 +409,7 @@ def _wire_pip(monkeypatch, results):
     return lb, calls
 
 
-def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch):
+def test_bootstrap_private_vcs_pip_uses_temporary_askpass(monkeypatch):
     import os
     from pathlib import Path
 
@@ -411,7 +427,9 @@ def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch
         calls.append({"cmd": cmd, "env": env})
         return _FakePipProc()
 
-    monkeypatch.setattr(lb.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("GITHUB_TOKEN", "operator-secret")
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
+    monkeypatch.setattr(lb.bootstrap_pip.subprocess, "Popen", fake_popen)
     lb.install_extra_pip(_pip_payload())
 
     assert len(calls) == 1
@@ -419,7 +437,7 @@ def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch
     assert env["GITHUB_TOKEN"] == "ghp-secret"
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert askpass_paths
-    assert all(not p.exists() for p in askpass_paths)
+    assert all(not path.exists() for path in askpass_paths)
 
 
 def test_bootstrap_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
@@ -433,15 +451,15 @@ def test_bootstrap_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
         askpass_paths.append(Path(env["GIT_ASKPASS"]))
         return _FakePipProc()
 
-    original_remove = lb.os.remove
+    original_remove = lb.bootstrap_pip.os.remove
 
     def fake_remove(path):
         if Path(path) in askpass_paths:
             raise PermissionError("locked askpass helper")
         return original_remove(path)
 
-    monkeypatch.setattr(lb.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(lb.os, "remove", fake_remove)
+    monkeypatch.setattr(lb.bootstrap_pip.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(lb.bootstrap_pip.os, "remove", fake_remove)
 
     try:
         lb.install_extra_pip(_pip_payload())

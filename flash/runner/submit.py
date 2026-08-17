@@ -277,7 +277,7 @@ def submit_job(
         # the source repo, so this HF write stays real-submit-only (unlike the read-only preflights
         # above, which now run in both modes).
         _runner()._mark_warmstart_source(worker_spec, public_spec.run_id)
-    # env ref->sha pin is deferred (background) or after status save (sync) — never on creation path.
+    # environment staging runs after status persistence and before provider allocation.
     status = _runner().RunStatus(
         run_id=public_spec.run_id,
         state="queued",
@@ -320,11 +320,9 @@ def submit_job(
         threading.Thread(
             target=_runner()._run_job_background,
             args=(worker_spec, runtime_secrets or {}),
-            kwargs={"resolve_env_sha": True},
             daemon=True,
         ).start()
         return _runner().get_status(public_spec.run_id)
-    worker_spec = _runner()._assign_resolved_env_sha(worker_spec)
     if runtime_secrets:
         _runner()._run_job(worker_spec, runtime_secrets=runtime_secrets)
     else:

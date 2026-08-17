@@ -36,7 +36,15 @@ def _spec(run_id="flash-1700000001-rt01", algorithm="sft", **gpu_kw) -> JobSpec:
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": algorithm,
                 "run_id": run_id,
-                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "environment": {
+                    "id": "github:owner/repo@main:env/environment.py",
+                    "resolved_sha": "a" * 40,
+                    "package": {
+                        "artifact_revision": "b" * 40,
+                        "archive_sha256": "c" * 64,
+                        "manifest_sha256": "d" * 64,
+                    },
+                },
                 "train": {"epochs": 1, "max_examples": 8},
                 "gpu": gpu,
             }
@@ -610,6 +618,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     monkeypatch.setattr("flash.providers._lifecycle.worker.upload_code", lambda *a, **k: None)
     monkeypatch.setattr(orch, "flash_code_prefix", lambda: "code/test/flash")
+    monkeypatch.setattr(orch, "stage_environment_package", lambda spec, **_kwargs: spec)
     monkeypatch.setattr(orch, "_persist_metrics", lambda *a, **k: 0.0)
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
@@ -897,42 +906,23 @@ def test_the_reported_reason_describes_the_resolve_that_was_actually_used(orch, 
     assert calls == [1], f"the pin must be resolved exactly once, got {len(calls)} calls"
 
 
-def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
-    """A pin the lifecycle fallback recovers must survive a control-plane restart.
-
-    Submit's pin is best-effort, so a GitHub blip leaves the run unpinned and
-    `_pin_environment_for_run` resolves it instead. That SHA has to reach
-    `effective_preparation.worker_spec` before provisioning: recovery reloads only the persisted
-    record and calls that helper with `attempt_started=True`, which deliberately refuses to resolve
-    again. A pin held in the lifecycle's local `spec` alone would leave recovery unpinned, so a later
-    attempt could resolve a moved ref to different code while resuming the first attempt's
-    checkpoint.
-
-    Exercised on grpo because sft can no longer reach this state at all: its profile gate rejects an
-    unpinned environment at submit instead of deferring the pin (the fail-closed test above). grpo
-    and opd keep the best-effort pin, so the fallback they depend on is still live.
-    """
+def test_controller_staging_is_persisted_before_provider_submission(orch, monkeypatch):
     from dataclasses import replace
 
     import flash.core.catalog as catalog
-    import flash.envs.loader as env_loader
+    from flash.core.spec import EnvironmentPackageSpec
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import jobs as rp_jobs
     from flash.runner.supervise import lifecycle
 
-    first_sha = "a" * 40
-    # every resolution AFTER the fallback returns a different commit, standing in for a push landing
-    # mid-run. seeing it anywhere proves something re-resolved a ref that was already pinned.
-    moved_sha = "c" * 40
-    resolutions = []
+    resolved_sha = "e" * 40
+    package = EnvironmentPackageSpec(
+        artifact_revision="f" * 40,
+        archive_sha256="1" * 64,
+        manifest_sha256="2" * 64,
+    )
     persisted_at_submission = []
-
-    def fake_resolve(_parsed, *_args, **_kwargs):
-        resolutions.append(len(resolutions))
-        if not resolutions[:-1]:
-            raise RuntimeError("github rate limit at submit time")
-        return first_sha if len(resolutions) == 2 else moved_sha
 
     monkeypatch.setattr(
         orch,
@@ -940,13 +930,27 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
         lambda spec, **_kw: replace(spec, model_revision="b" * 40, model_revision_auto=True),
     )
     monkeypatch.setattr(orch, "resolve_model", lambda model, *a, **k: catalog.MODELS[model])
+    monkeypatch.setattr(
+        orch,
+        "preflight_validate_environment_ref",
+        lambda spec: (spec, True),
+    )
+
+    def fake_stage(spec, **_kwargs):
+        return replace(
+            spec,
+            environment=replace(
+                spec.environment,
+                resolved_sha=resolved_sha,
+                package=package,
+            ),
+        )
 
     def fake_runpod_submit(run_spec, seed, **kwargs):
         persisted = orch.get_status(run_spec.run_id).effective_preparation["worker_spec"]
-        persisted_at_submission.append(persisted["environment"]["resolved_sha"])
+        persisted_at_submission.append(persisted["environment"])
         return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1})
 
-    monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
     monkeypatch.setattr(
         "flash.cost.spec.estimate_for_spec",
         lambda _spec, **_kwargs: type("Estimate", (), {"total_usd": 1.0})(),
@@ -955,6 +959,7 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     monkeypatch.setattr("flash.providers._lifecycle.worker.upload_code", lambda *a, **k: None)
     monkeypatch.setattr(orch, "flash_code_prefix", lambda: "code/test/flash")
+    monkeypatch.setattr(orch, "stage_environment_package", fake_stage)
     monkeypatch.setattr(orch, "_persist_metrics", lambda *a, **k: 0.0)
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
@@ -962,18 +967,19 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     public = _public_spec(algorithm="grpo")
     orch.submit_job(public)
 
-    # the pin must already be persisted when the provider is called, not written back afterwards:
-    # a crash between provisioning and a later write is exactly the window recovery reads in.
-    assert persisted_at_submission == [first_sha]
-
-    # a control-plane restart keeps nothing in memory -- this is the whole recovery input.
+    assert len(persisted_at_submission) == 1
+    persisted_environment = persisted_at_submission[0]
+    assert persisted_environment["id"] == public.environment.id
+    assert persisted_environment["resolved_sha"] == resolved_sha
+    assert persisted_environment["package"] == {
+        "artifact_revision": package.artifact_revision,
+        "archive_sha256": package.archive_sha256,
+        "manifest_sha256": package.manifest_sha256,
+    }
     restarted = orch.get_status(public.run_id)
-    assert (
-        restarted.effective_preparation["worker_spec"]["environment"]["resolved_sha"] == first_sha
-    )
     recovered = orch.reallocation_spec_from_status(restarted, verify_source=True)
-    assert recovered.environment.resolved_sha == first_sha
-    assert moved_sha not in resolutions
+    assert recovered.environment.resolved_sha == resolved_sha
+    assert recovered.environment.package == package
 
 
 @pytest.mark.parametrize(

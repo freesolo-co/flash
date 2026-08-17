@@ -139,10 +139,8 @@ def build_worker_env(
         "HF_TOKEN",
         "GITHUB_TOKEN",
     ):
-        # Stripped, and a blank value forwards NOTHING. The worker's git askpass and HF client both
-        # branch on presence, so a whitespace-only credential is worse than an absent one: it turns
-        # an anonymous public fetch into an authenticated request with a malformed token, which
-        # GitHub and HF reject outright.
+        # stripped, and a blank value forwards nothing. the pip bootstrap uses github only for a
+        # request-scoped askpass helper, then removes both values before launching training code.
         value = (os.environ.get(key) or "").strip()
         if value:
             env[key] = value

@@ -45,7 +45,7 @@ def _rollout_spec() -> JobSpec:
                 "algorithm": "grpo",
                 "run_id": "persisted-envelope",
                 "project": "11111111-1111-4111-8111-111111111111",
-                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "environment": {},
                 "gpu": {"type": "H100", "count": 1},
                 "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 32},
             }

@@ -92,8 +92,11 @@ from flash.engine.worker.train.rl.config import (
     grpo_overrides,
     resolve_grpo_prompts_per_step,
 )
-from flash.envs.adapter import GitHubTransientError
-from flash.envs.base import load_environment
+from flash.envs.staged import (
+    StagedEnvironmentMaterialization,
+    StagedEnvironmentTransientError,
+    load_staged_freesolo_environment,
+)
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 
@@ -184,8 +187,11 @@ def _load_active_env():
             "(a Freesolo environment id like 'your-org/your-project/your-env', returned by "
             "`flash env push --project <project-uuid> --name <name>`)."
         )
-    env = load_environment(
-        env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
+    global ACTIVE_ENV_PACKAGE
+    env, ACTIVE_ENV_PACKAGE = load_staged_freesolo_environment(
+        JOB_SPEC.environment,
+        JOB_SPEC.environment.params,
+        hf_repo=JOB_SPEC.train.hf_repo,
     )
     from flash.content.multimodal import validate_image_observation_environment
 
@@ -200,6 +206,15 @@ def _load_active_env():
 
 
 ACTIVE_ENV = None
+ACTIVE_ENV_PACKAGE: StagedEnvironmentMaterialization | None = None
+
+
+def _cleanup_active_env_package() -> None:
+    global ACTIVE_ENV_PACKAGE
+    if ACTIVE_ENV_PACKAGE is None:
+        return
+    ACTIVE_ENV_PACKAGE.cleanup()
+    ACTIVE_ENV_PACKAGE = None
 
 
 def require_active_env():
@@ -219,10 +234,7 @@ def require_active_env():
 
 
 def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
-    # GitHubTransientError covers both the quota case and GitHub being unreachable. The worker's
-    # answer to either is the same -- reschedule -- so it catches the base; only the control plane,
-    # which has a status code to report, distinguishes them.
-    retriable = isinstance(exc, (RetriableInfraError, GitHubTransientError))
+    retriable = isinstance(exc, (RetriableInfraError, StagedEnvironmentTransientError))
     return {"retriable": retriable, "oom": (not retriable and is_cuda_oom(exc))}
 
 
@@ -368,8 +380,11 @@ def _run_worker_mode() -> None:
     _restrict_fla_gdn_autotune_on_blackwell()
     heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
     load_mega_cache()
-    handler()
-    # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.
+    try:
+        handler()
+    finally:
+        _cleanup_active_env_package()
+    # hard-exit: colocated vllm can deadlock on nccl/cuda teardown; all artifacts are already on hf.
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)

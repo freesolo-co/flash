@@ -386,6 +386,8 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     effective["train"] = effective_train
     public_environment = dict(public["environment"])
     effective_environment = dict(effective["environment"])
+    # the staged package is controller-managed and digest-bound in the worker half only.
+    effective_environment.pop("package", None)
     public_sha = public_environment.get("resolved_sha")
     effective_sha = effective_environment.get("resolved_sha")
     if not public_sha and isinstance(effective_sha, str):
