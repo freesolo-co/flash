@@ -25,6 +25,7 @@ from flash.engine.worker.teacher.encoding import (
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
 from flash.envs.base import map_bounded
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
+from flash.teacher.provider_status import validated_provider_status
 
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
 _BROKER_PROVIDER_TIMEOUT_CEILING_S = 90.0
@@ -49,9 +50,12 @@ from flash.content.multimodal import (  # noqa: E402
 class TeacherError(RuntimeError):
     """A classified managed-teacher failure."""
 
-    def __init__(self, *args, permanent: bool = False) -> None:
+    def __init__(
+        self, *args, permanent: bool = False, provider_status: int | None = None
+    ) -> None:
         super().__init__(*args)
         self.permanent = permanent
+        self.provider_status = validated_provider_status(provider_status)
 
 
 def _remaining_run_wall_seconds() -> float | None:
@@ -567,12 +571,16 @@ class TeacherClient:
             except urllib.error.HTTPError as error:
                 code = "broker_http_error"
                 classification = "permanent"
+                provider_status = None
                 try:
                     payload = json.loads(error.read(64 * 1024 + 1).decode("utf-8"))
                     broker_error = payload.get("error") if isinstance(payload, dict) else None
                     if isinstance(broker_error, dict):
                         raw_code = broker_error.get("code")
                         raw_classification = broker_error.get("classification")
+                        provider_status = validated_provider_status(
+                            broker_error.get("provider_status")
+                        )
                         if isinstance(raw_code, str) and raw_code:
                             code = raw_code
                         if isinstance(raw_classification, str) and raw_classification in {
@@ -588,10 +596,15 @@ class TeacherClient:
                 ):
                     pass
                 retryable = classification == "transient"
+                provider_status_detail = (
+                    f" provider_status={provider_status}" if provider_status is not None else ""
+                )
                 broker_failure = TeacherError(
-                    f"teacher broker HTTP {error.code} for {request_id} on {path}: {code} "
+                    f"teacher broker HTTP {error.code} for {request_id} on {path}: {code}"
+                    f"{provider_status_detail} "
                     f"({'transient' if retryable else 'permanent'})",
                     permanent=not retryable,
+                    provider_status=provider_status,
                 )
                 if not retryable:
                     raise broker_failure from None

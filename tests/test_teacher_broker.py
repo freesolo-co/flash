@@ -746,6 +746,7 @@ def test_provider_error_body_is_suppressed_from_response_and_sqlite(broker_db, m
             "code": "provider_rejected",
             "classification": "permanent",
             "request_id": "request-private-00001",
+            "provider_status": 400,
         }
     }
     assert error.value.retryable is False
@@ -757,10 +758,59 @@ def test_provider_error_body_is_suppressed_from_response_and_sqlite(broker_db, m
         )
     assert duplicate.value.code == "provider_rejected"
     assert duplicate.value.retryable is False
+    assert duplicate.value.payload()["error"]["provider_status"] == 400
     assert len(dispatches) == 1
     assert private_canary not in dump
     assert "control-plane-only-canary" not in dump
     assert token not in dump
+
+
+@pytest.mark.parametrize("provider_status", [True, "invalid", 0, -1, 600, 700])
+def test_malformed_stored_provider_status_is_omitted_on_replay(
+    broker_db, monkeypatch, provider_status
+):
+    _service_ready(monkeypatch)
+    token = _issue()
+    private_canary = "private-provider-error-body-canary"
+    dispatches = []
+
+    def reject(*_args):
+        dispatches.append(1)
+        return 403, private_canary.encode()
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", reject)
+    request_id = "request-malformed-status-01"
+
+    with pytest.raises(teacher_broker.TeacherBrokerError):
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+
+    connection = sqlite3.connect(broker_db)
+    connection.execute(
+        "UPDATE teacher_score_requests SET provider_status = ? WHERE request_id = ?",
+        (provider_status, request_id),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as replay:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+
+    payload = replay.value.payload()
+    assert replay.value.retryable is False
+    assert replay.value.provider_status is None
+    assert payload["error"]["code"] == "provider_rejected"
+    assert payload["error"]["classification"] == "permanent"
+    assert "provider_status" not in payload["error"]
+    assert private_canary not in json.dumps(payload)
+    assert len(dispatches) == 1
 
 
 @pytest.mark.parametrize("status", [408, 429, 500, 502, 503])
@@ -1062,8 +1112,77 @@ def test_worker_fails_closed_on_nontransient_broker_classification(monkeypatch, 
         client.score("question", "answer")
 
     assert error.value.permanent is True
+    assert error.value.provider_status is None
     assert "provider_rejected (permanent)" in str(error.value)
+    assert "provider_status=" not in str(error.value)
     assert len(request_ids) == 1
+
+
+def test_worker_renders_provider_status_without_leaking_broker_payload(monkeypatch):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    private_canary = "private-provider-error-body-canary"
+
+    def urlopen(_transport, request, timeout=None):
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "provider_rejected",
+                    "classification": "permanent",
+                    "provider_status": 403,
+                    "provider_text": private_canary,
+                }
+            }
+        ).encode()
+        raise urllib.error.HTTPError(request.full_url, 502, "rejected", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert error.value.provider_status == 403
+    assert "provider_rejected provider_status=403 (permanent)" in str(error.value)
+    assert private_canary not in str(error.value)
+
+
+@pytest.mark.parametrize("provider_status", [True, "403", 0, -1, 600, 700])
+def test_worker_omits_malformed_provider_status(monkeypatch, provider_status):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    body = json.dumps(
+        {
+            "error": {
+                "code": "provider_rejected",
+                "classification": "permanent",
+                "provider_status": provider_status,
+            }
+        }
+    ).encode()
+
+    def urlopen(_transport, request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 502, "rejected", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert error.value.provider_status is None
+    assert "provider_rejected (permanent)" in str(error.value)
+    assert "provider_status=" not in str(error.value)
 
 
 def test_operation_specific_route_requires_bearer_json_and_request_id(monkeypatch):
@@ -1116,6 +1235,92 @@ def test_operation_specific_route_requires_bearer_json_and_request_id(monkeypatc
         "raw_body": bytearray(b"{}"),
     }
     assert isinstance(captured["raw_body"], bytearray)
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "expected_status"),
+    [
+        (403, 403),
+        (None, None),
+        (True, None),
+        ("403", None),
+        (0, None),
+        (-1, None),
+        (600, None),
+        (700, None),
+    ],
+)
+def test_broker_error_serializes_only_valid_provider_status(provider_status, expected_status):
+    error = teacher_broker.TeacherBrokerError(
+        "provider_rejected",
+        status_code=502,
+        request_id="request-status-boundary-01",
+        provider_status=provider_status,
+    )
+
+    payload = error.payload()["error"]
+    if expected_status is None:
+        assert error.provider_status is None
+        assert "provider_status" not in payload
+    else:
+        assert error.provider_status == expected_status
+        assert payload["provider_status"] == expected_status
+
+
+def test_teacher_route_propagates_provider_status_through_dispatch_and_replay(
+    broker_db, monkeypatch
+):
+    fastapi = pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from flash.server.routes import teacher as teacher_route
+
+    _service_ready(monkeypatch)
+    token = _issue()
+    request_id = "request-route-replay-001"
+    private_canary = "private-provider-error-body-canary"
+    dispatches = []
+
+    def reject(*_args):
+        dispatches.append(1)
+        return 403, private_canary.encode()
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", reject)
+    app = fastapi.FastAPI()
+    app.include_router(teacher_route.router)
+    client = TestClient(app)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Flash-Teacher-Request-Id": request_id,
+    }
+    expected = {
+        "error": {
+            "code": "provider_rejected",
+            "classification": "permanent",
+            "request_id": request_id,
+            "provider_status": 403,
+        }
+    }
+
+    first = client.post("/v1/teacher/completions", content=_body(), headers=headers)
+    replay = client.post("/v1/teacher/completions", content=_body(), headers=headers)
+
+    assert first.status_code == 502
+    assert replay.status_code == 409
+    assert first.json() == expected
+    assert replay.json() == expected
+    assert private_canary not in first.text
+    assert private_canary not in replay.text
+    assert len(dispatches) == 1
+    connection = sqlite3.connect(broker_db)
+    stored = connection.execute(
+        "SELECT state, provider_status, error_class FROM teacher_score_requests "
+        "WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    connection.close()
+    assert stored == ("provider_rejected", 403, "permanent")
 
 
 def test_chat_route_mirrors_completion_route_auth_and_request_binding(monkeypatch):

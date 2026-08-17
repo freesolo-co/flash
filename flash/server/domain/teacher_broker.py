@@ -388,6 +388,7 @@ def _map_ledger_error(error: db.TeacherLedgerError, request_id: str) -> TeacherB
         status_code=status,
         retryable=error.retryable,
         request_id=request_id,
+        provider_status=error.provider_status,
     )
 
 
@@ -734,6 +735,7 @@ def _dispatch_to_teacher_provider(
             status_code=502,
             retryable=transient,
             request_id=request_id,
+            provider_status=status,
         )
     return status, response_body
 

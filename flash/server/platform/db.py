@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from flash._internal.paths import data_dir
+from flash.teacher.provider_status import validated_provider_status
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -410,10 +411,17 @@ def all_runs() -> list[dict]:
 
 
 class TeacherLedgerError(RuntimeError):
-    def __init__(self, code: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        retryable: bool = False,
+        provider_status: int | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+        self.provider_status = validated_provider_status(provider_status)
 
 
 def _immediate(conn: sqlite3.Connection) -> None:
@@ -610,7 +618,10 @@ def _resume_existing_teacher_request(conn, capability, existing, *, admitted_at)
             "request": dict(existing),
             "response_body": response_body,
         }
-    raise TeacherLedgerError(state)
+    raise TeacherLedgerError(
+        state,
+        provider_status=existing["provider_status"] if state == "provider_rejected" else None,
+    )
 
 
 def reserve_teacher_request(
