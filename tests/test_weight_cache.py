@@ -17,7 +17,7 @@ import pytest
 from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 from tests._helpers.profile import satisfy_sft_profile
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 
 
 def _oversized_model_info():

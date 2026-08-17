@@ -8,6 +8,9 @@ CPU-only; the per-key REST call is mocked.
 
 from __future__ import annotations
 
+import io
+import urllib.error
+
 import pytest
 
 
@@ -26,6 +29,7 @@ def test_key_fingerprint_is_stable_and_non_revealing():
     assert fp == api.key_fingerprint(secret)  # stable across calls
     assert secret not in fp  # never embeds the secret
     assert fp.startswith("rpk-")
+    assert len(fp) == 68
     assert api.key_fingerprint("a-different-key") != fp  # distinguishes accounts
 
 
@@ -36,7 +40,7 @@ def test_key_lookup_rejects_unknown_fingerprint_without_leaking_credentials(monk
     monkeypatch.setattr(api._keys, "keys", lambda: keys)
 
     with pytest.raises(api.RunpodApiError, match="exactly one") as exc_info:
-        api._key_for_fingerprint("rpk-no-such-account")
+        api._key_for_fingerprint("rpk-" + "0" * 64)
 
     assert all(key not in str(exc_info.value) for key in keys)
 
@@ -45,7 +49,7 @@ def test_key_lookup_rejects_colliding_configured_fingerprints(monkeypatch):
     from flash.providers.runpod import api
 
     keys = ["secretA", "secretB"]
-    fingerprint = "rpk-aaaaaaaaaaaa"
+    fingerprint = "rpk-" + "a" * 64
     monkeypatch.setattr(api._keys, "keys", lambda: keys)
     monkeypatch.setattr(api, "key_fingerprint", lambda _key: fingerprint)
 
@@ -53,6 +57,59 @@ def test_key_lookup_rejects_colliding_configured_fingerprints(monkeypatch):
         api._key_for_fingerprint(fingerprint)
 
     assert all(key not in str(exc_info.value) for key in keys)
+
+
+def test_rotated_sole_replacement_with_same_48_bit_prefix_cannot_confirm_absence(monkeypatch):
+    from flash.providers.runpod import api
+
+    digests = {
+        b"secretA": "a" * 12 + "1" * 52,
+        b"secretB": "a" * 12 + "2" * 52,
+    }
+
+    class Digest:
+        def __init__(self, value):
+            self.value = value
+
+        def hexdigest(self):
+            return self.value
+
+    monkeypatch.setattr(api.hashlib, "sha256", lambda value: Digest(digests[value]))
+    owner = api.key_fingerprint("secretA")
+    monkeypatch.setattr(api._keys, "keys", lambda: ["secretB"])
+
+    def wrong_account_404(*_args, **_kwargs):
+        error = urllib.error.HTTPError(
+            "https://rest.runpod.io/v1/endpoints/ep-owner-a",
+            404,
+            "not found",
+            {},
+            io.BytesIO(b""),
+        )
+        raise api.RunpodApiError("not found") from error
+
+    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", wrong_account_404)
+
+    with pytest.raises(api.RunpodApiError, match="exactly one"):
+        api.endpoint_absent_for_fingerprint("ep-owner-a", owner)
+
+
+def test_strict_handle_rejects_truncated_owner_identity():
+    from flash.providers.runpod.jobs import JobHandle
+
+    payload = {
+        "provider": "runpod",
+        "endpoint_id": "ep-1",
+        "endpoint_name": "flash-test",
+        "key_fingerprint": "rpk-" + "a" * 12,
+        "attempt": 0,
+        "started_ts": 1.0,
+    }
+    with pytest.raises(ValueError, match="key fingerprint is invalid"):
+        JobHandle.from_dict(payload)
+
+    payload["key_fingerprint"] = "rpk-" + "a" * 64
+    assert JobHandle.from_dict(payload).key_fingerprint == payload["key_fingerprint"]
 
 
 def test_list_endpoints_by_key_returns_fingerprints_not_raw_keys(monkeypatch):
@@ -100,7 +157,30 @@ def test_fingerprint_helpers_resolve_to_the_owning_key(monkeypatch):
     assert seen["health"] == ("ep-1", "secretB", 123.0)
 
     with pytest.raises(api.RunpodApiError):
-        api.delete_endpoint_for_fingerprint("ep-1", "rpk-no-such-account")  # no pool key matches
+        api.delete_endpoint_for_fingerprint("ep-1", "rpk-" + "0" * 64)  # no pool key matches
+
+
+def test_submit_job_missing_id_never_exposes_provider_response(monkeypatch):
+    from flash.providers.runpod import api
+
+    key = "secretA"
+    private_canary = "provider-private-response-canary"
+    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+    monkeypatch.setattr(
+        api._CLIENT,
+        "request_with_retries_for_key",
+        lambda *_args, **_kwargs: {"error": private_canary, "nested": {"token": private_canary}},
+    )
+
+    with pytest.raises(api.RunpodApiError, match="response did not contain a job id") as exc_info:
+        api.submit_job(
+            "ep-1",
+            {"x": 1},
+            key_fingerprint=api.key_fingerprint(key),
+            deadline_at=4_000_000_000.0,
+        )
+
+    assert private_canary not in str(exc_info.value)
 
 
 def test_submit_status_cancel_and_delete_keep_owning_key_after_rotation(monkeypatch):

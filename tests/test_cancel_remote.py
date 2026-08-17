@@ -17,7 +17,7 @@ import flash.providers.runpod.serverless as ftrain
 from flash.providers.runpod.serverless import _run_suffix, _select_endpoint_resources, endpoint_name
 from tests._helpers.runner import provisioned_status
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 
 
 def _remote(endpoint_id, job_id, attempt):

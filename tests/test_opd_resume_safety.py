@@ -21,7 +21,7 @@ from flash.teacher.retry_contract import (
 )
 from tests._helpers.runner import provisioned_status
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 
 
 @pytest.fixture(autouse=True)

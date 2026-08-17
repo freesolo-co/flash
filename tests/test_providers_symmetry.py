@@ -17,7 +17,7 @@ import importlib
 
 import pytest
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 
 # The universal per-provider surface: concerns every substrate must implement itself (no shared
 # default fits). ``gpus``/``train`` are intentionally NOT here — they're per-provider by necessity.

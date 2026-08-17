@@ -19,18 +19,27 @@ QUEUE_BASE = "https://api.runpod.ai/v2"
 
 
 def key_fingerprint(key: str) -> str:
-    """Stable non-secret identifier for a pool key — safe to log; never the raw credential."""
-    return "rpk-" + hashlib.sha256(key.encode()).hexdigest()[:12]
+    """Stable non-secret owner identity for a pool key; safe to log, never the raw credential."""
+    return "rpk-" + hashlib.sha256(key.encode()).hexdigest()
+
+
+def _is_valid_key_fingerprint(fingerprint: object) -> bool:
+    return (
+        isinstance(fingerprint, str)
+        and len(fingerprint) == 68
+        and fingerprint.startswith("rpk-")
+        and all(char in "0123456789abcdef" for char in fingerprint[4:])
+    )
 
 
 def _key_for_fingerprint(fingerprint: str) -> str:
-    """Resolve a key_fingerprint back to its unique raw pool key."""
+    """Resolve a full key fingerprint back to its unique raw pool key."""
+    if not _is_valid_key_fingerprint(fingerprint):
+        raise RunpodApiError("persisted RunPod key fingerprint is invalid")
     configured_keys = _keys.keys()
     matches = [key for key in configured_keys if key_fingerprint(key) == fingerprint]
     if len(matches) != 1:
-        raise RunpodApiError(
-            "expected exactly one RunPod pool key for the persisted fingerprint"
-        )
+        raise RunpodApiError("expected exactly one RunPod pool key for the persisted fingerprint")
     return matches[0]
 
 
@@ -171,9 +180,7 @@ def endpoint_absent_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
         raise RunpodApiError(
             f"runpod endpoint lookup failed for {endpoint_id}; cleanup unconfirmed"
         ) from None
-    raise RunpodApiError(
-        f"runpod endpoint {endpoint_id} still exists; cleanup unconfirmed"
-    )
+    raise RunpodApiError(f"runpod endpoint {endpoint_id} still exists; cleanup unconfirmed")
 
 
 def endpoint_health_for_fingerprint(
@@ -276,9 +283,9 @@ def submit_job(
         retries=0,
         deadline_at=deadline_at,
     )
-    job_id = out.get("id")
+    job_id = out.get("id") if isinstance(out, dict) else None
     if not job_id:
-        raise RunpodApiError(f"submit_job: no job id in response: {out}")
+        raise RunpodApiError("submit_job: response did not contain a job id")
     return job_id
 
 

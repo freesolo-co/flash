@@ -14,7 +14,7 @@ import pytest
 
 from tests._helpers.runner import provisioned_status
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 
 
 def _live_clock_handle(jobs):

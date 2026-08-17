@@ -10,7 +10,7 @@ import pytest
 
 from tests._helpers.runner import provisioned_status
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 
 
 def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
@@ -1489,7 +1489,7 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
     )
-    other_fingerprint = "rpk-fedcba987654"
+    other_fingerprint = "rpk-" + "f" * 64
     confirmed = _runpod_remote("endpoint-shared", "job-confirmed", attempt=1)
     different_owner = _runpod_remote(
         "endpoint-shared",
@@ -2463,7 +2463,7 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
         "provider": "runpod",
         "endpoint_id": "ep-unconfirmed",
         "endpoint_name": "flash-recover-unconfirmed",
-        "key_fingerprint": "rpk-0123456789ab",
+        "key_fingerprint": "rpk-" + "0" * 64,
         "attempt": 0,
         "started_ts": 1.0,
     }
