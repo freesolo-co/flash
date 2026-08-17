@@ -236,31 +236,54 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     assert "UNDECLARED_API_KEY" not in env
 
 
-def test_build_worker_env_lists_declared_secret_names_for_the_redactors():
-    """declared runtime secrets can carry any name (AWS_SECRET_ACCESS_KEY, ...), so the redactors
-    cannot rely on the name-shape heuristic; the env carries the applied names explicitly."""
+def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypatch, tmp_path):
+    """the producer's exact applied-name metadata is also the verl child scrub contract."""
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.engine.worker.sft_train import _build_verl_child_env
     from flash.providers.runpod.serverless import build_worker_env
 
+    declared = (
+        "AWS_SECRET_ACCESS_KEY",
+        "CUDA_SECRET",
+        "FLA_CREDENTIAL",
+        "PYTHONPATH",
+        "WANDB_USER_SECRET",
+    )
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
-        environment=EnvironmentSpec(id="owner/env", secrets=("AWS_SECRET_ACCESS_KEY",)),
+        environment=EnvironmentSpec(id="owner/env", secrets=declared),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
-
-    env = build_worker_env(
-        spec,
-        0,
-        runtime_secrets={"AWS_SECRET_ACCESS_KEY": "aws-user", "WANDB_API_KEY": "user-wb"},
-    )
+    supplied = {name: f"synthetic-{name.lower()}" for name in declared}
+    supplied["WANDB_API_KEY"] = "synthetic-wandb-key"
+    env = build_worker_env(spec, 0, runtime_secrets=supplied)
 
     listed = set(env[SECRET_ENV_KEYS_ENV].split(","))
-    assert listed == {"AWS_SECRET_ACCESS_KEY", "WANDB_API_KEY"}
+    assert listed == {*declared, "WANDB_API_KEY"}
+    for name in listed:
+        assert name in env
     # a run with no applied secrets carries no list at all.
     assert SECRET_ENV_KEYS_ENV not in build_worker_env(_spec(), 0)
+
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("FLA_TILELANG", "0")
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    child = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=True)
+
+    for name in declared:
+        if name != "PYTHONPATH":
+            assert name not in child
+    assert child["PYTHONPATH"] == str(tmp_path)
+    assert SECRET_ENV_KEYS_ENV not in child
+    assert "WANDB_API_KEY" in child
+    assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert child["FLA_TILELANG"] == "0"
+    assert child["WANDB_MODE"] == "offline"
 
 
 def test_the_redactor_metadata_name_is_reserved_from_declared_secrets():

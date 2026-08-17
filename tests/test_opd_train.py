@@ -6772,6 +6772,53 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
     assert "FLASH_OPD_THINKING" not in child
 
 
+def test_opd_child_environment_scrubs_declared_prefixed_secrets(monkeypatch, tmp_path):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+
+    declared = (
+        "CUDA_SECRET",
+        "FLA_CREDENTIAL",
+        "PYTHONPATH",
+        "WANDB_USER_SECRET",
+        "WANDB_API_KEY",
+    )
+    for name in declared:
+        monkeypatch.setenv(name, f"synthetic-{name.lower()}")
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, ",".join(declared))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("NCCL_DEBUG", "WARN")
+    monkeypatch.setenv("FLA_TILELANG", "0")
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    child = _build_opd_child_env(
+        shim_dir=str(tmp_path),
+        wandb_enabled=True,
+        bridge_url="http://127.0.0.1:4444",
+        bridge_token="synthetic-bridge-token",
+        seed=42,
+        stop_sequences=(),
+        eos_token_ids=frozenset({1}),
+        structured_outputs=None,
+        model_vocab_size=248320,
+        thinking=False,
+        plugin_config='{"wandb":true}',
+    )
+
+    for name in declared:
+        if name not in {"PYTHONPATH", "WANDB_API_KEY"}:
+            assert name not in child
+    assert child["PYTHONPATH"] == str(tmp_path)
+    assert SECRET_ENV_KEYS_ENV not in child
+    assert "WANDB_API_KEY" in child
+    assert child["WANDB_MODE"] == "offline"
+    assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert child["NCCL_DEBUG"] == "WARN"
+    assert child["FLA_TILELANG"] == "0"
+    assert "FLASH_OPD_BRIDGE_URL" in child
+    assert "FLASH_OPD_BRIDGE_TOKEN" in child
+    assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_opd_plugin"
+    assert child["FLASH_OPD_PLUGIN_CONFIG"] == '{"wandb":true}'
+
+
 def test_structured_child_environment_carries_only_canonical_replay_inputs(tmp_path):
     child = _build_opd_child_env(
         shim_dir=str(tmp_path),
