@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import re
 import sys
@@ -256,6 +257,7 @@ def test_runtime_installer_replaces_only_fresh_text_targeting(monkeypatch):
 
 
 def test_sft_and_opd_child_configs_install_text_targeting_only_for_text_jobs(tmp_path):
+    importlib.import_module("flash.engine.worker.sft_train")
     from flash.engine.worker import sft_train_runner
     from flash.engine.worker.train.opd.overrides import _build_opd_plugin_config
 
