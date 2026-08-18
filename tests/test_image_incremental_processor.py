@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import importlib
 import io
 import os
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 import pytest
 
 from flash.content import multimodal as mm
 
-MODEL_ID = "Qwen/Qwen3.5-0.8B"
-MODEL_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
+MODEL_ID = "Qwen/Qwen3.5-4B"
+MODEL_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 _IMAGE_CASES = [
     ((56, 56), "red", 64),
     ((300, 200), "green", 70),
@@ -37,6 +39,27 @@ def _image_bytes(size: tuple[int, int], color: str) -> bytes:
 
     out = io.BytesIO()
     Image.new("RGB", size, color).save(out, format="PNG")
+    return out.getvalue()
+
+
+def _nonuniform_32_png() -> bytes:
+    from PIL import Image
+
+    image = Image.new("RGB", (32, 32))
+    image.putdata(
+        [
+            (
+                (x * 17 + y * 3) % 256,
+                (x * 5 + y * 19) % 256,
+                (x * 11 + y * 7) % 256,
+            )
+            for y in range(32)
+            for x in range(32)
+        ]
+    )
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    image.close()
     return out.getvalue()
 
 
@@ -154,30 +177,149 @@ def real_processor():
         )
 
 
-def test_processor_digests_match_raw_and_qwen_sized_images(real_processor):
+def test_dynamic_image_decoder_accepts_only_canonical_managed_data_uris():
+    from PIL import Image
+
+    from flash.engine.worker.train.core.child.glue import _decode_image_data_uris
+
+    supported = []
+    for image_format, media_type in (
+        ("PNG", "image/png"),
+        ("JPEG", "image/jpeg"),
+        ("WEBP", "image/webp"),
+    ):
+        out = io.BytesIO()
+        Image.new("RGB", (3, 2), "purple").save(out, format=image_format)
+        supported.append(
+            f"data:{media_type};base64,{base64.b64encode(out.getvalue()).decode('ascii')}"
+        )
+    decoded = _decode_image_data_uris(supported)
+    try:
+        assert [image.mode for image in decoded] == ["RGB", "RGB", "RGB"]
+        assert [image.size for image in decoded] == [(3, 2), (3, 2), (3, 2)]
+    finally:
+        for image in decoded:
+            image.close()
+
+    png_payload = supported[0].split(",", 1)[1]
+    rejected = [
+        ("https://images.example/reply.png", "remote media"),
+        (f"data:image/gif;base64,{png_payload}", "canonical base64 PNG, JPEG, or WebP"),
+        ("data:image/png;base64,not base64", "invalid base64"),
+        (f"data:image/png,{png_payload}", "canonical base64 PNG, JPEG, or WebP"),
+        (f"data:image/jpeg;base64,{png_payload}", "MIME type does not match"),
+    ]
+    for uri, message in rejected:
+        with pytest.raises(ValueError, match=message):
+            _decode_image_data_uris([uri])
+
+
+def test_dynamic_image_decoder_matches_parent_retained_rgb_budget(monkeypatch):
+    from flash.engine.worker.train.core.child import glue as child_glue
+
+    uris = [
+        "data:image/png;base64," + base64.b64encode(_image_bytes((4, 4), color)).decode("ascii")
+        for color in ("red", "blue")
+    ]
+    monkeypatch.setattr(child_glue, "_MAX_TOTAL_DECODED_BYTES", 200)
+    decoded = child_glue._decode_image_data_uris(uris)
+    try:
+        assert [image.size for image in decoded] == [(4, 4), (4, 4)]
+    finally:
+        for image in decoded:
+            image.close()
+
+
+def test_dynamic_image_decoder_rejects_memory_before_pixel_load(monkeypatch):
+    from PIL import Image, PngImagePlugin
+
+    from flash.engine.worker.train.core.child import glue as child_glue
+
+    out = io.BytesIO()
+    Image.new("RGBA", (4, 4), (1, 2, 3, 4)).save(out, format="PNG")
+    uri = "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("ascii")
+    monkeypatch.setattr(child_glue, "_MAX_TOTAL_DECODED_BYTES", 100)
+
+    def reject_load(_image):
+        raise AssertionError("pixel load occurred before the decoded-memory gate")
+
+    monkeypatch.setattr(PngImagePlugin.PngImageFile, "load", reject_load)
+    with pytest.raises(ValueError, match="aggregate decoded-byte limit"):
+        child_glue._decode_image_data_uris([uri])
+
+
+def test_dynamic_image_decoder_closes_partial_results_on_failure(monkeypatch):
+    from flash.engine.worker.train.core.child import glue as child_glue
+
+    valid_uri = "data:image/png;base64," + base64.b64encode(_image_bytes((2, 2), "red")).decode(
+        "ascii"
+    )
+    captured = []
+    decode_one = child_glue._decode_validated_dynamic_image
+
+    def recording_decode(data, expected_format):
+        if captured:
+            raise ValueError("injected second image decode failure")
+        image = decode_one(data, expected_format)
+        captured.append(image)
+        return image
+
+    monkeypatch.setattr(child_glue, "_decode_validated_dynamic_image", recording_decode)
+    with pytest.raises(ValueError, match="injected second image decode failure"):
+        child_glue._decode_image_data_uris([valid_uri, valid_uri])
+    assert len(captured) == 1
+    with pytest.raises(ValueError, match="closed image"):
+        captured[0].getpixel((0, 0))
+
+
+def test_dynamic_image_transport_requires_exact_block_count():
+    from flash.engine.worker.train.core.child.glue import EnvGlueProcessor
+
+    class _Loop:
+        def __init__(self):
+            self.processor = object()
+            self.tokenizer = object()
+            self.apply_chat_template_kwargs = {}
+
+    glue = EnvGlueProcessor(_Loop(), thinking=False)
+    message = [{"role": "user", "content": [{"type": "image"}]}]
+    with pytest.raises(ValueError, match="image block count"):
+        asyncio.run(glue(message, []))
+    with pytest.raises(ValueError, match="image block count"):
+        asyncio.run(glue([{"role": "user", "content": "text"}], ["data:image/png;base64,"]))
+
+
+def test_source_shipped_glue_imports_under_a_flat_child_name():
+    from flash.engine.worker.train.core.child import glue as child_glue
+
+    spec = importlib.util.spec_from_file_location("flash_env_glue_flat_test", child_glue.__file__)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.EnvGlueProcessor.__name__ == "EnvGlueProcessor"
+
+
+def test_processor_digest_detects_a_qwen_intermediate_resize(real_processor):
     from flash.engine.worker.train.core.child.glue import (
         parent_image_digests,
         processor_image_digests,
     )
 
-    digests = []
-    for size, color in (((32, 32), "red"), ((300, 200), "green")):
-        descriptor = mm.normalize_image_source(_image_bytes(size, color), None)
-        raw = mm.decode_image_descriptors([descriptor], None)
+    descriptor = mm.normalize_image_source(_nonuniform_32_png(), None)
+    raw = mm.decode_image_descriptors([descriptor], None)
+    try:
+        resized = [_qwen_sized_image(real_processor, raw[0])]
         try:
-            resized = [_qwen_sized_image(real_processor, raw[0])]
-            try:
-                parent = parent_image_digests(real_processor, [descriptor], None)
-                child = processor_image_digests(real_processor, resized)
-            finally:
-                resized[0].close()
+            assert raw[0].size == (32, 32)
+            assert resized[0].size != raw[0].size
+            assert parent_image_digests(real_processor, [descriptor], None) != (
+                processor_image_digests(real_processor, resized)
+            )
         finally:
-            raw[0].close()
-        assert parent == child
-        digests.extend(parent)
-
-    other = mm.normalize_image_source(_image_bytes((32, 32), "blue"), None)
-    assert parent_image_digests(real_processor, [other], None)[0] != digests[0]
+            resized[0].close()
+    finally:
+        raw[0].close()
 
     class _TextOnlyProcessor:
         @property
@@ -224,83 +366,80 @@ def test_processor_digest_separates_images_that_differ_only_by_grid(real_process
     )
 
 
-def test_real_processor_drives_the_shared_dynamic_child_glue(real_processor):
+def test_real_processor_preserves_dynamic_reply_pixels_and_media_identity(real_processor):
     from flash.engine.worker.train.core.child.glue import (
         EnvGlueProcessor,
         parent_image_digests,
     )
+    from flash.engine.worker.train.opd.child.multiturn import _validate_opd_reply_media
+    from flash.engine.worker.train.rl.child.multiturn import _validate_grpo_reply_media
+
+    class _ProcessorProbe:
+        def __init__(self, delegate):
+            self.delegate = delegate
+            self.mm_processor_calls = []
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+        def __call__(self, *args, **kwargs):
+            self.mm_processor_calls.append(kwargs.pop("flash_probe", None))
+            return self.delegate(*args, **kwargs)
 
     class _Loop:
         def __init__(self, processor):
-            self.processor = processor
+            self.processor = _ProcessorProbe(processor)
             self.tokenizer = processor.tokenizer
             self.apply_chat_template_kwargs = {}
+            self.process_multi_modal_info_calls = 0
 
         def _get_mm_processor_kwargs(self, _audio_data=None):
-            return {}
+            return {"flash_probe": True}
 
-        async def process_multi_modal_info(self, messages):
-            uris = [
-                block["image"]
-                for message in messages
-                for block in message.get("content", [])
-                if isinstance(block, dict) and block.get("type") == "image"
-            ]
-            descriptors = [mm.normalize_image_source(uri, None) for uri in uris]
-            decoded = mm.decode_image_descriptors(descriptors, None)
-            try:
-                return {"images": [_qwen_sized_image(self.processor, image) for image in decoded]}
-            finally:
-                for image in decoded:
-                    image.close()
+        async def process_multi_modal_info(self, _messages):
+            self.process_multi_modal_info_calls += 1
+            raise AssertionError("dynamic reply images reached process_multi_modal_info")
 
+    observation = mm.normalize_prompt_images(
+        {},
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "inspect the nonuniform image"},
+                    {"type": "input_image", "input_image": _nonuniform_32_png()},
+                ],
+            }
+        ],
+        None,
+    )
     loop = _Loop(real_processor)
-    glue = EnvGlueProcessor(loop, thinking=False)
-    cumulative_images = []
-    cumulative_digests = []
-    snapshots = []
-
-    for index, (size, color, _expected_run) in enumerate(_IMAGE_CASES):
-        observation = mm.normalize_prompt_images(
-            {},
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": f"observation {index + 1}"},
-                        {"type": "input_image", "input_image": _image_bytes(size, color)},
-                    ],
-                }
-            ],
-            None,
+    result = asyncio.run(
+        EnvGlueProcessor(loop, thinking=False)(
+            observation.messages,
+            mm.image_descriptors_to_data_uris(observation.descriptors, None),
         )
-        result = asyncio.run(
-            glue(
-                observation.messages,
-                mm.image_descriptors_to_data_uris(observation.descriptors, None),
-            )
-        )
-        expected = _parent_glue_ids(
+    )
+    try:
+        expected_digests = parent_image_digests(real_processor, observation.descriptors, None)
+        assert result.token_ids == _parent_glue_ids(
             real_processor,
             observation.messages,
             observation.descriptors,
         )
-        assert result.token_ids == expected
-        assert len(result.images) == 1
-        assert result.image_digests == parent_image_digests(
-            real_processor, observation.descriptors, None
-        )
-        cumulative_images.extend(result.images)
-        cumulative_digests.extend(result.image_digests)
-        snapshots.append((list(cumulative_images), list(cumulative_digests)))
-        assert len(cumulative_images) == index + 1
-        assert len(set(cumulative_digests)) == index + 1
+        assert [image.size for image in result.images] == [(32, 32)]
+        assert result.image_digests == expected_digests
+        assert loop.processor.mm_processor_calls == [True]
+        assert loop.process_multi_modal_info_calls == 0
 
-    for images, digests in snapshots:
-        assert images == cumulative_images[: len(images)]
-        assert digests == cumulative_digests[: len(digests)]
-    for image in cumulative_images:
-        image.close()
+        prompt = SimpleNamespace(image_digests=[])
+        step = {"image_count": 1, "image_digests": expected_digests}
+        _validate_opd_reply_media(prompt, result, step)
+        _validate_grpo_reply_media(prompt, result, step)
+        assert result.images[0].getpixel((7, 11))
+    finally:
+        for image in result.images:
+            image.close()
 
 
 def test_real_processor_proves_incremental_four_image_glue(real_processor, monkeypatch):

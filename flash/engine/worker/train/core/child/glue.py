@@ -1,7 +1,8 @@
 """child-side multi-turn rollout primitives shared by the OPD and GRPO verl agent loops.
 
-stdlib only. no verl import and no flash import, so the parent can copy this file into a verl
-child's workdir the same way it copies the loop modules themselves.
+stdlib only at import time. no verl import and no flash import, so the parent can copy this file
+into a verl child's workdir the same way it copies the loop modules themselves. image decoding loads
+Pillow only when a validated dynamic image reply arrives.
 
 everything here is algorithm-neutral: turning an environment reply into the exact tokens the chat
 template would have produced, deciding whether an assistant turn terminated or was truncated, and
@@ -13,9 +14,13 @@ returns one output per episode, and those differences are the point.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
+import io
 import json
+import warnings
 from typing import Any
 from uuid import uuid4
 
@@ -27,6 +32,38 @@ _PROBE_PREFIX = "flash-env-glue-probe"
 # here as literals rather than imported from flash.content.multimodal because this module is copied
 # into the verl child, where flash is not importable -- see the module docstring.
 _MEDIA_BLOCK_TYPES = frozenset({"image", "video", "audio"})
+_IMAGE_DATA_URI_HEADERS = {
+    "data:image/jpeg;base64": "JPEG",
+    "data:image/png;base64": "PNG",
+    "data:image/webp;base64": "WEBP",
+}
+_MAX_IMAGES_PER_REPLY = 4
+_MAX_IMAGE_SOURCE_BYTES = 8 * 1024 * 1024
+_MAX_TOTAL_IMAGE_SOURCE_BYTES = 16 * 1024 * 1024
+_MAX_IMAGE_WIDTH = 8192
+_MAX_IMAGE_HEIGHT = 8192
+_MAX_IMAGE_PIXELS = 16_777_216
+_MAX_TOTAL_IMAGE_PIXELS = 33_554_432
+_MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
+_MODE_BYTES_PER_PIXEL = {
+    "1": 1,
+    "L": 1,
+    "P": 1,
+    "I;16": 2,
+    "I;16B": 2,
+    "I;16L": 2,
+    "LA": 2,
+    "La": 2,
+    "RGB": 3,
+    "YCbCr": 3,
+    "LAB": 3,
+    "HSV": 3,
+    "RGBA": 4,
+    "RGBa": 4,
+    "CMYK": 4,
+    "I": 4,
+    "F": 4,
+}
 
 
 def normalize_token_ids(value) -> list[int]:
@@ -315,35 +352,155 @@ def processor_image_digests(processor, images) -> list[str]:
     return [processor_image_digest(processor, image) for image in images]
 
 
-def bind_image_data_uris(messages: list[dict], image_data_uris: list[str]) -> list[dict]:
-    """bind ordered data uris to source-free image blocks for child-side decoding."""
-    uri_iter = iter(image_data_uris)
-    prepared = []
-    for message in validate_structured_messages(messages, source="environment reply"):
-        copied = dict(message)
-        content = copied.get("content")
-        if isinstance(content, list):
-            blocks = []
-            for block in content:
-                copied_block = dict(block)
-                if copied_block.get("type") == "image":
-                    try:
-                        uri = next(uri_iter)
-                    except StopIteration as error:
-                        raise ValueError(
-                            "environment reply has more image blocks than transported image data"
-                        ) from error
-                    if not isinstance(uri, str) or not uri.startswith("data:image/"):
-                        raise ValueError("environment reply image transport must use data uris")
-                    copied_block["image"] = uri
-                blocks.append(copied_block)
-            copied["content"] = blocks
-        prepared.append(copied)
+def _validate_reply_image_count(messages: list[dict], image_data_uris: list[str]) -> None:
+    image_count = 0
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            block_type = block.get("type")
+            if block_type == "image":
+                image_count += 1
+            elif block_type in {"video", "audio"}:
+                raise ValueError("environment reply image glue cannot carry video or audio media")
+    if image_count != len(image_data_uris):
+        raise ValueError(
+            "environment reply image block count does not match its transported image data"
+        )
+
+
+def _validate_dynamic_image_dimensions(width: int, height: int) -> int:
+    if width <= 0 or height <= 0:
+        raise ValueError("environment reply image width and height must be positive")
+    if width > _MAX_IMAGE_WIDTH or height > _MAX_IMAGE_HEIGHT:
+        raise ValueError(
+            f"environment reply image dimensions {width}x{height} exceed the "
+            f"{_MAX_IMAGE_WIDTH}x{_MAX_IMAGE_HEIGHT} limit"
+        )
+    pixels = width * height
+    if pixels > _MAX_IMAGE_PIXELS:
+        raise ValueError(
+            f"environment reply image has {pixels} pixels, exceeding the "
+            f"{_MAX_IMAGE_PIXELS}-pixel limit"
+        )
+    return pixels
+
+
+def _decode_canonical_image_data_uri(uri: str) -> tuple[bytes, str]:
+    if not isinstance(uri, str):
+        raise ValueError("environment reply image transport must use canonical data uris")
+    header, separator, payload = uri.partition(",")
+    expected_format = _IMAGE_DATA_URI_HEADERS.get(header)
+    if not separator or expected_format is None:
+        if uri.startswith(("http://", "https://")):
+            raise ValueError("environment reply image transport cannot use remote media")
+        if uri.startswith("data:"):
+            raise ValueError(
+                "environment reply image transport must use canonical base64 PNG, JPEG, or WebP "
+                "data uris"
+            )
+        raise ValueError("environment reply image transport must use canonical data uris")
+    max_encoded_size = ((_MAX_IMAGE_SOURCE_BYTES + 2) // 3) * 4
+    if len(payload) > max_encoded_size:
+        raise ValueError(
+            f"environment reply image source exceeds the {_MAX_IMAGE_SOURCE_BYTES}-byte limit"
+        )
     try:
-        next(uri_iter)
-    except StopIteration:
-        return prepared
-    raise ValueError("environment reply transported image data without a matching image block")
+        data = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("environment reply image data uri contains invalid base64 data") from error
+    if len(data) > _MAX_IMAGE_SOURCE_BYTES:
+        raise ValueError(
+            f"environment reply image source exceeds the {_MAX_IMAGE_SOURCE_BYTES}-byte limit"
+        )
+    if base64.b64encode(data).decode("ascii") != payload:
+        raise ValueError("environment reply image transport data uri is not canonical")
+    return data, expected_format
+
+
+def _inspect_dynamic_image(data: bytes, expected_format: str) -> tuple[int, int]:
+    from PIL import Image
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                image_format = str(image.format or "").upper()
+                if image_format != expected_format:
+                    raise ValueError(
+                        "environment reply image data uri MIME type does not match its image format"
+                    )
+                if getattr(image, "n_frames", 1) != 1:
+                    raise ValueError("environment reply image must be a static single-frame image")
+                pixels = _validate_dynamic_image_dimensions(image.width, image.height)
+                decoded_peak_bytes = pixels * (_MODE_BYTES_PER_PIXEL.get(image.mode, 4) + 6)
+                image.verify()
+        return pixels, decoded_peak_bytes
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError("environment reply image source is not a valid image") from error
+
+
+def _decode_validated_dynamic_image(data: bytes, expected_format: str):
+    from PIL import Image, ImageOps
+
+    converted = None
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if str(image.format or "").upper() != expected_format:
+                raise ValueError(
+                    "environment reply image data uri MIME type does not match its image format"
+                )
+            if getattr(image, "n_frames", 1) != 1:
+                raise ValueError("environment reply image must be a static single-frame image")
+            _validate_dynamic_image_dimensions(image.width, image.height)
+            image.load()
+            ImageOps.exif_transpose(image, in_place=True)
+            _validate_dynamic_image_dimensions(image.width, image.height)
+            converted = image.convert("RGB")
+            converted.load()
+        return converted
+    except ValueError:
+        if converted is not None:
+            converted.close()
+        raise
+    except Exception as error:
+        if converted is not None:
+            converted.close()
+        raise ValueError("environment reply image source is not a valid image") from error
+
+
+def _decode_image_data_uris(image_data_uris: list[str]) -> list:
+    if len(image_data_uris) > _MAX_IMAGES_PER_REPLY:
+        raise ValueError(f"environment reply exceeds the {_MAX_IMAGES_PER_REPLY}-image limit")
+    prepared: list[tuple[bytes, str]] = []
+    total_source_bytes = 0
+    prior_pixels = 0
+    for uri in image_data_uris:
+        data, expected_format = _decode_canonical_image_data_uri(uri)
+        total_source_bytes += len(data)
+        if total_source_bytes > _MAX_TOTAL_IMAGE_SOURCE_BYTES:
+            raise ValueError("environment reply images exceed the aggregate source-byte limit")
+        pixels, decoded_peak_bytes = _inspect_dynamic_image(data, expected_format)
+        if prior_pixels + pixels > _MAX_TOTAL_IMAGE_PIXELS:
+            raise ValueError("environment reply images exceed the aggregate pixel limit")
+        if 3 * prior_pixels + decoded_peak_bytes > _MAX_TOTAL_DECODED_BYTES:
+            raise ValueError("environment reply images exceed the aggregate decoded-byte limit")
+        prior_pixels += pixels
+        prepared.append((data, expected_format))
+
+    images = []
+    try:
+        for data, expected_format in prepared:
+            images.append(_decode_validated_dynamic_image(data, expected_format))
+        return images
+    except Exception:
+        for image in images:
+            with contextlib.suppress(Exception):
+                image.close()
+        raise
 
 
 def _processor_glue_ids(
@@ -461,6 +618,7 @@ class EnvGlueProcessor:
     ) -> EnvironmentReplyGlue:
         image_data_uris = list(image_data_uris or ())
         structured = validate_structured_messages(messages, source="environment reply")
+        _validate_reply_image_count(structured, image_data_uris)
         if not image_data_uris:
             text_messages = validate_transcript_messages(
                 structured,
@@ -471,15 +629,7 @@ class EnvGlueProcessor:
         processor = getattr(self.loop_self, "processor", None)
         if processor is None:
             raise ValueError("environment reply carries images but the rollout has no processor")
-        prepared = bind_image_data_uris(structured, image_data_uris)
-        multi_modal_data = await self.loop_self.process_multi_modal_info(prepared)
-        images = list((multi_modal_data or {}).get("images") or ())
-        if len(images) != len(image_data_uris):
-            raise ValueError(
-                "environment reply decoded image count does not match its transported image data"
-            )
-        if (multi_modal_data or {}).get("videos") or (multi_modal_data or {}).get("audios"):
-            raise ValueError("environment reply image glue cannot carry video or audio media")
+        images = _decode_image_data_uris(image_data_uris)
         try:
             mm_processor_kwargs = self.loop_self._get_mm_processor_kwargs(None)
             token_ids = _processor_glue_ids(
