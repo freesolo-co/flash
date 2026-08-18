@@ -6214,7 +6214,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
             lora_rank=32,
             lora_alpha=64,
             target_modules="all-linear",
-            exclude_modules=None,
+            exclude_modules="text-export-policy",
             warmstart_adapter=None,
         ),
         runtime=SimpleNamespace(
@@ -6230,6 +6230,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
     )
 
     assert config["ulysses_sequence_parallel_size"] == 1
+    assert config["exclude_modules"] is None
     # every allocated card still trains: the cards move from sequence ranks to dp ranks, so capacity
     # is unchanged and 32k multi-card survives.
     assert config["n_gpus_per_node"] == gpu_count

@@ -524,7 +524,7 @@ def _build_base_config(
         "lora_rank": workload.lora_rank,
         "lora_alpha": workload.lora_alpha,
         "target_modules": workload.target_modules,
-        "exclude_modules": workload.exclude_modules,
+        "exclude_modules": None,
         "target_parameters": _opd_train._w.lora_target_parameters(request.model_id),
         "lora_adapter_path": workload.warmstart_adapter,
         "learning_rate": knobs.learning_rate,

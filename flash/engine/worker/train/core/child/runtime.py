@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import traceback
+from dataclasses import is_dataclass, replace
 
 FLASH_WANDB_LINK_MARKER = "FLASH_WANDB_LINK"
 FLASH_GDN_VARLEN_MARKER = "[flash-verl] gdn packed-boundary resets active"
@@ -460,17 +461,26 @@ def install_text_lora_targeting(language_prefix: str) -> None:
         model_config = self.model_config
         if getattr(model_config, "lora_adapter_path", None) is not None:
             return original(self, module)
-        if not getattr(model_config, "exclude_modules", None):
-            return original(self, module)
         if getattr(model_config, "target_modules", None) != "all-linear":
             raise RuntimeError(
                 "flash text LoRA targeting expected fresh-training target_modules='all-linear'"
             )
+        if getattr(model_config, "exclude_modules", None) is not None:
+            raise RuntimeError(
+                "flash text LoRA targeting requires exclude_modules=null after runtime target "
+                "resolution replaced regex filtering"
+            )
 
         targets = resolve_text_lora_target_modules(module, language_prefix)
-        model_config.target_modules = targets
-        model_config.exclude_modules = None
-        result = original(self, module)
+        if not is_dataclass(model_config):
+            raise RuntimeError("flash text LoRA targeting requires Verl's dataclass model config")
+        replacement_config = replace(model_config, target_modules=targets)
+
+        self.model_config = replacement_config
+        try:
+            result = original(self, module)
+        finally:
+            self.model_config = model_config
         targeted = set(getattr(result.base_model, "targeted_module_names", ()))
         if targeted != set(targets):
             raise RuntimeError(

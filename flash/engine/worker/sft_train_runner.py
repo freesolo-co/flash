@@ -623,7 +623,7 @@ def _prepare_sft_child(
         "lora_rank": model.lora_rank,
         "lora_alpha": model.lora_alpha,
         "target_modules": model.target_modules,
-        "exclude_modules": model.exclude_modules,
+        "exclude_modules": None,
         "target_parameters": _w.lora_target_parameters(options.model_id),
         "lora_adapter_path": model.warmstart_adapter,
         "ulysses_sp_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,

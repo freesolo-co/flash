@@ -597,7 +597,7 @@ def _build_verl_training_cfg(
         "lora_rank": inp["lora_rank"],
         "lora_alpha": inp["lora_alpha"],
         "target_modules": targeting.target_modules,
-        "exclude_modules": targeting.exclude_modules,
+        "exclude_modules": None,
         # the catalog id, never model_path: fused routed-expert parameters are part of the same
         # resolved target surface and must not be derived from the local snapshot path.
         "target_parameters": targeting.target_parameters,

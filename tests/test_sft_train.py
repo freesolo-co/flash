@@ -3106,6 +3106,25 @@ def test_the_child_caps_at_the_quoted_horizon_without_an_authored_max_steps(monk
     assert "trainer.total_training_steps=null" not in child.command
 
 
+def test_text_sft_keeps_export_policy_out_of_the_frozen_verl_runtime_config(monkeypatch):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+    options = sft_train_runner._resolve_sft_options(spec)
+    data = sft_train_runner._prepare_sft_data(options)
+    model = sft_train_runner._prepare_sft_model(options, data)
+    assert model.exclude_modules is not None
+    capabilities = sft_train_runner._SftCapabilities(
+        python_bin="/venv/bin/python", caps={}, gdn_hybrid=False, gdn_module=""
+    )
+
+    child = sft_train_runner._prepare_sft_child(options, data, model, capabilities, True, None)
+
+    assert "model.exclude_modules=null" in child.command
+    assert child.expected_shims.count("text-lora-targeting") == 1
+
+
 def test_a_packed_quote_fails_closed_when_environment_filtering_leaves_less_than_one_batch(
     monkeypatch,
 ):

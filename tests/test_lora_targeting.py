@@ -5,7 +5,7 @@ import json
 import re
 import sys
 import types
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, dataclass, field, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -182,7 +182,16 @@ def test_every_campaign_multimodal_trainer_keeps_the_existing_all_linear_surface
         assert targeting.target_parameters is None
 
 
-def _install_fake_verl_engine(monkeypatch):
+@dataclass(frozen=True)
+class _FrozenModelConfig:
+    target_modules: object = "all-linear"
+    target_parameters: list[str] | None = field(default_factory=list)
+    exclude_modules: str | None = None
+    lora_adapter_path: str | None = None
+    preserved: object = None
+
+
+def _install_fake_verl_engine(monkeypatch, *, attached_targets=None, builder_error=None):
     calls = []
 
     class _Engine:
@@ -190,17 +199,14 @@ def _install_fake_verl_engine(monkeypatch):
             self.model_config = config
 
         def _build_lora_module(self, module):
-            calls.append(
-                (
-                    self.model_config.target_modules,
-                    self.model_config.exclude_modules,
-                    self.model_config.lora_adapter_path,
-                )
-            )
+            calls.append(self.model_config)
+            if builder_error is not None:
+                raise builder_error
             targets = self.model_config.target_modules
+            attached = targets if attached_targets is None else attached_targets
             return SimpleNamespace(
                 base_model=SimpleNamespace(
-                    targeted_module_names=list(targets) if isinstance(targets, list) else []
+                    targeted_module_names=list(attached) if isinstance(attached, list) else []
                 )
             )
 
@@ -220,48 +226,94 @@ def _install_fake_verl_engine(monkeypatch):
     return _Engine, calls
 
 
-def test_runtime_installer_replaces_only_fresh_text_targeting(monkeypatch):
+@pytest.mark.parametrize("wrapper", ["", "module.", "_orig_mod.", "base_model.model."])
+def test_runtime_installer_replaces_only_target_modules_and_restores_the_caller(
+    monkeypatch, wrapper
+):
     engine_cls, calls = _install_fake_verl_engine(monkeypatch)
-    broken_hydra_regex = r"^(?!model\\.language_model(?:\\.|$)).*$"
+    fused_targets = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+    preserved = object()
+    original = _FrozenModelConfig(target_parameters=fused_targets, preserved=preserved)
+    original_values = {item.name: getattr(original, item.name) for item in fields(original)}
+    engine = engine_cls(original)
 
-    text_config = SimpleNamespace(
-        target_modules="all-linear",
-        exclude_modules=broken_hydra_regex,
-        lora_adapter_path=None,
-    )
-    engine_cls(text_config)._build_lora_module(_runtime_topology("module."))
-    assert calls[-1] == (
-        [
-            "module.model.language_model.layers.0.mlp.down_proj",
-            "module.model.language_model.layers.0.self_attn.q_proj",
-        ],
-        None,
-        None,
-    )
+    engine._build_lora_module(_runtime_topology(wrapper))
 
-    multimodal_config = SimpleNamespace(
-        target_modules="all-linear",
-        exclude_modules=None,
-        lora_adapter_path=None,
-    )
-    engine_cls(multimodal_config)._build_lora_module(_runtime_topology())
-    assert calls[-1] == ("all-linear", None, None)
-
-    warmstart_config = SimpleNamespace(
-        target_modules="all-linear",
-        exclude_modules=broken_hydra_regex,
-        lora_adapter_path="/adapter",
-    )
-    engine_cls(warmstart_config)._build_lora_module(_runtime_topology())
-    assert calls[-1] == ("all-linear", broken_hydra_regex, "/adapter")
+    replacement = calls[-1]
+    expected_targets = [
+        f"{wrapper}model.language_model.layers.0.mlp.down_proj",
+        f"{wrapper}model.language_model.layers.0.self_attn.q_proj",
+    ]
+    assert replacement is not original
+    assert replacement.target_modules == expected_targets
+    assert replacement.target_parameters is fused_targets
+    assert replacement.preserved is preserved
+    assert engine.model_config is original
+    assert {item.name: getattr(original, item.name) for item in fields(original)} == original_values
+    for item in fields(original):
+        if item.name != "target_modules":
+            assert getattr(replacement, item.name) is getattr(original, item.name)
+    with pytest.raises(FrozenInstanceError):
+        replacement.target_modules = []
+    with pytest.raises(FrozenInstanceError):
+        original.target_modules = []
 
 
-def test_sft_and_opd_child_configs_install_text_targeting_only_for_text_jobs(tmp_path):
+def test_runtime_installer_bypasses_warm_start_without_copying_or_resolving(monkeypatch):
+    engine_cls, calls = _install_fake_verl_engine(monkeypatch)
+    original = _FrozenModelConfig(lora_adapter_path="/adapter", exclude_modules="preserved")
+    engine = engine_cls(original)
+
+    engine._build_lora_module(_FakeModule([]))
+
+    assert calls == [original]
+    assert engine.model_config is original
+
+
+def test_runtime_installer_restores_the_original_config_when_the_builder_fails(monkeypatch):
+    class _BuilderError(RuntimeError):
+        pass
+
+    error = _BuilderError("builder failed")
+    engine_cls, calls = _install_fake_verl_engine(monkeypatch, builder_error=error)
+    original = _FrozenModelConfig()
+    engine = engine_cls(original)
+
+    with pytest.raises(_BuilderError, match="builder failed"):
+        engine._build_lora_module(_runtime_topology())
+    assert calls[-1] is not original
+    assert engine.model_config is original
+
+
+def test_runtime_installer_rejects_stale_or_non_dataclass_configs_and_incomplete_attachment(
+    monkeypatch,
+):
+    engine_cls, _calls = _install_fake_verl_engine(monkeypatch)
+    with pytest.raises(RuntimeError, match="requires exclude_modules=null"):
+        engine_cls(_FrozenModelConfig(exclude_modules="stale"))._build_lora_module(
+            _runtime_topology()
+        )
+    with pytest.raises(RuntimeError, match="requires Verl's dataclass model config"):
+        engine_cls(
+            SimpleNamespace(
+                target_modules="all-linear",
+                exclude_modules=None,
+                lora_adapter_path=None,
+            )
+        )._build_lora_module(_runtime_topology())
+
+    engine_cls, _calls = _install_fake_verl_engine(monkeypatch, attached_targets=[])
+    with pytest.raises(RuntimeError, match="did not attach the complete exact"):
+        engine_cls(_FrozenModelConfig())._build_lora_module(_runtime_topology())
+
+
+def test_sft_grpo_and_opd_plugins_install_text_targeting_only_for_text_jobs(tmp_path):
     importlib.import_module("flash.engine.worker.sft_train")
     from flash.engine.worker import sft_train_runner
     from flash.engine.worker.train.opd.overrides import _build_opd_plugin_config
+    from flash.engine.worker.train.rl.child.plugin import required_patch_names
 
-    shim_dir = tmp_path / "sft-shim"
+    shim_dir = tmp_path / "sft-text-shim"
     shim_dir.mkdir()
     _marker, expected, raw_sft = sft_train_runner._write_sft_child_shims(
         SimpleNamespace(model_id="Qwen/Qwen3.5-0.8B", save_at_steps=()),
@@ -279,6 +331,31 @@ def test_sft_and_opd_child_configs_install_text_targeting_only_for_text_jobs(tmp
     assert child_runtime.TEXT_LORA_TARGET_SHIM in expected
     assert json.loads(raw_sft)["lora_language_prefix"] == "model.language_model"
 
+    multimodal_dir = tmp_path / "sft-multimodal-shim"
+    multimodal_dir.mkdir()
+    _marker, expected, raw_sft = sft_train_runner._write_sft_child_shims(
+        SimpleNamespace(model_id="Qwen/Qwen3.5-0.8B", save_at_steps=()),
+        SimpleNamespace(
+            update_horizon=1,
+            reentrant_gradient_checkpointing=False,
+            exclude_modules=None,
+        ),
+        shim_dir=str(multimodal_dir),
+        custom_dataset_path=str(multimodal_dir / "dataset.py"),
+        seed=42,
+        loggers=[],
+        gdn_reset_arch=None,
+    )
+    assert child_runtime.TEXT_LORA_TARGET_SHIM not in expected
+    assert json.loads(raw_sft)["lora_language_prefix"] == ""
+
+    grpo_text = required_patch_names(
+        {"lora_language_prefix": "model.language_model", "total_steps": 1}
+    )
+    grpo_multimodal = required_patch_names({"lora_language_prefix": "", "total_steps": 1})
+    assert child_runtime.TEXT_LORA_TARGET_SHIM in grpo_text
+    assert child_runtime.TEXT_LORA_TARGET_SHIM not in grpo_multimodal
+
     raw_opd = _build_opd_plugin_config(
         shim_dir=str(tmp_path),
         save_at_steps=(),
@@ -288,6 +365,15 @@ def test_sft_and_opd_child_configs_install_text_targeting_only_for_text_jobs(tmp
         lora_language_prefix="model.language_model",
     )
     assert json.loads(raw_opd)["lora_language_prefix"] == "model.language_model"
+    raw_opd = _build_opd_plugin_config(
+        shim_dir=str(tmp_path),
+        save_at_steps=(),
+        total_steps=1,
+        gdn_model_type=None,
+        loggers=[],
+        lora_language_prefix="",
+    )
+    assert "lora_language_prefix" not in json.loads(raw_opd)
 
 
 def test_exact_verl_hf_model_reproduces_old_peft_failure_and_attaches_new_targets():

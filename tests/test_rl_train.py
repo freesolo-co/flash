@@ -1400,6 +1400,7 @@ def test_build_verl_training_cfg_resolves_expert_targets_from_the_catalog_id():
         "mlp.experts.gate_up_proj",
         "mlp.experts.down_proj",
     ]
+    assert cfg["exclude_modules"] is None
 
 
 def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
