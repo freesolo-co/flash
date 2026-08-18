@@ -279,6 +279,13 @@ def _prepare_prompts(
     )
 
 
+def _reset_workdir(workdir: str) -> None:
+    shutil.rmtree(workdir, ignore_errors=True)
+    if os.path.lexists(workdir):
+        raise RuntimeError(f"could not clear stale OPD attempt workdir {workdir!r}")
+    os.makedirs(workdir)
+
+
 def _prepare_workload(
     request: _OpdRequest,
     prompt_state: _PromptState,
@@ -298,7 +305,7 @@ def _prepare_workload(
     workdir = os.path.join(
         "/tmp", "flash-opd-verl", _opd_train._w.RUN_ID, f"seed-{_opd_train._w.SEED}"
     )
-    shutil.rmtree(workdir, ignore_errors=True)
+    _reset_workdir(workdir)
     data_dir = os.path.join(workdir, "data")
     image_dir = os.path.join(workdir, "images")
     shim_dir = os.path.join(workdir, "shim")
@@ -306,6 +313,7 @@ def _prepare_workload(
     export_root = os.path.join(workdir, "checkpoint-adapters")
     mutation_failure_path = os.path.join(workdir, "mutation-failure")
     score_delivery_failure_path = os.path.join(workdir, "score-delivery-failure")
+    rollout_failure_path = os.path.join(workdir, "rollout-failure")
     abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
     resample_failure_path = os.path.join(workdir, "resample-failure")
     cycle_commit_failure_path = os.path.join(workdir, "cycle-commit-failure")
@@ -363,6 +371,7 @@ def _prepare_workload(
         export_root,
         mutation_failure_path,
         score_delivery_failure_path,
+        rollout_failure_path,
         abandonment_failure_path,
         resample_failure_path,
         cycle_commit_failure_path,
@@ -789,6 +798,7 @@ def _build_child_env(
         max_model_len=prompt_state.max_model_len,
         mutation_failure_path=workload.mutation_failure_path,
         score_delivery_failure_path=workload.score_delivery_failure_path,
+        rollout_failure_path=workload.rollout_failure_path,
         abandonment_failure_path=workload.abandonment_failure_path,
         resample_failure_path=workload.resample_failure_path,
         cycle_commit_failure_path=workload.cycle_commit_failure_path,
@@ -828,6 +838,7 @@ def _reconcile_child_failures(
     cycle_commit_failure = _opd_train._read_classified_failure_fallback(
         workload.cycle_commit_failure_path
     )
+    rollout_failure = _opd_train._read_rollout_failure_fallback(workload.rollout_failure_path)
     _opd_train._raise_verl_failure(
         return_code,
         bridge.teacher_failure,
@@ -835,6 +846,7 @@ def _reconcile_child_failures(
         cycle_commit_failure,
         no_signal_failure,
         score_delivery_failure,
+        rollout_failure=rollout_failure,
         truncation_window=truncation_window,
     )
 

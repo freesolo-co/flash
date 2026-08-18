@@ -455,6 +455,9 @@ from flash.engine.worker.train.opd.batching import (  # noqa: E402,F401
     _validate_text_teacher_batch,
 )
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge  # noqa: E402
+from flash.engine.worker.train.opd.child.bridge import (  # noqa: E402,F401
+    _read_rollout_failure_fallback,
+)
 
 # failure accounting and resume staging, implemented in `.train.opd.failures`. imported at the
 # BOTTOM because that module reads this one's teacher exit codes, so a top-level import would be

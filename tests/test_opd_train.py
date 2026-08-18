@@ -5842,6 +5842,7 @@ def _reconcile_opd_failure(truncation_window: _TruncationWindow):
     )
     workload = SimpleNamespace(
         score_delivery_failure_path="",
+        rollout_failure_path="",
         resample_failure_path="",
         abandonment_failure_path="",
         mutation_failure_path="",
@@ -6930,6 +6931,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
         thinking=False,
         mutation_failure_path=str(tmp_path / "mutation-failure"),
         score_delivery_failure_path=str(tmp_path / "score-delivery-failure"),
+        rollout_failure_path=str(tmp_path / "rollout-failure"),
         abandonment_failure_path=str(tmp_path / "abandonment-failure"),
         resample_failure_path=str(tmp_path / "resample-failure"),
         cycle_commit_failure_path=str(tmp_path / "cycle-commit-failure"),
@@ -6940,6 +6942,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
     assert child["FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH"] == str(
         tmp_path / "score-delivery-failure"
     )
+    assert child["FLASH_OPD_ROLLOUT_FAILURE_PATH"] == str(tmp_path / "rollout-failure")
     assert child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] == str(tmp_path / "abandonment-failure")
     assert child["FLASH_OPD_RESAMPLE_FAILURE_PATH"] == str(tmp_path / "resample-failure")
     assert child["FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH"] == str(tmp_path / "cycle-commit-failure")
@@ -7970,6 +7973,26 @@ def test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction():
     # rather than a second gradient path, so moving it changes the objective, not just the value.
     assert "flat_student.detach()" in source
     assert source.count(".detach()") == 1
+
+
+def test_opd_workdir_reset_removes_stale_state_and_fails_closed(monkeypatch, tmp_path):
+    import flash.engine.worker.opd_train_runner as opd_runner
+
+    workdir = tmp_path / "attempt"
+    workdir.mkdir()
+    stale_record = workdir / "rollout-failure.json"
+    stale_record.write_text("stale")
+
+    opd_runner._reset_workdir(str(workdir))
+
+    assert workdir.is_dir()
+    assert list(workdir.iterdir()) == []
+
+    stale_record.write_text("still stale")
+    monkeypatch.setattr(opd_runner.shutil, "rmtree", lambda *_args, **_kwargs: None)
+    with pytest.raises(RuntimeError, match="could not clear stale OPD attempt workdir"):
+        opd_runner._reset_workdir(str(workdir))
+    assert stale_record.read_text() == "still stale"
 
 
 def test_opd_sitecustomize_is_only_the_startup_bootstrap(tmp_path, monkeypatch):

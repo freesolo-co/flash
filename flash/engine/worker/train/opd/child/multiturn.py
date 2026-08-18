@@ -20,6 +20,7 @@ if __name__ == "flash_opd_multiturn":
         sum_preemptions,
         validate_glue_template,
     )
+    from flash_opd_bridge import _write_rollout_failure_fallback
 else:
     from flash.engine.worker.train.core.child.glue import (
         EnvGlueProcessor,
@@ -31,6 +32,7 @@ else:
         sum_preemptions,
         validate_glue_template,
     )
+    from flash.engine.worker.train.opd.child.bridge import _write_rollout_failure_fallback
 
 __all__ = [
     "EnvGlueProcessor",
@@ -279,6 +281,10 @@ async def _opd_run(
         _attach_teacher_rows(outputs, score_payload)
     except Exception as error:
         failure_exit_code = fatal_rollout_exit_code(error)
+        failure_classification = (
+            "transient" if failure_exit_code == transient_teacher_exit else "permanent"
+        )
+        _write_rollout_failure_fallback(error, failure_classification)
         with contextlib.suppress(BaseException):
             mark_prompt_failure(
                 str(kwargs["uid"]),
@@ -477,6 +483,10 @@ def build_flash_multi_turn_agent_loop(
                     if getattr(error, "classification", None) == "transient"
                     else permanent_teacher_exit
                 )
+                failure_classification = (
+                    "transient" if exit_code == transient_teacher_exit else "permanent"
+                )
+                _write_rollout_failure_fallback(error, failure_classification)
                 exit_process(exit_code)
                 raise AssertionError("multi-turn OPD process exit returned unexpectedly") from error
 

@@ -42,6 +42,7 @@ class _WorkloadState:
     export_root: str
     mutation_failure_path: str
     score_delivery_failure_path: str
+    rollout_failure_path: str
     abandonment_failure_path: str
     resample_failure_path: str
     cycle_commit_failure_path: str

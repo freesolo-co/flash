@@ -376,6 +376,7 @@ def _build_opd_child_env(
     max_model_len: int = 32768,
     mutation_failure_path: str = "",
     score_delivery_failure_path: str = "",
+    rollout_failure_path: str = "",
     abandonment_failure_path: str = "",
     resample_failure_path: str = "",
     cycle_commit_failure_path: str = "",
@@ -396,6 +397,8 @@ def _build_opd_child_env(
         child["FLASH_OPD_MUTATION_FAILURE_PATH"] = mutation_failure_path
     if score_delivery_failure_path:
         child["FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH"] = score_delivery_failure_path
+    if rollout_failure_path:
+        child["FLASH_OPD_ROLLOUT_FAILURE_PATH"] = rollout_failure_path
     if abandonment_failure_path:
         child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] = abandonment_failure_path
     if resample_failure_path:

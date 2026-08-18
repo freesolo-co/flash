@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import types
 
 if __name__ == "flash_opd_replay_guard":
     from flash_child_diagnostics import sanitize_diagnostic
+    from flash_opd_bridge import _read_rollout_failure_fallback, _render_rollout_failure
 else:
     from flash._internal.diagnostics import sanitize_diagnostic
+    from flash.engine.worker.train.opd.child.bridge import (
+        _read_rollout_failure_fallback,
+        _render_rollout_failure,
+    )
 
 _REPLAY_STALL_SECONDS = 1200.0
 _REPLAY_POLL_SECONDS = 0.1
@@ -62,6 +68,12 @@ def _actor_probe_state(trainer) -> str:
 
 
 def _raise_prompt_failure(key: str, global_steps: int) -> None:
+    recorded = _read_rollout_failure_fallback(os.environ.get("FLASH_OPD_ROLLOUT_FAILURE_PATH", ""))
+    if recorded is not None:
+        detail = _render_rollout_failure(recorded)
+        raise RuntimeError(
+            f"multi-turn OPD rollout failed at global_steps={global_steps}: {detail}"
+        )
     detail = sanitize_diagnostic(
         f"opd replay observed failed prompt {key!r} at global_steps={global_steps}",
         limit=2000,
