@@ -24,6 +24,10 @@ on:
         description: "comma-separated sm list to bake; default is all validated arches"
         default: "sm80,sm86,sm89,sm90,sm120,sm100"
         required: false
+      target_tag_prefix:
+        description: "target image tag before the -sm suffix"
+        default: "cu128"
+        required: false
   # auto-rebake.yml calls this for the EXPENSIVE path (the cache is invalid and must be re-warmed on a
   # real GPU). It passes the arch subset, the fingerprints to stamp, and a digest-pinned base so the
   # warm runs inside the exact :cu128 the per-arch tag will sit on.
@@ -48,6 +52,10 @@ on:
         type: string
         required: false
         default: ""
+      target_tag_prefix:
+        type: string
+        required: false
+        default: "cu128"
 
 permissions:
   contents: read
@@ -85,51 +93,36 @@ jobs:
           - {
               sm: sm80,
               arch: "8.0",
-              gpu_type_id: "NVIDIA A100 80GB PCIe",
               allowed_cuda: "",
             }
           - {
               sm: sm86,
               arch: "8.6",
-              gpu_type_id: "NVIDIA RTX A6000",
               allowed_cuda: "",
             }
-          # sm89 (Ada): warm on the L40S -- a DATACENTER Ada card with reliable secure-cloud capacity --
-          # instead of the consumer RTX 4090 (scarce/cold on secure cloud, where the bake pod often never
-          # finished pulling the ~20GB image before the deadline). The cache is sm-keyed, so an L40S-warmed
-          # sm89 cache is valid on every sm89 card (4090/L40/L4). NB: verify the exact RunPod gpuTypeId.
+          # the controller walks ordered same-sm secure-cloud gpu types from its per-sm map.
+          # preferred datacenter cards stay first, but one empty sku cannot strand this architecture
+          # on a stale image and send ordinary starts through jit.
           - {
               sm: sm89,
               arch: "8.9",
-              gpu_type_id: "NVIDIA L40S",
               allowed_cuda: "",
             }
-          # sm90 (Hopper): warm on the H200 (141GB, sm90) -- better secure-cloud capacity than the
-          # heavily-contended H100 80GB HBM3 (which cold-pull-stalled the bake). Same sm90, so the cache
-          # is valid on every H100/H200. H200 is in flash's validated GPU catalog (providers/base.py).
           - {
               sm: sm90,
               arch: "9.0",
-              gpu_type_id: "NVIDIA H200",
               allowed_cuda: "",
             }
-          # Blackwell needs CUDA-13 hosts to JIT its PTX (matches min_cuda_for in the provider). Bake
-          # sm120 on the RTX Pro 6000 (Server Edition): it's the same sm120 (cache is sm-keyed, so it's
-          # valid for RTX 5090 too) but has far better secure-cloud on-demand capacity -- the RTX 5090
-          # pool repeatedly returned "machine does not have the resources" at create_pod.
+          # blackwell needs cuda-13 hosts to jit its ptx (matches min_cuda_for in the provider).
           - {
               sm: sm120,
               arch: "12.0",
-              gpu_type_id: "NVIDIA RTX PRO 6000 Blackwell Server Edition",
               allowed_cuda: "13.0",
             }
-          # datacenter blackwell (sm100, distinct from the sm120 rtx pro 6000). b200 has 180 gb,
-          # good secure-cloud capacity, and is validated. promote its image only after a successful
-          # real-b200 bake, then include it in default and automatic rebakes.
+          # datacenter blackwell is distinct from sm120. b200 is the only validated sm100 type.
           - {
               sm: sm100,
               arch: "10.0",
-              gpu_type_id: "NVIDIA B200",
               allowed_cuda: "13.0",
             }
     steps:
@@ -227,7 +220,6 @@ jobs:
         run: |
           uv run python docker/bake_kernel_cache.py \
             --arch "${{ matrix.arch }}" --sm "${{ matrix.sm }}" \
-            --gpu-type-id "${{ matrix.gpu_type_id }}" \
             --allowed-cuda "${{ matrix.allowed_cuda }}" \
             --image "$BASE_IMAGE" \
             --out build/kernel_cache
@@ -256,7 +248,7 @@ jobs:
           context: .
           file: docker/Dockerfile.kernelcache
           push: true
-          tags: ghcr.io/freesolo-co/flash-worker:cu128-${{ matrix.sm }}
+          tags: ghcr.io/freesolo-co/flash-worker:${{ inputs.target_tag_prefix || 'cu128' }}-${{ matrix.sm }}
           provenance: false
           build-args: |
             BASE=${{ steps.base.outputs.ref }}

@@ -12,6 +12,27 @@ name: flash worker image
 # means only the flash COPY+install layer reruns on pure Python changes (~minutes, not hours).
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      source_ref:
+        type: string
+        required: true
+    outputs:
+      base_ref:
+        description: digest-pinned worker base
+        value: ${{ jobs.build.outputs.base_ref }}
+      fp_cache:
+        description: kernel-cache compatibility fingerprint
+        value: ${{ jobs.build.outputs.fp_cache }}
+      fp_base:
+        description: full worker-base fingerprint
+        value: ${{ jobs.build.outputs.fp_base }}
+      base_revision:
+        description: resolved source revision
+        value: ${{ jobs.build.outputs.base_revision }}
   workflow_dispatch:
     inputs:
       tag:
@@ -46,7 +67,7 @@ permissions:
 # a non-prod `tag=cu128-test` dispatch can't cancel an in-flight prod `cu128` push on the same ref
 # (which would leave :cu128 unpublished for that commit and auto-rebake blind to it).
 concurrency:
-  group: worker-image-${{ github.ref }}-${{ github.event.inputs.tag || 'cu128' }}
+  group: worker-image-${{ github.ref }}-${{ inputs.tag || github.event.inputs.tag || 'cu128' }}
   cancel-in-progress: true
 
 jobs:
@@ -63,6 +84,11 @@ jobs:
     # vllm and the flash-attn wheels from scratch, while still releasing the runner well before
     # the 6-hour default would.
     timeout-minutes: 90
+    outputs:
+      base_ref: ghcr.io/freesolo-co/flash-worker@${{ steps.image.outputs.digest }}
+      fp_cache: ${{ steps.fp.outputs.fp_cache }}
+      fp_base: ${{ steps.fp.outputs.fp_base }}
+      base_revision: ${{ steps.source.outputs.revision }}
     # Single source for the FlashAttention wheel: used BOTH as a build-arg and as a fingerprint input
     # (so a wheel bump moves fp_base). Keep FA2_SPEC in sync with Dockerfile.worker's ARG default.
     env:
@@ -75,6 +101,16 @@ jobs:
       FA2_SHA256: a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+
+      - name: Resolve source metadata
+        id: source
+        env:
+          IMAGE_TAG: ${{ inputs.tag || github.event.inputs.tag || 'cu128' }}
+        run: |
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
       # Compute the kernel-cache fingerprints (stdlib-only, no uv sync) and stamp them as labels on
       # :cu128 below, so auto-rebake.yml can read what this base was built from. Fails the build if a
@@ -103,6 +139,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build + push worker image
+        id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -111,14 +148,14 @@ jobs:
           # pin the freesolo-co namespace: runpod, vast, and lambda training paths pull the image
           # declared in flash/providers/_lifecycle/worker.py, so a fork run must not push to its own owner
           # namespace and leave the real image stale.
-          tags: ghcr.io/freesolo-co/flash-worker:${{ github.event.inputs.tag || 'cu128' }}
+          tags: ghcr.io/freesolo-co/flash-worker:${{ steps.source.outputs.tag }}
           provenance: false
           # Stamp the kernel-cache fingerprints + the source commit so auto-rebake.yml can read what
           # this base was built from (docker/kernel_fingerprint.py is the source of truth).
           labels: |
             co.freesolo.flash.kernelcache.fp_cache=${{ steps.fp.outputs.fp_cache }}
             co.freesolo.flash.kernelcache.fp_base=${{ steps.fp.outputs.fp_base }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
           # Install a PREBUILT flash-attn wheel instead of compiling from source (a multi-arch
           # source compile is huge and OOM-kills the runner). The wheel matches the base exactly
           # (cu128 / torch2.10 / cp312). The FA2 spec comes from the job-level env (single source).
