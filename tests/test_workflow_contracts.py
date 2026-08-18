@@ -488,6 +488,7 @@ def test_workflows_that_touch_shared_resources_are_upstream_only():
         "publish-image.yml": "publish-flash-image",
         "worker-image.yml": "build",
         "auto-rebake.yml": "gate",
+        "dev-kernel-cache.yml": "detect",
         "notify-tests-repo.yml": "notify",
         # Reached two ways, and the gate on `auto-rebake` only covers one of them: this workflow is
         # also directly dispatchable, so it needs its own guard. It is the most expensive job in the
@@ -497,3 +498,115 @@ def test_workflows_that_touch_shared_resources_are_upstream_only():
     for filename, job_name in guarded.items():
         job = _jobs(_load(WORKFLOW_DIR / filename))[job_name]
         _assert_gated_upstream(job.get("if"), f"{filename}:{job_name}")
+
+
+def test_worker_image_can_build_an_exact_reusable_source():
+    document = _load(WORKFLOW_DIR / "worker-image.yml")
+    call = _triggers(document)["workflow_call"]
+    assert call["inputs"]["tag"]["required"] is True
+    assert call["inputs"]["source_ref"]["required"] is True
+    assert set(call["outputs"]) == {
+        "base_ref",
+        "fp_cache",
+        "fp_base",
+        "base_revision",
+    }
+
+    job = _jobs(document)["build"]
+    checkout = next(
+        step
+        for step in _steps(job)
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert "inputs.source_ref" in checkout["with"]["ref"]
+    source = next(step for step in _steps(job) if step.get("id") == "source")
+    assert "git rev-parse HEAD" in source["run"]
+    image = next(step for step in _steps(job) if step.get("id") == "image")
+    assert "steps.source.outputs.tag" in image["with"]["tags"]
+    assert "steps.source.outputs.revision" in image["with"]["labels"]
+    assert "steps.image.outputs.digest" in job["outputs"]["base_ref"]
+
+
+def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
+    document = _load(WORKFLOW_DIR / "dev-kernel-cache.yml")
+    triggers = _triggers(document)
+    assert triggers["push"]["branches"] == ["dev"]
+    assert triggers["schedule"] == [{"cron": "0 9 * * *"}]
+    assert "workflow_dispatch" in triggers
+
+    jobs = _jobs(document)
+    build = jobs["build-base"]
+    bake = jobs["bake"]
+    assert "github.event_name != 'push'" in build["if"]
+    assert "needs.detect.outputs.needs_bake == 'true'" in build["if"]
+    assert build["uses"] == "./.github/workflows/worker-image.yml"
+    assert "needs.detect.outputs.revision" in build["with"]["source_ref"]
+    assert "github.event_name != 'push'" in bake["if"]
+    assert bake["uses"] == "./.github/workflows/bake-kernel-cache.yml"
+    assert "cu128-dev-" in bake["with"]["target_tag_prefix"]
+
+    publish = jobs["publish-ready"]
+    script = next(
+        step
+        for step in _steps(publish)
+        if step.get("name") == "Publish ready aliases"
+    )["run"]
+    assert "cu128-dev-$REVISION-$sm" in script
+    assert "cu128-dev-ready-$sm" in script
+    assert script.index("candidate validation failed") < script.index("crane copy")
+
+
+def test_main_pr_check_requires_each_exact_sm_cache():
+    document = _load(WORKFLOW_DIR / "production-kernel-cache-ready.yml")
+    assert _triggers(document)["pull_request"]["branches"] == ["main"]
+    job = _jobs(document)["ready"]
+    assert job["name"] == "production kernel cache ready"
+
+    checkout = next(
+        step
+        for step in _steps(job)
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+    verify = next(
+        step
+        for step in _steps(job)
+        if step.get("name") == "Verify every sm cache is ready"
+    )
+    script = verify["run"]
+    assert "--print-baked-arches" in script
+    assert "cu128-dev-ready-$sm" in script
+    assert 'candidate_pc" = "$FP_CACHE' in script
+    assert 'candidate_rev" = "$HEAD_SHA' in script
+    assert "exit 1" in script
+
+
+def test_production_relayer_promotes_matching_dev_cache_before_gpu_fallback():
+    document = _load(WORKFLOW_DIR / "auto-rebake.yml")
+    jobs = _jobs(document)
+    classify = next(
+        step for step in _steps(jobs["gate"]) if step.get("id") == "classify"
+    )["run"]
+    assert "cu128-dev-ready-$sm" in classify
+    assert 'candidate_pc" = "$FP_CACHE' in classify
+    assert "gpu re-warm (candidate missing)" in classify
+    assert "relayer_matrix=" in classify
+
+    relayer = jobs["relayer"]
+    assert "relayer_matrix" in relayer["strategy"]["matrix"]["include"]
+    resolve = next(
+        step for step in _steps(relayer) if step.get("id") == "old"
+    )["run"]
+    assert 'img="${{ matrix.source }}"' in resolve
+
+
+def test_bake_workflow_can_publish_versioned_candidate_tags():
+    document = _load(WORKFLOW_DIR / "bake-kernel-cache.yml")
+    call_inputs = _triggers(document)["workflow_call"]["inputs"]
+    assert call_inputs["target_tag_prefix"]["default"] == "cu128"
+    image = next(
+        step
+        for step in _steps(_jobs(document)["bake"])
+        if "docker/build-push-action@" in step.get("uses", "")
+    )
+    assert "inputs.target_tag_prefix" in image["with"]["tags"]

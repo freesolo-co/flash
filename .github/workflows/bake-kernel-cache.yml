@@ -24,6 +24,10 @@ on:
         description: "comma-separated sm list to bake; default is all validated arches"
         default: "sm80,sm86,sm89,sm90,sm120,sm100"
         required: false
+      target_tag_prefix:
+        description: "target image tag before the -sm suffix"
+        default: "cu128"
+        required: false
   # auto-rebake.yml calls this for the EXPENSIVE path (the cache is invalid and must be re-warmed on a
   # real GPU). It passes the arch subset, the fingerprints to stamp, and a digest-pinned base so the
   # warm runs inside the exact :cu128 the per-arch tag will sit on.
@@ -48,6 +52,10 @@ on:
         type: string
         required: false
         default: ""
+      target_tag_prefix:
+        type: string
+        required: false
+        default: "cu128"
 
 permissions:
   contents: read
@@ -240,7 +248,7 @@ jobs:
           context: .
           file: docker/Dockerfile.kernelcache
           push: true
-          tags: ghcr.io/freesolo-co/flash-worker:cu128-${{ matrix.sm }}
+          tags: ghcr.io/freesolo-co/flash-worker:${{ inputs.target_tag_prefix || 'cu128' }}-${{ matrix.sm }}
           provenance: false
           build-args: |
             BASE=${{ steps.base.outputs.ref }}
