@@ -18,7 +18,8 @@ RUN python -c 'import sys; assert sys.version_info[:2] == (3, 12)' \
 
 COPY pyproject.toml uv.lock README.md LICENSE NOTICE ./
 COPY flash ./flash
+COPY serve_launch.py ./serve_launch.py
 RUN uv sync --frozen --no-dev --extra serve-runtime
 
 EXPOSE 8000
-CMD ["python", "-m", "flash.serve.app", "serve"]
+CMD ["python", "/app/serve_launch.py"]

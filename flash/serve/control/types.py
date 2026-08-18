@@ -364,11 +364,10 @@ def validate_resolved_adapter(adapter: ResolvedAdapter) -> None:
 class ModalPlacement:
     """modal-specific placement with explicit gpu type and count."""
 
-    workspace_id: str
+    workspace_name: str
     environment: str
     gpu: str
     region: str | None
-    volume_size_gb: int
     gpu_count: int = 1
 
     def __post_init__(self) -> None:
@@ -382,12 +381,11 @@ class ModalPlacement:
 def validate_modal_placement(placement: ModalPlacement) -> None:
     if type(placement) is not ModalPlacement:
         raise ValueError("modal requests require ModalPlacement")
-    _require_nonempty(placement.workspace_id, "modal workspace_id")
+    _require_nonempty(placement.workspace_name, "modal workspace_name")
     _require_nonempty(placement.environment, "modal environment")
     _require_nonempty(placement.gpu, "modal gpu")
     _require_positive_int(placement.gpu_count, "modal gpu_count")
     _require_optional_nonempty(placement.region, "modal region")
-    _require_positive_int(placement.volume_size_gb, "modal volume_size_gb")
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,11 +554,13 @@ class ModalProviderHandle:
     deployment_id: str
     generation: int
     engine_id: str
-    workspace_id: str
+    workspace_name: str
     app_id: str
     app_name: str
     volume_id: str
     volume_name: str
+    inference_secret_id: str
+    inference_secret_name: str
     environment: str
     region: str | None
     image_digest: str
@@ -576,11 +576,13 @@ def validate_modal_handle(handle: ModalProviderHandle) -> None:
         raise ValueError("handle must be an exact ModalProviderHandle")
     for name in (
         "deployment_id",
-        "workspace_id",
+        "workspace_name",
         "app_id",
         "app_name",
         "volume_id",
         "volume_name",
+        "inference_secret_id",
+        "inference_secret_name",
         "environment",
     ):
         _require_nonempty(getattr(handle, name), name)
@@ -603,6 +605,10 @@ class RunPodProviderHandle:
     pod_name: str
     network_volume_id: str
     network_volume_name: str
+    template_id: str
+    template_name: str
+    inference_secret_id: str
+    inference_secret_name: str
     data_center_id: str
     image_digest: str
     public_url: str
@@ -621,6 +627,10 @@ def validate_runpod_handle(handle: RunPodProviderHandle) -> None:
         "pod_name",
         "network_volume_id",
         "network_volume_name",
+        "template_id",
+        "template_name",
+        "inference_secret_id",
+        "inference_secret_name",
         "data_center_id",
     ):
         _require_nonempty(getattr(handle, name), name)
@@ -648,7 +658,7 @@ def _validate_handle_against_plan(
         validate_modal_handle(handle)
         assert type(placement) is ModalPlacement
         if (
-            handle.workspace_id != placement.workspace_id
+            handle.workspace_name != placement.workspace_name
             or handle.environment != placement.environment
             or handle.region != placement.region
         ):

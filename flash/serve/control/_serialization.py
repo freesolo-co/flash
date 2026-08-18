@@ -113,11 +113,10 @@ def canonical_adapter_sort_key(value: ResolvedAdapter) -> str:
 def _placement_payload(value: ModalPlacement | RunPodPlacement) -> dict[str, object]:
     if type(value) is ModalPlacement:
         return {
-            "workspace_id": value.workspace_id,
+            "workspace_name": value.workspace_name,
             "environment": value.environment,
             "gpu": value.gpu,
             "region": value.region,
-            "volume_size_gb": value.volume_size_gb,
             "gpu_count": value.gpu_count,
             "provider": value.provider,
         }
@@ -179,11 +178,13 @@ def _serialize_modal_handle(value: ModalProviderHandle) -> dict[str, object]:
         "deployment_id": value.deployment_id,
         "generation": value.generation,
         "engine_id": value.engine_id,
-        "workspace_id": value.workspace_id,
+        "workspace_name": value.workspace_name,
         "app_id": value.app_id,
         "app_name": value.app_name,
         "volume_id": value.volume_id,
         "volume_name": value.volume_name,
+        "inference_secret_id": value.inference_secret_id,
+        "inference_secret_name": value.inference_secret_name,
         "environment": value.environment,
         "region": value.region,
         "image_digest": value.image_digest,
@@ -204,6 +205,10 @@ def _serialize_runpod_handle(value: RunPodProviderHandle) -> dict[str, object]:
         "pod_name": value.pod_name,
         "network_volume_id": value.network_volume_id,
         "network_volume_name": value.network_volume_name,
+        "template_id": value.template_id,
+        "template_name": value.template_name,
+        "inference_secret_id": value.inference_secret_id,
+        "inference_secret_name": value.inference_secret_name,
         "data_center_id": value.data_center_id,
         "image_digest": value.image_digest,
         "public_url": value.public_url,

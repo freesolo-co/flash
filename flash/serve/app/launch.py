@@ -1,0 +1,499 @@
+"""shared pid 1 launcher for one immutable serving deployment."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import signal
+import subprocess
+import sys
+import threading
+import uuid
+from collections.abc import MutableMapping
+from pathlib import Path
+from types import FrameType, SimpleNamespace
+from typing import Any, Protocol, Self
+
+_MANIFEST_ENV = "FLASH_SERVING_MANIFEST"
+_MANIFEST_ID_ENV = "FLASH_SERVING_MANIFEST_ID"
+_IMAGE_DIGEST_ENV = "FLASH_SERVING_IMAGE_DIGEST"
+_CACHE_ROOT_ENV = "FLASH_SERVING_CACHE_ROOT"
+_HOST_ENV = "FLASH_SERVING_HOST"
+_PORT_ENV = "FLASH_SERVING_PORT"
+_INFERENCE_TOKEN_ENV = "FLASH_INFERENCE_TOKEN"
+_ARTIFACT_TOKEN_ENV = "FLASH_ARTIFACT_TOKEN"
+_INFERENCE_TOKEN_FD_ENV = "FLASH_INFERENCE_TOKEN_FD"
+_ARTIFACT_TOKEN_FD_ENV = "FLASH_ARTIFACT_TOKEN_FD"
+_DEFAULT_CACHE_ROOT = "/var/lib/flash-serving"
+_DEFAULT_HOST = "0.0.0.0"
+_DEFAULT_PORT = 8000
+_CHILD_STOP_TIMEOUT_SECONDS = 5.0
+_BOOTSTRAP_PATH = "/app/serve_launch.py"
+_SAFE_CHILD_COPIED_ENV_NAMES = frozenset(
+    {
+        "CUDA_VISIBLE_DEVICES",
+        "FLASH_SERVING_CACHE_ROOT",
+        "FLASH_SERVING_HOST",
+        "FLASH_SERVING_IMAGE_DIGEST",
+        "FLASH_SERVING_MANIFEST",
+        "FLASH_SERVING_MANIFEST_ID",
+        "FLASH_SERVING_PORT",
+        "LANG",
+        "LC_ALL",
+        "NVIDIA_DRIVER_CAPABILITIES",
+        "NVIDIA_VISIBLE_DEVICES",
+        "TZ",
+    }
+)
+_FIXED_CHILD_ENVIRONMENT = {
+    "PATH": "/opt/flash-venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin",
+    "PYTHONUNBUFFERED": "1",
+}
+
+ServingRuntimeSecrets: Any = None
+MaterializationError: Any = None
+adapter_cache_path: Any = None
+decode_manifest_environment: Any = None
+hydrate_manifest: Any = None
+validate_manifest_cache: Any = None
+_prepare_cache_root: Any = None
+_serve: Any = None
+
+
+class LaunchError(RuntimeError):
+    """the sanitized serving launcher rejected its startup inputs."""
+
+
+class StartupTerminated(LaunchError):
+    """startup was interrupted before the runtime assumed signal ownership."""
+
+    def __init__(self, exit_code: int) -> None:
+        self.exit_code = exit_code
+        super().__init__("serving startup was terminated")
+
+
+class _PopenFactory(Protocol):
+    def __call__(self, args: list[str], **kwargs: Any) -> subprocess.Popen[Any]: ...
+
+
+class _SignalGuardHandoff(Protocol):
+    def release_for_handoff(self) -> dict[int, Any]: ...
+
+
+def _load_project_boundaries() -> None:
+    global MaterializationError
+    global ServingRuntimeSecrets
+    global _prepare_cache_root
+    global _serve
+    global adapter_cache_path
+    global decode_manifest_environment
+    global hydrate_manifest
+    global validate_manifest_cache
+
+    from flash.serve.app.__main__ import _serve as loaded_serve
+    from flash.serve.app.materialize import (
+        MaterializationError as LoadedMaterializationError,
+    )
+    from flash.serve.app.materialize import (
+        _prepare_cache_root as loaded_prepare_cache_root,
+    )
+    from flash.serve.app.materialize import adapter_cache_path as loaded_adapter_cache_path
+    from flash.serve.app.materialize import hydrate_manifest as loaded_hydrate_manifest
+    from flash.serve.app.materialize import (
+        validate_manifest_cache as loaded_validate_manifest_cache,
+    )
+    from flash.serve.provisioning import ServingRuntimeSecrets as LoadedServingRuntimeSecrets
+    from flash.serve.provisioning import (
+        decode_manifest_environment as loaded_decode_manifest_environment,
+    )
+
+    if MaterializationError is None:
+        MaterializationError = LoadedMaterializationError
+    if ServingRuntimeSecrets is None:
+        ServingRuntimeSecrets = LoadedServingRuntimeSecrets
+    if _prepare_cache_root is None:
+        _prepare_cache_root = loaded_prepare_cache_root
+    if _serve is None:
+        _serve = loaded_serve
+    if adapter_cache_path is None:
+        adapter_cache_path = loaded_adapter_cache_path
+    if decode_manifest_environment is None:
+        decode_manifest_environment = loaded_decode_manifest_environment
+    if hydrate_manifest is None:
+        hydrate_manifest = loaded_hydrate_manifest
+    if validate_manifest_cache is None:
+        validate_manifest_cache = loaded_validate_manifest_cache
+
+
+def _required_environment(environment: MutableMapping[str, str], name: str) -> str:
+    value = environment.get(name)
+    if type(value) is not str or not value:
+        raise LaunchError(f"{name} is required")
+    return value
+
+
+def _read_secret_descriptor(raw_fd: str | None, name: str) -> str | None:
+    if raw_fd is None:
+        return None
+    if not raw_fd.isdecimal():
+        raise LaunchError(f"{name} descriptor is invalid")
+    try:
+        with os.fdopen(int(raw_fd), "r", encoding="utf-8", closefd=True) as source:
+            value = source.read().strip()
+    except OSError as exc:
+        raise LaunchError(f"{name} descriptor could not be read") from exc
+    if not value:
+        raise LaunchError(f"{name} descriptor was empty")
+    return value
+
+
+def _close_raw_descriptor(raw_fd: str | None) -> None:
+    if raw_fd is not None and raw_fd.isdecimal():
+        with contextlib.suppress(OSError):
+            os.close(int(raw_fd))
+
+
+def _validate_secret(value: str | None, name: str, *, optional: bool = False) -> str | None:
+    if value is None and optional:
+        return None
+    if type(value) is not str or not value or value != value.strip():
+        raise LaunchError(f"{name} is invalid")
+    return value
+
+
+def _pop_runtime_secrets(
+    environment: MutableMapping[str, str],
+) -> tuple[str, str | None]:
+    inference = environment.pop(_INFERENCE_TOKEN_ENV, None)
+    artifact = environment.pop(_ARTIFACT_TOKEN_ENV, None)
+    inference_fd = environment.pop(_INFERENCE_TOKEN_FD_ENV, None)
+    artifact_fd = environment.pop(_ARTIFACT_TOKEN_FD_ENV, None)
+    try:
+        if inference is not None and inference_fd is not None:
+            raise LaunchError("inference token has multiple sources")
+        if artifact is not None and artifact_fd is not None:
+            raise LaunchError("artifact token has multiple sources")
+        if inference is None:
+            selected_fd, inference_fd = inference_fd, None
+            inference = _read_secret_descriptor(selected_fd, "inference token")
+        if artifact is None:
+            selected_fd, artifact_fd = artifact_fd, None
+            artifact = _read_secret_descriptor(selected_fd, "artifact token")
+        inference = _validate_secret(inference, "inference token")
+        artifact = _validate_secret(artifact, "artifact token", optional=True)
+        assert inference is not None
+        return inference, artifact
+    finally:
+        _close_raw_descriptor(inference_fd)
+        _close_raw_descriptor(artifact_fd)
+
+
+class _StartupSignalGuard:
+    def __init__(self) -> None:
+        self._previous: dict[int, Any] = {}
+        self._active = False
+
+    def __enter__(self) -> Self:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            self._previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._terminate)
+        self._active = True
+        return self
+
+    def _terminate(self, signum: int, _frame: FrameType | None) -> None:
+        raise StartupTerminated(128 + signum)
+
+    def restore(self) -> None:
+        if not self._active:
+            return
+        for signum, previous in self._previous.items():
+            signal.signal(signum, previous)
+        self._active = False
+
+    def adopt_previous(self, previous_guard: _SignalGuardHandoff) -> None:
+        self._previous = previous_guard.release_for_handoff()
+
+    def release_for_handoff(self) -> dict[int, Any]:
+        previous = dict(self._previous)
+        self._active = False
+        return previous
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.restore()
+
+
+def _verify_external_bindings(manifest: Any, environment: MutableMapping[str, str]) -> None:
+    manifest_id = _required_environment(environment, _MANIFEST_ID_ENV)
+    image_digest = _required_environment(environment, _IMAGE_DIGEST_ENV)
+    if manifest.manifest_id != manifest_id:
+        raise LaunchError("serving manifest id does not match its external binding")
+    if manifest.expected_oci_digest != image_digest:
+        raise LaunchError("serving image digest does not match its external binding")
+
+
+def _atomic_write_manifest(manifest: Any, cache_root: str) -> Path:
+    root = _prepare_cache_root(cache_root)
+    target = root / "serving-manifest.json"
+    temporary_name = f".serving-manifest-{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(root, directory_flags)
+    temporary_fd: int | None = None
+    try:
+        temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        payload = manifest.canonical_json().encode("utf-8")
+        with os.fdopen(temporary_fd, "wb", closefd=False) as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(temporary_fd)
+        os.replace(temporary_name, target.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        raise
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        os.close(directory_fd)
+    return target
+
+
+def _cache_has_missing_adapter(manifest: Any, cache_root: str) -> bool:
+    for adapter in manifest.adapters:
+        try:
+            os.lstat(adapter_cache_path(cache_root, adapter))
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def _write_all(fd: int, value: str) -> None:
+    payload = value.encode("utf-8")
+    offset = 0
+    try:
+        while offset < len(payload):
+            written = os.write(fd, payload[offset:])
+            if written <= 0:
+                raise OSError("secret pipe write failed")
+            offset += written
+    except OSError as exc:
+        raise LaunchError("secret descriptor could not be populated") from exc
+
+
+@contextlib.contextmanager
+def _secret_descriptor(value: str):
+    read_fd, write_fd = os.pipe()
+    errors: list[BaseException] = []
+
+    def populate() -> None:
+        try:
+            _write_all(write_fd, value)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(write_fd)
+
+    writer = threading.Thread(target=populate, name="flash-secret-pipe", daemon=True)
+    writer.start()
+    try:
+        yield read_fd
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(read_fd)
+        writer.join()
+    if errors:
+        raise LaunchError("secret descriptor could not be populated") from errors[0]
+
+
+def _prepare_cache(manifest: Any, cache_root: str, artifact_token: str | None) -> None:
+    try:
+        validate_manifest_cache(manifest, cache_root)
+        return
+    except MaterializationError as exc:
+        if not _cache_has_missing_adapter(manifest, cache_root):
+            raise LaunchError("serving cache validation failed") from exc
+    if artifact_token is None:
+        raise LaunchError("artifact token is required when serving cache hydration is missing")
+    try:
+        with _secret_descriptor(artifact_token) as token_fd:
+            hydrate_manifest(manifest, cache_root, token_fd=token_fd)
+    except MaterializationError as exc:
+        raise LaunchError("serving cache hydration failed") from exc
+
+
+def _port(environment: MutableMapping[str, str]) -> int:
+    raw = environment.get(_PORT_ENV, str(_DEFAULT_PORT))
+    if not raw.isdecimal():
+        raise LaunchError("serving port is invalid")
+    port = int(raw)
+    if not 0 < port <= 65535:
+        raise LaunchError("serving port is invalid")
+    return port
+
+
+def _run_with_secrets(
+    environment: MutableMapping[str, str],
+    raw_inference: str,
+    raw_artifact: str | None,
+    startup_signals: _StartupSignalGuard,
+) -> None:
+    _load_project_boundaries()
+    try:
+        secrets = ServingRuntimeSecrets(raw_inference, raw_artifact)
+    except ValueError as exc:
+        raise LaunchError("runtime secret input is invalid") from exc
+    encoded_manifest = _required_environment(environment, _MANIFEST_ENV)
+    try:
+        manifest = decode_manifest_environment(encoded_manifest)
+    except ValueError as exc:
+        raise LaunchError("encoded serving manifest is invalid") from exc
+    _verify_external_bindings(manifest, environment)
+    cache_root = environment.get(_CACHE_ROOT_ENV, _DEFAULT_CACHE_ROOT)
+    if type(cache_root) is not str or not cache_root:
+        raise LaunchError("serving cache root is invalid")
+    _atomic_write_manifest(manifest, cache_root)
+    inference_token, artifact_token = secrets._reveal_for_launch()
+    _prepare_cache(manifest, cache_root, artifact_token)
+    args = SimpleNamespace(
+        cache_root=cache_root,
+        host=environment.get(_HOST_ENV, _DEFAULT_HOST),
+        port=_port(environment),
+    )
+    with _secret_descriptor(inference_token) as inference_fd:
+        asyncio.run(
+            _serve(
+                args,
+                manifest,
+                inference_token_fd=inference_fd,
+                on_signals_installed=startup_signals.release_for_handoff,
+            )
+        )
+
+
+def run_launcher(environment: MutableMapping[str, str] | None = None) -> None:
+    """validate, hydrate if missing, and own the serving process in pid 1."""
+
+    environment = os.environ if environment is None else environment
+    with _StartupSignalGuard() as startup_signals:
+        raw_inference, raw_artifact = _pop_runtime_secrets(environment)
+        _run_with_secrets(environment, raw_inference, raw_artifact, startup_signals)
+
+
+def run_launcher_with_secrets(
+    inference_token: str,
+    artifact_token: str | None,
+    *,
+    environment: MutableMapping[str, str] | None = None,
+    previous_signal_guard: _SignalGuardHandoff | None = None,
+) -> None:
+    """accept bootstrap-popped secrets under a nested startup signal guard."""
+
+    environment = os.environ if environment is None else environment
+    with _StartupSignalGuard() as startup_signals:
+        if previous_signal_guard is not None:
+            startup_signals.adopt_previous(previous_signal_guard)
+        inference = _validate_secret(inference_token, "inference token")
+        artifact = _validate_secret(artifact_token, "artifact token", optional=True)
+        assert inference is not None
+        _run_with_secrets(environment, inference, artifact, startup_signals)
+
+
+def _scrub_child_environment(environment: MutableMapping[str, str]) -> dict[str, str]:
+    child = dict(_FIXED_CHILD_ENVIRONMENT)
+    child.update(
+        {key: environment[key] for key in _SAFE_CHILD_COPIED_ENV_NAMES if key in environment}
+    )
+    return child
+
+
+def _close_descriptors(descriptors: list[int]) -> None:
+    for fd in descriptors:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _terminate_and_reap(process: subprocess.Popen[Any]) -> None:
+    with contextlib.suppress(Exception):
+        process.terminate()
+    try:
+        process.wait(timeout=_CHILD_STOP_TIMEOUT_SECONDS)
+        return
+    except Exception:
+        pass
+    with contextlib.suppress(Exception):
+        process.kill()
+    try:
+        process.wait(timeout=_CHILD_STOP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(Exception):
+            process.wait()
+    except Exception:
+        pass
+
+
+def start_launcher_process(
+    environment: MutableMapping[str, str] | None = None,
+    *,
+    popen_factory: _PopenFactory = subprocess.Popen,
+) -> subprocess.Popen[Any]:
+    """start the launcher with secrets only on inherited numeric descriptors."""
+
+    environment = os.environ if environment is None else environment
+    raw_inference, raw_artifact = _pop_runtime_secrets(environment)
+    _load_project_boundaries()
+    try:
+        secrets = ServingRuntimeSecrets(raw_inference, raw_artifact)
+    except ValueError as exc:
+        raise LaunchError("runtime secret input is invalid") from exc
+    inference_token, artifact_token = secrets._reveal_for_launch()
+    child_environment = _scrub_child_environment(environment)
+    read_fds: list[int] = []
+    write_fds: list[int] = []
+    process: subprocess.Popen[Any] | None = None
+    try:
+        inference_read, inference_write = os.pipe()
+        read_fds.append(inference_read)
+        write_fds.append(inference_write)
+        child_environment[_INFERENCE_TOKEN_FD_ENV] = str(inference_read)
+        if artifact_token is not None:
+            artifact_read, artifact_write = os.pipe()
+            read_fds.append(artifact_read)
+            write_fds.append(artifact_write)
+            child_environment[_ARTIFACT_TOKEN_FD_ENV] = str(artifact_read)
+        process = popen_factory(
+            [sys.executable, _BOOTSTRAP_PATH],
+            env=child_environment,
+            pass_fds=tuple(read_fds),
+            close_fds=True,
+        )
+        _close_descriptors(read_fds)
+        read_fds.clear()
+        _write_all(write_fds[0], inference_token)
+        if artifact_token is not None:
+            _write_all(write_fds[1], artifact_token)
+        return process
+    except BaseException:
+        if process is not None:
+            _terminate_and_reap(process)
+        raise
+    finally:
+        _close_descriptors(read_fds)
+        _close_descriptors(write_fds)
+
+
+def main() -> None:
+    try:
+        run_launcher()
+    except StartupTerminated as exc:
+        raise SystemExit(exc.exit_code) from None
+
+
+if __name__ == "__main__":
+    main()

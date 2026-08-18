@@ -109,11 +109,10 @@ def _spec_and_inputs(
             generation=3,
             provider="modal",
             placement=ModalPlacement(
-                workspace_id="workspace",
+                workspace_name="workspace",
                 environment="main",
                 gpu="B200",
                 region=None,
-                volume_size_gb=100,
             ),
             engine=identity,
             adapters=(adapter,),

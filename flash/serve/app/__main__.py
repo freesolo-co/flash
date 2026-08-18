@@ -6,6 +6,9 @@ import argparse
 import asyncio
 import hashlib
 import os
+import signal
+from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 from .bootstrap import bootstrap_serving
@@ -50,17 +53,29 @@ def _bound_manifest(path: str) -> ServingManifest:
     return manifest
 
 
-def _read_inference_token() -> str:
-    raw_fd = os.environ.get(_INFERENCE_TOKEN_FD_ENV)
-    if raw_fd is None or not raw_fd.isdecimal():
-        raise RuntimeError("inference token fd is not configured")
-    return read_artifact_token_fd(int(raw_fd))
+def _read_inference_token(fd: int | None = None) -> str:
+    if fd is None:
+        raw_fd = os.environ.get(_INFERENCE_TOKEN_FD_ENV)
+        if raw_fd is None or not raw_fd.isdecimal():
+            raise RuntimeError("inference token fd is not configured")
+        fd = int(raw_fd)
+    return read_artifact_token_fd(fd)
 
 
-async def _serve(args: argparse.Namespace, manifest: ServingManifest) -> None:
+async def _serve(
+    args: argparse.Namespace,
+    manifest: ServingManifest,
+    *,
+    inference_token_fd: int | None = None,
+    on_signals_installed: Callable[[], dict[int, object]] | None = None,
+) -> None:
     import uvicorn
 
-    token = _read_inference_token()
+    token = (
+        _read_inference_token()
+        if inference_token_fd is None
+        else _read_inference_token(inference_token_fd)
+    )
     try:
         bearer_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
     finally:
@@ -70,6 +85,29 @@ async def _serve(args: argparse.Namespace, manifest: ServingManifest) -> None:
         app = create_app(owner, bearer_digest=bearer_digest)
         config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
         server = uvicorn.Server(config)
+        if on_signals_installed is not None:
+
+            @contextmanager
+            def capture_with_handoff():
+                startup_handlers = {
+                    signum: signal.signal(signum, server.handle_exit)
+                    for signum in uvicorn.server.HANDLED_SIGNALS
+                }
+                try:
+                    restore_handlers = on_signals_installed()
+                except BaseException:
+                    for signum, handler in startup_handlers.items():
+                        signal.signal(signum, handler)
+                    raise
+                try:
+                    yield
+                finally:
+                    for signum, handler in restore_handlers.items():
+                        signal.signal(signum, handler)
+                for captured_signal in reversed(server._captured_signals):
+                    signal.raise_signal(captured_signal)
+
+            server.capture_signals = capture_with_handoff
         await server.serve()
     finally:
         await owner.close()

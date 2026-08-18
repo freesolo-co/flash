@@ -119,11 +119,10 @@ def _modal_request(*adapters: ResolvedAdapter, provider: str = "modal") -> Deplo
         generation=2,
         provider=provider,
         placement=ModalPlacement(
-            workspace_id="workspace-1",
+            workspace_name="workspace-1",
             environment="main",
             gpu="B200",
             region="us-east",
-            volume_size_gb=100,
         ),
         engine=_ADAPTER_ENGINES.get(id(selected[0]), _engine()),
         adapters=selected,
@@ -160,19 +159,30 @@ blocked = ("torch", "vllm", "transformers", "PIL", "modal", "runpod", "runpod_fl
 real_import = builtins.__import__
 
 
+intercepted = []
+
+
 def guarded(name, globals=None, locals=None, fromlist=(), level=0):
-    if name == blocked or name.startswith(tuple(item + "." for item in blocked)):
+    if name in blocked or name.startswith(tuple(item + "." for item in blocked)):
+        intercepted.append(name)
         raise ModuleNotFoundError(name)
     return real_import(name, globals, locals, fromlist, level)
 
 
 builtins.__import__ = guarded
+try:
+    __import__("modal")
+except ModuleNotFoundError:
+    pass
+assert intercepted == ["modal"]
+intercepted.clear()
 from flash.serve.control import DeploymentSpec, EngineIdentity, ModalCredentials, plan_deployment
 
 assert DeploymentSpec
 assert EngineIdentity
 assert ModalCredentials
 assert plan_deployment
+assert intercepted == []
 for name in blocked:
     assert name not in sys.modules
 """
@@ -419,8 +429,8 @@ def test_planning_rejects_provider_placement_and_gpu_count_mismatches() -> None:
     with pytest.raises(PlanningError, match="RunPodPlacement"):
         plan_deployment(replace(_modal_request(_adapter(1)), provider="runpod"))
     request = _modal_request(_adapter(1))
-    with pytest.raises(ValueError, match="workspace_id"):
-        replace(request.placement, workspace_id="")
+    with pytest.raises(ValueError, match="workspace_name"):
+        replace(request.placement, workspace_name="")
 
     engine = _engine(tensor_parallel_size=2)
     adapter = _adapter(1, engine)
@@ -570,11 +580,13 @@ def _modal_handle(spec: DeploymentSpec) -> ModalProviderHandle:
         deployment_id=spec.deployment_id,
         generation=spec.generation,
         engine_id=spec.engine.engine_id,
-        workspace_id="workspace-1",
+        workspace_name="workspace-1",
         app_id="app-1",
         app_name="flash-app",
         volume_id="volume-1",
         volume_name="flash-volume",
+        inference_secret_id="secret-1",
+        inference_secret_name="flash-inference-secret",
         environment="main",
         region="us-east",
         image_digest=spec.engine.image_digest,
@@ -592,6 +604,10 @@ def _runpod_handle(spec: DeploymentSpec) -> RunPodProviderHandle:
         pod_name="flash-pod",
         network_volume_id="volume-1",
         network_volume_name="flash-volume",
+        template_id="template-1",
+        template_name="flash-template",
+        inference_secret_id="secret-1",
+        inference_secret_name="flash-inference-secret",
         data_center_id="US-KS-2",
         image_digest=spec.engine.image_digest,
         public_url=f"https://{POD_ID}-8000.proxy.runpod.net",
@@ -605,8 +621,12 @@ def test_sanitized_handles_and_results_are_json_safe_secret_free_and_flat() -> N
         (_modal_handle(modal_spec), modal_spec),
         (_runpod_handle(runpod_spec), runpod_spec),
     )
-    spec_encoded = json.dumps(sanitized_dict(modal_spec), sort_keys=True)
+    modal_spec_payload = sanitized_dict(modal_spec)
+    spec_encoded = json.dumps(modal_spec_payload, sort_keys=True)
     assert SECRET_SENTINEL not in spec_encoded
+    assert modal_spec_payload["placement"]["workspace_name"] == "workspace-1"
+    assert "workspace_id" not in modal_spec_payload["placement"]
+    assert "volume_size_gb" not in modal_spec_payload["placement"]
 
     for handle, spec in handles_and_specs:
         result = DeploymentResult.from_spec(spec, status="ready", handle=handle)
@@ -630,11 +650,24 @@ def test_sanitized_handles_and_results_are_json_safe_secret_free_and_flat() -> N
         }
         assert not any("group" in key for key in payload)
         assert "group_id" not in {entry.name for entry in fields(handle)}
+        assert payload["handle"]["inference_secret_id"] == "secret-1"
+        assert payload["handle"]["inference_secret_name"] == "flash-inference-secret"
+        assert not any(key.startswith("artifact_secret") for key in payload["handle"])
+        if type(handle) is ModalProviderHandle:
+            assert payload["handle"]["workspace_name"] == "workspace-1"
+            assert "workspace_id" not in payload["handle"]
+        else:
+            assert payload["handle"]["template_id"] == "template-1"
+            assert payload["handle"]["template_name"] == "flash-template"
 
     with pytest.raises(ValueError, match="pod_id"):
         replace(handles_and_specs[1][0], pod_id="")
     with pytest.raises(ValueError, match="app_id"):
         replace(handles_and_specs[0][0], app_id="")
+    with pytest.raises(ValueError, match="inference_secret_id"):
+        replace(handles_and_specs[0][0], inference_secret_id="")
+    with pytest.raises(ValueError, match="template_id"):
+        replace(handles_and_specs[1][0], template_id="")
 
 
 def test_deployment_result_requires_factory_bound_exact_spec_provenance() -> None:
@@ -735,7 +768,7 @@ def test_deployment_result_validates_shared_placement_provenance() -> None:
     modal_spec = plan_deployment(_modal_request(_adapter(1)))
     modal_handle = _modal_handle(modal_spec)
     for field_name, value in (
-        ("workspace_id", "workspace-other"),
+        ("workspace_name", "workspace-other"),
         ("environment", "staging"),
         ("region", "us-west"),
     ):
