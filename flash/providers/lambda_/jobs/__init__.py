@@ -198,7 +198,7 @@ def _build_launch_user_data(
     seed: int,
     attempt: int,
     runtime_secrets: dict | None,
-    code_prefix: str | None,
+    source_snapshot: dict | None,
     absolute_deadline: float,
     *,
     cache_host_mount: str | None = None,
@@ -208,15 +208,13 @@ def _build_launch_user_data(
     """Build user_data with this region's actual NFS mount point."""
     payload_kwargs = {
         "runtime_secrets": runtime_secrets,
-        "code_prefix": code_prefix,
+        "source_snapshot": source_snapshot,
+        "mode": mode,
+        "models": models,
         **deadline_kwargs(build_payload, absolute_deadline),
     }
     if cache_host_mount is not None:
-        payload_kwargs.update(
-            cache_host_mount=cache_host_mount,
-            mode=mode,
-            models=models,
-        )
+        payload_kwargs["cache_host_mount"] = cache_host_mount
     return build_user_data(
         build_payload(spec, seed, attempt, **payload_kwargs),
         gpu=spec.gpu.type,
@@ -432,7 +430,7 @@ class _LaunchPlan:
     seed: int
     attempt: int
     runtime_secrets: dict | None
-    code_prefix: str | None
+    source_snapshot: dict | None
     absolute_deadline: float
     mode: str | None
     models: list | None
@@ -449,7 +447,7 @@ def _build_launch_plan(
     seed: int,
     attempt: int,
     runtime_secrets: dict | None,
-    code_prefix: str | None,
+    source_snapshot: dict | None,
     absolute_deadline: float,
     mode: str | None,
     models: list | None,
@@ -457,13 +455,13 @@ def _build_launch_plan(
     """Build the label, SSH key, and both user_data variants once, before any region is tried."""
     cache_name = getattr(spec.gpu, "network_volume", None)
     default_cache_mount = f"/lambda/nfs/{cache_name}" if cache_name else ""
-    build_kwargs = (spec, seed, attempt, runtime_secrets, code_prefix, absolute_deadline)
+    build_kwargs = (spec, seed, attempt, runtime_secrets, source_snapshot, absolute_deadline)
     return _LaunchPlan(
         spec=spec,
         seed=seed,
         attempt=attempt,
         runtime_secrets=runtime_secrets,
-        code_prefix=code_prefix,
+        source_snapshot=source_snapshot,
         absolute_deadline=absolute_deadline,
         mode=mode,
         models=models,
@@ -472,7 +470,11 @@ def _build_launch_plan(
             **deadline_kwargs(resolve_ssh_key_names, absolute_deadline),
         ),
         cache_name=cache_name,
-        cold_user_data=_build_launch_user_data(*build_kwargs),
+        cold_user_data=_build_launch_user_data(
+            *build_kwargs,
+            mode=mode if mode == "preload" else None,
+            models=models if mode == "preload" else None,
+        ),
         cache_user_data=(
             _build_launch_user_data(
                 *build_kwargs,
@@ -512,7 +514,7 @@ def _region_launch_inputs(
                 plan.seed,
                 plan.attempt,
                 plan.runtime_secrets,
-                plan.code_prefix,
+                plan.source_snapshot,
                 plan.absolute_deadline,
                 cache_host_mount=mount_point,
                 mode=plan.mode,
@@ -541,7 +543,7 @@ def launch_and_submit(
     runtime_secrets: dict | None = None,
     mode: str | None = None,
     models: list | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> LambdaJobHandle:
     """Launch the first region that accepts the job; walk regions on a capacity rejection.
@@ -558,7 +560,7 @@ def launch_and_submit(
         )
     instances = _disk_capable_instances(spec, instances, say)
     plan = _build_launch_plan(
-        spec, seed, attempt, runtime_secrets, code_prefix, absolute_deadline, mode, models
+        spec, seed, attempt, runtime_secrets, source_snapshot, absolute_deadline, mode, models
     )
 
     tried_regions: set[str] = set()
@@ -817,7 +819,7 @@ def submit_run_lambda(
     on_handle=None,
     attempt: int = 0,
     runtime_secrets: dict | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> PollResult:
     """Launch, poll, and always terminate the instance (finally is the cost-safety primary)."""
@@ -842,7 +844,7 @@ def submit_run_lambda(
         attempt=attempt,
         log=log,
         runtime_secrets=runtime_secrets,
-        code_prefix=code_prefix,
+        source_snapshot=source_snapshot,
         **deadline_kwargs(launch_and_submit, absolute_deadline),
     )
     try:

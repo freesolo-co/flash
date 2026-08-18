@@ -367,6 +367,8 @@ def _classify_terminal_status(
         try:
             return PollResult(True, metrics=_jobs.decode_output(provider_status.get("output")))
         except RuntimeError as exc:
+            output = provider_status.get("output")
+            output_retriable = isinstance(output, dict) and output.get("_flash_retriable") is True
             state.last_hb_key, retriable, oom = _jobs.surfaced_worker_flags(
                 context.heartbeat_reader,
                 state.last_hb_key,
@@ -377,7 +379,11 @@ def _classify_terminal_status(
             detail = _jobs._append_failure_artifacts(str(exc), context.failure_detail_reader)
             return PollResult(
                 False,
-                failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
+                failure=(
+                    "oom"
+                    if oom
+                    else ("job_preempted" if retriable or output_retriable else "job_failed")
+                ),
                 detail=detail,
             )
     if status not in _jobs.TERMINAL_FAIL:

@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 
+from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
@@ -203,6 +204,9 @@ _CHILD_ENV_PREFIXES = (
 
 
 def _build_verl_child_env(*, shim_dir: str, wandb_enabled: bool) -> dict[str, str]:
+    applied_secret_names = frozenset(
+        name.strip() for name in os.environ.get(SECRET_ENV_KEYS_ENV, "").split(",") if name.strip()
+    )
     child = {
         key: value
         for key, value in os.environ.items()
@@ -210,9 +214,16 @@ def _build_verl_child_env(*, shim_dir: str, wandb_enabled: bool) -> dict[str, st
     }
     if wandb_enabled:
         child.update({key: value for key, value in os.environ.items() if key.startswith("WANDB_")})
-    child["PYTHONPATH"] = os.pathsep.join(
-        item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
+    # retained runtime namespaces are filtered by applied-secret provenance. authenticated child-side
+    # wandb logging is the sole secret exception, and only when the existing logger gate enables it.
+    for name in applied_secret_names:
+        child.pop(name, None)
+    if wandb_enabled and "WANDB_API_KEY" in os.environ:
+        child["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
+    parent_pythonpath = (
+        os.environ.get("PYTHONPATH", "") if "PYTHONPATH" not in applied_secret_names else ""
     )
+    child["PYTHONPATH"] = os.pathsep.join(item for item in (shim_dir, parent_pythonpath) if item)
     child["PYTHONUNBUFFERED"] = "1"
     child["HYDRA_FULL_ERROR"] = "1"
     child["HF_HUB_OFFLINE"] = "1"

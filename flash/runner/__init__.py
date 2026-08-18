@@ -196,6 +196,9 @@ class RunStatus:
     # none for sft, which reports truncation through workload_profile, and for older records.
     prompt_budget: PromptBudget | None = None
     effective_preparation: dict | None = None
+    # full managed source descriptor, kept private because it carries the repository path.
+    source_snapshot: dict | None = None
+    source_verified_attempt: int | None = None
 
     def to_dict(self) -> dict:
         """Return the public run status representation."""
@@ -206,6 +209,18 @@ class RunStatus:
         data.pop("report_sequence", None)
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)
+        heartbeat = data.get("last_heartbeat")
+        if isinstance(heartbeat, dict):
+            heartbeat.pop("source_provenance", None)
+        source_snapshot = data.pop("source_snapshot", None)
+        data.pop("source_verified_attempt", None)
+        if source_snapshot is not None:
+            from flash.source_snapshot import safe_public_projection
+
+            data["source_provenance"] = safe_public_projection(
+                source_snapshot,
+                verified_attempt=self.source_verified_attempt,
+            )
         if isinstance(self.deployment, dict):
             data["deployment"] = public_deployment(self.deployment)
         return data
@@ -278,6 +293,8 @@ def _redact_internal_adapter_ref(data: dict) -> None:
 def _status_storage_dict(status: RunStatus) -> dict:
     """Serialize status for persistence without filtering internal deployment state."""
     data = asdict(status)
+    if data.get("source_snapshot") is None:
+        data.pop("source_snapshot", None)
     data["adapter_ref"] = (
         _adapter_ref_for_status(status) if status.state in {"done", "deployed"} else None
     )
@@ -761,6 +778,7 @@ def _save_status_unlocked(
             os.unlink(tmp)
 
 
+from flash.providers._lifecycle.worker import publish_source_snapshot  # noqa: E402,F401
 from flash.runner.artifacts import (  # noqa: E402,F401
     _assign_managed_hf_repo,
     _assign_resolved_env_sha,
@@ -768,7 +786,6 @@ from flash.runner.artifacts import (  # noqa: E402,F401
     _file_digest,
     _pin_env_sha_with_reason,
     artifact_namespace,
-    flash_code_prefix,
     managed_hf_repo_for_environment,
     preflight_validate_environment_ref,
 )
@@ -850,8 +867,11 @@ from flash.runner.status import (  # noqa: E402,F401
     list_runs,
     reallocation_spec_from_status,
     record_heartbeat,
+    source_snapshot_from_status,
+    validate_terminal_source_metrics,
 )
 from flash.runner.submit import (  # noqa: E402,F401
+    SourceSnapshotPublicationError,
     _persist_effective_worker_spec,
     _reject_managed_volume_removal,
     prepare_job,

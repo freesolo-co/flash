@@ -58,7 +58,7 @@ class VastProvider(InstanceProvider):
         on_handle: Any,
         attempt: int,
         runtime_secrets: dict[str, str] | None,
-        code_prefix: str | None,
+        source_snapshot: dict | None,
         deadline_at: float | None,
     ) -> PollResult:
         from flash.providers.vast.jobs import submit_run_vast
@@ -70,7 +70,7 @@ class VastProvider(InstanceProvider):
             on_handle=on_handle,
             attempt=attempt,
             runtime_secrets=runtime_secrets,
-            code_prefix=code_prefix,
+            source_snapshot=source_snapshot,
             deadline_at=deadline_at,
         )
 

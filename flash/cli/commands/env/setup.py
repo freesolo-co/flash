@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 
 from flash._internal.channel import CLI_NAME
@@ -13,6 +14,7 @@ from flash.cli.commands.env.retained import (
     _warn_if_environment_form_disagrees,
     _warn_if_retained_starter_files_describe_another_plane,
 )
+from flash.cli.commands.env.setup_wandb import _wandb_block, _wandb_project
 from flash.cli.scaffold import TRAINING_MD
 from flash.cli.ui import render
 from flash.envs.evaluations import _DEFAULT_EVALUATIONS_PATH
@@ -358,22 +360,14 @@ _REASONING_OPTIONS = [
 _SKIP_TRACES = ""  # sentinel option value: scaffold the starter rows instead of importing
 
 
-def _require_setup_project(args) -> str:
+def _require_setup_project(args, *, api_url: str | None, api_key: str) -> Mapping[str, object]:
     """Resolve and validate the one explicit project used by the whole scaffold."""
-    from flash.client import ClientError, list_projects, resolve_project_id
-    from flash.client.config import load_credentials
+    from flash.client import ClientError, list_projects, resolve_project
     from flash.client.http import has_freesolo_backend
-
-    api_url, api_key = load_credentials()
-    if not api_key:
-        raise ClientError(
-            f"not logged in. Run `{CLI_NAME} login` before `{CLI_NAME} env setup` "
-            "so the project can be validated"
-        )
 
     supplied = str(getattr(args, "project", "") or "").strip()
     if supplied:
-        return resolve_project_id(supplied, api_key, api_url)
+        return resolve_project(supplied, api_key, api_url)
     if not _setup_interactive(args):
         raise ClientError(
             "--project PROJECT_UUID is required in noninteractive mode, with redirected stdin, or with --yes"
@@ -395,7 +389,7 @@ def _require_setup_project(args) -> str:
             f"`{CLI_NAME} projects create NAME`"
         )
     selected = render.select_required("Choose the Freesolo project for this environment", options)
-    return resolve_project_id(selected, api_key, api_url)
+    return resolve_project(selected, api_key, api_url)
 
 
 # Guidance the starter .py docstrings carry, per plane kind. The templates hold placeholders
@@ -450,7 +444,7 @@ def _render_starter(template: str, project_id: str, *, can_publish: bool) -> str
     return template.replace("PROJECT_UUID", project_id)
 
 
-def _plane_can_publish_environments() -> bool:
+def _plane_can_publish_environments(api_url: str | None) -> bool:
     """Whether `flash env push` can actually publish for the logged-in plane.
 
     Publishing uploads to the plane, which commits into the managed environment hub
@@ -462,10 +456,8 @@ def _plane_can_publish_environments() -> bool:
     operator-run Freesolo-compatible backend has a project directory (which is what that helper
     answers) but still cannot publish to the hub.
     """
-    from flash.client.config import load_credentials
     from flash.serve.urls import is_freesolo_hosted_url
 
-    api_url, _ = load_credentials()
     # Unset means the built-in default, which is the managed plane.
     return api_url is None or is_freesolo_hosted_url(api_url)
 
@@ -553,7 +545,7 @@ def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
     return next(iter(found.values()), None)
 
 
-def _traces_dataset(args, project_id: str) -> str | None:
+def _traces_dataset(args, project_id: str, api_key: str) -> str | None:
     """Optionally export traces from the already-selected project."""
     if not _setup_interactive(args):
         return None
@@ -568,7 +560,7 @@ def _traces_dataset(args, project_id: str) -> str | None:
     if use_traces == _SKIP_TRACES:
         return None
     try:
-        exported = traces.fetch_records(project_id)
+        exported = traces.fetch_records(project_id, api_key)
     except Exception as exc:  # trace import is optional after project validation succeeds
         _warn(f"could not export traces from {project_id} ({exc}); using the starter dataset")
         return None
@@ -692,6 +684,7 @@ def _write_rl_config(
     rl: Path,
     project_line: str,
     thinking_line: str,
+    wandb_block: str,
     env_comment: str,
     max_examples_line: str,
     rl_reasoning_train: str,
@@ -704,6 +697,7 @@ def _write_rl_config(
             'algorithm = "grpo"\n'
             f"{thinking_line}"
             "\n"
+            f"{wandb_block}"
             f"{env_comment}"
             "[train]\n"
             "epochs = 1\n"
@@ -722,6 +716,7 @@ def _write_sft_config(
     sft: Path,
     project_line: str,
     thinking_line: str,
+    wandb_block: str,
     env_comment: str,
     max_examples_line: str,
     sft_reasoning_note: str,
@@ -734,6 +729,7 @@ def _write_sft_config(
             'algorithm = "sft"\n'
             f"{thinking_line}"
             "\n"
+            f"{wandb_block}"
             f"{env_comment}"
             "[train]\n"
             "epochs = 1\n"
@@ -766,6 +762,7 @@ def _write_opd_config(
     project_line: str,
     project_id: str,
     thinking_line: str,
+    wandb_block: str,
     max_examples_line: str,
     *,
     can_publish: bool = True,
@@ -788,6 +785,7 @@ def _write_opd_config(
             'algorithm = "opd"   # on-policy distillation from a managed parasail teacher (default glm 5.2)\n'
             f"{thinking_line}"
             "\n"
+            f"{wandb_block}"
             + _environment_comment(
                 project_id,
                 can_publish=can_publish,
@@ -816,15 +814,34 @@ def _write_training_guide(training: Path, project_id: str) -> None:
         )
 
 
+def _resolve_setup_identity(args) -> tuple[str, str, str, str, str]:
+    """Resolve the credential, project, and folder identity used by every setup phase."""
+    from flash.client import ClientError
+    from flash.client.config import load_credentials
+
+    api_url, api_key = load_credentials()
+    if not api_key:
+        raise ClientError(
+            f"not logged in. Run `{CLI_NAME} login` before `{CLI_NAME} env setup` "
+            "so the project can be validated"
+        )
+    project = _require_setup_project(args, api_url=api_url, api_key=api_key)
+    project_id = str(project["id"])
+    folder_name = Path.cwd().name
+    if not folder_name.strip():
+        raise ClientError("the current environment folder name must be nonblank")
+    return api_url, api_key, project_id, _wandb_project(project), folder_name
+
+
 def cmd_env_setup(args) -> int:
-    project_id = _require_setup_project(args)
+    api_url, api_key, project_id, project_name, folder_name = _resolve_setup_identity(args)
     _validate_existing_config_projects(project_id)
     starter_env = Path("environment.py")
     starter_evaluations = Path(_DEFAULT_EVALUATIONS_PATH)
     dataset = Path("dataset/train.jsonl")
     # trace import is optional and can only read the selected project. an existing dataset is never
     # overwritten, so importing into it would be a silently discarded download.
-    traces_jsonl = None if dataset.exists() else _traces_dataset(args, project_id)
+    traces_jsonl = None if dataset.exists() else _traces_dataset(args, project_id, api_key)
     multi_turn, starter_env_exists = _resolve_turn_mode(args, starter_env, dataset)
 
     rl = Path("configs/rl.toml")
@@ -837,7 +854,7 @@ def cmd_env_setup(args) -> int:
     reasoning_configs = (rl, opd, sft)
     reasoning = _resolve_reasoning_mode(args, reasoning_configs)
 
-    can_publish = _plane_can_publish_environments()
+    can_publish = _plane_can_publish_environments(api_url)
     _warn_if_environment_form_disagrees(reasoning_configs, can_publish=can_publish, warn=_warn)
     env_py = _render_starter(
         _STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY,
@@ -908,6 +925,7 @@ def cmd_env_setup(args) -> int:
         rl,
         project_line,
         thinking_line,
+        _wandb_block(project_name, f"{folder_name}-grpo"),
         env_comment,
         max_examples_line,
         rl_reasoning_train,
@@ -916,6 +934,7 @@ def cmd_env_setup(args) -> int:
         sft,
         project_line,
         thinking_line,
+        _wandb_block(project_name, f"{folder_name}-sft"),
         env_comment,
         max_examples_line,
         sft_reasoning_note,
@@ -927,6 +946,7 @@ def cmd_env_setup(args) -> int:
         project_line,
         project_id,
         thinking_line,
+        _wandb_block(project_name, f"{folder_name}-opd"),
         max_examples_line,
         can_publish=can_publish,
     )

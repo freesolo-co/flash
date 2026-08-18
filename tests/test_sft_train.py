@@ -1656,6 +1656,65 @@ def _module(name, **attrs):
     return module
 
 
+@pytest.mark.parametrize(
+    "original_error",
+    [RuntimeError("original failure"), AttributeError("original failure")],
+)
+def test_seeded_dataloader_handles_missing_and_present_validation_sampler(
+    monkeypatch, original_error
+):
+    missing = object()
+
+    class FakeTrainer:
+        def __init__(self, val_sampler=missing, error=None):
+            self._val_sampler = val_sampler
+            self._error = error
+
+        def _build_dataloader(self):
+            if self._error is not None:
+                raise self._error
+            self.train_sampler = SimpleNamespace(seed=None)
+            if self._val_sampler is not missing:
+                self.val_sampler = self._val_sampler
+            return "loader"
+
+    probe = FakeTrainer()
+    assert FakeTrainer._build_dataloader(probe) == "loader"
+    with pytest.raises(AttributeError, match="val_sampler"):
+        _ = probe.val_sampler
+
+    fake_sft_module = _module("verl.trainer.sft_trainer", SFTTrainer=FakeTrainer)
+    monkeypatch.setitem(sys.modules, "torch", _module("torch", manual_seed=lambda seed: None))
+    monkeypatch.setitem(
+        sys.modules,
+        "numpy",
+        _module("numpy", random=SimpleNamespace(seed=lambda seed: None)),
+    )
+    monkeypatch.setitem(sys.modules, "verl", _module("verl"))
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.trainer",
+        _module("verl.trainer", sft_trainer=fake_sft_module),
+    )
+
+    sft_plugin._install_seeded_dataloader(43)
+
+    trainer_without_validation = FakeTrainer()
+    assert trainer_without_validation._build_dataloader() == "loader"
+    assert trainer_without_validation.train_sampler.seed == 43
+    assert not hasattr(trainer_without_validation, "val_sampler")
+
+    validation_sampler = SimpleNamespace(seed=None)
+    trainer_with_validation = FakeTrainer(val_sampler=validation_sampler)
+    assert trainer_with_validation._build_dataloader() == "loader"
+    assert trainer_with_validation.train_sampler.seed == 43
+    assert validation_sampler.seed == 43
+
+    with pytest.raises(type(original_error), match="original failure") as exc_info:
+        FakeTrainer(error=original_error)._build_dataloader()
+    assert exc_info.value is original_error
+
+
 def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus(
     monkeypatch, capsys
 ):
@@ -2105,6 +2164,74 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
 
     with_wandb = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=True)
     assert with_wandb["WANDB_API_KEY"] == "wandb-secret"
+
+
+def test_shared_child_environment_scrubs_declared_prefixed_secrets(monkeypatch, tmp_path):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+
+    declared_secrets = (
+        "CUDA_SECRET",
+        "NCCL_CREDENTIAL",
+        "TORCH_PRIVATE_TOKEN",
+        "PYTORCH_AUTH",
+        "VERL_USER_SECRET",
+        "FLA_CREDENTIAL",
+        "PYTHONPATH",
+        "WANDB_USER_SECRET",
+        "CUSTOM_USER_SECRET",
+        "WANDB_API_KEY",
+    )
+    runtime_controls = {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "NCCL_DEBUG": "WARN",
+        "TORCH_LOGS": "+dynamo",
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:256",
+        "VERL_LOGGING_LEVEL": "INFO",
+        "FLA_TILELANG": "0",
+        "OMP_NUM_THREADS": "4",
+        "MKL_NUM_THREADS": "4",
+        "OPENBLAS_NUM_THREADS": "4",
+        "LC_ALL": "C.UTF-8",
+        "HF_HOME": "/cache/hf",
+        "FLASH_VERL_PYTHON": "/verl/python",
+    }
+    for name in declared_secrets:
+        monkeypatch.setenv(name, f"synthetic-{name.lower()}")
+    for name, value in runtime_controls.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv(
+        SECRET_ENV_KEYS_ENV,
+        f"  {','.join(declared_secrets[:4])},, {','.join(declared_secrets[4:])}  ",
+    )
+
+    without_wandb = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
+    for name, value in runtime_controls.items():
+        assert without_wandb[name] == value
+    for name in declared_secrets:
+        if name != "PYTHONPATH":
+            assert name not in without_wandb
+    assert without_wandb["PYTHONPATH"] == str(tmp_path)
+    assert "WANDB_MODE" not in without_wandb
+    assert SECRET_ENV_KEYS_ENV not in without_wandb
+
+    with_wandb = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=True)
+    for name, value in runtime_controls.items():
+        assert with_wandb[name] == value
+    for name in declared_secrets:
+        if name not in {"PYTHONPATH", "WANDB_API_KEY"}:
+            assert name not in with_wandb
+    assert with_wandb["PYTHONPATH"] == str(tmp_path)
+    assert "WANDB_API_KEY" in with_wandb
+    assert with_wandb["WANDB_MODE"] == "offline"
+    assert SECRET_ENV_KEYS_ENV not in with_wandb
+
+    monkeypatch.setenv(
+        SECRET_ENV_KEYS_ENV,
+        ",".join(name for name in declared_secrets if name != "PYTHONPATH"),
+    )
+    inherited = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
+    assert inherited["PYTHONPATH"] == os.pathsep.join((str(tmp_path), "synthetic-pythonpath"))
 
 
 def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_path):
@@ -2779,8 +2906,11 @@ def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monk
 
 
 def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.engine.worker import sft_train
 
+    monkeypatch.setenv("PYTHONPATH", "synthetic-sft-parent-path")
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PYTHONPATH")
     spec, captured = _stub_sft_run(monkeypatch)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
@@ -2812,7 +2942,7 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
         if value.startswith("data.custom_cls.path=")
     )
     assert os.path.isfile(custom_path)
-    assert captured["child_env"]["PYTHONPATH"].split(os.pathsep)[0].endswith("/shim")
+    assert captured["child_env"]["PYTHONPATH"] == os.path.dirname(captured["child"].shim_markers)
     assert captured["child_env"]["HF_HUB_OFFLINE"] == "1"
     assert captured["uploads"][0][1:] == ("adapter", True)
     assert captured["published"][0][1] == 2
