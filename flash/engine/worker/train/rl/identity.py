@@ -69,6 +69,10 @@ class RolloutIdentityLedger:
         self._registered: dict[int, frozenset[RolloutIdentity]] = {}
         self._observed: dict[int, set[RolloutIdentity]] = {}
         self._sealed_steps: set[int] = set()
+        self._sealed_evidence: dict[
+            int,
+            tuple[tuple[RolloutIdentity, ...], tuple[RolloutIdentity, ...]],
+        ] = {}
 
     def _parse_training_identity(self, value: Any) -> RolloutIdentity:
         identity = parse_rollout_identity(value)
@@ -181,9 +185,27 @@ class RolloutIdentityLedger:
                     f"GRPO step {step} observed identity set does not equal registration: "
                     f"missing={missing}, unexpected={unexpected}"
                 )
+            self._sealed_evidence[step] = (
+                tuple(sorted(expected)),
+                tuple(sorted(observed)),
+            )
             self._sealed_steps.add(step)
             del self._registered[step]
             del self._observed[step]
+
+    def evidence(self) -> dict[str, list[dict[str, Any]]]:
+        with self._lock:
+            return {
+                "steps": [
+                    {
+                        "optimizer_step": step,
+                        "registered": [identity.to_dict() for identity in registered],
+                        "observed": [identity.to_dict() for identity in observed],
+                    }
+                    for step, (registered, observed) in sorted(self._sealed_evidence.items())
+                ],
+                "validation": [],
+            }
 
     def assert_idle(self) -> None:
         with self._lock:

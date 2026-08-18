@@ -43,6 +43,53 @@ def test_identity_ledger_accepts_resumed_step_and_exact_out_of_order_set():
     ledger.assert_idle()
 
 
+def test_identity_ledger_retains_exact_p64_g2_terminal_evidence_and_returns_deep_copies():
+    ledger = RolloutIdentityLedger(64, 2)
+    exact_by_step = {}
+    for step in (1, 2):
+        expected = _expected(step, tuple(range(64)), 2)
+        exact_by_step[step] = expected
+        ledger.register(reversed(expected))
+        for identity in reversed(expected):
+            ledger.record(identity, identity["sample_index"])
+        ledger.seal(step)
+
+    failed = _expected(3, tuple(range(64)), 2)
+    ledger.register(failed)
+    for identity in failed[:-1]:
+        ledger.record(identity, identity["sample_index"])
+    with pytest.raises(ValueError, match="does not equal registration"):
+        ledger.seal(3)
+
+    evidence = ledger.evidence()
+    assert evidence == {
+        "steps": [
+            {
+                "optimizer_step": step,
+                "registered": exact_by_step[step],
+                "observed": exact_by_step[step],
+            }
+            for step in (1, 2)
+        ],
+        "validation": [],
+    }
+    for step in evidence["steps"]:
+        assert len(step["registered"]) == 128
+        assert len(step["observed"]) == 128
+        assert len({tuple(identity.items()) for identity in step["registered"]}) == 128
+        assert step["registered"] == step["observed"]
+        assert all(identity["validate"] is False for identity in step["registered"])
+        assert all(
+            identity["optimizer_step"] == step["optimizer_step"] for identity in step["registered"]
+        )
+
+    evidence["steps"][0]["registered"][0]["sample_index"] = 999
+    evidence["steps"].append({"optimizer_step": 999, "registered": [], "observed": []})
+    fresh = ledger.evidence()
+    assert [step["optimizer_step"] for step in fresh["steps"]] == [1, 2]
+    assert fresh["steps"][0]["registered"][0]["sample_index"] == 0
+
+
 def test_identity_ledger_rejects_whole_prompt_substitution_with_constant_count():
     ledger = RolloutIdentityLedger(2, 2)
     ledger.register(_expected(3, (10, 11), 2))

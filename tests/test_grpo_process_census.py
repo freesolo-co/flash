@@ -14,8 +14,12 @@ from flash.engine.worker.verl.process_census import (
 )
 
 
-def _census(root_start: int | None = 100) -> GrpoProcessCensus:
-    census = GrpoProcessCensus(1, interval_s=60)
+def _census(
+    root_start: int | None = 100,
+    *,
+    expected_steps: tuple[int, ...] = (1,),
+) -> GrpoProcessCensus:
+    census = GrpoProcessCensus(1, expected_steps=expected_steps, interval_s=60)
     census._root_identity = _ProcessIdentity(1, root_start) if root_start is not None else None
     return census
 
@@ -45,6 +49,7 @@ def test_snapshot_root_read_failure_is_unavailable(monkeypatch):
     monkeypatch.setattr(census_module, "_read_start_time", lambda _pid: None)
     snapshot = _census()._snapshot()
     assert snapshot.available == 0
+    assert snapshot.incomplete_attempts == 3
     assert (
         snapshot.descendant_processes,
         snapshot.descendant_threads,
@@ -65,35 +70,32 @@ def test_snapshot_partial_child_task_read_failure_is_unavailable(monkeypatch):
 
 def test_snapshot_thread_count_failure_is_unavailable(monkeypatch):
     _complete_proc_view(monkeypatch, with_child=True)
-    calls = {2: 0}
     original = census_module._list_task_ids
-
-    def list_tasks(pid):
-        if pid == 2:
-            calls[2] += 1
-            if calls[2] == 2:
-                return None
-        return original(pid)
-
-    monkeypatch.setattr(census_module, "_list_task_ids", list_tasks)
+    monkeypatch.setattr(
+        census_module,
+        "_list_task_ids",
+        lambda pid: None if pid == 2 else original(pid),
+    )
     assert _census()._snapshot().available == 0
 
 
-def test_snapshot_child_exit_race_is_unavailable(monkeypatch):
-    _complete_proc_view(monkeypatch, with_child=True)
-    calls = {2: 0}
+def test_snapshot_retries_a_transient_proc_exit_race(monkeypatch):
+    _stable_auxiliary_metrics(monkeypatch)
+    calls = 0
 
-    def start_time(pid):
-        if pid == 2:
-            calls[2] += 1
-            return 200 if calls[2] == 1 else None
-        return 100
+    def descendant_counts(_root):
+        nonlocal calls
+        calls += 1
+        return None if calls == 1 else (1, 2, 2)
 
-    monkeypatch.setattr(census_module, "_read_start_time", start_time)
-    assert _census()._snapshot().available == 0
+    monkeypatch.setattr(census_module, "_descendant_counts", descendant_counts)
+    snapshot = _census()._snapshot()
+    assert snapshot.available == 1
+    assert snapshot.incomplete_attempts == 1
+    assert snapshot.descendant_processes == 1
 
 
-def test_snapshot_descendant_pid_reuse_is_unavailable(monkeypatch):
+def test_snapshot_discards_pid_reuse_attempt_before_accepting_a_stable_retry(monkeypatch):
     _complete_proc_view(monkeypatch, with_child=True)
     calls = {2: 0}
 
@@ -104,7 +106,9 @@ def test_snapshot_descendant_pid_reuse_is_unavailable(monkeypatch):
         return 100
 
     monkeypatch.setattr(census_module, "_read_start_time", start_time)
-    assert _census()._snapshot().available == 0
+    snapshot = _census()._snapshot()
+    assert snapshot.available == 1
+    assert snapshot.incomplete_attempts == 1
 
 
 def test_snapshot_root_pid_reuse_is_unavailable(monkeypatch):
@@ -123,6 +127,7 @@ def test_snapshot_complete_empty_tree_reports_real_zero(monkeypatch):
     _complete_proc_view(monkeypatch, with_child=False)
     snapshot = _census()._snapshot()
     assert snapshot.available == 1
+    assert snapshot.incomplete_attempts == 0
     assert (
         snapshot.descendant_processes,
         snapshot.descendant_threads,
@@ -141,43 +146,151 @@ def test_snapshot_complete_nonempty_tree_reports_process_and_threads(monkeypatch
     ) == (1, 2, 2)
 
 
-def _snapshot(available: int, processes: int, threads: int, maximum: int) -> ProcessCensusSnapshot:
+def _snapshot(
+    available: int,
+    processes: int,
+    threads: int,
+    maximum: int,
+    *,
+    pids_current: int = 10,
+    pids_max: int = 100,
+    incomplete_attempts: int = 0,
+) -> ProcessCensusSnapshot:
     return ProcessCensusSnapshot(
         available=available,
         descendant_processes=processes,
         descendant_threads=threads,
         max_descendant_threads=maximum,
-        pids_current=10,
-        pids_max=100,
-        pids_headroom=90,
+        pids_current=pids_current,
+        pids_max=pids_max,
+        pids_headroom=pids_max - pids_current,
         cpu_quota_millicores=2000,
         affinity_cpus=2,
+        incomplete_attempts=incomplete_attempts,
     )
 
 
-def test_incomplete_sample_latches_unavailable_without_changing_complete_peaks():
-    census = _census()
-    baseline = _snapshot(1, 2, 7, 4)
-    incomplete = _snapshot(0, -1, -1, -1)
-    later = _snapshot(1, 1, 3, 2)
-    census._baseline = baseline
-    census._per_step = incomplete
-    census._terminal = later
-    census._observe(baseline)
-    census._observe(incomplete)
-    census._observe(later)
+def _set_baseline(census: GrpoProcessCensus, snapshot: ProcessCensusSnapshot) -> None:
+    census._baseline = snapshot
+    census._observe(snapshot)
+
+
+def _set_terminal(census: GrpoProcessCensus, snapshot: ProcessCensusSnapshot) -> None:
+    census._terminal = snapshot
+    census._observe(snapshot)
+
+
+def _sample(census: GrpoProcessCensus, monkeypatch, step: int, snapshot) -> None:
+    monkeypatch.setattr(census, "_snapshot", lambda: snapshot)
+    census.sample_step(step)
+
+
+def test_transient_background_partial_does_not_erase_complete_required_checkpoints(monkeypatch):
+    census = _census(expected_steps=(1, 2))
+    _set_baseline(census, _snapshot(1, 2, 7, 4, pids_current=12))
+    census._observe(_snapshot(0, -1, -1, -1, pids_current=95, incomplete_attempts=1))
+    _sample(census, monkeypatch, 1, _snapshot(1, 3, 8, 5, pids_current=20))
+    _sample(census, monkeypatch, 2, _snapshot(1, 4, 9, 6, pids_current=30))
+    _set_terminal(census, _snapshot(1, 1, 3, 2, pids_current=15))
+
+    summary = census.summary()
+    assert summary["available"] == 1
+    assert summary["incomplete_sample_count"] == 1
+    assert summary["peak_pids_current"] == 95
+    assert summary["minimum_pids_headroom"] == 5
+    assert summary["peak_processes"] == 4
+    assert summary["peak_threads"] == 9
+
+
+@pytest.mark.parametrize("checkpoint", ["baseline", "step", "terminal"])
+def test_partial_required_checkpoint_is_unavailable(monkeypatch, checkpoint):
+    census = _census(expected_steps=(1,))
+    complete = _snapshot(1, 2, 7, 4)
+    partial = _snapshot(0, -1, -1, -1, incomplete_attempts=3)
+    _set_baseline(census, partial if checkpoint == "baseline" else complete)
+    _sample(census, monkeypatch, 1, partial if checkpoint == "step" else complete)
+    _set_terminal(census, partial if checkpoint == "terminal" else complete)
 
     summary = census.summary()
     assert summary["available"] == 0
-    assert summary["per_step_processes"] == -1
-    assert summary["per_step_threads"] == -1
-    assert summary["peak_processes"] == 2
-    assert summary["peak_threads"] == 7
-    assert summary["peak_single_process_threads"] == 4
+    assert summary["incomplete_sample_count"] == 3
+
+
+def test_missing_duplicate_and_conflicting_steps_fail_closed(monkeypatch):
+    complete = _snapshot(1, 2, 7, 4)
+
+    missing = _census(expected_steps=(1, 2))
+    _set_baseline(missing, complete)
+    _sample(missing, monkeypatch, 1, complete)
+    _set_terminal(missing, complete)
+    assert missing.summary()["missing_step_count"] == 1
+    assert missing.summary()["available"] == 0
+
+    duplicate = _census(expected_steps=(1,))
+    _set_baseline(duplicate, complete)
+    _sample(duplicate, monkeypatch, 1, complete)
+    _sample(duplicate, monkeypatch, 1, complete)
+    _set_terminal(duplicate, complete)
+    assert duplicate.summary()["duplicate_step_count"] == 1
+    assert duplicate.summary()["available"] == 0
+
+    conflicting = _census(expected_steps=(1,))
+    _set_baseline(conflicting, complete)
+    _sample(conflicting, monkeypatch, 1, complete)
+    _sample(conflicting, monkeypatch, 1, _snapshot(1, 3, 8, 5))
+    _set_terminal(conflicting, complete)
+    assert conflicting.summary()["conflicting_step_count"] == 1
+    assert conflicting.summary()["available"] == 0
+
+
+def test_step_evidence_is_deterministic_and_separates_growth_from_terminal_state(monkeypatch):
+    census = _census(expected_steps=(1, 2))
+    _set_baseline(census, _snapshot(1, 1, 2, 2, pids_current=10))
+    _sample(census, monkeypatch, 2, _snapshot(1, 7, 12, 8, pids_current=30))
+    _sample(census, monkeypatch, 1, _snapshot(1, 3, 6, 4, pids_current=20))
+    _set_terminal(census, _snapshot(1, 4, 7, 5, pids_current=18))
+
+    summary = census.summary()
+    assert summary["available"] == 1
+    assert summary["steps"] == [
+        {
+            "optimizer_step": 1,
+            "processes": 3,
+            "threads": 6,
+            "max_process_threads": 4,
+            "pids_current": 20,
+            "pids_max": 100,
+            "pids_headroom": 80,
+        },
+        {
+            "optimizer_step": 2,
+            "processes": 7,
+            "threads": 12,
+            "max_process_threads": 8,
+            "pids_current": 30,
+            "pids_max": 100,
+            "pids_headroom": 70,
+        },
+    ]
+    assert summary["terminal_processes"] == 4
+    assert summary["terminal_processes"] > summary["baseline_processes"]
+    assert "cleanup" not in summary
+    assert summary == census.summary()
+
+
+def test_pids_peak_and_headroom_update_on_partial_samples():
+    census = _census()
+    census._observe(_snapshot(0, -1, -1, -1, pids_current=87, incomplete_attempts=1))
+    summary = census.summary()
+    assert summary["peak_pids_current"] == 87
+    assert summary["minimum_pids_headroom"] == 13
+    assert summary["incomplete_sample_count"] == 1
 
 
 def test_process_census_reports_numeric_bounded_summary():
-    census = GrpoProcessCensus(__import__("os").getpid(), interval_s=0.02).start()
+    census = GrpoProcessCensus(
+        __import__("os").getpid(), expected_steps=(1,), interval_s=0.02
+    ).start()
     script = """
 import subprocess
 import sys
@@ -194,18 +307,20 @@ for thread in threads:
     thread.join()
 """
     proc = subprocess.Popen([sys.executable, "-c", script])
-    deadline = time.monotonic() + 2.0
-    while proc.poll() is None and time.monotonic() < deadline:
-        census.sample_step()
-        time.sleep(0.02)
-    assert proc.wait(timeout=1) == 0
+    time.sleep(0.1)
+    census.sample_step(1)
+    assert proc.wait(timeout=2) == 0
     summary = census.stop()
 
-    assert all(isinstance(value, int) for value in summary.values())
+    cgroup_available = summary["pids_max"] >= 0 and summary["pids_current"] >= 0
+    assert summary["available"] == int(cgroup_available)
     assert summary["peak_processes"] >= 3
     assert summary["peak_threads"] >= 5
     assert summary["peak_single_process_threads"] >= 4
-    assert len(summary) <= 16
+    if cgroup_available:
+        assert summary["peak_pids_current"] > 0
+        assert summary["minimum_pids_headroom"] > 0
+    assert summary["steps"][0]["optimizer_step"] == 1
 
 
 def test_process_census_source_avoids_sensitive_proc_metadata():

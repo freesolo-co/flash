@@ -4626,6 +4626,49 @@ def _notes_common():
     return {"steps_run": 3, "retained_prompts": 8, "reward_history": [0.5], "loss_curve": [0.1]}
 
 
+def test_successful_child_validation_publishes_exact_rollout_identity_evidence_in_notes():
+    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+
+    ledger = RolloutIdentityLedger(1, 2)
+    expected = [
+        {
+            "optimizer_step": 1,
+            "sample_index": 0,
+            "rollout_ordinal": ordinal,
+            "validate": False,
+        }
+        for ordinal in range(2)
+    ]
+    ledger.register(expected)
+    for identity in reversed(expected):
+        ledger.record(identity, 0)
+    ledger.seal(1)
+
+    state = rl_train._StepMetricState()
+    state.reward_history.append(0.5)
+    state.adv_spread_history.append(1.0)
+    runtime = SimpleNamespace(identity_ledger=ledger)
+    rl_train._validate_rl_child(0, state, 0, 1, None, reward_runtime=runtime)
+
+    terminal_source = inspect.getsource(rl_train._write_terminal_metadata)
+    assert "rollout_identity_evidence=state.rollout_identity_evidence" in terminal_source
+    notes = rl_train._build_verl_train_notes(
+        _notes_inp(),
+        **_notes_common(),
+        rollout_identity_evidence=state.rollout_identity_evidence,
+    )
+    assert notes["rollout_identity_evidence"] == {
+        "steps": [
+            {
+                "optimizer_step": 1,
+                "registered": expected,
+                "observed": expected,
+            }
+        ],
+        "validation": [],
+    }
+
+
 def test_train_notes_carry_the_trl_observability_fields():
     # the console is uploaded only on FAILURE, so a successful run's train_meta is the sole record
     # of how it ran. the retired trl path reported these; without them a verl run cannot be compared to a

@@ -9,6 +9,7 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 
@@ -685,7 +686,8 @@ def _build_verl_train_notes(
     wandb_id: str | None = None,
     reward_bridge_batching: bool = False,
     gdn_boundary_resets: bool | None = None,
-    host_census: dict[str, int] | None = None,
+    host_census: dict | None = None,
+    rollout_identity_evidence: dict | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -742,7 +744,10 @@ def _build_verl_train_notes(
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
         "reward_bridge_batching": bool(reward_bridge_batching),
-        "host_census": dict(host_census or {}),
+        "host_census": copy.deepcopy(host_census or {}),
+        "rollout_identity_evidence": copy.deepcopy(
+            rollout_identity_evidence or {"steps": [], "validation": []}
+        ),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],

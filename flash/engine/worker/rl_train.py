@@ -237,6 +237,7 @@ def _write_terminal_metadata(
             reward_bridge_batching=not inp["multi_turn"],
             gdn_boundary_resets=gdn_hybrid or None,
             host_census=state.host_census,
+            rollout_identity_evidence=state.rollout_identity_evidence,
         ),
     )
 

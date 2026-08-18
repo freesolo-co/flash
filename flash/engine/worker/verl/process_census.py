@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 _UNAVAILABLE = -1
+_SNAPSHOT_ATTEMPTS = 3
 
 
 @dataclass(frozen=True, order=True)
@@ -101,6 +103,23 @@ def _complete_descendants(root: _ProcessIdentity) -> set[_ProcessIdentity] | Non
     return descendants
 
 
+def _descendant_counts(root: _ProcessIdentity | None) -> tuple[int, int, int] | None:
+    if root is None:
+        return None
+    descendants = _complete_descendants(root)
+    if descendants is None:
+        return None
+    thread_counts: list[int] = []
+    for identity in descendants:
+        count = _stable_thread_count(identity)
+        if count is None:
+            return None
+        thread_counts.append(count)
+    if _read_start_time(root.pid) != root.start_time:
+        return None
+    return len(descendants), sum(thread_counts), max(thread_counts, default=0)
+
+
 def _read_scalar(path: str) -> str | None:
     try:
         with open(path, encoding="ascii") as handle:
@@ -154,27 +173,65 @@ class ProcessCensusSnapshot:
     pids_headroom: int
     cpu_quota_millicores: int
     affinity_cpus: int
+    incomplete_attempts: int = 0
+
+
+def _step_evidence(step: int, snapshot: ProcessCensusSnapshot) -> dict[str, int]:
+    return {
+        "optimizer_step": step,
+        "processes": snapshot.descendant_processes,
+        "threads": snapshot.descendant_threads,
+        "max_process_threads": snapshot.max_descendant_threads,
+        "pids_current": snapshot.pids_current,
+        "pids_max": snapshot.pids_max,
+        "pids_headroom": snapshot.pids_headroom,
+    }
+
+
+def _required_snapshot_complete(snapshot: ProcessCensusSnapshot | None) -> bool:
+    return bool(
+        snapshot is not None
+        and snapshot.available == 1
+        and snapshot.pids_current >= 0
+        and snapshot.pids_max >= 0
+        and snapshot.pids_headroom > 0
+    )
 
 
 class GrpoProcessCensus:
     """Sample numeric process pressure without inspecting process metadata."""
 
-    def __init__(self, root_pid: int, *, interval_s: float = 0.1) -> None:
+    def __init__(
+        self,
+        root_pid: int,
+        *,
+        expected_steps: Iterable[int],
+        interval_s: float = 0.1,
+    ) -> None:
+        parsed_steps = tuple(int(step) for step in expected_steps)
+        if any(step <= 0 for step in parsed_steps) or len(set(parsed_steps)) != len(parsed_steps):
+            raise ValueError("expected GRPO census steps must be unique positive integers")
         self._root_pid = int(root_pid)
+        self._expected_steps = tuple(sorted(parsed_steps))
         self._interval_s = max(0.02, float(interval_s))
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._root_identity: _ProcessIdentity | None = None
         self._baseline: ProcessCensusSnapshot | None = None
-        self._per_step: ProcessCensusSnapshot | None = None
+        self._step_snapshots: dict[int, ProcessCensusSnapshot] = {}
+        self._step_attempts: dict[int, ProcessCensusSnapshot] = {}
         self._terminal: ProcessCensusSnapshot | None = None
         self._peak_processes = 0
         self._peak_threads = 0
         self._peak_single_process_threads = 0
+        self._peak_pids_current = _UNAVAILABLE
         self._minimum_headroom = _UNAVAILABLE
         self._complete_samples = 0
-        self._all_samples_complete = True
+        self._incomplete_sample_count = 0
+        self._duplicate_step_count = 0
+        self._conflicting_step_count = 0
+        self._unexpected_step_count = 0
 
     def _snapshot(self) -> ProcessCensusSnapshot:
         current, maximum, headroom = _cgroup_pids()
@@ -182,35 +239,44 @@ class GrpoProcessCensus:
             affinity = len(os.sched_getaffinity(self._root_pid))
         except (AttributeError, OSError, ProcessLookupError):
             affinity = _UNAVAILABLE
-        root = self._root_identity
-        descendants = _complete_descendants(root) if root is not None else None
-        thread_counts: list[int] | None = [] if descendants is not None else None
-        if descendants is not None:
-            for identity in descendants:
-                count = _stable_thread_count(identity)
-                if count is None:
-                    thread_counts = None
-                    break
-                thread_counts.append(count)
-        if root is None or _read_start_time(root.pid) != root.start_time:
-            thread_counts = None
-        complete = descendants is not None and thread_counts is not None
+        counts = None
+        incomplete_attempts = 0
+        for _attempt in range(_SNAPSHOT_ATTEMPTS):
+            counts = _descendant_counts(self._root_identity)
+            if counts is not None:
+                break
+            incomplete_attempts += 1
+        complete = counts is not None
+        processes, threads, maximum_threads = counts or (
+            _UNAVAILABLE,
+            _UNAVAILABLE,
+            _UNAVAILABLE,
+        )
         return ProcessCensusSnapshot(
             available=int(complete),
-            descendant_processes=len(descendants) if complete else _UNAVAILABLE,
-            descendant_threads=sum(thread_counts) if complete else _UNAVAILABLE,
-            max_descendant_threads=max(thread_counts, default=0) if complete else _UNAVAILABLE,
+            descendant_processes=processes,
+            descendant_threads=threads,
+            max_descendant_threads=maximum_threads,
             pids_current=current,
             pids_max=maximum,
             pids_headroom=headroom,
             cpu_quota_millicores=_cpu_quota_millicores(),
             affinity_cpus=affinity,
+            incomplete_attempts=incomplete_attempts,
         )
 
     def _observe(self, snapshot: ProcessCensusSnapshot) -> None:
         with self._lock:
+            self._incomplete_sample_count += snapshot.incomplete_attempts
+            if snapshot.pids_current >= 0:
+                self._peak_pids_current = max(self._peak_pids_current, snapshot.pids_current)
+            if snapshot.pids_headroom >= 0:
+                self._minimum_headroom = (
+                    snapshot.pids_headroom
+                    if self._minimum_headroom < 0
+                    else min(self._minimum_headroom, snapshot.pids_headroom)
+                )
             if snapshot.available != 1:
-                self._all_samples_complete = False
                 return
             self._complete_samples += 1
             self._peak_processes = max(self._peak_processes, snapshot.descendant_processes)
@@ -219,12 +285,6 @@ class GrpoProcessCensus:
                 self._peak_single_process_threads,
                 snapshot.max_descendant_threads,
             )
-            if snapshot.pids_headroom >= 0:
-                self._minimum_headroom = (
-                    snapshot.pids_headroom
-                    if self._minimum_headroom < 0
-                    else min(self._minimum_headroom, snapshot.pids_headroom)
-                )
 
     def _run(self) -> None:
         while not self._stop.wait(self._interval_s):
@@ -245,13 +305,26 @@ class GrpoProcessCensus:
         self._thread.start()
         return self
 
-    def sample_step(self) -> None:
+    def sample_step(self, optimizer_step: int) -> None:
+        step = int(optimizer_step)
         snapshot = self._snapshot()
         self._observe(snapshot)
         with self._lock:
-            self._per_step = snapshot
+            if step not in self._expected_steps:
+                self._unexpected_step_count += 1
+                return
+            existing = self._step_attempts.get(step)
+            if existing is not None:
+                if existing == snapshot:
+                    self._duplicate_step_count += 1
+                else:
+                    self._conflicting_step_count += 1
+                return
+            self._step_attempts[step] = snapshot
+            if snapshot.available == 1:
+                self._step_snapshots[step] = snapshot
 
-    def stop(self) -> dict[str, int]:
+    def stop(self) -> dict[str, int | list[dict[str, int]]]:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self._interval_s * 4))
@@ -261,23 +334,48 @@ class GrpoProcessCensus:
             self._terminal = terminal
         return self.summary()
 
-    def summary(self) -> dict[str, int]:
+    def summary(self) -> dict[str, int | list[dict[str, int]]]:
         with self._lock:
             baseline = self._baseline
-            per_step = self._per_step
             terminal = self._terminal
+            steps = [
+                _step_evidence(step, self._step_snapshots[step])
+                for step in sorted(self._step_snapshots)
+            ]
+            latest = (
+                self._step_snapshots[max(self._step_snapshots)] if self._step_snapshots else None
+            )
+            exact_steps = tuple(sorted(self._step_snapshots)) == self._expected_steps
+            required = [baseline, terminal, *self._step_snapshots.values()]
+            required_complete = bool(self._expected_steps) and all(
+                _required_snapshot_complete(snapshot) for snapshot in required
+            )
+            step_errors = (
+                self._duplicate_step_count
+                + self._conflicting_step_count
+                + self._unexpected_step_count
+            )
+            missing_step_count = len(set(self._expected_steps) - set(self._step_snapshots))
             have_peaks = self._complete_samples > 0
             return {
-                "available": int(have_peaks and self._all_samples_complete),
+                "available": int(
+                    have_peaks
+                    and exact_steps
+                    and required_complete
+                    and step_errors == 0
+                    and missing_step_count == 0
+                ),
                 "baseline_processes": baseline.descendant_processes if baseline else _UNAVAILABLE,
                 "baseline_threads": baseline.descendant_threads if baseline else _UNAVAILABLE,
-                "per_step_processes": per_step.descendant_processes if per_step else _UNAVAILABLE,
-                "per_step_threads": per_step.descendant_threads if per_step else _UNAVAILABLE,
+                "per_step_processes": latest.descendant_processes if latest else _UNAVAILABLE,
+                "per_step_threads": latest.descendant_threads if latest else _UNAVAILABLE,
+                "steps": steps,
                 "peak_processes": self._peak_processes if have_peaks else _UNAVAILABLE,
                 "peak_threads": self._peak_threads if have_peaks else _UNAVAILABLE,
                 "peak_single_process_threads": (
                     self._peak_single_process_threads if have_peaks else _UNAVAILABLE
                 ),
+                "peak_pids_current": self._peak_pids_current,
                 "terminal_processes": terminal.descendant_processes if terminal else _UNAVAILABLE,
                 "terminal_threads": terminal.descendant_threads if terminal else _UNAVAILABLE,
                 "pids_current": terminal.pids_current
@@ -287,6 +385,11 @@ class GrpoProcessCensus:
                 if terminal
                 else (baseline.pids_max if baseline else _UNAVAILABLE),
                 "minimum_pids_headroom": self._minimum_headroom,
+                "incomplete_sample_count": self._incomplete_sample_count,
+                "missing_step_count": missing_step_count,
+                "duplicate_step_count": self._duplicate_step_count,
+                "conflicting_step_count": self._conflicting_step_count,
+                "unexpected_step_count": self._unexpected_step_count,
                 "cpu_quota_millicores": baseline.cpu_quota_millicores if baseline else _UNAVAILABLE,
                 "affinity_cpus": baseline.affinity_cpus if baseline else _UNAVAILABLE,
             }

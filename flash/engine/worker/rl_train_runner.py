@@ -12,6 +12,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
@@ -70,7 +71,10 @@ class _StepMetricState:
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
     metrics_last: list[dict] = field(default_factory=list)
     step_timing: StepTiming = field(default_factory=StepTiming)
-    host_census: dict[str, int] = field(default_factory=dict)
+    host_census: dict[str, Any] = field(default_factory=dict)
+    rollout_identity_evidence: dict[str, list] = field(
+        default_factory=lambda: {"steps": [], "validation": []}
+    )
     sent_first_metrics: bool = False
     sent_first_timing: bool = False
 
@@ -431,7 +435,11 @@ def _ingest_step_metrics(
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]
         step_metrics.update(
-            {f"host_census/{key}": value for key, value in state.host_census.items()}
+            {
+                f"host_census/{key}": value
+                for key, value in state.host_census.items()
+                if isinstance(value, int)
+            }
         )
         append_step_metrics(state.metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT)
         # the worker's error path reads this global, so a run that dies mid-training
@@ -492,7 +500,11 @@ def _execute_rl_child(
     # reaped at teardown. this process is not pid 1 (the runpod handler is), so without it
     # every wait answers ChildProcessError for a zombie nobody will collect.
     adopt_orphaned_descendants()
-    census = GrpoProcessCensus(os.getpid()).start()
+    resume_step = int((files or {}).get("resume_step", 0))
+    census = GrpoProcessCensus(
+        os.getpid(),
+        expected_steps=range(resume_step + 1, int(inp["steps"]) + 1),
+    ).start()
     try:
         proc = subprocess.Popen(
             [python_bin, "-m", "flash_grpo_entry", *overrides],
@@ -530,8 +542,6 @@ def _execute_rl_child(
             if step_number is not None:
                 progress["step"] = step_number
                 silence_watchdog.observe_step(step_number)
-                census.sample_step()
-                state.host_census = census.summary()
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
                 # flash patch at all, so fail now rather than after the whole run is paid for. not
@@ -541,6 +551,8 @@ def _execute_rl_child(
                     shims_verified = True
                 # dump one sample completion per new step to the flash log (#607).
                 if progress["step"] != last_dump_step[0]:
+                    census.sample_step(progress["step"])
+                    state.host_census = census.summary()
                     # the generation boundary: verl logs this line once its step is scored, so
                     # everything the reward bridge buffered since the last one is that step's
                     # complete output. seal exact identities before publishing any step output.
@@ -574,7 +586,11 @@ def _execute_rl_child(
         state.host_census = census.stop()
         if state.metrics_last:
             state.metrics_last[-1].update(
-                {f"host_census/{key}": value for key, value in state.host_census.items()}
+                {
+                    f"host_census/{key}": value
+                    for key, value in state.host_census.items()
+                    if isinstance(value, int)
+                }
             )
             LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
 
@@ -603,8 +619,10 @@ def _validate_rl_child(
         raise RuntimeError(
             f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback"
         )
+    rollout_identity_evidence = None
     if reward_runtime is not None:
         reward_runtime.identity_ledger.assert_idle()
+        rollout_identity_evidence = reward_runtime.identity_ledger.evidence()
     # belt and braces behind the first-step check in _execute_rl_child: a run that exits 0 without
     # printing a step line (a resume already at the horizon) still may not pass unverified.
     shim_markers = (files or {}).get("shim_markers")
@@ -630,6 +648,8 @@ def _validate_rl_child(
     if resume_uploader is not None and resume_uploader.required_steps:
         resume_uploader.stop()
         resume_uploader.raise_if_incomplete()
+    if rollout_identity_evidence is not None:
+        state.rollout_identity_evidence = rollout_identity_evidence
 
 
 def _prepare_final_adapter(local_dir: str, t_train: float):
