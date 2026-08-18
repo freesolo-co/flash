@@ -138,12 +138,15 @@ jobs:
             fi
             if [ "$pc" != "$FP_CACHE" ]; then
               candidate="ghcr.io/freesolo-co/flash-worker:cu128-dev-ready-$sm"
-              candidate_pc=""
-              if candidate_cfg=$(crane config "$candidate" 2>/dev/null); then
+              candidate_pc=""; candidate_ref=""
+              if candidate_digest=$(crane digest "$candidate" 2>/dev/null); then
+                candidate_ref="${candidate%:*}@$candidate_digest"
+              fi
+              if [ -n "$candidate_ref" ] && candidate_cfg=$(crane config "$candidate_ref" 2>/dev/null); then
                 candidate_pc=$(echo "$candidate_cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_cache"] // ""')
               fi
               if [ "$candidate_pc" = "$FP_CACHE" ]; then
-                relayer+=("$(jq -cn --arg sm "$sm" --arg source "$candidate" '{sm:$sm, source:$source}')")
+                relayer+=("$(jq -cn --arg sm "$sm" --arg source "$candidate_ref" '{sm:$sm, source:$source}')")
                 action="promote dev cache (free)"
               else
                 gpu+=("$sm"); action="gpu re-warm (candidate missing)"
@@ -243,9 +246,13 @@ jobs:
         id: old
         run: |
           img="${{ matrix.source }}"
-          digest=$(docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}')
-          # canonical digest ref (repo@sha256, no tag) for the FROM in the relayer build.
-          echo "ref=${img%:*}@$digest" >> "$GITHUB_OUTPUT"
+          if [[ "$img" == *@sha256:* ]]; then
+            echo "ref=$img" >> "$GITHUB_OUTPUT"
+          else
+            digest=$(docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}')
+            # canonical digest ref (repo@sha256, no tag) for the FROM in the relayer build.
+            echo "ref=${img%:*}@$digest" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Re-layer cache onto the fresh base (no GPU)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0

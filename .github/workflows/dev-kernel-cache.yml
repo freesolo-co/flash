@@ -20,13 +20,9 @@ on:
     # 09:00 utc is 01:00 pst / 02:00 pdt.
     - cron: "0 9 * * *"
   workflow_dispatch:
-    inputs:
-      source_ref:
-        description: source ref to bake immediately
-        default: dev
-        required: false
 
 permissions:
+  actions: write
   contents: read
   packages: write
 
@@ -35,8 +31,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  dispatch-dev:
+    if: github.repository == 'freesolo-co/flash' && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Dispatch the dev workflow definition
+        run: gh workflow run dev-kernel-cache.yml --ref dev
+
   detect:
-    if: github.repository == 'freesolo-co/flash'
+    if: github.repository == 'freesolo-co/flash' && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -51,7 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'push' && github.sha || inputs.source_ref || 'dev' }}
+          ref: ${{ github.sha }}
 
       - name: Resolve source metadata
         id: source
@@ -91,8 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           arches=$(python3 docker/kernel_fingerprint.py --print-baked-arches)
-          prod_ready=true
-          candidate_ready=true
+          uncovered=false
           summary="| arch | production | dev candidate |\n|---|---|---|\n"
           for sm in $arches; do
             prod="ghcr.io/freesolo-co/flash-worker:cu128-$sm"
@@ -102,26 +107,22 @@ jobs:
             if cfg=$(crane config "$prod" 2>/dev/null); then
               prod_pc=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_cache"] // ""')
             fi
-            if [ "$prod_pc" != "$FP_CACHE" ]; then
-              prod_ready=false
-            fi
-
             candidate_pc=""; candidate_rev=""
             if cfg=$(crane config "$candidate" 2>/dev/null); then
               candidate_pc=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_cache"] // ""')
               candidate_rev=$(echo "$cfg" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')
             fi
-            if [ "$candidate_pc" != "$FP_CACHE" ] || [ "$candidate_rev" != "$REVISION" ]; then
-              candidate_ready=false
+            if [ "$prod_pc" != "$FP_CACHE" ] && [ "$candidate_pc" != "$FP_CACHE" ]; then
+              uncovered=true
             fi
 
             summary="$summary| $sm | \`${prod_pc:-missing}\` | \`${candidate_pc:-missing}\` at \`${candidate_rev:-unknown}\` |\n"
           done
 
-          if [ "$prod_ready" = true ] || [ "$candidate_ready" = true ]; then
-            echo "needs_bake=false" >> "$GITHUB_OUTPUT"
-          else
+          if [ "$uncovered" = true ]; then
             echo "needs_bake=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_bake=false" >> "$GITHUB_OUTPUT"
           fi
           {
             echo "### dev kernel-cache candidate"
@@ -129,14 +130,14 @@ jobs:
             echo "source revision: \`$REVISION\`"
             echo ""
             echo -e "$summary"
-            if [ "${{ github.event_name }}" = push ] && [ "$prod_ready" = false ] && [ "$candidate_ready" = false ]; then
+            if [ "${{ github.event_name }}" = push ] && [ "$uncovered" = true ]; then
               echo "A bake is pending for the next off-peak run. Use workflow dispatch for an urgent release."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   build-base:
     needs: detect
-    if: github.event_name != 'push' && needs.detect.outputs.needs_bake == 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.detect.outputs.needs_bake == 'true'
     uses: ./.github/workflows/worker-image.yml
     with:
       tag: cu128-dev-${{ needs.detect.outputs.revision }}
@@ -145,7 +146,7 @@ jobs:
 
   bake:
     needs: [detect, build-base]
-    if: github.event_name != 'push' && needs.detect.outputs.needs_bake == 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.detect.outputs.needs_bake == 'true'
     uses: ./.github/workflows/bake-kernel-cache.yml
     with:
       sms: ${{ needs.detect.outputs.sms }}
@@ -158,7 +159,7 @@ jobs:
 
   publish-ready:
     needs: [detect, bake]
-    if: github.event_name != 'push' && needs.detect.outputs.needs_bake == 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.detect.outputs.needs_bake == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -204,3 +205,8 @@ jobs:
               "$repo:cu128-dev-$REVISION-$sm" \
               "$repo:cu128-dev-ready-$sm"
           done
+
+      - name: Re-run production readiness for dev
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run production-kernel-cache-ready.yml --ref dev

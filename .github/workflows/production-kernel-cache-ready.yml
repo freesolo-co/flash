@@ -1,11 +1,12 @@
 name: production kernel-cache readiness
 
 # this check is registry-only and never starts a gpu. branch protection can require its named job
-# to prove every production sm already has the cache or has an exact dev candidate ready to promote.
+# to prove every production sm already has the cache or has a compatible dev candidate to promote.
 
 on:
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Compute proposed kernel fingerprint
         id: fp
@@ -51,7 +52,7 @@ jobs:
       - name: Verify every sm cache is ready
         env:
           FP_CACHE: ${{ steps.fp.outputs.fp_cache }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           arches=$(python3 docker/kernel_fingerprint.py --print-baked-arches)
@@ -74,7 +75,7 @@ jobs:
 
             if [ "$prod_pc" = "$FP_CACHE" ]; then
               result="production ready"
-            elif [ "$candidate_pc" = "$FP_CACHE" ] && [ "$candidate_rev" = "$HEAD_SHA" ]; then
+            elif [ "$candidate_pc" = "$FP_CACHE" ]; then
               result="dev candidate ready"
             else
               result="missing"
@@ -92,6 +93,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error::missing exact kernel-cache candidates for: ${missing[*]}. Run the dev kernel-cache candidate workflow for $HEAD_SHA."
+            echo "::error::missing kernel-cache candidates for: ${missing[*]}. Run the dev kernel-cache candidate workflow for $HEAD_SHA."
             exit 1
           fi

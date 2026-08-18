@@ -533,13 +533,26 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
     assert "workflow_dispatch" in triggers
 
     jobs = _jobs(document)
+    dispatch = jobs["dispatch-dev"]
+    dispatch_script = next(step for step in _steps(dispatch) if "run" in step)["run"]
+    _assert_gated_upstream(dispatch.get("if"), "dev-kernel-cache.yml:dispatch-dev")
+    assert "github.event_name == 'schedule'" in dispatch["if"]
+    assert "gh workflow run dev-kernel-cache.yml --ref dev" in dispatch_script
+    assert "github.event_name != 'schedule'" in jobs["detect"]["if"]
+    detect_checkout = next(
+        step
+        for step in _steps(jobs["detect"])
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert detect_checkout["with"]["ref"] == "${{ github.sha }}"
+
     build = jobs["build-base"]
     bake = jobs["bake"]
-    assert "github.event_name != 'push'" in build["if"]
+    assert "github.event_name == 'workflow_dispatch'" in build["if"]
     assert "needs.detect.outputs.needs_bake == 'true'" in build["if"]
     assert build["uses"] == "./.github/workflows/worker-image.yml"
     assert "needs.detect.outputs.revision" in build["with"]["source_ref"]
-    assert "github.event_name != 'push'" in bake["if"]
+    assert "github.event_name == 'workflow_dispatch'" in bake["if"]
     assert bake["uses"] == "./.github/workflows/bake-kernel-cache.yml"
     assert "cu128-dev-" in bake["with"]["target_tag_prefix"]
 
@@ -550,18 +563,30 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
     assert "cu128-dev-$REVISION-$sm" in script
     assert "cu128-dev-ready-$sm" in script
     assert script.index("candidate validation failed") < script.index("crane copy")
+    rerun = next(
+        step
+        for step in _steps(publish)
+        if step.get("name") == "Re-run production readiness for dev"
+    )["run"]
+    assert "production-kernel-cache-ready.yml --ref dev" in rerun
+
+    classify = next(step for step in _steps(jobs["detect"]) if step.get("id") == "classify")["run"]
+    assert '[ "$prod_pc" != "$FP_CACHE" ] && [ "$candidate_pc" != "$FP_CACHE" ]' in classify
+    assert 'candidate_rev" != "$REVISION' not in classify
 
 
-def test_main_pr_check_requires_each_exact_sm_cache():
+def test_main_pr_check_accepts_each_fingerprint_compatible_sm_cache():
     document = _load(WORKFLOW_DIR / "production-kernel-cache-ready.yml")
-    assert _triggers(document)["pull_request"]["branches"] == ["main"]
+    triggers = _triggers(document)
+    assert triggers["pull_request"]["branches"] == ["main"]
+    assert "workflow_dispatch" in triggers
     job = _jobs(document)["ready"]
     assert job["name"] == "production kernel cache ready"
 
     checkout = next(
         step for step in _steps(job) if str(step.get("uses", "")).startswith("actions/checkout@")
     )
-    assert checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+    assert checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha || github.sha }}"
     verify = next(
         step for step in _steps(job) if step.get("name") == "Verify every sm cache is ready"
     )
@@ -569,7 +594,7 @@ def test_main_pr_check_requires_each_exact_sm_cache():
     assert "--print-baked-arches" in script
     assert "cu128-dev-ready-$sm" in script
     assert 'candidate_pc" = "$FP_CACHE' in script
-    assert 'candidate_rev" = "$HEAD_SHA' in script
+    assert 'candidate_rev" = "$HEAD_SHA' not in script
     assert "exit 1" in script
 
 
@@ -578,7 +603,10 @@ def test_production_relayer_promotes_matching_dev_cache_before_gpu_fallback():
     jobs = _jobs(document)
     classify = next(step for step in _steps(jobs["gate"]) if step.get("id") == "classify")["run"]
     assert "cu128-dev-ready-$sm" in classify
+    assert "crane digest" in classify
+    assert 'crane config "$candidate_ref"' in classify
     assert 'candidate_pc" = "$FP_CACHE' in classify
+    assert '--arg source "$candidate_ref"' in classify
     assert "gpu re-warm (candidate missing)" in classify
     assert "relayer_matrix=" in classify
 
@@ -586,6 +614,7 @@ def test_production_relayer_promotes_matching_dev_cache_before_gpu_fallback():
     assert "relayer_matrix" in relayer["strategy"]["matrix"]["include"]
     resolve = next(step for step in _steps(relayer) if step.get("id") == "old")["run"]
     assert 'img="${{ matrix.source }}"' in resolve
+    assert '"$img" == *@sha256:*' in resolve
 
 
 def test_bake_workflow_can_publish_versioned_candidate_tags():
