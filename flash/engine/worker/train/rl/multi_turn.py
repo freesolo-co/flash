@@ -116,6 +116,42 @@ def request_session_id(payload: dict) -> str:
     return str(_request_field(payload, "session_id"))
 
 
+def _authentication_prompts_equal(expected: list[dict], actual: list[dict]) -> bool:
+    """compare prompts after only the text concatenation performed by chat templates."""
+
+    def content_parts(content) -> list[tuple[str, object]]:
+        if isinstance(content, str):
+            return [("text", content)] if content else []
+        parts: list[tuple[str, object]] = []
+        text_parts: list[str] = []
+        for block in content:
+            if block.get("type") == "text":
+                text_parts.append(block["text"])
+                continue
+            text = "".join(text_parts)
+            if text:
+                parts.append(("text", text))
+            text_parts = []
+            parts.append(("block", block))
+        text = "".join(text_parts)
+        if text:
+            parts.append(("text", text))
+        return parts
+
+    if len(expected) != len(actual):
+        return False
+    for expected_message, actual_message in zip(expected, actual, strict=True):
+        expected_metadata = {
+            key: value for key, value in expected_message.items() if key != "content"
+        }
+        actual_metadata = {key: value for key, value in actual_message.items() if key != "content"}
+        if expected_metadata != actual_metadata:
+            return False
+        if content_parts(expected_message["content"]) != content_parts(actual_message["content"]):
+            return False
+    return True
+
+
 # ONLY the bridge's own deliberate rejections are client errors. classifying by exception TYPE
 # instead cannot work: a user env raising IndexError/KeyError deep inside its own scoring would be
 # reported as a malformed request -- the same "blame the caller for this side's failure" bug this
@@ -297,7 +333,7 @@ class MultiTurnBridge:
             raw_prompt = validate_structured_messages(
                 payload["raw_prompt"], source="child initial prompt"
             )
-            if raw_prompt != expected_prompt:
+            if not _authentication_prompts_equal(expected_prompt, raw_prompt):
                 raise _BadRequest(
                     "multi-turn child prompt does not match the frozen environment prompt"
                 )

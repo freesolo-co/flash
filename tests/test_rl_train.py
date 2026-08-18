@@ -5249,6 +5249,253 @@ def test_bridge_start_passes_the_index_aligned_prepared_prompt_into_state_creati
     assert state["messages"] == prepared_prompt
 
 
+def test_bridge_accepts_child_string_for_frozen_singleton_text_block_without_replacing_it():
+    class _RecordingEnv(_BridgeEnv):
+        def __init__(self):
+            super().__init__()
+            self.starts = []
+
+        def new_rollout_state(self, example, prepared_prompt):
+            self.starts.append((example, prepared_prompt))
+            return super().new_rollout_state(example, prepared_prompt)
+
+    env = _RecordingEnv()
+    frozen_prompt = [{"role": "user", "content": [{"type": "text", "text": "prepared"}]}]
+    bridge = _bridge(env, examples=[{"index": 0}], env_prompts=[frozen_prompt])
+
+    bridge.start(
+        {
+            "index": 0,
+            "session_id": "a",
+            "raw_prompt": [{"role": "user", "content": "prepared"}],
+            "image_count": 0,
+            "image_digests": [],
+        }
+    )
+
+    expected_prompt = bridge._env_prompts[0]
+    assert env.starts[0][1] is expected_prompt, "the child string replaced the frozen env prompt"
+    assert expected_prompt[0]["content"] == [{"type": "text", "text": "prepared"}]
+    assert bridge._sessions["a"]["state"]["prompt"] == expected_prompt
+    assert bridge._sessions["a"]["messages"] == expected_prompt
+
+
+@pytest.mark.parametrize(
+    ("text_blocks", "child_text"),
+    [
+        ([{"type": "text", "text": "first"}, {"type": "text", "text": " second"}], "first second"),
+        ([{"type": "text", "text": ""}], ""),
+    ],
+)
+def test_bridge_authentication_joins_consecutive_text_blocks_like_the_chat_template(
+    text_blocks, child_text
+):
+    frozen_prompt = [{"role": "user", "content": text_blocks}]
+    child_prompt = [{"role": "user", "content": child_text}]
+    tokenizer = _BridgeGlueTokenizer()
+    assert tokenizer.apply_chat_template(frozen_prompt) == tokenizer.apply_chat_template(
+        child_prompt
+    )
+
+    bridge = _bridge(
+        _BridgeEnv(), examples=[{"index": 0}], env_prompts=[frozen_prompt], tokenizer=tokenizer
+    )
+    bridge.start(
+        {
+            "index": 0,
+            "session_id": "a",
+            "raw_prompt": child_prompt,
+            "image_count": 0,
+            "image_digests": [],
+        }
+    )
+    assert bridge.open_sessions() == 1
+
+
+def test_bridge_authentication_rejects_changed_text_after_text_block_concatenation():
+    from flash.engine.worker.train.rl.multi_turn import _BadRequest
+
+    bridge = _bridge(
+        _BridgeEnv(),
+        examples=[{"index": 0}],
+        env_prompts=[
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first"},
+                        {"type": "text", "text": " second"},
+                    ],
+                }
+            ]
+        ],
+    )
+    with pytest.raises(_BadRequest, match="does not match the frozen environment prompt"):
+        bridge.start(
+            {
+                "index": 0,
+                "session_id": "a",
+                "raw_prompt": [{"role": "user", "content": "first  second"}],
+                "image_count": 0,
+                "image_digests": [],
+            }
+        )
+    assert bridge.open_sessions() == 0
+
+
+def test_bridge_authentication_rejects_image_placement_and_media_digest_sabotage():
+    from flash.engine.worker.train.rl.multi_turn import (
+        _authentication_prompts_equal,
+        _BadRequest,
+    )
+
+    exact_blocks = [
+        {
+            "role": "user",
+            "metadata": {"source": "parent"},
+            "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image", "image": "image-a"},
+                {"type": "video", "video": "video-a"},
+            ],
+        }
+    ]
+    for sabotage in (
+        [{**exact_blocks[0], "role": "assistant"}],
+        [{**exact_blocks[0], "metadata": {"source": "child"}}],
+        [
+            {
+                **exact_blocks[0],
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image", "image": "image-b"},
+                    {"type": "video", "video": "video-a"},
+                ],
+            }
+        ],
+        [
+            {
+                **exact_blocks[0],
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image", "image": "image-a"},
+                    {"type": "video", "video": "video-b"},
+                ],
+            }
+        ],
+    ):
+        assert not _authentication_prompts_equal(exact_blocks, sabotage)
+
+    image, descriptor = _bridge_image()
+    tokenizer = _BridgeGlueTokenizer()
+    processor = _BridgeGlueProcessor(tokenizer)
+    frozen_prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image"},
+                {"type": "text", "text": "after"},
+            ],
+        }
+    ]
+    child_prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image", "image": "/tmp/image.png"},
+                {"type": "text", "text": "after"},
+            ],
+        }
+    ]
+    bridge = _bridge(
+        _BridgeEnv(),
+        examples=[{"index": 0}],
+        env_prompts=[frozen_prompt],
+        prompt_descriptors=[[descriptor]],
+        processor=processor,
+        tokenizer=tokenizer,
+    )
+    correct_digests = list(bridge._prompt_digests[0])
+    sabotages = [
+        {
+            "raw_prompt": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": "/tmp/image.png"},
+                        {"type": "text", "text": "beforeafter"},
+                    ],
+                }
+            ],
+            "image_count": 1,
+            "image_digests": correct_digests,
+        },
+        {
+            "raw_prompt": [{"role": "user", "content": "beforeafter"}],
+            "image_count": 1,
+            "image_digests": correct_digests,
+        },
+        {
+            "raw_prompt": child_prompt,
+            "image_count": 1,
+            "image_digests": ["changed-image-content"],
+        },
+    ]
+    try:
+        for index, sabotage in enumerate(sabotages):
+            with pytest.raises(_BadRequest):
+                bridge.start({"index": 0, "session_id": f"s{index}", **sabotage})
+        assert bridge.open_sessions() == 0
+    finally:
+        image.close()
+
+
+def test_image_observation_prompt_without_initial_images_authenticates_through_verl_row():
+    from flash.engine.worker.train.rl import inputs as rl_inputs
+
+    class _ImageObservationEnv(_BridgeEnv):
+        image_observations = True
+
+    env = _ImageObservationEnv()
+    example = {"index": 0}
+    source_prompt = [{"role": "user", "content": "question"}]
+    processor = _CapabilityProcessor()
+    prompts = rl_inputs._build_grpo_prompts(
+        [example], [source_prompt], True, processor, processor.tokenizer, None, 32
+    )
+    prepared = prompts[0]
+    rows = rl_train.build_verl_dataset_rows(
+        [prepared["prompt"]], [0], [""], image_uris=[prepared["images"]]
+    )
+
+    assert prepared["env_prompt"][0]["content"] == [{"type": "text", "text": "question"}]
+    assert rows[0]["prompt"] == [{"role": "user", "content": "question"}]
+    assert rows[0]["images"] == []
+
+    bridge = _bridge(
+        env,
+        examples=[example],
+        env_prompts=[prepared["env_prompt"]],
+        prompt_ids=[prepared["prompt_ids"]],
+        prompt_descriptors=[prepared["images"]],
+        processor=processor,
+        tokenizer=processor.tokenizer,
+    )
+    bridge.start(
+        {
+            "index": 0,
+            "session_id": "a",
+            "raw_prompt": rows[0]["prompt"],
+            "prompt_ids": prepared["prompt_ids"],
+            "image_count": 0,
+            "image_digests": [],
+        }
+    )
+    assert bridge._sessions["a"]["state"]["prompt"] == prepared["env_prompt"]
+
+
 @pytest.mark.parametrize("shape", ["image", "image_url", "input_image", "mixed"])
 def test_bridge_normalizes_and_authenticates_every_supported_image_reply_shape(shape):
     from flash.content.multimodal import image_descriptors_to_data_uris
