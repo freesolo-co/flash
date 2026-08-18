@@ -17,6 +17,7 @@ from ._canonical import canonical_json
 from ._urls import validate_modal_public_url, validate_runpod_pod_id, validate_runpod_public_url
 
 Provider: TypeAlias = Literal["modal", "runpod"]
+RepoType: TypeAlias = Literal["model", "dataset"]
 Modality: TypeAlias = Literal["text", "multimodal"]
 DeploymentStatus: TypeAlias = Literal[
     "ready",
@@ -60,6 +61,7 @@ _HEX_40_RE = re.compile(r"[0-9a-f]{40}")
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _SAFE_SUBFOLDER_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_REPO_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
 
 
 def _require_nonempty(value: object, name: str) -> str:
@@ -126,6 +128,19 @@ def _require_nonnegative_number(value: object, name: str) -> float:
 def _require_bool(value: object, name: str) -> bool:
     if type(value) is not bool:
         raise ValueError(f"{name} must be a boolean")
+    return value
+
+
+def _validate_repo_id(value: object) -> str:
+    repo_id = _require_nonempty(value, "artifact_repo_id")
+    if _REPO_ID_RE.fullmatch(repo_id) is None:
+        raise ValueError("artifact_repo_id must be an exact owner/name repository id")
+    return repo_id
+
+
+def _validate_repo_type(value: object) -> RepoType:
+    if type(value) is not str or value not in {"model", "dataset"}:
+        raise ValueError("artifact_repo_type must be model or dataset")
     return value
 
 
@@ -239,6 +254,10 @@ def validate_engine_identity(identity: EngineIdentity) -> None:
         raise ValueError("max_cpu_loras must be at least max_loras")
     _require_optional_positive_int(identity.max_num_batched_tokens, "max_num_batched_tokens")
     _require_optional_positive_int(identity.image_limit, "image_limit")
+    if identity.modality == "text" and identity.image_limit is not None:
+        raise ValueError("text engines cannot declare an image_limit")
+    if identity.modality == "multimodal" and identity.image_limit is None:
+        raise ValueError("multimodal engines require a positive image_limit")
     utilization = _canonical_float(identity.gpu_memory_utilization, "gpu_memory_utilization")
     if utilization <= 0 or utilization > 1:
         raise ValueError("gpu_memory_utilization must be greater than zero and at most one")
@@ -250,6 +269,8 @@ def validate_engine_identity(identity: EngineIdentity) -> None:
             _require_nonnegative_number(getattr(identity, name), name),
         )
     _require_bool(identity.enable_tower_connector_lora, "enable_tower_connector_lora")
+    if identity.modality == "text" and identity.enable_tower_connector_lora:
+        raise ValueError("text engines cannot enable tower connector lora")
     _require_optional_nonempty(identity.reasoning_parser, "reasoning_parser")
     _require_bool(identity.trust_remote_code, "trust_remote_code")
     for name in (
@@ -277,11 +298,13 @@ class AdapterAliasIntent:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedAdapter:
-    """one authorized immutable adapter and its complete engine identity."""
+    """one authorized immutable adapter and its exact data-only artifact source."""
 
     run_id: str
     checkpoint: str
     adapter_revision: str
+    artifact_repo_id: str
+    artifact_repo_type: RepoType
     artifact_revision: str
     artifact_digest: str
     artifact_subfolder: str
@@ -291,7 +314,6 @@ class ResolvedAdapter:
     thinking_default: bool
     structured_outputs_default_json: str | None
     alias_intent: AdapterAliasIntent
-    engine: EngineIdentity
 
     def __post_init__(self) -> None:
         validate_resolved_adapter(self)
@@ -302,7 +324,6 @@ def validate_resolved_adapter(adapter: ResolvedAdapter) -> None:
 
     if type(adapter) is not ResolvedAdapter:
         raise ValueError("adapters must contain exact ResolvedAdapter records")
-    validate_engine_identity(adapter.engine)
     run_id = _require_identifier(adapter.run_id, "run_id")
     revision = _require_nonempty(adapter.adapter_revision, "adapter_revision")
     match = _ADAPTER_REVISION_RE.fullmatch(revision)
@@ -313,6 +334,8 @@ def validate_resolved_adapter(adapter: ResolvedAdapter) -> None:
     checkpoint = "final" if match.group("step") is None else f"step-{match.group('step')}"
     if adapter.checkpoint != checkpoint:
         raise ValueError("checkpoint does not match adapter_revision")
+    _validate_repo_id(adapter.artifact_repo_id)
+    _validate_repo_type(adapter.artifact_repo_type)
     artifact_revision = _require_exact_digest(
         adapter.artifact_revision,
         "artifact_revision",
@@ -324,9 +347,7 @@ def validate_resolved_adapter(adapter: ResolvedAdapter) -> None:
     _validate_subfolder(adapter.artifact_subfolder)
     _require_nonempty(adapter.base_model, "base_model")
     _require_exact_digest(adapter.base_model_revision, "base_model_revision", _HEX_40_RE)
-    rank = _require_positive_int(adapter.lora_rank, "adapter lora_rank")
-    if rank > adapter.engine.max_lora_rank:
-        raise ValueError("adapter lora_rank exceeds engine max_lora_rank")
+    _require_positive_int(adapter.lora_rank, "adapter lora_rank")
     _require_bool(adapter.thinking_default, "thinking_default")
     _validate_structured_default(adapter.structured_outputs_default_json)
     if type(adapter.alias_intent) is not AdapterAliasIntent:
@@ -418,20 +439,20 @@ def _validate_deployment_components(
     generation: object,
     provider: object,
     placement: object,
+    engine: object,
     adapters: object,
-    engine: object | None = None,
-) -> EngineIdentity:
+) -> None:
     _require_identifier(deployment_id, "deployment_id")
     _require_positive_int(generation, "generation")
     validated_placement = _validate_provider_placement(provider, placement)
+    validate_engine_identity(engine)
+    if engine.tensor_parallel_size != validated_placement.gpu_count:
+        raise ValueError("placement gpu_count must equal engine tensor_parallel_size")
     if type(adapters) is not tuple or not adapters:
         raise ValueError("deployments require at least one adapter")
-    if engine is not None:
-        validate_engine_identity(engine)
 
     revisions: set[str] = set()
     activating_runs: set[str] = set()
-    expected_engine: EngineIdentity | None = None
     expected_base: tuple[str, str] | None = None
     for adapter in adapters:
         validate_resolved_adapter(adapter)
@@ -442,14 +463,8 @@ def _validate_deployment_components(
             if adapter.run_id in activating_runs:
                 raise ValueError("deployment permits at most one active alias intent per run")
             activating_runs.add(adapter.run_id)
-        if adapter.engine.tensor_parallel_size != validated_placement.gpu_count:
-            raise ValueError("placement gpu_count must equal engine tensor_parallel_size")
-        if expected_engine is None:
-            expected_engine = adapter.engine
-        elif adapter.engine != expected_engine:
-            raise ValueError(
-                "all adapters in one deployment must use the same complete engine identity"
-            )
+        if adapter.lora_rank > engine.max_lora_rank:
+            raise ValueError("adapter lora_rank exceeds engine max_lora_rank")
         base = (adapter.base_model, adapter.base_model_revision)
         if expected_base is None:
             expected_base = base
@@ -458,12 +473,8 @@ def _validate_deployment_components(
                 "all adapters in one deployment must use the same logical base model and revision"
             )
 
-    assert expected_engine is not None
-    if engine is not None and engine != expected_engine:
-        raise ValueError("deployment engine does not match its adapters")
-    if len(adapters) > expected_engine.adapter_capacity:
+    if len(adapters) > engine.adapter_capacity:
         raise ValueError("deployment adapter count exceeds the validated max_cpu_loras capacity")
-    return expected_engine
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +485,7 @@ class DeploymentRequest:
     generation: int
     provider: Provider
     placement: Placement
+    engine: EngineIdentity
     adapters: tuple[ResolvedAdapter, ...]
 
     def __post_init__(self) -> None:
@@ -502,16 +514,17 @@ class DeploymentSpec:
         return spec_identity(self)
 
 
-def validate_deployment_request(request: DeploymentRequest) -> EngineIdentity:
+def validate_deployment_request(request: DeploymentRequest) -> None:
     """validate raw deployment input before deterministic ordering."""
 
     if type(request) is not DeploymentRequest:
         raise ValueError("request must be an exact DeploymentRequest")
-    return _validate_deployment_components(
+    _validate_deployment_components(
         deployment_id=request.deployment_id,
         generation=request.generation,
         provider=request.provider,
         placement=request.placement,
+        engine=request.engine,
         adapters=request.adapters,
     )
 

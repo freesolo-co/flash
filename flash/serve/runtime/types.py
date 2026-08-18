@@ -186,6 +186,8 @@ class EngineConfig:
     max_cpu_loras: int = 16
     pin_loras: bool | None = None
     image_limit: int | None = None
+    mm_processor_cache_gb: float = 0.0
+    enable_tower_connector_lora: bool = False
     prompt_cache_size: int = 128
     reasoning_parser: str | None = None
     liveness_interval_seconds: float = 5.0
@@ -211,6 +213,14 @@ class EngineConfig:
             "pin_loras",
             _require_bool(self.pin_loras, "pin_loras", optional=True),
         )
+        object.__setattr__(
+            self,
+            "enable_tower_connector_lora",
+            _require_bool(
+                self.enable_tower_connector_lora,
+                "enable_tower_connector_lora",
+            ),
+        )
         for name in ("max_loras", "max_lora_rank", "max_cpu_loras"):
             object.__setattr__(self, name, _require_int(getattr(self, name), name, minimum=1))
         if self.max_cpu_loras < self.max_loras:
@@ -221,6 +231,10 @@ class EngineConfig:
                 "image_limit",
                 _require_int(self.image_limit, "image_limit", minimum=1),
             )
+        mm_cache = _require_finite_number(self.mm_processor_cache_gb, "mm_processor_cache_gb")
+        if mm_cache < 0:
+            raise RuntimeConfigurationError("mm_processor_cache_gb must be non-negative")
+        object.__setattr__(self, "mm_processor_cache_gb", mm_cache)
         object.__setattr__(
             self,
             "prompt_cache_size",

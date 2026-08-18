@@ -18,7 +18,7 @@ def plan_deployment(request: DeploymentRequest) -> DeploymentSpec:
     """validate and return one deterministic credential-free deployment spec."""
 
     try:
-        engine = validate_deployment_request(request)
+        validate_deployment_request(request)
     except (TypeError, ValueError) as exc:
         raise PlanningError(str(exc)) from exc
     ordered = tuple(sorted(request.adapters, key=canonical_adapter_sort_key))
@@ -28,7 +28,7 @@ def plan_deployment(request: DeploymentRequest) -> DeploymentSpec:
             generation=request.generation,
             provider=request.provider,
             placement=request.placement,
-            engine=engine,
+            engine=request.engine,
             adapters=ordered,
         )
     except (TypeError, ValueError) as exc:

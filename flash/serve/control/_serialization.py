@@ -82,6 +82,8 @@ def _adapter_payload(value: ResolvedAdapter) -> dict[str, object]:
         "run_id": value.run_id,
         "checkpoint": value.checkpoint,
         "adapter_revision": value.adapter_revision,
+        "artifact_repo_id": value.artifact_repo_id,
+        "artifact_repo_type": value.artifact_repo_type,
         "artifact_revision": value.artifact_revision,
         "artifact_digest": value.artifact_digest,
         "artifact_subfolder": value.artifact_subfolder,
@@ -91,7 +93,6 @@ def _adapter_payload(value: ResolvedAdapter) -> dict[str, object]:
         "thinking_default": value.thinking_default,
         "structured_outputs_default_json": value.structured_outputs_default_json,
         "alias_intent": _alias_payload(value.alias_intent),
-        "engine": _engine_payload(value.engine),
     }
 
 
@@ -106,9 +107,7 @@ def canonical_adapter_sort_key(value: ResolvedAdapter) -> str:
 
     _require_exact(value, ResolvedAdapter, "adapter")
     validate_resolved_adapter(value)
-    payload = _adapter_payload(value)
-    payload.pop("engine")
-    return canonical_json(payload)
+    return canonical_json(_adapter_payload(value))
 
 
 def _placement_payload(value: ModalPlacement | RunPodPlacement) -> dict[str, object]:

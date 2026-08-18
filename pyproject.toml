@@ -88,6 +88,10 @@ serve-modal = [
 # production freesolo serving image. vllm stays exact until a real-gpu base plus lora canary validates
 # a replacement; this extra intentionally remains independent from both `gpu` and `serve-modal`.
 serve-runtime = [
+    "fastapi",
+    "uvicorn",
+    "huggingface-hub>=1.2.0",
+    "safetensors",
     "pillow>=11.0.0",
     # same range as every other extra: the serving image resolves from these bounds rather than the
     # lockfile, so an unbounded declaration silently rides a transformers line nothing validated.

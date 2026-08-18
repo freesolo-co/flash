@@ -42,6 +42,8 @@ TOKENIZER_KWARGS_FINGERPRINT = canonical_mapping_fingerprint({"use_fast": True})
 PROCESSOR_KWARGS_FINGERPRINT = canonical_mapping_fingerprint({"max_pixels": 1024})
 SECRET_SENTINEL = "provider-secret-sentinel"
 POD_ID = "abc123def4567"
+_ADAPTER_ENGINES: dict[int, EngineIdentity] = {}
+_ADAPTER_REFERENCES: list[ResolvedAdapter] = []
 
 
 def _engine(**overrides: object) -> EngineIdentity:
@@ -91,6 +93,8 @@ def _adapter(
         "run_id": run_id,
         "checkpoint": "final",
         "adapter_revision": f"{run_id}@final.{artifact_revision}",
+        "artifact_repo_id": "flash-owned/runs",
+        "artifact_repo_type": "model",
         "artifact_revision": artifact_revision,
         "artifact_digest": f"{index + 100:064x}",
         "artifact_subfolder": f"sft/{run_id}",
@@ -100,13 +104,16 @@ def _adapter(
         "thinking_default": False,
         "structured_outputs_default_json": '{"json_object":true}',
         "alias_intent": AdapterAliasIntent(activate=False, expected_adapter_revision=None),
-        "engine": identity,
     }
     values.update(overrides)
-    return ResolvedAdapter(**values)
+    adapter = ResolvedAdapter(**values)
+    _ADAPTER_REFERENCES.append(adapter)
+    _ADAPTER_ENGINES[id(adapter)] = identity
+    return adapter
 
 
 def _modal_request(*adapters: ResolvedAdapter, provider: str = "modal") -> DeploymentRequest:
+    selected = tuple(adapters) or (_adapter(1),)
     return DeploymentRequest(
         deployment_id="deployment-1",
         generation=2,
@@ -118,11 +125,13 @@ def _modal_request(*adapters: ResolvedAdapter, provider: str = "modal") -> Deplo
             region="us-east",
             volume_size_gb=100,
         ),
-        adapters=tuple(adapters) or (_adapter(1),),
+        engine=_ADAPTER_ENGINES.get(id(selected[0]), _engine()),
+        adapters=selected,
     )
 
 
 def _runpod_spec() -> DeploymentSpec:
+    adapter = _adapter(1)
     return plan_deployment(
         DeploymentRequest(
             deployment_id="deployment-1",
@@ -136,7 +145,8 @@ def _runpod_spec() -> DeploymentSpec:
                 container_disk_gb=50,
                 volume_size_gb=100,
             ),
-            adapters=(_adapter(1),),
+            engine=_ADAPTER_ENGINES[id(adapter)],
+            adapters=(adapter,),
         )
     )
 
@@ -216,7 +226,32 @@ def test_engine_id_is_canonical_stable_and_sensitive_to_every_field() -> None:
     }
     assert set(alternatives) == {entry.name for entry in fields(identity)}
     for name, value in alternatives.items():
-        assert replace(identity, **{name: value}).engine_id != identity.engine_id, name
+        overrides = {name: value}
+        if name == "modality":
+            overrides["image_limit"] = 4
+        elif name == "image_limit":
+            overrides["modality"] = "multimodal"
+        elif name == "enable_tower_connector_lora":
+            overrides.update(modality="multimodal", image_limit=4)
+        assert replace(identity, **overrides).engine_id != identity.engine_id, name
+
+
+def test_engine_identity_enforces_modality_and_image_limit_consistency() -> None:
+    text = _engine()
+    multimodal = _engine(
+        modality="multimodal",
+        image_limit=4,
+        enable_tower_connector_lora=True,
+    )
+    assert text.image_limit is None
+    assert multimodal.image_limit == 4
+
+    with pytest.raises(ValueError, match="text engines cannot declare"):
+        _engine(image_limit=1)
+    with pytest.raises(ValueError, match="multimodal engines require"):
+        _engine(modality="multimodal")
+    with pytest.raises(ValueError, match="text engines cannot enable tower connector"):
+        _engine(enable_tower_connector_lora=True)
 
 
 def test_engine_identity_normalizes_numeric_equivalence_and_requires_integer_types() -> None:
@@ -262,7 +297,8 @@ def test_multiple_compatible_adapters_return_one_order_stable_spec() -> None:
     assert forward == reverse
     assert forward.engine is engine
     assert forward.adapters == (first, second)
-    assert all(adapter.engine == forward.engine for adapter in forward.adapters)
+    assert "engine" not in {entry.name for entry in fields(ResolvedAdapter)}
+    assert "engine" in {entry.name for entry in fields(DeploymentRequest)}
     assert "groups" not in {entry.name for entry in fields(forward)}
     assert "group_id" not in sanitized_dict(forward)
     assert "group_name" not in sanitized_dict(forward)
@@ -290,11 +326,16 @@ def test_deployment_spec_requires_canonical_adapter_order_at_every_boundary() ->
         sanitized_dict(planned)
 
 
-def test_planning_rejects_mixed_complete_engine_identities() -> None:
-    first = _adapter(1, _engine())
-    second = _adapter(2, _engine(dtype="float16"))
-    with pytest.raises(PlanningError, match="same complete engine identity"):
-        plan_deployment(_modal_request(first, second))
+def test_request_is_the_single_engine_authority() -> None:
+    engine = _engine(dtype="float16")
+    adapter = _adapter(1, _engine())
+    request = replace(_modal_request(adapter), engine=engine)
+
+    spec = plan_deployment(request)
+
+    assert spec.engine is engine
+    assert sanitized_dict(spec)["engine"]["dtype"] == "float16"
+    assert "engine" not in sanitized_dict(spec)["adapters"][0]
 
 
 def test_capacity_at_limit_succeeds_and_capacity_plus_one_fails_without_chunking() -> None:
@@ -319,8 +360,8 @@ def test_adapter_rank_is_per_adapter_under_one_engine_ceiling() -> None:
     assert [adapter.lora_rank for adapter in spec.adapters] == [8, 64]
     assert "lora_rank" not in {entry.name for entry in fields(engine)}
 
-    with pytest.raises(ValueError, match="exceeds engine max_lora_rank"):
-        _adapter(1, engine, lora_rank=65)
+    with pytest.raises(PlanningError, match="exceeds engine max_lora_rank"):
+        plan_deployment(_modal_request(_adapter(1, engine, lora_rank=65)))
 
 
 def test_logical_adapter_base_model_may_differ_from_exact_served_checkpoint() -> None:
@@ -397,6 +438,8 @@ def test_planning_rejects_provider_placement_and_gpu_count_mismatches() -> None:
         ({"adapter_revision": "run-1@final.main"}, "full immutable"),
         ({"adapter_revision": f"other@final.{11:040x}"}, "does not belong"),
         ({"checkpoint": "step-1"}, "checkpoint"),
+        ({"artifact_repo_id": "missing-owner"}, "owner/name"),
+        ({"artifact_repo_type": "space"}, "model or dataset"),
         ({"artifact_revision": "A" * 40}, "lowercase"),
         ({"artifact_revision": "9" * 40}, "does not match"),
         ({"artifact_digest": "A" * 64}, "lowercase"),

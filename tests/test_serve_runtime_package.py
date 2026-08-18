@@ -23,6 +23,15 @@ CONTROL_FILES = {
     "flash/serve/control/planning.py",
     "flash/serve/control/types.py",
 }
+APP_FILES = {
+    "flash/serve/app/__init__.py",
+    "flash/serve/app/__main__.py",
+    "flash/serve/app/bootstrap.py",
+    "flash/serve/app/http.py",
+    "flash/serve/app/manifest.py",
+    "flash/serve/app/materialize.py",
+    "flash/serve/app/openai.py",
+}
 RUNTIME_FILES = {
     "flash/serve/runtime/__init__.py",
     "flash/serve/runtime/adapters.py",
@@ -41,6 +50,10 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
 
     assert project["project"]["dependencies"] == []
     assert extras["serve-runtime"] == [
+        "fastapi",
+        "uvicorn",
+        "huggingface-hub>=1.2.0",
+        "safetensors",
         "pillow>=11.0.0",
         TRANSFORMERS_REQUIREMENT,
         "vllm==0.23.0",
@@ -69,7 +82,7 @@ def test_wheel_contains_runtime_and_declares_extra(tmp_path: Path) -> None:
 
     with zipfile.ZipFile(wheels[0]) as wheel:
         names = set(wheel.namelist())
-        assert names >= RUNTIME_FILES | CONTROL_FILES
+        assert names >= APP_FILES | RUNTIME_FILES | CONTROL_FILES
         # the template is data, not python, so nothing imports it and a packaging miss would only
         # surface the first time a user ran `flash serve setup` off a real install.
         assert TEMPLATE_RESOURCE in names
@@ -77,6 +90,8 @@ def test_wheel_contains_runtime_and_declares_extra(tmp_path: Path) -> None:
         metadata = wheel.read(metadata_name).decode()
 
     assert "Provides-Extra: serve-runtime" in metadata
+    for dependency in ("fastapi", "uvicorn", "huggingface-hub", "safetensors"):
+        assert f"Requires-Dist: {dependency}" in metadata
     assert "Requires-Dist: vllm==0.23.0; extra == 'serve-runtime'" in metadata
     assert "Requires-Dist: vllm==0.19.1; extra == 'gpu'" in metadata
 

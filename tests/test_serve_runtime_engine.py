@@ -250,6 +250,8 @@ def test_exact_engine_args_and_processor_construction() -> None:
             max_lora_rank=128,
             max_cpu_loras=12,
             image_limit=4,
+            mm_processor_cache_gb=1.5,
+            enable_tower_connector_lora=True,
             reasoning_parser="qwen3",
             engine_args={
                 "dtype": "bfloat16",
@@ -273,7 +275,7 @@ def test_exact_engine_args_and_processor_construction() -> None:
         max_cpu_loras=12,
         reasoning_parser="qwen3",
         limit_mm_per_prompt={"image": 4},
-        mm_processor_cache_gb=0,
+        mm_processor_cache_gb=1.5,
         enable_tower_connector_lora=True,
         dtype="bfloat16",
         quantization=None,

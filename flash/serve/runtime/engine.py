@@ -404,11 +404,9 @@ class VllmLoraRuntime:
         if self.config.reasoning_parser is not None:
             kwargs["reasoning_parser"] = self.config.reasoning_parser
         if self.config.image_limit is not None:
-            kwargs.update(
-                limit_mm_per_prompt={"image": self.config.image_limit},
-                mm_processor_cache_gb=0,
-                enable_tower_connector_lora=True,
-            )
+            kwargs["limit_mm_per_prompt"] = {"image": self.config.image_limit}
+        kwargs["mm_processor_cache_gb"] = self.config.mm_processor_cache_gb
+        kwargs["enable_tower_connector_lora"] = self.config.enable_tower_connector_lora
         return AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**kwargs))
 
     async def _ensure_started(self) -> None:
