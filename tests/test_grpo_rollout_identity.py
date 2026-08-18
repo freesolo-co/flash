@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import inspect
 import sys
 import types
 from types import SimpleNamespace
 
+import cloudpickle
 import pytest
 
 from flash.engine.worker.train.rl.child import patches
@@ -25,6 +27,10 @@ def _identity(step: int, index: int, ordinal: int, *, validate: bool = False) ->
 
 def _expected(step: int, indexes: tuple[int, ...], group_size: int) -> list[dict]:
     return [_identity(step, index, ordinal) for index in indexes for ordinal in range(group_size)]
+
+
+async def get_trajectory_info(*_args):
+    raise AssertionError("test must replace the pinned Verl trajectory helper")
 
 
 def test_identity_ledger_accepts_resumed_step_and_exact_out_of_order_set():
@@ -196,7 +202,7 @@ def test_manager_registers_exact_set_before_dispatch_and_sidecars_global_ordinal
         return identity
 
     async def worker_generate(self, batch):
-        trajectories = await modules[-1].get_trajectory_info(
+        trajectories = await get_trajectory_info(
             batch.meta_info["global_steps"],
             batch.non_tensor_batch["index"].tolist(),
             batch.meta_info["validate"],
@@ -237,6 +243,7 @@ def test_manager_registers_exact_set_before_dispatch_and_sidecars_global_ordinal
             ]
         )
 
+    monkeypatch.setitem(worker_generate.__globals__, "get_trajectory_info", trajectory_info)
     modules = _fake_agent_loop_module(
         original_run,
         worker_generate,
@@ -329,6 +336,158 @@ def test_manager_registers_exact_set_before_dispatch_and_sidecars_global_ordinal
     assert output.values == expected
     ledger.seal(17)
     ledger.assert_idle()
+
+
+def test_patched_actor_serializes_and_concurrent_calls_keep_identity_task_local(monkeypatch):
+    async def trajectory_info(step, indexes, validate):
+        return [
+            {
+                "step": step,
+                "sample_index": index,
+                "rollout_n": ordinal,
+                "validate": validate,
+            }
+            for ordinal, index in enumerate(indexes)
+        ]
+
+    async def original_run(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
+        assert sampling_params == {}
+        assert agent_name == "single_turn_agent"
+        assert trace is True
+        assert kwargs["extra_info"]["flash_rollout_identity"] == kwargs["flash_rollout_identity"]
+        return kwargs["flash_rollout_identity"]
+
+    async def worker_generate(self, batch):
+        await self.enter()
+        trajectory_info = await get_trajectory_info(
+            batch.meta_info["global_steps"],
+            batch.non_tensor_batch["index"].tolist(),
+            batch.meta_info["validate"],
+        )
+        return [
+            await self._run_agent_loop(
+                {},
+                trajectory,
+                agent_name="single_turn_agent",
+                extra_info={"index": index},
+            )
+            for trajectory, index in zip(
+                trajectory_info, batch.non_tensor_batch["index"].tolist(), strict=True
+            )
+        ]
+
+    async def manager_generate(self, prompts):
+        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        return await asyncio.gather(
+            *[
+                worker.generate_sequences.remote(chunk)
+                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+            ]
+        )
+
+    monkeypatch.setitem(worker_generate.__globals__, "get_trajectory_info", trajectory_info)
+    modules = _fake_agent_loop_module(
+        original_run,
+        worker_generate,
+        manager_generate,
+        trajectory_info,
+    )
+    _install_fake_modules(monkeypatch, modules)
+    run_source = 'trajectory["rollout_n"]\nself._agent_loop_postprocess'
+    worker_source = "trajectory_info = await get_trajectory_info\nself._run_agent_loop("
+    manager_source = "chunkes = prompts.chunk\nworker.generate_sequences.remote(chunk)"
+    sources = {
+        original_run: run_source,
+        worker_generate: worker_source,
+        manager_generate: manager_source,
+    }
+    monkeypatch.setattr(inspect, "getsource", lambda function: sources[function])
+    monkeypatch.setattr(
+        patches,
+        "_PINNED_RUN_AGENT_LOOP_SHA256",
+        hashlib.sha256(run_source.encode()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        patches,
+        "_PINNED_WORKER_GENERATE_SHA256",
+        hashlib.sha256(worker_source.encode()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        patches,
+        "_PINNED_MANAGER_GENERATE_SHA256",
+        hashlib.sha256(manager_source.encode()).hexdigest(),
+    )
+    bridge = types.ModuleType("flash_grpo_multiturn")
+    bridge.post_json = lambda *_args, **_kwargs: {}
+    monkeypatch.setitem(sys.modules, "flash_grpo_multiturn", bridge)
+
+    patches.install_exact_rollout_identity()
+    actor_class = modules[-1].AgentLoopWorker
+    cloudpickle.dumps(actor_class)
+    closure = inspect.getclosurevars(actor_class.generate_sequences_with_flash_identities)
+    assert set(closure.nonlocals) == {"original_worker_generate"}
+    for value in closure.nonlocals.values():
+        cloudpickle.dumps(value)
+
+    bad_sidecar = contextvars.ContextVar("flash_rollout_identity_sidecar")
+
+    async def nonserializable_capture():
+        return bad_sidecar.get(None)
+
+    with pytest.raises(TypeError, match="ContextVar"):
+        cloudpickle.dumps(nonserializable_capture)
+
+    class Indexes(list):
+        def tolist(self):
+            return list(self)
+
+    class Batch:
+        def __init__(self, step, index):
+            self.non_tensor_batch = {"index": Indexes([index])}
+            self.meta_info = {"global_steps": step, "validate": False}
+
+    async def exercise_concurrent_calls():
+        worker = actor_class()
+        both_entered = asyncio.Event()
+        release = asyncio.Event()
+        entered = 0
+
+        async def enter():
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                both_entered.set()
+            await both_entered.wait()
+            await release.wait()
+
+        worker.enter = enter
+        first_identity = _identity(12, 4, 7)
+        second_identity = _identity(99, 8, 3)
+        first = asyncio.create_task(
+            worker.generate_sequences_with_flash_identities(Batch(12, 4), [first_identity])
+        )
+        second = asyncio.create_task(
+            worker.generate_sequences_with_flash_identities(Batch(99, 8), [second_identity])
+        )
+        await both_entered.wait()
+        release.set()
+        outputs = await asyncio.gather(first, second)
+        return outputs, first_identity, second_identity
+
+    outputs, first_identity, second_identity = asyncio.run(exercise_concurrent_calls())
+    assert outputs == [[first_identity], [second_identity]]
+
+    async def proceed():
+        return None
+
+    worker = actor_class()
+    worker.enter = proceed
+    with pytest.raises(RuntimeError, match="length does not match"):
+        asyncio.run(worker.generate_sequences_with_flash_identities(Batch(12, 4), []))
+    with pytest.raises(RuntimeError, match="index mismatch"):
+        asyncio.run(
+            worker.generate_sequences_with_flash_identities(Batch(12, 4), [_identity(12, 8, 7)])
+        )
 
 
 def test_exact_identity_patch_fails_closed_on_manager_boundary_drift(monkeypatch):

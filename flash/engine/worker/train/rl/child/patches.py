@@ -48,49 +48,52 @@ def _identity_from_trajectory(trajectory):
     }
 
 
-def _build_worker_identity_wrappers(original_worker_generate, original_trajectory_info):
-    import contextvars
-
-    sidecar = contextvars.ContextVar("flash_rollout_identity_sidecar", default=None)
-
-    async def exact_trajectory_info(step, index, validate):
-        identities = sidecar.get()
-        if identities is None:
-            return await original_trajectory_info(step, index, validate)
-        if len(identities) != len(index):
-            raise RuntimeError("flash rollout identity sidecar length does not match worker batch")
-        trajectories = []
-        for position, (identity, sample_index) in enumerate(zip(identities, index, strict=True)):
-            if identity["optimizer_step"] != _trajectory_int(step, "step"):
-                raise RuntimeError(
-                    "flash rollout identity sidecar step does not match worker batch"
-                )
-            if identity["sample_index"] != _trajectory_int(sample_index, "sample_index"):
-                raise RuntimeError(
-                    f"flash rollout identity sidecar index mismatch at position {position}"
-                )
-            if identity["validate"] is not _trajectory_bool(validate, "validate"):
-                raise RuntimeError(
-                    "flash rollout identity sidecar validate flag does not match batch"
-                )
-            trajectories.append(
-                {
-                    "step": identity["optimizer_step"],
-                    "sample_index": identity["sample_index"],
-                    "rollout_n": identity["rollout_ordinal"],
-                    "validate": identity["validate"],
-                }
+def _trajectory_info_from_identities(step, index, validate, identities):
+    if len(identities) != len(index):
+        raise RuntimeError("flash rollout identity sidecar length does not match worker batch")
+    trajectories = []
+    for position, (identity, sample_index) in enumerate(zip(identities, index, strict=True)):
+        if identity["optimizer_step"] != _trajectory_int(step, "step"):
+            raise RuntimeError("flash rollout identity sidecar step does not match worker batch")
+        if identity["sample_index"] != _trajectory_int(sample_index, "sample_index"):
+            raise RuntimeError(
+                f"flash rollout identity sidecar index mismatch at position {position}"
             )
-        return trajectories
+        if identity["validate"] is not _trajectory_bool(validate, "validate"):
+            raise RuntimeError("flash rollout identity sidecar validate flag does not match batch")
+        trajectories.append(
+            {
+                "step": identity["optimizer_step"],
+                "sample_index": identity["sample_index"],
+                "rollout_n": identity["rollout_ordinal"],
+                "validate": identity["validate"],
+            }
+        )
+    return trajectories
 
+
+def _build_worker_identity_wrapper(original_worker_generate):
     async def generate_sequences_with_identities(self, batch, identities):
-        token = sidecar.set(tuple(dict(identity) for identity in identities))
-        try:
-            return await original_worker_generate(self, batch)
-        finally:
-            sidecar.reset(token)
+        import types
 
-    return exact_trajectory_info, generate_sequences_with_identities
+        identity_sidecar = tuple(dict(identity) for identity in identities)
+
+        async def exact_trajectory_info(step, index, validate):
+            return _trajectory_info_from_identities(step, index, validate, identity_sidecar)
+
+        worker_globals = dict(original_worker_generate.__globals__)
+        worker_globals["get_trajectory_info"] = exact_trajectory_info
+        worker_generate = types.FunctionType(
+            original_worker_generate.__code__,
+            worker_globals,
+            original_worker_generate.__name__,
+            original_worker_generate.__defaults__,
+            original_worker_generate.__closure__,
+        )
+        worker_generate.__kwdefaults__ = original_worker_generate.__kwdefaults__
+        return await worker_generate(self, batch)
+
+    return generate_sequences_with_identities
 
 
 def _build_manager_identity_wrapper(agent_loop, original_trajectory_info, post_json):
@@ -203,9 +206,7 @@ def install_exact_rollout_identity() -> None:
         "manager generation",
         ("chunkes = prompts.chunk", "worker.generate_sequences.remote(chunk)"),
     )
-    exact_trajectory_info, worker_generate = _build_worker_identity_wrappers(
-        original_worker_generate, original_trajectory_info
-    )
+    worker_generate = _build_worker_identity_wrapper(original_worker_generate)
     manager_generate = _build_manager_identity_wrapper(
         agent_loop, original_trajectory_info, post_json
     )
@@ -214,7 +215,6 @@ def install_exact_rollout_identity() -> None:
     manager_generate = agent_loop.auto_await(manager_generate)
     manager_generate._flash_exact_rollout_identity = True
     manager_generate._flash_pinned_source_sha256 = _PINNED_MANAGER_GENERATE_SHA256
-    agent_loop.get_trajectory_info = exact_trajectory_info
     agent_loop.AgentLoopWorker.generate_sequences_with_flash_identities = worker_generate
     agent_loop.AgentLoopWorker._run_agent_loop = run_agent_loop
     agent_loop.AgentLoopManager.generate_sequences = manager_generate

@@ -86,9 +86,7 @@ def test_exact_endpoint_lookup_accepts_only_explicit_owner_404(monkeypatch):
     )
 
     assert (
-        runpod_api.endpoint_absent_for_fingerprint(
-            "ep-gone", runpod_api.key_fingerprint(key)
-        )
+        runpod_api.endpoint_absent_for_fingerprint("ep-gone", runpod_api.key_fingerprint(key))
         is True
     )
 
@@ -115,9 +113,7 @@ def test_exact_endpoint_lookup_rejects_every_success_response(monkeypatch, respo
     )
 
     with pytest.raises(runpod_api.RunpodApiError, match="cleanup unconfirmed") as exc_info:
-        runpod_api.endpoint_absent_for_fingerprint(
-            "ep-present", runpod_api.key_fingerprint(key)
-        )
+        runpod_api.endpoint_absent_for_fingerprint("ep-present", runpod_api.key_fingerprint(key))
 
     assert calls == [
         (
