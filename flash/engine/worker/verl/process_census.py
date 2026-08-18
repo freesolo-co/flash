@@ -17,6 +17,12 @@ class _ProcessIdentity:
     start_time: int
 
 
+@dataclass(frozen=True)
+class _ProcessTree:
+    identities: frozenset[_ProcessIdentity]
+    edges: frozenset[tuple[_ProcessIdentity, _ProcessIdentity]]
+
+
 def _read_start_time(pid: int) -> int | None:
     try:
         with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
@@ -78,13 +84,14 @@ def _stable_thread_count(identity: _ProcessIdentity) -> int | None:
     return len(task_ids)
 
 
-def _complete_descendants(root: _ProcessIdentity) -> set[_ProcessIdentity] | None:
+def _scan_process_tree(root: _ProcessIdentity) -> _ProcessTree | None:
     known = {root.pid: root.start_time}
-    descendants: set[_ProcessIdentity] = set()
+    identities = {root}
+    edges: set[tuple[_ProcessIdentity, _ProcessIdentity]] = set()
     pending = [root]
     while pending:
-        identity = pending.pop()
-        children = _stable_children(identity)
+        parent = pending.pop()
+        children = _stable_children(parent)
         if children is None:
             return None
         for pid in children:
@@ -92,23 +99,28 @@ def _complete_descendants(root: _ProcessIdentity) -> set[_ProcessIdentity] | Non
             if start_time is None:
                 return None
             previous = known.get(pid)
-            if previous is not None:
-                if previous != start_time:
-                    return None
-                continue
+            if previous is not None and previous != start_time:
+                return None
             child = _ProcessIdentity(pid, start_time)
+            edges.add((parent, child))
+            if previous is not None:
+                continue
             known[pid] = start_time
-            descendants.add(child)
+            identities.add(child)
             pending.append(child)
-    return descendants
+    return _ProcessTree(frozenset(identities), frozenset(edges))
 
 
 def _descendant_counts(root: _ProcessIdentity | None) -> tuple[int, int, int] | None:
     if root is None:
         return None
-    descendants = _complete_descendants(root)
-    if descendants is None:
+    first = _scan_process_tree(root)
+    if first is None:
         return None
+    second = _scan_process_tree(root)
+    if second is None or second != first:
+        return None
+    descendants = second.identities - {root}
     thread_counts: list[int] = []
     for identity in descendants:
         count = _stable_thread_count(identity)
@@ -347,9 +359,7 @@ class GrpoProcessCensus:
             )
             exact_steps = tuple(sorted(self._step_snapshots)) == self._expected_steps
             required = [baseline, terminal, *self._step_snapshots.values()]
-            required_complete = bool(self._expected_steps) and all(
-                _required_snapshot_complete(snapshot) for snapshot in required
-            )
+            required_complete = all(_required_snapshot_complete(snapshot) for snapshot in required)
             step_errors = (
                 self._duplicate_step_count
                 + self._conflicting_step_count

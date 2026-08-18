@@ -621,8 +621,9 @@ def _validate_rl_child(
         )
     rollout_identity_evidence = None
     if reward_runtime is not None:
-        reward_runtime.identity_ledger.assert_idle()
-        rollout_identity_evidence = reward_runtime.identity_ledger.evidence()
+        rollout_identity_evidence = reward_runtime.identity_ledger.finalize(
+            range(int(resume_step) + 1, int(expected_steps) + 1)
+        )
     # belt and braces behind the first-step check in _execute_rl_child: a run that exits 0 without
     # printing a step line (a resume already at the horizon) still may not pass unverified.
     shim_markers = (files or {}).get("shim_markers")

@@ -11,6 +11,7 @@ from flash.engine.worker.verl.process_census import (
     GrpoProcessCensus,
     ProcessCensusSnapshot,
     _ProcessIdentity,
+    _ProcessTree,
 )
 
 
@@ -89,6 +90,55 @@ def test_snapshot_retries_a_transient_proc_exit_race(monkeypatch):
         return None if calls == 1 else (1, 2, 2)
 
     monkeypatch.setattr(census_module, "_descendant_counts", descendant_counts)
+    snapshot = _census()._snapshot()
+    assert snapshot.available == 1
+    assert snapshot.incomplete_attempts == 1
+    assert snapshot.descendant_processes == 1
+
+
+def _tree(*identities, edges=()):
+    return _ProcessTree(frozenset(identities), frozenset(edges))
+
+
+@pytest.mark.parametrize("drift", ["pid_reuse", "edge_removal", "edge_addition", "child_creation"])
+def test_snapshot_rejects_tree_drift_between_complete_scans(monkeypatch, drift):
+    _stable_auxiliary_metrics(monkeypatch)
+    root = _ProcessIdentity(1, 100)
+    child = _ProcessIdentity(2, 200)
+    replacement = _ProcessIdentity(2, 201)
+    created = _ProcessIdentity(3, 300)
+    first = _tree(root, child, edges=((root, child),))
+    second = {
+        "pid_reuse": _tree(root, replacement, edges=((root, replacement),)),
+        "edge_removal": _tree(root, child),
+        "edge_addition": _tree(root, child, edges=((root, child), (child, root))),
+        "child_creation": _tree(
+            root,
+            child,
+            created,
+            edges=((root, child), (root, created)),
+        ),
+    }[drift]
+    scans = iter([first, second] * 3)
+    monkeypatch.setattr(census_module, "_scan_process_tree", lambda _root: next(scans))
+
+    snapshot = _census()._snapshot()
+    assert snapshot.available == 0
+    assert snapshot.incomplete_attempts == 3
+
+
+def test_snapshot_tree_drift_consumes_one_retry_before_a_stable_pair(monkeypatch):
+    _stable_auxiliary_metrics(monkeypatch)
+    root = _ProcessIdentity(1, 100)
+    child = _ProcessIdentity(2, 200)
+    created = _ProcessIdentity(3, 300)
+    stable = _tree(root, child, edges=((root, child),))
+    changed = _tree(root, child, created, edges=((root, child), (root, created)))
+    scans = iter((stable, changed, stable, stable))
+    monkeypatch.setattr(census_module, "_scan_process_tree", lambda _root: next(scans))
+    monkeypatch.setattr(census_module, "_stable_thread_count", lambda _identity: 2)
+    monkeypatch.setattr(census_module, "_read_start_time", lambda pid: 100 if pid == 1 else 200)
+
     snapshot = _census()._snapshot()
     assert snapshot.available == 1
     assert snapshot.incomplete_attempts == 1
@@ -200,6 +250,19 @@ def test_transient_background_partial_does_not_erase_complete_required_checkpoin
     assert summary["minimum_pids_headroom"] == 5
     assert summary["peak_processes"] == 4
     assert summary["peak_threads"] == 9
+
+
+def test_zero_step_resume_is_complete_with_baseline_terminal_and_cgroup_data():
+    census = _census(expected_steps=())
+    _set_baseline(census, _snapshot(1, 2, 7, 4, pids_current=12))
+    _set_terminal(census, _snapshot(1, 1, 3, 2, pids_current=15))
+
+    summary = census.summary()
+    assert summary["available"] == 1
+    assert summary["steps"] == []
+    assert summary["missing_step_count"] == 0
+    assert summary["per_step_processes"] == -1
+    assert summary["per_step_threads"] == -1
 
 
 @pytest.mark.parametrize("checkpoint", ["baseline", "step", "terminal"])

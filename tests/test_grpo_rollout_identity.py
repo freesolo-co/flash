@@ -5,6 +5,7 @@ import contextvars
 import hashlib
 import inspect
 import sys
+import threading
 import types
 from types import SimpleNamespace
 
@@ -40,7 +41,7 @@ def test_identity_ledger_accepts_resumed_step_and_exact_out_of_order_set():
     for identity in (expected[3], expected[0], expected[2], expected[1]):
         ledger.record(identity, identity["sample_index"])
     ledger.seal(17)
-    ledger.assert_idle()
+    ledger.finalize({17})
 
 
 def test_identity_ledger_retains_exact_p64_g2_terminal_evidence_and_returns_deep_copies():
@@ -54,14 +55,7 @@ def test_identity_ledger_retains_exact_p64_g2_terminal_evidence_and_returns_deep
             ledger.record(identity, identity["sample_index"])
         ledger.seal(step)
 
-    failed = _expected(3, tuple(range(64)), 2)
-    ledger.register(failed)
-    for identity in failed[:-1]:
-        ledger.record(identity, identity["sample_index"])
-    with pytest.raises(ValueError, match="does not equal registration"):
-        ledger.seal(3)
-
-    evidence = ledger.evidence()
+    evidence = ledger.finalize({1, 2})
     assert evidence == {
         "steps": [
             {
@@ -88,6 +82,65 @@ def test_identity_ledger_retains_exact_p64_g2_terminal_evidence_and_returns_deep
     fresh = ledger.evidence()
     assert [step["optimizer_step"] for step in fresh["steps"]] == [1, 2]
     assert fresh["steps"][0]["registered"][0]["sample_index"] == 0
+
+
+def test_failed_identity_seal_does_not_publish_terminal_evidence():
+    ledger = RolloutIdentityLedger(1, 2)
+    expected = _expected(3, (0,), 2)
+    ledger.register(expected)
+    ledger.record(expected[0], 0)
+    with pytest.raises(ValueError, match="does not equal registration"):
+        ledger.seal(3)
+    assert ledger.evidence() == {"steps": [], "validation": []}
+
+
+def test_identity_ledger_finalize_rejects_missing_and_extra_resume_steps():
+    missing = RolloutIdentityLedger(1, 2)
+    with pytest.raises(ValueError, match=r"missing=\[6, 7, 8, 9\], extra=\[\]"):
+        missing.finalize(range(6, 10))
+
+    extra = RolloutIdentityLedger(1, 2)
+    for step in (6, 7, 8, 9, 99):
+        expected = _expected(step, (0,), 2)
+        extra.register(expected)
+        for identity in expected:
+            extra.record(identity, 0)
+        extra.seal(step)
+    with pytest.raises(ValueError, match=r"missing=\[\], extra=\[99\]"):
+        extra.finalize(range(6, 10))
+
+
+def test_identity_ledger_empty_finalize_is_atomic_and_permanently_rejects_mutation():
+    ledger = RolloutIdentityLedger(1, 2)
+    register_started = threading.Event()
+    release_register = threading.Event()
+    result = []
+
+    def late_register():
+        register_started.set()
+        release_register.wait(timeout=1)
+        try:
+            ledger.register(_expected(1, (0,), 2))
+        except ValueError as error:
+            result.append(str(error))
+
+    thread = threading.Thread(target=late_register)
+    thread.start()
+    assert register_started.wait(timeout=1)
+    assert ledger.finalize(range(5, 5)) == {"steps": [], "validation": []}
+    release_register.set()
+    thread.join(timeout=1)
+    assert result == ["GRPO rollout identity ledger is already finalized"]
+
+    identity = _identity(1, 0, 0)
+    for mutation in (
+        lambda: ledger.require_registered(identity, 0),
+        lambda: ledger.record(identity, 0),
+        lambda: ledger.seal(1),
+        lambda: ledger.finalize(()),
+    ):
+        with pytest.raises(ValueError, match="already finalized"):
+            mutation()
 
 
 def test_identity_ledger_rejects_whole_prompt_substitution_with_constant_count():
@@ -155,7 +208,7 @@ def test_identity_ledger_allows_noncontiguous_steps_and_rejects_late_prior_step(
     for identity in resumed:
         ledger.record(identity, 7)
     ledger.seal(91)
-    ledger.assert_idle()
+    ledger.finalize({40, 91})
 
 
 @pytest.mark.parametrize(
@@ -382,7 +435,7 @@ def test_manager_registers_exact_set_before_dispatch_and_sidecars_global_ordinal
     assert [value for kind, value in events if kind == "reward"] == expected
     assert output.values == expected
     ledger.seal(17)
-    ledger.assert_idle()
+    ledger.finalize({17})
 
 
 def test_patched_actor_serializes_and_concurrent_calls_keep_identity_task_local(monkeypatch):
@@ -605,7 +658,7 @@ def test_single_turn_reward_server_registration_and_scoring_use_same_identity(mo
                 == 0.0
             )
         ledger.seal(6)
-        ledger.assert_idle()
+        ledger.finalize({6})
     finally:
         server.shutdown()
 
@@ -658,7 +711,7 @@ def test_multi_turn_bridge_carries_and_records_the_registered_identity():
             )
             bridge.close({"session_id": session_id})
         ledger.seal(4)
-        ledger.assert_idle()
+        ledger.finalize({4})
     finally:
         bridge.shutdown()
 

@@ -4669,6 +4669,15 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
     }
 
 
+def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
+    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+
+    state = rl_train._StepMetricState()
+    runtime = SimpleNamespace(identity_ledger=RolloutIdentityLedger(1, 2))
+    rl_train._validate_rl_child(0, state, 5, 5, None, reward_runtime=runtime)
+    assert state.rollout_identity_evidence == {"steps": [], "validation": []}
+
+
 def test_train_notes_carry_the_trl_observability_fields():
     # the console is uploaded only on FAILURE, so a successful run's train_meta is the sole record
     # of how it ran. the retired trl path reported these; without them a verl run cannot be compared to a
@@ -7450,7 +7459,7 @@ def test_multi_turn_child_preserves_exact_identity_through_start_and_score(monke
             rollout_ordinal=ordinal,
         )
     ledger.seal(1)
-    ledger.assert_idle()
+    ledger.finalize({1})
 
 
 def test_an_image_prompt_reaches_media_extraction_and_the_rollout(monkeypatch):

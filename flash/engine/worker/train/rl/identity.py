@@ -73,6 +73,28 @@ class RolloutIdentityLedger:
             int,
             tuple[tuple[RolloutIdentity, ...], tuple[RolloutIdentity, ...]],
         ] = {}
+        self._finalized = False
+
+    def _reject_finalized(self) -> None:
+        if self._finalized:
+            raise ValueError("GRPO rollout identity ledger is already finalized")
+
+    def _ensure_open(self) -> None:
+        with self._lock:
+            self._reject_finalized()
+
+    def _evidence_unlocked(self) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "steps": [
+                {
+                    "optimizer_step": step,
+                    "registered": [identity.to_dict() for identity in registered],
+                    "observed": [identity.to_dict() for identity in observed],
+                }
+                for step, (registered, observed) in sorted(self._sealed_evidence.items())
+            ],
+            "validation": [],
+        }
 
     def _parse_training_identity(self, value: Any) -> RolloutIdentity:
         identity = parse_rollout_identity(value)
@@ -110,6 +132,7 @@ class RolloutIdentityLedger:
             )
 
     def register(self, values: Iterable[Any]) -> int:
+        self._ensure_open()
         parsed = tuple(self._parse_training_identity(value) for value in values)
         if len(parsed) != self._expected_count:
             raise ValueError(
@@ -125,6 +148,7 @@ class RolloutIdentityLedger:
         self._validate_registered_shape(identities)
         step = next(iter(steps))
         with self._lock:
+            self._reject_finalized()
             if step in self._sealed_steps:
                 raise ValueError(f"GRPO identity registration targets sealed step {step}")
             existing = self._registered.get(step)
@@ -144,9 +168,11 @@ class RolloutIdentityLedger:
         return identity
 
     def require_registered(self, value: Any, expected_index: int) -> RolloutIdentity:
+        self._ensure_open()
         identity = self.validate_for_index(value, expected_index)
         step = identity.optimizer_step
         with self._lock:
+            self._reject_finalized()
             if step in self._sealed_steps:
                 raise ValueError(f"late GRPO rollout identity for sealed step {step}")
             expected = self._registered.get(step)
@@ -163,15 +189,25 @@ class RolloutIdentityLedger:
     def record(self, value: Any, expected_index: int) -> RolloutIdentity:
         identity = self.require_registered(value, expected_index)
         with self._lock:
-            observed = self._observed[identity.optimizer_step]
+            self._reject_finalized()
+            step = identity.optimizer_step
+            observed = self._observed.get(step)
+            if observed is None:
+                if step in self._sealed_steps:
+                    raise ValueError(f"late GRPO rollout identity for sealed step {step}")
+                raise ValueError(
+                    f"GRPO reward arrived before identity registration for step {step}"
+                )
             if identity in observed:
                 raise ValueError(f"duplicate GRPO rollout identity {identity.to_dict()}")
             observed.add(identity)
         return identity
 
     def seal(self, optimizer_step: int) -> None:
+        self._ensure_open()
         step = _strict_int(optimizer_step, "optimizer_step")
         with self._lock:
+            self._reject_finalized()
             expected = self._registered.get(step)
             if expected is None:
                 if step in self._sealed_steps:
@@ -195,22 +231,28 @@ class RolloutIdentityLedger:
 
     def evidence(self) -> dict[str, list[dict[str, Any]]]:
         with self._lock:
-            return {
-                "steps": [
-                    {
-                        "optimizer_step": step,
-                        "registered": [identity.to_dict() for identity in registered],
-                        "observed": [identity.to_dict() for identity in observed],
-                    }
-                    for step, (registered, observed) in sorted(self._sealed_evidence.items())
-                ],
-                "validation": [],
-            }
+            return self._evidence_unlocked()
 
-    def assert_idle(self) -> None:
+    def finalize(self, expected_steps: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
         with self._lock:
-            if self._registered or any(self._observed.values()):
+            self._reject_finalized()
+            expected: set[int] = set()
+            for value in expected_steps:
+                step = _strict_int(value, "optimizer_step")
+                if step <= 0:
+                    raise ValueError("GRPO expected optimizer steps must be positive")
+                expected.add(step)
+            if self._registered or self._observed:
                 raise ValueError(
                     "GRPO rollout identity registrations remain unsealed for steps "
                     f"{sorted(self._registered)}"
                 )
+            if self._sealed_steps != expected:
+                missing = sorted(expected - self._sealed_steps)
+                extra = sorted(self._sealed_steps - expected)
+                raise ValueError(
+                    "GRPO sealed rollout identity steps do not equal the expected steps: "
+                    f"missing={missing}, extra={extra}"
+                )
+            self._finalized = True
+            return self._evidence_unlocked()
