@@ -16,6 +16,7 @@ import threading
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,7 +47,7 @@ from flash.engine.worker.opd_train import (
     build_opd_overrides,
     encode_shifted_group_metadata,
 )
-from flash.engine.worker.opd_train_runner import _prepare_prompt_messages
+from flash.engine.worker.opd_train_runner import _prepare_prompt_messages, _render_prompt_rows
 from flash.engine.worker.teacher.client import TeacherScore
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
 from flash.engine.worker.train.core.child.glue import (
@@ -830,6 +831,7 @@ class _MockMultimodalProcessor:
 
     def __init__(self):
         self.rendered = None
+        self.call_kwargs = None
         self.images = None
 
     def apply_chat_template(self, messages, **kwargs):
@@ -842,11 +844,47 @@ class _MockMultimodalProcessor:
         return "<vision>describe"
 
     def __call__(self, **kwargs):
-        self.images = kwargs["images"]
+        if "images" in kwargs and not kwargs["images"]:
+            raise AssertionError("processor received an explicitly empty image collection")
+        self.call_kwargs = kwargs
+        self.images = kwargs.get("images")
         assert kwargs["text"] == ["<vision>describe"]
         assert kwargs["videos"] is None
         assert kwargs["return_tensors"] == "pt"
-        return {"input_ids": [[10, self.image_token_id, self.image_token_id, 11]]}
+        input_ids = [10, self.image_token_id, self.image_token_id, 11] if self.images else [10, 11]
+        return {"input_ids": [input_ids]}
+
+
+def test_image_observation_env_text_prompt_omits_empty_processor_images(monkeypatch):
+    class _DynamicImageEnv:
+        image_observations = True
+
+        def dataset(self):
+            return [{"id": 1}]
+
+        def prompt_messages(self, _example):
+            return [{"role": "user", "content": "describe"}]
+
+    monkeypatch.setattr(opd_train, "seed_training_rngs", lambda _seed: None)
+    monkeypatch.setattr(opd_train, "liveness_heartbeat", lambda *_args, **_kwargs: nullcontext())
+    prompt_rows, multimodal = _render_prompt_rows(
+        SimpleNamespace(env=_DynamicImageEnv(), spec=None)
+    )
+    messages = prompt_rows[0][1]
+    processor = _MockMultimodalProcessor()
+
+    prompt_ids = _processor_expanded_prompt_ids(
+        processor,
+        messages,
+        (),
+        None,
+        enable_thinking=False,
+    )
+
+    assert multimodal is True
+    assert prompt_ids == (10, 11)
+    assert processor.rendered == messages
+    assert "images" not in processor.call_kwargs
 
 
 def test_processor_expanded_prompt_ids_enforce_visual_token_budget(tmp_path):

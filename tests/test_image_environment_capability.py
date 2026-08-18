@@ -49,14 +49,14 @@ def test_worker_environment_load_applies_the_capability_guard(monkeypatch):
         environment=SimpleNamespace(id="local", params={}, resolved_sha=""),
         model="meta-llama/Llama-3.2-1B",
         algorithm="grpo",
-        train=SimpleNamespace(teacher_model=None),
+        train=SimpleNamespace(teacher_model=None, hf_repo=""),
         thinking=False,
     )
     monkeypatch.setattr(worker, "JOB_SPEC", spec)
     monkeypatch.setattr(
         worker,
-        "load_environment",
-        lambda *_args, **_kwargs: SimpleNamespace(image_observations=True),
+        "load_staged_freesolo_environment",
+        lambda *_args, **_kwargs: (SimpleNamespace(image_observations=True), None),
     )
 
     with pytest.raises(ValueError, match="does not support image-bearing"):
