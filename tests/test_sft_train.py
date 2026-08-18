@@ -2896,6 +2896,105 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     )
 
 
+def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monkeypatch):
+    """the final export must carry the same text-only policy as both step checkpoints."""
+    from flash.engine.worker import sft_train
+
+    exports = []
+
+    class TwoCheckpointWatcher:
+        def __init__(self, **kwargs):
+            self.local_dir = kwargs["local_dir"]
+            self.export_root = kwargs["export_root"]
+            self.python_bin = kwargs["python_bin"]
+            self.model_id = kwargs["model_id"]
+            self.model_revision = kwargs["model_revision"]
+            self.exclude_modules = kwargs["exclude_modules"]
+            self.required_steps = frozenset(kwargs["required_steps"])
+            self.lifecycle = CheckpointLedger()
+
+        def start(self):
+            return None
+
+        def stop(self, *, require_complete):
+            assert require_complete is True
+            for step in (1, 2):
+                sft_train._export_checkpoint_adapter(
+                    os.path.join(self.local_dir, f"global_step_{step}"),
+                    os.path.join(self.export_root, f"step-{step}"),
+                    model_id=self.model_id,
+                    model_revision=self.model_revision,
+                    exclude_modules=self.exclude_modules,
+                    python_bin=self.python_bin,
+                )
+                self.lifecycle.mark_deployable_published(step)
+
+        def raise_if_failed(self):
+            return None
+
+    spec, captured = _stub_sft_run(
+        monkeypatch,
+        save_at_steps=(1, 2),
+        watcher_cls=TwoCheckpointWatcher,
+    )
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
+
+    def strict_export(
+        actor_dir,
+        adapter_dir,
+        *,
+        model_id,
+        model_revision,
+        exclude_modules,
+        python_bin,
+    ):
+        exports.append(
+            {
+                "actor_dir": actor_dir,
+                "adapter_dir": adapter_dir,
+                "model_id": model_id,
+                "model_revision": model_revision,
+                "exclude_modules": exclude_modules,
+                "python_bin": python_bin,
+            }
+        )
+        os.makedirs(adapter_dir, exist_ok=True)
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", strict_export)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        captured["command"] = command
+        captured["child_env"] = env
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:1 - train/loss:1.1 - train/global_tokens:4\n")
+        on_step(1)
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        heartbeat()
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+
+    assert len(exports) == 3
+    assert [os.path.basename(export["actor_dir"]) for export in exports] == [
+        "global_step_1",
+        "global_step_2",
+        "global_step_2",
+    ]
+    assert [os.path.basename(export["adapter_dir"]) for export in exports] == [
+        "step-1",
+        "step-2",
+        "adapter",
+    ]
+    expected_exclusion = r"^(?!model\.language_model(?:\.|$)).*$"
+    assert {export["exclude_modules"] for export in exports} == {expected_exclusion}
+    assert {export["model_id"] for export in exports} == {spec.model}
+    assert {export["model_revision"] for export in exports} == {spec.model_revision}
+    assert {export["python_bin"] for export in exports} == {"/venv/bin/python"}
+
+
 def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypatch):
     """the seed has to happen in the runner, before the watcher's thread takes its first sweep."""
     from flash.engine.worker import sft_train

@@ -613,6 +613,7 @@ def run_sft_train(spec=None) -> None:
             adapter_dir,
             model_id=options.model_id,
             model_revision=options.model_revision,
+            exclude_modules=model.exclude_modules,
             python_bin=child.python_bin,
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
