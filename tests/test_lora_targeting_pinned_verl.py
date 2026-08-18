@@ -4,8 +4,10 @@ import hashlib
 import importlib.metadata
 import inspect
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -34,14 +36,18 @@ class _FakeLinear:
 
 
 class _FakeModule:
+    def __init__(self, wrapper="module."):
+        self.wrapper = wrapper
+
     def named_modules(self):
+        root = f"{self.wrapper}model.language_model"
         return iter(
             [
                 ("", object()),
-                ("module.model.language_model", object()),
-                ("module.model.language_model.layers.0.self_attn.q_proj", _FakeLinear()),
-                ("module.model.language_model.layers.0.mlp.down_proj", _FakeLinear()),
-                ("module.model.visual.blocks.0.attn.proj", _FakeLinear()),
+                (root, object()),
+                (f"{root}.layers.0.self_attn.q_proj", _FakeLinear()),
+                (f"{root}.layers.0.mlp.down_proj", _FakeLinear()),
+                (f"{self.wrapper}model.visual.blocks.0.attn.proj", _FakeLinear()),
             ]
         )
 
@@ -155,3 +161,80 @@ def test_exact_pinned_verl_frozen_config_is_replaced_without_gpu_or_field_loss(m
             assert getattr(replacement, item.name) == getattr(original, item.name)
     with pytest.raises(FrozenInstanceError, match="target_modules"):
         replacement.target_modules = []
+
+
+def test_exact_pinned_verl_builder_isolates_same_engine_concurrent_calls(monkeypatch):
+    barrier = Barrier(2)
+    live_engine = []
+    isolated_engines = []
+
+    def original_builder(self, module):
+        isolated_engines.append(self)
+        assert self is not live_engine[0]
+        assert live_engine[0].model_config is original
+        module.attached_targets = tuple(self.model_config.target_modules)
+        barrier.wait(timeout=5)
+        assert live_engine[0].model_config is original
+        return SimpleNamespace(
+            base_model=SimpleNamespace(targeted_module_names=list(module.attached_targets))
+        )
+
+    monkeypatch.setattr(FSDPEngine, "_build_lora_module", original_builder)
+    monkeypatch.setattr(child_runtime, "_text_lora_module_types", lambda: (_FakeLinear,))
+    child_runtime.install_text_lora_targeting("model.language_model")
+    original = _build_model_config(monkeypatch, [], {"concurrent": True})
+    engine = FSDPEngine.__new__(FSDPEngine)
+    engine.model_config = original
+    live_engine.append(engine)
+    modules = [_FakeModule("module."), _FakeModule("_orig_mod.")]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(engine._build_lora_module, modules))
+
+    assert engine.model_config is original
+    assert len({id(item) for item in isolated_engines}) == 2
+    assert [tuple(result.base_model.targeted_module_names) for result in results] == [
+        module.attached_targets for module in modules
+    ]
+    assert modules[0].attached_targets[0].startswith("module.")
+    assert modules[1].attached_targets[0].startswith("_orig_mod.")
+
+
+def test_exact_pinned_verl_builder_isolates_same_engine_reentry_and_exceptions(monkeypatch):
+    live_engine = []
+    isolated_engines = []
+    nested_module = _FakeModule("module.")
+
+    def original_builder(self, module):
+        isolated_engines.append(self)
+        assert self is not live_engine[0]
+        assert live_engine[0].model_config is original
+        if len(isolated_engines) == 1:
+            live_engine[0]._build_lora_module(nested_module)
+        if module.wrapper == "raise.":
+            raise RuntimeError("pinned builder failed")
+        module.attached_targets = tuple(self.model_config.target_modules)
+        return SimpleNamespace(
+            base_model=SimpleNamespace(targeted_module_names=list(module.attached_targets))
+        )
+
+    monkeypatch.setattr(FSDPEngine, "_build_lora_module", original_builder)
+    monkeypatch.setattr(child_runtime, "_text_lora_module_types", lambda: (_FakeLinear,))
+    child_runtime.install_text_lora_targeting("model.language_model")
+    original = _build_model_config(monkeypatch, [], {"reentrant": True})
+    engine = FSDPEngine.__new__(FSDPEngine)
+    engine.model_config = original
+    live_engine.append(engine)
+    outer_module = _FakeModule("_orig_mod.")
+
+    result = engine._build_lora_module(outer_module)
+
+    assert engine.model_config is original
+    assert len({id(item) for item in isolated_engines}) == 2
+    assert tuple(result.base_model.targeted_module_names) == outer_module.attached_targets
+    assert nested_module.attached_targets[0].startswith("module.")
+
+    with pytest.raises(RuntimeError, match="pinned builder failed"):
+        engine._build_lora_module(_FakeModule("raise."))
+    assert engine.model_config is original
+    assert isolated_engines[-1] is not engine

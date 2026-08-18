@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -476,11 +477,9 @@ def install_text_lora_targeting(language_prefix: str) -> None:
             raise RuntimeError("flash text LoRA targeting requires Verl's dataclass model config")
         replacement_config = replace(model_config, target_modules=targets)
 
-        self.model_config = replacement_config
-        try:
-            result = original(self, module)
-        finally:
-            self.model_config = model_config
+        isolated_engine = copy.copy(self)
+        isolated_engine.model_config = replacement_config
+        result = original(isolated_engine, module)
         targeted = set(getattr(result.base_model, "targeted_module_names", ()))
         if targeted != set(targets):
             raise RuntimeError(

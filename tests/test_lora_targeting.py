@@ -5,8 +5,10 @@ import json
 import re
 import sys
 import types
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, dataclass, field, fields, replace
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 
 import numpy as np
@@ -191,7 +193,9 @@ class _FrozenModelConfig:
     preserved: object = None
 
 
-def _install_fake_verl_engine(monkeypatch, *, attached_targets=None, builder_error=None):
+def _install_fake_verl_engine(
+    monkeypatch, *, attached_targets=None, builder_error=None, builder_observer=None
+):
     calls = []
 
     class _Engine:
@@ -200,6 +204,8 @@ def _install_fake_verl_engine(monkeypatch, *, attached_targets=None, builder_err
 
         def _build_lora_module(self, module):
             calls.append(self.model_config)
+            if builder_observer is not None:
+                builder_observer(self, module)
             if builder_error is not None:
                 raise builder_error
             targets = self.model_config.target_modules
@@ -270,19 +276,98 @@ def test_runtime_installer_bypasses_warm_start_without_copying_or_resolving(monk
     assert engine.model_config is original
 
 
-def test_runtime_installer_restores_the_original_config_when_the_builder_fails(monkeypatch):
+def test_runtime_installer_isolates_the_original_config_when_the_builder_fails(monkeypatch):
     class _BuilderError(RuntimeError):
         pass
 
+    live_engine = []
+
+    def observe(isolated_engine, _module):
+        assert isolated_engine is not live_engine[0]
+        assert live_engine[0].model_config is original
+
     error = _BuilderError("builder failed")
-    engine_cls, calls = _install_fake_verl_engine(monkeypatch, builder_error=error)
+    engine_cls, calls = _install_fake_verl_engine(
+        monkeypatch, builder_error=error, builder_observer=observe
+    )
     original = _FrozenModelConfig()
     engine = engine_cls(original)
+    live_engine.append(engine)
 
     with pytest.raises(_BuilderError, match="builder failed"):
         engine._build_lora_module(_runtime_topology())
     assert calls[-1] is not original
     assert engine.model_config is original
+
+
+def test_runtime_installer_isolates_same_engine_concurrent_calls(monkeypatch):
+    barrier = Barrier(2)
+    live_engine = []
+    isolated_engines = []
+
+    def observe(isolated_engine, module):
+        isolated_engines.append(isolated_engine)
+        assert isolated_engine is not live_engine[0]
+        assert live_engine[0].model_config is original
+        module.attached_targets = tuple(isolated_engine.model_config.target_modules)
+        barrier.wait(timeout=5)
+        assert live_engine[0].model_config is original
+
+    engine_cls, calls = _install_fake_verl_engine(monkeypatch, builder_observer=observe)
+    original = _FrozenModelConfig()
+    engine = engine_cls(original)
+    live_engine.append(engine)
+    modules = [_runtime_topology("module."), _runtime_topology("_orig_mod.")]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(engine._build_lora_module, modules))
+
+    assert engine.model_config is original
+    assert len({id(item) for item in isolated_engines}) == 2
+    assert all(item is not engine for item in isolated_engines)
+    assert {tuple(config.target_modules) for config in calls} == {
+        (
+            "module.model.language_model.layers.0.mlp.down_proj",
+            "module.model.language_model.layers.0.self_attn.q_proj",
+        ),
+        (
+            "_orig_mod.model.language_model.layers.0.mlp.down_proj",
+            "_orig_mod.model.language_model.layers.0.self_attn.q_proj",
+        ),
+    }
+    assert [tuple(result.base_model.targeted_module_names) for result in results] == [
+        module.attached_targets for module in modules
+    ]
+
+
+def test_runtime_installer_isolates_same_engine_reentrant_calls(monkeypatch):
+    live_engine = []
+    nested_module = _runtime_topology("module.")
+    observed = []
+
+    def observe(isolated_engine, module):
+        observed.append(isolated_engine)
+        assert isolated_engine is not live_engine[0]
+        assert live_engine[0].model_config is original
+        module.attached_targets = tuple(isolated_engine.model_config.target_modules)
+        if len(observed) == 1:
+            live_engine[0]._build_lora_module(nested_module)
+            assert live_engine[0].model_config is original
+
+    engine_cls, calls = _install_fake_verl_engine(monkeypatch, builder_observer=observe)
+    original = _FrozenModelConfig()
+    engine = engine_cls(original)
+    live_engine.append(engine)
+    outer_module = _runtime_topology("_orig_mod.")
+
+    result = engine._build_lora_module(outer_module)
+
+    assert engine.model_config is original
+    assert len({id(item) for item in observed}) == 2
+    assert calls[0].target_modules[0].startswith("_orig_mod.")
+    assert calls[1].target_modules[0].startswith("module.")
+    assert tuple(result.base_model.targeted_module_names) == outer_module.attached_targets
+    assert nested_module.attached_targets == tuple(calls[1].target_modules)
 
 
 def test_runtime_installer_rejects_stale_or_non_dataclass_configs_and_incomplete_attachment(

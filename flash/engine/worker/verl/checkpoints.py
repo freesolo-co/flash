@@ -16,9 +16,10 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Mapping
 
 from flash.adapters.fused_experts import (
-    has_complete_fused_expert_tensors,
+    fused_expert_lora_tensor_pairs,
     lora_target_parameters,
     normalize_verl_fused_expert_export,
     validate_fused_expert_adapter_config,
@@ -458,12 +459,95 @@ _NON_LANGUAGE_ADAPTER_SEGMENTS = frozenset(
 )
 
 
-def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
-    """validate the actual non-moe LoRA payload before canonicalizing its config."""
+def _pair_has_nonzero_delta(factor_a, factor_b, *, require_finite_scan: bool) -> bool:
+    """return whether B @ A is nonzero, checking every block when overflow is possible."""
+    import numpy as np
+
+    active = np.flatnonzero(np.any(factor_b != 0, axis=0) & np.any(factor_a != 0, axis=1))
+    if active.size == 0:
+        return False
+    factor_a = factor_a[active].astype(np.float32, copy=False)
+    factor_b = factor_b[:, active].astype(np.float32, copy=False)
+    found_nonzero = False
+    for row_start in range(0, factor_b.shape[0], 64):
+        row_block = factor_b[row_start : row_start + 64]
+        for column_start in range(0, factor_a.shape[1], 256):
+            delta = row_block @ factor_a[:, column_start : column_start + 256]
+            if not np.isfinite(delta).all():
+                raise RuntimeError("composed LoRA delta contains non-finite values")
+            if np.count_nonzero(delta):
+                found_nonzero = True
+                if not require_finite_scan:
+                    return True
+    return found_nonzero
+
+
+def _validate_adapter_tensor_values(
+    adapter_dir: str,
+    metadata: dict[str, tuple[int, ...]],
+    pairs: Mapping[object, tuple[str, str]],
+    *,
+    label: str,
+) -> None:
+    """validate finite payload values and require one nonzero composed LoRA delta."""
     import numpy as np
 
     from flash.adapters.artifacts import loadable_adapter_weight_files
 
+    selected = loadable_adapter_weight_files(os.listdir(adapter_dir))
+    with contextlib.ExitStack() as stack:
+        sources = {}
+        for name in selected:
+            path = os.path.join(adapter_dir, name)
+            if name.endswith(".safetensors"):
+                handle = stack.enter_context(_open_safetensors_numpy(path))
+                tensor_keys = handle.keys()
+                sources.update({key: (handle, key) for key in tensor_keys})
+            else:
+                import torch
+
+                sources.update(torch.load(path, map_location="cpu", weights_only=True))
+        if sources.keys() != metadata.keys():
+            raise RuntimeError(f"{label} tensor sources disagree with their metadata")
+
+        def tensor(key: str):
+            source = sources[key]
+            if isinstance(source, tuple):
+                return source[0].get_tensor(source[1])
+            return source.detach().cpu().numpy()
+
+        for key in metadata:
+            if not np.isfinite(tensor(key)).all():
+                raise RuntimeError(f"{label} tensor {key!r} contains non-finite values")
+
+        any_nonzero_delta = False
+        ordered_pairs = sorted(pairs.values(), key=lambda pair: metadata[pair[0]][0])
+        for a_key, b_key in ordered_pairs:
+            factor_a = tensor(a_key)
+            factor_b = tensor(b_key)
+            if factor_b.shape[1] != factor_a.shape[0]:
+                raise RuntimeError(f"{label} LoRA pair {a_key!r}, {b_key!r} cannot compose B @ A")
+            max_a = float(np.max(np.abs(factor_a.astype(np.float32, copy=False))))
+            max_b = float(np.max(np.abs(factor_b.astype(np.float32, copy=False))))
+            finite_bound = max_a * max_b * factor_a.shape[0]
+            require_finite_scan = finite_bound > np.finfo(np.float32).max
+            if any_nonzero_delta and not require_finite_scan:
+                continue
+            try:
+                pair_nonzero = _pair_has_nonzero_delta(
+                    factor_a, factor_b, require_finite_scan=require_finite_scan
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"{label} LoRA pair {a_key!r}, {b_key!r} has a non-finite composed delta"
+                ) from exc
+            any_nonzero_delta = any_nonzero_delta or pair_nonzero
+        if not any_nonzero_delta:
+            raise RuntimeError(f"{label} has no nonzero composed LoRA delta")
+
+
+def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
+    """validate the actual non-moe LoRA payload before canonicalizing its config."""
     try:
         metadata = _read_adapter_tensor_metadata(adapter_dir) or {}
     except ValueError as exc:
@@ -523,61 +607,8 @@ def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
             f"factors; incomplete_modules={incomplete[:4]}"
         )
 
-    selected = loadable_adapter_weight_files(os.listdir(adapter_dir))
-    with contextlib.ExitStack() as stack:
-        sources = {}
-        for name in selected:
-            path = os.path.join(adapter_dir, name)
-            if name.endswith(".safetensors"):
-                handle = stack.enter_context(_open_safetensors_numpy(path))
-                tensor_keys = handle.keys()
-                sources.update({key: (handle, key) for key in tensor_keys})
-            else:
-                import torch
-
-                state = torch.load(path, map_location="cpu", weights_only=True)
-                sources.update(state)
-        if sources.keys() != metadata.keys():
-            raise RuntimeError("exported text adapter tensor sources disagree with their metadata")
-
-        def tensor(key: str):
-            source = sources[key]
-            if isinstance(source, tuple):
-                return source[0].get_tensor(source[1])
-            return source.detach().cpu().numpy()
-
-        for key in metadata:
-            if not np.isfinite(tensor(key)).all():
-                raise RuntimeError(
-                    f"exported text adapter tensor {key!r} contains non-finite values"
-                )
-
-        any_nonzero_delta = False
-        for module in sorted(pairs):
-            a_key = pairs[module]["A"]
-            b_key = pairs[module]["B"]
-            factor_a = tensor(a_key)
-            factor_b = tensor(b_key)
-            if factor_b.shape[1] != factor_a.shape[0]:
-                raise RuntimeError(
-                    f"exported text adapter LoRA pair {a_key!r}, {b_key!r} cannot compose B @ A"
-                )
-            factor_a_float = factor_a.astype(np.float32, copy=False)
-            rows_per_chunk = max(1, (1 << 20) // max(1, factor_a.shape[1]))
-            for start in range(0, factor_b.shape[0], rows_per_chunk):
-                delta = (
-                    factor_b[start : start + rows_per_chunk].astype(np.float32, copy=False)
-                    @ factor_a_float
-                )
-                if not np.isfinite(delta).all():
-                    raise RuntimeError(
-                        f"exported text adapter LoRA pair {a_key!r}, {b_key!r} has a non-finite "
-                        "composed delta"
-                    )
-                if np.count_nonzero(delta):
-                    any_nonzero_delta = True
-        if not any_nonzero_delta:
-            raise RuntimeError("exported text adapter has no nonzero composed LoRA delta")
+    pair_keys = {module: (factors["A"], factors["B"]) for module, factors in pairs.items()}
+    _validate_adapter_tensor_values(adapter_dir, metadata, pair_keys, label="exported text adapter")
 
 
 def stamp_adapter_dir_provenance(
@@ -616,12 +647,19 @@ def stamp_adapter_dir_provenance(
     normalize_verl_fused_expert_export(cfg, model_id)
     validate_fused_expert_adapter_config(cfg, model_id)
     if lora_target_parameters(model_id):
-        tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
-        if not has_complete_fused_expert_tensors(tensors, cfg, model_id):
+        try:
+            tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
+        except ValueError as exc:
+            raise RuntimeError("exported fused-expert adapter tensor artifact is invalid") from exc
+        pairs = fused_expert_lora_tensor_pairs(tensors, cfg, model_id)
+        if pairs is None:
             raise RuntimeError(
                 f"exported adapter for {model_id} does not contain complete fused expert LoRA "
                 "weights; refusing to stamp it as warm-start compatible"
             )
+        _validate_adapter_tensor_values(
+            adapter_dir, tensors, pairs, label="exported fused-expert adapter"
+        )
     else:
         _validate_text_adapter_tensors(adapter_dir, cfg)
     cfg["target_modules"] = "all-linear"

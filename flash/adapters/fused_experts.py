@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any
@@ -28,10 +29,28 @@ _QWEN36_FUSED_TARGET_RUNGS = {
 }
 _FUSED_EXPERT_SYNTHETIC_MODULES = frozenset({"experts", "base_layer"})
 _FUSED_EXPERT_WRAPPER_MODULES = ("mlp.experts", "mlp.experts.base_layer")
+_NON_LANGUAGE_LORA_SEGMENTS = frozenset(
+    {
+        "mtp",
+        "multi_modal_projector",
+        "patch_embed",
+        "visual",
+        "vision",
+        "vision_encoder",
+        "vision_model",
+        "vision_tower",
+    }
+)
 _INVALID_FUSED_LOCATION = object()
+_FUSED_LORA_KEY_RE = re.compile(
+    r"^(?P<module>base_model\.model\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+)"
+    r"(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+))*)\.lora_(?P<factor>[AB])\."
+    r"(?P<adapter>[A-Za-z0-9_-]+)\.weight$"
+)
 
 _LoraTensor = tuple[str, str, str, str, tuple[int, ...]]
 _LoraPair = tuple[tuple[int, ...], tuple[int, ...]]
+_LoraPairKeys = tuple[str, str]
 
 
 def lora_target_parameters(model_id: str | None) -> list[str] | None:
@@ -131,41 +150,44 @@ def normalize_verl_fused_expert_export(config: dict[str, Any], model_id: str) ->
         ]
 
 
+def fused_expert_lora_tensor_pairs(
+    tensors: Mapping[str, tuple[int, ...]], config: Mapping[str, Any], model_id: str
+) -> dict[tuple[str, str], _LoraPairKeys] | None:
+    """Return complete canonical pair keys when fused and ordinary topology is exact."""
+    expected = _expected_fused_expert_rungs(config, model_id)
+    if expected is None:
+        return None
+    parsed = []
+    for key, shape in tensors.items():
+        tensor = _parse_lora_tensor(key, shape)
+        if tensor is None:
+            return None
+        module_path = tensor[0]
+        if set(module_path.lower().split(".")) & _NON_LANGUAGE_LORA_SEGMENTS:
+            return None
+        parsed.append(tensor)
+    if len({adapter_name for _, _, adapter_name, _, _ in parsed}) != 1:
+        return None
+    if not _has_complete_fused_rungs(parsed, expected, model_id) or not _has_ordinary_evidence(
+        parsed, config, expected
+    ):
+        return None
+    return _complete_lora_pair_keys(parsed)
+
+
 def has_complete_fused_expert_tensors(
     tensors: Mapping[str, tuple[int, ...]], config: Mapping[str, Any], model_id: str
 ) -> bool:
     """Return whether fused and ordinary LoRA tensors match the declared PEFT topology."""
-    expected = _expected_fused_expert_rungs(config, model_id)
-    if expected is None:
-        return False
-    parsed = [
-        tensor
-        for key, shape in tensors.items()
-        if (tensor := _parse_lora_tensor(key, shape)) is not None
-    ]
-    if len({adapter_name for _, _, adapter_name, _, _ in parsed}) != 1:
-        return False
-    return _has_complete_fused_rungs(parsed, expected, model_id) and _has_ordinary_evidence(
-        parsed, config, expected
-    )
+    return fused_expert_lora_tensor_pairs(tensors, config, model_id) is not None
 
 
 def _parse_lora_tensor(key: str, shape: tuple[int, ...]) -> _LoraTensor | None:
     """Parse one canonical PEFT LoRA tensor key."""
-    matches = [
-        (factor, infix) for factor, infix in (("A", ".lora_A."), ("B", ".lora_B.")) if infix in key
-    ]
-    if len(matches) != 1:
+    match = _FUSED_LORA_KEY_RE.fullmatch(key)
+    if match is None:
         return None
-    factor, infix = matches[0]
-    module_path, _, leaf = key.partition(infix)
-    leaf_parts = leaf.split(".")
-    if not module_path or len(leaf_parts) != 2:
-        return None
-    adapter_name, parameter = leaf_parts
-    if not adapter_name or parameter != "weight":
-        return None
-    return module_path, factor, adapter_name, key, shape
+    return match.group("module"), match.group("factor"), match.group("adapter"), key, shape
 
 
 def _expected_fused_expert_rungs(
@@ -286,7 +308,7 @@ def _has_ordinary_evidence(
             continue
         matched = tuple(target for target in targets if _anchored_suffix_match(module_path, target))
         if not all_linear and not matched:
-            continue
+            return False
         evidence.update(matched)
         groups.setdefault(module_path, {}).setdefault(adapter_name, {})[factor] = (key, shape)
     if not groups or (not all_linear and evidence != set(targets)):
@@ -303,6 +325,21 @@ def _has_ordinary_evidence(
             if not _is_positive_2d(shape) or lora_tensor_rank_disagrees(key, shape, declared):
                 return False
     return True
+
+
+def _complete_lora_pair_keys(
+    tensors: list[_LoraTensor],
+) -> dict[tuple[str, str], _LoraPairKeys] | None:
+    """Return every canonical module and namespace pair without orphan factors."""
+    groups: dict[tuple[str, str], dict[str, str]] = {}
+    for module_path, factor, adapter_name, key, _shape in tensors:
+        factors = groups.setdefault((module_path, adapter_name), {})
+        if factor in factors:
+            return None
+        factors[factor] = key
+    if not groups or any(set(factors) != {"A", "B"} for factors in groups.values()):
+        return None
+    return {group: (factors["A"], factors["B"]) for group, factors in groups.items()}
 
 
 def _is_fused_rung(module_path: str, fused_rungs: Mapping[str, Mapping[str, _LoraPair]]) -> bool:

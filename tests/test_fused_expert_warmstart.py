@@ -262,6 +262,9 @@ def _patch_export_metadata(monkeypatch):
         "_read_adapter_tensor_metadata",
         lambda _path: tensors,
     )
+    monkeypatch.setattr(
+        checkpoints, "_validate_adapter_tensor_values", lambda *args, **kwargs: None
+    )
     return checkpoints.stamp_adapter_dir_provenance
 
 
@@ -308,6 +311,36 @@ def test_verl_fused_export_canonicalizes_suffix_order_to_all_linear(
     assert saved["flash_provenance"] == {"source": "verl"}
 
 
+def test_fused_export_rejects_complete_visual_pair_before_stamping(monkeypatch, tmp_path):
+    import flash.engine.worker.verl.checkpoints as checkpoints
+
+    tensors = _complete_expert_tensors()
+    tensors.update(
+        _wrapper_tensors(
+            "base_model.model.visual.blocks.0.attn.proj",
+            ((32, 2048), (2048, 32)),
+        )
+    )
+    monkeypatch.setattr(checkpoints, "_read_adapter_tensor_metadata", lambda _path: tensors)
+    monkeypatch.setattr(
+        checkpoints, "_validate_adapter_tensor_values", lambda *args, **kwargs: None
+    )
+    config = {
+        "peft_type": "LORA",
+        "r": 32,
+        "target_modules": ["q_proj", "experts", "base_layer"],
+        "target_parameters": None,
+    }
+    _write_expert_adapter(tmp_path, config=config)
+    config_path = tmp_path / "adapter_config.json"
+    before = config_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="complete fused expert LoRA weights"):
+        checkpoints.stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+
+    assert config_path.read_bytes() == before
+
+
 def test_export_refuses_incomplete_expert_weights_before_changing_config(tmp_path):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 
@@ -325,6 +358,70 @@ def test_export_refuses_incomplete_expert_weights_before_changing_config(tmp_pat
         stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
 
     assert config_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("tensor_mode", "message"),
+    [
+        ("nonfinite", "contains non-finite values"),
+        ("all_zero", "no nonzero composed LoRA delta"),
+    ],
+)
+def test_fused_export_validates_actual_tensor_values_before_stamping(
+    monkeypatch, tmp_path, tensor_mode, message
+):
+    import flash.engine.worker.verl.checkpoints as checkpoints
+
+    config = {
+        "peft_type": "LORA",
+        "r": 1,
+        "target_modules": ["q_proj"],
+        "target_parameters": None,
+    }
+    _write_expert_adapter(tmp_path, config=config, tensor_mode=tensor_mode, text_rank=1)
+
+    def pair_keys(tensors, _config, _model_id):
+        a_key = next(key for key in tensors if ".lora_A." in key)
+        b_key = next(key for key in tensors if ".lora_B." in key)
+        return {("q_proj", "default"): (a_key, b_key)}
+
+    monkeypatch.setattr(checkpoints, "fused_expert_lora_tensor_pairs", pair_keys)
+    config_path = tmp_path / "adapter_config.json"
+    before = config_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match=message):
+        checkpoints.stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+
+    assert config_path.read_bytes() == before
+
+
+def test_fused_export_accepts_a_finite_nonzero_actual_payload(monkeypatch, tmp_path):
+    import flash.engine.worker.verl.checkpoints as checkpoints
+
+    config = {
+        "peft_type": "LORA",
+        "r": 1,
+        "target_modules": ["q_proj", "v_proj"],
+        "target_parameters": None,
+    }
+    _write_expert_adapter(tmp_path, config=config, tensor_mode="mixed", text_rank=1)
+
+    def pair_keys(tensors, _config, _model_id):
+        groups = {}
+        for key in tensors:
+            module, factor = key.rsplit(".lora_", 1)
+            groups.setdefault(module, {})[factor[0]] = key
+        return {
+            (module, "default"): (factors["A"], factors["B"]) for module, factors in groups.items()
+        }
+
+    monkeypatch.setattr(checkpoints, "fused_expert_lora_tensor_pairs", pair_keys)
+
+    checkpoints.stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["target_modules"] == "all-linear"
+    assert saved["target_parameters"] == _TARGETS
 
 
 def test_export_rejects_malformed_modules_after_normalization_without_writing(tmp_path):
@@ -733,6 +830,46 @@ def test_tensor_analyzer_accepts_canonical_qwen36_rung_geometry():
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
     assert has_complete_fused_expert_tensors(_complete_expert_tensors(), _valid_config(), _MODEL_ID)
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "visual.blocks.0.attn.proj",
+        "vision_tower.blocks.0.proj",
+        "multi_modal_projector.linear",
+        "patch_embed.proj",
+        "mtp.layers.0.proj",
+    ],
+)
+def test_tensor_analyzer_rejects_complete_non_language_pairs(module):
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _complete_expert_tensors()
+    tensors.update(
+        _wrapper_tensors(
+            f"base_model.model.{module}",
+            ((32, 2048), (2048, 32)),
+        )
+    )
+
+    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+
+
+def test_tensor_analyzer_rejects_unparsed_and_undeclared_ordinary_tensors():
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    malformed = _complete_expert_tensors()
+    malformed["base_model.model.layers.0.self_attn.q_proj.unparsed"] = (1,)
+    assert not has_complete_fused_expert_tensors(malformed, _valid_config(), _MODEL_ID)
+
+    arbitrary_root = _complete_expert_tensors()
+    arbitrary_root.update(_wrapper_tensors("attacker.layers.0.q_proj", ((32, 2048), (2048, 32))))
+    assert not has_complete_fused_expert_tensors(arbitrary_root, _valid_config(), _MODEL_ID)
+
+    undeclared = _complete_expert_tensors()
+    undeclared.update(_ordinary_tensors(target="v_proj"))
+    assert not has_complete_fused_expert_tensors(undeclared, _valid_config(), _MODEL_ID)
 
 
 def test_tensor_analyzer_rejects_swapped_qwen36_rungs():
