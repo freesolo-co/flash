@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import concurrent.futures
+import contextlib
 import json
+import sys
+import threading
+import types
 from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
@@ -142,6 +147,87 @@ def _profile(entrypoint: Path, *, params: dict | None = None):
         packing_support=lambda _model, _revision: ("pure-attention", True),
     )
     return spec, profile
+
+
+class _ConcurrentAutoTokenizerImportTrap(types.ModuleType):
+    """a fake lazy module that rejects overlapping autotokenizer resolution."""
+
+    def __init__(self) -> None:
+        super().__init__("transformers")
+        self._state_lock = threading.Lock()
+        self._overlap = threading.Event()
+        self._active = 0
+        self.max_active = 0
+
+    def __getattr__(self, name: str):
+        if name != "AutoTokenizer":
+            raise AttributeError(name)
+        with self._state_lock:
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+            if self._active > 1:
+                self._overlap.set()
+        self._overlap.wait(timeout=0.05)
+        with self._state_lock:
+            overlapped = self._active > 1
+            self._active -= 1
+        if overlapped:
+            raise ModuleNotFoundError(
+                "Could not import module 'AutoTokenizer'. Are this object's requirements defined "
+                "correctly?"
+            )
+
+        class _AutoTokenizer:
+            @staticmethod
+            def from_pretrained(*_args, **_kwargs):
+                return FakeTokenizer()
+
+        return _AutoTokenizer
+
+
+def test_concurrent_profile_serializes_transformers_lazy_import(tmp_path, monkeypatch) -> None:
+    import flash.engine.profiling.tokenizer as tokenizer_module
+
+    entrypoint = _package(
+        tmp_path,
+        {
+            "dataset/train.jsonl": (
+                '{"input":"one","output":"alpha"}\n{"input":"two","output":"beta"}\n'
+            )
+        },
+    )
+    spec = _spec(environment_id=str(entrypoint))
+
+    def run_profiles():
+        gate = threading.Barrier(2)
+
+        def prepare():
+            gate.wait(timeout=1)
+            return profile_packaged_sft_dataset(
+                spec,
+                producer_version="1.2.3",
+                packing_support=lambda _model, _revision: ("pure-attention", True),
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            return [pool.submit(prepare) for _ in range(2)]
+
+    serialized = _ConcurrentAutoTokenizerImportTrap()
+    monkeypatch.setitem(sys.modules, "transformers", serialized)
+    profiles = [future.result() for future in run_profiles()]
+    assert serialized.max_active == 1
+    assert [profile.retained_examples for profile in profiles] == [2, 2]
+
+    unguarded = _ConcurrentAutoTokenizerImportTrap()
+    monkeypatch.setitem(sys.modules, "transformers", unguarded)
+    monkeypatch.setattr(tokenizer_module, "_TRANSFORMERS_IMPORT_LOCK", contextlib.nullcontext())
+    errors = [future.exception() for future in run_profiles()]
+    assert unguarded.max_active == 2
+    assert any(
+        "Could not import module 'AutoTokenizer'" in str(error)
+        for error in errors
+        if error is not None
+    )
 
 
 def test_profile_reads_packaged_train_jsonl_without_executing_environment_code(tmp_path) -> None:
