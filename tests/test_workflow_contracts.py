@@ -514,9 +514,7 @@ def test_worker_image_can_build_an_exact_reusable_source():
 
     job = _jobs(document)["build"]
     checkout = next(
-        step
-        for step in _steps(job)
-        if str(step.get("uses", "")).startswith("actions/checkout@")
+        step for step in _steps(job) if str(step.get("uses", "")).startswith("actions/checkout@")
     )
     assert "inputs.source_ref" in checkout["with"]["ref"]
     source = next(step for step in _steps(job) if step.get("id") == "source")
@@ -546,11 +544,9 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
     assert "cu128-dev-" in bake["with"]["target_tag_prefix"]
 
     publish = jobs["publish-ready"]
-    script = next(
-        step
-        for step in _steps(publish)
-        if step.get("name") == "Publish ready aliases"
-    )["run"]
+    script = next(step for step in _steps(publish) if step.get("name") == "Publish ready aliases")[
+        "run"
+    ]
     assert "cu128-dev-$REVISION-$sm" in script
     assert "cu128-dev-ready-$sm" in script
     assert script.index("candidate validation failed") < script.index("crane copy")
@@ -563,15 +559,11 @@ def test_main_pr_check_requires_each_exact_sm_cache():
     assert job["name"] == "production kernel cache ready"
 
     checkout = next(
-        step
-        for step in _steps(job)
-        if str(step.get("uses", "")).startswith("actions/checkout@")
+        step for step in _steps(job) if str(step.get("uses", "")).startswith("actions/checkout@")
     )
     assert checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
     verify = next(
-        step
-        for step in _steps(job)
-        if step.get("name") == "Verify every sm cache is ready"
+        step for step in _steps(job) if step.get("name") == "Verify every sm cache is ready"
     )
     script = verify["run"]
     assert "--print-baked-arches" in script
@@ -584,9 +576,7 @@ def test_main_pr_check_requires_each_exact_sm_cache():
 def test_production_relayer_promotes_matching_dev_cache_before_gpu_fallback():
     document = _load(WORKFLOW_DIR / "auto-rebake.yml")
     jobs = _jobs(document)
-    classify = next(
-        step for step in _steps(jobs["gate"]) if step.get("id") == "classify"
-    )["run"]
+    classify = next(step for step in _steps(jobs["gate"]) if step.get("id") == "classify")["run"]
     assert "cu128-dev-ready-$sm" in classify
     assert 'candidate_pc" = "$FP_CACHE' in classify
     assert "gpu re-warm (candidate missing)" in classify
@@ -594,9 +584,7 @@ def test_production_relayer_promotes_matching_dev_cache_before_gpu_fallback():
 
     relayer = jobs["relayer"]
     assert "relayer_matrix" in relayer["strategy"]["matrix"]["include"]
-    resolve = next(
-        step for step in _steps(relayer) if step.get("id") == "old"
-    )["run"]
+    resolve = next(step for step in _steps(relayer) if step.get("id") == "old")["run"]
     assert 'img="${{ matrix.source }}"' in resolve
 
 
