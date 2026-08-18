@@ -39,7 +39,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Dispatch the dev workflow definition
-        run: gh workflow run dev-kernel-cache.yml --ref dev
+        run: gh workflow run dev-kernel-cache.yml --repo "$GITHUB_REPOSITORY" --ref dev
 
   detect:
     if: github.repository == 'freesolo-co/flash' && github.event_name != 'schedule'
@@ -209,4 +209,4 @@ jobs:
       - name: Re-run production readiness for dev
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run production-kernel-cache-ready.yml --ref dev
+        run: gh workflow run production-kernel-cache-ready.yml --repo "$GITHUB_REPOSITORY" --ref dev

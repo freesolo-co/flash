@@ -537,7 +537,9 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
     dispatch_script = next(step for step in _steps(dispatch) if "run" in step)["run"]
     _assert_gated_upstream(dispatch.get("if"), "dev-kernel-cache.yml:dispatch-dev")
     assert "github.event_name == 'schedule'" in dispatch["if"]
-    assert "gh workflow run dev-kernel-cache.yml --ref dev" in dispatch_script
+    assert "gh workflow run dev-kernel-cache.yml" in dispatch_script
+    assert '--repo "$GITHUB_REPOSITORY"' in dispatch_script
+    assert "--ref dev" in dispatch_script
     assert "github.event_name != 'schedule'" in jobs["detect"]["if"]
     detect_checkout = next(
         step
@@ -568,7 +570,9 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
         for step in _steps(publish)
         if step.get("name") == "Re-run production readiness for dev"
     )["run"]
-    assert "production-kernel-cache-ready.yml --ref dev" in rerun
+    assert "production-kernel-cache-ready.yml" in rerun
+    assert '--repo "$GITHUB_REPOSITORY"' in rerun
+    assert "--ref dev" in rerun
 
     classify = next(step for step in _steps(jobs["detect"]) if step.get("id") == "classify")["run"]
     assert '[ "$prod_pc" != "$FP_CACHE" ] && [ "$candidate_pc" != "$FP_CACHE" ]' in classify
