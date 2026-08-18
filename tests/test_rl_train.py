@@ -7646,6 +7646,7 @@ def _shim_files(tmp_path):
 def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_path):
     files = _shim_files(tmp_path)
     inp = {
+        "model_id": "Qwen/Qwen3.5-0.8B",
         # one card: the rank/device assertion renders empty, so it owes no marker here. the
         # multi-card case is pinned by the test below.
         "dp_cards": 1,
@@ -7669,6 +7670,7 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
         "nonempty-response-mask",
         "exact-rollout-identity",
         "reentrant-checkpointing",
+        "text-lora-targeting",
         "entropy-quantile",
         "stop-sequences",
         "exact-save-steps",
@@ -7685,12 +7687,14 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
     config = json.loads(Path(files["plugin_config_path"]).read_text())
     assert files["expected_shims"] == grpo_plugin.required_patch_names(config)
     assert config["gdn_model_type"] is None
+    assert config["lora_language_prefix"] == "model.language_model"
     assert config["kl_ref_adapter"] is True
 
 
 def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_cards(tmp_path):
     files = _shim_files(tmp_path)
     inp = {
+        "model_id": "Qwen/Qwen3.5-0.8B",
         "dp_cards": 2,
         "reentrant_checkpointing": True,
         "multimodal": False,
@@ -7712,6 +7716,7 @@ def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_card
         "nonempty-response-mask",
         "exact-rollout-identity",
         "reentrant-checkpointing",
+        "text-lora-targeting",
         "lora-rollout-guard",
     ]
     config = json.loads(Path(files["plugin_config_path"]).read_text())

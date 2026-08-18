@@ -74,6 +74,15 @@ def required_patch_specs(config: dict) -> tuple[tuple, ...]:
             {"multimodal": bool(config.get("multimodal"))},
         ),
         (
+            runtime.TEXT_LORA_TARGET_SHIM,
+            bool(config.get("lora_language_prefix")),
+            "required",
+            "verl.workers.engine.fsdp.transformer_impl",
+            runtime.install_text_lora_targeting,
+            (str(config.get("lora_language_prefix") or ""),),
+            {},
+        ),
+        (
             "entropy-quantile",
             entropy_quantile is not None and float(entropy_quantile) < 1.0,
             "required",

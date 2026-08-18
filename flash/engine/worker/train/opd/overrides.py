@@ -344,6 +344,7 @@ def _build_opd_plugin_config(
     total_steps: int,
     gdn_model_type: str | None,
     loggers,
+    lora_language_prefix: str = "",
 ) -> str:
     """serialize the non-secret OPD runtime patch configuration."""
     return json.dumps(
@@ -352,6 +353,7 @@ def _build_opd_plugin_config(
             "no_signal_attempts": OPD_NO_SIGNAL_ATTEMPTS,
             "save_at_steps": list(save_at_steps),
             "total_steps": int(total_steps),
+            **({"lora_language_prefix": lora_language_prefix} if lora_language_prefix else {}),
             "gdn_model_type": gdn_model_type,
             "wandb": "wandb" in loggers,
         },

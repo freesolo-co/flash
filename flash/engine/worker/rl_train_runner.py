@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from flash.adapters.targets import resolve_lora_targeting
+from flash.core.catalog import get_model
 from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.result.rollout_samples import sample_completion_text, sanitize_rollout_text
@@ -202,6 +203,9 @@ def _write_rl_shim(inp, files) -> None:
 
 def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) -> None:
     """serialize the final GRPO plugin configuration after capability resolution."""
+    targeting = resolve_lora_targeting(
+        inp["model_id"], algorithm="grpo", multimodal=bool(inp["multimodal"])
+    )
     config = {
         "marker_file": files["shim_markers"],
         "dp_cards": int(inp["dp_cards"]),
@@ -216,6 +220,9 @@ def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
         "total_steps": int(inp["steps"]),
         "kl_ref_adapter": bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0,
         "multi_turn": bool(inp["multi_turn"]),
+        "lora_language_prefix": (
+            get_model(inp["model_id"]).lora_language_prefix if targeting.exclude_modules else ""
+        ),
         "gdn_model_type": gdn_reset_arch,
         "wandb": "wandb" in loggers,
     }

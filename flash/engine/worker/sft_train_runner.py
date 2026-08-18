@@ -15,8 +15,10 @@ from functools import reduce
 from math import gcd
 
 from flash.adapters.targets import resolve_lora_targeting
+from flash.core.catalog import get_model
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
 from flash.engine.worker import sft_train as _sft_train
+from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.base import rentable_gpu_counts
 
@@ -562,6 +564,7 @@ def _write_sft_child_shims(
         file.write(render_sitecustomize_bootstrap())
     with open(custom_dataset_path, "w", encoding="utf-8") as file:
         file.write(_render_sft_dataset_module())
+    text_only = bool(getattr(model, "exclude_modules", None))
     plugin_config = json.dumps(
         {
             "marker_file": shim_markers,
@@ -571,13 +574,20 @@ def _write_sft_child_shims(
             "save_at_steps": list(options.save_at_steps),
             "total_steps": int(model.update_horizon),
             "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),
+            "lora_language_prefix": (
+                get_model(options.model_id).lora_language_prefix if text_only else ""
+            ),
             "gdn_model_type": gdn_reset_arch,
             "wandb": "wandb" in loggers,
         },
         sort_keys=True,
         separators=(",", ":"),
     )
-    expected = ("sft-core",) + (("gdn-varlen",) if gdn_reset_arch else ())
+    expected = ("sft-core",)
+    if text_only:
+        expected += (TEXT_LORA_TARGET_SHIM,)
+    if gdn_reset_arch:
+        expected += ("gdn-varlen",)
     return shim_markers, expected, plugin_config
 
 

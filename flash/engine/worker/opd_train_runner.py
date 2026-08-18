@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import Any
 
 from flash.adapters.targets import resolve_lora_targeting
+from flash.core.catalog import get_model
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
+from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.train.opd.reporting import (
     _build_train_note_sections as _build_train_note_sections,
 )
@@ -680,6 +682,7 @@ def _run_child(
     # filtering is the entire meaning of that marker.
     expected_shims = (
         (("opd-core",) if request.knobs.save_at_steps else ())
+        + ((TEXT_LORA_TARGET_SHIM,) if getattr(workload, "exclude_modules", None) else ())
         + (LORA_ROLLOUT_GUARD_SHIM,)
         + (("gdn-varlen",) if runtime.gdn_reset_arch else ())
     )
@@ -808,6 +811,9 @@ def _build_child_env(
             shim_dir=workload.shim_dir,
             save_at_steps=request.knobs.save_at_steps,
             total_steps=workload.update_horizon,
+            lora_language_prefix=(
+                get_model(request.model_id).lora_language_prefix if workload.exclude_modules else ""
+            ),
             gdn_model_type=runtime.gdn_reset_arch,
             loggers=runtime.loggers,
         ),

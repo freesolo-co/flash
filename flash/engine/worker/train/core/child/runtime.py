@@ -11,8 +11,23 @@ FLASH_WANDB_LINK_MARKER = "FLASH_WANDB_LINK"
 FLASH_GDN_VARLEN_MARKER = "[flash-verl] gdn packed-boundary resets active"
 FLASH_FLASH_QLA_MARKER = "[flash-verl] flashqla gdn backend active"
 FLASH_LORA_ROLLOUT_MARKER = "[flash-verl] lora rollout guard active"
+FLASH_TEXT_LORA_TARGET_MARKER = "[flash-verl] exact text lora targets active"
 LORA_ROLLOUT_GUARD_SHIM = "lora-rollout-guard"
+TEXT_LORA_TARGET_SHIM = "text-lora-targeting"
 SHIM_FRAGMENT_FAILED_EXIT_CODE = 97
+
+_NON_LANGUAGE_LORA_SEGMENTS = frozenset(
+    {
+        "mtp",
+        "multi_modal_projector",
+        "patch_embed",
+        "visual",
+        "vision",
+        "vision_encoder",
+        "vision_model",
+        "vision_tower",
+    }
+)
 
 _LORA_ROLLOUT_TARGET = "verl.workers.rollout.vllm_rollout.vllm_async_server"
 
@@ -367,6 +382,119 @@ def install_deferred_flash_qla(model_type: str, marker_file: str) -> None:
         target=target,
         patch=_patch_flash_qla,
         required=False,
+    )
+
+
+def _text_lora_module_types():
+    import torch
+    from transformers.pytorch_utils import Conv1D
+
+    return (torch.nn.Linear, Conv1D)
+
+
+def _text_lora_language_root(named_modules, language_prefix: str) -> str:
+    prefix = language_prefix.strip(".")
+    if not prefix:
+        raise RuntimeError("flash text LoRA targeting requires a non-empty language module prefix")
+    roots = {
+        name for name, _module in named_modules if name == prefix or name.endswith(f".{prefix}")
+    }
+    if len(roots) != 1:
+        raise RuntimeError(
+            "flash text LoRA targeting requires exactly one runtime language root for "
+            f"{prefix!r}; found {sorted(roots)}"
+        )
+    return next(iter(roots))
+
+
+def resolve_text_lora_target_modules(
+    module, language_prefix: str, *, module_types=None
+) -> list[str]:
+    """Resolve exact runtime paths for every supported language LoRA module."""
+    named_modules = list(module.named_modules())
+    language_root = _text_lora_language_root(named_modules, language_prefix)
+    supported_types = module_types or _text_lora_module_types()
+    candidates = {
+        name
+        for name, child in named_modules
+        if name.startswith(f"{language_root}.") and isinstance(child, supported_types)
+    }
+    targets = sorted(
+        name
+        for name in candidates
+        if not (set(name.lower().split(".")) & _NON_LANGUAGE_LORA_SEGMENTS)
+    )
+    if not targets:
+        raise RuntimeError(
+            "flash text LoRA targeting found no supported language modules under runtime root "
+            f"{language_root!r}"
+        )
+
+    matched = {
+        name
+        for name, child in named_modules
+        if isinstance(child, supported_types)
+        and any(name == target or name.endswith(f".{target}") for target in targets)
+    }
+    if matched != set(targets):
+        extras = sorted(matched - set(targets))
+        raise RuntimeError(
+            "flash text LoRA targets are not unambiguous under PEFT suffix matching; "
+            f"unexpected matches={extras[:4]}"
+        )
+    return targets
+
+
+def install_text_lora_targeting(language_prefix: str) -> None:
+    """Replace fragile text regex filtering with exact pre-PEFT runtime module paths."""
+    from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
+
+    original = FSDPEngine._build_lora_module
+    installed_prefix = getattr(original, "_flash_text_lora_prefix", None)
+    if installed_prefix is not None:
+        if installed_prefix != language_prefix:
+            raise RuntimeError("flash text LoRA targeting was installed with a different prefix")
+        return
+
+    def build_lora_module(self, module):
+        model_config = self.model_config
+        if getattr(model_config, "lora_adapter_path", None) is not None:
+            return original(self, module)
+        if not getattr(model_config, "exclude_modules", None):
+            return original(self, module)
+        if getattr(model_config, "target_modules", None) != "all-linear":
+            raise RuntimeError(
+                "flash text LoRA targeting expected fresh-training target_modules='all-linear'"
+            )
+
+        targets = resolve_text_lora_target_modules(module, language_prefix)
+        model_config.target_modules = targets
+        model_config.exclude_modules = None
+        result = original(self, module)
+        targeted = set(getattr(result.base_model, "targeted_module_names", ()))
+        if targeted != set(targets):
+            raise RuntimeError(
+                "PEFT did not attach the complete exact flash text LoRA target set; "
+                f"expected={len(targets)} attached={len(targeted)}"
+            )
+        print(
+            f"{FLASH_TEXT_LORA_TARGET_MARKER} root={language_prefix} count={len(targets)}",
+            flush=True,
+        )
+        return result
+
+    build_lora_module._flash_text_lora_prefix = language_prefix
+    FSDPEngine._build_lora_module = build_lora_module
+
+
+def install_deferred_text_lora_targeting(language_prefix: str, marker_file: str) -> None:
+    """Arm exact text targeting without importing the torch-bearing Verl engine at plugin load."""
+    _arm_deferred(
+        name=TEXT_LORA_TARGET_SHIM,
+        marker_file=marker_file,
+        target="verl.workers.engine.fsdp.transformer_impl",
+        patch=lambda _module: install_text_lora_targeting(language_prefix),
+        required=True,
     )
 
 

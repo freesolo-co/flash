@@ -158,6 +158,9 @@ def install() -> None:
     config = runtime.load_plugin_config("FLASH_SFT_PLUGIN_CONFIG")
     marker_file = str(config["marker_file"])
     runtime.install_required("sft-core", marker_file, _install_core, config)
+    language_prefix = str(config.get("lora_language_prefix") or "")
+    if language_prefix:
+        runtime.install_deferred_text_lora_targeting(language_prefix, marker_file)
     model_type = config.get("gdn_model_type")
     if model_type:
         runtime.install_deferred_gdn(str(model_type), marker_file)

@@ -19,6 +19,9 @@ def install(config: dict) -> None:
             save_at_steps,
             int(config["total_steps"]),
         )
+    language_prefix = str(config.get("lora_language_prefix") or "")
+    if language_prefix:
+        runtime.install_deferred_text_lora_targeting(language_prefix, marker_file)
     model_type = config.get("gdn_model_type")
     if model_type:
         runtime.install_deferred_gdn(str(model_type), marker_file)
