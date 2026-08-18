@@ -688,6 +688,8 @@ def _build_verl_train_notes(
     gdn_boundary_resets: bool | None = None,
     host_census: dict | None = None,
     rollout_identity_evidence: dict | None = None,
+    advantage_spread_history: list[float] | None = None,
+    advantage_bounds: list[dict] | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -748,6 +750,8 @@ def _build_verl_train_notes(
         "rollout_identity_evidence": copy.deepcopy(
             rollout_identity_evidence or {"steps": [], "validation": []}
         ),
+        "advantage_spread_history": list(advantage_spread_history or []),
+        "advantage_bounds": copy.deepcopy(advantage_bounds or []),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],

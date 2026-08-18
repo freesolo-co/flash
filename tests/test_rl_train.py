@@ -4077,9 +4077,13 @@ def test_run_rl_train_wires_the_gradient_check_into_the_publish_path():
     assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in verdict_source
     assert entry_source.index("_validate_rl_child(") < entry_source.index("_export_final_adapter(")
     assert "export_peft_adapter(" in export_source
-    # and that the spread series it passes is actually collected from the child's output.
-    assert 'parse_verl_metric(line, "critic/advantages/max")' in metrics_source
-    assert 'parse_verl_metric(line, "critic/advantages/min")' in metrics_source
+    # and that the spread series it passes is collected from the structured durable metrics row.
+    assert 'step_metrics.get("advantage_max")' in metrics_source
+    assert 'step_metrics.get("advantage_min")' in metrics_source
+    assert "_finalize_advantage_evidence(state, resume_step, expected_steps)" in verdict_source
+    assert verdict_source.index("_check_grpo_had_a_gradient(") < verdict_source.index(
+        "_finalize_advantage_evidence(state, resume_step, expected_steps)"
+    )
 
 
 def test_grpo_gradient_check_abstains_for_a_resumed_run():
@@ -4097,6 +4101,29 @@ def test_grpo_gradient_check_abstains_for_a_resumed_run():
     # about the resume boundary, not a weakening of the guard.
     with pytest.raises(RuntimeError, match="zero advantage spread"):
         rl_train._check_grpo_had_a_gradient([1.0], [0.0], resumed=False)
+
+
+def test_terminal_advantage_evidence_rejects_missing_nonfinite_and_zero_spread():
+    missing = rl_train._StepMetricState()
+    missing.reward_history[:] = [0.5, 0.5]
+    missing.adv_spread_history[:] = [1.0]
+    missing.advantage_bounds[1] = (-0.5, 0.5)
+    with pytest.raises(RuntimeError, match=r"missing=\[2\], extra=\[\]"):
+        rl_train._validate_rl_child(0, missing, 0, 2, None)
+
+    nonfinite = rl_train._StepMetricState()
+    nonfinite.reward_history.append(0.5)
+    nonfinite.adv_spread_history.append(1.0)
+    nonfinite.advantage_bounds[1] = (0.0, float("inf"))
+    with pytest.raises(RuntimeError, match="not finite and ordered"):
+        rl_train._validate_rl_child(0, nonfinite, 0, 1, None)
+
+    zero = rl_train._StepMetricState()
+    zero.reward_history.append(0.5)
+    zero.adv_spread_history.append(0.0)
+    zero.advantage_bounds[1] = (0.0, 0.0)
+    with pytest.raises(RuntimeError, match="zero advantage spread"):
+        rl_train._validate_rl_child(0, zero, 0, 1, None)
 
 
 def test_grpo_gradient_check_accepts_a_resume_that_is_already_complete():
@@ -4647,15 +4674,20 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
     state = rl_train._StepMetricState()
     state.reward_history.append(0.5)
     state.adv_spread_history.append(1.0)
+    state.advantage_bounds[1] = (-0.25, 0.75)
     runtime = SimpleNamespace(identity_ledger=ledger)
     rl_train._validate_rl_child(0, state, 0, 1, None, reward_runtime=runtime)
 
     terminal_source = inspect.getsource(rl_train._write_terminal_metadata)
     assert "rollout_identity_evidence=state.rollout_identity_evidence" in terminal_source
+    assert "advantage_spread_history=state.adv_spread_history" in terminal_source
+    assert "advantage_bounds=state.advantage_bounds_evidence" in terminal_source
     notes = rl_train._build_verl_train_notes(
         _notes_inp(),
         **_notes_common(),
         rollout_identity_evidence=state.rollout_identity_evidence,
+        advantage_spread_history=state.adv_spread_history,
+        advantage_bounds=state.advantage_bounds_evidence,
     )
     assert notes["rollout_identity_evidence"] == {
         "steps": [
@@ -4667,6 +4699,8 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
         ],
         "validation": [],
     }
+    assert notes["advantage_spread_history"] == [1.0]
+    assert notes["advantage_bounds"] == [{"step": 1, "min": -0.25, "max": 0.75, "spread": 1.0}]
 
 
 def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
@@ -4676,6 +4710,16 @@ def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
     runtime = SimpleNamespace(identity_ledger=RolloutIdentityLedger(1, 2))
     rl_train._validate_rl_child(0, state, 5, 5, None, reward_runtime=runtime)
     assert state.rollout_identity_evidence == {"steps": [], "validation": []}
+    assert state.adv_spread_history == []
+    assert state.advantage_bounds_evidence == []
+    notes = rl_train._build_verl_train_notes(
+        _notes_inp(),
+        **_notes_common(),
+        advantage_spread_history=state.adv_spread_history,
+        advantage_bounds=state.advantage_bounds_evidence,
+    )
+    assert notes["advantage_spread_history"] == []
+    assert notes["advantage_bounds"] == []
 
 
 def test_train_notes_carry_the_trl_observability_fields():
@@ -7806,6 +7850,7 @@ def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
     state = rl_train._StepMetricState()
     state.reward_history.append(0.5)
     state.adv_spread_history.append(1.0)
+    state.advantage_bounds[1] = (-0.5, 0.5)
     marker = tmp_path / "applied_shims.txt"
     marker.write_text("entropy-quantile\n")
     # the complete set passes and falls through to the gradient verdict.

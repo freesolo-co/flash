@@ -6,6 +6,7 @@ Split out of ``flash.engine.worker.rl_train`` to keep that module under the file
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -68,6 +69,8 @@ class _StepMetricState:
     resp_len_history: list[float] = field(default_factory=list)
     loss_curve: list[float] = field(default_factory=list)
     adv_spread_history: list[float] = field(default_factory=list)
+    advantage_bounds: dict[int, tuple[float, float]] = field(default_factory=dict)
+    advantage_bounds_evidence: list[dict[str, int | float]] = field(default_factory=list)
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
     metrics_last: list[dict] = field(default_factory=list)
     step_timing: StepTiming = field(default_factory=StepTiming)
@@ -476,13 +479,18 @@ def _ingest_step_metrics(
             value = parse_verl_metric(line, verl_key)
             if value is not None:
                 sink.append(value)
-        # advantages/max and /min are emitted for every step outside verl's
-        # use_critic branch (trainer/ppo/metric_utils.py), so they are present under
-        # grpo even though the key is namespaced critic/.
-        adv_max = parse_verl_metric(line, "critic/advantages/max")
-        adv_min = parse_verl_metric(line, "critic/advantages/min")
-        if adv_max is not None and adv_min is not None:
-            state.adv_spread_history.append(adv_max - adv_min)
+        # the structured parser admits advantage bounds only as a complete finite ordered pair.
+        # key them by optimizer step so replayed lines replace rather than duplicate terminal proof.
+        adv_min = step_metrics.get("advantage_min")
+        adv_max = step_metrics.get("advantage_max")
+        if isinstance(adv_min, float) and isinstance(adv_max, float):
+            state.advantage_bounds[int(step_metrics["step"])] = (adv_min, adv_max)
+            state.adv_spread_history[:] = [
+                maximum - minimum
+                for minimum, maximum in (
+                    state.advantage_bounds[step] for step in sorted(state.advantage_bounds)
+                )
+            ]
 
 
 def _execute_rl_child(
@@ -595,6 +603,38 @@ def _execute_rl_child(
             LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
 
 
+def _finalize_advantage_evidence(state, resume_step: int, expected_steps: int) -> None:
+    expected = tuple(range(int(resume_step) + 1, int(expected_steps) + 1))
+    actual = tuple(sorted(state.advantage_bounds))
+    if actual != expected:
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        raise RuntimeError(
+            "GRPO advantage bounds do not cover the executed optimizer steps: "
+            f"missing={missing}, extra={extra}"
+        )
+    rows: list[dict[str, int | float]] = []
+    spreads: list[float] = []
+    for step in expected:
+        minimum, maximum = state.advantage_bounds[step]
+        spread = maximum - minimum
+        if not all(math.isfinite(value) for value in (minimum, maximum, spread)) or spread < 0.0:
+            raise RuntimeError(f"GRPO advantage bounds for step {step} are not finite and ordered")
+        row: dict[str, int | float] = {
+            "step": step,
+            "min": minimum,
+            "max": maximum,
+            "spread": spread,
+        }
+        if maximum - minimum != spread:
+            raise RuntimeError(f"GRPO advantage spread for step {step} does not match its bounds")
+        rows.append(row)
+        spreads.append(spread)
+    if state.adv_spread_history != spreads:
+        raise RuntimeError("GRPO advantage spread history does not match the exact per-step bounds")
+    state.advantage_bounds_evidence = rows
+
+
 def _validate_rl_child(
     rc,
     state,
@@ -642,6 +682,7 @@ def _validate_rl_child(
         # expected_steps, so this cannot excuse a run that stopped short.
         already_complete=bool(resume_step) and resume_step >= expected_steps,
     )
+    _finalize_advantage_evidence(state, resume_step, expected_steps)
     # training finished cleanly, so a missing required save is a real defect rather than a
     # side effect of a crash. stop here (not in finally, which suppresses) to surface it.
     # only when exact saves were requested: without them the drain stays best-effort, and
