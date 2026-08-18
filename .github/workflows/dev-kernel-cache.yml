@@ -115,7 +115,7 @@ jobs:
               candidate_ready=false
             fi
 
-            summary="$summary| $sm | `${prod_pc:-missing}` | `${candidate_pc:-missing}` at `${candidate_rev:-unknown}` |\n"
+            summary="$summary| $sm | \`${prod_pc:-missing}\` | \`${candidate_pc:-missing}\` at \`${candidate_rev:-unknown}\` |\n"
           done
 
           if [ "$prod_ready" = true ] || [ "$candidate_ready" = true ]; then
@@ -126,7 +126,7 @@ jobs:
           {
             echo "### dev kernel-cache candidate"
             echo ""
-            echo "source revision: `$REVISION`"
+            echo "source revision: \`$REVISION\`"
             echo ""
             echo -e "$summary"
             if [ "${{ github.event_name }}" = push ] && [ "$prod_ready" = false ] && [ "$candidate_ready" = false ]; then

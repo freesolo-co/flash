@@ -80,13 +80,13 @@ jobs:
               result="missing"
               missing+=("$sm")
             fi
-            summary="$summary| $sm | `${prod_pc:-missing}` | `${candidate_pc:-missing}` at `${candidate_rev:-unknown}` | $result |\n"
+            summary="$summary| $sm | \`${prod_pc:-missing}\` | \`${candidate_pc:-missing}\` at \`${candidate_rev:-unknown}\` | $result |\n"
           done
 
           {
             echo "### production kernel-cache readiness"
             echo ""
-            echo "required fp_cache: `$FP_CACHE`"
+            echo "required fp_cache: \`$FP_CACHE\`"
             echo ""
             echo -e "$summary"
           } >> "$GITHUB_STEP_SUMMARY"
