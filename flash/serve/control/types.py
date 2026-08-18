@@ -60,6 +60,12 @@ _ADAPTER_REVISION_RE = re.compile(ADAPTER_REVISION_PATTERN)
 _HEX_40_RE = re.compile(r"[0-9a-f]{40}")
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_MODAL_PROVIDER_ID_PATTERNS = {
+    "app": re.compile(r"ap-[A-Za-z0-9]{22}"),
+    "function": re.compile(r"fu-[A-Za-z0-9]{22}"),
+    "secret": re.compile(r"st-[A-Za-z0-9]{22}"),
+    "volume": re.compile(r"vo-[A-Za-z0-9]{22}"),
+}
 _SAFE_SUBFOLDER_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _REPO_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
 
@@ -571,21 +577,42 @@ class ModalProviderHandle:
         validate_modal_handle(self)
 
 
+def validate_modal_provider_id(
+    value: object,
+    role: str,
+    *,
+    name: str | None = None,
+) -> str:
+    """validate one role-specific provider id from the pinned modal contract."""
+
+    pattern = _MODAL_PROVIDER_ID_PATTERNS.get(role)
+    if pattern is None:
+        raise ValueError("modal provider id role is not allowlisted")
+    selected = _require_nonempty(value, name or f"{role}_id")
+    if pattern.fullmatch(selected) is None:
+        raise ValueError(f"modal {role} id does not match the pinned provider contract")
+    return selected
+
+
 def validate_modal_handle(handle: ModalProviderHandle) -> None:
     if type(handle) is not ModalProviderHandle:
         raise ValueError("handle must be an exact ModalProviderHandle")
     for name in (
         "deployment_id",
         "workspace_name",
-        "app_id",
         "app_name",
-        "volume_id",
         "volume_name",
-        "inference_secret_id",
         "inference_secret_name",
         "environment",
     ):
         _require_nonempty(getattr(handle, name), name)
+    validate_modal_provider_id(handle.app_id, "app", name="app_id")
+    validate_modal_provider_id(handle.volume_id, "volume", name="volume_id")
+    validate_modal_provider_id(
+        handle.inference_secret_id,
+        "secret",
+        name="inference_secret_id",
+    )
     _require_exact_digest(handle.engine_id, "engine_id", _HEX_64_RE)
     _require_exact_digest(handle.image_digest, "image_digest", _IMAGE_DIGEST_RE)
     _require_positive_int(handle.generation, "generation")

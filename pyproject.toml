@@ -81,7 +81,7 @@ server = [
 # modal does not depend on fastapi itself, so without this a fresh `pip install
 # 'freesolo-flash[serve-modal]'` fails at `modal deploy` with ModuleNotFoundError: fastapi.
 serve-modal = [
-    "modal>=1.0",
+    "modal==1.5.4",
     "fastapi",
 ]
 # reusable gpu execution runtime. these are the model-path dependencies validated by the current

@@ -58,11 +58,14 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
         TRANSFORMERS_REQUIREMENT,
         "vllm==0.23.0",
     ]
-    assert extras["serve-modal"] == ["modal>=1.0", "fastapi"]
+    assert extras["serve-modal"] == ["modal==1.5.4", "fastapi"]
     assert "serve-control" not in extras
     assert all("serve-runtime" not in dependency for dependency in extras["serve-modal"])
     assert "vllm==0.19.1" in extras["gpu"]
     assert project["tool"]["uv"]["conflicts"] == [[{"extra": "gpu"}, {"extra": "serve-runtime"}]]
+    lock = (ROOT / "uv.lock").read_text()
+    assert 'name = "modal"\nversion = "1.5.4"' in lock
+    assert '{ name = "modal", marker = "extra == \'serve-modal\'", specifier = "==1.5.4" }' in lock
 
 
 def test_wheel_contains_runtime_and_declares_extra(tmp_path: Path) -> None:

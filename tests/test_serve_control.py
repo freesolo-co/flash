@@ -581,11 +581,11 @@ def _modal_handle(spec: DeploymentSpec) -> ModalProviderHandle:
         generation=spec.generation,
         engine_id=spec.engine.engine_id,
         workspace_name="workspace-1",
-        app_id="app-1",
+        app_id="ap-" + "A" * 22,
         app_name="flash-app",
-        volume_id="volume-1",
+        volume_id="vo-" + "V" * 22,
         volume_name="flash-volume",
-        inference_secret_id="secret-1",
+        inference_secret_id="st-" + "S" * 22,
         inference_secret_name="flash-inference-secret",
         environment="main",
         region="us-east",
@@ -650,7 +650,7 @@ def test_sanitized_handles_and_results_are_json_safe_secret_free_and_flat() -> N
         }
         assert not any("group" in key for key in payload)
         assert "group_id" not in {entry.name for entry in fields(handle)}
-        assert payload["handle"]["inference_secret_id"] == "secret-1"
+        assert payload["handle"]["inference_secret_id"] == handle.inference_secret_id
         assert payload["handle"]["inference_secret_name"] == "flash-inference-secret"
         assert not any(key.startswith("artifact_secret") for key in payload["handle"])
         if type(handle) is ModalProviderHandle:
