@@ -525,6 +525,69 @@ def test_chat_resolves_the_alias_to_its_immutable_revision(http, deployed, chat_
         assert response.headers.get(header) == value
 
 
+def _solid_png_data_uri(rgb: tuple[int, int, int]) -> str:
+    """a one-colour png as a base64 data uri, built here rather than committed as a fixture blob."""
+
+    import base64
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 64), rgb).save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def test_an_image_request_reaches_the_vision_path(http, deployed, chat_timeout):
+    """an image-capable deployment must actually decode images, not just accept the request.
+
+    the profile declares these engines multimodal, which is what loads the processor and passes
+    limit_mm_per_prompt. that claim is only worth anything if a real image round-trips: a text-only
+    engine answers this request with 400 or a MultimodalRequestError rather than a completion.
+
+    the image is solid red and the question asks for its colour, so the answer is only available by
+    decoding pixels. the assertion stays on the transport and the vision path rather than on the
+    exact word: a small adapter-tuned model may describe the colour loosely, and pinning its wording
+    would make this a quality test that fails for the wrong reason.
+    """
+
+    run = deployed["metadata"]["run_id"]
+    assert _activate(http, deployed["adapter_id"], None).status_code == 200
+    response = http.post(
+        "/v1/chat/completions",
+        json={
+            "model": run,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _solid_png_data_uri((220, 20, 20))},
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 24,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        timeout=chat_timeout,
+    )
+    assert response.status_code == 200, (
+        f"image request refused with {response.status_code}: {response.text[:400]}"
+    )
+    payload = response.json()
+    choices = payload.get("choices")
+    assert isinstance(choices, list)
+    assert choices
+    content = choices[0].get("message", {}).get("content")
+    assert isinstance(content, str)
+    assert content.strip(), "vision path returned no text"
+
+
 def test_undeploy_disables_the_alias_and_its_revisions(http, adapter_source, run_id, ready_timeout):
     body = _registration(run_id, adapter_source)
     try:
