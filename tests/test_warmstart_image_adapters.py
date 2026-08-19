@@ -153,6 +153,59 @@ def test_image_run_warm_start_stays_rejected_for_sft():
         _require_supported_adapter_continuation(spec)
 
 
+def test_queued_warm_start_snapshot_survives_before_the_environment_is_staged():
+    """A warm start on a staged environment must persist before staging has run.
+
+    Ordering: `submit_job` writes the effective-preparation snapshot, then `_run_job_inner` calls
+    `stage_environment_package` and persists again. `_persist_effective_worker_spec` re-reads its
+    own snapshot through `effective_spec_from_status`, but only for warm-start runs -- so a guard
+    demanding a staged package unconditionally rejects the first persist of every warm start on a
+    Freesolo environment, while non-warm-start runs never take that branch and look fine.
+
+    Reproduced live: `image-gate-qwen35-4b-opd-fromsft-20260819-03` failed with "persisted
+    effective preparation failed integrity validation" after staging uploaded the package but
+    before a provider was allocated.
+    """
+    import flash.runner as runner
+    from flash.runner.status import effective_spec_from_status
+
+    public = JobSpec.from_dict(_image_rl_spec("opd", source=_IMAGE_SFT_SOURCE))
+    # the worker half carries the RESOLVED storage ref, the public half the run id, exactly as
+    # preparation writes them; reusing one spec for both would fail on the ref shape instead.
+    worker_data = _image_rl_spec("opd", source=_IMAGE_SFT_SOURCE)
+    worker_data["train"]["init_from_adapter"] = (
+        f"Freesolo-Co/flashrun-image-gate:sft/{_IMAGE_SFT_SOURCE}"
+    )
+    worker_data["train"]["init_from_adapter_revision"] = "a69435c93e9d4cbd8674bd66740a87015a2e1e59"
+    worker = JobSpec.from_dict(worker_data)
+    # the four keys the live snapshot of the reproducing run carried, so the fixture fails on the
+    # staged-package ordering rather than on a missing recovery record.
+    identity = {
+        "digest": "image-sft-artifact-v1",
+        "config_sha256": "e" * 64,
+        "weight_filename": "adapter_model.safetensors",
+        "weight_identity": "f" * 64,
+    }
+    status = runner.RunStatus(
+        run_id=public.run_id,
+        state="queued",
+        spec=public.to_dict(),
+        effective_preparation={
+            "worker_spec": worker.to_internal_dict(),
+            "adapter_identity": identity,
+            "preparation_digest": runner._preparation_digest(public, worker, identity),
+        },
+    )
+    assert worker.environment.package is None
+    # queued is the pre-staging window, so the absent package is the expected ordering.
+    assert effective_spec_from_status(status).run_id == public.run_id
+
+    # paired control: past that window a missing package is a stripped one and must still fail.
+    status.state = "provisioning"
+    with pytest.raises(ValueError, match="integrity validation"):
+        effective_spec_from_status(status)
+
+
 def _image_environment() -> dict:
     return {
         "id": (
