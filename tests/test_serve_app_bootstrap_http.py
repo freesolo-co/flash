@@ -732,3 +732,39 @@ def test_missing_inference_token_prevents_runtime_bootstrap(monkeypatch) -> None
         asyncio.run(app_main._serve(args, _manifest()))
 
     assert bootstrap_calls == 0
+
+
+def test_the_packaged_app_exposes_exactly_its_documented_route_surface() -> None:
+    # this app is immutable by construction: bootstrap_serving registers every adapter from the
+    # manifest at boot and freezes the model map, so there is deliberately no /adapters surface.
+    # docs/serving-contract.md documents the DYNAMIC contract (generated + hosted backends) and now
+    # says so explicitly, because pointing tests/serving_conformance at a `flash serve deploy`
+    # endpoint fails 26 registration/activation/alias tests against a perfectly healthy deployment.
+    #
+    # pinning the surface keeps those two facts from drifting apart. adding a route here without
+    # updating the doc is exactly the drift that sent a live canary through a conformance run it
+    # could never pass.
+    owner, _ = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+
+    served = {
+        (route.path, method)
+        for route in app.routes
+        for method in getattr(route, "methods", set()) or set()
+        if method not in {"HEAD", "OPTIONS"}
+    }
+    assert served == {
+        ("/healthz", "GET"),
+        ("/v1/models", "GET"),
+        ("/v1/chat/completions", "POST"),
+    }, f"packaged serving app route surface changed: {sorted(served)}"
+
+    # the absence of /adapters is the load-bearing half, so assert it as a live response rather
+    # than only as a route-table fact: a customer probing it must get 404, not a half-wired handler.
+    registered = asyncio.run(
+        _request(app, "POST", "/adapters", headers=_auth(), json={"adapter_id": "x"})
+    )
+    assert registered.status_code == 404, (
+        "the packaged app must not accept dynamic adapter registration; its adapters come from "
+        "the immutable manifest at boot"
+    )
