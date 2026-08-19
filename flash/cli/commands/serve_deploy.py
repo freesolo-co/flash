@@ -115,6 +115,7 @@ def cmd_serve_deploy(args) -> int:
             run_id=args.run,
             artifact_repo_id=args.artifact_repo,
             artifact_subfolder=args.artifact_subfolder,
+            artifact_repo_type=getattr(args, "artifact_repo_type", "dataset"),
             base_model=args.model,
             base_model_revision=resolve_base_revision(args.model),
             lora_rank=args.lora_rank,

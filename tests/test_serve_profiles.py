@@ -51,8 +51,16 @@ def test_supported_models_are_all_resolvable() -> None:
 def test_unknown_model_fails_closed_rather_than_defaulting() -> None:
     # a guessed placement is a real gpu rental in the customer's account, so an unlisted model
     # must raise instead of falling back to any other profile.
+    #
+    # the id is derived from the registry rather than hardcoded: this test previously named a real
+    # catalog model that simply had no profile yet, so adding that profile turned the test red for
+    # the wrong reason. an id built from the registry cannot become registered behind the test's
+    # back, which keeps this asserting "unlisted fails closed" rather than "this model is absent".
+    unknown = "unlisted/" + "-".join(sorted(supported_models()))[:64]
+    assert unknown not in supported_models()
+
     with pytest.raises(ProfileError) as excinfo:
-        get_profile("Qwen/Qwen3.5-4B")
+        get_profile(unknown)
 
     assert "no customer-owned serving profile" in str(excinfo.value)
 

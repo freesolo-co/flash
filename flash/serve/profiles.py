@@ -64,6 +64,10 @@ class RunPodGpu:
 # GPU_CLASSES row at all (that table covers training cards), so a runpod id cannot be derived
 # from either and is stated per profile below.
 _RUNPOD_L40S = RunPodGpu(gpu_type_id="NVIDIA L40S", container_disk_gb=60, volume_size_gb=120)
+# 24 GB card, so the disk and volume are sized down accordingly: the serving image is ~14 GB and
+# the fp8 4B checkpoint plus its adapters are far smaller than the 9B set. Both ids are the exact
+# `gpuTypes.id` strings the runpod api returns ("NVIDIA L4", "NVIDIA L40S"), not display names.
+_RUNPOD_L4 = RunPodGpu(gpu_type_id="NVIDIA L4", container_disk_gb=40, volume_size_gb=60)
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +209,35 @@ _PROFILES: dict[str, ServingProfile] = {
         processor_kwargs={},
         modal_gpu="L40S",
         runpod_gpu=_RUNPOD_L40S,
+    ),
+    "Qwen/Qwen3.5-4B": ServingProfile(
+        model_id="Qwen/Qwen3.5-4B",
+        modality="text",
+        served_model="Freesolo-Co/Qwen3.5-4B-FP8",
+        tokenizer_model="Freesolo-Co/Qwen3.5-4B-FP8",
+        dtype="bfloat16",
+        quantization="fp8",
+        kv_cache_dtype=None,
+        max_model_len=32768,
+        max_num_seqs=8,
+        max_loras=16,
+        max_cpu_loras=16,
+        max_lora_rank=128,
+        max_num_batched_tokens=None,
+        # 0.98, not the 9B's 0.90: the catalog states it per model and _require_catalog_agreement
+        # rejects any drift from it, so this is copied from the catalog rather than chosen here.
+        gpu_memory_utilization=0.98,
+        swap_space_gb=0.0,
+        cpu_offload_gb=0.0,
+        image_limit=None,
+        mm_processor_cache_gb=0.0,
+        enable_tower_connector_lora=False,
+        reasoning_parser=None,
+        engine_args={},
+        tokenizer_kwargs={},
+        processor_kwargs={},
+        modal_gpu="L4",
+        runpod_gpu=_RUNPOD_L4,
     ),
 }
 

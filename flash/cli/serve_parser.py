@@ -86,6 +86,15 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction, handler) -> None:
     deploy.add_argument(
         "--artifact-subfolder", required=True, help="path within the repo holding the adapter"
     )
+    # flash runs publish adapters into dataset repos, so that stays the default. the override
+    # exists for an adapter published as a model repo, where resolution would otherwise fail
+    # against the wrong repo type rather than reporting that the repo is a different kind.
+    deploy.add_argument(
+        "--artifact-repo-type",
+        choices=("dataset", "model"),
+        default="dataset",
+        help="hub repo type holding the adapter (default: dataset, as flash runs publish)",
+    )
     deploy.add_argument("--lora-rank", type=int, required=True, help="the adapter's lora rank")
     deploy.add_argument(
         "--checkpoint-step",
