@@ -10,17 +10,26 @@ from dataclasses import dataclass
 _UNAVAILABLE = -1
 _SNAPSHOT_ATTEMPTS = 3
 
+# a walked process is in exactly one of these states. only reuse is an integrity failure:
+# a rollout tree is always creating and reaping workers, so exit is the normal case.
+_ALIVE = "alive"
+_GONE = "gone"
+_REUSED = "reused"
+
+
+class _VanishedProcess:
+    """Marker for a process that exited during the walk, which is benign for a descendant."""
+
+    __slots__ = ()
+
+
+_VANISHED = _VanishedProcess()
+
 
 @dataclass(frozen=True, order=True)
 class _ProcessIdentity:
     pid: int
     start_time: int
-
-
-@dataclass(frozen=True)
-class _ProcessTree:
-    identities: frozenset[_ProcessIdentity]
-    edges: frozenset[tuple[_ProcessIdentity, _ProcessIdentity]]
 
 
 def _read_start_time(pid: int) -> int | None:
@@ -56,80 +65,122 @@ def _read_task_children(pid: int, task_id: int) -> set[int] | None:
     return {int(value) for value in values if value.isdigit()}
 
 
-def _stable_children(identity: _ProcessIdentity) -> set[int] | None:
-    if _read_start_time(identity.pid) != identity.start_time:
-        return None
+def _liveness(identity: _ProcessIdentity) -> str:
+    """Classify a pid as still alive, exited, or replaced by an unrelated process."""
+    start_time = _read_start_time(identity.pid)
+    if start_time is None:
+        return _GONE
+    return _ALIVE if start_time == identity.start_time else _REUSED
+
+
+def _stable_children(identity: _ProcessIdentity) -> set[int] | _VanishedProcess | None:
+    """Children of a live process, ``_VANISHED`` if it exited, ``None`` on an unusable read."""
+    state = _liveness(identity)
+    if state != _ALIVE:
+        return _VANISHED if state == _GONE else None
     task_ids = _list_task_ids(identity.pid)
     if task_ids is None:
-        return None
+        return _VANISHED if _liveness(identity) == _GONE else None
     children: set[int] = set()
     for task_id in task_ids:
         task_children = _read_task_children(identity.pid, task_id)
         if task_children is None:
-            return None
+            # a thread of a live process must be readable; only a whole-process exit is benign
+            return _VANISHED if _liveness(identity) == _GONE else None
         children.update(task_children)
-    if _read_start_time(identity.pid) != identity.start_time:
-        return None
+    state = _liveness(identity)
+    if state != _ALIVE:
+        return _VANISHED if state == _GONE else None
     return children
 
 
-def _stable_thread_count(identity: _ProcessIdentity) -> int | None:
-    if _read_start_time(identity.pid) != identity.start_time:
-        return None
+def _stable_thread_count(identity: _ProcessIdentity) -> int | _VanishedProcess | None:
+    """Thread count of a live process, ``_VANISHED`` if it exited, ``None`` on an unusable read."""
+    state = _liveness(identity)
+    if state != _ALIVE:
+        return _VANISHED if state == _GONE else None
     task_ids = _list_task_ids(identity.pid)
     if task_ids is None:
-        return None
-    if _read_start_time(identity.pid) != identity.start_time:
-        return None
+        return _VANISHED if _liveness(identity) == _GONE else None
+    state = _liveness(identity)
+    if state != _ALIVE:
+        return _VANISHED if state == _GONE else None
     return len(task_ids)
 
 
-def _scan_process_tree(root: _ProcessIdentity) -> _ProcessTree | None:
+def _scan_process_tree(root: _ProcessIdentity) -> frozenset[_ProcessIdentity] | None:
+    """Walk the live descendant tree.
+
+    A descendant exiting mid-walk is expected on a rollout tree and is skipped along with the
+    subtree that left with it. Only an unusable read of a live process, pid reuse, or the root
+    itself disappearing invalidates the walk.
+    """
     known = {root.pid: root.start_time}
     identities = {root}
-    edges: set[tuple[_ProcessIdentity, _ProcessIdentity]] = set()
     pending = [root]
     while pending:
         parent = pending.pop()
         children = _stable_children(parent)
         if children is None:
             return None
+        if isinstance(children, _VanishedProcess):
+            if parent == root:
+                return None
+            continue
         for pid in children:
             start_time = _read_start_time(pid)
             if start_time is None:
-                return None
+                continue
             previous = known.get(pid)
-            if previous is not None and previous != start_time:
-                return None
-            child = _ProcessIdentity(pid, start_time)
-            edges.add((parent, child))
             if previous is not None:
+                if previous != start_time:
+                    return None
                 continue
             known[pid] = start_time
+            child = _ProcessIdentity(pid, start_time)
             identities.add(child)
             pending.append(child)
-    return _ProcessTree(frozenset(identities), frozenset(edges))
+    return frozenset(identities)
+
+
+def _reuse_contradiction(
+    first: frozenset[_ProcessIdentity], second: frozenset[_ProcessIdentity]
+) -> bool:
+    """True when a pid is present in both scans under two different start times."""
+    starts = {identity.pid: identity.start_time for identity in first}
+    return any(
+        starts.get(identity.pid, identity.start_time) != identity.start_time
+        for identity in second
+    )
 
 
 def _descendant_counts(root: _ProcessIdentity | None) -> tuple[int, int, int] | None:
+    """Count live descendants and their threads.
+
+    The paired scan no longer demands an identical tree, which never holds while workers are
+    being created and reaped. It asserts the weaker invariant that actually signals corruption:
+    no pid may be seen under two different start times. Processes are counted only when their
+    thread count was also read, so the reported pair stays self-consistent.
+    """
     if root is None:
         return None
     first = _scan_process_tree(root)
     if first is None:
         return None
     second = _scan_process_tree(root)
-    if second is None or second != first:
+    if second is None or _reuse_contradiction(first, second):
         return None
-    descendants = second.identities - {root}
     thread_counts: list[int] = []
-    for identity in descendants:
+    for identity in second - {root}:
         count = _stable_thread_count(identity)
         if count is None:
             return None
+        if isinstance(count, _VanishedProcess):
+            continue
         thread_counts.append(count)
-    if _read_start_time(root.pid) != root.start_time:
+    if _liveness(root) != _ALIVE:
         return None
-    return len(descendants), sum(thread_counts), max(thread_counts, default=0)
+    return len(thread_counts), sum(thread_counts), max(thread_counts, default=0)
 
 
 def _read_scalar(path: str) -> str | None:

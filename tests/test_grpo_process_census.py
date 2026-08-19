@@ -11,7 +11,6 @@ from flash.engine.worker.verl.process_census import (
     GrpoProcessCensus,
     ProcessCensusSnapshot,
     _ProcessIdentity,
-    _ProcessTree,
 )
 
 
@@ -58,7 +57,8 @@ def test_snapshot_root_read_failure_is_unavailable(monkeypatch):
     ) == (-1, -1, -1)
 
 
-def test_snapshot_partial_child_task_read_failure_is_unavailable(monkeypatch):
+def test_snapshot_partial_child_task_read_failure_on_a_live_process_is_unavailable(monkeypatch):
+    """A thread of a process that is still alive must be readable, or the sample is unusable."""
     _complete_proc_view(monkeypatch, with_child=True)
     original = census_module._read_task_children
     monkeypatch.setattr(
@@ -69,7 +69,26 @@ def test_snapshot_partial_child_task_read_failure_is_unavailable(monkeypatch):
     assert _census()._snapshot().available == 0
 
 
-def test_snapshot_thread_count_failure_is_unavailable(monkeypatch):
+def test_snapshot_child_task_read_failure_after_exit_is_tolerated(monkeypatch):
+    """The same failed read is benign once the child has actually exited."""
+    _stable_auxiliary_metrics(monkeypatch)
+    starts: dict[int, int | None] = {1: 100, 2: 200}
+    monkeypatch.setattr(census_module, "_read_start_time", lambda pid: starts.get(pid))
+    monkeypatch.setattr(census_module, "_list_task_ids", lambda pid: {1: (1,), 2: (2,)}.get(pid))
+
+    def read_children(pid, task_id):
+        if pid == 2:
+            starts[2] = None  # the child exits mid-read
+            return None
+        return {2} if (pid, task_id) == (1, 1) else set()
+
+    monkeypatch.setattr(census_module, "_read_task_children", read_children)
+    snapshot = _census()._snapshot()
+    assert snapshot.available == 1
+    assert snapshot.descendant_processes == 0
+
+
+def test_snapshot_thread_count_failure_on_a_live_process_is_unavailable(monkeypatch):
     _complete_proc_view(monkeypatch, with_child=True)
     original = census_module._list_task_ids
     monkeypatch.setattr(
@@ -78,6 +97,23 @@ def test_snapshot_thread_count_failure_is_unavailable(monkeypatch):
         lambda pid: None if pid == 2 else original(pid),
     )
     assert _census()._snapshot().available == 0
+
+
+def test_snapshot_thread_count_failure_after_exit_is_tolerated(monkeypatch):
+    """A descendant that exits before its threads are counted is dropped, not fatal."""
+    _stable_auxiliary_metrics(monkeypatch)
+    root = _ProcessIdentity(1, 100)
+    child = _ProcessIdentity(2, 200)
+    monkeypatch.setattr(census_module, "_scan_process_tree", lambda _root: _tree(root, child))
+    monkeypatch.setattr(
+        census_module,
+        "_stable_thread_count",
+        lambda identity: census_module._VANISHED if identity.pid == 2 else 3,
+    )
+    monkeypatch.setattr(census_module, "_read_start_time", lambda pid: 100 if pid == 1 else None)
+    snapshot = _census()._snapshot()
+    assert snapshot.available == 1
+    assert (snapshot.descendant_processes, snapshot.descendant_threads) == (0, 0)
 
 
 def test_snapshot_retries_a_transient_proc_exit_race(monkeypatch):
@@ -96,30 +132,17 @@ def test_snapshot_retries_a_transient_proc_exit_race(monkeypatch):
     assert snapshot.descendant_processes == 1
 
 
-def _tree(*identities, edges=()):
-    return _ProcessTree(frozenset(identities), frozenset(edges))
+def _tree(*identities):
+    return frozenset(identities)
 
 
-@pytest.mark.parametrize("drift", ["pid_reuse", "edge_removal", "edge_addition", "child_creation"])
-def test_snapshot_rejects_tree_drift_between_complete_scans(monkeypatch, drift):
+def test_snapshot_rejects_pid_reuse_between_complete_scans(monkeypatch):
+    """A pid seen under two start times means the tree is corrupt, not merely churning."""
     _stable_auxiliary_metrics(monkeypatch)
     root = _ProcessIdentity(1, 100)
     child = _ProcessIdentity(2, 200)
     replacement = _ProcessIdentity(2, 201)
-    created = _ProcessIdentity(3, 300)
-    first = _tree(root, child, edges=((root, child),))
-    second = {
-        "pid_reuse": _tree(root, replacement, edges=((root, replacement),)),
-        "edge_removal": _tree(root, child),
-        "edge_addition": _tree(root, child, edges=((root, child), (child, root))),
-        "child_creation": _tree(
-            root,
-            child,
-            created,
-            edges=((root, child), (root, created)),
-        ),
-    }[drift]
-    scans = iter([first, second] * 3)
+    scans = iter([_tree(root, child), _tree(root, replacement)] * 3)
     monkeypatch.setattr(census_module, "_scan_process_tree", lambda _root: next(scans))
 
     snapshot = _census()._snapshot()
@@ -127,22 +150,28 @@ def test_snapshot_rejects_tree_drift_between_complete_scans(monkeypatch, drift):
     assert snapshot.incomplete_attempts == 3
 
 
-def test_snapshot_tree_drift_consumes_one_retry_before_a_stable_pair(monkeypatch):
+@pytest.mark.parametrize("drift", ["child_exit", "child_creation", "full_turnover"])
+def test_snapshot_tolerates_benign_churn_between_scans(monkeypatch, drift):
+    """A rollout tree constantly creates and reaps workers; that must still be measurable."""
     _stable_auxiliary_metrics(monkeypatch)
     root = _ProcessIdentity(1, 100)
     child = _ProcessIdentity(2, 200)
     created = _ProcessIdentity(3, 300)
-    stable = _tree(root, child, edges=((root, child),))
-    changed = _tree(root, child, created, edges=((root, child), (root, created)))
-    scans = iter((stable, changed, stable, stable))
+    first = _tree(root, child)
+    second = {
+        "child_exit": _tree(root),
+        "child_creation": _tree(root, child, created),
+        "full_turnover": _tree(root, created),
+    }[drift]
+    scans = iter((first, second))
     monkeypatch.setattr(census_module, "_scan_process_tree", lambda _root: next(scans))
     monkeypatch.setattr(census_module, "_stable_thread_count", lambda _identity: 2)
     monkeypatch.setattr(census_module, "_read_start_time", lambda pid: 100 if pid == 1 else 200)
 
     snapshot = _census()._snapshot()
     assert snapshot.available == 1
-    assert snapshot.incomplete_attempts == 1
-    assert snapshot.descendant_processes == 1
+    assert snapshot.incomplete_attempts == 0
+    assert snapshot.descendant_processes == len(second - {root})
 
 
 def test_snapshot_discards_pid_reuse_attempt_before_accepting_a_stable_retry(monkeypatch):
@@ -170,6 +199,57 @@ def test_snapshot_root_pid_reuse_is_unavailable(monkeypatch):
         return 100 if calls[1] <= 2 else 101
 
     monkeypatch.setattr(census_module, "_read_start_time", start_time)
+    assert _census()._snapshot().available == 0
+
+
+def test_snapshot_root_exit_is_unavailable_not_an_empty_tree(monkeypatch):
+    """Tolerating descendant exit must never let the root's own exit report a healthy zero."""
+    _stable_auxiliary_metrics(monkeypatch)
+    monkeypatch.setattr(census_module, "_read_start_time", lambda _pid: None)
+    monkeypatch.setattr(census_module, "_list_task_ids", lambda _pid: (1,))
+    monkeypatch.setattr(census_module, "_read_task_children", lambda _pid, _task: set())
+    snapshot = _census()._snapshot()
+    assert snapshot.available == 0
+    assert snapshot.descendant_processes == -1
+
+
+def test_snapshot_root_exit_during_the_walk_is_unavailable(monkeypatch):
+    """The root disappearing mid-walk invalidates the sample even though children looked fine."""
+    _stable_auxiliary_metrics(monkeypatch)
+    starts: dict[int, int | None] = {1: 100}
+    monkeypatch.setattr(census_module, "_read_start_time", lambda pid: starts.get(pid))
+    monkeypatch.setattr(census_module, "_list_task_ids", lambda _pid: (1,))
+
+    def read_children(_pid, _task_id):
+        starts[1] = None  # the root exits while its own children are being read
+        return
+
+    monkeypatch.setattr(census_module, "_read_task_children", read_children)
+    assert _census()._snapshot().available == 0
+
+
+def test_descendant_pid_reuse_within_one_scan_is_unavailable(monkeypatch):
+    """Two parents reporting the same pid under different start times is corruption."""
+    _stable_auxiliary_metrics(monkeypatch)
+    starts = {1: 100, 2: 200, 3: 300}
+    tasks = {1: (1,), 2: (2,), 3: (3,)}
+    children = {(1, 1): {2, 3}, (2, 2): {4}, (3, 3): {4}}
+    shared_reads = {"count": 0}
+
+    def read_start_time(pid):
+        if pid != 4:
+            return starts.get(pid)
+        # the two parents always disagree, so no retry can settle the contradiction
+        shared_reads["count"] += 1
+        return 400 if shared_reads["count"] % 2 == 1 else 401
+
+    monkeypatch.setattr(census_module, "_read_start_time", read_start_time)
+    monkeypatch.setattr(census_module, "_list_task_ids", lambda pid: tasks.get(pid, (pid,)))
+    monkeypatch.setattr(
+        census_module,
+        "_read_task_children",
+        lambda pid, task_id: children.get((pid, task_id), set()),
+    )
     assert _census()._snapshot().available == 0
 
 
