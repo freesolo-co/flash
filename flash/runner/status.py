@@ -68,14 +68,8 @@ def source_snapshot_from_status(status: RunStatus, *, required: bool = False) ->
     return parse_descriptor(raw).to_dict()
 
 
-def effective_spec_from_status(
-    status: RunStatus, *, verify_source: bool = False, require_staged_environment: bool = True
-) -> JobSpec:
-    """Load the private prepared worker spec, optionally revalidating its source artifact.
-
-    `require_staged_environment=False` is for the one caller that reads a snapshot written *before*
-    `stage_environment_package` ran; see the guard below.
-    """
+def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
+    """Load the private prepared worker spec, optionally revalidating its source artifact."""
     public_spec = JobSpec.from_dict(status.spec)
     snapshot = status.effective_preparation
     if not isinstance(snapshot, dict):
@@ -100,21 +94,6 @@ def effective_spec_from_status(
     has_workload_profile = bool(
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
-    from flash.envs.identity import is_freesolo_environment_id
-
-    requires_staged_environment = is_freesolo_environment_id(public_spec.environment.id)
-    # `submit_job` writes the snapshot, then `_run_job_inner` stages the package and persists again,
-    # so the submit-time snapshot legitimately has no package. `_persist_effective_worker_spec`
-    # re-reads exactly that stale snapshot before overwriting it -- and only for warm starts, so
-    # demanding a package unconditionally rejected every warm start on a Freesolo environment while
-    # non-warm-start runs never took the branch. run state cannot separate the two windows:
-    # `_run_job` sets `provisioning` before staging. the caller can, so it says so.
-    if (
-        require_staged_environment
-        and requires_staged_environment
-        and worker_spec.environment.package is None
-    ):
-        raise ValueError("persisted effective preparation failed integrity validation")
     # the auto-pin marker is excluded from the structural compare (the public half always reads
     # False by construction), so nothing else here would catch a forged worker-half marker. deploy
     # reads it to decide whether to relax the authored-pin rejection, which makes it a privilege
@@ -137,9 +116,7 @@ def effective_spec_from_status(
     # MAX_COMBINATION_CARDS, and unlike `model_revision_auto` it cannot relax a deploy-time
     # rejection -- a forged marker only widens the allocator's ceiling, which the VRAM fit check and
     # the geometry cap still constrain.
-    if (
-        has_workload_profile or requires_staged_environment or worker_spec.model_revision_auto
-    ) and (
+    if (has_workload_profile or worker_spec.model_revision_auto) and (
         not isinstance(stored_digest, str)
         or stored_digest
         != runner._preparation_digest(

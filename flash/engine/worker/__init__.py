@@ -92,6 +92,7 @@ from flash.engine.worker.train.rl.config import (
     grpo_overrides,
     resolve_grpo_prompts_per_step,
 )
+from flash.envs.identity import GitHubTransientError
 from flash.envs.staged import (
     StagedEnvironmentMaterialization,
     StagedEnvironmentTransientError,
@@ -234,7 +235,12 @@ def require_active_env():
 
 
 def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
-    retriable = isinstance(exc, (RetriableInfraError, StagedEnvironmentTransientError))
+    # both transient families, not just the staged one: `GitHubTransientError` (quota and outage)
+    # still reaches here from the environment identity path, and the worker's answer to either is
+    # the same -- reschedule. classifying only the staged type would fail those runs permanently.
+    retriable = isinstance(
+        exc, (RetriableInfraError, StagedEnvironmentTransientError, GitHubTransientError)
+    )
     return {"retriable": retriable, "oom": (not retriable and is_cuda_oom(exc))}
 
 

@@ -386,7 +386,20 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     effective["train"] = effective_train
     public_environment = dict(public["environment"])
     effective_environment = dict(effective["environment"])
-    # the staged package is controller-managed and digest-bound in the worker half only.
+    # the staged package is controller-managed: staging writes it onto the worker half only, so the
+    # public half never carries one and comparing the two directly would fail every staged run.
+    # this exclusion cannot be tightened into a tamper check here. `to_internal_dict` OMITS the key
+    # when unset, so a stripped package is byte-identical to a run that simply has not staged yet --
+    # which is the state of every run between submit and allocation, and of every finished run in
+    # the hosted tests. rejecting that shape fails 96 legitimate runs
+    # (tests/test_server_api.py, tests/test_client_server_integration.py), and widening the digest
+    # trigger instead fails ordinary runs whose gpu.type the allocator rewrote at provisioning
+    # (tests/test_server_api.py::test_deploy_ignores_stored_training_gpu).
+    # stripping it is contained at the consumer rather than here: `stage_environment_package` sees
+    # no package and re-stages from the SAME digest-bound `resolved_sha`, and the worker's loader
+    # raises "worker job spec has no staged environment package" rather than importing anything.
+    # a substituted package is the case that must fail closed, and does: it is bound to the pin by
+    # `verify_staged_environment`, which re-derives both digests before any environment code loads.
     effective_environment.pop("package", None)
     public_sha = public_environment.get("resolved_sha")
     effective_sha = effective_environment.get("resolved_sha")

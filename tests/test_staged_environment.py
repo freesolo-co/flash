@@ -411,8 +411,11 @@ def test_worker_failure_boundary_marks_staged_transient_retriable() -> None:
         "retriable": True,
         "oom": False,
     }
-    assert worker._worker_failure_flags(GitHubUnavailableError("old worker fallback")) == {
-        "retriable": False,
+    # the staged type is NEW, so this must not narrow the boundary to it: a github outage or quota
+    # exhaustion still arrives here as GitHubTransientError, and the worker's answer to either is
+    # the same -- reschedule. classifying only the staged type would fail those runs permanently.
+    assert worker._worker_failure_flags(GitHubUnavailableError("github outage")) == {
+        "retriable": True,
         "oom": False,
     }
 
@@ -578,9 +581,17 @@ def test_identical_archives_for_different_git_shas_use_distinct_manifests_concur
     assert first.artifact_revision != second.artifact_revision
 
 
-def test_missing_package_and_pin_recovery_rejects_before_restage_or_allocation(
-    monkeypatch, tmp_path
+def test_a_stripped_package_restages_from_the_same_pin_instead_of_running_unstaged(
+    tmp_path,
 ) -> None:
+    """Dropping the package from a snapshot must not silently produce an unstaged run.
+
+    `_validate_effective_spec` cannot reject this shape: `to_internal_dict` omits the key when
+    unset, so a stripped package is byte-identical to a run that has not staged yet -- the state of
+    every run between submit and allocation. The containment is at the consumer instead, and the
+    property that matters is that the recovered spec keeps the digest-bound `resolved_sha`, so a
+    restage rebuilds the SAME commit rather than resolving a newer one.
+    """
     import flash.runner as runner
 
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
@@ -592,27 +603,22 @@ def test_missing_package_and_pin_recovery_rejects_before_restage_or_allocation(
     }
     tampered = copy.deepcopy(snapshot)
     tampered["worker_spec"]["environment"].pop("package")
-    tampered["worker_spec"]["environment"].pop("resolved_sha")
     status = runner.RunStatus(
         run_id=worker.run_id,
         state="provisioning",
         spec=public.to_dict(),
         effective_preparation=tampered,
     )
-    calls = {"restage": 0, "allocate": 0}
-    monkeypatch.setattr(
-        runner,
-        "stage_environment_package",
-        lambda *_args, **_kwargs: calls.__setitem__("restage", calls["restage"] + 1),
-    )
-    monkeypatch.setattr(
-        "flash.providers.allocator.allocate",
-        lambda *_args, **_kwargs: calls.__setitem__("allocate", calls["allocate"] + 1),
-    )
 
-    with pytest.raises(ValueError, match="integrity validation"):
-        runner.effective_spec_from_status(status)
-    assert calls == {"restage": 0, "allocate": 0}
+    recovered = runner.effective_spec_from_status(status)
+    assert recovered.environment.package is None
+    # the pin survives, so a restage cannot drift to a different commit than the one staged.
+    assert recovered.environment.resolved_sha == worker.environment.resolved_sha
+
+
+# a SUBSTITUTED package -- the case that must fail closed -- is covered by
+# test_manifest_identity_tampering_fails_before_environment_import above, which asserts the
+# specific digest/entrypoint rejection rather than merely that something raised.
 
 
 def test_initial_lifecycle_defers_transient_staging_before_training(monkeypatch, tmp_path) -> None:

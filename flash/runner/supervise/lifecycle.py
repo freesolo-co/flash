@@ -240,7 +240,6 @@ def _run_job_inner(
 ) -> None:
     from flash.runner import (
         _load_run_deadline_at,
-        _persist_effective_worker_spec,
         _run_training,
         _RunCancelled,
         _update,
@@ -250,11 +249,12 @@ def _run_job_inner(
 
     try:
         # dev replaced the explicit code upload with managed source snapshots, so staging only has
-        # to pin the environment package before the provider is allocated.
+        # to pin the environment package before the provider is allocated. the staged package rides
+        # into the persisted snapshot at the per-attempt persist in `_submit_seed_supervised`, which
+        # already runs after this with the fully planned spec -- persisting a second time here would
+        # hash a half-planned spec no later integrity check can reproduce.
         deadline_at = _load_run_deadline_at(spec.run_id)
         spec = stage_environment_package(spec, deadline_at=deadline_at)
-        if not _persist_effective_worker_spec(spec):
-            raise _RunCancelled(f"run {spec.run_id} went terminal before environment staging")
         with open(log_path, "a") as log:
             _run_training(
                 spec,
