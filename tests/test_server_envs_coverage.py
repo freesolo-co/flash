@@ -701,6 +701,40 @@ def test_image_deployment_smoke_still_rejects_wrong_provenance(monkeypatch):
         _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
 
 
+@pytest.mark.parametrize(
+    "answer",
+    ["BLUE", "green", "a red-and-blue checkerboard", "I cannot see an image."],
+)
+def test_image_deployment_smoke_rejects_an_answer_that_is_not_the_red_square(monkeypatch, answer):
+    """The colour assertion is what makes this smoke image-dependent, so pin it.
+
+    every other image-smoke test hands back "RED", which means they all pass whether or not the
+    model actually looked at the pixels. a deployment whose vision path is broken -- wrong
+    processor, dropped media, placeholders that never expanded -- still answers *something*, and
+    without this the suite would accept it as verified. the sibling test already proves the prompt
+    never says "red", so the only way to answer it is to decode the image.
+    """
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: _smoke_response(answer))
+
+    with pytest.raises(ServingError, match="did not identify the trusted red square"):
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+
+def test_text_only_model_smoke_does_not_require_the_red_answer(monkeypatch):
+    """The control: the colour gate must apply to image-capable models only.
+
+    a text-only deployment never receives the image, so requiring "RED" from it would fail every
+    text model. this is what proves the gate above keys on capability rather than being global.
+    """
+    monkeypatch.setattr(
+        serving._app, "serve_chat", lambda **_kwargs: _smoke_response("The answer is 4")
+    )
+
+    out = _run_smoke(_smoke_spec(thinking=False))
+
+    assert out["verify_kind"] == "fixed_prompt"
+
+
 def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(monkeypatch):
     calls = []
     validated = []
