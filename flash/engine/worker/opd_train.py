@@ -35,6 +35,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     resolve_rollout_enforce_eager,
     resolve_verl_loggers,
     resolve_verl_python,
+    rollout_fp8_kv,
     rollout_sleep_unsupported,
     run_verl_training,
     shim_marker_file,
@@ -317,7 +318,7 @@ def run_opd_train(spec=None) -> None:
         gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
         # ONE child answers every independent capability question. each used to cost its own interpreter, and the torch/verl import -- not the question -- was the price.
         caps = probe_verl_capabilities(python_bin, gdn_module)
-    # enable fp8 kv on cc >= 8.9 only for non-gdn models; gdn sleep/wake crashes on hybrid caches. keep this aligned with vram.py, and keep the device probe separate from gdn classification.
+    # enable fp8 kv on cc >= 8.9. a gdn hybrid qualifies only when the catalog pins its rollout engine resident: it is sleep/WAKE that crashes on the hybrid cache, not gdn itself. see rollout_fp8_kv. keep this aligned with vram.py, and keep the device probe separate from gdn classification.
     try:
         import torch as _torch_cc
 
@@ -326,7 +327,7 @@ def run_opd_train(spec=None) -> None:
         )
     except Exception:  # no cuda / probe failure -> conservative bf16 kv
         _cc_ok = False
-    fp8_kv = _cc_ok and not gdn_hybrid
+    fp8_kv = rollout_fp8_kv(_cc_ok, gdn_hybrid, model_id)
     # gdn packing requires child support for seq_idx and cu_seqlens; fallbacks discard both and silently bleed state across examples. record whether the child can reset gdn state because successful runs upload no console and failure here is silent contamination; none means non-gdn. see require_gdn_boundary_resets.
     gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
     # run sm86 eagerly because vllm 0.19.1 graph capture degenerates there. sm89 capture is empirically acceptable; enforce_eager overrides async cudagraph settings last at config/vllm.py:1024.
