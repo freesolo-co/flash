@@ -441,14 +441,23 @@ def _validate_cache_ancestor_stat(details: os.stat_result, name: str) -> None:
         raise MaterializationError(f"{name} is not a directory")
     owner = details.st_uid
     writable = bool(details.st_mode & 0o022)
-    root_sticky_shared = (
-        owner == 0
-        and bool(details.st_mode & stat.S_ISVTX)
-        and stat.S_IMODE(details.st_mode) == 0o1777
-    )
+    # a root-owned shared directory is trusted even when it is world writable. /tmp is the sticky
+    # 1777 form of this; a provider's mounted volume is the non-sticky form. runpod mounts its
+    # network volume at /runpod-volume as root-owned 0777 with no sticky bit (measured on a live
+    # pod), which this rejected -- so every runpod deployment died here about two seconds into
+    # startup and was restarted forever. externally that is indistinguishable from a slow image
+    # pull: empty log, proxy 404, and an uptime that never climbs.
+    #
+    # only root can have created or replaced an entry in a root-owned directory tree, and the cache
+    # root and every directory and file inside it still go through _validate_trusted_directory_stat
+    # and _validate_regular_stat, which require our own uid and reject any group or world write bit.
+    # so the traversal below cannot be redirected by an unprivileged user either way; what the
+    # sticky bit adds here is only a restriction between non-root users, none of which own any part
+    # of this path.
+    root_shared = owner == 0
     if owner not in {0, os.getuid()}:
         raise MaterializationError(f"{name} is owned by an untrusted uid")
-    if writable and not root_sticky_shared:
+    if writable and not root_shared:
         raise MaterializationError(f"{name} is group or world writable")
 
 

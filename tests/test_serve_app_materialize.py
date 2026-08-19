@@ -304,10 +304,32 @@ def test_cache_ancestor_policy_allows_narrow_root_directories() -> None:
         _directory_stat(uid=0, permissions=0o1777),
         "root sticky shared ancestor",
     )
+    # a root-owned world-writable ancestor is accepted with OR without the sticky bit. runpod
+    # mounts its network volume as root-owned 0777 and non-sticky (measured on a live pod), and
+    # rejecting that killed the container about two seconds into every startup, forever.
+    _validate_cache_ancestor_stat(
+        _directory_stat(uid=0, permissions=0o777),
+        "root writable non-sticky ancestor",
+    )
+
+
+def test_cache_ancestor_policy_still_rejects_a_non_root_writable_ancestor() -> None:
+    # widening the root case must not widen this one: an ancestor owned by another unprivileged
+    # user is what the traversal actually has to defend against, and it stays rejected whether or
+    # not it carries the sticky bit.
+    foreign_uid = 1 if os.getuid() != 1 else 2
+    for permissions in (0o777, 0o1777, 0o770):
+        with pytest.raises(MaterializationError, match="untrusted uid"):
+            _validate_cache_ancestor_stat(
+                _directory_stat(uid=foreign_uid, permissions=permissions),
+                "foreign writable ancestor",
+            )
+    # and an ancestor owned by us still may not be group or world writable, because we are not
+    # root: anyone in the group could swap a component of the path.
     with pytest.raises(MaterializationError, match="group or world writable"):
         _validate_cache_ancestor_stat(
-            _directory_stat(uid=0, permissions=0o777),
-            "root writable non-sticky ancestor",
+            _directory_stat(uid=os.getuid(), permissions=0o777),
+            "current uid writable ancestor",
         )
 
 
