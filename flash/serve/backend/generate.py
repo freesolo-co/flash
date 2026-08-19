@@ -76,8 +76,13 @@ def render_app(
         "APP_NAME": app_name_for(info.id),
         "BASE_MODEL": info.id,
         "GPU": serving.gpu,
-        "QUANTIZATION": serving.quantization,
-        "KV_CACHE_DTYPE": "fp8",
+        # `serving.quantization` describes the pre-quantized `serve_model_id` checkpoint, which is
+        # a private repo this generated app deliberately cannot reference (see
+        # test_no_private_repo_or_platform_coupling). this app serves the public `info.id` weights,
+        # so claiming that quantization here would ask vllm to quantize a different checkpoint on
+        # the fly -- an engine shape nobody validated on the listed gpu.
+        "QUANTIZATION": None,
+        "KV_CACHE_DTYPE": None,
         "MAX_MODEL_LEN": serving.max_model_len,
         "MAX_NUM_SEQS": serving.max_num_seqs or 8,
         "MAX_NUM_BATCHED_TOKENS": serving.max_num_batched_tokens or 0,

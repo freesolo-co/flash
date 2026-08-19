@@ -125,12 +125,26 @@ def test_a_catalog_prefill_budget_reaches_the_engine_args(model_id):
     assert "if MAX_NUM_BATCHED_TOKENS" in source
 
 
-def test_moe_renders_bf16_and_dense_renders_fp8():
+def test_moe_renders_bf16_and_keeps_its_lora_budget():
     moe = _constants(render_app(MODELS["Qwen/Qwen3.6-35B-A3B"]))
     assert moe["QUANTIZATION"] is None
     assert moe["MAX_LORAS"] == 6
-    dense = _constants(render_app(MODELS["Qwen/Qwen3.5-4B"]))
-    assert dense["QUANTIZATION"] == "fp8"
+
+
+@pytest.mark.parametrize("model_id", _MODEL_IDS)
+def test_the_generated_app_never_quantizes_the_public_checkpoint(model_id):
+    """the catalog's fp8 describes `serve_model_id`, not the weights this app actually loads.
+
+    those pre-quantized repos are private, and this app is forbidden from naming them
+    (test_no_private_repo_or_platform_coupling), so it serves the public `info.id` instead.
+    passing the catalog quantization through would tell vllm to quantize a different checkpoint
+    on the fly, which is an engine shape nobody validated on the listed gpu.
+    """
+
+    rendered = _constants(render_app(MODELS[model_id]))
+    assert rendered["BASE_MODEL"] == model_id
+    assert rendered["QUANTIZATION"] is None
+    assert rendered["KV_CACHE_DTYPE"] is None
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS)
