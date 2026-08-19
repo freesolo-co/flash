@@ -556,7 +556,6 @@ def _patch_fused_submit_preflight(monkeypatch, config, *, reject_config):
     )
     status = SimpleNamespace(state="done")
     runner = SimpleNamespace(
-        _require_supported_adapter_continuation=lambda _spec: None,
         get_status=lambda _run_id: status,
         _warmstart_source_is_authorized=lambda *_args, **_kwargs: True,
         effective_spec_from_status=lambda _status: source_spec,
