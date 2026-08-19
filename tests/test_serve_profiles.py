@@ -282,3 +282,23 @@ def test_profile_mappings_cannot_be_mutated_through_the_registry() -> None:
 
     with pytest.raises(TypeError):
         profile.engine_args["enforce_eager"] = True  # type: ignore[index]
+
+
+def test_image_capable_profiles_enable_tower_connector_lora() -> None:
+    # flash trains image loras with target_modules="all-linear", which peft resolves to include the
+    # vision tower: real published image adapters carry 196 visual.* tensors out of 692
+    # (model.visual.blocks.N.attn.qkv/proj, .mlp.linear_fc1/fc2, model.visual.merger.*).
+    #
+    # vllm only wraps those modules when enable_tower_connector_lora is true. with it false they are
+    # absent from expected_lora_modules, and LoRAModel.from_local_checkpoint RAISES ValueError
+    # ("expected target modules in ... but received ...") rather than dropping them. none of the
+    # four vision suffixes (qkv, proj, linear_fc1, linear_fc2) collide with a language-model
+    # suffix, so the rejection is certain, not incidental: serving an image adapter would fail.
+    for model_id in supported_models():
+        profile = get_profile(model_id)
+        if profile.modality != "multimodal":
+            continue
+        assert profile.enable_tower_connector_lora, (
+            f"{model_id} serves images but disables tower connector lora, so vllm would reject "
+            "every adapter trained on images"
+        )

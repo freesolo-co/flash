@@ -218,7 +218,13 @@ _PROFILES: dict[str, ServingProfile] = {
         # exactly what it will accept rather than a larger number it would silently trim.
         image_limit=4,
         mm_processor_cache_gb=0.0,
-        enable_tower_connector_lora=False,
+        # true, because flash's own image adapters contain vision-tower weights. training targets
+        # "all-linear", which peft resolves to include model.visual.blocks.*.attn.{qkv,proj} and
+        # .mlp.linear_fc{1,2}; real image runs publish 196 such tensors out of 692. with this false
+        # vllm wraps no visual.* module, so those suffixes are missing from expected_lora_modules
+        # and from_local_checkpoint RAISES on them ("expected target modules in ... but received").
+        # a customer who trained on images would get a deployment that refuses to load the adapter.
+        enable_tower_connector_lora=True,
         reasoning_parser=None,
         engine_args={},
         tokenizer_kwargs={},
@@ -251,7 +257,8 @@ _PROFILES: dict[str, ServingProfile] = {
         # image-capable for the same reason as the 9B above.
         image_limit=4,
         mm_processor_cache_gb=0.0,
-        enable_tower_connector_lora=False,
+        # true for the same reason as the 9B above.
+        enable_tower_connector_lora=True,
         reasoning_parser=None,
         engine_args={},
         tokenizer_kwargs={},
