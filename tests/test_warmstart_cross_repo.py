@@ -1179,3 +1179,97 @@ def test_every_algorithm_pair_prepares_a_warm_start(
     # sentinel and let this test pass on the very block it exists to rule out.
     with pytest.raises(_ReachedArtifactResolution):
         R._prepare_init_from_adapter_inner(inherited, token="token")
+
+
+def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
+    """A warm-started SFT run profiles and sizes against the SOURCE's pin, not a fresh one.
+
+    SFT is the only algorithm `prepare_job` force-pins, and it does so immediately after the
+    inheritance. If the child resolved its own pin instead, it would take the base model's CURRENT
+    hub tip -- so `_prepare_init_from_adapter_inner`'s equality check would reject every source
+    trained before the tip last moved, and SFT continuation would work only by luck. The profile
+    digest is keyed on the same revision (`_require_sft_workload_profile`), so the tokenizer would
+    also disagree with the weights actually being continued.
+
+    Asserts what the resolver was HANDED, not just the end state: a `required=True` call arriving
+    with an empty revision is the regression, even when the final spec happens to look right.
+    """
+    import flash.adapters.lora_rank as rank_mod
+    import flash.cost.spec as cost_spec
+    import flash.runner as R
+    import flash.runner.results.checkpoints as checkpoints
+    from flash.core.spec import JobSpec
+
+    source, source_status = _auto_pinned_source(R, org_id="")
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": source.model,
+            "algorithm": "sft",
+            "environment": {"id": "freesolo/math-agent/gsm8k"},
+            "train": {"init_from_adapter": "source-run", "epochs": 1, "max_examples": 8},
+        }
+    )
+    resolver_calls = []
+
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+
+    def fake_resolve(spec, *, required=False):
+        resolver_calls.append((spec.model_revision, required))
+        return spec
+
+    monkeypatch.setattr(R, "_resolve_model_revision", fake_resolve)
+    # a pinned spec makes `resolve_model` re-derive geometry from the commit, which is a live HF
+    # read; size unpinned so this stays a unit test of the ordering.
+    real_resolve = R.resolve_model
+    monkeypatch.setattr(
+        R,
+        "resolve_model",
+        lambda model_id, algorithm, model_revision="": real_resolve(model_id, algorithm),
+    )
+    # sft-only preparation: the packaged dataset and its pinned env are a separate contract from
+    # warm start, and profiling one here would test the profiler rather than the inheritance.
+    profiled = []
+    monkeypatch.setattr(R, "_require_pinned_profile_environment", lambda spec: spec)
+    monkeypatch.setattr(
+        R,
+        "_require_sft_workload_profile",
+        lambda spec: profiled.append(spec.model_revision) or spec,
+    )
+    monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
+    monkeypatch.setattr(
+        checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        lambda adapter_ref, token, revision: {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": source.model,
+            "r": 64,
+            "lora_alpha": 128,
+        },
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "adapter_artifact_identity",
+        lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+            "digest", "config", "adapter_model.safetensors", "weight:1"
+        ),
+    )
+    monkeypatch.setattr(cost_spec, "estimate_for_spec", lambda spec: SimpleNamespace(total_usd=1.0))
+
+    prepared = R.prepare_job(child)
+
+    # the force-pin ran, and it was already holding the source's revision when it did.
+    assert resolver_calls == [(_REVISION, True)], resolver_calls
+    # the tokenizer the profile digest keys on is the base the adapter was actually trained against
+    assert profiled == [_REVISION], profiled
+    assert prepared.worker_spec.model_revision == _REVISION
+    # runner-assigned, not authored: deploy refuses an authored pin, so a self-resolved one would
+    # leave every warm-started sft run undeployable.
+    assert prepared.worker_spec.model_revision_auto is True
+    # source metadata stays authoritative for rank/alpha on this path too
+    assert prepared.worker_spec.train.lora_rank == 64
+    assert prepared.worker_spec.train.lora_alpha == 128
