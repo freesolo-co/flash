@@ -34,6 +34,7 @@ from flash.engine.worker import backend_common, rl_train, sft_train
 from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.train.core.child import runtime as child_runtime
+from flash.engine.worker.train.core.child import runtime as verl_child_runtime
 from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 from flash.engine.worker.train.rl.child import patches as verl_patches
 from flash.engine.worker.train.rl.child import plugin as grpo_plugin
@@ -3151,7 +3152,7 @@ def _vision_hook_installer(torch_module):
     saved = sys.modules.get("torch")
     sys.modules["torch"] = torch_module
     try:
-        yield verl_patches._install_vision_input_grads
+        yield verl_child_runtime.install_vision_input_grads
     finally:
         if saved is None:
             sys.modules.pop("torch", None)

@@ -1854,6 +1854,7 @@ def test_sft_plugin_config_carries_the_canonical_loraplus_marker(tmp_path):
         seed=42,
         loggers=[],
         gdn_reset_arch=None,
+        multimodal=False,
     )
 
     assert json.loads(raw_config)["loraplus_ready_marker"] == _LORAPLUS_READY_MARKER
@@ -2001,7 +2002,7 @@ def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointi
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    sft_plugin._install_reentrant_checkpointing()
+    sft_plugin._install_reentrant_checkpointing(multimodal=False)
     FakeEngine()._build_module()
 
     assert calls[0] == "require_grads"
@@ -2009,6 +2010,60 @@ def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointi
         "gc_enable",
         {"gradient_checkpointing_kwargs": {"use_reentrant": True}},
     )
+
+
+@pytest.mark.parametrize("multimodal", [True, False])
+def test_reentrant_checkpointing_installs_vision_grads_only_when_multimodal(
+    monkeypatch, multimodal
+):
+    """a reentrant-checkpointed vision tower gets ZERO gradient without this hook.
+
+    ``enable_input_require_grads()`` only reaches the text embedding, so pixel values stay
+    grad-free and every ``visual.blocks.*`` lora pair stays exactly at its init value while the
+    language model trains normally. that leaves the aggregate adapter delta large and the deployed
+    red/blue probe passing, so this seam is the only place the regression is observable.
+    """
+    installed = []
+
+    class FakeModule:
+        def enable_input_require_grads(self):
+            pass
+
+        def gradient_checkpointing_enable(self, **kwargs):
+            pass
+
+    class FakeEngine:
+        def _build_module(self):
+            return FakeModule()
+
+    transformer_impl = _module("verl.workers.engine.fsdp.transformer_impl", FSDPEngine=FakeEngine)
+    for name, module in {
+        "verl": _module("verl"),
+        "verl.workers": _module("verl.workers"),
+        "verl.workers.engine": _module("verl.workers.engine"),
+        "verl.workers.engine.fsdp": _module("verl.workers.engine.fsdp"),
+        "verl.workers.engine.fsdp.transformer_impl": transformer_impl,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(
+        sft_plugin.runtime, "install_vision_input_grads", lambda module: installed.append(module)
+    )
+
+    sft_plugin._install_reentrant_checkpointing(multimodal=multimodal)
+    FakeEngine()._build_module()
+
+    assert len(installed) == (1 if multimodal else 0)
+
+
+def test_sft_plugin_config_carries_multimodal_for_the_vision_hook():
+    """the child cannot see the workload, so the parent must ship the multimodal flag."""
+    import inspect
+
+    from flash.engine.worker import sft_train_runner
+
+    writer = inspect.getsource(sft_train_runner._write_sft_child_shims)
+    assert '"multimodal": bool(multimodal),' in writer
+    assert "multimodal=data.multimodal," in inspect.getsource(sft_train_runner._prepare_sft_child)
 
 
 class _TolerantWatcher:

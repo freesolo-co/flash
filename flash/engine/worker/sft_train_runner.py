@@ -543,6 +543,7 @@ def _write_sft_child_shims(
     seed: int,
     loggers: list[str],
     gdn_reset_arch: str | None,
+    multimodal: bool,
 ) -> tuple[str, tuple[str, ...], str]:
     """write the SFT plugin bundle, startup bootstrap, and non-secret plugin config."""
     parent_dir = os.path.dirname(_sft_train.__file__)
@@ -567,6 +568,7 @@ def _write_sft_child_shims(
             "save_at_steps": list(options.save_at_steps),
             "total_steps": int(model.update_horizon),
             "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),
+            "multimodal": bool(multimodal),
             "gdn_model_type": gdn_reset_arch,
             "wandb": "wandb" in loggers,
         },
@@ -652,6 +654,7 @@ def _prepare_sft_child(
         seed=config["seed"],
         loggers=loggers,
         gdn_reset_arch=gdn_reset_arch,
+        multimodal=data.multimodal,
     )
 
     # the RESOLVED width, not the allocated card count: it is what becomes --nproc-per-node below,
