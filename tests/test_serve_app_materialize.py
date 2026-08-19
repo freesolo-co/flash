@@ -27,9 +27,18 @@ from tests.test_serve_app_manifest import BASE_REVISION, _spec_and_inputs
 TOKEN = "scoped-artifact-token-sentinel"
 
 
-def _artifact_bytes(tmp_path: Path, **config_overrides: object) -> tuple[bytes, bytes]:
+def _artifact_bytes(
+    tmp_path: Path, *, adapter_name: str = "default", **config_overrides: object
+) -> tuple[bytes, bytes]:
+    """build one adapter, optionally without the peft adapter-name segment.
+
+    ``adapter_name=""`` produces the "<module>.lora_A.weight" shape verl's model_merger writes,
+    which is what every adapter flash actually serves looks like.
+    """
+
     source = tmp_path / "source"
     source.mkdir()
+    infix = f".{adapter_name}." if adapter_name else "."
     config = {
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
@@ -44,14 +53,11 @@ def _artifact_bytes(tmp_path: Path, **config_overrides: object) -> tuple[bytes, 
     config_path = source / "adapter_config.json"
     config_path.write_bytes(config_bytes)
     weights_path = source / "adapter_model.safetensors"
+    module = "base_model.model.layers.0.self_attn.q_proj"
     save_file(
         {
-            "base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight": np.zeros(
-                (16, 2), dtype=np.float32
-            ),
-            "base_model.model.layers.0.self_attn.q_proj.lora_B.default.weight": np.zeros(
-                (2, 16), dtype=np.float32
-            ),
+            f"{module}.lora_A{infix}weight": np.zeros((16, 2), dtype=np.float32),
+            f"{module}.lora_B{infix}weight": np.zeros((2, 16), dtype=np.float32),
         },
         weights_path,
     )
@@ -383,3 +389,41 @@ def test_locked_cache_revalidates_replacement_before_release(tmp_path: Path) -> 
 
     with pytest.raises(MaterializationError, match=r"size|digest|changed"):
         replace_after_validation()
+
+
+def test_adapter_without_a_peft_adapter_name_segment_validates(tmp_path: Path) -> None:
+    # verl's model_merger produces every adapter flash serves, and it writes
+    # "<module>.lora_A.weight" with no adapter-name segment. the validator demanded exactly two
+    # leaf parts, so it rejected all of them with "malformed LoRA tensor key" -- after the
+    # provider had created and started billing for the app, volume, secret, and pod. the whole
+    # materialize suite passed because every fixture here hand-wrote ".default.weight", a shape
+    # flash's own exporter never emits.
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path, adapter_name="")
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+
+    hydrate_manifest(
+        manifest,
+        cache,
+        token_fd=_token_fd(),
+        snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+    )
+
+    validate_manifest_cache(manifest, cache)
+
+
+def test_lora_tensor_key_with_extra_leaf_segments_is_still_refused(tmp_path: Path) -> None:
+    # relaxing the leaf count must not turn into accepting anything: a key carrying more than an
+    # optional adapter name before "weight" is not a shape peft or verl produces, and pairing on
+    # it would silently merge distinct tensors under one identity.
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path, adapter_name="default.extra")
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+
+    with pytest.raises(MaterializationError, match="malformed LoRA tensor key"):
+        hydrate_manifest(
+            manifest,
+            cache,
+            token_fd=_token_fd(),
+            snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+        )

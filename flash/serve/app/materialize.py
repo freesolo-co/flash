@@ -540,10 +540,20 @@ def _validate_lora_pairs(tensors: Mapping[str, tuple[int, ...]]) -> None:
             raise MaterializationError("adapter safetensors contains a non-LoRA tensor")
         factor, infix = matches[0]
         module, _, leaf = key.partition(infix)
+        # the adapter name between the infix and "weight" is optional. peft writes
+        # "<module>.lora_A.<adapter>.weight" when saving a named adapter, but verl's model_merger
+        # -- which is what produces every adapter flash serves -- writes "<module>.lora_A.weight"
+        # with no name at all. demanding exactly two leaf parts rejected every real flash adapter
+        # while accepting the hand-built ".default.weight" fixtures, so the whole materialize
+        # suite passed against a key shape flash does not actually produce. the adapter name is
+        # only part of the pairing identity, so an absent one pairs under "".
         leaf_parts = leaf.split(".")
-        if not module or len(leaf_parts) != 2 or not leaf_parts[0] or leaf_parts[1] != "weight":
+        if not module or not leaf_parts or leaf_parts[-1] != "weight" or len(leaf_parts) > 2:
             raise MaterializationError("adapter safetensors contains a malformed LoRA tensor key")
-        pair = pairs.setdefault((module, leaf_parts[0]), {})
+        adapter_name = leaf_parts[0] if len(leaf_parts) == 2 else ""
+        if len(leaf_parts) == 2 and not adapter_name:
+            raise MaterializationError("adapter safetensors contains a malformed LoRA tensor key")
+        pair = pairs.setdefault((module, adapter_name), {})
         if factor in pair:
             raise MaterializationError("adapter safetensors contains duplicate LoRA factors")
         pair[factor] = shape
