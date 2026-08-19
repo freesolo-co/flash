@@ -445,7 +445,7 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
     spec = {
         **SPEC,
         "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
+        "train": {**SPEC["train"], "teacher_model": "deepseek-v4-pro"},
     }
 
     res = api.post(
@@ -479,7 +479,7 @@ def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monk
     spec = {
         **SPEC,
         "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
+        "train": {**SPEC["train"], "teacher_model": "deepseek-v4-pro"},
     }
 
     res = api.post(
@@ -644,9 +644,31 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
     unsupported_spec = {
         **SPEC,
-        # sft continuation is rejected statically and can never launch regardless of balance.
-        "algorithm": "sft",
-        "train": {**SPEC["train"], "init_from_adapter": "source-run"},
+        # image records distilled from a text-only teacher. the subject of this test is the
+        # ORDERING, so the case only has to be something static validation refuses; it deliberately
+        # is not a warm-start or a multi-turn-image case, because both of those were once
+        # unsupported and have since been implemented, and each silently turned this into a test
+        # that asserted nothing the moment its premise became supported. a teacher that cannot see
+        # images is a property of the teacher, not a gap waiting to be closed.
+        "algorithm": "opd",
+        "train": {**SPEC["train"], "teacher_model": "deepseek-v4-pro"},
+        "environment": {
+            **SPEC["environment"],
+            "params": {
+                "records": [
+                    {
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
+                                ],
+                            }
+                        ]
+                    }
+                ],
+            },
+        },
     }
     res = api.post(
         "/v1/runs",
@@ -655,7 +677,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     )
 
     assert res.status_code == 400, res.text
-    assert "SFT adapter continuation is not supported" in res.text
+    assert "cannot see images" in res.text
     assert "insufficient" not in res.text
 
 

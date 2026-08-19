@@ -563,6 +563,7 @@ def test_child_glue_image_limits_match_the_parent_normalizer():
     rejects mid-rollout, and lowering one alone would silently re-validate already-accepted media.
     nothing else pins the two together, so pin them here.
     """
+    from flash.content import image_descriptors as _image_descriptors
     from flash.engine.worker.train.core.child import glue as child_glue
 
     assert mm.MAX_IMAGES_PER_EXAMPLE == child_glue._MAX_IMAGES_PER_REPLY
@@ -571,5 +572,12 @@ def test_child_glue_image_limits_match_the_parent_normalizer():
     assert mm.MAX_IMAGE_WIDTH == child_glue._MAX_IMAGE_WIDTH
     assert mm.MAX_IMAGE_HEIGHT == child_glue._MAX_IMAGE_HEIGHT
     assert mm.MAX_IMAGE_PIXELS == child_glue._MAX_IMAGE_PIXELS
-    assert mm.MAX_TOTAL_IMAGE_PIXELS == child_glue._MAX_TOTAL_IMAGE_PIXELS
     assert mm.MAX_TOTAL_DECODED_BYTES == child_glue._MAX_TOTAL_DECODED_BYTES
+
+    # the caps above are derived from the per-mode byte table, so equal caps do not by themselves
+    # prove the two copies agree: adding a mode to one table only (say `"RGBX": 4`) leaves the max
+    # -- and therefore every cap -- unchanged while the per-image decoded peaks silently diverge.
+    # pin the inputs, not just the outputs.
+    assert _image_descriptors._MODE_BYTES_PER_PIXEL == child_glue._MODE_BYTES_PER_PIXEL
+    assert _image_descriptors.RGB_BYTES_PER_PIXEL == child_glue._RGB_BYTES_PER_PIXEL
+    assert _image_descriptors.WORST_BYTES_PER_PIXEL == child_glue._WORST_BYTES_PER_PIXEL

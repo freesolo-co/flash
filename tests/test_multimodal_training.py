@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import json
 import urllib.parse
@@ -543,22 +544,71 @@ def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
         mm.decode_image_descriptors([descriptor], root)
 
 
-def test_the_advertised_pixel_cap_is_reachable_by_a_real_image():
-    """An image exactly at the pixel cap must pass the decoded-memory guard too.
+def test_an_image_at_the_advertised_pixel_cap_survives_the_decoded_memory_guard(
+    monkeypatch, tmp_path
+):
+    """A real image exactly at the pixel cap must pass the memory guard that runs after it.
 
     The two limits are enforced in sequence, so a pixel cap the memory guard would always reject
-    is not a limit at all -- it is a promise the validator breaks. With the cap chosen
-    independently of the budget they disagreed: a 4K RGB screenshot (8.3 MP) sat under an
-    advertised 16.7 MP cap and still failed at ~71 MiB against 64 MiB. Assert the relationship
-    rather than the number so a future edit to either side has to keep them consistent.
-    """
-    worst_case_decoded_bytes = mm.MAX_IMAGE_PIXELS * _image_descriptors.WORST_BYTES_PER_PIXEL
-    assert worst_case_decoded_bytes <= mm.MAX_TOTAL_DECODED_BYTES
+    is not a limit at all -- it is a promise the validator breaks. That was the live bug: with the
+    cap chosen independently of the budget, a 4K RGB screenshot (8.3 MP) sat under an advertised
+    16.7 MP cap and still failed at ~71 MiB against 64 MiB.
 
-    # and the cap is not merely safe by being tiny: one more pixel would exceed the budget, so
-    # this is the largest image the decoded-memory guard can actually admit.
-    assert (mm.MAX_IMAGE_PIXELS + 1) * _image_descriptors.WORST_BYTES_PER_PIXEL > (
-        mm.MAX_TOTAL_DECODED_BYTES
+    This pushes an actual image through `validate_image_descriptors` rather than asserting the
+    arithmetic. Asserting `MAX_IMAGE_PIXELS * WORST_BYTES_PER_PIXEL <= MAX_TOTAL_DECODED_BYTES`
+    looks like it pins the derivation, but for `cap = budget // worst` that inequality is a
+    property of floor division -- it holds for every budget and every factor, so it stays green
+    even when the guard's own formula is changed out from under it. Only a real decode can tell
+    whether the number the guard computes agrees with the number the cap was derived from.
+
+    The cap is scaled down here (via the real limit constants) so the test decodes a small image
+    instead of allocating 6.7 MP; the ratio between cap and budget is what is under test, and it
+    is preserved exactly.
+    """
+    root, _image = _package(tmp_path)
+    worst = _image_descriptors.WORST_BYTES_PER_PIXEL
+
+    # a 4x4 RGBA image: the worst decoded mode, so its real peak is the one the cap assumes.
+    image_module = pytest.importorskip("PIL.Image")
+    out = io.BytesIO()
+    image_module.new("RGBA", (4, 4), (255, 0, 0, 255)).save(out, format="PNG")
+    data = out.getvalue()
+    pixels = 16
+
+    # the cap, derived exactly as the module derives it, for a budget this image sits at.
+    monkeypatch.setattr(mm, "MAX_TOTAL_DECODED_BYTES", pixels * worst)
+    monkeypatch.setattr(mm, "MAX_IMAGE_PIXELS", mm.MAX_TOTAL_DECODED_BYTES // worst)
+    assert pixels == mm.MAX_IMAGE_PIXELS
+
+    # an image exactly at the cap must be accepted: it passes the pixel check by equality, and
+    # its real decoded peak must fit the budget the cap came from.
+    descriptor = mm.normalize_image_source(data, root)
+    assert mm.decode_image_descriptors([descriptor], root)
+
+    # and the cap is not safe merely by being tiny -- one pixel more must not fit the budget.
+    monkeypatch.setattr(mm, "MAX_TOTAL_DECODED_BYTES", (pixels - 1) * worst)
+    with pytest.raises(ValueError, match="decoded images"):
+        mm.decode_image_descriptors([mm.normalize_image_source(data, root)], root)
+
+
+def test_no_cumulative_pixel_cap_shadows_the_decoded_memory_budget():
+    """Image sets are bounded by decoded memory, never by a total pixel count.
+
+    A sum of pixels cannot bound decoded memory: cost depends on each image's decoded mode (1 to 4
+    bytes per pixel) and on their order, and a pixel count carries neither. Every mode-blind total
+    is therefore wrong in one direction. One low enough to be safe for four RGBA images rejects
+    the same pixel count spread across cheaper modes; one high enough to admit those can never
+    fire, because the memory guard rejects first. Concretely, with a 64 MiB budget the memory
+    guard can never admit more than 19,984,521 total pixels, so any cap at or above that is dead
+    code and any cap below it rejects sets the budget permits.
+
+    The per-image cap is different and is kept: one image in the worst mode is exactly the case
+    `WORST_BYTES_PER_PIXEL` describes, so there the derivation is sound.
+    """
+    assert not hasattr(mm, "MAX_TOTAL_IMAGE_PIXELS")
+    assert not any(
+        field.name == "max_total_pixels"
+        for field in dataclasses.fields(_image_descriptors.ImageDescriptorLimits)
     )
 
 
