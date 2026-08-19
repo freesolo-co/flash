@@ -147,6 +147,28 @@ def _require_reasoning_compatibility(
         raise RuntimeNotReadyError("vllm reasoning api is missing " + ", ".join(missing))
 
 
+def _has_hub_credential(configured_token: str | None) -> bool:
+    """report whether this process can authenticate to the hub at all.
+
+    an explicit token settles it. otherwise the hub is asked directly instead of reading
+    HF_TOKEN here, because its own resolution order also covers HUGGING_FACE_HUB_TOKEN, the
+    cached login file, and OIDC exchange -- reimplementing that would drift and would wrongly
+    report "no credential" for a container that can in fact download.
+    """
+
+    if configured_token:
+        return True
+    try:
+        from huggingface_hub import get_token
+
+        return bool(get_token())
+    except Exception:
+        # if the hub cannot even be asked, assume no credential and stay on the cache. that is
+        # the safe direction: a needless local-only load fails loudly on a missing file rather
+        # than silently reaching the network from a container that has no way to authenticate.
+        return False
+
+
 class VllmLoraRuntime:
     """one lazy, process-local vllm engine with exact adapter incarnations."""
 
@@ -355,14 +377,19 @@ class VllmLoraRuntime:
         common = {
             "token": self.config.hf_token,
             "trust_remote_code": self.config.trust_remote_code,
-            # load strictly from the cache the launcher hydrated. without this transformers
-            # enumerates the repo's additional_chat_templates/ over the network, and the served
-            # base model is a private repo whose token is deleted at the end of bootstrap. that
-            # call fails closed rather than falling back: list_repo_templates re-raises
-            # RepositoryNotFoundError (what a 401 becomes) instead of reading local files, so a
-            # fully populated cache does not save it. nothing here is fetchable at serve time
-            # anyway -- every start after bootstrap is tokenless by design.
-            "local_files_only": True,
+            # a start with no credential at all must not reach the hub. transformers enumerates
+            # the repo's additional_chat_templates/ over the network, and for a private served
+            # model that 401 fails closed rather than falling back: list_repo_templates re-raises
+            # RepositoryNotFoundError instead of reading local files, so even a fully hydrated
+            # cache does not save it.
+            #
+            # having a credential is exactly what separates the two callers. the packaged
+            # launcher hydrates the cache during bootstrap and then deletes the token, so every
+            # later start has none and must resolve locally. the generated app keeps HF_TOKEN in
+            # its environment and starts against an empty volume, so it must still be allowed to
+            # download. the ambient variable counts because huggingface_hub falls back to it when
+            # token is None, which is how that app has always authenticated.
+            "local_files_only": not _has_hub_credential(self.config.hf_token),
         }
         if self.config.tokenizer_revision is not None:
             common["revision"] = self.config.tokenizer_revision

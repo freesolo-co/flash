@@ -23,6 +23,7 @@ from flash.serve.runtime import (
     StreamReady,
     VllmLoraRuntime,
 )
+from flash.serve.runtime import engine as engine_module
 
 SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}}
 MODEL_REVISION = "a" * 40
@@ -173,6 +174,19 @@ class _Engine:
             raise scenario
         for output in scenario:
             yield output
+
+
+@pytest.fixture(autouse=True)
+def _no_hub_credential(monkeypatch):
+    """pin the loader to the credentialless case unless a test says otherwise.
+
+    whether the loader may reach the hub depends on a real ambient token, so without this the
+    result would differ between a developer machine with HF_TOKEN exported and CI without one.
+    the packaged serving container is credentialless, so that is the default here; the test that
+    owns the credentialed path overrides this.
+    """
+
+    monkeypatch.setattr(engine_module, "_has_hub_credential", lambda _token: False)
 
 
 @pytest.fixture(autouse=True)
@@ -336,16 +350,16 @@ def test_text_tokenizer_receives_exact_revision() -> None:
     ],
     ids=["text", "multimodal"],
 )
-def test_the_loader_never_reaches_the_network_for_the_served_model(
+def test_a_credentialless_loader_never_reaches_the_network(
     image_limit: int | None, recorder: Any, other: Any
 ) -> None:
-    """both loaders must resolve from the hydrated cache alone.
+    """without a credential both loaders must resolve from the hydrated cache alone.
 
-    the served base model is a private repo and the artifact token is deleted at the end of
-    bootstrap, so every later start is tokenless. transformers enumerates the repo's
-    additional_chat_templates/ over the network unless told otherwise, and a 401 there surfaces
-    as RepositoryNotFoundError, which it deliberately re-raises instead of falling back to the
-    cache. so a populated cache is not enough on its own -- the flag has to be passed.
+    the served base model is private and the artifact token is deleted at the end of bootstrap,
+    so every later start of the packaged container is credentialless. transformers enumerates
+    the repo's additional_chat_templates/ over the network unless told otherwise, and a 401
+    there surfaces as RepositoryNotFoundError, which it deliberately re-raises instead of
+    falling back to the cache. so a populated cache is not enough on its own.
 
     setting HF_HUB_OFFLINE cannot substitute for this: huggingface_hub binds that constant when
     it is imported, and hydration imports it earlier in the same process, so a later env write
@@ -366,6 +380,68 @@ def test_the_loader_never_reaches_the_network_for_the_served_model(
     assert len(recorder.calls) == 1
     assert recorder.calls[0][1]["local_files_only"] is True
     asyncio.run(runtime.close())
+
+
+@pytest.mark.parametrize(
+    ("image_limit", "recorder"),
+    [(None, _Tokenizer), (4, _Processor)],
+    ids=["text", "multimodal"],
+)
+def test_a_credentialed_loader_may_still_populate_a_cold_cache(
+    monkeypatch, image_limit: int | None, recorder: Any
+) -> None:
+    """with a credential the loader must stay allowed to download.
+
+    the generated app from `flash serve setup` is the other consumer of this runtime. it starts
+    against an empty volume and fetches the base model with HF_TOKEN, so forcing local-only
+    unconditionally would make its very first start fail closed instead of populating the cache.
+    """
+
+    monkeypatch.setattr(engine_module, "_has_hub_credential", lambda _token: True)
+    runtime = VllmLoraRuntime(
+        EngineConfig(
+            model="served/model",
+            model_revision=MODEL_REVISION,
+            tokenizer_revision=TOKENIZER_REVISION,
+            image_limit=image_limit,
+        )
+    )
+    asyncio.run(runtime.start())
+
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0][1]["local_files_only"] is False
+    asyncio.run(runtime.close())
+
+
+def test_an_ambient_token_counts_as_a_hub_credential(monkeypatch) -> None:
+    """the generated app authenticates through the environment, not through EngineConfig.
+
+    it passes no hf_token and relies on HF_TOKEN being present, so a check that only read
+    config.hf_token would report "no credential" for a container that can in fact download.
+    huggingface_hub is asked directly because its own order also covers HUGGING_FACE_HUB_TOKEN,
+    the cached login file, and OIDC exchange.
+    """
+
+    # the autouse fixture replaces this function for every other test; undo that here so the
+    # real implementation is the thing under test rather than the stub standing in for it.
+    monkeypatch.undo()
+    from flash.serve.runtime.engine import _has_hub_credential
+
+    assert _has_hub_credential("explicit-token") is True
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.get_token = lambda: "ambient-token"
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    assert _has_hub_credential(None) is True
+
+    hub.get_token = lambda: None
+    assert _has_hub_credential(None) is False
+
+    def _explode() -> str:
+        raise RuntimeError("hub unavailable")
+
+    hub.get_token = _explode
+    assert _has_hub_credential(None) is False
 
 
 def test_runtime_mappings_thaw_to_detached_shape_preserving_builtin_containers() -> None:
