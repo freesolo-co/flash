@@ -40,6 +40,9 @@ _PUBLISHED_IMAGE_ADAPTER_SIDECARS = (
 
 _IMAGE_MODEL = "Qwen/Qwen3.5-4B"
 
+# the live image sft gate run whose published adapter is the warm-start source for rl.
+_IMAGE_SFT_SOURCE = "image-gate-qwen35-4b-sft-20260818-06"
+
 
 def _adapter_config(model: str = _IMAGE_MODEL) -> dict:
     return {
@@ -112,6 +115,29 @@ def test_image_run_warm_start_is_accepted_for_supported_algorithms(algorithm):
     assert spec.algorithm == algorithm
 
 
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_rl_warm_start_accepts_an_image_sft_adapter_as_its_source(algorithm):
+    """SFT -> RL is the canonical warm start, and the SFT source may be an image run.
+
+    The direction matters: SFT cannot itself be warm-started (see the sibling test below), but its
+    published adapter is the normal starting point for GRPO and OPD. Nothing about that path was
+    pinned for an image-bearing SFT source, whose adapter carries processor sidecars a text run's
+    does not.
+
+    Validated live against `image-gate-qwen35-4b-sft-20260818-06`: both target algorithms inherited
+    rank 16 / alpha 32, pinned source revision a69435c9, and adopted the runner-chosen base pin
+    851bf6e8 with `model_revision_auto` preserved as True so the child stays deployable.
+    """
+    spec = JobSpec.from_dict(_image_rl_spec(algorithm, source=_IMAGE_SFT_SOURCE))
+    assert spec.train.init_from_adapter == _IMAGE_SFT_SOURCE
+    assert spec.algorithm == algorithm
+    # the source adapter's topology is authoritative, so the public round trip drops both knobs
+    # rather than re-validating a combination the parser refuses.
+    public_train = spec.to_dict()["train"]
+    assert "lora_rank" not in public_train
+    assert "lora_alpha" not in public_train
+
+
 def test_image_run_warm_start_stays_rejected_for_sft():
     """SFT adapter continuation is unsupported product-wide, images included.
 
@@ -137,7 +163,7 @@ def _image_environment() -> dict:
     }
 
 
-def _image_rl_spec(algorithm: str) -> dict:
+def _image_rl_spec(algorithm: str, source: str = "image-gate-qwen35-4b-opd-20260818-06") -> dict:
     train = {
         "max_steps": 3,
         "max_examples": 1,
@@ -145,7 +171,7 @@ def _image_rl_spec(algorithm: str) -> dict:
         "group_size": 4,
         "max_completion_tokens": 16,
         "max_context_tokens": 1024,
-        "init_from_adapter": "image-gate-qwen35-4b-opd-20260818-06",
+        "init_from_adapter": source,
     }
     if algorithm == "opd":
         train["teacher_model"] = "qwen3.5-397b-a17b"
