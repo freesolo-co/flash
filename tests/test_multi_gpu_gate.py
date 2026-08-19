@@ -1586,9 +1586,9 @@ def test_every_catalog_row_shards_on_every_vllm_tensor_parallel_axis():
         admitted = [width for width in rentable_gpu_counts(8) if width <= cap]
         assert admitted, f"{model_id}: no rentable width survives the cap"
         for width in admitted:
-            assert not _vllm_tp_axis_failures(info, width), (
-                f"{model_id} is admitted at {width} cards but vllm cannot shard it: "
-                f"{_vllm_tp_axis_failures(info, width)}"
+            failures = _vllm_tp_axis_failures(info, width)
+            assert not failures, (
+                f"{model_id} is admitted at {width} cards but vllm cannot shard it: {failures}"
             )
 
 
