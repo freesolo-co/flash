@@ -1,7 +1,7 @@
 """complete immutable serving inputs for one model on one supported provider.
 
 ``provision_modal_deployment`` and ``provision_runpod_deployment`` take a ``DeploymentBundle``,
-which requires an exact ``EngineIdentity`` (28 fields), an exact provider ``Placement``, and a
+which requires an exact ``EngineIdentity`` (27 fields), an exact provider ``Placement``, and a
 digest-qualified ``ServingImage``. Nothing in flash produced those, so the provisioning code had
 no caller outside its tests. This module is that producer.
 
