@@ -1273,3 +1273,82 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
     # source metadata stays authoritative for rank/alpha on this path too
     assert prepared.worker_spec.train.lora_rank == 64
     assert prepared.worker_spec.train.lora_alpha == 128
+
+
+def test_inherited_sft_pin_survives_the_force_pin_when_the_hub_tip_moved(monkeypatch):
+    """The source's sha must outlive `_resolve_model_revision`, not just `_inherit_warmstart_revision`.
+
+    SFT is force-pinned (`required=True`), and an inherited pin is marked runner-assigned, so it
+    reads as unauthored -- which sends the lookup at `revision=None` to the CURRENT hub tip. If the
+    resolver overwrites the inherited sha with that tip, warm start breaks the moment the base model
+    moves, and `_adopted_warmstart_revision` cannot repair it because the pin is already set. Stubbing
+    the resolver would hide exactly that, so this test drives the real one over a moved hub.
+    """
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+
+    moved_tip = "b" * 40
+
+    class _Info:
+        sha = moved_tip
+
+    class _Api:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def model_info(self, _model, revision=None):
+            # a real hub resolves None to whatever the tip is now, which is no longer the source's
+            return _Info() if revision is None else SimpleNamespace(sha=revision)
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+
+    inherited = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3-4B",
+            "algorithm": "sft",
+            "model_revision": _REVISION,
+            "model_revision_auto": True,
+            "train": {"init_from_adapter": "source-run", "hf_repo": "org/repo"},
+            "environment": {"id": "org/env"},
+        }
+    )
+
+    resolved = R._resolve_model_revision(inherited, required=True)
+
+    assert resolved.model_revision == _REVISION, (
+        f"force-pin overwrote the inherited source pin with {resolved.model_revision!r}"
+    )
+    assert resolved.model_revision_auto is True
+
+
+def test_force_pin_still_pins_a_fresh_sft_run_to_the_hub_tip(monkeypatch):
+    """The short-circuit above must not disarm the force-pin it sits in front of."""
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+
+    tip = "b" * 40
+
+    class _Api:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def model_info(self, _model, revision=None):
+            return SimpleNamespace(sha=tip if revision is None else revision)
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+
+    fresh = JobSpec.from_dict(
+        {
+            "run_id": "fresh-run",
+            "model": "Qwen/Qwen3-4B",
+            "algorithm": "sft",
+            "train": {"hf_repo": "org/repo"},
+            "environment": {"id": "org/env"},
+        }
+    )
+
+    resolved = R._resolve_model_revision(fresh, required=True)
+
+    assert resolved.model_revision == tip
+    assert resolved.model_revision_auto is True

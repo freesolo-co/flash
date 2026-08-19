@@ -468,6 +468,14 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
     authored = "" if spec.model_revision_auto else spec.model_revision
     if not authored and not required:
         return spec
+    # an inherited warm-start pin is already an immutable sha chosen by a previous run, so there is
+    # nothing left to resolve. re-resolving would look up the CURRENT hub tip (``authored`` is empty
+    # for a runner-assigned pin, so the lookup passes ``revision=None``) and overwrite the source's
+    # sha with it. the warm start would then be rejected for a revision mismatch the moment the base
+    # model moved -- and ``_adopted_warmstart_revision`` cannot undo it, because it refuses to
+    # replace a pin that is already set.
+    if spec.model_revision_auto and re.fullmatch(r"[0-9a-f]{40}", spec.model_revision or ""):
+        return spec
     try:
         from huggingface_hub import HfApi
 
