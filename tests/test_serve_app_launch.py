@@ -37,6 +37,24 @@ def _environment(tmp_path: Path, *, artifact: bool = True) -> dict[str, str]:
     return environment
 
 
+@pytest.fixture(autouse=True)
+def _base_weights_present(monkeypatch):
+    """treat the base weights as already on the volume unless a test says otherwise.
+
+    these tests all run against an empty tmp cache and are about adapters, descriptors, and
+    signals. the real lookup would call huggingface_hub for every one of them, so it is stubbed
+    here rather than reaching the network. the tests that own base-weight behaviour replace this
+    with their own stub, which takes precedence because monkeypatch applies in call order.
+    """
+
+    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        launch,
+        "hydrate_base_weights",
+        lambda *_a, **_k: pytest.fail("base weights were already present"),
+    )
+
+
 def _successful_serve(captured: dict[str, object]):
     async def serve(args, manifest, *, inference_token_fd: int, on_signals_installed):
         captured["args"] = args
@@ -208,6 +226,106 @@ def test_launcher_hydrates_missing_cache_through_closed_descriptor(
             os.fstat(captured[key])
 
 
+def test_bootstrap_hydrates_base_weights_while_the_artifact_token_still_exists(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # the served base model is a private repo, so vllm cannot fetch it anonymously. the artifact
+    # token exists only during bootstrap, so if the weights are not pulled onto the volume here
+    # they can never be pulled at all: the finalized redeploy carries no token. every offline test
+    # passed because they all stubbed adapter hydration and no test asserted on the base model,
+    # so both providers deployed successfully and then died inside the container with
+    # "Freesolo-Co/Qwen3.5-4B-FP8 is not a local folder", after billing had already started.
+    environment = _environment(tmp_path)
+    captured: dict[str, object] = {}
+
+    def weights_absent(*_args, **_kwargs):
+        return False
+
+    def hydrate_weights(_manifest, _cache_root, *, token_fd: int):
+        captured["weights_token"] = read_artifact_token_fd(token_fd)
+
+    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(launch, "base_weights_are_cached", weights_absent)
+    monkeypatch.setattr(launch, "hydrate_base_weights", hydrate_weights)
+    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+
+    launch.run_launcher(environment)
+
+    assert captured["weights_token"] == ARTIFACT_TOKEN
+
+
+def test_missing_base_weights_without_a_token_fail_before_the_engine_starts(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # a finalized container with a cold volume cannot recover: it has no token, and vllm would
+    # otherwise reach the network anonymously and fail deep inside engine construction. failing
+    # here keeps the reason attributable instead of surfacing as a transformers OSError.
+    environment = _environment(tmp_path, artifact=False)
+    serve_calls = 0
+
+    async def serve(*_args, **_kwargs):
+        nonlocal serve_calls
+        serve_calls += 1
+
+    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: False)
+    monkeypatch.setattr(launch, "_serve", serve)
+
+    with pytest.raises(launch.LaunchError, match="artifact token is required"):
+        launch.run_launcher(environment)
+
+    assert serve_calls == 0
+
+
+def test_cached_base_weights_are_not_downloaded_again_on_a_warm_restart(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # scale-from-zero is the common case and carries no artifact token. re-downloading would make
+    # every cold start pay for the full base model, and on a finalized container it would fail.
+    environment = _environment(tmp_path, artifact=False)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        launch,
+        "hydrate_base_weights",
+        lambda *_a, **_k: pytest.fail("a warm volume must not re-download the base weights"),
+    )
+    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+
+    launch.run_launcher(environment)
+
+    assert captured["inference_token"] == INFERENCE_TOKEN
+
+
+def test_hub_cache_is_bound_to_the_volume_for_the_engine_child(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # hydration and vllm are different processes. hydration writes into the volume's hub cache,
+    # and the engine resolves the base model through huggingface_hub's own cache lookup, so if
+    # the two disagree the engine finds nothing and tries the network with no token. the child
+    # environment is scrubbed to an allowlist, so the names must survive that scrub too.
+    environment = _environment(tmp_path, artifact=False)
+    cache_root = environment["FLASH_SERVING_CACHE_ROOT"]
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
+    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+
+    launch.run_launcher(environment)
+
+    assert environment["HF_HOME"] == cache_root
+    assert environment["HF_HUB_CACHE"] == str(launch.base_weights_cache_path(cache_root))
+    scrubbed = launch._scrub_child_environment(environment)
+    assert scrubbed["HF_HUB_CACHE"] == str(launch.base_weights_cache_path(cache_root))
+
+
 def test_sigterm_during_hydration_aborts_and_closes_startup_state(
     monkeypatch,
     tmp_path: Path,
@@ -326,6 +444,9 @@ async def serve(*_args, **_kwargs):
 
 launch.validate_manifest_cache = missing
 launch.hydrate_manifest = terminate
+# this probe is about the adapter hydration signal window, so the base weights are declared
+# present rather than reaching huggingface_hub from a subprocess with an empty cache.
+launch.base_weights_are_cached = lambda *_a, **_k: True
 launch._serve = serve
 try:
     launch.run_launcher(environment)
@@ -388,6 +509,9 @@ def create_app(*_args, **_kwargs):
 
 launch._load_project_boundaries()
 launch.validate_manifest_cache = lambda *_args: {{}}
+# this probe is about the signal window between bootstrap and uvicorn, so the base weights are
+# declared present rather than reaching huggingface_hub from a subprocess with an empty cache.
+launch.base_weights_are_cached = lambda *_a, **_k: True
 app_main.bootstrap_serving = bootstrap
 app_main.create_app = create_app
 launch._serve = app_main._serve

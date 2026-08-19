@@ -39,6 +39,11 @@ _SAFE_CHILD_COPIED_ENV_NAMES = frozenset(
         "FLASH_SERVING_MANIFEST",
         "FLASH_SERVING_MANIFEST_ID",
         "FLASH_SERVING_PORT",
+        # the hub cache location, so the child engine reads the weights bootstrap hydrated into
+        # the volume instead of looking in ephemeral storage and reaching for the network.
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "HF_HUB_DISABLE_XET",
         "LANG",
         "LC_ALL",
         "NVIDIA_DRIVER_CAPABILITIES",
@@ -54,7 +59,10 @@ _FIXED_CHILD_ENVIRONMENT = {
 ServingRuntimeSecrets: Any = None
 MaterializationError: Any = None
 adapter_cache_path: Any = None
+base_weights_are_cached: Any = None
+base_weights_cache_path: Any = None
 decode_manifest_environment: Any = None
+hydrate_base_weights: Any = None
 hydrate_manifest: Any = None
 validate_manifest_cache: Any = None
 _prepare_cache_root: Any = None
@@ -87,7 +95,10 @@ def _load_project_boundaries() -> None:
     global _prepare_cache_root
     global _serve
     global adapter_cache_path
+    global base_weights_are_cached
+    global base_weights_cache_path
     global decode_manifest_environment
+    global hydrate_base_weights
     global hydrate_manifest
     global validate_manifest_cache
 
@@ -99,6 +110,13 @@ def _load_project_boundaries() -> None:
         _prepare_cache_root as loaded_prepare_cache_root,
     )
     from flash.serve.app.materialize import adapter_cache_path as loaded_adapter_cache_path
+    from flash.serve.app.materialize import (
+        base_weights_are_cached as loaded_base_weights_are_cached,
+    )
+    from flash.serve.app.materialize import (
+        base_weights_cache_path as loaded_base_weights_cache_path,
+    )
+    from flash.serve.app.materialize import hydrate_base_weights as loaded_hydrate_base_weights
     from flash.serve.app.materialize import hydrate_manifest as loaded_hydrate_manifest
     from flash.serve.app.materialize import (
         validate_manifest_cache as loaded_validate_manifest_cache,
@@ -118,8 +136,14 @@ def _load_project_boundaries() -> None:
         _serve = loaded_serve
     if adapter_cache_path is None:
         adapter_cache_path = loaded_adapter_cache_path
+    if base_weights_are_cached is None:
+        base_weights_are_cached = loaded_base_weights_are_cached
+    if base_weights_cache_path is None:
+        base_weights_cache_path = loaded_base_weights_cache_path
     if decode_manifest_environment is None:
         decode_manifest_environment = loaded_decode_manifest_environment
+    if hydrate_base_weights is None:
+        hydrate_base_weights = loaded_hydrate_base_weights
     if hydrate_manifest is None:
         hydrate_manifest = loaded_hydrate_manifest
     if validate_manifest_cache is None:
@@ -313,19 +337,54 @@ def _secret_descriptor(value: str):
 
 
 def _prepare_cache(manifest: Any, cache_root: str, artifact_token: str | None) -> None:
+    """make both the adapters and the base weights present before the engine starts.
+
+    the served base model is a private repo, and the artifact token is deleted at the end of
+    bootstrap, so the weights have to reach the persistent volume while the token still exists.
+    every later start -- including the finalized redeploy that carries no token at all -- then
+    resolves them offline from that volume.
+    """
+
+    adapters_missing = True
     try:
         validate_manifest_cache(manifest, cache_root)
-        return
+        adapters_missing = False
     except MaterializationError as exc:
         if not _cache_has_missing_adapter(manifest, cache_root):
             raise LaunchError("serving cache validation failed") from exc
+    weights_missing = not base_weights_are_cached(manifest, cache_root)
+    if not adapters_missing and not weights_missing:
+        return
     if artifact_token is None:
         raise LaunchError("artifact token is required when serving cache hydration is missing")
     try:
-        with _secret_descriptor(artifact_token) as token_fd:
-            hydrate_manifest(manifest, cache_root, token_fd=token_fd)
+        if weights_missing:
+            with _secret_descriptor(artifact_token) as token_fd:
+                hydrate_base_weights(manifest, cache_root, token_fd=token_fd)
+        if adapters_missing:
+            with _secret_descriptor(artifact_token) as token_fd:
+                hydrate_manifest(manifest, cache_root, token_fd=token_fd)
     except MaterializationError as exc:
         raise LaunchError("serving cache hydration failed") from exc
+
+
+def _bind_hub_cache(environment: MutableMapping[str, str], cache_root: str) -> None:
+    """point huggingface_hub at the persistent volume for both hydration and engine start.
+
+    hydration and vllm are separate processes, and vllm resolves the base model through the hub's
+    own cache lookup. without this they use different directories: hydration writes to the volume
+    and the engine then looks in ephemeral container storage, finds nothing, and tries the network
+    with no token. setting it here -- before hydration -- keeps writer and reader on one path.
+    """
+
+    hub_cache = str(base_weights_cache_path(cache_root))
+    environment["HF_HOME"] = cache_root
+    environment["HF_HUB_CACHE"] = hub_cache
+    # the download path this image uses; xet intermittently fails engine init on a cold volume.
+    environment["HF_HUB_DISABLE_XET"] = "1"
+    os.environ["HF_HOME"] = cache_root
+    os.environ["HF_HUB_CACHE"] = hub_cache
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 
 def _port(environment: MutableMapping[str, str]) -> int:
@@ -359,6 +418,7 @@ def _run_with_secrets(
     if type(cache_root) is not str or not cache_root:
         raise LaunchError("serving cache root is invalid")
     _atomic_write_manifest(manifest, cache_root)
+    _bind_hub_cache(environment, cache_root)
     inference_token, artifact_token = secrets._reveal_for_launch()
     _prepare_cache(manifest, cache_root, artifact_token)
     args = SimpleNamespace(

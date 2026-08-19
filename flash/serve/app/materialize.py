@@ -33,6 +33,10 @@ _ARTIFACT_TOKEN_FD_ENV = "FLASH_ARTIFACT_TOKEN_FD"
 _CONFIG_NAME = "adapter_config.json"
 _WEIGHTS_NAME = "adapter_model.safetensors"
 _COPY_CHUNK_BYTES = 1024 * 1024
+# the served base model is a private Freesolo-Co repo, so vllm cannot fetch it anonymously. the
+# artifact token only exists during bootstrap, so the weights are pulled into the persistent
+# volume's hub cache while it is still available and every later start reads them from there.
+BASE_WEIGHTS_CACHE_DIRNAME = "hub"
 
 
 class MaterializationError(RuntimeError):
@@ -43,6 +47,100 @@ def adapter_cache_path(cache_root: str | os.PathLike[str], adapter: ManifestAdap
     """return the digest-addressed runtime directory for one adapter."""
 
     return Path(cache_root) / "adapters" / adapter.aggregate_sha256
+
+
+def base_weights_cache_path(cache_root: str | os.PathLike[str]) -> Path:
+    """return the huggingface hub cache directory shared by every start of one deployment."""
+
+    return Path(cache_root) / BASE_WEIGHTS_CACHE_DIRNAME
+
+
+def base_weights_are_cached(
+    manifest: ServingManifest,
+    cache_root: str | os.PathLike[str],
+    *,
+    snapshot_download_fn: Callable[..., str] | None = None,
+) -> bool:
+    """report whether the exact served base revision resolves offline from the volume cache.
+
+    this asks huggingface_hub itself rather than looking for a directory, because only the hub
+    knows whether every file of that revision landed. a partial download leaves the directory in
+    place, and treating that as cached would defer the failure to vllm on a container with no
+    token left to retry with.
+    """
+
+    if type(manifest) is not ServingManifest:
+        raise MaterializationError("base weight lookup requires an exact ServingManifest")
+    if snapshot_download_fn is None:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download_fn = snapshot_download
+    cache_dir = str(base_weights_cache_path(cache_root))
+    for repo_id, revision in _base_weight_sources(manifest):
+        try:
+            snapshot_download_fn(
+                repo_id=repo_id,
+                revision=revision,
+                cache_dir=cache_dir,
+                local_files_only=True,
+            )
+        except Exception:
+            return False
+    return True
+
+
+def _base_weight_sources(manifest: ServingManifest) -> tuple[tuple[str, str | None], ...]:
+    """return each distinct (repo, revision) vllm loads for this engine identity.
+
+    the tokenizer is usually the same repo as the model, but the profile states them separately,
+    so both are hydrated and deduplicated rather than assuming they agree.
+    """
+
+    engine = manifest.engine
+    sources: list[tuple[str, str | None]] = [(engine.served_model, engine.model_revision)]
+    tokenizer_model = getattr(engine, "tokenizer_model", None) or engine.served_model
+    tokenizer_revision = getattr(engine, "tokenizer_revision", None)
+    sources.append((tokenizer_model, tokenizer_revision))
+    seen: dict[tuple[str, str | None], None] = {}
+    for source in sources:
+        seen.setdefault(source, None)
+    return tuple(seen)
+
+
+def hydrate_base_weights(
+    manifest: ServingManifest,
+    cache_root: str | os.PathLike[str],
+    *,
+    token_fd: int | None = None,
+    snapshot_download_fn: Callable[..., str] | None = None,
+) -> None:
+    """download the served base model into the volume hub cache with the bootstrap token."""
+
+    if type(manifest) is not ServingManifest:
+        raise MaterializationError("base weight hydration requires an exact ServingManifest")
+    token = read_artifact_token_fd(token_fd)
+    try:
+        if snapshot_download_fn is None:
+            from huggingface_hub import snapshot_download
+
+            snapshot_download_fn = snapshot_download
+        root = _prepare_cache_root(cache_root)
+        cache_dir = root / BASE_WEIGHTS_CACHE_DIRNAME
+        cache_dir.mkdir(mode=0o755, exist_ok=True)
+        for repo_id, revision in _base_weight_sources(manifest):
+            try:
+                snapshot_download_fn(
+                    repo_id=repo_id,
+                    revision=revision,
+                    token=token,
+                    cache_dir=str(cache_dir),
+                )
+            except Exception:
+                # the repo id is manifest data and safe to name, but the exception can carry the
+                # request headers, so it is dropped rather than chained.
+                raise MaterializationError(f"base weight download failed for {repo_id}") from None
+    finally:
+        token = ""
 
 
 def read_artifact_token_fd(fd: int | None = None) -> str:
