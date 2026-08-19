@@ -49,6 +49,14 @@ class NormalizedEnvironmentReply:
 
 
 def _image_limits() -> _image_descriptors.ImageDescriptorLimits:
+    """Rebuild the limits per call so the module constants stay late-bound.
+
+    this looks like a frozen value that could be built once at import, but the constants above are
+    the documented override point: the limit tests `monkeypatch.setattr` them on this module and
+    expect the next normalize call to honour the new value. binding a module-level singleton would
+    freeze the import-time numbers and leave those tests green against the original limits, which is
+    the worst failure mode available here -- a caps test that no longer tests the cap.
+    """
     return _image_descriptors.ImageDescriptorLimits(
         max_images=MAX_IMAGES_PER_EXAMPLE,
         max_source_bytes=MAX_IMAGE_SOURCE_BYTES,
@@ -84,10 +92,6 @@ def _descriptor(kind: str, value: str) -> str:
     )
 
 
-def _parse_descriptor(raw: str) -> tuple[str, str]:
-    return _image_descriptors.parse_descriptor(raw)
-
-
 def _decode_data_uri(uri: str) -> tuple[bytes, str]:
     return _image_descriptors.decode_data_uri(uri, _image_limits())
 
@@ -107,10 +111,6 @@ def _validate_dimensions(width: int, height: int) -> int:
 def inspect_image_bytes(data: bytes) -> tuple[int, int, int]:
     """validate one image and return its decoded peak bytes, width, and height."""
     return _image_descriptors.inspect_image_bytes(data, _image_limits())
-
-
-def _inspect_image_bytes(data: bytes) -> int:
-    return inspect_image_bytes(data)[0]
 
 
 def _pil_descriptor(image: object) -> str:
