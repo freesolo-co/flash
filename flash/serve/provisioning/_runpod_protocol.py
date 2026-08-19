@@ -36,9 +36,13 @@ query FlashServingAccountSecrets {
 }
 """.strip()
 
+# the mutations are `secretCreate` / `secretDelete`, not `createSecret` / `deleteSecret`:
+# runpod's graphql schema rejects the latter outright with "Cannot query field ... on type
+# Mutation", so every provisioning attempt died at the first secret. secretDelete takes a bare
+# `id: ID!` rather than an input object and returns Void, which takes no selection set.
 CREATE_SECRET = """
 mutation FlashServingCreateSecret($name: String!, $value: String!) {
-  createSecret(input: {name: $name, value: $value}) {
+  secretCreate(input: {name: $name, value: $value}) {
     id
     name
   }
@@ -46,8 +50,8 @@ mutation FlashServingCreateSecret($name: String!, $value: String!) {
 """.strip()
 
 DELETE_SECRET = """
-mutation FlashServingDeleteSecret($id: String!) {
-  deleteSecret(input: {id: $id})
+mutation FlashServingDeleteSecret($id: ID!) {
+  secretDelete(id: $id)
 }
 """.strip()
 
@@ -258,7 +262,7 @@ def parse_created_secret(value: object) -> RunPodSecretObservation:
     if "errors" in root:
         raise ValueError("graphql response contains errors")
     data = _mapping(root.get("data"), "graphql data")
-    row = _mapping(data.get("createSecret"), "created secret")
+    row = _mapping(data.get("secretCreate"), "created secret")
     return RunPodSecretObservation(
         id=_provider_id(row.get("id"), "secret id"),
         name=_string(row.get("name"), "secret name"),
@@ -266,11 +270,19 @@ def parse_created_secret(value: object) -> RunPodSecretObservation:
 
 
 def parse_deleted_secret(value: object) -> bool:
+    """confirm a secret deletion from runpod's Void-returning secretDelete mutation.
+
+    the field's type is Void, so a success carries `null` rather than `true`. absence of the key
+    is not accepted: that is what a response for some other mutation would look like, and this
+    result is what lets teardown report the secret gone. errors are still rejected first, so a
+    failed delete can never read as a successful one.
+    """
+
     root = _mapping(value, "graphql response")
     if "errors" in root:
         raise ValueError("graphql response contains errors")
     data = _mapping(root.get("data"), "graphql data")
-    if data.get("deleteSecret") is not True:
+    if "secretDelete" not in data or data["secretDelete"] is not None:
         raise ValueError("deleted secret response is malformed")
     return True
 

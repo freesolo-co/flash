@@ -23,7 +23,10 @@ from flash.serve.provisioning import DeploymentBundle, ServingImage, ServingRunt
 from flash.serve.provisioning._common import serving_resource_names
 from flash.serve.provisioning._runpod_probe import RunPodEndpointProbe
 from flash.serve.provisioning._runpod_protocol import (
+    CREATE_SECRET,
+    DELETE_SECRET,
     PROXY_PORT_SPEC,
+    parse_deleted_secret,
     parse_pods,
     parse_templates,
     pod_payload,
@@ -203,11 +206,15 @@ class _FakeTransport:
         mutation: bool,
         deadline_at: float,
     ) -> object:
+        # match runpod's real mutation names. keying off the old ones made this double answer a
+        # document runpod itself rejects, so the whole suite passed against a schema that does
+        # not exist -- the create branch is selected by name, so a renamed field would silently
+        # fall through to the delete branch here rather than failing.
         operation = (
-            "createSecret"
-            if "createSecret" in document
-            else "deleteSecret"
-            if "deleteSecret" in document
+            "secretCreate"
+            if "secretCreate" in document
+            else "secretDelete"
+            if "secretDelete" in document
             else "myself"
         )
         self._record("graphql", operation, mutation, dict(variables))
@@ -221,17 +228,18 @@ class _FakeTransport:
                 }
             }
         self._begin_mutation()
-        if operation == "createSecret":
+        if operation == "secretCreate":
             created = {
                 "id": f"secret{len(self.secrets) + 1:02d}",
                 "name": variables["name"],
             }
             self.secrets.append(created)
-            response = {"data": {"createSecret": dict(created)}}
+            response = {"data": {"secretCreate": dict(created)}}
         else:
             secret_id = variables["id"]
             self.secrets = [item for item in self.secrets if item["id"] != secret_id]
-            response = {"data": {"deleteSecret": True}}
+            # secretDelete's type is Void, so a success is null rather than true.
+            response = {"data": {"secretDelete": None}}
         self._end_mutation()
         return response
 
@@ -280,7 +288,7 @@ class _FakeTransport:
 
     def _record(self, kind: str, operation: str, mutation: bool, payload: object) -> None:
         recorded = payload
-        if operation == "createSecret" and type(payload) is dict:
+        if operation == "secretCreate" and type(payload) is dict:
             value = payload.get("value")
             recorded = {
                 "name": payload.get("name"),
@@ -550,12 +558,12 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
         (kind, operation) for kind, operation, mutation, _payload in transport.calls if mutation
     ]
     assert mutations == [
-        ("graphql", "createSecret"),
-        ("graphql", "createSecret"),
+        ("graphql", "secretCreate"),
+        ("graphql", "secretCreate"),
         ("rest", "POST /networkvolumes"),
         ("rest", "POST /templates"),
         ("rest", "POST /pods"),
-        ("graphql", "deleteSecret"),
+        ("graphql", "secretDelete"),
     ]
 
 
@@ -578,14 +586,14 @@ def test_secret_sentinels_are_confined_to_exact_request_sinks() -> None:
     secret_mutations = [
         payload
         for kind, operation, mutation, payload in transport.calls
-        if kind == "graphql" and operation == "createSecret" and mutation
+        if kind == "graphql" and operation == "secretCreate" and mutation
     ]
     assert [payload["value_present"] for payload in secret_mutations] == [True, True]
     assert [payload["value_is_expected"] for payload in secret_mutations] == [True, True]
     non_secret_calls = [
         payload
         for kind, operation, _mutation, payload in transport.calls
-        if not (kind == "graphql" and operation == "createSecret")
+        if not (kind == "graphql" and operation == "secretCreate")
     ]
     serialized_calls = repr(non_secret_calls)
     assert INFERENCE_SECRET not in serialized_calls
@@ -798,7 +806,7 @@ def test_adoption_deletes_one_lingering_artifact_only_after_endpoint_proof() -> 
     assert result.handle == handle
     assert probe.calls
     assert probe.calls[0][1] is True
-    assert [call[1] for call in _mutation_calls(transport)] == ["deleteSecret"]
+    assert [call[1] for call in _mutation_calls(transport)] == ["secretDelete"]
     assert [item["name"] for item in transport.secrets] == [_names(bundle).inference_secret]
 
 
@@ -904,7 +912,7 @@ def test_ambiguous_adoption_artifact_cleanup_is_outcome_unknown() -> None:
     result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
     assert result.status == "outcome_unknown"
     assert result.handle == handle
-    assert len([call for call in _mutation_calls(transport) if call[1] == "deleteSecret"]) == 1
+    assert len([call for call in _mutation_calls(transport) if call[1] == "secretDelete"]) == 1
 
 
 def test_volume_resize_only_grows_and_mutates_once() -> None:
@@ -985,7 +993,7 @@ def test_teardown_deletes_pod_before_attached_volume_and_confirms_absence() -> N
         f"DELETE /pods/{POD_ID}",
         "DELETE /templates/template01",
         "DELETE /networkvolumes/volume01",
-        "deleteSecret",
+        "secretDelete",
     ]
     assert transport.pods == []
     assert transport.templates == []
@@ -1128,7 +1136,7 @@ def test_artifact_cleanup_ambiguity_keeps_handle_and_never_retries() -> None:
     assert result.error_code == "resource_ambiguous"
     assert result.handle is not None
     assert transport.mutation_count == 6
-    deletes = [call for call in _mutation_calls(transport) if call[1] == "deleteSecret"]
+    deletes = [call for call in _mutation_calls(transport) if call[1] == "secretDelete"]
     assert len(deletes) == 1
 
 
@@ -1187,7 +1195,7 @@ def test_stdlib_transport_attempts_mutation_once_and_sanitizes_malformed_success
     "payload",
     [
         {"errors": [{"message": "rejected"}]},
-        {"data": {"createSecret": {"id": "secret01"}}, "errors": [{"message": "partial"}]},
+        {"data": {"secretCreate": {"id": "secret01"}}, "errors": [{"message": "partial"}]},
     ],
 )
 def test_graphql_mutation_errors_are_always_outcome_unknown(payload: dict[str, object]) -> None:
@@ -1395,6 +1403,33 @@ def test_rest_encodes_query_parameters_without_reopening_the_path_injection_hole
     for bad in ({"": "true"}, {"includeMachine": ""}, {"includeMachine": True}):
         with pytest.raises(ValueError, match="query"):
             transport.rest("GET", "/pods", None, mutation=False, deadline_at=10.0, query=bad)
+
+
+def test_secret_documents_name_the_mutations_runpods_schema_actually_defines() -> None:
+    # runpod's graphql schema has secretCreate / secretDelete. the old createSecret / deleteSecret
+    # names are rejected outright with "Cannot query field ... on type Mutation", so provisioning
+    # died at its first secret. only the fake answered them, which is why every offline test
+    # passed against a schema that does not exist -- pinning the names here is what stops a
+    # matching rename in the fake from keeping the suite green on its own.
+    assert "secretCreate(input: {name: $name, value: $value})" in CREATE_SECRET
+    assert "secretDelete(id: $id)" in DELETE_SECRET
+    # secretDelete takes a bare ID! and returns Void: an input-object argument or a selection set
+    # is a schema error, not a stylistic difference.
+    assert "$id: ID!" in DELETE_SECRET
+    assert "input: {id:" not in DELETE_SECRET
+    for document in (CREATE_SECRET, DELETE_SECRET):
+        assert "createSecret" not in document
+        assert "deleteSecret" not in document
+
+    # Void returns null on success, so a bare `true` is not what runpod sends back.
+    assert parse_deleted_secret({"data": {"secretDelete": None}}) is True
+    for malformed in (
+        {"data": {}},
+        {"data": {"secretDelete": True}},
+        {"data": {"deleteSecret": None}},
+    ):
+        with pytest.raises(ValueError, match="deleted secret response is malformed"):
+            parse_deleted_secret(malformed)
 
 
 def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> None:
