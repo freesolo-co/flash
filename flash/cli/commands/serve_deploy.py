@@ -101,6 +101,7 @@ def cmd_serve_deploy(args) -> int:
             provider,
             workspace_name=getattr(args, "modal_workspace", "") or "",
             environment=getattr(args, "modal_environment", "") or "",
+            region=getattr(args, "modal_region", "") or "",
             account_id=getattr(args, "runpod_account", "") or "",
             data_center_id=getattr(args, "runpod_data_center", "") or "",
         )

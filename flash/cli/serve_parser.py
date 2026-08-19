@@ -108,6 +108,11 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction, handler) -> None:
     # modal placement
     deploy.add_argument("--modal-workspace", default="", help="modal workspace name")
     deploy.add_argument("--modal-environment", default="", help="modal environment name")
+    # modal prices a pinned region above an unpinned one and a narrower region draws on a smaller
+    # capacity pool, so prefer a broad value ("us-east") over a specific one ("us-east-1").
+    deploy.add_argument(
+        "--modal-region", default="", help="modal region, e.g. us-east (broad is cheaper)"
+    )
     # runpod placement
     deploy.add_argument("--runpod-account", default="", help="runpod account id")
     deploy.add_argument("--runpod-data-center", default="", help="runpod data center id")

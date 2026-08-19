@@ -46,10 +46,21 @@ def _args(**overrides) -> argparse.Namespace:
         "workspace",
         "--modal-environment",
         "dev",
+        "--modal-region",
+        "us-east",
     ]
     parsed = _parse(base)
     for key, value in overrides.items():
         setattr(parsed, key, value)
+    # the base args are modal's, so overriding provider="runpod" would otherwise leave modal
+    # placement fields set and placement_for would reject them as foreign inputs -- a fixture
+    # artifact, not the behavior under test. each provider keeps only its own fields.
+    if parsed.provider == "runpod":
+        parsed.modal_workspace = ""
+        parsed.modal_environment = ""
+        parsed.modal_region = ""
+        parsed.runpod_account = parsed.runpod_account or "account1"
+        parsed.runpod_data_center = parsed.runpod_data_center or "US-KS-2"
     return parsed
 
 
@@ -236,7 +247,9 @@ def _result(bundle):
             inference_secret_id="st-" + "1" * 22,
             inference_secret_name="flash-inference-secret-test",
             environment=spec.placement.environment,
-            region=None,
+            # from the spec, not a literal: the handle is validated against the planned placement,
+            # so a hardcoded region silently becomes a mismatch the moment the plan carries one.
+            region=spec.placement.region,
             public_url="https://workspace--flash-app-test.modal.run",
             **common,
         )

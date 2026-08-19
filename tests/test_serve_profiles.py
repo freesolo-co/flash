@@ -152,13 +152,17 @@ def test_engine_identity_changes_when_any_immutable_input_changes() -> None:
 def test_modal_placement_uses_the_validated_gpu_and_matches_tensor_parallelism() -> None:
     profile = get_profile(MODEL)
 
-    placement = placement_for(profile, "modal", workspace_name="workspace", environment="dev")
+    placement = placement_for(
+        profile, "modal", workspace_name="workspace", environment="dev", region="us-east"
+    )
 
     assert type(placement) is ModalPlacement
     assert placement.gpu == profile.modal_gpu
+    # _validate_placement rejects a None region, so a placement built without one could never be
+    # provisioned. asserting it here keeps the profile from silently reverting to that.
+    assert placement.region == "us-east"
     # DeploymentSpec requires placement gpu_count == engine tensor_parallel_size.
     assert placement.gpu_count == profile.tensor_parallel_size
-    assert placement.region is None
 
 
 def test_runpod_placement_uses_the_runpod_gpu_id_not_the_modal_name() -> None:
@@ -177,8 +181,9 @@ def test_runpod_placement_uses_the_runpod_gpu_id_not_the_modal_name() -> None:
 @pytest.mark.parametrize(
     ("provider", "supplied"),
     [
-        ("modal", {"workspace_name": "workspace"}),
-        ("modal", {"environment": "dev"}),
+        ("modal", {"workspace_name": "workspace", "region": "us-east"}),
+        ("modal", {"environment": "dev", "region": "us-east"}),
+        ("modal", {"workspace_name": "workspace", "environment": "dev"}),
         ("runpod", {"account_id": "account"}),
         ("runpod", {"data_center_id": "US-KS-2"}),
     ],
@@ -197,9 +202,15 @@ def test_incomplete_placement_inputs_are_rejected(provider: str, supplied: dict)
     [
         (
             "modal",
-            {"workspace_name": "w", "environment": "dev", "data_center_id": "US-KS-2"},
+            {
+                "workspace_name": "w",
+                "environment": "dev",
+                "region": "us-east",
+                "data_center_id": "US-KS-2",
+            },
         ),
         ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "environment": "dev"}),
+        ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "region": "us-east"}),
     ],
 )
 def test_foreign_provider_inputs_are_rejected_rather_than_ignored(

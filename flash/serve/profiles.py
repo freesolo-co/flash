@@ -152,14 +152,22 @@ class ServingProfile:
             processor_kwargs_fingerprint=canonical_mapping_fingerprint(self.processor_kwargs),
         )
 
-    def modal_placement(self, *, workspace_name: str, environment: str) -> ModalPlacement:
-        """build the exact modal placement for this profile's validated gpu."""
+    def modal_placement(
+        self, *, workspace_name: str, environment: str, region: str
+    ) -> ModalPlacement:
+        """build the exact modal placement for this profile's validated gpu.
+
+        region is required rather than defaulted: `_validate_placement` rejects None, so a profile
+        that hardcoded it produced a placement the planner could never provision. it is also a
+        deployment decision like the workspace, not a property of the model, and modal prices a
+        pinned region above an unpinned one, so the caller states it.
+        """
 
         return ModalPlacement(
             workspace_name=workspace_name,
             environment=environment,
             gpu=self.modal_gpu,
-            region=None,
+            region=region,
             gpu_count=self.tensor_parallel_size,
         )
 
@@ -307,6 +315,7 @@ def placement_for(
     *,
     workspace_name: str = "",
     environment: str = "",
+    region: str = "",
     account_id: str = "",
     data_center_id: str = "",
 ) -> ModalPlacement | RunPodPlacement:
@@ -319,12 +328,24 @@ def placement_for(
     if provider == "modal":
         _reject_foreign(provider, (("account_id", account_id), ("data_center_id", data_center_id)))
         _require_inputs(
-            provider, (("workspace_name", workspace_name), ("environment", environment))
+            provider,
+            (
+                ("workspace_name", workspace_name),
+                ("environment", environment),
+                ("region", region),
+            ),
         )
-        return profile.modal_placement(workspace_name=workspace_name, environment=environment)
+        return profile.modal_placement(
+            workspace_name=workspace_name, environment=environment, region=region
+        )
     if provider == "runpod":
         _reject_foreign(
-            provider, (("workspace_name", workspace_name), ("environment", environment))
+            provider,
+            (
+                ("workspace_name", workspace_name),
+                ("environment", environment),
+                ("region", region),
+            ),
         )
         _require_inputs(provider, (("account_id", account_id), ("data_center_id", data_center_id)))
         return profile.runpod_placement(account_id=account_id, data_center_id=data_center_id)
