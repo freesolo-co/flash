@@ -716,7 +716,20 @@ def cmd_env_push(args) -> int:
         readme = pkg / "README.md"
         if not readme.exists():
             readme.write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
-        # One progress widget spans both phases the user otherwise waits through silently:
+        from flash.envs.package.direct_tokens import (
+            DirectTokenScanError,
+            package_contains_direct_token,
+        )
+
+        try:
+            contains_direct_token = package_contains_direct_token(pkg)
+        except DirectTokenScanError:
+            return _err("environment package could not be scanned safely")
+        if contains_direct_token:
+            return _err(
+                "environment package contains a direct access token; remove it before publishing"
+            )
+        # one progress widget spans both phases the user otherwise waits through silently:
         # packaging (walk + gzip, slow for large datasets) and the upload itself.
         bar = _UploadProgress(env_name)
         bar.status("packaging environment")

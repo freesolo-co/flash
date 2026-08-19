@@ -12,7 +12,6 @@ import time  # noqa: F401
 from dataclasses import dataclass
 
 from flash.core.spec import JobSpec, gpu_count_of, require_matching_seed
-from flash.providers._lifecycle.deadline import deadline_kwargs
 
 # Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
 # max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
@@ -100,8 +99,6 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
 
     preflight_validate_image_opd(spec)
 
-    # Lazy import: dry-run / unit tests never construct a Flash endpoint.
-    from flash.providers._lifecycle.worker import upload_code
     from flash.runner import (
         RUNS_DIR,
         TERMINAL_STATES,
@@ -117,7 +114,7 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
     _update(spec.run_id, "provisioning")
     log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
     try:
-        _run_job_inner(spec, log_path, upload_code, runtime_secrets=runtime_secrets)
+        _run_job_inner(spec, log_path, runtime_secrets=runtime_secrets)
     finally:
         # GC registered endpoints — undeleted endpoints count against the account-wide worker quota.
         # Skip when the run is still non-terminal: that means another live supervisor already owns the
@@ -216,7 +213,7 @@ def _submit_seed_supervised(
     seed: int,
     log,
     runtime_secrets: dict[str, str] | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     attempt_start: int = 0,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures.
@@ -232,7 +229,7 @@ def _submit_seed_supervised(
         seed,
         log,
         runtime_secrets=runtime_secrets,
-        code_prefix=code_prefix,
+        source_snapshot=source_snapshot,
         attempt_start=attempt_start,
     )
 
@@ -257,32 +254,17 @@ def _terminal_failure_detail(exc: BaseException) -> str:
 def _run_job_inner(
     spec: JobSpec,
     log_path: str,
-    upload_code,
     runtime_secrets: dict[str, str] | None = None,
 ) -> None:
-    from flash.runner import (
-        _load_run_deadline_at,
-        _run_training,
-        _RunCancelled,
-        _update,
-        flash_code_prefix,
-        get_status,
-    )
+    from flash.runner import _run_training, _RunCancelled, _update, get_status
 
     try:
-        code_prefix = flash_code_prefix()
-        upload_code(
-            spec.train.hf_repo,
-            code_prefix=code_prefix,
-            **deadline_kwargs(upload_code, _load_run_deadline_at(spec.run_id)),
-        )
         with open(log_path, "a") as log:
             _run_training(
                 spec,
                 log,
                 prior_cost=0.0,
                 runtime_secrets=runtime_secrets,
-                code_prefix=code_prefix,
             )
     except _RunCancelled:
         return  # cancel_run already set the terminal state
@@ -298,7 +280,7 @@ def _run_training(
     *,
     prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     attempt_start: int = 0,
 ) -> None:
     """Train the run's single adapter under supervision; finalize the run.
@@ -316,9 +298,18 @@ def _run_training(
         _update,
         artifacts_dir,
         get_status,
+        source_snapshot_from_status,
+        validate_terminal_source_metrics,
     )
 
-    # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped into ANY
+    if spec.algorithm == "opd":
+        from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+
+        preflight_validate_managed_teacher(spec)
+    status = get_status(spec.run_id)
+    if source_snapshot is None:
+        source_snapshot = source_snapshot_from_status(status, required=True)
+    # defense in depth against the recovery toctou (see attach_run): a run can be flipped into any
     # terminal state — not just `cancelled` — by a concurrent thread/process between the resume
     # decision and here. Bail before _update + the supervised submit so we never submit PAID GPU
     # work for an already-terminal run. _RunCancelled is the terminal signal; callers swallow it.
@@ -340,10 +331,11 @@ def _run_training(
         spec.seed,
         log,
         runtime_secrets=runtime_secrets,
-        code_prefix=code_prefix,
+        source_snapshot=source_snapshot,
         attempt_start=attempt_start,
     )
-    # measured wall x $/hr is recorded in metrics.json for analytics, but is NOT what we charge.
+    metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
+    # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.
     measured_cost = prior_cost + _persist_metrics(spec, metrics)
     # The customer is charged the submit-time QUOTE, not measured wall. Legacy runs without a
     # persisted quote are re-priced from the spec, falling back only for old/unpriceable records.
@@ -359,6 +351,7 @@ def _run_training(
         "done",
         cost_usd=charge_usd,
         artifacts_dir=artifacts_dir(spec),
+        source_verified_attempt=verified_attempt,
     )
     print(
         f"done: train_wall={metrics.get('wall_seconds')} measured={measured_cost:.4f} "

@@ -35,6 +35,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from flash.client.http import ApiClient, ApiError
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 # A representative managed-run spec -- the shape the freesolo bridge / SDK
 # submits: catalog model, Freesolo environment id, and an HF repo for artifacts.
@@ -48,6 +49,7 @@ SPEC = {
 }
 
 _USER_PREFIX = "fslo-user-"
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 _counter = itertools.count()
 
 
@@ -110,6 +112,7 @@ def make_client(tmp_path, monkeypatch):
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo: _SOURCE_SNAPSHOT)
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
     # Keep ``create_run`` offline: the spec is really validated and a run row is

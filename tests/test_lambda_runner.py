@@ -18,8 +18,9 @@ import time
 import pytest
 
 from flash.core.spec import JobSpec
+from tests._helpers.source_snapshot import valid_source_snapshot
 
-CODE_PREFIX = "code/0123456789abcdef0123456789abcdef/flash"
+SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _capsule_member(member: str) -> str:
@@ -75,18 +76,21 @@ def _deadline_at() -> float:
 def _build_payload(builders, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
+    kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
     return builders.build_payload(*args, **kwargs)
 
 
 def _launch(jobs, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
+    kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
     return jobs.launch_and_submit(*args, **kwargs)
 
 
 def _submit(jobs, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
+    kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
     return jobs.submit_run_lambda(*args, **kwargs)
 
 
@@ -151,10 +155,8 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     assert payload["hf_repo"] == "org/repo"
     # The worker env's HF_REPO is sourced from the run's [train] hf_repo (not an operator default).
     assert payload["env"]["HF_REPO"] == "org/repo"
-    assert (
-        _build_payload(builders, _spec(), seed=0, attempt=1, code_prefix=CODE_PREFIX)["code_prefix"]
-        == CODE_PREFIX
-    )
+    assert payload["source_snapshot"] == SOURCE_SNAPSHOT
+    assert "code_prefix" not in payload
 
     script = builders.build_user_data(payload)
     # payload travels base64-encoded inside a quoted heredoc, byte-exact
@@ -248,7 +250,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True, extra_pip=()):
             "env": {},
             "extra_pip": list(extra_pip),
             "hf_prefix": "sft/x",
-            "code_prefix": CODE_PREFIX,
+            "source_snapshot": SOURCE_SNAPSHOT,
             "deadline_at": created_at + 60.0,
             "run_created_at": created_at,
             "run_max_wall_seconds": 60.0,
@@ -274,7 +276,15 @@ def test_build_worker_env_exports_attempt():
     # rejected as mismatched, potentially losing valid retriable evidence.
     from flash.providers._lifecycle import bootstrap as lb
 
-    payload = {"phase": "sft", "seed": 0, "flash_arm": "vast", "attempt": 2, "job_spec_json": "{}"}
+    payload = {
+        "phase": "sft",
+        "seed": 0,
+        "flash_arm": "vast",
+        "attempt": 2,
+        "run_id": "run-1",
+        "job_spec_json": "{}",
+        "source_snapshot": SOURCE_SNAPSHOT,
+    }
     env = lb.build_worker_env(payload)
     assert env["ATTEMPT"] == "2"  # exported from the payload attempt, as a str (worker reads a str)
     payload.pop("attempt")
@@ -323,14 +333,14 @@ def test_bootstrap_fetch_code_failure_is_retriable(monkeypatch):
     lb, calls, markers = _bootstrap_env(monkeypatch)
 
     def boom(_payload):
-        raise RuntimeError("HF 503 storm")
+        raise lb.RetriableBootstrapError("failed to fetch the pinned flash source snapshot")
 
     monkeypatch.setattr(lb, "fetch_code", boom)
     assert lb.main() == 1
     assert calls == []  # crashed before launching the worker subprocess
     ok, error, retriable = markers[0]
     assert not ok
-    assert error == "RetriableBootstrapError: failed to fetch run code from HF"
+    assert error == "RetriableBootstrapError: failed to fetch the pinned flash source snapshot"
     assert retriable is True
 
 
@@ -347,14 +357,20 @@ def test_bootstrap_sets_lambda_arm():
             "attempt": 0,
             "env": {},
             "flash_arm": "lambda",
-            "code_prefix": CODE_PREFIX,
+            "run_id": "run-1",
+            "source_snapshot": SOURCE_SNAPSHOT,
         }
     )
     assert env["FLASH_ARM"] == "lambda"
     # And Lambda's build_payload is what sets flash_arm='lambda'.
     from flash.providers.lambda_.jobs.builders import build_payload
 
-    assert build_payload(_spec(), 0, 0, deadline_at=_deadline_at())["flash_arm"] == "lambda"
+    assert (
+        build_payload(_spec(), 0, 0, source_snapshot=SOURCE_SNAPSHOT, deadline_at=_deadline_at())[
+            "flash_arm"
+        ]
+        == "lambda"
+    )
 
 
 class _FakePipProc:
@@ -838,71 +854,57 @@ def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
         "seed": 0,
         "env": {},
         "flash_arm": "lambda",
-        "code_prefix": CODE_PREFIX,
+        "run_id": "run-1",
+        "source_snapshot": SOURCE_SNAPSHOT,
     }
     assert lb.build_worker_env({**base, "attempt": 3})["ATTEMPT"] == "3"
     assert lb.build_worker_env({**base, "attempt": 0})["ATTEMPT"] == "0"
     with pytest.raises(RuntimeError, match="attempt identity is invalid"):
         lb.build_worker_env(base)
     # And the producer end actually carries the launched attempt into the payload bootstrap reads.
-    assert build_payload(_spec(), seed=0, attempt=2, deadline_at=_deadline_at())["attempt"] == 2
+    assert (
+        build_payload(
+            _spec(),
+            seed=0,
+            attempt=2,
+            source_snapshot=SOURCE_SNAPSHOT,
+            deadline_at=_deadline_at(),
+        )["attempt"]
+        == 2
+    )
 
 
-def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
-    import types
-
+def test_bootstrap_fetch_code_uses_pinned_verified_archive(monkeypatch, tmp_path):
     import huggingface_hub
 
     from flash.providers._lifecycle import bootstrap as lb
 
     monkeypatch.setattr(lb, "CODE_ROOT", str(tmp_path))
-    list_calls = []
-    download_calls = []
-    sleeps = []
+    archive_path = tmp_path / "source.zip"
+    archive_path.write_bytes(b"archive")
+    events = []
 
-    class _FakeApi:
-        def __init__(self, token=None):
-            pass
+    def fake_download(**kwargs):
+        events.append(("download", kwargs))
+        return str(archive_path)
 
-        def list_repo_tree(self, **kw):
-            list_calls.append(kw)
-            return [
-                types.SimpleNamespace(path=f"{CODE_PREFIX}/__init__.py", size=0),
-                types.SimpleNamespace(path=f"{CODE_PREFIX}/runner.py", size=10),
-                types.SimpleNamespace(path=f"{CODE_PREFIX}", tree_id="folder"),
-            ]
+    def fake_materialize(path, descriptor, destination):
+        events.append(("verify-materialize", path, descriptor.to_dict(), destination))
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
-    monkeypatch.setattr(lb.time, "sleep", sleeps.append)
-
-    class _Response:
-        status_code = 429
-
-        def __init__(self) -> None:
-            self.headers = {"Retry-After": "3"}
-
-    class _RateLimited(Exception):
-        response = _Response()
-
-    def fake_hf_hub_download(*, filename, local_dir, **kw):
-        download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
-        if (
-            filename.endswith("runner.py")
-            and len([call for call in download_calls if call["filename"] == filename]) == 1
-        ):
-            raise _RateLimited("slow down")
-        target = tmp_path / filename
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("")
-        return str(target)
-
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(
+        lb._source_snapshot,
+        "materialize_verified_archive_file",
+        fake_materialize,
+    )
     created_at = time.time()
 
     lb.fetch_code(
         {
             "hf_repo": "org/repo",
-            "code_prefix": CODE_PREFIX,
+            "source_snapshot": SOURCE_SNAPSHOT,
+            "run_id": "run-1",
+            "attempt": 2,
             "env": {"HF_TOKEN": "tok"},
             "deadline_at": created_at + 3600.0,
             "run_created_at": created_at,
@@ -910,22 +912,22 @@ def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
         }
     )
 
-    assert list_calls == [
+    assert events[0] == (
+        "download",
         {
             "repo_id": "org/repo",
             "repo_type": "dataset",
-            "path_in_repo": CODE_PREFIX,
-            "recursive": True,
+            "filename": SOURCE_SNAPSHOT["archive_path"],
+            "revision": SOURCE_SNAPSHOT["revision"],
             "token": "tok",
-        }
-    ]
-    assert [call["filename"] for call in download_calls] == [
-        f"{CODE_PREFIX}/__init__.py",
-        f"{CODE_PREFIX}/runner.py",
-        f"{CODE_PREFIX}/runner.py",
-    ]
-    assert all(call["local_dir"] == str(tmp_path) for call in download_calls)
-    assert sleeps == [3.0]
+        },
+    )
+    assert events[1] == (
+        "verify-materialize",
+        str(archive_path),
+        SOURCE_SNAPSHOT,
+        str(tmp_path / "run-1-attempt-2"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1666,6 +1668,7 @@ def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
         0,
         0,
         cache_host_mount="/lambda/nfs/flash-weights",
+        source_snapshot=SOURCE_SNAPSHOT,
         deadline_at=_deadline_at(),
     )
     assert payload["env"]["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
@@ -2353,8 +2356,8 @@ def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
     monkeypatch.setenv("LAMBDA_API_KEY", "lk")
     monkeypatch.setenv("HF_TOKEN", "hf")
     payload = _build_payload(builders, _spec(), seed=0, attempt=2)
-    assert payload["code_prefix"].startswith("code/")
-    assert payload["code_prefix"].endswith("/flash")
+    assert payload["source_snapshot"] == SOURCE_SNAPSHOT
+    assert "code_prefix" not in payload
     script = builders.build_user_data(payload)
     # the uploader INVOCATION precedes the image pull
     uploader = "python3 /opt/flash/capsule.pyz hostlog"
@@ -3553,7 +3556,8 @@ def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
             "attempt": 0,
             "env": {},
             "flash_arm": "lambda",
-            "code_prefix": CODE_PREFIX,
+            "run_id": "run-1",
+            "source_snapshot": SOURCE_SNAPSHOT,
         }
     )
     # A >96k spec is passed via file, mirroring the inline-large path.
@@ -3617,7 +3621,7 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
             "env": {},
             "extra_pip": [],
             "hf_prefix": "sft/x",
-            "code_prefix": CODE_PREFIX,
+            "source_snapshot": SOURCE_SNAPSHOT,
             "deadline_at": created_at + 60.0,
             "run_created_at": created_at,
             "run_max_wall_seconds": 60.0,
@@ -3746,7 +3750,7 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
         attempt=7,
         arm="lambda",
         cache_host_mount="/mnt/cache",
-        code_prefix=CODE_PREFIX,
+        source_snapshot=SOURCE_SNAPSHOT,
         deadline_at=_deadline_at(),
     )
     spec_document = json.loads(representative["job_spec_json"])

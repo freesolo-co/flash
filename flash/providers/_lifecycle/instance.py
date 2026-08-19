@@ -191,7 +191,7 @@ def build_payload(
     cache_host_mount: str | None = None,
     mode: str | None = None,
     models: list | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> dict:
     """The bootstrap's input — field-compatible with the RunPod ``_train_body`` payload, plus the
@@ -203,7 +203,7 @@ def build_payload(
         build_worker_env,
         strip_runpod_volume_env,
     )
-    from flash.runner import flash_code_prefix
+    from flash.source_snapshot import parse_descriptor
 
     canonical_seed = require_matching_seed(spec, seed)
     # strip the runpod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.
@@ -233,12 +233,13 @@ def build_payload(
         # [environment] pip is appended to the worker requirement, never substituted for it.
         "extra_pip": worker_pip_with_extras(spec.environment.id, spec.environment.pip),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
-        "code_prefix": code_prefix or flash_code_prefix(),
         "deadline_at": absolute_deadline,
         "run_created_at": absolute_deadline - max_wall_seconds,
         "run_max_wall_seconds": max_wall_seconds,
         "attempt": attempt_id,
     }
+    if mode != "preload":
+        payload["source_snapshot"] = parse_descriptor(source_snapshot).to_dict()
     if cache_host_mount:
         payload["cache_host_mount"] = cache_host_mount
         # Carry the mount sentinel filename so the bootstrap's mount-check reads it from one constant.

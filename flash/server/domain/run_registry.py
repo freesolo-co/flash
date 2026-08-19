@@ -74,6 +74,7 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         project_id = require_project_id(spec.get("project"))
     except (TypeError, ValueError):
         return False
+    public_status = status.to_dict()
     body = {
         "orgId": org_id,
         "runId": status.run_id,
@@ -88,12 +89,12 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "gpuType": attributed_gpu_type(status) or None,
         "costUsd": status.cost_usd,
         "realizedCostUsd": status.realized_cost_usd,
-        "adapterRef": status.to_dict().get("adapter_ref"),
+        "adapterRef": public_status.get("adapter_ref"),
         "artifactsDir": status.artifacts_dir,
         "error": status.error,
         "spec": spec,
         "deployment": status.deployment,
-        "lastHeartbeat": status.last_heartbeat,
+        "lastHeartbeat": public_status.get("last_heartbeat"),
         "gpuStatus": status.gpu_status,
         "createdAt": _iso_from_epoch(status.created_at),
         "updatedAt": _iso_from_epoch(status.updated_at),

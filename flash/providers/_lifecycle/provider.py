@@ -66,7 +66,7 @@ class InstanceProvider(abc.ABC):
         on_handle: Any,
         attempt: int,
         runtime_secrets: dict[str, str] | None,
-        code_prefix: str | None,
+        source_snapshot: dict | None,
         deadline_at: float | None,
     ) -> PollResult: ...
 
@@ -122,7 +122,7 @@ class InstanceProvider(abc.ABC):
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
-        code_prefix: str | None = None,
+        source_snapshot: dict | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
         from flash.core.spec import require_matching_seed
@@ -136,7 +136,7 @@ class InstanceProvider(abc.ABC):
             on_handle=on_handle,
             attempt=attempt,
             runtime_secrets=runtime_secrets,
-            code_prefix=code_prefix,
+            source_snapshot=source_snapshot,
             deadline_at=_deadline_at,
         )
 

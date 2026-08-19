@@ -21,6 +21,7 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- Managed attempts now pin, verify, and report one immutable Flash source archive across retries and recovery.
 - Multi-turn GRPO now clones each sibling rollout from the task state that produced its prepared
   prompt. Environments that record randomized episode choices on the task during `start_episode`
   are stepped and scored against the same episode the model saw, without sharing mutable state
@@ -53,6 +54,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 - `mypy` runs in CI as an advisory (non-blocking) job.
 
 ### Fixed
+
+- Completed verl children now finish each captured W&B run before the W&B service shuts down,
+  avoiding teardown tracebacks, and `flash env setup` now gives every starter config explicit W&B
+  project and folder-derived run metadata.
 
 - An ordered `[gpu] type` list is now priced over every class it declares acceptable, not just the
   first. Allocation cost-ranks the whole set, so quoting the head alone priced a shape the run may

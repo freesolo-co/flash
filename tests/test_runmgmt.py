@@ -9,8 +9,10 @@ import tempfile
 import pytest
 
 from tests._helpers.runner import provisioned_status
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
@@ -171,6 +173,7 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda spec: spec)
+    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
 
     seen: dict[str, float] = {}
 
@@ -664,7 +667,12 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must use submit quote")),
     )
 
-    lifecycle._run_training(spec, io.StringIO(), prior_cost=0.0)
+    monkeypatch.setattr(
+        runner,
+        "validate_terminal_source_metrics",
+        lambda _status, metrics, expected_attempt=None: (metrics, expected_attempt),
+    )
+    lifecycle._run_training(spec, io.StringIO(), prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
 
     st = runner.get_status(spec.run_id)
     assert st.state == "done"
@@ -744,7 +752,9 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    metrics = lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    metrics = lifecycle._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
 
     assert metrics["wall_seconds"] == 1.0
     assert provider.attempts == [0, 1]
@@ -816,7 +826,9 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    lifecycle._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
 
     assert provider.attempts == [0, 1]
     assert runner.get_status(spec.run_id).remote["attempt"] == 1
@@ -902,7 +914,9 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    lifecycle._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
 
     assert provider.attempts == [0, 1]
     assert allocation_walls == [200.0, 120.0]
@@ -981,7 +995,7 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
 
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance") as exc_info:
-        lifecycle._submit_seed_supervised(spec, spec.seed, log)
+        lifecycle._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert provider.attempts == [0]
     assert allocations == [True]
@@ -1610,7 +1624,9 @@ def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatc
     monkeypatch.setattr(allocator, "allocate", lambda *_args, **_kwargs: allocations.append(True))
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
+        lifecycle._submit_seed_supervised(
+            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+        )
 
     assert allocations == []
     assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 0
@@ -1675,10 +1691,11 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
         "endpoint-old",
         "job-old",
         attempt=persisted_attempt,
-        code_prefix="code/revision",
     )
+    status = provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
     runner._save_status(
-        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
+        status,
         _run_deadline_at=300.0,
         _next_attempt=2,
     )
@@ -2206,7 +2223,7 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
         spec,
         0,
         attempt=2,
-        code_prefix="code/revision",
+        source_snapshot=_SOURCE_SNAPSHOT,
         on_handle=handles.append,
         deadline_at=10_000_000_000.0,
     )
@@ -2579,8 +2596,10 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
     )
+    status = provisioned_status(runner, spec, state="provisioning", created_at=10.0)
+    status.source_snapshot = _SOURCE_SNAPSHOT
     runner._save_status(
-        provisioned_status(runner, spec, state="provisioning", created_at=10.0),
+        status,
         _run_deadline_at=130.0,
         _next_attempt=0,
     )
@@ -2858,7 +2877,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
             spec,
             spec.seed,
             io.StringIO(),
-            code_prefix="code/revision",
+            source_snapshot=_SOURCE_SNAPSHOT,
         )
 
     status = runner.get_status(spec.run_id)
@@ -2941,7 +2960,7 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
             spec,
             spec.seed,
             io.StringIO(),
-            code_prefix="code/revision",
+            source_snapshot=_SOURCE_SNAPSHOT,
         )
 
     raw = runner._load_status_json(spec.run_id)
@@ -2977,5 +2996,5 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     )
 
     with pytest.raises(runner._RunCancelled):
-        lifecycle._run_training(spec, None, prior_cost=0.0)
+        lifecycle._run_training(spec, None, prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
     assert submitted == []  # never charged a GPU for an already-terminal run

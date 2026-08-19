@@ -15,8 +15,22 @@ from tests._helpers.profile import (
     satisfy_sft_profile,
     stub_revision_geometry,
 )
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
+_SOURCE_SNAPSHOT = valid_source_snapshot()
+
+
+@pytest.fixture(autouse=True)
+def _source_snapshot_boundary(monkeypatch):
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
+    monkeypatch.setattr(
+        runner,
+        "validate_terminal_source_metrics",
+        lambda _status, metrics, expected_attempt=None: (metrics, expected_attempt),
+    )
 
 
 def _spec(run_id="flash-1700000001-rt01", algorithm="sft", **gpu_kw) -> JobSpec:
@@ -206,6 +220,7 @@ def test_runpod_allocation_routes_to_runpod_submit(
         spec.seed,
         io.StringIO(),
         runtime_secrets={"WANDB_API_KEY": "user-wb"},
+        source_snapshot=_SOURCE_SNAPSHOT,
     )
     assert metrics["train_tokens"] == 4096
     assert captured["gpu_type"] == "RTX 4090"
@@ -302,7 +317,9 @@ def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, mo
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
 
     with pytest.raises(orch._RunCancelled):
-        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+        orch._submit_seed_supervised(
+            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+        )
 
     status = orch.get_status(spec.run_id)
     assert status.state == "cancelled"
@@ -375,7 +392,9 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(
 
     def submit():
         try:
-            orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+            orch._submit_seed_supervised(
+                spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+            )
         except Exception as exc:
             submit_errors.append(exc)
 
@@ -472,7 +491,9 @@ def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch,
 
     def submit(name):
         try:
-            results[name] = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+            results[name] = orch._submit_seed_supervised(
+                spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+            )
         except Exception as exc:
             results[name] = exc
 
@@ -535,11 +556,15 @@ def test_provider_submission_paths_release_run_lock(orch, monkeypatch, failure_m
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
 
     if failure_mode == "provider_without_callback":
-        metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+        metrics = orch._submit_seed_supervised(
+            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+        )
         assert metrics["train_tokens"] == 4096
     else:
         with pytest.raises(RuntimeError, match="failed after retries"):
-            orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+            orch._submit_seed_supervised(
+                spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+            )
 
     lock = _deploy_lock(spec.run_id)
     assert lock.acquire(blocking=False)
@@ -608,8 +633,12 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     monkeypatch.setattr("flash.cost.spec.estimate_for_spec", fake_estimate)
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    monkeypatch.setattr("flash.providers._lifecycle.worker.upload_code", lambda *a, **k: None)
-    monkeypatch.setattr(orch, "flash_code_prefix", lambda: "code/test/flash")
+    monkeypatch.setattr(orch, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
+    monkeypatch.setattr(
+        orch,
+        "validate_terminal_source_metrics",
+        lambda _status, metrics, expected_attempt=None: (metrics, expected_attempt),
+    )
     monkeypatch.setattr(orch, "_persist_metrics", lambda *a, **k: 0.0)
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
@@ -953,8 +982,12 @@ def test_lifecycle_fallback_pin_is_persisted_for_recovery(orch, monkeypatch):
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    monkeypatch.setattr("flash.providers._lifecycle.worker.upload_code", lambda *a, **k: None)
-    monkeypatch.setattr(orch, "flash_code_prefix", lambda: "code/test/flash")
+    monkeypatch.setattr(orch, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
+    monkeypatch.setattr(
+        orch,
+        "validate_terminal_source_metrics",
+        lambda _status, metrics, expected_attempt=None: (metrics, expected_attempt),
+    )
     monkeypatch.setattr(orch, "_persist_metrics", lambda *a, **k: 0.0)
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
@@ -1127,7 +1160,9 @@ def test_the_allocated_card_count_reaches_the_metrics_the_cost_is_read_from(orch
     spec = _spec(provider="runpod", type="RTX 4090", count=4)
     _seed_status(orch, spec)
 
-    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    metrics = orch._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
 
     assert metrics["allocated_gpu_count"] == 4
     # and the stamp is what pricing then reads, so the two halves compose
@@ -1169,7 +1204,7 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
-    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
     assert metrics["train_tokens"] == 4096
     assert submitted_gpus == ["RTX 4090", "H100"]
     assert cancelled == [("ep1", "j1")]
@@ -1210,7 +1245,7 @@ def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch,
     _seed_status(orch, spec)
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="failed after retries"):
-        orch._submit_seed_supervised(spec, spec.seed, log)
+        orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     # pcie, sxm, then pcie again -- and there it stops, because that third submission is pcie's
     # second refusal and pcie is where the retry keeps landing. not the budget's five: the two
@@ -1258,7 +1293,7 @@ def test_a_named_alternative_still_gets_its_own_look_after_the_first_class_refus
     )
     _seed_status(orch, spec)
     log = io.StringIO()
-    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     # three submissions, not the two a membership set would have allowed: the run survives one
     # refusal from each class and rents pcie on the look the tally kept alive.
@@ -1311,7 +1346,7 @@ def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monke
     log = io.StringIO()
 
     with pytest.raises(RuntimeError, match="teardown could not be confirmed"):
-        orch._submit_seed_supervised(spec, spec.seed, log)
+        orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert submitted_attempts == [0]
     assert deleted_endpoints
@@ -1363,7 +1398,9 @@ def _run_failed_oom_sequence(orch, monkeypatch, failures, *, max_retries):
     spec = _spec(max_retries=max_retries)
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError):
-        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+        orch._submit_seed_supervised(
+            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+        )
     return submitted, on_last_gpu
 
 
@@ -1544,7 +1581,7 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
-    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
     assert metrics["train_tokens"] == 4096
     assert rp_gpus == ["H100"]  # RunPod tried exactly once...
     assert lam_gpus == ["H100"]  # ...then the retry escaped cross-provider to Lambda
@@ -1586,7 +1623,9 @@ def test_shared_cache_zero_retries_submits_exactly_once(orch, monkeypatch, failu
     spec = _spec(max_retries=0, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError, match="failed after retries"):
-        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+        orch._submit_seed_supervised(
+            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+        )
     assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME]
 
 
@@ -1634,7 +1673,9 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
     spec = _spec(max_retries=1, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
     _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    metrics = orch._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
     assert metrics["train_tokens"] == 4096
     # cache attempt -> cache-less SAME class (free fallback) -> GPU-walk to the OTHER class (real retry).
     assert seen == [
@@ -1692,7 +1733,7 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
-    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
     assert metrics["train_tokens"] == 4096
     assert lam_gpus == ["A10"]  # broken Lambda instance tried once...
     assert rp_gpus == ["H100"]  # ...then escaped cross-provider to RunPod
@@ -1742,7 +1783,9 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
     spec = _spec()
     _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    metrics = orch._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
     assert metrics["train_tokens"] == 4096
     assert lam_gpus == ["H100"]  # sick region tried once...
     assert rp_gpus == ["H100"]  # ...then escaped cross-provider to RunPod
@@ -1765,7 +1808,9 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError, match="bad reward fn"):
-        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+        orch._submit_seed_supervised(
+            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+        )
     assert calls == [0]
 
 
@@ -1880,7 +1925,7 @@ def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monk
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
-    orch._submit_seed_supervised(spec, spec.seed, log)
+    orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert gpus == ["H200", "H200"]  # nowhere to walk: the same class is genuinely reused
     action = _retry_action_line(log.getvalue(), 0)
@@ -1930,7 +1975,7 @@ def test_retry_message_admits_when_the_projected_provider_already_failed(orch, m
     spec = _spec(max_retries=2)
     _seed_status(orch, spec)
     log = io.StringIO()
-    orch._submit_seed_supervised(spec, spec.seed, log)
+    orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     # attempt 0 fails runpod, and the only other candidate is also runpod, so the "failover" is
     # back onto the provider that just failed.
@@ -1977,7 +2022,7 @@ def test_retry_message_does_not_deny_a_provider_that_is_in_the_candidate_list(or
     spec = _spec(max_retries=2)
     _seed_status(orch, spec)
     log = io.StringIO()
-    orch._submit_seed_supervised(spec, spec.seed, log)
+    orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     # attempt 1 projects back onto a failed provider while the other one is still in the list.
     action = _retry_action_line(log.getvalue(), 1)
@@ -2017,7 +2062,7 @@ def test_a_genuine_cross_provider_failover_is_not_labelled_exhausted(orch, monke
     _seed_status(orch, spec)
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="failed after retries"):
-        orch._submit_seed_supervised(spec, spec.seed, log)
+        orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     action = _retry_action_line(log.getvalue(), 0)
     assert "@ lambda" in action, action
@@ -2059,7 +2104,7 @@ def test_last_gpu_retry_message_names_the_clamped_back_class_not_the_current_one
     spec = _spec(max_retries=2)
     _seed_status(orch, spec)
     log = io.StringIO()
-    orch._submit_seed_supervised(spec, spec.seed, log)
+    orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     # the clamp-back the message has to describe: cheapest, then the untried SXM, then back.
     assert gpus == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
@@ -2112,7 +2157,7 @@ def test_cache_drop_retry_names_the_same_class_it_reselects(orch, monkeypatch):
     spec = _spec(max_retries=1, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
     _seed_status(orch, spec)
     log = io.StringIO()
-    orch._submit_seed_supervised(spec, spec.seed, log)
+    orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     action = _retry_action_line(log.getvalue(), 0)
     # two classes fit, so the escalation claim must be absent -- but the class is still named.
@@ -2166,7 +2211,7 @@ def test_cache_drop_failure_detail_does_not_contradict_the_action_line(orch, mon
     spec = _spec(max_retries=1, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
     _seed_status(orch, spec)
     log = io.StringIO()
-    orch._submit_seed_supervised(spec, spec.seed, log)
+    orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     block = _retry_block(log.getvalue(), 0)
     assert "expecting to retry on H100 @ runpod again" in block, block
@@ -2214,7 +2259,7 @@ def test_projected_retry_class_is_worded_as_a_projection_not_a_promise(orch, mon
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
-    orch._submit_seed_supervised(spec, spec.seed, log)
+    orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     # the projection named H200; reallocation actually produced H100. the wording must survive that.
     assert gpus == ["H200", "H100"]
@@ -2263,7 +2308,7 @@ def test_sole_class_cache_drop_does_not_claim_the_class_is_exhausted(orch, monke
     spec = _spec(max_retries=1, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
     _seed_status(orch, spec)
     log = io.StringIO()
-    orch._submit_seed_supervised(spec, spec.seed, log)
+    orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     # the flag really is set here -- otherwise this test would pass for the wrong reason.
     assert seen_flags[0] is True, seen_flags
@@ -2302,7 +2347,7 @@ def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     spec = _spec(max_retries=2)
     _seed_status(orch, spec)
     log = io.StringIO()
-    orch._submit_seed_supervised(spec, spec.seed, log)
+    orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     action = _retry_action_line(log.getvalue(), 0)
     assert "expecting to retry on H100 @ runpod again" in action, action
@@ -2349,7 +2394,9 @@ def test_workload_profile_mismatch_fails_fast_instead_of_retrying(orch, monkeypa
     spec = _spec(max_retries=2)
     _seed_status(orch, spec)
     with pytest.raises(WorkloadProfileMismatch):
-        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+        orch._submit_seed_supervised(
+            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+        )
 
     assert submits == []  # never reached a provider
     assert slept == []  # and never backed off waiting for it to clear
@@ -2396,7 +2443,9 @@ def test_unknown_prompt_pool_size_fails_fast_instead_of_retrying(orch, monkeypat
     spec = _spec(max_retries=2)
     _seed_status(orch, spec)
     with pytest.raises(UnknownPromptPoolSize):
-        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+        orch._submit_seed_supervised(
+            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+        )
 
     assert submits == []  # never reached a provider
     assert slept == []  # and never burned the retry budget re-asking an unanswerable question
@@ -2413,7 +2462,14 @@ def test_submit_supplies_the_worker_pip_when_the_author_declared_none() -> None:
     spec = _spec()
     assert not spec.environment.pip
 
-    payload = build_payload(spec, spec.seed, 0, arm="a", deadline_at=1_800_000_000.0)
+    payload = build_payload(
+        spec,
+        spec.seed,
+        0,
+        arm="a",
+        source_snapshot=_SOURCE_SNAPSHOT,
+        deadline_at=1_800_000_000.0,
+    )
 
     assert payload["extra_pip"] == ["freesolo>=0.4.1"]
 
@@ -2431,7 +2487,14 @@ def test_submit_appends_authored_pip_without_displacing_the_worker_spec() -> Non
     spec = _spec()
     spec = replace(spec, environment=replace(spec.environment, pip=("pymongo>=4.6", "rapidfuzz")))
 
-    payload = build_payload(spec, spec.seed, 0, arm="a", deadline_at=1_800_000_000.0)
+    payload = build_payload(
+        spec,
+        spec.seed,
+        0,
+        arm="a",
+        source_snapshot=_SOURCE_SNAPSHOT,
+        deadline_at=1_800_000_000.0,
+    )
 
     assert payload["extra_pip"] == ["freesolo>=0.4.1", "pymongo>=4.6", "rapidfuzz"]
 
@@ -2482,7 +2545,7 @@ def _submit_failure(provider_obj):
             seed=spec.seed,
             log=io.StringIO(),
             runtime_secrets={},
-            code_prefix="p",
+            source_snapshot=_SOURCE_SNAPSHOT,
             attempt_start=0,
             infra_budget=1,
             retry_budget=None,
@@ -2603,7 +2666,7 @@ def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_clas
     _seed_status(orch, spec)
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="failed after retries"):
-        orch._submit_seed_supervised(spec, spec.seed, log)
+        orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     # TWO submissions, not the budget's five: the class refused, the retry confirmed it, and the
     # remaining attempts would each have re-asked the settled question at a full capacity grace.
@@ -2646,7 +2709,7 @@ def test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up(orch, monkey
     spec = _spec(run_id="flash-pinned-gpu-blip", type="H200", provider="runpod")
     _seed_status(orch, spec)
     log = io.StringIO()
-    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert metrics["train_tokens"] == 4096
     assert submitted_gpus == ["H200", "H200"], "the blip must cost a retry, not the run"
@@ -2679,7 +2742,7 @@ def test_dynamic_provider_search_keeps_the_full_capacity_retry_budget(orch, monk
     _seed_status(orch, spec)
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="failed after retries"):
-        orch._submit_seed_supervised(spec, spec.seed, log)
+        orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert submitted_gpus == ["H200"] * (INFRA_RETRY_FLOOR + 1)
     assert "has already refused capacity twice" not in log.getvalue()
@@ -2716,7 +2779,7 @@ def test_multi_count_pin_keeps_retry_budget_when_another_width_can_reappear(orch
     _seed_status(orch, spec)
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="failed after retries"):
-        orch._submit_seed_supervised(spec, spec.seed, log)
+        orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert submissions == [1] * (INFRA_RETRY_FLOOR + 1)
     assert "has already refused capacity twice" not in log.getvalue()
@@ -2744,7 +2807,7 @@ def test_allocation_time_sellout_counts_for_a_fixed_shape(orch, monkeypatch):
     _seed_status(orch, spec)
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="failed after retries"):
-        orch._submit_seed_supervised(spec, spec.seed, log)
+        orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert calls == 2
     assert "has already refused capacity twice" in log.getvalue()
@@ -2772,7 +2835,7 @@ def test_allocation_lookup_outage_keeps_the_full_retry_budget(orch, monkeypatch)
     _seed_status(orch, spec)
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="failed after retries"):
-        orch._submit_seed_supervised(spec, spec.seed, log)
+        orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert calls == INFRA_RETRY_FLOOR + 1
     assert "has already refused capacity twice" not in log.getvalue()
@@ -2804,7 +2867,7 @@ def test_a_provisioned_attempt_resets_the_class_capacity_refusals(orch, monkeypa
     spec = _spec(run_id="flash-capacity-recovers", type="H200", provider="runpod", max_retries=3)
     _seed_status(orch, spec)
     log = io.StringIO()
-    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert metrics["train_tokens"] == 4096
     assert submitted_gpus == ["H200", "H200", "H200", "H200"]
@@ -2855,7 +2918,9 @@ def test_dropping_the_weight_cache_gives_the_widened_search_its_own_capacity_loo
         network_volume_gb=100,
     )
     _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    metrics = orch._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
 
     # the run survives to its third look. carrying the cache-pinned refusal would have made the
     # cacheless blip the second strike and stopped here with the market never having been asked twice.

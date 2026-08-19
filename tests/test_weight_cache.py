@@ -16,8 +16,10 @@ import pytest
 
 from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 from tests._helpers.profile import satisfy_sft_profile
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _oversized_model_info():
@@ -525,6 +527,7 @@ def test_instance_payload_strips_runpod_volume_redirect():
             seed=0,
             attempt=0,
             arm=arm,
+            source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=10_000_000_000.0,
         )["env"]
         assert not env.get("FLASH_WEIGHT_CACHE_DIR", "").startswith("/runpod-volume"), arm
@@ -847,8 +850,11 @@ def _supervised_walk(monkeypatch, failures):
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(orch, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
         monkeypatch.setattr(
-            "flash.providers._lifecycle.worker.upload_code", lambda repo=None, **_: "repo"
+            orch,
+            "validate_terminal_source_metrics",
+            lambda _status, metrics, expected_attempt=None: (metrics, expected_attempt),
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
@@ -1606,6 +1612,7 @@ def test_instance_build_payload_preload_mode():
         spec.seed,
         0,
         arm="lambda",
+        source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=10_000_000_000.0,
         cache_host_mount="/lambda/nfs/flash-weights",
         mode="preload",
@@ -1629,6 +1636,7 @@ def test_instance_build_payload_no_mode_by_default():
         spec.seed,
         0,
         arm="lambda",
+        source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=10_000_000_000.0,
         cache_host_mount="/lambda/nfs/flash-weights",
     )
@@ -1787,6 +1795,7 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
         spec.seed,
         0,
         arm="lambda",
+        source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=10_000_000_000.0,
         cache_host_mount="/lambda/nfs/flash-weights",
         mode="preload",
@@ -1855,6 +1864,52 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     payload = _json.loads(base64.b64decode(b64))
     assert payload["mode"] == "preload"
     assert payload["models"] == ["Qwen/Qwen3.5-0.8B"]
+    assert "source_snapshot" not in payload
+
+
+def test_lambda_warm_caller_uses_source_independent_preload_payload(monkeypatch):
+    import base64
+    import json as _json
+
+    from flash.providers.artifacts import weight_cache as preload
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import jobs
+    from tests.test_lambda_runner import _inst
+
+    launched = {}
+    terminated = []
+    monkeypatch.setattr(preload, "_ensure_region_filesystem", lambda *_args: "listed")
+    monkeypatch.setattr(
+        preload,
+        "make_hf_text_reader",
+        lambda _repo, path, **_kwargs: (
+            (lambda force=False: _json.dumps({"preloaded": ["a/b"], "failed": {}}))
+            if path.endswith("preload_result.json")
+            else (lambda force=False: None)
+        ),
+    )
+    monkeypatch.setattr(
+        lambda_api,
+        "ensure_filesystem",
+        lambda name, region, deadline_at=None: f"/lambda/nfs/{name}",
+    )
+    monkeypatch.setattr(lambda_api, "resolve_ssh_key_names", lambda: ["key"], raising=False)
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["key"])
+    monkeypatch.setattr(
+        lambda_api,
+        "launch_instance",
+        lambda **kwargs: launched.update(kwargs) or "instance-1",
+    )
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: terminated.append(run_id))
+
+    result = preload._warm_one_lambda_instance(jobs, [_inst()], ["a/b"], 600, 0.0)
+
+    payload_b64 = launched["user_data"].split("FLASH_PAYLOAD_EOF")[1].strip()
+    payload = _json.loads(base64.b64decode(payload_b64))
+    assert result["status"] == "ok"
+    assert payload["mode"] == "preload"
+    assert "source_snapshot" not in payload
+    assert terminated
 
 
 # ---------------------------------------------------------------------------

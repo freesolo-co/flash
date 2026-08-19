@@ -272,8 +272,10 @@ lora_rank = 32              # lora_alpha defaults to 2 x lora_rank; set it to ov
 # All knobs live under [train]. Do not add [sft], [grpo], or [opd] tables.
 
 [wandb]
-# project  = "my-project"   # the table allows exactly `project` and `run_name`;
-# run_name = "sft-run-1"    # `name` is rejected
+# new scaffolds set `project` from the selected Freesolo project and `run_name` from the folder
+# plus algorithm. edit either value as needed; only `project` and `run_name` are allowed.
+# project  = "my-project"
+# run_name = "sft-run-1"
 ```
 
 **Knobs are scoped by algorithm.** `[train]` is one flat table shared by all three algorithms,
