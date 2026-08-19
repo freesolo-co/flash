@@ -613,9 +613,9 @@ def test_chat_streams_deltas_the_way_the_cli_asks_for_them(http, deployed, chat_
     assert "".join(deltas).strip()
 
 
-def test_a_wrong_serving_key_is_rejected(serving_client_factory, internal_key, adapter_source):
-    if not internal_key:
-        pytest.skip("no FREESOLO_INTERNAL_KEY configured; the backend is intentionally open")
+def test_a_wrong_serving_key_is_rejected(serving_client_factory, serving_key, adapter_source):
+    if not serving_key:
+        pytest.skip("no FLASH_SERVING_KEY configured; the backend is intentionally open")
     revision = f"{_UNAUTHORIZED_RUN_ID}@final." + "0" * 40
     unauthorized_body = _registration(
         _UNAUTHORIZED_RUN_ID, {**adapter_source, "hf_revision": "0" * 40}, step=None
@@ -636,7 +636,7 @@ def test_a_wrong_serving_key_is_rejected(serving_client_factory, internal_key, a
     unprotected = []
     try:
         with serving_client_factory() as client:
-            client.headers["X-Freesolo-Internal-Key"] = internal_key + "-wrong"
+            client.headers["Authorization"] = f"Bearer {serving_key}-wrong"
             for name, method, path, body in probes:
                 response = client.request(method, path, json=body)
                 if response.status_code not in (401, 403):

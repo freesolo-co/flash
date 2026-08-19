@@ -33,8 +33,15 @@ def serving_url(request) -> str:
 
 
 @pytest.fixture(scope="session")
-def internal_key() -> str:
-    return (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
+def serving_key() -> str:
+    """the bearer token the serving app authenticates every request with.
+
+    this is the deployment's own inference credential, the value `flash serve deploy` read from
+    FLASH_SERVING_KEY. it is deliberately NOT FREESOLO_INTERNAL_KEY: that key belongs to the
+    freesolo control plane and must never be sent to a customer-owned endpoint.
+    """
+
+    return (os.environ.get("FLASH_SERVING_KEY") or "").strip()
 
 
 @pytest.fixture(scope="session")
@@ -95,10 +102,14 @@ def _require_httpx() -> None:
         )
 
 
-def _build_client(serving_url, internal_key):
+def _build_client(serving_url, serving_key):
     import httpx
 
-    headers = {"X-Freesolo-Internal-Key": internal_key} if internal_key else {}
+    # the serving app reads only `authorization` and compares a sha-256 of the bearer value
+    # against the inference token it launched with. it never reads X-Freesolo-Internal-Key --
+    # that header belonged to the freesolo-gateway app this path replaces, so sending it here
+    # authenticates nothing and every request comes back 401.
+    headers = {"Authorization": f"Bearer {serving_key}"} if serving_key else {}
 
     def _origin(url) -> tuple[str, str, int | None]:
         return (url.scheme.lower(), (url.host or "").rstrip(".").lower(), url.port)
@@ -106,10 +117,10 @@ def _build_client(serving_url, internal_key):
     target = _origin(httpx.URL(serving_url))
 
     def _strip_key_off_origin(request) -> None:
-        if "X-Freesolo-Internal-Key" not in request.headers:
+        if "Authorization" not in request.headers:
             return
         if _origin(request.url) != target:
-            del request.headers["X-Freesolo-Internal-Key"]
+            del request.headers["Authorization"]
 
     return httpx.Client(
         base_url=serving_url,
@@ -130,19 +141,19 @@ def chat_timeout():
 
 
 @pytest.fixture(scope="session")
-def serving_client_factory(serving_url, internal_key):
+def serving_client_factory(serving_url, serving_key):
     _require_httpx()
 
     def _factory():
-        return _build_client(serving_url, internal_key)
+        return _build_client(serving_url, serving_key)
 
     return _factory
 
 
 @pytest.fixture(scope="session")
-def http(serving_url, internal_key):
+def http(serving_url, serving_key):
     _require_httpx()
-    with _build_client(serving_url, internal_key) as client:
+    with _build_client(serving_url, serving_key) as client:
         yield client
 
 
