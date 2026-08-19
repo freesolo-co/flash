@@ -15,7 +15,7 @@ from ._common import (
     serving_resource_names,
 )
 from ._runpod_protocol import (
-    LAUNCH_COMMAND,
+    LAUNCH_COMMAND_ARGV,
     NETWORK_VOLUME_MOUNT,
     PROXY_PORT,
     PROXY_PORT_SPEC,
@@ -153,7 +153,10 @@ def build_runpod_create_plan(bundle: DeploymentBundle) -> RunPodCreatePlan:
     }
     template_base: dict[str, object] = {
         "containerDiskInGb": placement.container_disk_gb,
-        "dockerStartCmd": LAUNCH_COMMAND,
+        # runpod's rest schema types TemplateCreateInput.dockerStartCmd as array<string>, and
+        # GET /templates returns it the same way. sending the bare string was accepted by the
+        # transport and only failed later, when parse_templates read the list back.
+        "dockerStartCmd": list(LAUNCH_COMMAND_ARGV),
         "imageName": bundle.image.reference,
         "isServerless": False,
         "name": names.template,
@@ -163,10 +166,9 @@ def build_runpod_create_plan(bundle: DeploymentBundle) -> RunPodCreatePlan:
     }
 
     def template(environment: tuple[tuple[str, str], ...]) -> dict[str, object]:
-        return {
-            **template_base,
-            "env": [{"key": key, "value": value} for key, value in environment],
-        }
+        # env is an object in runpod's schema, not a list of {key, value} rows. the pair-list form
+        # round-trips through _environment on read, so this mismatch stayed invisible offline.
+        return {**template_base, "env": dict(environment)}
 
     pod_static = {
         "containerDiskInGb": placement.container_disk_gb,

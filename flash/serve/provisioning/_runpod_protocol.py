@@ -15,7 +15,12 @@ PROXY_PORT = 8000
 PROXY_PORT_SPEC = "8000/http"
 NETWORK_VOLUME_MOUNT = "/runpod-volume"
 SERVING_CACHE_ROOT = "/runpod-volume/flash-serving"
-LAUNCH_COMMAND = "python /app/serve_launch.py"
+# runpod carries dockerStartCmd as argv (array<string> in its rest schema, and what GET /templates
+# returns), so argv is the source of truth and LAUNCH_COMMAND is derived for display and for the
+# adoption comparison in _runpod_resources. defining it the other way round would need shell
+# splitting to recover the argv the api actually wants.
+LAUNCH_COMMAND_ARGV = ("python", "/app/serve_launch.py")
+LAUNCH_COMMAND = " ".join(LAUNCH_COMMAND_ARGV)
 
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,127}")
 
@@ -93,8 +98,14 @@ class RunPodPodObservation:
     gpu_count: int
     data_center_id: str
     container_disk_gb: int
-    network_volume_id: str
-    template_id: str
+    # None when the pod has no network volume attached. every pod in the account is parsed during
+    # observation, including ones flash did not create, and demanding an id there failed the whole
+    # pass on a foreign volume-less pod. our own pods always carry one, and `pod_matches` compares
+    # this against the plan's volume id, so None simply never matches.
+    network_volume_id: str | None
+    # None when the pod was not created from a template. runpod returns "" rather than omitting
+    # the key, and the same foreign-pod reasoning as network_volume_id applies.
+    template_id: str | None
     ports: tuple[str, ...]
 
 
@@ -173,6 +184,23 @@ def _ports(value: object, name: str) -> tuple[str, ...]:
     if len(parsed) != len(set(parsed)):
         raise ValueError(f"{name} contains duplicates")
     return parsed
+
+
+def _docker_start_cmd(value: object) -> str:
+    """read runpod's argv-shaped dockerStartCmd back as the joined command string.
+
+    the api types this as array<string> and returns it that way for every template in the
+    account, including ones flash did not create -- so demanding a string here failed the whole
+    observation pass on a foreign template and never reached our own. the joined form is what
+    `_runpod_resources` compares against LAUNCH_COMMAND. a plain string is still accepted because
+    runpod's graphql surface answers with one.
+    """
+
+    if type(value) is str:
+        return _string(value, "template dockerStartCmd")
+    if type(value) is not list or not value:
+        raise ValueError("template dockerStartCmd must be a string or nonempty list of strings")
+    return " ".join(_string(part, "template dockerStartCmd entry") for part in value)
 
 
 def _environment(value: object) -> tuple[tuple[str, str], ...]:
@@ -256,16 +284,20 @@ def parse_templates(value: object) -> tuple[RunPodTemplateObservation, ...]:
                 id=_provider_id(row.get("id"), "template id"),
                 name=_string(row.get("name"), "template name"),
                 image_name=_string(row.get("imageName"), "template imageName"),
-                docker_start_cmd=_string(row.get("dockerStartCmd"), "template dockerStartCmd"),
+                docker_start_cmd=_docker_start_cmd(row.get("dockerStartCmd")),
                 container_disk_gb=_positive_int(
                     row.get("containerDiskInGb"), "template containerDiskInGb"
                 ),
-                volume_gb=_nonnegative_int(row.get("volumeInGb"), "template volumeInGb"),
+                # runpod omits volumeInGb and isServerless from GET /templates when they hold their
+                # defaults rather than returning 0/false, so a missing key is the documented
+                # default, not a malformed row. a present key is still type-checked; only absence
+                # is defaulted, so a wrong-typed value still fails.
+                volume_gb=_nonnegative_int(row.get("volumeInGb", 0), "template volumeInGb"),
                 volume_mount_path=_string(row.get("volumeMountPath"), "template volumeMountPath"),
                 ports=_ports(row.get("ports"), "template ports"),
                 environment=_environment(row.get("env")),
-                is_serverless=row.get("isServerless")
-                if type(row.get("isServerless")) is bool
+                is_serverless=row.get("isServerless", False)
+                if type(row.get("isServerless", False)) is bool
                 else _invalid_bool("template isServerless"),
             )
         )
@@ -295,9 +327,16 @@ def parse_pods(value: object) -> tuple[RunPodPodObservation, ...]:
     parsed = []
     for entry in _resource_rows(value, "pods"):
         row = _mapping(entry, "pod")
-        gpu_type = row.get("gpuTypeId")
-        if gpu_type is None and type(row.get("gpu")) is dict:
-            gpu_type = row["gpu"].get("id")
+        # runpod's rest Pod schema carries no flat gpuTypeId / dataCenterId / networkVolumeId.
+        # they live in the nested `machine`, `gpu`, and `networkVolume` objects, which the api
+        # only returns when includeMachine / includeNetworkVolume are set. the flat keys are read
+        # first because runpod's graphql surface does return them at the top level.
+        machine = row.get("machine") if type(row.get("machine")) is dict else {}
+        gpu = row.get("gpu") if type(row.get("gpu")) is dict else {}
+        volume = row.get("networkVolume") if type(row.get("networkVolume")) is dict else {}
+        gpu_type = row.get("gpuTypeId") or machine.get("gpuTypeId") or gpu.get("id")
+        data_center = row.get("dataCenterId") or machine.get("dataCenterId")
+        network_volume = row.get("networkVolumeId") or volume.get("id")
         parsed.append(
             RunPodPodObservation(
                 id=validate_runpod_pod_id(row.get("id")),
@@ -306,12 +345,20 @@ def parse_pods(value: object) -> tuple[RunPodPodObservation, ...]:
                 image_name=_string(row.get("imageName"), "pod imageName"),
                 gpu_type_id=_string(gpu_type, "pod gpuTypeId"),
                 gpu_count=_positive_int(row.get("gpuCount"), "pod gpuCount"),
-                data_center_id=_string(row.get("dataCenterId"), "pod dataCenterId"),
+                data_center_id=_string(data_center, "pod dataCenterId"),
                 container_disk_gb=_positive_int(
                     row.get("containerDiskInGb"), "pod containerDiskInGb"
                 ),
-                network_volume_id=_provider_id(row.get("networkVolumeId"), "pod networkVolumeId"),
-                template_id=_provider_id(row.get("templateId"), "pod templateId"),
+                network_volume_id=(
+                    None
+                    if network_volume is None
+                    else _provider_id(network_volume, "pod networkVolumeId")
+                ),
+                template_id=(
+                    _provider_id(row.get("templateId"), "pod templateId")
+                    if row.get("templateId")
+                    else None
+                ),
                 ports=_ports(row.get("ports"), "pod ports"),
             )
         )

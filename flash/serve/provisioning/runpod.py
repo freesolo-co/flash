@@ -168,7 +168,17 @@ def _observe(
         parse_volumes,
     )
     pods = _read_call(
-        lambda: transport.rest("GET", "/pods", None, mutation=False, deadline_at=deadline_at),
+        # runpod omits the machine and network-volume objects unless asked, and gpu type and data
+        # center live only inside them. without these flags a pod's gpuTypeId is always absent, so
+        # adoption could never confirm a pod matches the plan's placement.
+        lambda: transport.rest(
+            "GET",
+            "/pods",
+            None,
+            mutation=False,
+            deadline_at=deadline_at,
+            query={"includeMachine": "true", "includeNetworkVolume": "true"},
+        ),
         parse_pods,
     )
     assert type(account_id) is str

@@ -24,6 +24,7 @@ from flash.serve.control import (
 )
 from flash.serve.provisioning import DeploymentBundle, ServingImage, ServingRuntimeSecrets
 from flash.serve.provisioning._modal_plan import (
+    MODAL_APP_TAG_LIMIT,
     MODAL_DEPLOYMENT_TAG_LIMIT,
     build_modal_create_plan,
 )
@@ -385,6 +386,20 @@ def test_deployment_tag_fits_modals_limit_in_every_phase() -> None:
     assert tags["bootstrap"] != tags["finalized"]
 
 
+def test_app_tag_set_fits_modals_tag_budget_in_every_phase() -> None:
+    # modal caps an app at 8 tags server-side and its client does not check, so a ninth key fails
+    # inside app.deploy() -- after the inference secret and volume exist -- and surfaces as
+    # outcome_unknown with orphaned billable resources. the plan carried 9 and every deploy died
+    # here. asserting the budget rather than the exact key list keeps this from turning red for a
+    # deliberate rename, while still failing the moment a tag is added without removing one.
+    for phase in ("bootstrap", "finalized"):
+        tags = build_modal_create_plan(_bundle(), phase=phase).tags
+        assert len(tags) <= MODAL_APP_TAG_LIMIT, f"{phase} carries {len(tags)} tags"
+        assert len({key for key, _ in tags}) == len(tags), "tag keys must be unique"
+
+    assert "flash-launcher" not in dict(build_modal_create_plan(_bundle()).tags)
+
+
 def test_plan_is_complete_secret_free_and_binds_launcher_abi(monkeypatch) -> None:
     bundle = _bundle()
     plan = build_modal_create_plan(bundle)
@@ -413,9 +428,15 @@ def test_plan_is_complete_secret_free_and_binds_launcher_abi(monkeypatch) -> Non
     from flash.serve.provisioning import _modal_plan
 
     original = plan.names
+    original_topology = dict(plan.tags)["flash-topology"]
     monkeypatch.setattr(_modal_plan, "LAUNCHER_ABI_ID", "fsla1-" + "a" * 43)
-    changed = build_modal_create_plan(bundle).names
-    assert changed != original
+    changed = build_modal_create_plan(bundle)
+    assert changed.names != original
+    # the abi no longer travels as its own tag, so `flash-topology` is what carries it into the
+    # tag set. without this, dropping `flash-launcher` would let two different launcher abis
+    # produce byte-identical tags, and `deployed_app_matches` compares tags to decide whether an
+    # existing app may be adopted rather than replaced.
+    assert dict(changed.tags)["flash-topology"] != original_topology
 
 
 def test_happy_create_uses_exact_resources_endpoint_and_cleanup_order() -> None:

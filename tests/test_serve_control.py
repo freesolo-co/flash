@@ -840,13 +840,30 @@ def test_deployment_result_equality_and_serialization_include_public_provenance(
         "abc:def456789",
         "abc.def456789",
         "ABC123DEF4567",
-        "abc123def456",
-        "abc123def45678",
+        # length bounds, not an exact length: runpod's own rest schema examples are 14 characters
+        # and live accounts return 14, so requiring exactly 13 rejected every real pod. these are
+        # the cases the charset and range still refuse.
+        "abc12def9",
+        "a" * 33,
+        "abc123 def4567",
+        "",
     ],
 )
 def test_runpod_handle_rejects_pod_id_injection(pod_id: str) -> None:
     with pytest.raises(ValueError, match="pod_id"):
         replace(_runpod_handle(_runpod_spec()), pod_id=pod_id)
+
+
+@pytest.mark.parametrize("pod_id", ["abc123def4567", "abc123def45678"])
+def test_runpod_handle_accepts_the_pod_id_lengths_runpod_actually_issues(pod_id: str) -> None:
+    # 13 and 14 both occur in real accounts. this is the half the injection cases cannot prove:
+    # a validator that rejects everything would pass all of them and still be broken.
+    handle = replace(
+        _runpod_handle(_runpod_spec()),
+        pod_id=pod_id,
+        public_url=f"https://{pod_id}-8000.proxy.runpod.net",
+    )
+    assert handle.pod_id == pod_id
 
 
 def test_runpod_handle_requires_canonical_proxy_origin() -> None:

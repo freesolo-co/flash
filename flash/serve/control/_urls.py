@@ -5,13 +5,18 @@ from __future__ import annotations
 import re
 from urllib.parse import SplitResult, urlsplit
 
-_RUNPOD_POD_ID_RE = re.compile(r"[a-z0-9]{13}")
+# runpod does not publish a fixed pod id length: its own rest schema gives a 14-character example
+# ("xedezhzb9la3ye") and live accounts return 14, while 13 also occurs. pinning an exact length
+# rejected every real pod at parse time, so this bounds the charset and a sane range instead. the
+# length is not what makes the proxy origin safe -- validate_runpod_public_url requires the
+# hostname to equal f"{pod_id}-8000.proxy.runpod.net" exactly, which is the actual control.
+_RUNPOD_POD_ID_RE = re.compile(r"[a-z0-9]{10,32}")
 _MODAL_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.modal\.run")
 
 
 def validate_runpod_pod_id(value: object) -> str:
     if type(value) is not str or _RUNPOD_POD_ID_RE.fullmatch(value) is None:
-        raise ValueError("pod_id must be exactly 13 lowercase alphanumeric characters")
+        raise ValueError("pod_id must be 10 to 32 lowercase alphanumeric characters")
     return value
 
 

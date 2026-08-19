@@ -79,6 +79,12 @@ def _validate_placement(placement: ModalPlacement) -> None:
 # surfaced as outcome_unknown with orphaned resources rather than a clean rejection.
 MODAL_DEPLOYMENT_TAG_LIMIT = 50
 
+# separate limit, separate api: the one above bounds the length of the single `tag=` string on
+# app.deploy(), while this bounds how many key/value pairs the app itself may carry. modal enforces
+# it server-side ("Apps must have no more than 8 tags") and the client does not check it, so an
+# over-budget tag set also fails inside app.deploy() with resources already created.
+MODAL_APP_TAG_LIMIT = 8
+
 
 def _deployment_tag(phase: str, topology: str) -> str:
     """build a modal deployment tag that fits modal's 50-character limit.
@@ -165,17 +171,25 @@ def _tags(
     endpoint_label: str,
     phase: ModalDeploymentPhase,
 ) -> tuple[tuple[str, str], ...]:
+    # modal caps an app at MODAL_APP_TAG_LIMIT tags server-side, and this dict is the whole app
+    # tag set. the launcher abi is deliberately absent: it is a compile-time constant, so as a tag
+    # it distinguishes nothing between deployments, and it is already bound into `flash-topology`
+    # (as `launcher_abi`), every resource name, and the endpoint label. dropping it costs no
+    # provenance. adding a tenth key here would exceed the cap, and because the failure lands at
+    # app.deploy() -- after the secret and volume exist -- it surfaces as outcome_unknown with
+    # orphaned billable resources rather than a clean rejection. _assert_tag_budget enforces that.
     values = {
         "flash-deployment": _hashed_identity(bundle.spec.deployment_id),
         "flash-engine": _identity(bundle.spec.engine.engine_id),
         "flash-generation": str(bundle.spec.generation),
         "flash-image": _identity(bundle.image.digest.removeprefix("sha256:")),
-        "flash-launcher": LAUNCHER_ABI_ID,
         "flash-manifest": _identity(bundle.manifest.manifest_id),
         "flash-phase": phase,
         "flash-spec": _identity(bundle.spec.spec_id),
         "flash-topology": _topology_identity(bundle, placement, names, endpoint_label),
     }
+    if len(values) > MODAL_APP_TAG_LIMIT:
+        raise ValueError("modal app tag set exceeds modal's tag limit")
     tags = tuple(sorted(values.items()))
     if any(
         _TAG_RE.fullmatch(key) is None or _TAG_RE.fullmatch(value) is None for key, value in tags

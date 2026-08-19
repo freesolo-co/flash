@@ -24,12 +24,15 @@ from flash.serve.provisioning._common import serving_resource_names
 from flash.serve.provisioning._runpod_probe import RunPodEndpointProbe
 from flash.serve.provisioning._runpod_protocol import (
     PROXY_PORT_SPEC,
+    parse_pods,
+    parse_templates,
     pod_payload,
     template_payload,
     volume_payload,
 )
 from flash.serve.provisioning._runpod_transport import (
     GRAPHQL_URL,
+    REST_BASE_URL,
     USER_AGENT,
     RunPodTransportFailure,
     StdlibRunPodTransport,
@@ -186,6 +189,7 @@ class _FakeTransport:
         self.volumes: list[dict[str, object]] = []
         self.pods: list[dict[str, object]] = []
         self.calls: list[tuple[str, str, bool, object]] = []
+        self.queries: list[tuple[str, dict[str, str]]] = []
         self.mutation_count = 0
         self.fail_mutation_at: int | None = None
         self.failure_mode = "ambiguous_before"
@@ -239,7 +243,13 @@ class _FakeTransport:
         *,
         mutation: bool,
         deadline_at: float,
+        query: dict[str, str] | None = None,
     ) -> object:
+        # the real transport takes query parameters as a mapping, and runpod gates whole response
+        # objects behind them (includeMachine). a double without this parameter raises TypeError
+        # on every call, which the lifecycle then classifies as transport_failed -- so each such
+        # test would still "fail closed" and look like it was exercising its own scenario.
+        self.queries.append((f"{method} {path}", dict(query or {})))
         self._record(
             "rest", f"{method} {path}", mutation, None if payload is None else dict(payload)
         )
@@ -507,6 +517,12 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
     assert result.status == "ready"
     assert result.handle is not None
     assert result.handle.pod_id == POD_ID
+    # the pod listing must ask for the nested objects. runpod returns no gpu type or data center
+    # without these flags, and the fake serves flat rows either way, so nothing else here would
+    # notice the caller dropping them -- while against the real api observation would fail.
+    assert ("GET /pods", {"includeMachine": "true", "includeNetworkVolume": "true"}) in (
+        transport.queries
+    )
     assert result.handle.public_url == f"https://{POD_ID}-8000.proxy.runpod.net"
     assert result.handle.image_digest == bundle.image.digest
     assert result.handle.account_id == bundle.spec.placement.account_id
@@ -515,8 +531,10 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
     assert transport.pods[0]["ports"] == [PROXY_PORT_SPEC]
     assert transport.pods[0]["imageName"] == bundle.image.reference
     assert transport.templates[0]["imageName"] == bundle.image.reference
-    assert transport.templates[0]["dockerStartCmd"] == "python /app/serve_launch.py"
-    template_env = {item["key"]: item["value"] for item in transport.templates[0]["env"]}
+    # argv, not a joined string: runpod types dockerStartCmd as array<string> in its rest schema
+    # and returns it that way, and env as an object rather than a list of {key, value} rows.
+    assert transport.templates[0]["dockerStartCmd"] == ["python", "/app/serve_launch.py"]
+    template_env = dict(transport.templates[0]["env"])
     names = _names(bundle)
     assert template_env["FLASH_INFERENCE_TOKEN"] == (
         f"{{{{ RUNPOD_SECRET_{names.inference_secret} }}}}"
@@ -1328,3 +1346,138 @@ def test_requests_send_an_explicit_user_agent_on_both_apis() -> None:
     for agent in seen:
         assert agent, "an unset agent falls back to urllib's default, which runpod rejects"
         assert "urllib" not in agent.lower()
+
+
+def _capturing_transport(seen: list[str]) -> StdlibRunPodTransport:
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def opener(request, *, timeout: float):
+        seen.append(request.full_url)
+        return Response()
+
+    return StdlibRunPodTransport(PROVIDER_SECRET, opener=opener, clock=lambda: 0.0)
+
+
+def test_rest_encodes_query_parameters_without_reopening_the_path_injection_hole() -> None:
+    # runpod hides whole response objects behind query flags, so the transport has to send them.
+    # they are encoded from a mapping rather than spliced into `path` precisely so the "no ?"
+    # check on the path cannot be bypassed by a caller passing a url fragment as the path.
+    seen: list[str] = []
+    transport = _capturing_transport(seen)
+    transport.rest(
+        "GET",
+        "/pods",
+        None,
+        mutation=False,
+        deadline_at=10.0,
+        query={"includeNetworkVolume": "true", "includeMachine": "true"},
+    )
+    transport.rest("GET", "/templates", None, mutation=False, deadline_at=10.0)
+
+    assert seen == [
+        f"{REST_BASE_URL}/pods?includeMachine=true&includeNetworkVolume=true",
+        f"{REST_BASE_URL}/templates",
+    ]
+
+    for path in ("/pods?includeMachine=true", "/pods#frag", "https://evil.example/pods"):
+        with pytest.raises(ValueError, match="absolute path"):
+            transport.rest("GET", path, None, mutation=False, deadline_at=10.0)
+    for bad in ({"": "true"}, {"includeMachine": ""}, {"includeMachine": True}):
+        with pytest.raises(ValueError, match="query"):
+            transport.rest("GET", "/pods", None, mutation=False, deadline_at=10.0, query=bad)
+
+
+def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> None:
+    # runpod's rest Pod schema has no flat gpuTypeId / dataCenterId / networkVolumeId: they live
+    # in the nested machine, gpu, and networkVolume objects. reading only the flat keys left
+    # gpu_type_id absent on every real pod, which fails the whole observation pass -- so the
+    # lifecycle could never even look at its own pod.
+    nested = parse_pods(
+        [
+            {
+                "id": "abc123def45678",
+                "name": "pod-a",
+                "desiredStatus": "RUNNING",
+                "imageName": "ghcr.io/org/image@sha256:" + "0" * 64,
+                "gpuCount": 1,
+                "containerDiskInGb": 60,
+                "ports": ["8000/http"],
+                "templateId": "tpl0000001",
+                "machine": {"gpuTypeId": "NVIDIA L4", "dataCenterId": "US-KS-2"},
+                "networkVolume": {"id": "vol0000001"},
+            }
+        ]
+    )
+    assert nested[0].gpu_type_id == "NVIDIA L4"
+    assert nested[0].data_center_id == "US-KS-2"
+    assert nested[0].network_volume_id == "vol0000001"
+
+    # a pod with no volume and no template is a real state for pods flash did not create. every
+    # pod in the account is parsed, so rejecting those aborts observation before reaching ours.
+    bare = parse_pods(
+        [
+            {
+                "id": "abc123def45679",
+                "name": "foreign",
+                "desiredStatus": "EXITED",
+                "imageName": "pytorch/pytorch:2.6.0",
+                "gpuCount": 1,
+                "containerDiskInGb": 300,
+                "ports": ["8000/http"],
+                "templateId": "",
+                "machine": {"gpuTypeId": "NVIDIA A100 80GB PCIe", "dataCenterId": "CA-MTL-3"},
+            }
+        ]
+    )
+    assert bare[0].network_volume_id is None
+    assert bare[0].template_id is None
+
+
+def test_template_observation_reads_argv_and_omitted_defaults() -> None:
+    # dockerStartCmd comes back as argv and volumeInGb / isServerless are omitted at their
+    # defaults rather than returned as 0 / false. demanding a string and a present key failed on
+    # a foreign template and took the whole observation pass with it.
+    parsed = parse_templates(
+        [
+            {
+                "id": "tpl0000002",
+                "name": "foreign-tpl",
+                "imageName": "pytorch/pytorch:2.6.0",
+                "dockerStartCmd": ["bash", "-lc", "run.sh"],
+                "containerDiskInGb": 300,
+                "volumeMountPath": "/workspace",
+                "ports": ["8000/http"],
+                "env": {"A": "1"},
+            }
+        ]
+    )
+    assert parsed[0].docker_start_cmd == "bash -lc run.sh"
+    assert parsed[0].volume_gb == 0
+    assert parsed[0].is_serverless is False
+
+    for broken in ([], "", 5, [""], ["ok", 3]):
+        with pytest.raises(ValueError, match="dockerStartCmd"):
+            parse_templates(
+                [
+                    {
+                        "id": "tpl0000002",
+                        "name": "t",
+                        "imageName": "img",
+                        "dockerStartCmd": broken,
+                        "containerDiskInGb": 300,
+                        "volumeMountPath": "/workspace",
+                        "ports": ["8000/http"],
+                        "env": {},
+                    }
+                ]
+            )

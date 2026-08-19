@@ -6,6 +6,7 @@ import json
 import math
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from typing import Protocol
@@ -62,6 +63,7 @@ class RunPodTransport(Protocol):
         *,
         mutation: bool,
         deadline_at: float,
+        query: Mapping[str, str] | None = None,
     ) -> object: ...
 
 
@@ -117,14 +119,25 @@ class StdlibRunPodTransport:
         *,
         mutation: bool,
         deadline_at: float,
+        query: Mapping[str, str] | None = None,
     ) -> object:
         if method not in {"GET", "POST", "PATCH", "DELETE"}:
             raise ValueError("runpod rest method is unsupported")
         if type(path) is not str or not path.startswith("/") or "?" in path or "#" in path:
             raise ValueError("runpod rest path must be an absolute path")
+        # query parameters arrive as a mapping and are encoded here rather than being spliced into
+        # `path`, so the caller can never smuggle a second "?" or a whole other url past the check
+        # above. runpod gates real response fields behind these flags (includeMachine), so this is
+        # required to observe a pod's gpu type at all, not a convenience.
+        url = REST_BASE_URL + path
+        if query:
+            for key, value in query.items():
+                if type(key) is not str or type(value) is not str or not key or not value:
+                    raise ValueError("runpod rest query must be nonempty string pairs")
+            url += "?" + urllib.parse.urlencode(sorted(query.items()))
         body = None if payload is None else dict(payload)
         return self._request(
-            REST_BASE_URL + path,
+            url,
             method=method,
             payload=body,
             mutation=mutation,
