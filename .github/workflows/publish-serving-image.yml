@@ -43,7 +43,12 @@ jobs:
     # namespace, so a fork's GITHUB_TOKEN cannot write it and the build would burn its runner
     # and then fail at the push.
     if: github.repository == 'freesolo-co/flash'
-    runs-on: ubuntu-latest
+    # NOT ubuntu-latest, despite publish-image.yml using it: that workflow builds a
+    # `python:3.12-slim` image, while Dockerfile.serve shares the WORKER image's
+    # `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel` base and then installs vllm on top. A standard
+    # hosted runner only guarantees ~14 GB free, so this needs the same larger runner and the same
+    # disk reclaim as worker-image.yml or it dies with ENOSPC and never publishes a digest.
+    runs-on: ubuntu-24.04-8core
     # The serving image installs the vLLM/torch runtime extra on a CUDA devel base, so it is
     # substantially heavier than the control-plane image. 90 minutes covers a cold cache.
     timeout-minutes: 90
@@ -55,6 +60,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same reclaim as worker-image.yml, which builds the same CUDA devel base. The runner ships
+      # several GB of toolchains this build never uses, and the image does not fit without them
+      # removed first.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache /usr/share/swift \
+            /usr/local/share/boost /usr/local/lib/node_modules \
+            /usr/local/share/powershell /usr/share/miniconda || true
+          sudo apt-get clean || true
+          sudo docker image prune -af || true
+          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
