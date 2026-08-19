@@ -1,10 +1,11 @@
-"""Provider-neutral worker packaging: the deps/image/env every rent-a-box or serverless worker ships, plus upload_code for the HF code snapshot. Shared kernel — no provider package imports another for this."""
+"""Provider-neutral worker packaging and immutable managed source publication."""
 
 from __future__ import annotations
 
 import os
 import time
 from io import BytesIO
+from pathlib import Path
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash._internal.logging import get_logger
@@ -203,9 +204,6 @@ def build_worker_env(
     return env
 
 
-_CODE_SNAPSHOT_COMPLETE = ".flash-code-snapshot-complete"
-
-
 def _hf_call(call, label: str, *, deadline_at: float | None = None):
     return hf_call(
         call,
@@ -244,53 +242,120 @@ def _ensure_private_artifact_repo(
     )
 
 
-def upload_code(
+def _repo_revision(api, repo: str, *, deadline_at: float | None) -> str:
+    info = _hf_call(
+        lambda: api.repo_info(repo_id=repo, repo_type="dataset"),
+        f"read artifact repo revision {repo}",
+        deadline_at=deadline_at,
+    )
+    revision = str(getattr(info, "sha", None) or getattr(info, "oid", None) or "").strip()
+    if not revision:
+        raise RuntimeError("artifact repository revision is unavailable")
+    return revision
+
+
+def _download_source_archive(
+    repo: str,
+    archive_path: str,
+    revision: str,
+    token: str | None,
+    *,
+    deadline_at: float | None,
+) -> bytes | None:
+    from huggingface_hub import hf_hub_download
+
+    try:
+        local_path = _hf_call(
+            lambda: hf_hub_download(
+                repo_id=repo,
+                repo_type="dataset",
+                filename=archive_path,
+                revision=revision,
+                token=token,
+            ),
+            f"download source snapshot {repo}:{archive_path}@{revision}",
+            deadline_at=deadline_at,
+        )
+    except Exception as exc:
+        if hf_status_code(exc) == 404 or exc.__class__.__name__ in {
+            "EntryNotFoundError",
+            "LocalEntryNotFoundError",
+        }:
+            return None
+        raise
+    with open(local_path, "rb") as source:
+        return source.read()
+
+
+def publish_source_snapshot(
     repo: str | None = None,
     *,
-    code_prefix: str | None = None,
     deadline_at: float | None = None,
-) -> str:
-    """Upload the ``flash`` package to its content-addressed HF artifact prefix."""
+) -> dict:
+    """Publish one deterministic source archive and return its immutable descriptor."""
     from huggingface_hub import HfApi
 
     import flash
-    from flash.runner import flash_code_prefix
+    from flash.source_snapshot import (
+        build_source_archive,
+        canonical_archive_path,
+        descriptor_for_archive,
+        read_verified_archive,
+        sha256_bytes,
+    )
 
     if not repo:
         raise RuntimeError(
             "hf_repo must be set (the run's [train] hf_repo: HF dataset repo for code + artifacts)"
         )
     token = os.environ.get("HF_TOKEN")
-    pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     api = HfApi(token=token)
     _ensure_private_artifact_repo(api, repo, deadline_at=deadline_at)
-    code_prefix = code_prefix or flash_code_prefix()
-    code_marker = f"{code_prefix}/{_CODE_SNAPSHOT_COMPLETE}"
-    if _hf_call(
-        lambda: api.file_exists(repo_id=repo, filename=code_marker, repo_type="dataset"),
-        f"check flash code snapshot {repo}:{code_marker}",
-        deadline_at=deadline_at,
-    ):
-        return repo
-    _hf_call(
-        lambda: api.upload_folder(
-            folder_path=pkg_dir,
-            path_in_repo=code_prefix,
-            repo_id=repo,
-            repo_type="dataset",
-            ignore_patterns=["__pycache__/*", "*.pyc", "*.pyo"],
-        ),
-        f"upload flash code to {repo}:{code_prefix}",
-        deadline_at=deadline_at,
-    )
-    _hf_call(
-        lambda: api.upload_file(
-            path_or_fileobj=BytesIO(b"complete\n"),
-            path_in_repo=code_marker,
-            repo_id=repo,
-            repo_type="dataset",
-        ),
-        f"mark flash code snapshot complete {repo}:{code_marker}",
-        deadline_at=deadline_at,
-    )
-    return repo
+    package_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
+    archive = build_source_archive(package_dir=Path(package_dir))
+    digest = sha256_bytes(archive)
+    archive_path = canonical_archive_path(digest)
+
+    def verified_at(revision: str) -> dict | None:
+        candidate = _download_source_archive(
+            repo,
+            archive_path,
+            revision,
+            token,
+            deadline_at=deadline_at,
+        )
+        if candidate is None:
+            return None
+        descriptor = descriptor_for_archive(archive, revision)
+        read_verified_archive(candidate, descriptor)
+        return descriptor.to_dict()
+
+    head = _repo_revision(api, repo, deadline_at=deadline_at)
+    existing = verified_at(head)
+    if existing is not None:
+        return existing
+    try:
+        commit = _hf_call(
+            lambda: api.upload_file(
+                path_or_fileobj=BytesIO(archive),
+                path_in_repo=archive_path,
+                repo_id=repo,
+                repo_type="dataset",
+                commit_message=f"publish flash source {digest}",
+            ),
+            f"publish source snapshot {repo}:{archive_path}",
+            deadline_at=deadline_at,
+        )
+        revision = str(getattr(commit, "oid", None) or "").strip()
+        if not revision:
+            raise RuntimeError("source snapshot publication returned no immutable revision")
+        published = verified_at(revision)
+        if published is None:
+            raise RuntimeError("published source snapshot is not readable at its commit revision")
+        return published
+    except Exception:
+        winner_revision = _repo_revision(api, repo, deadline_at=deadline_at)
+        winner = verified_at(winner_revision)
+        if winner is not None:
+            return winner
+        raise

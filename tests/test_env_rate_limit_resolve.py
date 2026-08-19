@@ -16,6 +16,8 @@ import urllib.request
 
 import pytest
 
+from tests._helpers.source_snapshot import valid_source_snapshot
+
 
 def _http_error(code: int, body: str) -> urllib.error.HTTPError:
     return urllib.error.HTTPError(
@@ -297,6 +299,15 @@ def test_background_submit_keeps_environment_staging_off_creation_path(monkeypat
 
     monkeypatch.setattr(runner, "stage_environment_package", fake_stage)
     monkeypatch.setattr(runner, "_run_job", fake_run_job)
+    monkeypatch.setattr(
+        runner,
+        "publish_source_snapshot",
+        lambda _repo=None: valid_source_snapshot(),
+    )
+    # the submit-time 404 gate resolves the ref too, and this spec names a placeholder repo that
+    # really does 404. its subject is WHICH THREAD pins, so stub the gate out rather than let a live
+    # GitHub lookup decide whether the test runs. pass the spec through unpinned: the gate returns
+    # what it resolved, and returning a pinned spec here would answer the question under test.
     monkeypatch.setattr(
         runner,
         "preflight_validate_environment_ref",

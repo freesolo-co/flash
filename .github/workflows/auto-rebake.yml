@@ -5,9 +5,8 @@ name: auto-rebake per-arch kernel cache
 # the per-arch tags pointing at the OLD base until rebaked. "Out of date" has two flavors, keyed off
 # the fp_cache / fp_base labels worker-image.yml stamps on :cu128 (docker/kernel_fingerprint.py):
 #
-#   * fp_cache changed -> the baked Triton/Inductor mega-cache is INVALID -> a real GPU re-warm is
-#     required (bake-kernel-cache.yml). PAID, and AUTO-fired by this detection (no manual approval) --
-#     fp_cache only moves on a deliberate toolchain bump, so spend stays tied to real need.
+#   * fp_cache changed -> promote a matching dev-ready cache by free re-layer. a real gpu re-warm is
+#     only the fail-safe when the required candidate is absent.
 #   * fp_cache same but fp_base changed -> the cache is still valid, the base just moved (FA wheel /
 #     causal-conv1d / rp_handler / a non-kernel dep) -> a FREE re-layer grafts the existing cache onto
 #     the fresh base (docker/Dockerfile.kernelcache.relayer), no GPU.
@@ -54,7 +53,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       proceed: ${{ steps.base.outputs.proceed }}
-      relayer_sms: ${{ steps.classify.outputs.relayer_sms }}
+      relayer_matrix: ${{ steps.classify.outputs.relayer_matrix }}
       gpu_sms: ${{ steps.classify.outputs.gpu_sms }}
       fp_cache: ${{ steps.base.outputs.fp_cache }}
       fp_base: ${{ steps.base.outputs.fp_base }}
@@ -138,9 +137,23 @@ jobs:
               pc="(missing)"; pb="(missing)"
             fi
             if [ "$pc" != "$FP_CACHE" ]; then
-              gpu+=("$sm"); action="GPU re-warm (cache invalid)"
+              candidate="ghcr.io/freesolo-co/flash-worker:cu128-dev-ready-$sm"
+              candidate_pc=""; candidate_ref=""
+              if candidate_digest=$(crane digest "$candidate" 2>/dev/null); then
+                candidate_ref="${candidate%:*}@$candidate_digest"
+              fi
+              if [ -n "$candidate_ref" ] && candidate_cfg=$(crane config "$candidate_ref" 2>/dev/null); then
+                candidate_pc=$(echo "$candidate_cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_cache"] // ""')
+              fi
+              if [ "$candidate_pc" = "$FP_CACHE" ]; then
+                relayer+=("$(jq -cn --arg sm "$sm" --arg source "$candidate_ref" '{sm:$sm, source:$source}')")
+                action="promote dev cache (free)"
+              else
+                gpu+=("$sm"); action="gpu re-warm (candidate missing)"
+              fi
             elif [ "$pb" != "$FP_BASE" ]; then
-              relayer+=("$sm"); action="re-layer (free)"
+              relayer+=("$(jq -cn --arg sm "$sm" --arg source "$img" '{sm:$sm, source:$source}')")
+              action="re-layer (free)"
             else
               action="up to date"
             fi
@@ -148,12 +161,12 @@ jobs:
             summary="$summary| $sm | \`$pc\` | \`$pb\` | $action |\n"
           done
           if [ ${#relayer[@]} -gt 0 ]; then
-            relayer_json=$(printf '%s\n' "${relayer[@]}" | jq -R . | jq -cs .)
+            relayer_json=$(printf '%s\n' "${relayer[@]}" | jq -cs .)
           else
             relayer_json='[]'
           fi
           gpu_csv=$(IFS=,; echo "${gpu[*]}")
-          echo "relayer_sms=$relayer_json" >> "$GITHUB_OUTPUT"
+          echo "relayer_matrix=$relayer_json" >> "$GITHUB_OUTPUT"
           echo "gpu_sms=$gpu_csv" >> "$GITHUB_OUTPUT"
           {
             echo "### auto-rebake plan (base rev \`$REV\`, fp_cache \`$FP_CACHE\` fp_base \`$FP_BASE\`)"
@@ -189,7 +202,7 @@ jobs:
   # FREE path: graft the existing valid cache onto the fresh base, no GPU. Runs automatically.
   relayer:
     needs: gate
-    if: needs.gate.outputs.proceed == 'true' && needs.gate.outputs.relayer_sms != '[]' && needs.gate.outputs.relayer_sms != ''
+    if: needs.gate.outputs.proceed == 'true' && needs.gate.outputs.relayer_matrix != '[]' && needs.gate.outputs.relayer_matrix != ''
     runs-on: ubuntu-24.04-8core
     # The graft pulls two ~20GB images and pushes one. 21min is the slowest auto-rebake run on
     # record; 60 covers a slow registry without holding the org's larger runner indefinitely.
@@ -197,7 +210,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sm: ${{ fromJson(needs.gate.outputs.relayer_sms || '[]') }}
+        include: ${{ fromJson(needs.gate.outputs.relayer_matrix || '[]') }}
     env:
       BASE_REF: ${{ needs.gate.outputs.base_ref }}
       FP_CACHE: ${{ needs.gate.outputs.fp_cache }}
@@ -232,10 +245,14 @@ jobs:
       - name: Resolve old per-arch cache digest
         id: old
         run: |
-          img="ghcr.io/freesolo-co/flash-worker:cu128-${{ matrix.sm }}"
-          digest=$(docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}')
-          # canonical digest ref (repo@sha256, no tag) for the FROM in the relayer build.
-          echo "ref=${img%:*}@$digest" >> "$GITHUB_OUTPUT"
+          img="${{ matrix.source }}"
+          if [[ "$img" == *@sha256:* ]]; then
+            echo "ref=$img" >> "$GITHUB_OUTPUT"
+          else
+            digest=$(docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}')
+            # canonical digest ref (repo@sha256, no tag) for the FROM in the relayer build.
+            echo "ref=${img%:*}@$digest" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Re-layer cache onto the fresh base (no GPU)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0

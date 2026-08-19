@@ -51,28 +51,6 @@ def _file_digest(path: str, digest) -> None:
             digest.update(chunk)
 
 
-def flash_code_prefix() -> str:
-    """Content-addressed HF path for the current ``flash`` package snapshot."""
-    import flash
-
-    pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
-    digest = hashlib.sha1()
-    for root, dirs, files in os.walk(pkg_dir):
-        dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not d.startswith("."))
-        for name in sorted(files):
-            if name.endswith((".pyc", ".pyo")):
-                continue
-            path = os.path.join(root, name)
-            if not os.path.isfile(path):
-                continue
-            rel = os.path.relpath(path, pkg_dir).replace(os.sep, "/")
-            digest.update(rel.encode("utf-8"))
-            digest.update(b"\0")
-            runner._file_digest(path, digest)
-            digest.update(b"\0")
-    return f"code/{digest.hexdigest()[:32]}/flash"
-
-
 def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     """Assign the environment-scoped HF artifact repo (platform-managed, never user-set)."""
     if not spec.run_id or spec.run_id == "local":

@@ -29,10 +29,14 @@ from flash.runner import RunStatus
 
 
 def _runstatus_from_json(d: dict) -> RunStatus:
-    # Tolerant load: drop unknown keys before constructing RunStatus. ``resume_seed_index``
-    # from the pre-#317 multi-seed era) -- and `~/.flash/runs/*.json` is never GC'd, so those
-    # files exist in prod RIGHT NOW.
-    return RunStatus(**{k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__})
+    # tolerant load: drop unknown keys before constructing runstatus. source_snapshot is different:
+    # malformed persisted identity must fail closed rather than be treated as a legacy absence.
+    values = {k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__}
+    if d.get("source_snapshot") is not None:
+        from flash.source_snapshot import parse_descriptor
+
+        values["source_snapshot"] = parse_descriptor(d["source_snapshot"]).to_dict()
+    return RunStatus(**values)
 
 
 def _load_status_json(run_id: str) -> dict:
@@ -48,6 +52,20 @@ def _load_status_json(run_id: str) -> dict:
 
 def get_status(run_id: str) -> RunStatus:
     return runner._runstatus_from_json(runner._load_status_json(run_id))
+
+
+def source_snapshot_from_status(status: RunStatus, *, required: bool = False) -> dict | None:
+    """Return the strict persisted descriptor without ever reconstructing source identity."""
+    raw = status.source_snapshot
+    if raw is None:
+        if required:
+            raise RuntimeError(
+                "managed source identity is unavailable; descriptor-less attempts cannot be replaced"
+            )
+        return None
+    from flash.source_snapshot import parse_descriptor
+
+    return parse_descriptor(raw).to_dict()
 
 
 def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
@@ -288,6 +306,54 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         status.updated_at = time.time()
         runner._save_status_unlocked(status)
     runner._report_status(status)
+
+
+def validate_terminal_source_metrics(
+    status: RunStatus,
+    metrics: dict,
+    *,
+    expected_attempt: int | None = None,
+) -> tuple[dict, int | None]:
+    """Require trusted attempt-bound evidence for runs carrying a source descriptor."""
+    if not isinstance(metrics, dict):
+        raise RuntimeError("terminal metrics are invalid")
+    from flash.source_snapshot import (
+        PUBLIC_PROVENANCE_KEY,
+        TERMINAL_ATTESTATION_KEY,
+        safe_public_projection,
+        validate_attestation,
+    )
+
+    sanitized = dict(metrics)
+    raw_attestation = sanitized.pop(TERMINAL_ATTESTATION_KEY, None)
+    sanitized.pop(PUBLIC_PROVENANCE_KEY, None)
+    descriptor = runner.source_snapshot_from_status(status)
+    if descriptor is None:
+        return sanitized, None
+    if expected_attempt is None:
+        remote = status.remote if isinstance(status.remote, dict) else {}
+        candidate = remote.get("attempt")
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+            expected_attempt = candidate
+    if expected_attempt is None:
+        expected_attempt = runner._latest_reserved_attempt(status.run_id)
+    if (
+        isinstance(expected_attempt, bool)
+        or not isinstance(expected_attempt, int)
+        or expected_attempt < 0
+    ):
+        raise RuntimeError("managed attempt identity is unavailable for source attestation")
+    validate_attestation(
+        raw_attestation,
+        descriptor,
+        run_id=status.run_id,
+        attempt=expected_attempt,
+    )
+    sanitized[PUBLIC_PROVENANCE_KEY] = safe_public_projection(
+        descriptor,
+        verified_attempt=expected_attempt,
+    )
+    return sanitized, expected_attempt
 
 
 def _persist_metrics(spec: JobSpec, metrics: dict) -> float:

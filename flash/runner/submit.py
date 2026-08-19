@@ -10,13 +10,24 @@ Split out of `flash.runner` to keep that module under the file-size limit.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from typing import TYPE_CHECKING
 
+from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
 from flash.core.spec_persistence import VersionedPersistedSpecEnvelope
 from flash.teacher.retry_contract import OPD_RETRY_CONTRACT_VERSION
+
+logger = logging.getLogger(__name__)
+
+
+class SourceSnapshotPublicationError(RuntimeError):
+    """Managed source publication failed before a provider could be created."""
+
+    plane_fault = True
+
 
 if TYPE_CHECKING:
     # annotation-only: both are defined in `flash.runner` above the point where it imports this
@@ -271,12 +282,24 @@ def submit_job(
     estimated_cost_usd = prepared.estimated_cost_usd
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
+    source_snapshot = None
     if not dry_run:
-        # Record the warm-start dependency on the SOURCE repo so the artifact GC spares it while this
-        # child is around (best-effort; never blocks submission). A dry-run preview must not mutate
-        # the source repo, so this HF write stays real-submit-only (unlike the read-only preflights
-        # above, which now run in both modes).
+        # record the warm-start dependency on the source repo so artifact gc spares it while this
+        # child is around. source publication is also real-submit-only and completes before status
+        # persistence, so no provider can be created without a durable immutable descriptor.
         _runner()._mark_warmstart_source(worker_spec, public_spec.run_id)
+        try:
+            source_snapshot = _runner().publish_source_snapshot(worker_spec.train.hf_repo)
+        except Exception as exc:
+            logger.warning(
+                "managed source publication failed for run %s: %s",
+                public_spec.run_id,
+                sanitize_diagnostic(exc, limit=500),
+            )
+            raise SourceSnapshotPublicationError(
+                "managed source publication failed; retry the submission later"
+            ) from None
+    # env ref->sha pin is deferred (background) or after status save (sync), never on creation path.
     # environment staging runs after status persistence and before provider allocation.
     status = _runner().RunStatus(
         run_id=public_spec.run_id,
@@ -292,7 +315,8 @@ def submit_job(
         effective_preparation=_effective_preparation_snapshot(
             public_spec, worker_spec, prepared.adapter_identity
         ),
-        # Snapshot the instance providers available at submit so a later handle-less recovery can fail
+        source_snapshot=source_snapshot,
+        # snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],

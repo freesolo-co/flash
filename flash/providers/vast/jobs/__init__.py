@@ -398,7 +398,7 @@ def deploy_and_submit(
     attempt: int = 0,
     log=None,
     runtime_secrets: dict | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> VastJobHandle:
     """Rent the cheapest accepting offer, walking live-market rejections.
@@ -417,7 +417,7 @@ def deploy_and_submit(
         seed,
         attempt,
         runtime_secrets=runtime_secrets,
-        code_prefix=code_prefix,
+        source_snapshot=source_snapshot,
         **deadline_kwargs(build_payload, absolute_deadline),
     )
     label = instance_label(spec.run_id, seed, attempt)
@@ -695,7 +695,7 @@ def submit_run_vast(
     on_handle=None,
     attempt: int = 0,
     runtime_secrets: dict | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> PollResult:
     """Vast equivalent of ``lambdalabs.jobs.submit_run_lambda``: rent, persist, poll, destroy.
@@ -779,7 +779,7 @@ def submit_run_vast(
             attempt=attempt,
             log=log,
             runtime_secrets=runtime_secrets,
-            code_prefix=code_prefix,
+            source_snapshot=source_snapshot,
             **deadline_kwargs(deploy_and_submit, absolute_deadline),
         )
         if on_handle is not None:

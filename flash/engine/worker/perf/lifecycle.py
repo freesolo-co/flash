@@ -34,36 +34,31 @@ class RetriableInfraError(RuntimeError):
 
 
 class DirtyGpuError(RetriableInfraError):
-    """The allocated card arrived with too little free VRAM to run on.
+    """An allocated GPU arrived with substantial pre-existing occupancy.
 
-    A RetriableInfraError, deliberately not an OOM. The two recover differently and only one of them
-    is right here: an OOM means the run does not fit the card and retries on a BIGGER one, spending
-    from a small dedicated OOM budget. A dirty card means the run fits fine and the card was already
-    occupied -- a co-tenant in another container, or a previous tenant's leak. Escalating size for
-    that pays more for a card that can be just as dirty, and burns an OOM retry proving it.
-
-    Infra retry reallocates instead: ``_handle_failure`` records the provider in ``failed_providers``
-    and the shape in ``tried_classes``, so the next attempt prefers a DIFFERENT provider, then an
-    untried shape, before clamping back. That is the right preference order for this failure --
-    co-tenancy is a property of the host pool that handed the instance out, not of the run -- but it
-    is a preference, not a guarantee, so nothing here promises which card comes back.
+    This is retriable infrastructure, deliberately not an OOM. An OOM means the run does not fit
+    and retries on a larger card. Substantial boot-time occupancy instead calls for a fresh
+    allocation, because a larger card can arrive just as occupied. This error does not claim that an
+    accepted card has enough free VRAM for the run: occupancy at or below 5%, unreadable NVML, and
+    invalid readings remain fail-open limits of the best-effort screen.
     """
 
 
-def _nvml_memory_gb() -> tuple[float, float] | None:
-    """``(free, total)`` on device 0 in GB straight from NVML, or None if NVML will not answer.
+def _nvml_memory_gb(device_index: int = 0) -> tuple[float, float] | None:
+    """``(free, total)`` for one device in GB from NVML, or None if NVML will not answer.
 
-    NVML, not ``torch.cuda.mem_get_info``: the torch call needs a CUDA context and CREATES one if the
-    process has none, so the act of measuring adds our own few hundred MB to the number being
-    measured. NVML queries the driver without initializing CUDA in this process, which is what lets
-    the boot reading be taken while the card is still provably untouched by us.
+    NVML, not ``torch.cuda.mem_get_info``: the torch call needs a CUDA context and creates one if the
+    process has none, so the act of measuring adds our own memory to the number being measured. NVML
+    queries the driver without initializing CUDA in this process. Device 0 remains the default for
+    the diagnostic helpers that expose its free and total memory.
     """
     try:
         import pynvml
 
         pynvml.nvmlInit()
         try:
-            info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0))
+            handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
             return float(info.free) / (1024**3), float(info.total) / (1024**3)
         finally:
             with contextlib.suppress(Exception):
@@ -110,76 +105,44 @@ def total_vram_gb() -> float | None:
     return None if reading is None else reading[1]
 
 
-def preflight_free_vram(*, max_occupied_fraction: float = 0.05) -> None:
-    """Fail fast when the allocated card arrives already occupied by somebody else.
+def preflight_gpu_occupancy(gpu_count: int, *, max_occupied_fraction: float = 0.05) -> None:
+    """Screen each allocated GPU for substantial occupancy before CUDA initialization.
 
-    Flash sizes the run, asks the provider for a card that fits, and then trains on whatever comes
-    back without ever checking that the memory is FREE. A real RTX 4090 arrived with
-    ``total=22.5 used=18.6 free=3.4``, only 0.486 GB of it owned by any process in this container:
-    ~18 GB was a co-tenant in another container. The number was already in the first heartbeat,
-    before any work -- recorded and not acted on -- so the run downloaded the model and built FSDP
-    for ~80s of paid GPU before dying on an OOM that was knowable at boot.
+    The worker reads exactly the allocator-resolved device indices ``range(gpu_count)`` through NVML.
+    An unreadable device or a non-positive total is skipped without hiding later allocated devices.
+    If any valid reading exceeds 5% occupancy, the allocation is rejected as retriable
+    infrastructure after every allocated device has been inspected.
 
-    Measured as OCCUPANCY (``used/total`` as the driver reports it), not against a requirement.
-    Re-deriving "what this run needs" here would be a second sizing model competing with the
-    allocator's, and it loses both ways: the allocator sizes SFT from profile-measured knobs
-    (``_overridden_train``) that reduce an authored batch 8 to the executed batch 1, so recomputing
-    from the authored spec demands more than the card was rented for; and a run sized exactly at a
-    catalog tier (24 GB) can exceed a real card's usable total (22.5 GB on a 4090), which no amount
-    of free memory can ever satisfy. Both reject a perfectly clean card and retry until the infra
-    budget is gone -- strictly worse than the OOM this exists to prevent.
-
-    Occupancy has neither failure mode: it needs no requirement, no profile, and no catalog number.
-    An empty card reads ~0 whatever is scheduled on it, so the threshold can sit near zero rather
-    than being padded to cover a requirement it never consults. 5% is the driver's own reserve plus
-    slack; the observed dirty card was at 83% with 0.486 GB attributable to us.
-
-    The floor is low BECAUSE the check is occupancy: a loose threshold has to be justified against
-    the biggest run that could be scheduled, and a 5 GB co-tenant that leaves a 20 GB run 17.5 GB on
-    a 22.5 GB card is 22% occupied and fatal. Sizing the threshold to survive that means re-deriving
-    the requirement, which is the failure above. Refusing every card with a stranger on it needs no
-    requirement and covers the close-fitting case too.
-
-    A threshold that low only works if none of the used memory is OURS, and that is established by
-    WHEN the reading is taken, not by trying to attribute it afterwards. Attribution was tried and
-    cannot work here: ``nvidia-smi --query-compute-apps`` reports HOST pids, while the worker
-    container runs with a private pid namespace (``docker run`` in ``providers/_lifecycle/instance``
-    passes no ``--pid=host``), so testing ``/proc/<pid>`` inside the container is not an ownership
-    test in either direction -- our own rows fail it and get counted as a stranger's, and under
-    ``--pid=host`` a real co-tenant passes it and gets credited to us, silently waving through the
-    exact card this exists to refuse.
-
-    So the check simply declines to run once this process has a CUDA context, which makes WHEN it
-    runs the whole design. There is exactly one call site, ``_preflight_free_vram_for_spec`` at the
-    top of ``_run_worker_mode``, and it is placed before ``_force_fla_triton_gdn_on_sm100`` because
-    that reads ``get_device_capability`` and creates the process's first context. Calling from
-    anywhere below that point is not a weaker check, it is no check at all: the guard above returns
-    immediately and the card is never read. A single early call site is therefore the invariant, not
-    an omission -- a later retry could only run after CUDA came up, when the reading is already
-    unusable. That also means one NVML failure at boot is one lost reading, not a lost run: the
-    guard below returns and training proceeds exactly as it did before this check existed.
+    This is a best-effort occupancy boundary, not an exact-fit guarantee. It deliberately does not
+    reconstruct the allocator's run requirement. Occupancy at or below 5%, unreadable NVML, and
+    invalid readings remain accepted. Once this process has initialized CUDA, the whole screen is
+    fail-open because the driver reading includes memory owned by this process with no sound way to
+    subtract it.
     """
     if cuda_is_initialized():
-        # some of `used` would be ours and there is no sound way to tell how much. a check that
-        # cannot distinguish our context from a co-tenant would either false-reject clean cards or
-        # need a threshold too loose to catch the tenant it exists for. staying silent is correct:
-        # the boot call already read this card while it was provably untouched.
+        # some of `used` would be ours and there is no sound way to tell how much
         return
-    reading = _nvml_memory_gb()
-    if reading is None:
-        # NVML would not answer. somebody else's failure to report, not evidence of a dirty card --
-        # training fails soon enough with a better message.
+
+    first_dirty: tuple[int, float, float] | None = None
+    for device_index in range(gpu_count):
+        reading = _nvml_memory_gb(device_index)
+        if reading is None:
+            # one unreadable device is not evidence about any later allocated device
+            continue
+        free, total = reading
+        if total <= 0:
+            continue
+        used = max(0.0, total - free)
+        if used > total * max_occupied_fraction and first_dirty is None:
+            first_dirty = (device_index, used, total)
+
+    if first_dirty is None:
         return
-    free, total = reading
-    if total <= 0:
-        return
-    used = max(0.0, total - free)
-    if used <= total * max_occupied_fraction:
-        return
+    device_index, used, total = first_dirty
     raise DirtyGpuError(
-        f"allocated GPU has {used:.1f} GB of {total:.1f} GB ({used / total:.0%}) already in use "
-        "before this run has touched it; the card is occupied by another tenant or a previous "
-        "tenant's leak, so retrying on a freshly allocated instance"
+        f"allocated GPU device {device_index} has {used:.1f} GB of {total:.1f} GB "
+        f"({used / total:.0%}) already in use before this run has touched it; the card is occupied "
+        "by another tenant or a previous tenant's leak, so retrying on a freshly allocated instance"
     )
 
 

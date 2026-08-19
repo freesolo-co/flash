@@ -14,6 +14,8 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from tests._helpers.source_snapshot import valid_source_snapshot
+
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
@@ -26,6 +28,7 @@ SPEC = {
 }
 
 _USER_PREFIX = "fslo-user-"
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _identity_for_token(token: str) -> dict[str, str]:
@@ -269,6 +272,7 @@ def api(tmp_path, monkeypatch):
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo: _SOURCE_SNAPSHOT)
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
     # Keep submit offline: validate + record, but the GPU job body is a no-op.

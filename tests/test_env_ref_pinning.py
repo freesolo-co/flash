@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 
 from flash.core.spec import JobSpec
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _SHA = "a" * 40
 _REVISION = "b" * 40
@@ -56,7 +57,7 @@ def test_submit_context_preserves_controller_staged_identity_without_resolving(m
         spec.seed,
         io.StringIO(),
         None,
-        "code/test/flash",
+        valid_source_snapshot(),
         0,
     )
     assert context.spec.environment.package == spec.environment.package
