@@ -326,6 +326,51 @@ def test_hub_cache_is_bound_to_the_volume_for_the_engine_child(
     assert scrubbed["HF_HUB_CACHE"] == str(launch.base_weights_cache_path(cache_root))
 
 
+def test_engine_start_is_sealed_offline_only_after_hydration(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # vllm probes the served repo for optional files and passes no local_files_only, so those
+    # calls follow the hub's offline flag. the served repo is private and the token is gone by
+    # then, so the probe authenticates as nobody and a private repo answers "not found" rather
+    # than "no such file" -- which transformers turns into a hard OSError that kills startup.
+    # both live canary arms died exactly there.
+    environment = _environment(tmp_path)
+    order: list[str] = []
+    captured: dict[str, object] = {}
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: False)
+
+    def hydrate(*_args, **_kwargs):
+        # the flag disables outgoing traffic globally, so sealing before this point would break
+        # the very download that fills the cache. hydration must still see it unset.
+        order.append("hydrate")
+        assert os.environ.get("HF_HUB_OFFLINE") is None
+
+    async def serve(*_args, **_kwargs):
+        import huggingface_hub.constants as hub_constants
+
+        order.append("serve")
+        # the environment variable alone is inert: huggingface_hub binds it to a module constant
+        # at import, and hydration already imported it. the constant is what vllm reads.
+        captured["constant"] = hub_constants.HF_HUB_OFFLINE
+        captured["variable"] = os.environ.get("HF_HUB_OFFLINE")
+
+    monkeypatch.setattr(launch, "hydrate_base_weights", hydrate)
+    monkeypatch.setattr(launch, "hydrate_manifest", hydrate)
+    monkeypatch.setattr(launch, "_serve", serve)
+
+    launch.run_launcher(environment)
+
+    assert order == ["hydrate", "serve"]
+    assert captured["constant"] is True
+    assert captured["variable"] == "1"
+    # a child imports the hub fresh, so it needs the name to survive the allowlist scrub.
+    assert launch._scrub_child_environment(environment)["HF_HUB_OFFLINE"] == "1"
+
+
 def test_sigterm_during_hydration_aborts_and_closes_startup_state(
     monkeypatch,
     tmp_path: Path,

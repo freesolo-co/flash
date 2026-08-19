@@ -44,6 +44,9 @@ _SAFE_CHILD_COPIED_ENV_NAMES = frozenset(
         "HF_HOME",
         "HF_HUB_CACHE",
         "HF_HUB_DISABLE_XET",
+        # a child imports the hub fresh, so it reads this from the environment rather than
+        # inheriting the constant this process already flipped.
+        "HF_HUB_OFFLINE",
         "LANG",
         "LC_ALL",
         "NVIDIA_DRIVER_CAPABILITIES",
@@ -387,6 +390,38 @@ def _bind_hub_cache(environment: MutableMapping[str, str], cache_root: str) -> N
     os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 
+def _seal_hub_offline(environment: MutableMapping[str, str]) -> None:
+    """stop the engine from reaching the hub once the cache is complete.
+
+    vllm probes the served repo for optional files -- an image processor config even for a
+    text-only model -- and passes no local_files_only, so those calls default to the hub's own
+    offline flag. the served repo is private and the artifact token is deleted at the end of
+    bootstrap, so the probe authenticates as nobody, and a private repo answers "not found"
+    rather than "no such file". transformers re-raises exactly that as a hard OSError even though
+    the caller asked it not to raise for missing entries, so an optional file kills startup.
+
+    the environment variable alone is not enough. huggingface_hub reads it once at import and
+    binds the result to a module constant, and hydration has already imported it by the time this
+    runs, so setting only the variable is inert. the constant is what vllm actually reads, through
+    a live attribute lookup, so both are set: the constant for this process, the variable for any
+    child that imports the hub fresh.
+
+    this must run after hydration. the flag disables outgoing traffic globally, so setting it any
+    earlier would break the very download that fills the cache.
+    """
+
+    environment["HF_HUB_OFFLINE"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    try:
+        import huggingface_hub.constants as hub_constants
+
+        hub_constants.HF_HUB_OFFLINE = True
+    except Exception as exc:
+        # the engine cannot serve without the hub library, so a failure here is not recoverable
+        # by continuing: it would reach the network with no token and fail later and less clearly.
+        raise LaunchError("hub offline mode could not be applied") from exc
+
+
 def _port(environment: MutableMapping[str, str]) -> int:
     raw = environment.get(_PORT_ENV, str(_DEFAULT_PORT))
     if not raw.isdecimal():
@@ -421,6 +456,7 @@ def _run_with_secrets(
     _bind_hub_cache(environment, cache_root)
     inference_token, artifact_token = secrets._reveal_for_launch()
     _prepare_cache(manifest, cache_root, artifact_token)
+    _seal_hub_offline(environment)
     args = SimpleNamespace(
         cache_root=cache_root,
         host=environment.get(_HOST_ENV, _DEFAULT_HOST),
