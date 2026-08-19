@@ -1518,7 +1518,7 @@ def test_observation_survives_a_resource_that_exposes_no_ports() -> None:
     # absence must stay absence, not become a wildcard that lets any port shape through: a
     # genuinely malformed value is still rejected, so this cannot mask a real schema change.
     for malformed in (0, 12.5, {"8000": "http"}, True):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="pod ports must be a string or list"):
             parse_pods(
                 [
                     {
