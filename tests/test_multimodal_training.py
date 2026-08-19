@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.content import image_descriptors as _image_descriptors
 from flash.content import multimodal as mm
 from tests._helpers.profile import attach_sft_profile
 
@@ -504,8 +505,8 @@ def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
     assert mm.MAX_IMAGES_PER_EXAMPLE == 4
     assert mm.MAX_IMAGE_SOURCE_BYTES == 8 * 1024 * 1024
     assert mm.MAX_TOTAL_IMAGE_SOURCE_BYTES == 16 * 1024 * 1024
-    assert mm.MAX_IMAGE_PIXELS == 16_777_216
-    assert mm.MAX_TOTAL_IMAGE_PIXELS == 33_554_432
+    assert mm.MAX_IMAGE_PIXELS == 6_710_886
+    assert mm.MAX_TOTAL_IMAGE_PIXELS == 13_421_772
     assert mm.MAX_TOTAL_DECODED_BYTES == 64 * 1024 * 1024
 
     monkeypatch.setattr(mm, "MAX_IMAGES_PER_EXAMPLE", 1)
@@ -536,16 +537,35 @@ def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="pixel limit"):
         mm.normalize_image_source(data, root)
 
-    monkeypatch.setattr(mm, "MAX_IMAGE_PIXELS", 16_777_216)
+    monkeypatch.setattr(mm, "MAX_IMAGE_PIXELS", 6_710_886)
     monkeypatch.setattr(mm, "MAX_TOTAL_IMAGE_PIXELS", 3)
     with pytest.raises(ValueError, match="pixel total"):
         mm.normalize_prompt_images({"images": [data, data]}, messages, root)
 
-    monkeypatch.setattr(mm, "MAX_TOTAL_IMAGE_PIXELS", 33_554_432)
+    monkeypatch.setattr(mm, "MAX_TOTAL_IMAGE_PIXELS", 13_421_772)
     monkeypatch.setattr(mm, "MAX_TOTAL_DECODED_BYTES", 1)
     descriptor = mm.normalize_image_source(data, root)
     with pytest.raises(ValueError, match="decoded images"):
         mm.decode_image_descriptors([descriptor], root)
+
+
+def test_the_advertised_pixel_cap_is_reachable_by_a_real_image():
+    """An image exactly at the pixel cap must pass the decoded-memory guard too.
+
+    The two limits are enforced in sequence, so a pixel cap the memory guard would always reject
+    is not a limit at all -- it is a promise the validator breaks. With the cap chosen
+    independently of the budget they disagreed: a 4K RGB screenshot (8.3 MP) sat under an
+    advertised 16.7 MP cap and still failed at ~71 MiB against 64 MiB. Assert the relationship
+    rather than the number so a future edit to either side has to keep them consistent.
+    """
+    worst_case_decoded_bytes = mm.MAX_IMAGE_PIXELS * _image_descriptors.WORST_BYTES_PER_PIXEL
+    assert worst_case_decoded_bytes <= mm.MAX_TOTAL_DECODED_BYTES
+
+    # and the cap is not merely safe by being tiny: one more pixel would exceed the budget, so
+    # this is the largest image the decoded-memory guard can actually admit.
+    assert (mm.MAX_IMAGE_PIXELS + 1) * _image_descriptors.WORST_BYTES_PER_PIXEL > (
+        mm.MAX_TOTAL_DECODED_BYTES
+    )
 
 
 def test_total_decoded_budget_is_checked_before_any_image_load_or_conversion(monkeypatch, tmp_path):

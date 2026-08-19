@@ -18,9 +18,13 @@ MAX_IMAGE_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_IMAGE_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_WIDTH = 8192
 MAX_IMAGE_HEIGHT = 8192
-MAX_IMAGE_PIXELS = 16_777_216
-MAX_TOTAL_IMAGE_PIXELS = 33_554_432
 MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
+# derived from the memory budget rather than chosen independently: with a separate number the
+# two disagreed, and an image under the advertised pixel cap could still be rejected for decoded
+# memory (a 4K RGB screenshot needed ~71 MiB against a 64 MiB budget). serving advertises this
+# same pair, so both repositories derive it the same way.
+MAX_IMAGE_PIXELS = MAX_TOTAL_DECODED_BYTES // _image_descriptors.WORST_BYTES_PER_PIXEL
+MAX_TOTAL_IMAGE_PIXELS = 2 * MAX_IMAGE_PIXELS
 MAX_DATA_URI_HEADER_BYTES = 1024
 MAX_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024

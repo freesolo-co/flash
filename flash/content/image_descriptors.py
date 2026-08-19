@@ -42,6 +42,10 @@ _MODE_BYTES_PER_PIXEL = {
     "F": 4,
 }
 _RGB_BYTES_PER_PIXEL = 3
+# decoding one image costs its own buffer plus a transient RGB conversion, so the worst mode
+# sets the bytes-per-pixel any pixel budget has to assume. exported because the pixel caps are
+# derived from it: a cap the decoded-memory guard would always reject is not a limit.
+WORST_BYTES_PER_PIXEL = max(_MODE_BYTES_PER_PIXEL.values()) + 2 * _RGB_BYTES_PER_PIXEL
 
 
 @dataclass(frozen=True)

@@ -42,8 +42,6 @@ _MAX_IMAGE_SOURCE_BYTES = 8 * 1024 * 1024
 _MAX_TOTAL_IMAGE_SOURCE_BYTES = 16 * 1024 * 1024
 _MAX_IMAGE_WIDTH = 8192
 _MAX_IMAGE_HEIGHT = 8192
-_MAX_IMAGE_PIXELS = 16_777_216
-_MAX_TOTAL_IMAGE_PIXELS = 33_554_432
 _MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
 _MODE_BYTES_PER_PIXEL = {
     "1": 1,
@@ -64,6 +62,17 @@ _MODE_BYTES_PER_PIXEL = {
     "I": 4,
     "F": 4,
 }
+_RGB_BYTES_PER_PIXEL = 3
+# decoding one image costs its own buffer plus a transient RGB conversion, so the worst mode
+# sets the bytes-per-pixel a pixel budget has to assume.
+_WORST_BYTES_PER_PIXEL = max(_MODE_BYTES_PER_PIXEL.values()) + 2 * _RGB_BYTES_PER_PIXEL
+
+# derived from the memory budget rather than chosen independently, matching the parent's
+# `flash.content.multimodal`: a pixel count the decoded-memory guard would always reject is not a
+# limit. this file cannot import flash, so the derivation is repeated rather than shared -- the
+# inputs above are the same, so the two land on the same numbers.
+_MAX_IMAGE_PIXELS = _MAX_TOTAL_DECODED_BYTES // _WORST_BYTES_PER_PIXEL
+_MAX_TOTAL_IMAGE_PIXELS = 2 * _MAX_IMAGE_PIXELS
 
 
 def normalize_token_ids(value) -> list[int]:
@@ -434,7 +443,9 @@ def _inspect_dynamic_image(data: bytes, expected_format: str) -> tuple[int, int]
                 if getattr(image, "n_frames", 1) != 1:
                     raise ValueError("environment reply image must be a static single-frame image")
                 pixels = _validate_dynamic_image_dimensions(image.width, image.height)
-                decoded_peak_bytes = pixels * (_MODE_BYTES_PER_PIXEL.get(image.mode, 4) + 6)
+                decoded_peak_bytes = pixels * (
+                    _MODE_BYTES_PER_PIXEL.get(image.mode, 4) + 2 * _RGB_BYTES_PER_PIXEL
+                )
                 image.verify()
         return pixels, decoded_peak_bytes
     except ValueError:
@@ -486,7 +497,7 @@ def _decode_image_data_uris(image_data_uris: list[str]) -> list:
         pixels, decoded_peak_bytes = _inspect_dynamic_image(data, expected_format)
         if prior_pixels + pixels > _MAX_TOTAL_IMAGE_PIXELS:
             raise ValueError("environment reply images exceed the aggregate pixel limit")
-        if 3 * prior_pixels + decoded_peak_bytes > _MAX_TOTAL_DECODED_BYTES:
+        if _RGB_BYTES_PER_PIXEL * prior_pixels + decoded_peak_bytes > _MAX_TOTAL_DECODED_BYTES:
             raise ValueError("environment reply images exceed the aggregate decoded-byte limit")
         prior_pixels += pixels
         prepared.append((data, expected_format))
