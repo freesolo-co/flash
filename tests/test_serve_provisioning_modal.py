@@ -5,6 +5,7 @@ from __future__ import annotations
 import email.message
 import io
 import json
+import re
 import subprocess
 import sys
 import urllib.response
@@ -22,7 +23,10 @@ from flash.serve.control import (
     sanitized_dict,
 )
 from flash.serve.provisioning import DeploymentBundle, ServingImage, ServingRuntimeSecrets
-from flash.serve.provisioning._modal_plan import build_modal_create_plan
+from flash.serve.provisioning._modal_plan import (
+    MODAL_DEPLOYMENT_TAG_LIMIT,
+    build_modal_create_plan,
+)
 from flash.serve.provisioning._modal_probe import ModalEndpointProbe, _provenance_matches
 from flash.serve.provisioning._modal_sdk import (
     ModalAppObservation,
@@ -361,6 +365,24 @@ def test_invalid_spec_credentials_and_deadline_fail_before_client_construction()
             sleep=clock.sleep,
         )
     assert factory.calls == []
+
+
+def test_deployment_tag_fits_modals_limit_in_every_phase() -> None:
+    # modal rejects a tag over 50 characters at app.deploy(), which happens AFTER the inference
+    # secret and volume are created -- so an over-long tag does not fail cleanly, it fails as
+    # outcome_unknown with orphaned billable resources. this asserts the shape modal accepts:
+    # within the length limit, in modal's charset, and still distinct per phase.
+    bundle = _bundle()
+    tags = {
+        phase: build_modal_create_plan(bundle, phase=phase).deployment_tag
+        for phase in ("bootstrap", "finalized")
+    }
+
+    for phase, tag in tags.items():
+        assert len(tag) <= MODAL_DEPLOYMENT_TAG_LIMIT, f"{phase} tag is {len(tag)} chars"
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", tag), f"{phase} tag has invalid characters"
+        assert tag.startswith(f"fsm1-{phase}-")
+    assert tags["bootstrap"] != tags["finalized"]
 
 
 def test_plan_is_complete_secret_free_and_binds_launcher_abi(monkeypatch) -> None:

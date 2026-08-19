@@ -73,6 +73,28 @@ def _validate_placement(placement: ModalPlacement) -> None:
         raise ValueError("modal gpu must be a canonical gpu type")
 
 
+# modal rejects a deployment tag over 50 characters, and `fsm1-<phase>-` already spends 15 of
+# them against a 43-character topology hash, so the untruncated tag was 58 and every deploy failed
+# at app.deploy() -- after the secret and volume had been created, which is why the failure
+# surfaced as outcome_unknown with orphaned resources rather than a clean rejection.
+MODAL_DEPLOYMENT_TAG_LIMIT = 50
+
+
+def _deployment_tag(phase: str, topology: str) -> str:
+    """build a modal deployment tag that fits modal's 50-character limit.
+
+    the topology hash is truncated rather than dropped: it is what distinguishes one deployment's
+    tag from another, and 35 base64url characters still carry ~208 bits. truncating keeps the tag
+    deterministic for the same bundle, which the finalize/reconcile path relies on.
+    """
+
+    prefix = f"fsm1-{phase}-"
+    tag = prefix + topology[: MODAL_DEPLOYMENT_TAG_LIMIT - len(prefix)]
+    if len(tag) > MODAL_DEPLOYMENT_TAG_LIMIT or not tag.startswith(prefix):
+        raise ValueError("modal deployment tag does not fit modal's tag limit")
+    return tag
+
+
 def _modal_resource_names(bundle: DeploymentBundle) -> ServingResourceNames:
     payload = b"\0".join(
         (
@@ -256,7 +278,7 @@ def build_modal_create_plan(
         encoded_manifest=encoded_manifest,
         environment=_environment(bundle, encoded_manifest),
         tags=tags,
-        deployment_tag=f"fsm1-{phase}-{topology}",
+        deployment_tag=_deployment_tag(phase, topology),
         gpu_request=f"{placement.gpu}:{placement.gpu_count}",
         function_name=names.template,
         endpoint_label=endpoint_label,

@@ -14,6 +14,9 @@ from flash.serve.control import DeploymentErrorCode
 
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 REST_BASE_URL = "https://rest.runpod.io/v1"
+# carries no version: this identifies the client to runpod and must not become another surface
+# that has to be bumped in lockstep with the package version.
+USER_AGENT = "flash-serving"
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
@@ -153,6 +156,11 @@ class StdlibRunPodTransport:
                 "Accept": "application/json",
                 "Authorization": f"Bearer {self.__api_key}",
                 "Content-Type": "application/json",
+                # runpod's graphql edge rejects urllib's default "Python-urllib/x.y" agent with
+                # 403 while accepting the identical request under any other agent. the rest api
+                # does not, so leaving it unset failed only on graphql and surfaced as
+                # authentication_failed -- indistinguishable from a bad key.
+                "User-Agent": USER_AGENT,
             },
             method=method,
         )

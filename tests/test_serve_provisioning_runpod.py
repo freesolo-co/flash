@@ -30,6 +30,7 @@ from flash.serve.provisioning._runpod_protocol import (
 )
 from flash.serve.provisioning._runpod_transport import (
     GRAPHQL_URL,
+    USER_AGENT,
     RunPodTransportFailure,
     StdlibRunPodTransport,
     build_no_redirect_opener,
@@ -1294,3 +1295,36 @@ def test_stdlib_transport_does_not_reflect_provider_error_bodies() -> None:
     assert exc_info.value.outcome_unknown is False
     assert calls == 1
     assert ARTIFACT_SECRET not in str(exc_info.value)
+
+
+def test_requests_send_an_explicit_user_agent_on_both_apis() -> None:
+    # runpod's graphql edge answers 403 to urllib's default "Python-urllib/x.y" agent while
+    # accepting the identical authenticated request under any other agent. the rest api does not,
+    # so an unset agent failed only on graphql and surfaced as authentication_failed -- which
+    # reads as a bad credential and sends debugging to the wrong place entirely.
+    seen: list[str | None] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def opener(request, *, timeout: float):
+        seen.append(request.get_header("User-agent"))
+        return Response()
+
+    transport = StdlibRunPodTransport(PROVIDER_SECRET, opener=opener, clock=lambda: 0.0)
+    transport.graphql("query Test { probe }", {}, mutation=False, deadline_at=10.0)
+    transport.rest("GET", "/pods", None, mutation=False, deadline_at=10.0)
+
+    assert seen == [USER_AGENT, USER_AGENT]
+    for agent in seen:
+        assert agent, "an unset agent falls back to urllib's default, which runpod rejects"
+        assert "urllib" not in agent.lower()
