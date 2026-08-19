@@ -149,8 +149,7 @@ def _reuse_contradiction(
     """True when a pid is present in both scans under two different start times."""
     starts = {identity.pid: identity.start_time for identity in first}
     return any(
-        starts.get(identity.pid, identity.start_time) != identity.start_time
-        for identity in second
+        starts.get(identity.pid, identity.start_time) != identity.start_time for identity in second
     )
 
 
