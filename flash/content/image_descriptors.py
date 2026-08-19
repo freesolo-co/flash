@@ -41,11 +41,11 @@ _MODE_BYTES_PER_PIXEL = {
     "I": 4,
     "F": 4,
 }
-_RGB_BYTES_PER_PIXEL = 3
+RGB_BYTES_PER_PIXEL = 3
 # decoding one image costs its own buffer plus a transient RGB conversion, so the worst mode
-# sets the bytes-per-pixel any pixel budget has to assume. exported because the pixel caps are
-# derived from it: a cap the decoded-memory guard would always reject is not a limit.
-WORST_BYTES_PER_PIXEL = max(_MODE_BYTES_PER_PIXEL.values()) + 2 * _RGB_BYTES_PER_PIXEL
+# sets the bytes-per-pixel a pixel budget has to assume. exported because the per-image pixel cap
+# is derived from it: a cap the decoded-memory guard would always reject is not a limit.
+WORST_BYTES_PER_PIXEL = max(_MODE_BYTES_PER_PIXEL.values()) + 2 * RGB_BYTES_PER_PIXEL
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,6 @@ class ImageDescriptorLimits:
     max_width: int
     max_height: int
     max_pixels: int
-    max_total_pixels: int
     max_total_decoded_bytes: int
     max_data_uri_header_bytes: int
     max_descriptor_bytes: int
@@ -212,7 +211,7 @@ def inspect_image_metadata(
                 stored_width, stored_height = image.size
                 pixels = validate_dimensions(stored_width, stored_height, limits)
                 decoded_peak_bytes = pixels * (
-                    _MODE_BYTES_PER_PIXEL.get(image.mode, 4) + 2 * _RGB_BYTES_PER_PIXEL
+                    _MODE_BYTES_PER_PIXEL.get(image.mode, 4) + 2 * RGB_BYTES_PER_PIXEL
                 )
                 image.verify()
             with Image.open(io.BytesIO(data)) as orientation_probe:
@@ -352,11 +351,7 @@ def validate_image_descriptors(
             raise ValueError(
                 f"example image sources exceed the {limits.max_total_source_bytes}-byte limit"
             )
-        if prior_pixels + item.pixels > limits.max_total_pixels:
-            raise ValueError(
-                f"example images exceed the {limits.max_total_pixels}-pixel total limit"
-            )
-        decoded_bytes = _RGB_BYTES_PER_PIXEL * prior_pixels + item.decoded_peak_bytes
+        decoded_bytes = RGB_BYTES_PER_PIXEL * prior_pixels + item.decoded_peak_bytes
         if decoded_bytes > limits.max_total_decoded_bytes:
             raise ValueError(
                 f"example decoded images exceed the {limits.max_total_decoded_bytes}-byte limit"

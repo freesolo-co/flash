@@ -70,9 +70,10 @@ _WORST_BYTES_PER_PIXEL = max(_MODE_BYTES_PER_PIXEL.values()) + 2 * _RGB_BYTES_PE
 # derived from the memory budget rather than chosen independently, matching the parent's
 # `flash.content.multimodal`: a pixel count the decoded-memory guard would always reject is not a
 # limit. this file cannot import flash, so the derivation is repeated rather than shared -- the
-# inputs above are the same, so the two land on the same numbers.
+# inputs above are the same, so the two land on the same numbers. there is no cumulative pixel cap
+# for the same reason as the parent: decoded memory depends on mode and order, so no mode-blind
+# total can track it, and the aggregate decoded-byte guard below already bounds it exactly.
 _MAX_IMAGE_PIXELS = _MAX_TOTAL_DECODED_BYTES // _WORST_BYTES_PER_PIXEL
-_MAX_TOTAL_IMAGE_PIXELS = 2 * _MAX_IMAGE_PIXELS
 
 
 def normalize_token_ids(value) -> list[int]:
@@ -495,8 +496,6 @@ def _decode_image_data_uris(image_data_uris: list[str]) -> list:
         if total_source_bytes > _MAX_TOTAL_IMAGE_SOURCE_BYTES:
             raise ValueError("environment reply images exceed the aggregate source-byte limit")
         pixels, decoded_peak_bytes = _inspect_dynamic_image(data, expected_format)
-        if prior_pixels + pixels > _MAX_TOTAL_IMAGE_PIXELS:
-            raise ValueError("environment reply images exceed the aggregate pixel limit")
         if _RGB_BYTES_PER_PIXEL * prior_pixels + decoded_peak_bytes > _MAX_TOTAL_DECODED_BYTES:
             raise ValueError("environment reply images exceed the aggregate decoded-byte limit")
         prior_pixels += pixels

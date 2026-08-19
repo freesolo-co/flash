@@ -14,10 +14,10 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from flash.content.image_descriptors import RGB_BYTES_PER_PIXEL
 from flash.content.multimodal import (
     MAX_IMAGES_PER_EXAMPLE,
     MAX_TOTAL_DECODED_BYTES,
-    MAX_TOTAL_IMAGE_PIXELS,
     MAX_TOTAL_IMAGE_SOURCE_BYTES,
     decode_descriptor_pixels,
     read_descriptor_source,
@@ -98,11 +98,7 @@ def image_descriptor_metadata(
             raise ValueError(
                 f"example image sources exceed the {MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit"
             )
-        if prior_pixels + item.pixels > MAX_TOTAL_IMAGE_PIXELS:
-            raise ValueError(
-                f"example images exceed the {MAX_TOTAL_IMAGE_PIXELS}-pixel total limit"
-            )
-        decoded_bytes = 3 * prior_pixels + item.decoded_peak_bytes
+        decoded_bytes = RGB_BYTES_PER_PIXEL * prior_pixels + item.decoded_peak_bytes
         if decoded_bytes > MAX_TOTAL_DECODED_BYTES:
             raise ValueError(
                 f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"

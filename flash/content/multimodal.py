@@ -23,8 +23,14 @@ MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
 # two disagreed, and an image under the advertised pixel cap could still be rejected for decoded
 # memory (a 4K RGB screenshot needed ~71 MiB against a 64 MiB budget). serving advertises this
 # same pair, so both repositories derive it the same way.
+#
+# there is deliberately no cumulative pixel cap. decoded memory is what a set of images actually
+# costs, and it depends on each image's decoded mode and on their order -- neither of which a sum
+# of pixel counts can see. every mode-blind total therefore has to be wrong in one direction: a
+# total low enough to be safe for four RGBA images rejects the same pixel count spread across
+# cheaper modes, and one high enough to admit those never fires at all. the cumulative
+# decoded-memory guard below already bounds the real resource exactly, per image and in order.
 MAX_IMAGE_PIXELS = MAX_TOTAL_DECODED_BYTES // _image_descriptors.WORST_BYTES_PER_PIXEL
-MAX_TOTAL_IMAGE_PIXELS = 2 * MAX_IMAGE_PIXELS
 MAX_DATA_URI_HEADER_BYTES = 1024
 MAX_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
@@ -68,7 +74,6 @@ def _image_limits() -> _image_descriptors.ImageDescriptorLimits:
         max_width=MAX_IMAGE_WIDTH,
         max_height=MAX_IMAGE_HEIGHT,
         max_pixels=MAX_IMAGE_PIXELS,
-        max_total_pixels=MAX_TOTAL_IMAGE_PIXELS,
         max_total_decoded_bytes=MAX_TOTAL_DECODED_BYTES,
         max_data_uri_header_bytes=MAX_DATA_URI_HEADER_BYTES,
         max_descriptor_bytes=MAX_IMAGE_DESCRIPTOR_BYTES,

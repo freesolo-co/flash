@@ -138,19 +138,34 @@ def test_rl_warm_start_accepts_an_image_sft_adapter_as_its_source(algorithm):
     assert "lora_alpha" not in public_train
 
 
-def test_image_run_warm_start_stays_rejected_for_sft():
-    """SFT adapter continuation is unsupported product-wide, images included.
+def test_image_sft_warm_start_inherits_the_source_pin_like_any_other_algorithm():
+    """An image SFT run continues from an adapter on the same terms as a text one.
 
-    This is not an image-specific restriction and image support does not relax it: the guard is
-    algorithm-level, so an image SFT run must fail for exactly the same reason a text one does.
-    Pinned here so a future image change cannot quietly open an SFT warm-start path that the rest
-    of the product does not implement.
+    SFT adapter continuation used to be rejected outright, and this test pinned that rejection so
+    an image change could not quietly open a path the product did not implement. `dev` then
+    implemented it for every algorithm combination, which makes the rejection the stale side: what
+    still needs pinning is that image support does not carve out its own variant. So assert the
+    inheritance the shared path performs -- an image SFT target takes the source's pin rather than
+    resolving its own -- because a self-resolved pin would break warm start the moment the base
+    model's hub tip moved, and would leave the child undeployable.
     """
-    from flash.runner.preparation import _require_supported_adapter_continuation
+    from dataclasses import replace
+
+    from flash.runner.preparation import _adopted_warmstart_revision
 
     spec = JobSpec.from_dict(_image_sft_spec())
-    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
-        _require_supported_adapter_continuation(spec)
+    assert spec.algorithm == "sft"
+    assert spec.train.init_from_adapter == _IMAGE_SFT_SOURCE
+    assert not spec.model_revision
+
+    source_revision = "851bf6e8" * 5
+    source = replace(spec, model_revision=source_revision, model_revision_auto=True)
+    inherited = _adopted_warmstart_revision(spec, source)
+
+    assert inherited.model_revision == source_revision
+    # inherited, not authored: serving refuses an AUTHORED pin, so a warm-started image SFT child
+    # stays deployable only while this flag survives the inheritance.
+    assert inherited.model_revision_auto is True
 
 
 def _image_environment() -> dict:

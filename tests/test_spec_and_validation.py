@@ -1825,14 +1825,16 @@ def test_authored_and_ordinary_auto_model_revision_resolution_is_unchanged(monke
 
     authored_resolved = _resolve_model_revision(authored, required=False)
     rollout_unchanged = _resolve_model_revision(ordinary_auto, required=False)
-    sft_refreshed = _resolve_model_revision(ordinary_auto, required=True)
+    sft_unchanged = _resolve_model_revision(ordinary_auto, required=True)
 
-    assert calls == ["release-tag", None]
+    # only the authored pin reaches the hub. an already-resolved auto sha is returned untouched in
+    # BOTH directions: re-resolving it would look up the current tip and overwrite a pin a previous
+    # run chose, which is what breaks a warm start the moment the base model moves.
+    assert calls == ["release-tag"]
     assert authored_resolved.model_revision == resolved_sha
     assert authored_resolved.model_revision_auto is False
     assert rollout_unchanged == ordinary_auto
-    assert sft_refreshed.model_revision == resolved_sha
-    assert sft_refreshed.model_revision_auto is True
+    assert sft_unchanged == ordinary_auto
 
 
 def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() -> None:

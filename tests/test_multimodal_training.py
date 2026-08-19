@@ -506,7 +506,6 @@ def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
     assert mm.MAX_IMAGE_SOURCE_BYTES == 8 * 1024 * 1024
     assert mm.MAX_TOTAL_IMAGE_SOURCE_BYTES == 16 * 1024 * 1024
     assert mm.MAX_IMAGE_PIXELS == 6_710_886
-    assert mm.MAX_TOTAL_IMAGE_PIXELS == 13_421_772
     assert mm.MAX_TOTAL_DECODED_BYTES == 64 * 1024 * 1024
 
     monkeypatch.setattr(mm, "MAX_IMAGES_PER_EXAMPLE", 1)
@@ -538,11 +537,6 @@ def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
         mm.normalize_image_source(data, root)
 
     monkeypatch.setattr(mm, "MAX_IMAGE_PIXELS", 6_710_886)
-    monkeypatch.setattr(mm, "MAX_TOTAL_IMAGE_PIXELS", 3)
-    with pytest.raises(ValueError, match="pixel total"):
-        mm.normalize_prompt_images({"images": [data, data]}, messages, root)
-
-    monkeypatch.setattr(mm, "MAX_TOTAL_IMAGE_PIXELS", 13_421_772)
     monkeypatch.setattr(mm, "MAX_TOTAL_DECODED_BYTES", 1)
     descriptor = mm.normalize_image_source(data, root)
     with pytest.raises(ValueError, match="decoded images"):

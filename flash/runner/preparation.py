@@ -496,7 +496,16 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
     # sha with it. the warm start would then be rejected for a revision mismatch the moment the base
     # model moved -- and ``_adopted_warmstart_revision`` cannot undo it, because it refuses to
     # replace a pin that is already set.
-    if spec.model_revision_auto and re.fullmatch(r"[0-9a-f]{40}", spec.model_revision or ""):
+    # a FORCED pin is excluded, and the exclusion is load-bearing rather than defensive: the
+    # ``model_revision_force_pin`` contract requires auto=True and a 40-hex sha, so a forced pin
+    # matches this condition every single time. without the exclusion this return would swallow
+    # every forced pin, skipping both the hub verification the marker exists to demand and the
+    # clearing below that keeps the one-shot request out of any persisted spec.
+    if (
+        spec.model_revision_auto
+        and not spec.model_revision_force_pin
+        and re.fullmatch(r"[0-9a-f]{40}", spec.model_revision or "")
+    ):
         return spec
     try:
         from huggingface_hub import HfApi
