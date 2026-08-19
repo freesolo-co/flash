@@ -26,6 +26,8 @@ _ARTIFACT_TOKEN_ENV = "FLASH_ARTIFACT_TOKEN"
 _INFERENCE_TOKEN_FD_ENV = "FLASH_INFERENCE_TOKEN_FD"
 _ARTIFACT_TOKEN_FD_ENV = "FLASH_ARTIFACT_TOKEN_FD"
 _DEFAULT_CACHE_ROOT = "/var/lib/flash-serving"
+# subdirectory of the cache root that holds vllm's compiled-graph cache.
+_VLLM_CACHE_DIRNAME = "vllm"
 _DEFAULT_HOST = "0.0.0.0"
 _DEFAULT_PORT = 8000
 _CHILD_STOP_TIMEOUT_SECONDS = 5.0
@@ -52,6 +54,9 @@ _SAFE_CHILD_COPIED_ENV_NAMES = frozenset(
         "NVIDIA_DRIVER_CAPABILITIES",
         "NVIDIA_VISIBLE_DEVICES",
         "TZ",
+        # the compiled-graph cache, so the child engine reuses the volume's graphs instead of
+        # recompiling the model into ephemeral storage on every start.
+        "VLLM_CACHE_ROOT",
     }
 )
 _FIXED_CHILD_ENVIRONMENT = {
@@ -400,12 +405,19 @@ def _bind_hub_cache(environment: MutableMapping[str, str], cache_root: str) -> N
     """
 
     hub_cache = str(base_weights_cache_path(cache_root))
+    # vllm's compile cache defaults to ephemeral container storage, so leaving this unset makes
+    # every cold start recompile the model. it belongs here rather than in a provider image for
+    # the same reason as the engine settings above: it derives from the cache root the runtime
+    # already knows, and a second provider must not have to rediscover it.
+    vllm_cache = str(Path(cache_root) / _VLLM_CACHE_DIRNAME)
     environment["HF_HOME"] = cache_root
     environment["HF_HUB_CACHE"] = hub_cache
+    environment["VLLM_CACHE_ROOT"] = vllm_cache
     # the download path this image uses; xet intermittently fails engine init on a cold volume.
     environment["HF_HUB_DISABLE_XET"] = "1"
     os.environ["HF_HOME"] = cache_root
     os.environ["HF_HUB_CACHE"] = hub_cache
+    os.environ["VLLM_CACHE_ROOT"] = vllm_cache
     os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 

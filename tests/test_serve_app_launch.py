@@ -373,6 +373,32 @@ def test_engine_runtime_environment_overrides_a_conflicting_inherited_value(
     assert launch._scrub_child_environment(environment)["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
 
 
+def test_compile_cache_is_bound_to_the_volume_on_every_provider(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # vllm's compile cache defaults to ephemeral container storage, so an unset cache root makes
+    # every cold start recompile the model. it was set only by the modal image, like the engine
+    # settings above, so runpod recompiled on each start while modal reused the volume's graphs.
+    environment = _environment(tmp_path, artifact=False)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
+    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+    monkeypatch.delenv("VLLM_CACHE_ROOT", raising=False)
+
+    launch.run_launcher(environment)
+
+    expected = str(Path(environment["FLASH_SERVING_CACHE_ROOT"]) / "vllm")
+    # under the cache root, so the graphs land on the persistent volume rather than in the
+    # container. the engine runs in-process, so os.environ is the mapping that actually decides it.
+    assert os.environ["VLLM_CACHE_ROOT"] == expected
+    assert environment["VLLM_CACHE_ROOT"] == expected
+    # and the child must inherit it, or a forked engine recompiles into ephemeral storage anyway.
+    assert launch._scrub_child_environment(environment)["VLLM_CACHE_ROOT"] == expected
+
+
 def test_engine_start_is_sealed_offline_only_after_hydration(
     monkeypatch,
     tmp_path: Path,
