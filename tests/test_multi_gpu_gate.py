@@ -1528,3 +1528,106 @@ def test_structured_opd_compiler_vocab_is_card_independent():
         assert seen == [("Qwen/Qwen3.5-9B", "opd", "a" * 40, ())]
     finally:
         monkey.undo()
+
+
+def _vllm_tp_axis_failures(info, tp: int) -> list[str]:
+    """Names of the vllm tensor-parallel axes a catalog row violates at width ``tp``.
+
+    Rebuilt from the row's OWN recorded geometry, never hardcoded, so a future row is judged on
+    what it actually declares. Empty list == the rollout engine can shard this row at this width.
+    """
+    failures = []
+    if info.num_attention_heads % tp:
+        failures.append("query_heads")
+    # kv heads PARTITION when there are at least as many as ranks, and REPLICATE otherwise. which
+    # branch applies flips with the width, so both are expressed rather than assuming one.
+    kv = info.num_key_value_heads
+    if (kv % tp) if kv >= tp else (tp % kv):
+        failures.append("kv_heads")
+    if info.linear_num_value_heads % tp:
+        failures.append("gdn_value_heads")
+    conv_dim = (
+        info.linear_key_head_dim * info.linear_num_key_heads * 2
+        + info.linear_value_head_dim * info.linear_num_value_heads
+    )
+    if conv_dim % tp:
+        failures.append("gdn_conv_dim")
+    return failures
+
+
+def test_every_catalog_row_shards_on_every_vllm_tensor_parallel_axis():
+    """A rentable width must satisfy EVERY vllm tp axis, not just the query heads we gate on.
+
+    grpo and opd hand the rented card count straight to the rollout engine as
+    ``tensor_model_parallel_size`` (``train/rl/verl_config.py``, ``train/opd/overrides.py``), and
+    vllm shards four INDEPENDENT axes when the engine initializes -- which happens after the box is
+    rented and billing has started. ``geometry_safe_gpu_cap`` certifies only the first of them and
+    documents that limit; the other three hold today purely as a property of this catalog, and a
+    new row is exactly what would break that silently.
+
+    The axes, read out of vllm 0.19.1 rather than inferred from docs:
+
+      * query heads -- ``config/model.py`` raises when ``total_num_attention_heads % tp != 0``.
+      * kv heads -- ``models/qwen3_next.py`` PARTITIONS them when ``kv >= tp`` (needs
+        ``kv % tp == 0``) and REPLICATES otherwise (needs ``tp % kv == 0``).
+      * GDN value heads and conv width -- ``layers/mamba/mamba_utils.py`` sizes the recurrent state
+        with ``divide(num_v_heads, tp)`` and ``divide(conv_dim, tp)``, and ``divide`` asserts exact
+        divisibility.
+
+    This pins the whole surface at the widths a run can actually be rented at, so a row that only
+    divides on query heads is caught here rather than on a paid box.
+    """
+    from flash.core.catalog import MODELS
+    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.base import rentable_gpu_counts
+
+    for model_id, info in MODELS.items():
+        cap = geometry_safe_gpu_cap(model_id, 8)
+        admitted = [width for width in rentable_gpu_counts(8) if width <= cap]
+        assert admitted, f"{model_id}: no rentable width survives the cap"
+        for width in admitted:
+            assert not _vllm_tp_axis_failures(info, width), (
+                f"{model_id} is admitted at {width} cards but vllm cannot shard it: "
+                f"{_vllm_tp_axis_failures(info, width)}"
+            )
+
+
+def test_the_tensor_parallel_axis_check_fails_a_row_vllm_would_reject():
+    """The axis check must have teeth: a row that only divides on query heads has to fail.
+
+    Without this, ``test_every_catalog_row_shards_on_every_vllm_tensor_parallel_axis`` would pass
+    just as happily against a helper that never returns a failure, and would go on passing after a
+    refactor quietly broke it. The counter-example is the shape the query-head gate cannot see: 16
+    query heads (divides 8 cleanly) over kv and GDN widths that do not.
+    """
+    from dataclasses import replace
+
+    from flash.core.catalog import MODELS
+
+    row = replace(
+        MODELS["Qwen/Qwen3.5-4B"],
+        num_attention_heads=16,
+        num_key_value_heads=3,
+        linear_num_value_heads=12,
+    )
+    # the axis the allocator certifies is clean, so a query-head-only check would admit this.
+    assert row.num_attention_heads % 8 == 0
+    # the axes it does NOT certify reject the row, and each violation is named.
+    assert _vllm_tp_axis_failures(row, 8) == ["kv_heads", "gdn_value_heads"]
+    # genuinely width-dependent rather than always-failing: 12 value heads divide 4, so only the
+    # kv axis (3 can neither partition across nor replicate into 4 ranks) still objects.
+    assert _vllm_tp_axis_failures(row, 4) == ["kv_heads"]
+    # a real row stays clean at every width, so the helper is not merely rejecting everything.
+    assert _vllm_tp_axis_failures(MODELS["Qwen/Qwen3.6-27B"], 8) == []
+    # the conv axis is reported, and ISOLATED: conv_dim is `head_k*num_k*2 + head_v*num_v`, which
+    # the catalog's 128-wide head dims keep a multiple of 8 for any head count -- so no value-head
+    # count alone can break it. Narrow the dims instead: 1*3*2 + 1*16 = 22 fails while the value
+    # heads (16) still divide 8, leaving conv_dim as the only objection.
+    narrow_conv = replace(
+        MODELS["Qwen/Qwen3.5-4B"],
+        linear_key_head_dim=1,
+        linear_num_key_heads=3,
+        linear_value_head_dim=1,
+        linear_num_value_heads=16,
+    )
+    assert _vllm_tp_axis_failures(narrow_conv, 8) == ["gdn_conv_dim"]
