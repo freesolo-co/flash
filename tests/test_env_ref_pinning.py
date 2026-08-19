@@ -17,9 +17,11 @@ import io
 import pytest
 
 from flash.core.spec import JobSpec
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _SHA = "a" * 40
 _NEWER_SHA = "b" * 40
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _env_spec(resolved_sha: str = "", **extra) -> JobSpec:
@@ -166,6 +168,17 @@ def _retry_spec() -> JobSpec:
     )
 
 
+def _seed_status(orch, spec: JobSpec) -> None:
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+    )
+
+
 @pytest.fixture
 def orch(monkeypatch, tmp_path):
     """The runner package on a tmp run-store, with the inter-attempt teardown kept off-network."""
@@ -235,7 +248,7 @@ def test_retry_trains_on_the_same_environment_commit_as_the_first_attempt(
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
 
     spec = _retry_spec()
-    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict()))
+    _seed_status(orch, spec)
     orch._submit_seed_supervised(spec, 0, io.StringIO())
 
     assert len(seen_shas) == 2, "the infra failure should have produced a second attempt"
@@ -288,7 +301,7 @@ def test_a_recovered_resolve_cannot_pin_a_newer_commit_mid_run(orch, monkeypatch
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
 
     spec = _retry_spec()
-    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict()))
+    _seed_status(orch, spec)
     log = io.StringIO()
     orch._submit_seed_supervised(spec, 0, log)
 

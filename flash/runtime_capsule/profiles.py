@@ -35,6 +35,7 @@ _INSTANCE_BOOTSTRAP_SOURCES = (
     (f"{_LIFECYCLE}/bootstrap_secrets.py", "bootstrap_secrets.py"),
     (f"{_LIFECYCLE}/bootstrap_console.py", "bootstrap_console.py"),
     (f"{_LIFECYCLE}/bootstrap_pip.py", "bootstrap_pip.py"),
+    ("flash/source_snapshot.py", "source_snapshot.py"),
 )
 
 # the host-side helpers the launch script invokes as standalone programs, alongside the bootstrap.
@@ -49,7 +50,7 @@ PROFILES: dict[str, Profile] = {
     # script runs directly. one profile, because both providers execute the same programs.
     "instance-bootstrap": Profile(
         name="instance-bootstrap",
-        version=1,
+        version=2,
         entrypoint="bootstrap.py",
         sources=_INSTANCE_BOOTSTRAP_SOURCES + _HOST_HELPER_SOURCES,
     ),

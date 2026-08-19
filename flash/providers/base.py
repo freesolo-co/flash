@@ -903,7 +903,7 @@ class Provider(Protocol):
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
-        code_prefix: str | None = None,
+        source_snapshot: dict | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
         """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll to terminal.

@@ -277,8 +277,14 @@ def _start_resubmit(
         _compare_and_prepare_resubmit,
         _run_job_background,
         _verified_opd_next_attempt,
+        source_snapshot_from_status,
     )
 
+    try:
+        source_snapshot_from_status(get_status(spec.run_id), required=True)
+    except Exception as exc:
+        _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
+        return False
     reason = _recovery_block_reason(spec)
     if reason is not None:
         if _recovery_wall_deadline_is_open(spec):

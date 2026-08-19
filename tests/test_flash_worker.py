@@ -12,6 +12,10 @@ import time
 
 import pytest
 
+from tests._helpers.source_snapshot import valid_source_snapshot
+
+SOURCE_SNAPSHOT = valid_source_snapshot()
+
 
 def _spec():
     from flash.core.spec import JobSpec, TrainSpec
@@ -841,7 +845,15 @@ class _FakePipProc:
         return self._returncode
 
 
-def _extra_pip_input() -> dict:
+def _extra_pip_input(monkeypatch) -> dict:
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: "/source.zip")
+    monkeypatch.setattr(
+        "flash.source_snapshot.materialize_verified_archive_file",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr("importlib.util.spec_from_file_location", lambda *_args: None)
     return {
         "phase": "sft",
         "seed": 0,
@@ -849,10 +861,66 @@ def _extra_pip_input() -> dict:
         "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
         "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
         "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
-        # an invalid prefix stops the handler right after the pip step, which is what is under test
-        "code_prefix": "../code/flash",
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "run_id": "flash-test-run",
+        "attempt": 0,
         **_run_deadline_fields(),
     }
+
+
+def test_train_body_source_verification_failure_prevents_pip(monkeypatch):
+    from flash import source_snapshot
+    from flash.providers.runpod.serverless import endpoints
+
+    input_data = _extra_pip_input(monkeypatch)
+    pip_calls = []
+    monkeypatch.setattr(
+        source_snapshot,
+        "materialize_verified_archive_file",
+        lambda *_args: (_ for _ in ()).throw(
+            source_snapshot.SourceSnapshotError("source verification failed")
+        ),
+    )
+    monkeypatch.setattr(
+        "subprocess.Popen", lambda *args, **kwargs: pip_calls.append((args, kwargs))
+    )
+
+    with pytest.raises(source_snapshot.SourceSnapshotError, match="verification"):
+        endpoints._train_body(input_data)
+    assert pip_calls == []
+
+
+@pytest.mark.parametrize(
+    ("status", "retriable"),
+    [(401, False), (403, False), (404, False), (429, True), (500, True), (599, True)],
+)
+def test_train_body_source_fetch_http_classification(monkeypatch, status, retriable):
+    import types
+
+    import huggingface_hub
+
+    from flash.providers.runpod.serverless import endpoints
+
+    input_data = _extra_pip_input(monkeypatch)
+    input_data["extra_pip"] = []
+    calls = []
+
+    class FetchError(RuntimeError):
+        pass
+
+    def fail_download(**_kwargs):
+        calls.append(status)
+        error = FetchError("private upstream response")
+        error.response = types.SimpleNamespace(status_code=status, headers={})
+        raise error
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fail_download)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="pinned flash source") as raised:
+        endpoints._train_body(input_data)
+    assert getattr(raised.value, "flash_retriable", False) is retriable
+    assert len(calls) == (6 if retriable else 1)
 
 
 def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
@@ -875,8 +943,8 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
 
-    with pytest.raises(ValueError, match="invalid code_prefix"):
-        endpoints._train_body(_extra_pip_input())
+    with pytest.raises(RuntimeError, match="could not load downloaded module"):
+        endpoints._train_body(_extra_pip_input(monkeypatch))
 
     assert len(calls) == 1
     env = calls[0]["env"]
@@ -909,8 +977,8 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
     monkeypatch.setattr(os, "remove", fake_remove)
 
     try:
-        with pytest.raises(ValueError, match="invalid code_prefix"):
-            endpoints._train_body(_extra_pip_input())
+        with pytest.raises(RuntimeError, match="could not load downloaded module"):
+            endpoints._train_body(_extra_pip_input(monkeypatch))
     finally:
         for askpass in askpass_paths:
             if askpass.exists():
@@ -949,8 +1017,8 @@ def test_train_body_extra_pip_retries_a_transient_index_failure(monkeypatch):
             ("Successfully installed some-env-pkg-1.0\n", 0),
         ],
     )
-    with pytest.raises(ValueError, match="invalid code_prefix"):
-        endpoints._train_body(_extra_pip_input())
+    with pytest.raises(RuntimeError, match="could not load downloaded module"):
+        endpoints._train_body(_extra_pip_input(monkeypatch))
     assert len(calls) == 2
 
 
@@ -963,7 +1031,7 @@ def test_train_body_extra_pip_resolution_error_stays_terminal(monkeypatch):
         [("ERROR: No matching distribution found for definitely-not-a-package\n", 1)],
     )
     with pytest.raises(RuntimeError, match="extra_pip install failed"):
-        endpoints._train_body(_extra_pip_input())
+        endpoints._train_body(_extra_pip_input(monkeypatch))
     assert len(calls) == 1  # fails fast, never walks the retry ladder
 
 
@@ -989,7 +1057,7 @@ def test_train_body_extra_pip_build_failure_outranks_earlier_transient_text(monk
         ],
     )
     with pytest.raises(RuntimeError, match="extra_pip install failed"):
-        endpoints._train_body(_extra_pip_input())
+        endpoints._train_body(_extra_pip_input(monkeypatch))
     assert len(calls) == 1  # the build failure names the cause, so no retry ladder
 
 
@@ -1008,8 +1076,8 @@ def test_train_body_extra_pip_matches_the_bootstrap_on_git_http_blips(monkeypatc
     calls = _wire_train_body_pip(
         monkeypatch, [(blip, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
     )
-    with pytest.raises(ValueError, match="invalid code_prefix"):
-        endpoints._train_body(_extra_pip_input())
+    with pytest.raises(RuntimeError, match="could not load downloaded module"):
+        endpoints._train_body(_extra_pip_input(monkeypatch))
     assert len(calls) == 2
 
     # git's DNS wording, which urllib never emits, must retry here too.
@@ -1019,14 +1087,14 @@ def test_train_body_extra_pip_matches_the_bootstrap_on_git_http_blips(monkeypatc
     calls = _wire_train_body_pip(
         monkeypatch, [(dns, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
     )
-    with pytest.raises(ValueError, match="invalid code_prefix"):
-        endpoints._train_body(_extra_pip_input())
+    with pytest.raises(RuntimeError, match="could not load downloaded module"):
+        endpoints._train_body(_extra_pip_input(monkeypatch))
     assert len(calls) == 2
 
     missing = blip.replace("returned error: 502", "returned error: 404")
     calls = _wire_train_body_pip(monkeypatch, [(missing, 1)])
     with pytest.raises(RuntimeError, match="extra_pip install failed"):
-        endpoints._train_body(_extra_pip_input())
+        endpoints._train_body(_extra_pip_input(monkeypatch))
     assert len(calls) == 1
 
 
@@ -1047,14 +1115,14 @@ def test_train_body_extra_pip_matches_the_bootstrap_on_an_index_outage_footer(mo
     calls = _wire_train_body_pip(
         monkeypatch, [(outage, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
     )
-    with pytest.raises(ValueError, match="invalid code_prefix"):
-        endpoints._train_body(_extra_pip_input())
+    with pytest.raises(RuntimeError, match="could not load downloaded module"):
+        endpoints._train_body(_extra_pip_input(monkeypatch))
     assert len(calls) == 2
 
     built = outage + "ERROR: Failed building wheel for requests\n"
     calls = _wire_train_body_pip(monkeypatch, [(built, 1)])
     with pytest.raises(RuntimeError, match="extra_pip install failed"):
-        endpoints._train_body(_extra_pip_input())
+        endpoints._train_body(_extra_pip_input(monkeypatch))
     assert len(calls) == 1
 
 
@@ -1063,7 +1131,7 @@ def test_train_body_extra_pip_stops_after_the_bounded_retries(monkeypatch):
 
     calls = _wire_train_body_pip(monkeypatch, [("read timed out\n", 1)] * 4)
     with pytest.raises(RuntimeError, match="could not reach the package index"):
-        endpoints._train_body(_extra_pip_input())
+        endpoints._train_body(_extra_pip_input(monkeypatch))
     assert len(calls) == 4  # one attempt plus the three bounded retries
 
 
@@ -1142,13 +1210,11 @@ def test_train_body_uploads_console_on_missing_metrics(
     import contextlib
     import os
     import subprocess
-    import types
 
     import huggingface_hub
 
     from flash.providers.runpod.serverless import endpoints
 
-    code_prefix = "code/0123456789abcdef0123456789abcdef/flash"
     run_code = tmp_path / "runcode"
     late_marker = tmp_path / "late-live-attempted"
     real_join = os.path.join
@@ -1160,33 +1226,13 @@ def test_train_body_uploads_console_on_missing_metrics(
         return joined
 
     monkeypatch.setattr(os.path, "join", mapped_join)
-    list_calls = []
     download_calls = []
-    monkeypatch.setattr(
-        huggingface_hub,
-        "snapshot_download",
-        lambda *a, **k: pytest.fail("code download should not use snapshot_download"),
-    )
 
     uploads = []
 
     class _FakeApi:
         def __init__(self, token=None):
             pass
-
-        def list_repo_tree(self, **kw):
-            list_calls.append(kw)
-            if len(list_calls) == 1:
-                raise _RateLimited("slow down")
-            return [
-                types.SimpleNamespace(path=f"{code_prefix}/__init__.py", size=0),
-                types.SimpleNamespace(path=f"{code_prefix}/engine/worker.py", size=10),
-                types.SimpleNamespace(
-                    path=f"{code_prefix}/providers/_lifecycle/bootstrap_console.py", size=10
-                ),
-                types.SimpleNamespace(path=f"{code_prefix}/adapters/artifacts.py", size=10),
-                types.SimpleNamespace(path=f"{code_prefix}/engine", tree_id="folder"),
-            ]
 
         def upload_file(self, **kw):
             uploads.append(kw)
@@ -1195,45 +1241,45 @@ def test_train_body_uploads_console_on_missing_metrics(
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
-    class _Response:
-        status_code = 429
+    def fake_hf_hub_download(**kwargs):
+        download_calls.append(kwargs)
+        return str(tmp_path / "source.zip")
 
-        def __init__(self) -> None:
-            self.headers = {"Retry-After": "0"}
-
-    class _RateLimited(Exception):
-        response = _Response()
-
-    def fake_hf_hub_download(*, filename, local_dir, **kw):
-        download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
-        target = run_code / filename
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if filename.endswith("bootstrap_console.py"):
-            target.write_text(
-                "import threading, time\n"
-                "def _run_console_upload_loop(console, interval, stop, *, upload):\n"
-                "    upload()\n"
-                "    def late():\n"
-                "        stop.wait(); time.sleep(0.01); upload()\n"
-                f"        open({str(late_marker)!r}, 'w').write('1')\n"
-                "    threading.Thread(target=late, daemon=True).start()\n"
-                "    stop.wait()\n"
-            )
-        elif filename.endswith("artifacts.py"):
-            target.write_text(
-                "def attempt_scoped_artifact_name(kind, phase, attempt):\n"
-                "    return f'exact_{kind}_{phase}_attempt{attempt}.txt'\n"
-            )
-        else:
-            target.write_text("")
-        return str(target)
+    def materialize(_archive_path, _descriptor, destination):
+        target = run_code / "flash-test-run-attempt-7"
+        assert destination == str(target)
+        console = target / "flash/providers/_lifecycle/bootstrap_console.py"
+        console.parent.mkdir(parents=True, exist_ok=True)
+        console.write_text(
+            "import threading, time\n"
+            "def _run_console_upload_loop(console, interval, stop, *, upload):\n"
+            "    upload()\n"
+            "    def late():\n"
+            "        stop.wait(); time.sleep(0.01); upload()\n"
+            f"        open({str(late_marker)!r}, 'w').write('1')\n"
+            "    threading.Thread(target=late, daemon=True).start()\n"
+            "    stop.wait()\n"
+        )
+        artifacts = target / "flash/adapters/artifacts.py"
+        artifacts.parent.mkdir(parents=True, exist_ok=True)
+        artifacts.write_text(
+            "def attempt_scoped_artifact_name(kind, phase, attempt):\n"
+            "    return f'exact_{kind}_{phase}_attempt{attempt}.txt'\n"
+        )
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
+
+    def materialization_path(root, run_id, attempt):
+        assert root == "/runcode"
+        return run_code / f"{run_id}-attempt-{attempt}"
+
+    monkeypatch.setattr("flash.source_snapshot.attempt_materialization_path", materialization_path)
+    monkeypatch.setattr("flash.source_snapshot.materialize_verified_archive_file", materialize)
 
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
-            assert k["cwd"] == str(run_code / "code/0123456789abcdef0123456789abcdef")
+            assert k["cwd"] == str(run_code / "flash-test-run-attempt-7")
             self.stdout = iter(console_lines)
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
@@ -1248,8 +1294,10 @@ def test_train_body_uploads_console_on_missing_metrics(
         "seed": 0,
         "hf_repo": "owner/runs",
         "job_spec_json": job_spec,
-        "env": {"HF_TOKEN": "tok", "PYTHONPATH": "", "ATTEMPT": "7"},
-        "code_prefix": code_prefix,
+        "env": {"HF_TOKEN": "tok", "PYTHONPATH": "", "ATTEMPT": "999"},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "run_id": "flash-test-run",
+        "attempt": 7,
         **_run_deadline_fields(),
     }
 
@@ -1282,13 +1330,9 @@ def test_train_body_uploads_console_on_missing_metrics(
             # needle -- so a margin sized from an unrelated secret leaves a long fragment of it
             # behind. the empty console never leaked.
             assert uploaded_console == ""
-        assert [call["path_in_repo"] for call in list_calls] == [code_prefix, code_prefix]
-        assert [call["filename"] for call in download_calls] == [
-            f"{code_prefix}/__init__.py",
-            f"{code_prefix}/engine/worker.py",
-            f"{code_prefix}/providers/_lifecycle/bootstrap_console.py",
-            f"{code_prefix}/adapters/artifacts.py",
-        ]
+        assert len(download_calls) == 1
+        assert download_calls[0]["filename"] == SOURCE_SNAPSHOT["archive_path"]
+        assert download_calls[0]["revision"] == SOURCE_SNAPSHOT["revision"]
     finally:
         # _train_body writes hardcoded console paths; remove them for parallel runs.
         import shutil
@@ -1303,17 +1347,17 @@ def test_train_body_uploads_console_on_missing_metrics(
                 os.remove(_p)
 
 
-def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
+def test_train_body_rejects_malformed_source_descriptor_before_download(monkeypatch):
     import huggingface_hub
 
     from flash.providers.runpod.serverless import endpoints
 
     monkeypatch.setattr(
         huggingface_hub,
-        "snapshot_download",
-        lambda *a, **k: pytest.fail("snapshot_download should not run with an invalid code prefix"),
+        "hf_hub_download",
+        lambda *a, **k: pytest.fail("download should not run with an invalid source descriptor"),
     )
-    with pytest.raises(ValueError, match="invalid code_prefix"):
+    with pytest.raises(RuntimeError, match="descriptor"):
         endpoints._train_body(
             {
                 "phase": "sft",
@@ -1321,7 +1365,9 @@ def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
                 "hf_repo": "owner/runs",
                 "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
                 "env": {"HF_TOKEN": "tok"},
-                "code_prefix": "../code/flash",
+                "source_snapshot": {"invalid": True},
+                "run_id": "flash-test-run",
+                "attempt": 0,
                 **_run_deadline_fields(),
             }
         )
