@@ -315,9 +315,10 @@ def _ensure_fla_fastpath_on_hopper() -> None:
             return False
         return rc == 0
 
-    # 0.1.12 double-registers the TVM-FFI runtime -> `import tilelang` aborts; keep in lockstep with Dockerfile.worker.
-    TVM_FFI_PIN = "0.1.11"
-    TILELANG_PIN = "0.1.11"
+    # flash-qla requires exactly these two, and 0.1.12 double-registers the TVM-FFI runtime ->
+    # `import tilelang` aborts; keep in lockstep with Dockerfile.worker and capabilities.py.
+    TVM_FFI_PIN = "0.1.9"
+    TILELANG_PIN = "0.1.9"
 
     try:
         tilelang_ok = True
