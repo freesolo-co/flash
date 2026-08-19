@@ -481,3 +481,39 @@ def test_unavailable_snapshot_never_reports_healthy_zero(monkeypatch, field):
     _complete_proc_view(monkeypatch, with_child=False)
     monkeypatch.setattr(census_module, "_read_start_time", lambda _pid: None)
     assert getattr(_census()._snapshot(), field) == -1
+
+
+def test_scan_keeps_the_tree_when_a_descendant_exits_mid_walk(monkeypatch):
+    """The real walk, not a stubbed one: a rollout worker exiting must not void the sample.
+
+    The churn test above replaces ``_scan_process_tree`` wholesale, so it cannot see a regression
+    inside the walk itself. On a live GRPO tree something is always exiting, so aborting the walk on
+    any descendant exit made a fully healthy run unmeasurable.
+    """
+    _stable_auxiliary_metrics(monkeypatch)
+    starts = {1: 100, 2: 200, 3: 300}
+    tasks = {1: (1,), 2: (2,), 3: (3,)}
+    # pid 2 is reaped the moment the walk reaches it; pid 3 stays alive.
+    children = {(1, 1): {2, 3}, (2, 2): None, (3, 3): set()}
+    monkeypatch.setattr(census_module, "_read_start_time", lambda pid: starts.get(pid))
+    monkeypatch.setattr(census_module, "_list_task_ids", lambda pid: tasks.get(pid))
+    monkeypatch.setattr(
+        census_module,
+        "_read_task_children",
+        lambda pid, task_id: children.get((pid, task_id)),
+    )
+    exited = {2}
+    original_alive = census_module._liveness
+    monkeypatch.setattr(
+        census_module,
+        "_liveness",
+        lambda identity: (
+            census_module._GONE if identity.pid in exited else original_alive(identity)
+        ),
+    )
+
+    scanned = census_module._scan_process_tree(_ProcessIdentity(1, 100))
+
+    assert scanned is not None, "a descendant exiting mid-walk must not void the whole scan"
+    assert _ProcessIdentity(1, 100) in scanned
+    assert _ProcessIdentity(3, 300) in scanned
