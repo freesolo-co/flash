@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 import types
 from types import SimpleNamespace
@@ -22,6 +23,34 @@ def _worker_image_specs() -> list[str]:
     return kf._pip_stack_specs((root / "Dockerfile.worker").read_text())
 
 
+def _perf_pins() -> tuple[str, str]:
+    """The (tilelang, apache-tvm-ffi) versions perf enforces at runtime.
+
+    Read from the source rather than restated here: these pins move together with flash-qla's hard
+    requirement, and a test that hardcodes them keeps passing while the image build breaks -- which
+    is exactly how the 0.1.11/0.1.9 conflict went unnoticed.
+    """
+    import re
+
+    import flash.engine.worker.perf as perf
+
+    source = inspect.getsource(perf._ensure_fla_fastpath_on_hopper)
+    tilelang = re.search(r'TILELANG_PIN\s*=\s*"([^"]+)"', source)
+    tvm_ffi = re.search(r'TVM_FFI_PIN\s*=\s*"([^"]+)"', source)
+    assert tilelang, "perf must declare TILELANG_PIN as a string literal"
+    assert tvm_ffi, "perf must declare TVM_FFI_PIN as a string literal"
+    return tilelang.group(1), tvm_ffi.group(1)
+
+
+def _other_version(pin: str) -> str:
+    """A version that is definitely NOT the pin, for 'wrong version resident' cases."""
+    return "0.0.1-not-the-pin" if pin != "0.0.1-not-the-pin" else "0.0.2-not-the-pin"
+
+
+# sentinel meaning "default to whatever perf currently enforces"; None already means "absent".
+_PIN = object()
+
+
 def test_gdn_fastpath_deps_present_and_kept_on_hopper():
     """The GDN fast-path stack (fla-from-git + tilelang + pinned apache-tvm-ffi) is baked in, and
     fla is KEPT on Hopper (sm90) — the #640 fix is fla's tilelang backend, not dropping fla."""
@@ -33,12 +62,41 @@ def test_gdn_fastpath_deps_present_and_kept_on_hopper():
     assert any(
         d.startswith("tilelang==") for d in specs
     )  # correct GDN backend on Triton>=3.4, PINNED for reproducibility
+    tilelang_pin, tvm_ffi_pin = _perf_pins()
     assert any(
-        d.startswith("apache-tvm-ffi==0.1.11") for d in specs
+        d.startswith(f"apache-tvm-ffi=={tvm_ffi_pin}") for d in specs
     )  # pin (0.1.12 aborts tilelang import)
+    # The image and the runtime gate must agree. perf fails CLOSED on a mismatch: it deletes fla and
+    # drops sm90 to the pure-PyTorch fallback, so a drifted pin is a silent perf cliff, not an error.
+    assert any(d.startswith(f"tilelang=={tilelang_pin}") for d in specs), (
+        f"Dockerfile tilelang must equal perf's TILELANG_PIN {tilelang_pin}, got: "
+        f"{[d for d in specs if d.startswith('tilelang')]}"
+    )
     # fla must NOT be dropped on Hopper anymore (it was, pre-fix).
     assert any("flash-linear-attention" in d for d in specs), (
         "fla must be kept on Hopper for the tilelang fast path"
+    )
+
+
+def test_tilelang_pin_satisfies_flash_qla_hard_requirement():
+    """flash-qla hard-pins tilelang and apache-tvm-ffi with `==`, so any other pin makes the image
+    layer unsatisfiable. That is not a soft warning: pip fails the build with ResolutionImpossible,
+    the image is never rebuilt, and GPU workers silently keep running whatever code was baked last.
+    Asserted against the Dockerfile rather than a restated constant so the two cannot drift apart.
+    """
+    specs = _worker_image_specs()
+    flash_qla = [d for d in specs if d.startswith("flash-qla==")]
+    if not flash_qla:
+        pytest.skip("no pinned flash-qla in the worker stack")
+    tilelang_pin, tvm_ffi_pin = _perf_pins()
+    # flash-qla 0.1.1 and 0.1.2 both require exactly tilelang==0.1.9 / apache-tvm-ffi==0.1.9.
+    required = "0.1.9"
+    assert tilelang_pin == required, (
+        f"flash-qla requires tilelang=={required}, but the worker pins {tilelang_pin}; "
+        "the image build fails with ResolutionImpossible"
+    )
+    assert tvm_ffi_pin == required, (
+        f"flash-qla requires apache-tvm-ffi=={required}, but the worker pins {tvm_ffi_pin}"
     )
 
 
@@ -713,8 +771,8 @@ def _patch_hopper_stack(
     *,
     pip_rc: int = 0,
     find_spec_ok: bool = True,
-    tvm_ffi_version: str | None = "0.1.11",
-    tilelang_version: str | None = "0.1.11",
+    tvm_ffi_version: str | None = _PIN,
+    tilelang_version: str | None = _PIN,
     record_pip: list[str] | None = None,
 ):
     """Wire the perf helper's external touchpoints for the Hopper fast-path tests and return the
@@ -722,9 +780,15 @@ def _patch_hopper_stack(
     list that records _remove_fla_from_disk (fla-disable) calls. * ``pip_rc`` -> the return code
     every mocked ``pip install`` reports (non-zero = failed install). * ``find_spec_ok`` -> whether
     the post-install import probe finds fla/fla.modules/tilelang. * ``tvm_ffi_version`` -> what
-    importlib.metadata.version('apache-tvm-ffi') reports (None=absent). * ``tilelang_version`` ->
-    what importlib.metadata.version('tilelang') reports (None=absent).
+    importlib.metadata.version('apache-tvm-ffi') reports (None=absent, _PIN=the enforced pin).
+    * ``tilelang_version`` -> same for tilelang. Defaulting to the pin read from perf keeps these
+    cases healthy-by-default without restating a version that moves with flash-qla.
     """
+    resolved_tilelang_pin, resolved_tvm_ffi_pin = _perf_pins()
+    if tvm_ffi_version is _PIN:
+        tvm_ffi_version = resolved_tvm_ffi_pin
+    if tilelang_version is _PIN:
+        tilelang_version = resolved_tilelang_pin
     import importlib.metadata
     import importlib.util
     import subprocess
@@ -807,9 +871,7 @@ def test_hopper_fla_kept_when_stack_healthy(monkeypatch):
     """Success path: every install exits 0, fla + fla.modules + tilelang all import, AND the
     resolved apache-tvm-ffi is exactly the pin -> fla is KEPT (the fast path is engaged, not
     removed)."""
-    perf, removed = _patch_hopper_stack(
-        monkeypatch, pip_rc=0, find_spec_ok=True, tvm_ffi_version="0.1.11"
-    )
+    perf, removed = _patch_hopper_stack(monkeypatch, pip_rc=0, find_spec_ok=True)
 
     perf._ensure_fla_fastpath_on_hopper()
 
@@ -826,27 +888,28 @@ def test_hopper_tilelang_present_but_wrong_version_is_reinstalled(monkeypatch):
         monkeypatch,
         pip_rc=0,
         find_spec_ok=True,
-        tvm_ffi_version="0.1.11",
-        tilelang_version="0.1.11",  # post-reinstall resolved version
+        # both default to the enforced pin: post-reinstall resolved version
         record_pip=pip_calls,
     )
     # Make the FIRST _ver('tilelang') read (the install gate) see a stale wrong version, while the
     # final ok-gate read sees the pin — i.e. the reinstall corrected it.
     import importlib.metadata as _md
 
-    gate_reads = iter(["0.1.9"])  # first read = stale; later reads -> pin (reinstall corrected it)
+    tilelang_pin = _perf_pins()[0]
+    # first read = stale wrong version; later reads -> the pin (i.e. the reinstall corrected it)
+    gate_reads = iter([_other_version(tilelang_pin)])
     orig_version = _md.version
 
     def _versioned(dist: str) -> str:
         if dist == "tilelang":
-            return next(gate_reads, "0.1.11")
+            return next(gate_reads, tilelang_pin)
         return orig_version(dist)
 
     monkeypatch.setattr(_md, "version", _versioned, raising=True)
 
     perf._ensure_fla_fastpath_on_hopper()
 
-    assert any(c.startswith("tilelang==0.1.11") for c in pip_calls), (
+    assert any(c.startswith(f"tilelang=={tilelang_pin}") for c in pip_calls), (
         f"present-but-wrong tilelang must trigger a pinned reinstall, got pip calls: {pip_calls}"
     )
     assert not removed, "after the pin reinstall lands, fla must be KEPT"
@@ -860,14 +923,13 @@ def test_hopper_tilelang_wrong_version_persists_disables_fla(monkeypatch):
         monkeypatch,
         pip_rc=0,
         find_spec_ok=True,
-        tvm_ffi_version="0.1.11",
-        tilelang_version="0.1.9",  # wrong version throughout (reinstall didn't correct it)
+        tilelang_version=_other_version(_perf_pins()[0]),  # wrong throughout (reinstall failed)
         record_pip=pip_calls,
     )
 
     perf._ensure_fla_fastpath_on_hopper()
 
-    assert any(c.startswith("tilelang==0.1.11") for c in pip_calls), (
+    assert any(c.startswith(f"tilelang=={_perf_pins()[0]}") for c in pip_calls), (
         "wrong resident tilelang must still attempt the pinned reinstall"
     )
     assert removed, "tilelang version != pin after install must DISABLE fla (pin didn't land)"
@@ -884,8 +946,7 @@ def test_hopper_tvm_ffi_pip_skipped_when_pin_already_present(monkeypatch):
         monkeypatch,
         pip_rc=0,
         find_spec_ok=True,
-        tvm_ffi_version="0.1.11",  # exact pin already resident
-        tilelang_version="0.1.11",  # exact pin -> tilelang NOT reinstalled this invocation
+        # both default to the exact pin already resident -> tilelang NOT reinstalled here
         record_pip=pip_calls,
     )
 
@@ -905,9 +966,7 @@ def test_hopper_outer_exception_disables_fla(monkeypatch):
     and never re-raise."""
     import importlib
 
-    perf, removed = _patch_hopper_stack(
-        monkeypatch, pip_rc=0, find_spec_ok=True, tvm_ffi_version="0.1.11"
-    )
+    perf, removed = _patch_hopper_stack(monkeypatch, pip_rc=0, find_spec_ok=True)
 
     # Make a call inside the try (after the Hopper guard + installs) blow up. invalidate_caches runs
     # right before the import-probe gate, so this drives the outer `except`.

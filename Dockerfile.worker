@@ -59,15 +59,15 @@ RUN pip install --no-cache-dir \
     "wandb>=0.17" \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@9c8e42e762fce087c27b673af4922795d9edb85e" \
     "flash-qla==0.1.2" \
-    "tilelang==0.1.11" \
-    "apache-tvm-ffi==0.1.11" \
+    "tilelang==0.1.9" \
+    "apache-tvm-ffi==0.1.9" \
     "hf_transfer" \
     "freesolo>=0.4.1" \
     "runpod"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
 # miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
-# we bake the pinned tilelang==0.1.11 + apache-tvm-ffi==0.1.11 (0.1.12 double-registers TVM-FFI ->
+# we bake the pinned tilelang==0.1.9 + apache-tvm-ffi==0.1.9 (0.1.12 double-registers TVM-FFI ->
 # `import tilelang` aborts) and KEEP fla on every arch; flash.engine.worker.perf._ensure_fla_fastpath_on_hopper
 # ensures the tilelang backend is live on sm90 before any model import. The INVERSE holds on
 # B200/sm100: THERE the tilelang chunk_bwd_dqkwg miscomputes gradients while the Triton path is
@@ -79,6 +79,13 @@ RUN pip install --no-cache-dir \
 # seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
 # (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
 # reproducible image builds; keep this sha in lockstep with the worker dependencies in flash/providers/_lifecycle/worker.py.
+# tilelang is 0.1.9, not the newest release: flash-qla (added for the sm90 GDN backend) hard-requires
+# tilelang==0.1.9 AND apache-tvm-ffi==0.1.9, so 0.1.11 made this layer unsatisfiable and every image
+# build failed from 2026-08-12 until the downgrade. 0.1.11 was only ever "latest stable at the time"
+# (the pin exists for determinism, not to dodge a 0.1.9 defect), and the version predates flash-qla.
+# Keep all four sites in lockstep -- both installs here, capabilities.py, and perf's TILELANG_PIN --
+# because perf fails CLOSED: a resolved version != TILELANG_PIN deletes fla and drops sm90 to the
+# pure-PyTorch fallback, which is correct but far slower.
 
 # FlashAttention: PREFER a prebuilt wheel. There is no OFFICIAL Dao-AILab wheel for torch 2.10 yet,
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC
@@ -334,8 +341,8 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
         cachetools uvicorn fastapi torchvision tqdm pyarrow \
         "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@9c8e42e762fce087c27b673af4922795d9edb85e" \
         "flash-qla==0.1.2" \
-        "tilelang==0.1.11" \
-        "apache-tvm-ffi==0.1.11" \
+        "tilelang==0.1.9" \
+        "apache-tvm-ffi==0.1.9" \
     && rm -f /tmp/verl-overrides.txt \
     && uv cache clean
 
