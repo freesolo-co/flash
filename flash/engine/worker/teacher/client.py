@@ -25,7 +25,10 @@ from flash.engine.worker.teacher.encoding import (
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
 from flash.envs.base import map_bounded
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
-from flash.teacher.provider_status import validated_provider_status
+from flash.teacher.provider_status import (
+    BODY_INDEPENDENT_TRANSIENT_STATUSES,
+    validated_provider_status,
+)
 
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
 _BROKER_PROVIDER_TIMEOUT_CEILING_S = 90.0
@@ -598,10 +601,12 @@ class TeacherClient:
                 if (
                     code == "broker_http_error"
                     and not structured_error
-                    and error.code in {409, 429}
+                    and error.code in BODY_INDEPENDENT_TRANSIENT_STATUSES
                 ):
-                    # an unstructured 409 can be an in-progress replay and 429 proves rejection before
-                    # execution. 408 and 5xx are ambiguous after dispatch and must not spend twice.
+                    # the body was lost in transit -- an intermediary may replace it. the broker
+                    # raises a retryable failure only on these statuses precisely so the signal
+                    # survives that. 408 and 5xx stay ambiguous after dispatch and must not spend
+                    # twice. see BODY_INDEPENDENT_TRANSIENT_STATUSES.
                     classification = "transient"
                 retryable = classification == "transient"
                 provider_status_detail = (

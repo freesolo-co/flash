@@ -1815,7 +1815,11 @@ def test_stalled_capability_bodies_time_out_without_blocking_another_capability(
     other, timed_out, recovered = asyncio.run(exercise())
 
     assert other.status_code == 200
-    assert [response.status_code for response in timed_out] == [408, 408]
+    # 429, not 408: the ingress timeout is retryable, and a retryable broker failure has to say so
+    # in the status line because an intermediary can replace the body. a bare 408 is unusable for
+    # that -- a proxy emits it for its own post-dispatch timeout -- so the concurrency-limit
+    # condition reports as 429. see BODY_INDEPENDENT_TRANSIENT_STATUSES.
+    assert [response.status_code for response in timed_out] == [429, 429]
     assert all(
         json.loads(response.body)["error"]["code"] == "body_ingress_timeout"
         for response in timed_out

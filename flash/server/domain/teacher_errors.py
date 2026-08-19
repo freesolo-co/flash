@@ -10,7 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from flash.teacher.provider_status import validated_provider_status
+from flash.teacher.provider_status import (
+    BODY_INDEPENDENT_TRANSIENT_STATUSES,
+    DEFAULT_TRANSIENT_STATUS,
+    validated_provider_status,
+)
 
 
 class TeacherBrokerError(RuntimeError):
@@ -25,7 +29,14 @@ class TeacherBrokerError(RuntimeError):
     ) -> None:
         super().__init__(code)
         self.code = code
-        self.status_code = status_code
+        # a retryable failure must announce itself in the status line, because the structured body
+        # below can be replaced by any intermediary before it reaches the worker. see
+        # BODY_INDEPENDENT_TRANSIENT_STATUSES.
+        self.status_code = (
+            status_code
+            if not retryable or status_code in BODY_INDEPENDENT_TRANSIENT_STATUSES
+            else DEFAULT_TRANSIENT_STATUS
+        )
         self.retryable = retryable
         self.request_id = request_id
         self.provider_status = validated_provider_status(provider_status)

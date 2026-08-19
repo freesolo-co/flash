@@ -1070,7 +1070,50 @@ def test_provider_429_is_retried_with_bounded_backoff(broker_ledger, monkeypatch
     assert (input_tokens, output_tokens) == (1, 1)
 
 
-def test_stripped_502_cannot_prove_rate_limit_and_never_redispatches(broker_ledger, monkeypatch):
+def test_rate_limit_survives_a_stripped_error_body(broker_ledger, monkeypatch):
+    """An upstream 429 stays retryable even when the broker's error body is destroyed in transit.
+
+    A live OPD run died here: an intermediary replaced the broker's structured 502 body with 16
+    bytes of `error code: 502`, so the worker fell back to `broker_http_error (permanent)` and
+    killed a run the provider had merely rate-limited. The retry signal therefore travels in the
+    status line, which intermediaries preserve, and this asserts the whole path end to end with
+    the body stripped on the first attempt.
+    """
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+
+    outcomes = [(429, b"rate limited"), (200, _parasail_success())]
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return outcomes[len(dispatches) - 1]
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    sleeps = []
+    monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
+    client, transport = _ledger_client(broker_ledger, strip_error_bodies=1)
+
+    scored = client.score("question", "answer")
+
+    assert scored.input_tokens == 1
+    # the bodyless rejection was retried rather than treated as terminal, and the retry is the
+    # same logical request, so the provider is not billed for two.
+    assert len(dispatches) == 2
+    assert len(set(transport.request_ids)) == 1
+    assert sleeps == [2.0]
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_stripped_ambiguous_5xx_stays_terminal_and_never_redispatches(
+    broker_ledger, monkeypatch, status
+):
+    """A bodyless 5xx must stay permanent: it can arrive after the provider began work.
+
+    This is the safety half of the rule above. Widening the bodyless rescue to "any 5xx" would
+    make the run survive, at the cost of dispatching and paying for the same teacher request
+    twice, so an ambiguous status must remain terminal even though the body is gone.
+    """
     from flash.engine.worker.teacher import client as worker_teacher
     from flash.server.domain import teacher_broker
 
@@ -1078,7 +1121,7 @@ def test_stripped_502_cannot_prove_rate_limit_and_never_redispatches(broker_ledg
 
     def dispatch(*_args):
         dispatches.append(1)
-        return 429, b"rate limited"
+        return status, b"upstream failure"
 
     monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
     sleeps = []
@@ -1092,14 +1135,14 @@ def test_stripped_502_cannot_prove_rate_limit_and_never_redispatches(broker_ledg
     assert len(dispatches) == 1
     assert len(transport.request_ids) == 1
     assert sleeps == []
-    state, attempts, status, error_class, input_tokens, output_tokens = _ledger_row(
+    state, attempts, ledger_status, error_class, input_tokens, output_tokens = _ledger_row(
         transport.request_ids[0]
     )
-    assert (state, attempts, status, error_class) == (
-        "provider_rejected",
+    assert (state, attempts, ledger_status, error_class) == (
+        "outcome_unknown",
         1,
-        429,
-        "transient",
+        status,
+        "permanent",
     )
     assert (input_tokens, output_tokens) == (0, 0)
 
