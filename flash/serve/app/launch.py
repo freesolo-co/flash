@@ -58,6 +58,25 @@ _FIXED_CHILD_ENVIRONMENT = {
     "PATH": "/opt/flash-venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin",
     "PYTHONUNBUFFERED": "1",
 }
+# engine settings the vllm process needs regardless of which provider started the container.
+#
+# these used to be supplied only by the modal image, which is why modal served and runpod did not:
+# without the spawn method vllm forks its EngineCore after this process has already touched cuda,
+# and the child dies with "Cannot re-initialize CUDA in forked subprocess" before anything binds a
+# port. externally that is another silent boot failure, indistinguishable from a slow image pull.
+#
+# they belong to the runtime rather than to a provider image: the engine's requirements do not
+# change with the machine that rented the gpu, and a second provider must not have to rediscover
+# them. applied to the running process and to the child, since the engine reads them at import.
+_ENGINE_RUNTIME_ENVIRONMENT = {
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    # the xet download path intermittently fails engine init, so force the http downloader.
+    "HF_HUB_DISABLE_XET": "1",
+    # expandable segments reduce fragmentation from repeated adapter load and unload.
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    # keep deepgemm out of the fp8 fused-moe backend selection.
+    "VLLM_MOE_USE_DEEP_GEMM": "0",
+}
 
 ServingRuntimeSecrets: Any = None
 MaterializationError: Any = None
@@ -421,6 +440,20 @@ def _seal_hub_offline(environment: MutableMapping[str, str]) -> None:
         raise LaunchError("hub offline mode could not be applied") from exc
 
 
+def _apply_engine_runtime_environment(environment: MutableMapping[str, str]) -> None:
+    """set the engine settings this process and its children need, on every provider.
+
+    vllm reads these at import time, so they have to be in place before the engine is constructed
+    rather than passed to it. the serving process starts the engine itself, so setting only the
+    child environment would leave the in-process path on the fork start method and reproduce the
+    cuda re-initialization failure this exists to prevent.
+    """
+
+    for key, value in _ENGINE_RUNTIME_ENVIRONMENT.items():
+        environment[key] = value
+        os.environ[key] = value
+
+
 def _port(environment: MutableMapping[str, str]) -> int:
     raw = environment.get(_PORT_ENV, str(_DEFAULT_PORT))
     if not raw.isdecimal():
@@ -452,6 +485,7 @@ def _run_with_secrets(
     if type(cache_root) is not str or not cache_root:
         raise LaunchError("serving cache root is invalid")
     _atomic_write_manifest(manifest, cache_root)
+    _apply_engine_runtime_environment(environment)
     _bind_hub_cache(environment, cache_root)
     inference_token, artifact_token = secrets._reveal_for_launch()
     _prepare_cache(manifest, cache_root, artifact_token)
@@ -505,6 +539,9 @@ def _scrub_child_environment(environment: MutableMapping[str, str]) -> dict[str,
     child.update(
         {key: environment[key] for key in _SAFE_CHILD_COPIED_ENV_NAMES if key in environment}
     )
+    # after the copy, so the engine's requirements win over an inherited value. a provider image
+    # that already sets these agrees with them; one that sets something else would break the child.
+    child.update(_ENGINE_RUNTIME_ENVIRONMENT)
     return child
 
 
