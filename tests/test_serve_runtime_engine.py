@@ -288,6 +288,7 @@ def test_exact_engine_args_and_processor_construction() -> None:
             {
                 "token": "secret",
                 "trust_remote_code": True,
+                "local_files_only": True,
                 "revision": TOKENIZER_REVISION,
             },
         )
@@ -314,6 +315,7 @@ def test_text_tokenizer_receives_exact_revision() -> None:
             {
                 "token": None,
                 "trust_remote_code": False,
+                "local_files_only": True,
                 "revision": TOKENIZER_REVISION,
                 "use_fast": True,
             },
@@ -323,6 +325,46 @@ def test_text_tokenizer_receives_exact_revision() -> None:
     assert _Engine.args is not None
     assert _Engine.args.revision == MODEL_REVISION
     assert _Engine.args.tokenizer_revision == TOKENIZER_REVISION
+    asyncio.run(runtime.close())
+
+
+@pytest.mark.parametrize(
+    ("image_limit", "recorder", "other"),
+    [
+        (None, _Tokenizer, _Processor),
+        (4, _Processor, _Tokenizer),
+    ],
+    ids=["text", "multimodal"],
+)
+def test_the_loader_never_reaches_the_network_for_the_served_model(
+    image_limit: int | None, recorder: Any, other: Any
+) -> None:
+    """both loaders must resolve from the hydrated cache alone.
+
+    the served base model is a private repo and the artifact token is deleted at the end of
+    bootstrap, so every later start is tokenless. transformers enumerates the repo's
+    additional_chat_templates/ over the network unless told otherwise, and a 401 there surfaces
+    as RepositoryNotFoundError, which it deliberately re-raises instead of falling back to the
+    cache. so a populated cache is not enough on its own -- the flag has to be passed.
+
+    setting HF_HUB_OFFLINE cannot substitute for this: huggingface_hub binds that constant when
+    it is imported, and hydration imports it earlier in the same process, so a later env write
+    is silently inert.
+    """
+
+    runtime = VllmLoraRuntime(
+        EngineConfig(
+            model="served/model",
+            model_revision=MODEL_REVISION,
+            tokenizer_revision=TOKENIZER_REVISION,
+            image_limit=image_limit,
+        )
+    )
+    asyncio.run(runtime.start())
+
+    assert other.calls == []
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0][1]["local_files_only"] is True
     asyncio.run(runtime.close())
 
 

@@ -352,7 +352,18 @@ class VllmLoraRuntime:
     def _load_tokenizer_processor(self) -> tuple[Any, Any | None]:
         from transformers import AutoProcessor, AutoTokenizer
 
-        common = {"token": self.config.hf_token, "trust_remote_code": self.config.trust_remote_code}
+        common = {
+            "token": self.config.hf_token,
+            "trust_remote_code": self.config.trust_remote_code,
+            # load strictly from the cache the launcher hydrated. without this transformers
+            # enumerates the repo's additional_chat_templates/ over the network, and the served
+            # base model is a private repo whose token is deleted at the end of bootstrap. that
+            # call fails closed rather than falling back: list_repo_templates re-raises
+            # RepositoryNotFoundError (what a 401 becomes) instead of reading local files, so a
+            # fully populated cache does not save it. nothing here is fetchable at serve time
+            # anyway -- every start after bootstrap is tokenless by design.
+            "local_files_only": True,
+        }
         if self.config.tokenizer_revision is not None:
             common["revision"] = self.config.tokenizer_revision
         if self.config.image_limit is not None:
