@@ -600,6 +600,17 @@ def _execute_rl_child(
                     if isinstance(value, int)
                 }
             )
+            # multi-turn totals ride the same final metrics row. published in `finally` so a run
+            # that dies mid-stream still reports the turns it did execute.
+            bridge = getattr(reward_runtime, "multi_turn_bridge", None)
+            accounting = bridge.turn_accounting() if bridge is not None else {}
+            state.metrics_last[-1].update(
+                {
+                    f"multi_turn/{key}": value
+                    for key, value in accounting.items()
+                    if value is not None
+                }
+            )
             LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
 
 

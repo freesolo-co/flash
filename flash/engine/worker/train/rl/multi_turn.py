@@ -224,6 +224,11 @@ class MultiTurnBridge:
         # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
         self._warned_missing_turn_rewards = False
+        # per-run turn totals, published through `turn_accounting`. guarded by the same lock as
+        # every other mutable bridge state.
+        self._scored_episodes = 0
+        self._scored_turns = 0
+        self._max_observed_turns = 0
         self._sessions: dict[str, dict] = {}
         self._session_lease_s = float(session_lease_s)
         # score many episodes under one lock-held env call so judge work can use the env's own
@@ -246,6 +251,25 @@ class MultiTurnBridge:
             "/multiturn/step": self.step,
             "/multiturn/score": self.score,
             "/multiturn/close": self.close,
+        }
+
+    def turn_accounting(self) -> dict[str, int | float | None]:
+        """Bounded per-run turn totals, for proving the multi-turn loop actually iterated.
+
+        A regression that ended every episode after one turn still produces finite gradients, a
+        nonzero adapter delta, and complete artifacts -- every existing gate stays green while the
+        environment's multi-turn contract is silently dead. These counters make that visible.
+        OPD already publishes the same pair as `episodes_seen` / `mt_turn_records`.
+        """
+        with self._lock:
+            episodes = self._scored_episodes
+            turns = self._scored_turns
+            maximum = self._max_observed_turns
+        return {
+            "episodes_scored": episodes,
+            "turn_records": turns,
+            "max_turns_observed": maximum,
+            "mean_turns_per_episode": (turns / episodes if episodes else None),
         }
 
     def shutdown(self) -> None:
@@ -371,6 +395,12 @@ class MultiTurnBridge:
             session = self._session(payload)
             state = session["state"]
             expected_identity = session.get("identity")
+            # one /score call per terminal episode, so this counts episodes exactly once. recorded
+            # here rather than in `step` because a truncated turn returns terminal without ever
+            # reaching the env, and it is still a turn the model generated and trained on.
+            self._scored_episodes += 1
+            self._scored_turns += turn_count
+            self._max_observed_turns = max(self._max_observed_turns, turn_count)
         if self._identity_ledger is not None:
             identity = self._identity_ledger.validate_for_index(
                 payload.get("identity"),

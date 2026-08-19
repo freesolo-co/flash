@@ -7914,3 +7914,99 @@ def test_the_fp8_kv_probe_reads_the_child_capability_probe_not_parent_cuda(monke
         settings = rl_train._resolve_training_settings(inp, caps)
         assert settings[0] == 4
         assert settings[-1] is cc_ok, caps
+
+
+def test_multi_turn_bridge_counts_turns_it_actually_ran():
+    """The bridge must report the turns it ran, so a collapse to single-turn is visible.
+
+    Every existing terminal gate -- finite gradients, nonzero adapter delta, complete artifacts --
+    stays green if a regression ends every episode after one turn, because a one-turn episode
+    still trains. These counters are the only evidence that separates "multi-turn ran" from
+    "multi-turn was configured". Driven through the real HTTP routes, not the bridge object, so
+    the transport the child actually uses is covered.
+    """
+    env = _BridgeEnv(done_after=3)
+    bridge = rl_train.MultiTurnBridge(
+        env,
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=5,
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        assert bridge.turn_accounting() == {
+            "episodes_scored": 0,
+            "turn_records": 0,
+            "max_turns_observed": 0,
+            "mean_turns_per_episode": None,
+        }
+        _post("/multiturn/start", {"index": 0, "session_id": "s"}).close()
+        for turn in range(3):
+            response = json.load(
+                _post("/multiturn/step", {"session_id": "s", "completion_text": str(turn)})
+            )
+            if response["terminal"]:
+                break
+        _post("/multiturn/score", {"session_id": "s", "turn_count": 3}).close()
+    finally:
+        bridge.shutdown()
+        server.shutdown()
+
+    accounting = bridge.turn_accounting()
+    assert accounting["episodes_scored"] == 1
+    assert accounting["turn_records"] == 3
+    assert accounting["max_turns_observed"] == 3
+    assert accounting["mean_turns_per_episode"] == 3.0
+    # the env really advanced: three assistant turns reached it, not one repeated.
+    assert env.recorded == ["0", "1", "2"]
+
+
+def test_single_turn_episode_is_reported_as_one_turn():
+    """A genuinely single-turn episode reports 1, so the counter is not merely 'nonzero'.
+
+    Without this, `turn_records >= 1` would pass for a run that collapsed to one turn per episode,
+    which is exactly the regression the accounting exists to catch.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(done_after=1),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=5,
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        _post("/multiturn/start", {"index": 0, "session_id": "s"}).close()
+        response = json.load(_post("/multiturn/step", {"session_id": "s", "completion_text": "x"}))
+        assert response["terminal"] is True
+        _post("/multiturn/score", {"session_id": "s", "turn_count": 1}).close()
+    finally:
+        bridge.shutdown()
+        server.shutdown()
+
+    accounting = bridge.turn_accounting()
+    assert accounting["episodes_scored"] == 1
+    assert accounting["turn_records"] == 1
+    assert accounting["max_turns_observed"] == 1
+    assert accounting["mean_turns_per_episode"] == 1.0
