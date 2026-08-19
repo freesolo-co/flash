@@ -867,23 +867,29 @@ Pick SFT when you already have good answers and want the model to imitate them.
   emit another opener.
 - **SFT is a great warm start for GRPO.** SFT first to teach the format and a competent
   baseline, then GRPO to optimize past it. Across that lineage keep the **same base
-  model**. Warm-start CONTINUES the one SFT adapter in place — GRPO/OPD keep training
-  the same LoRA (VL and text-only alike), so the run trains and serves at the SFT
+  model**. Warm-start CONTINUES one adapter in place — the next run keeps training the
+  same LoRA (VL and text-only alike), so it trains and serves at the source
   adapter's rank-`r` and just has to fit the selected model's serving `max_lora_rank` (some
   serving models allow rank 128, larger serving paths cap at 64). Do **NOT** set `lora_rank`
   or `lora_alpha` for a warm-start: the source adapter's rank/alpha metadata is authoritative.
   Flash reads the rank from the source adapter and uses it for cost, GPU allocation, and
   GRPO-sleep sizing, so setting either alongside `init_from_adapter` is rejected at submit; it
   also rejects a source adapter whose rank exceeds the serving cap.
+- **Any algorithm can warm-start from any other.** All nine source/target combinations are
+  supported — `sft`, `grpo`, and `opd` each read a source adapter produced by any of the three,
+  including same-algorithm continuation (`sft` → `sft` to keep training on more data, `grpo` →
+  `grpo` to extend a run). The source is named the same way in every case, and the only
+  cross-run requirements are the shared base model and the rank/alpha rules above.
 
 ```toml
 # configs/rl.toml — warm-start GRPO from the SFT run's adapter
 algorithm = "grpo"
 
 [train]
-# the sft run id (as printed by `flash runs status`); add /step-n to warm-start from a
-# specific checkpoint listed by `flash runs checkpoint <run-id>`
-init_from_adapter = "<sft-run-id>"
+# the source run id (as printed by `flash runs status`); add /step-n to warm-start from a
+# specific checkpoint listed by `flash runs checkpoint <run-id>`. the source may be an sft,
+# grpo, or opd run, and `algorithm` above may be any of the three.
+init_from_adapter = "<source-run-id>"
 # do NOT set lora_rank or lora_alpha for a warm-start: the source adapter's rank and alpha
 # metadata are authoritative, and setting either alongside init_from_adapter is rejected
 ```

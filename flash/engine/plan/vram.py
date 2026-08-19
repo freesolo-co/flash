@@ -249,10 +249,31 @@ def grpo_kv_floor_gb(
     return upper
 
 
+def _rollout_stays_resident(model_info, model_id: str = "") -> bool:
+    """True when the rollout engine is pinned resident and never sleeps.
+
+    Named for the property sizing actually depends on rather than the catalog flag that currently
+    implies it: ``sleep_unsupported`` records that a model HANGS on wake, and
+    ``rollout_resident_overrides`` turns that into ``free_cache_engine=false``. Sizing cares only
+    about the second fact, so it reads through this predicate -- the worker gate
+    (``rollout_fp8_kv``) answers the same question, and the two must not drift.
+    """
+    if getattr(model_info, "sleep_unsupported", False):
+        return True
+    if not model_id:
+        return False
+    from flash.core.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    return bool(info is not None and getattr(info, "sleep_unsupported", False))
+
+
 def _declares_linear_attention(model_info, model_id: str = "") -> bool:
     """True for a GDN hybrid, using the catalog rather than a network config fetch.
 
-    GDN workers reject fp8 KV, so sizing must not apply that discount. Fall back to catalog lookup
+    A GDN worker rejects fp8 KV only when its rollout engine sleeps, because the crash is vllm's
+    ``init_fp8_kv_scales`` on wake; a model the catalog pins resident keeps fp8. Callers that size a
+    KV pool must therefore pair this with ``_rollout_stays_resident``. Fall back to catalog lookup
     by model id for pinned revisions because attention family is revision-independent.
     """
     if int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0:
@@ -661,7 +682,12 @@ def _opd_fp8_adjust(
     """Re-size an OPD requirement with fp8 KV on modern cards when sufficient."""
     from flash.providers.base import max_non_fp8_kv_vram_gb
 
-    if _declares_linear_attention(model_info, model_id):
+    # a gdn hybrid keeps the bf16 reservation only while its engine sleeps. once the catalog pins
+    # it resident the worker sends fp8 (rollout_fp8_kv), so sizing must price the same cache or it
+    # reserves a full-width pool nobody allocates.
+    if _declares_linear_attention(model_info, model_id) and not _rollout_stays_resident(
+        model_info, model_id
+    ):
         return need
     ceiling = max_non_fp8_kv_vram_gb()
     if need <= ceiling:

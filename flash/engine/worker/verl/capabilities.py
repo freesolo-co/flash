@@ -479,15 +479,15 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 # binds chunk_gated_delta_rule to the pure-torch fallback that
                 # takes **kwargs and discards cu_seqlens, and packed gdn runs
                 # train across example boundaries while looking patched.
-                # apache-tvm-ffi is pinned to 0.1.11 because 0.1.12
-                # double-registers TVM-FFI and aborts `import tilelang`.
+                # apache-tvm-ffi is pinned to 0.1.9 because flash-qla requires exactly that, and
+                # 0.1.12 double-registers TVM-FFI and aborts `import tilelang`.
                 FLA_REQUIREMENT,
                 # the flashqla GDN backend fla 0.5.2 dispatches to. same lockstep requirement:
                 # the shim binds it in THIS interpreter, so a wheel present only in the worker's
                 # env would leave the child on the old kernel while the marker still printed.
                 FLASH_QLA_REQUIREMENT,
-                "tilelang==0.1.11",
-                "apache-tvm-ffi==0.1.11",
+                "tilelang==0.1.9",
+                "apache-tvm-ffi==0.1.9",
             ],
             check=True,
         )
@@ -740,6 +740,37 @@ def rollout_sleep_unsupported(model_id: str) -> bool:
 
     info = MODELS.get(model_id)
     return bool(info is not None and getattr(info, "sleep_unsupported", False))
+
+
+def rollout_fp8_kv(cc_ok: bool, gdn_hybrid: bool, model_id: str) -> bool:
+    """whether the rollout engine may cache KV in fp8. shared by grpo and opd.
+
+    ``cc_ok`` (cc>=8.9) is the hardware floor. the gdn exclusion on top of it is narrower than it
+    looks: the crash it avoids is vllm's ``init_fp8_kv_scales``, which zeroes each cache tensor and
+    hits ``'list' object has no attribute 'zero_'`` on a hybrid cache. that function is reachable
+    from exactly ONE place -- ``gpu_worker.wake_up`` (``v1/worker/gpu_worker.py:198-203``) -- and
+    verl only ever wakes an engine it put to sleep: both training-path callers are gated on
+    ``rollout.free_cache_engine`` (``engine_workers.py:706,741`` -> ``vllm_rollout.py:161``). a model
+    the catalog flags ``sleep_unsupported`` runs with that flag pinned false by
+    ``rollout_resident_overrides``, so it never sleeps, never wakes, and never reaches the crash.
+
+    the resident engine still gets fp8 for its ordinary attention layers: the recurrent state is a
+    separate ``MambaSpec`` carrying its own dtypes, so fp8 never applies to it. vram sizing already
+    prices this exact combination -- ``mamba_block_size=1072`` is the fp8-derived attention-token
+    page (the 1,097,728-byte gdn state over a 1024-byte fp8 attention token, rounded to vllm's
+    16-token alignment) and ``kv_sizing`` applies it only when ``fp8_kv`` is set.
+
+    this also closes a planner/worker disagreement rather than merely freeing memory: the grpo
+    resident wall in ``vram.py`` sizes a ``sleep_unsupported`` model with ``fp8_kv=True`` already,
+    so a worker that sent bf16 needed ~6-7 GB MORE than the planner had reserved for it (measured
+    at 4096x8 and 8192x4). the two halves now assume the same cache dtype.
+    """
+    if not cc_ok:
+        return False
+    if not gdn_hybrid:
+        return True
+    # gdn + sleeping engine is the combination that crashes on wake; gdn + resident is not.
+    return rollout_sleep_unsupported(model_id)
 
 
 def rollout_resident_overrides(sleep_unsupported: bool) -> list[str]:
