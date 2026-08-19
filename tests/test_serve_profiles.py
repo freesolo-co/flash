@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 
-from flash.core.catalog import get_model
+from flash.core.catalog import get_model, supports_image_training
 from flash.serve.control import ModalPlacement, RunPodPlacement
 from flash.serve.profiles import (
     SERVE_RUNTIME_FAMILY,
@@ -17,6 +17,7 @@ from flash.serve.profiles import (
     supported_models,
 )
 from flash.serve.provisioning import ServingImage
+from flash.serve.runtime.multimodal import _MAX_IMAGES
 
 MODEL = "Qwen/Qwen3.5-9B"
 DIGEST = "sha256:" + "a" * 64
@@ -46,6 +47,32 @@ def test_supported_models_are_all_resolvable() -> None:
     assert models, "the registry must expose at least one profile"
     for model_id in models:
         assert get_profile(model_id).model_id == model_id
+
+
+def test_image_trainable_models_are_served_image_capable() -> None:
+    # flash trains image loras on these models, so serving them text-only ships a dead end: the
+    # engine loads no processor and passes no limit_mm_per_prompt, and every image request fails
+    # with MultimodalRequestError even though the adapter was trained on images. both served
+    # checkpoints are Qwen3_5ForConditionalGeneration with a vision_config, so the capability is
+    # in the weights; only the profile decided not to expose it.
+    for model_id in supported_models():
+        profile = get_profile(model_id)
+        if not supports_image_training(model_id):
+            continue
+        assert profile.modality == "multimodal", (
+            f"{model_id} supports image training but is served as {profile.modality!r}"
+        )
+        assert profile.image_limit is not None, (
+            f"{model_id} supports image training but declares no image_limit"
+        )
+        assert profile.image_limit > 0, (
+            f"{model_id} supports image training but declares image_limit={profile.image_limit!r}"
+        )
+        # the runtime clamps to _MAX_IMAGES, so advertising more than that would promise a
+        # capacity the request path silently trims away.
+        assert profile.image_limit <= _MAX_IMAGES, (
+            f"{model_id} advertises {profile.image_limit} images above the runtime cap {_MAX_IMAGES}"
+        )
 
 
 def test_no_profile_forces_a_quantization_the_checkpoint_would_reject() -> None:

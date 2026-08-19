@@ -189,7 +189,7 @@ class ServingProfile:
 _PROFILES: dict[str, ServingProfile] = {
     "Qwen/Qwen3.5-9B": ServingProfile(
         model_id="Qwen/Qwen3.5-9B",
-        modality="text",
+        modality="multimodal",
         # the engine loads the freesolo-owned fp8 checkpoint, while adapters declare the base model
         # they trained against. catalog `serving.serve_model_id` is the authority for that split.
         served_model="Freesolo-Co/Qwen3.5-9B-FP8",
@@ -209,7 +209,14 @@ _PROFILES: dict[str, ServingProfile] = {
         max_lora_rank=128,
         gpu_memory_utilization=0.90,
         cpu_offload_gb=0.0,
-        image_limit=None,
+        # multimodal, not text: both served checkpoints are Qwen3_5ForConditionalGeneration with
+        # a vision_config, and flash trains image loras on both (catalog supports_image_training is
+        # true for each). declaring text here loaded no processor and passed no limit_mm_per_prompt,
+        # so a customer who trained an image adapter got an engine that rejected every image request.
+        #
+        # 4 matches _MAX_IMAGES, the ceiling the runtime already clamps to, so the engine advertises
+        # exactly what it will accept rather than a larger number it would silently trim.
+        image_limit=4,
         mm_processor_cache_gb=0.0,
         enable_tower_connector_lora=False,
         reasoning_parser=None,
@@ -221,7 +228,7 @@ _PROFILES: dict[str, ServingProfile] = {
     ),
     "Qwen/Qwen3.5-4B": ServingProfile(
         model_id="Qwen/Qwen3.5-4B",
-        modality="text",
+        modality="multimodal",
         served_model="Freesolo-Co/Qwen3.5-4B-FP8",
         tokenizer_model="Freesolo-Co/Qwen3.5-4B-FP8",
         dtype="bfloat16",
@@ -241,7 +248,8 @@ _PROFILES: dict[str, ServingProfile] = {
         # rejects any drift from it, so this is copied from the catalog rather than chosen here.
         gpu_memory_utilization=0.98,
         cpu_offload_gb=0.0,
-        image_limit=None,
+        # image-capable for the same reason as the 9B above.
+        image_limit=4,
         mm_processor_cache_gb=0.0,
         enable_tower_connector_lora=False,
         reasoning_parser=None,

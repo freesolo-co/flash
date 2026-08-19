@@ -393,9 +393,8 @@ def _bind_hub_cache(environment: MutableMapping[str, str], cache_root: str) -> N
 def _seal_hub_offline(environment: MutableMapping[str, str]) -> None:
     """stop the engine from reaching the hub once the cache is complete.
 
-    vllm probes the served repo for optional files -- an image processor config even for a
-    text-only model -- and passes no local_files_only, so those calls default to the hub's own
-    offline flag. the served repo is private and the artifact token is deleted at the end of
+    vllm probes the served repo for optional files -- an image processor config among them -- and
+    passes no local_files_only, so those calls default to the hub's own offline flag. the served repo is private and the artifact token is deleted at the end of
     bootstrap, so the probe authenticates as nobody, and a private repo answers "not found"
     rather than "no such file". transformers re-raises exactly that as a hard OSError even though
     the caller asked it not to raise for missing entries, so an optional file kills startup.
