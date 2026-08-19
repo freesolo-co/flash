@@ -21,11 +21,6 @@ import flash.runner as runner
 from flash.core.spec import JobSpec
 from flash.runner import RunStatus
 
-# states a run can be in before `stage_environment_package` has written the package onto its worker
-# spec. the submit-time snapshot is persisted in this window, so a missing package here is the
-# normal ordering rather than a stripped one.
-_PRE_STAGING_STATES = frozenset({"queued"})
-
 # every other collaborator is reached through `runner.` rather than bound here. `RUNS_DIR`,
 # `get_status`, `_update`, `effective_spec_from_status`, `_gpu_rate`, `_internal_spec_from_status`
 # and `_report_status` are all patched as attributes of `flash.runner` by the tests, and binding any
@@ -73,8 +68,14 @@ def source_snapshot_from_status(status: RunStatus, *, required: bool = False) ->
     return parse_descriptor(raw).to_dict()
 
 
-def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
-    """Load the private prepared worker spec, optionally revalidating its source artifact."""
+def effective_spec_from_status(
+    status: RunStatus, *, verify_source: bool = False, require_staged_environment: bool = True
+) -> JobSpec:
+    """Load the private prepared worker spec, optionally revalidating its source artifact.
+
+    `require_staged_environment=False` is for the one caller that reads a snapshot written *before*
+    `stage_environment_package` ran; see the guard below.
+    """
     public_spec = JobSpec.from_dict(status.spec)
     snapshot = status.effective_preparation
     if not isinstance(snapshot, dict):
@@ -102,15 +103,16 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     from flash.envs.identity import is_freesolo_environment_id
 
     requires_staged_environment = is_freesolo_environment_id(public_spec.environment.id)
-    # staging runs after the submit-time snapshot is written and before the provider is allocated,
-    # so a snapshot taken at submit legitimately has no package yet. only a run that already reached
-    # provisioning is expected to carry one; demanding it unconditionally rejects every warm start
-    # on a staged environment at its first persist, since that path re-reads its own pre-staging
-    # snapshot. `queued` is the pre-staging window; anything past it must have been staged.
+    # `submit_job` writes the snapshot, then `_run_job_inner` stages the package and persists again,
+    # so the submit-time snapshot legitimately has no package. `_persist_effective_worker_spec`
+    # re-reads exactly that stale snapshot before overwriting it -- and only for warm starts, so
+    # demanding a package unconditionally rejected every warm start on a Freesolo environment while
+    # non-warm-start runs never took the branch. run state cannot separate the two windows:
+    # `_run_job` sets `provisioning` before staging. the caller can, so it says so.
     if (
-        requires_staged_environment
+        require_staged_environment
+        and requires_staged_environment
         and worker_spec.environment.package is None
-        and status.state not in _PRE_STAGING_STATES
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
     # the auto-pin marker is excluded from the structural compare (the public half always reads

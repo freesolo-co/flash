@@ -230,7 +230,11 @@ def _persist_effective_worker_spec(
     if public_spec.train.init_from_adapter:
         if not isinstance(snapshot, dict):
             raise ValueError("persisted effective preparation is malformed")
-        _runner().effective_spec_from_status(status)
+        # this is the submit-time snapshot, written before `stage_environment_package` ran and about
+        # to be replaced by the staged `worker_spec` below, so its environment package is absent by
+        # construction rather than stripped. every other reader runs after staging and keeps the
+        # guard.
+        _runner().effective_spec_from_status(status, require_staged_environment=False)
         adapter_identity = snapshot.get("adapter_identity")
     else:
         adapter_identity = None

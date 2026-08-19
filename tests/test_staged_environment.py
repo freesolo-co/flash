@@ -28,6 +28,7 @@ from flash.envs.staged import (
     manifest_payload,
     write_environment_archive,
 )
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 _SHA = "a" * 40
 _OTHER_SHA = "b" * 40
@@ -637,14 +638,12 @@ def test_initial_lifecycle_defers_transient_staging_before_training(monkeypatch,
         return staged_spec
 
     monkeypatch.setattr(runner, "stage_environment_package", fake_stage)
-    monkeypatch.setattr(runner, "flash_code_prefix", lambda: "code/test/flash")
     monkeypatch.setattr(
         runner,
         "_run_training",
         lambda *_args, **_kwargs: calls.__setitem__("train", calls["train"] + 1),
     )
     monkeypatch.setattr("flash.content.multimodal.preflight_validate_image_opd", lambda _spec: None)
-    monkeypatch.setattr("flash.providers._lifecycle.worker.upload_code", lambda *_a, **_k: None)
     monkeypatch.setattr(lifecycle.time, "sleep", lambda _delay: None)
 
     lifecycle._run_job(unstaged)
@@ -673,14 +672,12 @@ def test_staging_deadline_prevents_training_and_provider_allocation(monkeypatch,
             StagedEnvironmentTransientError("timed out")
         ),
     )
-    monkeypatch.setattr(runner, "flash_code_prefix", lambda: "code/test/flash")
     monkeypatch.setattr(
         runner,
         "_run_training",
         lambda *_args, **_kwargs: calls.__setitem__("train", calls["train"] + 1),
     )
     monkeypatch.setattr("flash.content.multimodal.preflight_validate_image_opd", lambda _spec: None)
-    monkeypatch.setattr("flash.providers._lifecycle.worker.upload_code", lambda *_a, **_k: None)
 
     with pytest.raises(RuntimeError, match="deadline exhausted during environment staging"):
         lifecycle._run_job(unstaged)
@@ -720,7 +717,7 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
         seed=worker.seed,
         recovered_attempt=0,
         next_attempt=1,
-        code_prefix="code/test/flash",
+        source_snapshot=valid_source_snapshot(),
         allocated_gpu=None,
         allocated_gpu_count=None,
     )
@@ -782,7 +779,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
         seed=worker.seed,
         recovered_attempt=0,
         next_attempt=1,
-        code_prefix="code/test/flash",
+        source_snapshot=valid_source_snapshot(),
         allocated_gpu=None,
         allocated_gpu_count=None,
     )
@@ -872,7 +869,7 @@ def test_worker_cleans_materialized_package_after_training_handler(
     monkeypatch.setattr(worker, "run_sft", handler)
     monkeypatch.setattr(worker, "_disable_xet_upload_staging", lambda: None)
     monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: None)
-    monkeypatch.setattr(worker, "_preflight_free_vram_for_spec", lambda: None)
+    monkeypatch.setattr(worker, "_preflight_gpu_occupancy_for_spec", lambda: None)
     monkeypatch.setattr(worker, "_force_fla_triton_gdn_on_sm100", lambda: None)
     monkeypatch.setattr(worker, "_ensure_fla_fastpath_on_hopper", lambda: None)
     monkeypatch.setattr(worker, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)

@@ -153,18 +153,20 @@ def test_image_run_warm_start_stays_rejected_for_sft():
         _require_supported_adapter_continuation(spec)
 
 
-def test_queued_warm_start_snapshot_survives_before_the_environment_is_staged():
+def test_warm_start_snapshot_survives_the_read_that_precedes_environment_staging():
     """A warm start on a staged environment must persist before staging has run.
 
     Ordering: `submit_job` writes the effective-preparation snapshot, then `_run_job_inner` calls
     `stage_environment_package` and persists again. `_persist_effective_worker_spec` re-reads its
-    own snapshot through `effective_spec_from_status`, but only for warm-start runs -- so a guard
-    demanding a staged package unconditionally rejects the first persist of every warm start on a
-    Freesolo environment, while non-warm-start runs never take that branch and look fine.
+    own pre-staging snapshot through `effective_spec_from_status`, but only for warm-start runs --
+    so a guard demanding a staged package unconditionally rejects the first persist of every warm
+    start on a Freesolo environment, while non-warm-start runs never take that branch and look
+    fine. Run state cannot separate the windows (`_run_job` sets `provisioning` before staging),
+    so the caller carries the distinction.
 
-    Reproduced live: `image-gate-qwen35-4b-opd-fromsft-20260819-03` failed with "persisted
-    effective preparation failed integrity validation" after staging uploaded the package but
-    before a provider was allocated.
+    Reproduced live: `image-gate-qwen35-4b-opd-fromsft-20260819-06` failed with "persisted
+    effective preparation failed integrity validation" at submit.py's read, before a provider was
+    allocated.
     """
     import flash.runner as runner
     from flash.runner.status import effective_spec_from_status
@@ -188,7 +190,7 @@ def test_queued_warm_start_snapshot_survives_before_the_environment_is_staged():
     }
     status = runner.RunStatus(
         run_id=public.run_id,
-        state="queued",
+        state="provisioning",
         spec=public.to_dict(),
         effective_preparation={
             "worker_spec": worker.to_internal_dict(),
@@ -197,11 +199,14 @@ def test_queued_warm_start_snapshot_survives_before_the_environment_is_staged():
         },
     )
     assert worker.environment.package is None
-    # queued is the pre-staging window, so the absent package is the expected ordering.
-    assert effective_spec_from_status(status).run_id == public.run_id
+    # the pre-staging reader opts out, so the absent package is the expected ordering. the state is
+    # `provisioning` on purpose: `_run_job` sets it before staging, which is why run state cannot
+    # stand in for this.
+    recovered = effective_spec_from_status(status, require_staged_environment=False)
+    assert recovered.run_id == public.run_id
 
-    # paired control: past that window a missing package is a stripped one and must still fail.
-    status.state = "provisioning"
+    # paired control: every other reader runs after staging, so a missing package is a stripped one
+    # and must still fail.
     with pytest.raises(ValueError, match="integrity validation"):
         effective_spec_from_status(status)
 
