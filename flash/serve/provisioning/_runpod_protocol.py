@@ -178,10 +178,21 @@ def _nonnegative_int(value: object, name: str) -> int:
 
 
 def _ports(value: object, name: str) -> tuple[str, ...]:
-    if type(value) is str:
+    """read runpod's ports field, which is absent for a resource that exposes none.
+
+    the api omits `ports` entirely (json null) rather than sending an empty list, and it does that
+    for resources flash did not create as well as its own. rejecting null failed the whole
+    observation pass on the first foreign port-less pod in the account, so flash could never see
+    its own pods -- the same failure `_docker_start_cmd` below already had to fix. an empty string
+    was always accepted here and means exactly this, so null maps to the same empty result.
+    """
+
+    if value is None:
+        raw: list[object] = []
+    elif type(value) is str:
         raw = value.split(",") if value else []
     elif type(value) is list:
-        raw = value
+        raw = list(value)
     else:
         raise ValueError(f"{name} must be a string or list")
     parsed = tuple(_string(item, name) for item in raw)

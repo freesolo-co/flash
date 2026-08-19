@@ -1478,6 +1478,63 @@ def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> No
     assert bare[0].template_id is None
 
 
+def test_observation_survives_a_resource_that_exposes_no_ports() -> None:
+    # runpod sends `ports: null` for a resource created without exposed ports rather than an
+    # empty list. observed live: a foreign pod in the account came back that way, `_ports` rejected
+    # null, and the whole listing collapsed into an opaque transport failure -- so flash could
+    # never see its own pods. an empty string was always accepted and means the same thing.
+    pod = parse_pods(
+        [
+            {
+                "id": "abc123def45680",
+                "name": "portless",
+                "desiredStatus": "RUNNING",
+                "imageName": "pytorch/pytorch:2.6.0",
+                "gpuCount": 1,
+                "containerDiskInGb": 60,
+                "ports": None,
+                "machine": {"gpuTypeId": "NVIDIA H200", "dataCenterId": "EUR-IS-4"},
+            }
+        ]
+    )
+    assert pod[0].ports == ()
+
+    template = parse_templates(
+        [
+            {
+                "id": "tpl0000009",
+                "name": "portless-template",
+                "imageName": "pytorch/pytorch:2.6.0",
+                "dockerStartCmd": ["sleep", "infinity"],
+                "containerDiskInGb": 60,
+                "volumeMountPath": "/workspace",
+                "ports": None,
+                "env": {},
+            }
+        ]
+    )
+    assert template[0].ports == ()
+
+    # absence must stay absence, not become a wildcard that lets any port shape through: a
+    # genuinely malformed value is still rejected, so this cannot mask a real schema change.
+    for malformed in (0, 12.5, {"8000": "http"}, True):
+        with pytest.raises(ValueError):
+            parse_pods(
+                [
+                    {
+                        "id": "abc123def45681",
+                        "name": "malformed",
+                        "desiredStatus": "RUNNING",
+                        "imageName": "pytorch/pytorch:2.6.0",
+                        "gpuCount": 1,
+                        "containerDiskInGb": 60,
+                        "ports": malformed,
+                        "machine": {"gpuTypeId": "NVIDIA L4", "dataCenterId": "US-KS-2"},
+                    }
+                ]
+            )
+
+
 def test_template_observation_reads_argv_and_omitted_defaults() -> None:
     # dockerStartCmd comes back as argv and volumeInGb / isServerless are omitted at their
     # defaults rather than returned as 0 / false. demanding a string and a present key failed on
