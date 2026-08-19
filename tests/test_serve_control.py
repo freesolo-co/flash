@@ -66,7 +66,6 @@ def _engine(**overrides: object) -> EngineIdentity:
         "max_cpu_loras": 3,
         "max_lora_rank": 64,
         "gpu_memory_utilization": 0.9,
-        "swap_space_gb": 4.0,
         "cpu_offload_gb": 0.0,
         "image_limit": None,
         "mm_processor_cache_gb": 0.0,
@@ -223,7 +222,6 @@ def test_engine_id_is_canonical_stable_and_sensitive_to_every_field() -> None:
         "max_cpu_loras": 5,
         "max_lora_rank": 128,
         "gpu_memory_utilization": 0.8,
-        "swap_space_gb": 8.0,
         "cpu_offload_gb": 1.0,
         "image_limit": 4,
         "mm_processor_cache_gb": 1.0,
@@ -266,12 +264,11 @@ def test_engine_identity_enforces_modality_and_image_limit_consistency() -> None
 
 def test_engine_identity_normalizes_numeric_equivalence_and_requires_integer_types() -> None:
     identities = [
-        _engine(swap_space_gb=value, cpu_offload_gb=value, mm_processor_cache_gb=value)
-        for value in (0, 0.0, -0.0)
+        _engine(cpu_offload_gb=value, mm_processor_cache_gb=value) for value in (0, 0.0, -0.0)
     ]
     assert identities[0] == identities[1] == identities[2]
     assert len({identity.engine_id for identity in identities}) == 1
-    assert all(identity.swap_space_gb == 0.0 for identity in identities)
+    assert all(identity.cpu_offload_gb == 0.0 for identity in identities)
 
     with pytest.raises(ValueError, match="tensor_parallel_size must be an integer"):
         _engine(tensor_parallel_size=1.0)
@@ -404,8 +401,8 @@ def test_planning_rejects_mixed_logical_base_provenance(changes: dict[str, objec
 
 
 def test_numeric_equivalent_engines_produce_permutation_stable_specs() -> None:
-    first = _adapter(1, _engine(swap_space_gb=0))
-    second = _adapter(2, _engine(swap_space_gb=-0.0))
+    first = _adapter(1, _engine(cpu_offload_gb=0))
+    second = _adapter(2, _engine(cpu_offload_gb=-0.0))
     forward = plan_deployment(_modal_request(first, second))
     reverse = plan_deployment(_modal_request(second, first))
     assert forward == reverse

@@ -76,7 +76,6 @@ def engine_config_from_manifest(manifest: ServingManifest) -> EngineConfig:
         "max_model_len": identity.max_model_len,
         "max_num_seqs": identity.max_num_seqs,
         "gpu_memory_utilization": identity.gpu_memory_utilization,
-        "swap_space": identity.swap_space_gb,
         "cpu_offload_gb": identity.cpu_offload_gb,
     }
     if identity.max_num_batched_tokens is not None:

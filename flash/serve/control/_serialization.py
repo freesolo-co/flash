@@ -51,7 +51,6 @@ def _engine_payload(value: EngineIdentity) -> dict[str, object]:
         "max_cpu_loras": value.max_cpu_loras,
         "max_lora_rank": value.max_lora_rank,
         "gpu_memory_utilization": value.gpu_memory_utilization,
-        "swap_space_gb": value.swap_space_gb,
         "cpu_offload_gb": value.cpu_offload_gb,
         "image_limit": value.image_limit,
         "mm_processor_cache_gb": value.mm_processor_cache_gb,

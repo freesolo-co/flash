@@ -57,7 +57,6 @@ def _engine(**overrides: object) -> EngineIdentity:
         "max_cpu_loras": 2,
         "max_lora_rank": 64,
         "gpu_memory_utilization": 0.9,
-        "swap_space_gb": 4.0,
         "cpu_offload_gb": 0.0,
         "image_limit": None,
         "mm_processor_cache_gb": 0.0,

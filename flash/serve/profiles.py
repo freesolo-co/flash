@@ -88,7 +88,6 @@ class ServingProfile:
     max_cpu_loras: int
     max_lora_rank: int
     gpu_memory_utilization: float
-    swap_space_gb: float
     cpu_offload_gb: float
     image_limit: int | None
     mm_processor_cache_gb: float
@@ -140,7 +139,6 @@ class ServingProfile:
             max_cpu_loras=self.max_cpu_loras,
             max_lora_rank=self.max_lora_rank,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            swap_space_gb=self.swap_space_gb,
             cpu_offload_gb=self.cpu_offload_gb,
             image_limit=self.image_limit,
             mm_processor_cache_gb=self.mm_processor_cache_gb,
@@ -206,7 +204,6 @@ _PROFILES: dict[str, ServingProfile] = {
         max_cpu_loras=16,
         max_lora_rank=128,
         gpu_memory_utilization=0.90,
-        swap_space_gb=0.0,
         cpu_offload_gb=0.0,
         image_limit=None,
         mm_processor_cache_gb=0.0,
@@ -235,7 +232,6 @@ _PROFILES: dict[str, ServingProfile] = {
         # 0.98, not the 9B's 0.90: the catalog states it per model and _require_catalog_agreement
         # rejects any drift from it, so this is copied from the catalog rather than chosen here.
         gpu_memory_utilization=0.98,
-        swap_space_gb=0.0,
         cpu_offload_gb=0.0,
         image_limit=None,
         mm_processor_cache_gb=0.0,

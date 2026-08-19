@@ -201,7 +201,6 @@ class EngineIdentity:
     max_cpu_loras: int
     max_lora_rank: int
     gpu_memory_utilization: float
-    swap_space_gb: float
     cpu_offload_gb: float
     image_limit: int | None
     mm_processor_cache_gb: float
@@ -268,7 +267,7 @@ def validate_engine_identity(identity: EngineIdentity) -> None:
     if utilization <= 0 or utilization > 1:
         raise ValueError("gpu_memory_utilization must be greater than zero and at most one")
     object.__setattr__(identity, "gpu_memory_utilization", utilization)
-    for name in ("swap_space_gb", "cpu_offload_gb", "mm_processor_cache_gb"):
+    for name in ("cpu_offload_gb", "mm_processor_cache_gb"):
         object.__setattr__(
             identity,
             name,
