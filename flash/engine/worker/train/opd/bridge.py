@@ -496,7 +496,7 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
         session = self._session(payload.get("session_id"))
         turn_ordinal = int(payload.get("turn_ordinal", -1))
         accepted_prefix = [int(token_id) for token_id in payload.get("accepted_prefix", [])]
-        image_count, image_digests = step_media_identity(payload, session["image_digests"])
+        image_count, image_digests = step_media_identity(payload)
         raw_response_ids, response_ids, completion_text, skip_reason = (
             self._validated_multiturn_response(payload)
         )

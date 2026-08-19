@@ -2818,6 +2818,8 @@ def test_an_unusable_opd_turn_is_never_shown_to_the_environment():
             "session_id": "s1",
             "turn_ordinal": 0,
             "accepted_prefix": [10, 11],
+            "image_count": 0,
+            "image_digests": [],
             "raw_response_ids": [],
             "response_ids": [],
             "completion_text": "",
@@ -2852,6 +2854,8 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
             "session_id": "s1",
             "turn_ordinal": 0,
             "accepted_prefix": [10, 11],
+            "image_count": 0,
+            "image_digests": [],
             "raw_response_ids": [65],
             "response_ids": [65],
             "completion_text": "A",
@@ -8642,6 +8646,8 @@ def test_valid_image_prompt_reaches_environment_with_media_placement_intact():
             "session_id": "valid",
             "turn_ordinal": 0,
             "accepted_prefix": [10, 11],
+            "image_count": 1,
+            "image_digests": list(bridge.prompts[0].image_digests),
             "raw_response_ids": [65],
             "response_ids": [65],
             "completion_text": "A",
@@ -8784,3 +8790,29 @@ def test_opd_media_digest_order_sabotage_fails_before_environment_mutation():
             }
         )
     assert env.recorded == []
+
+
+def test_step_media_identity_requires_the_child_to_attest_its_media():
+    """A step that reports no media must fail, not inherit the session's own answer.
+
+    the caller compares this result against the session's media to catch parent/child drift.
+    defaulting a missing key to the session's values would compare the session to itself and pass
+    unconditionally, so the one drift worth catching here -- a child that stopped reporting media --
+    would be the single case the check cannot see. the real child always sends both keys.
+    """
+    from flash.engine.worker.train.opd.multiturn_media import step_media_identity
+
+    session_digests = ["digest-a", "digest-b"]
+    complete = {"image_count": 2, "image_digests": list(session_digests)}
+    assert step_media_identity(complete) == (2, session_digests)
+
+    for omitted in ("image_count", "image_digests"):
+        payload = {key: value for key, value in complete.items() if key != omitted}
+        with pytest.raises(ValueError, match="must report its image count and digests"):
+            step_media_identity(payload)
+
+    with pytest.raises(ValueError, match="must report its image count and digests"):
+        step_media_identity({})
+
+    with pytest.raises(ValueError, match="list of strings"):
+        step_media_identity({"image_count": 1, "image_digests": [b"not-a-str"]})

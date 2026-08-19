@@ -76,13 +76,19 @@ def normalize_initial_prompt(prompt, state: dict, processor) -> tuple[list[dict]
     return initial_messages, fresh_descriptors
 
 
-def step_media_identity(payload: dict, image_digests: list[str]) -> tuple[int, list[str]]:
-    if "image_count" not in payload and "image_digests" not in payload:
-        image_count = len(image_digests)
-        supplied_digests = list(image_digests)
-    else:
-        image_count = int(payload.get("image_count", -1))
-        supplied_digests = payload.get("image_digests")
+def step_media_identity(payload: dict) -> tuple[int, list[str]]:
+    """Read the media identity the child attests for this turn.
+
+    the caller compares the result against the session's own media, which is what catches a parent
+    and child that have drifted apart. defaulting a missing key to the session's values would make
+    that comparison compare the session to itself and pass unconditionally, turning the one drift
+    this detects -- a child that stopped reporting media at all -- into the one case it cannot see.
+    the child always sends both keys, so require them.
+    """
+    if "image_count" not in payload or "image_digests" not in payload:
+        raise ValueError("multi-turn rollout step must report its image count and digests")
+    image_count = int(payload["image_count"])
+    supplied_digests = payload["image_digests"]
     if not isinstance(supplied_digests, list) or any(
         not isinstance(value, str) for value in supplied_digests
     ):
