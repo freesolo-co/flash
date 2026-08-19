@@ -48,6 +48,23 @@ def test_supported_models_are_all_resolvable() -> None:
         assert get_profile(model_id).model_id == model_id
 
 
+def test_no_profile_forces_a_quantization_the_checkpoint_would_reject() -> None:
+    # every served checkpoint declares quant_method "compressed-tensors" in its own config, and
+    # vllm treats a disagreeing `quantization` argument as a hard ValidationError rather than a
+    # hint: "Quantization method specified in the model config (compressed-tensors) does not
+    # match the quantization method specified in the `quantization` argument (fp8)". that killed
+    # a live canary at engine construction, after the weights had already downloaded.
+    #
+    # leaving it unset lets vllm read the method from the checkpoint, which is the authority. a
+    # future profile may set this only for a checkpoint that declares the same method.
+    for model_id in supported_models():
+        profile = get_profile(model_id)
+        assert profile.quantization is None, (
+            f"{model_id} forces quantization={profile.quantization!r}; the checkpoint declares its "
+            "own method and vllm rejects an argument that disagrees"
+        )
+
+
 def test_unknown_model_fails_closed_rather_than_defaulting() -> None:
     # a guessed placement is a real gpu rental in the customer's account, so an unlisted model
     # must raise instead of falling back to any other profile.
@@ -76,7 +93,6 @@ def test_profile_matches_the_catalog_serving_capacity() -> None:
     assert profile.max_lora_rank == serving.max_lora_rank
     assert profile.gpu_memory_utilization == serving.gpu_memory_utilization
     assert profile.served_model == serving.serve_model_id
-    assert profile.quantization == serving.quantization
     assert profile.modal_gpu == serving.gpu
 
 
@@ -88,7 +104,6 @@ def test_profile_matches_the_catalog_serving_capacity() -> None:
         ("max_num_seqs", 4),
         ("gpu_memory_utilization", 0.5),
         ("served_model", "Freesolo-Co/other"),
-        ("quantization", None),
         ("modal_gpu", "H100"),
     ],
 )

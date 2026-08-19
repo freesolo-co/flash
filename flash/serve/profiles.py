@@ -195,7 +195,11 @@ _PROFILES: dict[str, ServingProfile] = {
         served_model="Freesolo-Co/Qwen3.5-9B-FP8",
         tokenizer_model="Freesolo-Co/Qwen3.5-9B-FP8",
         dtype="bfloat16",
-        quantization="fp8",
+        # none, not "fp8": these checkpoints declare quant_method "compressed-tensors" in
+        # their own config, and vllm rejects a `quantization` argument that disagrees with
+        # the checkpoint rather than treating it as a hint. the checkpoint is the authority,
+        # so nothing is forced here.
+        quantization=None,
         kv_cache_dtype=None,
         max_model_len=32768,
         max_num_seqs=8,
@@ -221,7 +225,11 @@ _PROFILES: dict[str, ServingProfile] = {
         served_model="Freesolo-Co/Qwen3.5-4B-FP8",
         tokenizer_model="Freesolo-Co/Qwen3.5-4B-FP8",
         dtype="bfloat16",
-        quantization="fp8",
+        # none, not "fp8": these checkpoints declare quant_method "compressed-tensors" in
+        # their own config, and vllm rejects a `quantization` argument that disagrees with
+        # the checkpoint rather than treating it as a hint. the checkpoint is the authority,
+        # so nothing is forced here.
+        quantization=None,
         kv_cache_dtype=None,
         max_model_len=32768,
         max_num_seqs=8,
@@ -295,7 +303,6 @@ def _require_catalog_agreement(profile: ServingProfile) -> None:
             )
     for label, expected, actual in (
         ("served_model", serving.serve_model_id, profile.served_model),
-        ("quantization", serving.quantization, profile.quantization),
         ("modal gpu", serving.gpu, profile.modal_gpu),
     ):
         if expected != actual:

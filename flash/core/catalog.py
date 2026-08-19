@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from math import ceil
-from typing import Any, Literal
+from typing import Any
 
 ALGORITHMS = ("sft", "grpo", "opd")
 
@@ -80,7 +80,6 @@ class ServingCapacity:
     max_loras: int
     max_lora_rank: int
     max_model_len: int
-    quantization: Literal["fp8"] | None = None
     serve_model_id: str = ""
     max_num_seqs: int = 0
     max_num_batched_tokens: int = 0
@@ -186,7 +185,6 @@ class ModelInfo:
         if serving is None:
             del data["serving"]
         else:
-            serving.pop("quantization", None)
             for key in (
                 "serve_model_id",
                 "max_num_seqs",
@@ -254,7 +252,6 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
             gpu="L4",
-            quantization="fp8",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-0.8B"],
             max_loras=16,
             max_lora_rank=128,
@@ -300,7 +297,6 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
             gpu="L4",
-            quantization="fp8",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-2B"],
             max_loras=16,
             max_lora_rank=128,
@@ -345,7 +341,6 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 5090",
         serving=ServingCapacity(
             gpu="L4",
-            quantization="fp8",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-4B"],
             max_loras=16,
             max_lora_rank=128,
@@ -399,7 +394,6 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="A100 PCIe",
         serving=ServingCapacity(
             gpu="L40S",
-            quantization="fp8",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"],
             max_loras=16,
             max_lora_rank=128,
@@ -455,7 +449,6 @@ MODELS: dict[str, ModelInfo] = {
         min_disk_gb=160,
         serving=ServingCapacity(
             gpu="H100",
-            quantization="fp8",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.6-27B"],
             max_loras=16,
             max_lora_rank=64,
