@@ -68,8 +68,9 @@ class RunPodGpu:
 # the extraction scratch and the runtime's own writes. the previous 40 GB was read off the
 # compressed number, so the image could not fit on the disk it was pulled onto at all.
 #
-# do not try to confirm this from the runpod api: `runtime: none` and a pod-proxy 404 both show up
-# on pods that are running fine, so neither distinguishes a failed pull from a slow one.
+# do not try to confirm this from the runpod api's `runtime` field: it reads null on pods that are
+# serving fine. the pod proxy is the signal that discriminates -- a live pod answers
+# `https://{podId}-8000.proxy.runpod.net/` with 200 and an exited one with 404.
 _RUNPOD_L40S = RunPodGpu(gpu_type_id="NVIDIA L40S", container_disk_gb=100, volume_size_gb=120)
 # 24 GB card, so the VOLUME (weights and adapters) is sized down relative to the 9B set. the
 # container disk is NOT sized down: it holds the same image on either card. both ids are the exact
