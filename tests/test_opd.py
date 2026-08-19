@@ -1178,12 +1178,13 @@ def test_gdn_fp8_exclusion_survives_a_pinned_revision():
 
 
 def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
-    """The worker's fp8 flag must follow the cc probe AND the GDN exclusion, because vram.py's
+    """The worker's fp8 flag must follow the cc probe AND the GDN rule, because vram.py's
     _opd_fp8_adjust sizes OPD against an fp8 KV pool above the non-fp8 card ceiling.
 
     Pins the flag itself rather than a VRAM number: this is the worker half of the pair whose sizing
-    half is asserted by test_gdn_fp8_exclusion_survives_a_pinned_revision. GDN hybrids are excluded
-    because vllm's fp8-kv wake path (init_fp8_kv_scales) crashes on the hybrid cache.
+    half is asserted by test_gdn_fp8_exclusion_survives_a_pinned_revision. A GDN hybrid qualifies
+    only when the catalog pins its engine resident, because it is sleep/wake (init_fp8_kv_scales)
+    that crashes on the hybrid cache, not GDN itself.
     """
     import inspect
 
@@ -1191,12 +1192,102 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
 
     src = inspect.getsource(opd_train.run_opd_train)
     assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
-    assert "fp8_kv = _cc_ok and not gdn_hybrid" in src
+    assert "fp8_kv = rollout_fp8_kv(_cc_ok, gdn_hybrid, model_id)" in src
     assert "get_device_capability() >= (8, 9)" in src
 
     # and the override is emitted only when the resolved flag is true, so a bf16 worker never sends
     # fp8 (an absent key means bf16, which is the conservative direction).
     assert 'if config.get("fp8_kv")' in inspect.getsource(opd_train.build_opd_overrides)
+
+
+def test_rollout_fp8_kv_admits_a_gdn_hybrid_only_when_its_engine_stays_resident():
+    """The GDN exclusion is scoped to sleeping engines, because sleep is what actually crashes.
+
+    vllm's ``init_fp8_kv_scales`` calls ``.zero_()`` per cache tensor and dies on a hybrid cache's
+    list. It is reachable from exactly one caller, ``gpu_worker.wake_up``, and verl only wakes an
+    engine it first put to sleep. A model the catalog flags ``sleep_unsupported`` is pinned resident
+    by ``rollout_resident_overrides``, so it never sleeps, never wakes, and never reaches the crash.
+
+    This asserts the intersection against the real catalog rather than a stub: the rule is only
+    correct if ``sleep_unsupported`` genuinely means "resident", so a stub that fakes the flag would
+    pass while the shipped behavior regressed.
+    """
+    from flash.core.catalog import MODELS
+    from flash.engine.worker.verl.capabilities import (
+        rollout_fp8_kv,
+        rollout_sleep_unsupported,
+    )
+
+    # the hardware floor dominates: cc<8.9 is bf16 regardless of architecture or catalog flag.
+    for gdn in (False, True):
+        for model_id in ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-35B-A3B", ""):
+            assert not rollout_fp8_kv(False, gdn, model_id)
+
+    # non-gdn on capable hardware is unconditional fp8 and must not consult the catalog at all,
+    # so an id the catalog does not carry still qualifies.
+    assert rollout_fp8_kv(True, False, "meta-llama/Llama-3.1-8B")
+
+    # a gdn hybrid the catalog does not pin resident stays bf16, including an unknown id: absent
+    # evidence of residency the conservative answer is the old exclusion.
+    assert not rollout_fp8_kv(True, True, "")
+    assert not rollout_fp8_kv(True, True, "some/unlisted-gdn-model")
+
+    # and the one case that changes: a gdn hybrid the catalog pins resident.
+    resident = [m for m in MODELS if rollout_sleep_unsupported(m)]
+    assert resident, "catalog carries no sleep_unsupported model; this rule is unreachable"
+    for model_id in resident:
+        assert rollout_fp8_kv(True, True, model_id), model_id
+
+    # every other catalog model is unchanged from the blanket exclusion this replaced.
+    for model_id in MODELS:
+        if model_id not in resident:
+            assert not rollout_fp8_kv(True, True, model_id), model_id
+
+
+def test_the_resident_grpo_wall_and_the_worker_agree_on_the_kv_dtype():
+    """The GRPO resident wall sizes a sleep_unsupported model with fp8 KV, so the worker must send
+    fp8 too or it needs more memory than the planner reserved.
+
+    ``vram.py``'s ``sleep_unsupported`` branch computes ``resident_need`` with ``fp8_kv=True`` and
+    admits the config against that wall. A worker that resolved bf16 for the same model consumed a
+    full-width cache the wall never priced, which is an under-reservation, not a safe margin. This
+    pins the two halves to one answer; it fails if either side flips its dtype independently.
+    """
+    import math
+
+    from flash.core.catalog import MODELS, vocab_size_for
+    from flash.engine.plan.vram import estimate_vram_gb
+    from flash.engine.worker.verl.capabilities import (
+        rollout_fp8_kv,
+        rollout_sleep_unsupported,
+    )
+
+    model_id = "Qwen/Qwen3.6-35B-A3B"
+    info = MODELS[model_id]
+    assert rollout_sleep_unsupported(model_id), "this model must still be the resident-pinned case"
+
+    # the worker half: a gdn hybrid on capable hardware now resolves fp8.
+    assert rollout_fp8_kv(True, True, model_id)
+
+    # the planner half: sizing the same run bf16 costs strictly more than the fp8 wall the
+    # planner actually admits against, so a bf16 worker would exceed its own reservation.
+    kw = {
+        "seq_len": 8192,
+        "max_tokens": 4096,
+        "lora_rank": 32,
+        "group_size": 4,
+        "thinking": False,
+        "use_vllm": True,
+        "vocab": vocab_size_for(model_id),
+        "sleep_offload": False,
+        "active_params_b": info.active_params_b,
+        "model_info": info,
+    }
+    wall = math.ceil(estimate_vram_gb(info.params_b, "grpo", "bf16", fp8_kv=True, **kw) * 1.15)
+    bf16_cost = math.ceil(
+        estimate_vram_gb(info.params_b, "grpo", "bf16", fp8_kv=False, **kw) * 1.15
+    )
+    assert bf16_cost > wall, (bf16_cost, wall)
 
 
 def test_opd_oversized_reject_names_the_knobs_to_shrink(monkeypatch):

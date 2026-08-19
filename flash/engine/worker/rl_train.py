@@ -41,6 +41,7 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     resolve_rollout_enforce_eager,
     resolve_verl_loggers,
     resolve_verl_python,
+    rollout_fp8_kv,
     stamp_adapter_dir_provenance,
     verl_declares_rollout_field,
     verl_device_capability,
@@ -266,8 +267,10 @@ def _configure_rl_child(
         gdn_reset_arch=gdn_reset_arch,
         loggers=loggers,
     )
-    # reuse the gdn answer resolved above rather than re-probing; see gdn_hybrid.
-    fp8_kv = cc_ok and not gdn_hybrid
+    # reuse the gdn answer resolved above rather than re-probing; see gdn_hybrid. a gdn hybrid keeps
+    # fp8 only when the catalog pins its engine resident -- see rollout_fp8_kv for why sleep is the
+    # thing that actually crashes, not gdn.
+    fp8_kv = rollout_fp8_kv(cc_ok, gdn_hybrid, inp["model_id"])
     # one capability probe, both rollout decisions below. asked of the verl interpreter, whose
     # torch/vllm stack is the one that has to run the rollout.
     verl_cc = verl_device_capability(caps)
