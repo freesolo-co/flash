@@ -690,6 +690,7 @@ def _build_verl_train_notes(
     rollout_identity_evidence: dict | None = None,
     advantage_spread_history: list[float] | None = None,
     advantage_bounds: list[dict] | None = None,
+    multi_turn_accounting: dict | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -752,6 +753,11 @@ def _build_verl_train_notes(
         ),
         "advantage_spread_history": list(advantage_spread_history or []),
         "advantage_bounds": copy.deepcopy(advantage_bounds or []),
+        # episode and turn totals for a multi-turn run; None for single-turn, which has no
+        # episode loop to account for. published in the durable notes rather than only on the
+        # heartbeat because this is the evidence that separates "multi-turn was configured" from
+        # "multi-turn actually iterated", and a one-turn collapse passes every other gate.
+        "multi_turn_accounting": copy.deepcopy(multi_turn_accounting),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],

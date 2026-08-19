@@ -240,6 +240,11 @@ def _write_terminal_metadata(
             rollout_identity_evidence=state.rollout_identity_evidence,
             advantage_spread_history=state.adv_spread_history,
             advantage_bounds=state.advantage_bounds_evidence,
+            multi_turn_accounting=(
+                reward_runtime.multi_turn_bridge.turn_accounting()
+                if reward_runtime.multi_turn_bridge is not None
+                else None
+            ),
         ),
     )
 

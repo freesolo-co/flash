@@ -8010,3 +8010,39 @@ def test_single_turn_episode_is_reported_as_one_turn():
     assert accounting["turn_records"] == 1
     assert accounting["max_turns_observed"] == 1
     assert accounting["mean_turns_per_episode"] == 1.0
+
+
+def test_turn_accounting_reaches_the_durable_notes_not_only_the_heartbeat():
+    """The counters have to land in `metrics.json` notes, which is what a terminal proof reads.
+
+    The heartbeat's `metrics_last` row is a live view that a completed run's artifact bundle does
+    not carry, so publishing there alone leaves the evidence unreadable after the fact. Assert both
+    that the terminal writer forwards the bridge totals and that the notes builder keeps them.
+    """
+    terminal_source = inspect.getsource(rl_train._write_terminal_metadata)
+    assert "multi_turn_accounting=(" in terminal_source
+    assert "reward_runtime.multi_turn_bridge.turn_accounting()" in terminal_source
+
+    accounting = {
+        "episodes_scored": 128,
+        "turn_records": 585,
+        "max_turns_observed": 5,
+        "mean_turns_per_episode": 4.5703125,
+    }
+    notes = rl_train._build_verl_train_notes(
+        _notes_inp(), **_notes_common(), multi_turn_accounting=accounting
+    )
+    assert notes["multi_turn_accounting"] == accounting
+    # a copy, so a later bridge update cannot retroactively rewrite a published record.
+    assert notes["multi_turn_accounting"] is not accounting
+
+
+def test_single_turn_run_records_multi_turn_accounting_as_an_explicit_none():
+    """Single-turn runs must record the key, so absence stays distinguishable from omission.
+
+    A terminal gate cannot tell "this run had no episode loop" from "the counters were never
+    wired" if the key is simply missing, and the second case is the one that hides a collapse.
+    """
+    notes = rl_train._build_verl_train_notes(_notes_inp(), **_notes_common())
+    assert "multi_turn_accounting" in notes
+    assert notes["multi_turn_accounting"] is None
