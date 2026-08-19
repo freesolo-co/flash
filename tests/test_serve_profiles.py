@@ -306,10 +306,8 @@ def test_image_capable_profiles_enable_tower_connector_lora() -> None:
 
 def test_runpod_container_disk_holds_the_extracted_serving_image() -> None:
     # the container disk must hold the image as EXTRACTED, not as downloaded. the serving image is
-    # 13.7 GB compressed and 40.7 GB on disk, and two canaries were lost to a 40 GB disk sized from
-    # the compressed number: the pod sits at desiredStatus RUNNING with `runtime: none` and no port
-    # mappings while the pull never completes, so it bills until something kills it and the deploy
-    # never surfaces an error to attribute it to.
+    # 13.7 GB compressed and 40.7 GB on disk (`docker system df -v`), so a 40 GB disk sized from the
+    # compressed number cannot hold the image it is pulling at all.
     #
     # this floor is deliberately stated as the extracted size plus room for extraction scratch and
     # the runtime's own writes. it is not a guess at "big enough": anything at or under ~41 GB is

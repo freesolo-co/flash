@@ -65,9 +65,11 @@ class RunPodGpu:
 # from either and is stated per profile below.
 # containerDiskInGb must hold the EXTRACTED image, not the registry download. the serving image is
 # 13.7 GB compressed but 40.7 GB on disk (`docker system df -v`), and the container disk also holds
-# the extraction scratch and the runtime's own writes. sizing either card from the compressed
-# number strands the pod: it stays RUNNING with `runtime: none` and no ports while the pull never
-# finishes, so it bills indefinitely and no deploy timeout ever sees a real error.
+# the extraction scratch and the runtime's own writes. the previous 40 GB was read off the
+# compressed number, so the image could not fit on the disk it was pulled onto at all.
+#
+# do not try to confirm this from the runpod api: `runtime: none` and a pod-proxy 404 both show up
+# on pods that are running fine, so neither distinguishes a failed pull from a slow one.
 _RUNPOD_L40S = RunPodGpu(gpu_type_id="NVIDIA L40S", container_disk_gb=100, volume_size_gb=120)
 # 24 GB card, so the VOLUME (weights and adapters) is sized down relative to the 9B set. the
 # container disk is NOT sized down: it holds the same image on either card. both ids are the exact
