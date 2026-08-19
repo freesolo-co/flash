@@ -314,9 +314,23 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
         }
 
 
-def test_sft_init_from_adapter_is_rejected_at_parse_time() -> None:
-    with pytest.raises(ConfigError, match="SFT adapter continuation is not supported"):
-        spec_from_dict(_raw(algorithm="sft", **{"train.init_from_adapter": "source-run"}))
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_init_from_adapter_parses_for_every_target_algorithm(algorithm) -> None:
+    """Warm start is target-algorithm agnostic: every algorithm may continue an adapter.
+
+    SFT used to be rejected here. The restriction described the retired trl SFT backend; the verl
+    backend loads a warm-start adapter exactly like GRPO and OPD do, so all nine source/target
+    combinations parse.
+    """
+    raw = _raw(algorithm=algorithm, **{"train.init_from_adapter": "source-run"})
+    # the source adapter's rank/alpha metadata is authoritative for every warm start, so authoring
+    # either alongside init_from_adapter stays rejected; BASE_RAW presets a rank.
+    raw["train"].pop("lora_rank")
+
+    spec = spec_from_dict(raw)
+
+    assert spec.algorithm == algorithm
+    assert spec.train.init_from_adapter == "source-run"
 
 
 @pytest.mark.parametrize(
@@ -1984,27 +1998,29 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
         orch.get_status(spec.run_id)
 
 
-def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
+    tmp_path, monkeypatch, algorithm
+) -> None:
+    """Preparation diagnoses the SOURCE run, never the target algorithm.
+
+    SFT used to be refused outright here. Now all three targets reach the same source resolution,
+    so an unknown source produces one identical message rather than SFT failing earlier and for a
+    different reason.
+    """
     from flash.core.spec import JobSpec, TrainSpec
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
-    # offline: sft requires a resolved model_revision, which calls HfApi().model_info(). Stub it
-    # the same way the sibling test above does, so the adapter-continuation rejection this test is
-    # about is what fails -- not an unrelated network lookup on a disconnected runner.
-    monkeypatch.setattr(
-        orch,
-        "_resolve_model_revision",
-        lambda s, **_kw: replace(s, model_revision="a" * 40, model_revision_auto=True),
-    )
     spec = JobSpec(
-        run_id="sft-warmstart",
+        run_id=f"{algorithm}-warmstart",
         model="Qwen/Qwen3.5-0.8B",
-        algorithm="sft",
+        algorithm=algorithm,
         project="11111111-1111-4111-8111-111111111111",
         train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run"),
     )
-    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
-        orch.submit_job(spec, dry_run=True)
+
+    with pytest.raises(ValueError, match="references unknown run 'source-run'"):
+        orch._prepare_init_from_adapter(spec)
 
 
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:

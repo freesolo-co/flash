@@ -34,14 +34,6 @@ def _runner():
     return runner
 
 
-def _require_supported_adapter_continuation(spec: JobSpec) -> None:
-    if spec.algorithm == "sft" and spec.train.init_from_adapter:
-        raise ValueError(
-            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
-            "SFT adapter continuation is not supported"
-        )
-
-
 def _adopted_warmstart_revision(spec: JobSpec, src_spec: JobSpec) -> JobSpec:
     """Take the warm-start source's pin and preserve who chose it.
 
@@ -102,6 +94,15 @@ def _inherit_warmstart_revision(
     and its own error type. Raising here would report those as generic submission failures instead,
     so an unreadable source simply leaves the spec untouched and the real check speaks.
 
+    Applies to an SFT target too, and that case is the one with no second chance. SFT is the only
+    algorithm ``prepare_job`` force-pins (``_resolve_model_revision(required=True)``), and that call
+    runs immediately after this one. Skipping the inheritance here would let the child resolve its
+    own pin to whatever the base model's hub tip is NOW, so a source trained before the tip moved
+    fails the equality check in ``_prepare_init_from_adapter_inner`` -- warm start would work only
+    while the base happened to be unchanged. Inheriting first also carries the source's
+    ``model_revision_auto``, which is what keeps a warm-started SFT child deployable: serving
+    refuses an AUTHORED pin, and a self-resolved one would be indistinguishable from the author's.
+
     Two ordering rules this function must not relax, because it now runs BEFORE the code that used
     to enforce them:
 
@@ -115,7 +116,7 @@ def _inherit_warmstart_revision(
       and inheriting it would silence that guard rather than trip it.
     """
     ref = spec.train.init_from_adapter
-    if spec.model_revision or not ref or spec.algorithm == "sft":
+    if spec.model_revision or not ref:
         return spec
     from flash.schema import parse_checkpoint_ref
 
@@ -168,7 +169,6 @@ def _prepare_init_from_adapter_inner(
     owner_key_id: int | None = None,
     token: str | None = None,
 ) -> tuple[JobSpec, JobSpec, dict | None, int | None]:
-    _runner()._require_supported_adapter_continuation(spec)
     ref = spec.train.init_from_adapter
     if not ref:
         return spec, spec, None, None
@@ -489,6 +489,14 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
         else spec.model_revision
     )
     if not authored and not required:
+        return spec
+    # an inherited warm-start pin is already an immutable sha chosen by a previous run, so there is
+    # nothing left to resolve. re-resolving would look up the CURRENT hub tip (``authored`` is empty
+    # for a runner-assigned pin, so the lookup passes ``revision=None``) and overwrite the source's
+    # sha with it. the warm start would then be rejected for a revision mismatch the moment the base
+    # model moved -- and ``_adopted_warmstart_revision`` cannot undo it, because it refuses to
+    # replace a pin that is already set.
+    if spec.model_revision_auto and re.fullmatch(r"[0-9a-f]{40}", spec.model_revision or ""):
         return spec
     try:
         from huggingface_hub import HfApi

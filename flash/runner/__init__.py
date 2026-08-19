@@ -821,7 +821,6 @@ from flash.runner.preparation import (  # noqa: E402,F401
     _profile_producer_version,
     _require_pinned_profile_environment,
     _require_sft_workload_profile,
-    _require_supported_adapter_continuation,
     _resolve_model_revision,
     _validate_effective_spec,
     _warmstart_source_is_authorized,

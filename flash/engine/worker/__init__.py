@@ -293,11 +293,6 @@ def _run_worker_mode() -> None:
     remaining = _remaining_worker_wall_seconds()
     if remaining is not None and remaining <= 0:
         raise RuntimeError("worker run wall deadline exceeded")
-    if RUN_MODE == "sft" and JOB_SPEC and JOB_SPEC.train.init_from_adapter:
-        raise ValueError(
-            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
-            "SFT adapter continuation is not supported"
-        )
     # Idempotency: check DONE before any env-mutating pip install (fla fast path).
     if HF_REPO:
         from huggingface_hub import hf_hub_download

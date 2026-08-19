@@ -6217,6 +6217,25 @@ def test_sitecustomize_saves_only_exact_required_steps(monkeypatch):
     assert results == [None, None, 3, None, None, None, 7]
 
 
+def test_overrides_point_verl_at_a_warm_start_adapter():
+    """A warm-started OPD run hands verl the staged source adapter.
+
+    OPD shares ``sft_train._warmstart_adapter_path`` with SFT, and this override is what turns the
+    staged directory into a continued LoRA rather than a fresh one. The matching assertions are
+    ``test_overrides_point_verl_at_a_warm_start_adapter`` in tests/test_sft_train.py and
+    ``test_build_verl_overrides_warmstart_adapter_path`` in tests/test_rl_train.py, so all three
+    algorithms are covered on the target side.
+    """
+    fresh = dict(value.split("=", 1) for value in build_opd_overrides(_config()))
+    assert fresh["actor_rollout_ref.model.lora_adapter_path"] == "null"
+
+    warm = dict(
+        value.split("=", 1)
+        for value in build_opd_overrides(_config(lora_adapter_path="/w/source_adapter"))
+    )
+    assert warm["actor_rollout_ref.model.lora_adapter_path"] == "/w/source_adapter"
+
+
 def test_overrides_match_verl_0_8_sync_distillation_contract():
     overrides = dict(value.split("=", 1) for value in build_opd_overrides(_config()))
     assert overrides["distillation._target_"] == "flash_opd_plugin.FlashRemoteDistillationConfig"
