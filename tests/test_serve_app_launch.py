@@ -582,6 +582,11 @@ assert not list(__import__("pathlib").Path({str(cache_root)!r}).glob(".serving-m
 
 
 def test_launcher_does_not_rehydrate_a_present_corrupt_cache(monkeypatch, tmp_path: Path) -> None:
+    # launch.adapter_cache_path is a deferred global: it stays None until the boundaries load, so
+    # reaching through `launch` without this call only works when some earlier test in the same
+    # process happened to load them first. that ordering dependency made this test pass alone and
+    # fail under -n auto, which is the configuration ci runs.
+    launch._load_project_boundaries()
     environment = _environment(tmp_path)
     manifest = _manifest()
     destination = launch.adapter_cache_path(tmp_path / "cache", manifest.adapters[0])
