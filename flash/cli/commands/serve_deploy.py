@@ -25,6 +25,12 @@ RUNPOD_API_KEY_ENV = "RUNPOD_API_KEY"
 # the serving app authenticates callers with this. a provider endpoint url is public, so without
 # it anyone who finds the url can load adapters and spend the customer's gpu budget.
 INFERENCE_KEY_ENV = "FLASH_SERVING_KEY"
+# the container hydrates its adapter from the hub itself, so it needs the same read token the
+# control plane used to resolve that adapter. an artifact repo is private by default, and without
+# this the launcher reaches `_prepare_cache` with nothing to authenticate as and dies with
+# "artifact token is required when serving cache hydration is missing" -- after the provider has
+# already created and started billing for every resource.
+ARTIFACT_TOKEN_ENV = "HF_TOKEN"
 
 
 def _err(message: str) -> int:
@@ -37,6 +43,12 @@ def _required_env(name: str) -> str:
     if not value:
         raise ValueError(f"{name} is not set")
     return value
+
+
+def _optional_env(name: str) -> str | None:
+    """read a token that is genuinely optional, mapping unset and blank alike to absence."""
+
+    return os.environ.get(name, "").strip() or None
 
 
 def _credentials(provider: str):
@@ -161,7 +173,15 @@ def cmd_serve_deploy(args) -> int:
 
     try:
         credentials = _credentials(provider)
-        runtime_secrets = ServingRuntimeSecrets(inference_token=_required_env(INFERENCE_KEY_ENV))
+        # the artifact token is passed rather than omitted whenever the operator has one. it is
+        # optional because a public artifact repo needs none, and the provisioning layer treats
+        # absence as "hydration cannot run": with a token it uses the two-phase bootstrap that
+        # deploys with the secret, hydrates the volume, then redeploys without it and deletes the
+        # secret, so the token never outlives hydration.
+        runtime_secrets = ServingRuntimeSecrets(
+            inference_token=_required_env(INFERENCE_KEY_ENV),
+            artifact_token=_optional_env(ARTIFACT_TOKEN_ENV),
+        )
     except ValueError as exc:
         return _err(
             f"{exc}. provider credentials are read from the environment for this one request "

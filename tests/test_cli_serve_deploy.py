@@ -157,6 +157,52 @@ def test_missing_credentials_fail_before_any_provider_call(
     assert cmd_serve_deploy(_args()) == 1
 
 
+def test_hub_token_reaches_provisioning_so_the_container_can_hydrate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the container hydrates its adapter from the hub itself, and artifact repos are private by
+    # default. the command resolved the adapter with HF_TOKEN and then built the runtime secrets
+    # without it, so every real deployment reached the launcher with no way to authenticate and
+    # died in `_prepare_cache` -- after the provider had created and started billing for the app,
+    # volume, secret, and pod. nothing offline noticed because no test read the secrets the
+    # command actually passed.
+    seen: list[tuple[str, str | None]] = []
+
+    def _capture(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        seen.append(secrets._reveal_for_launch())
+        return _result(bundle)
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
+    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _capture)
+
+    assert cmd_serve_deploy(_args()) == 0
+    assert seen == [("inference-key", "hf-token")]
+
+
+def test_absent_hub_token_stays_absent_rather_than_becoming_an_empty_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # a public artifact repo needs no token, and the provisioning layer reads absence as "skip the
+    # bootstrap phase entirely". a blank string is not absence: `ServingRuntimeSecrets` rejects an
+    # empty artifact token outright, so forwarding one would turn an unset variable into a hard
+    # failure for exactly the deployments that need no token at all.
+    seen: list[tuple[str, str | None]] = []
+
+    def _capture(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        seen.append(secrets._reveal_for_launch())
+        return _result(bundle)
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "   ")
+    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _capture)
+
+    assert cmd_serve_deploy(_args()) == 0
+    assert seen == [("inference-key", None)]
+
+
 def test_credentials_are_never_command_arguments() -> None:
     # a process list and shell history are both readable, so the token must not be expressible as
     # a flag even by mistake.

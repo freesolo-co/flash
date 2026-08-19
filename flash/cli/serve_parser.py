@@ -53,7 +53,10 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction, handler) -> None:
 
     Credentials are deliberately NOT arguments. They are read from the environment for this one
     request and never persisted, so they cannot leak into shell history, a process list, or a
-    durable record.
+    durable record. The command reads ``MODAL_TOKEN_ID``/``MODAL_TOKEN_SECRET`` or
+    ``RUNPOD_API_KEY`` for the provider, ``FLASH_SERVING_KEY`` for the endpoint's own auth, and
+    ``HF_TOKEN`` so the container can hydrate its adapter -- required for a private artifact repo,
+    which is the default.
     """
 
     deploy = serve_sub.add_parser(
