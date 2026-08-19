@@ -1111,10 +1111,12 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
 
 
 def test_gdn_fp8_exclusion_survives_a_pinned_revision():
-    """The GDN fp8 exclusion must key off the model, not off the sizing struct, which pinning nulls.
+    """The GDN fp8 rule must key off the model, not off the sizing struct, which pinning nulls.
 
-    Pinned GDN models still allocate bf16 KV because runtime rejects hybrid fp8 wake; reading only
-    ``sizing_info`` under-reserves them. This exclusion is empirically validated and may drift.
+    A pinned GDN model whose engine SLEEPS still allocates bf16 KV, because runtime rejects hybrid
+    fp8 wake; reading only ``sizing_info`` under-reserves it. A model the catalog pins resident
+    never wakes, so its worker sends fp8 and sizing must price fp8 to match. Either way the
+    invariant is the same: reserve at least what the worker actually allocates.
     """
     import math
     from unittest import mock
@@ -1174,7 +1176,79 @@ def test_gdn_fp8_exclusion_survives_a_pinned_revision():
         pinned = model_required_vram_gb(
             gdn, "opd", train=train, headroom=hr, model_revision="a" * 40
         )
-    assert pinned >= bf16_need
+    # the worker's dtype for this model, resolved by the same rule the worker uses.
+    from flash.engine.worker.verl.capabilities import rollout_fp8_kv
+
+    worker_sends_fp8 = rollout_fp8_kv(True, True, gdn)
+    worker_need = math.ceil(
+        estimate_vram_gb(
+            MODELS[gdn].params_b,
+            "opd",
+            "bf16",
+            seq_len=1024,
+            max_tokens=512,
+            batch_size=1,
+            group_size=16,
+            lora_rank=32,
+            vocab=vocab_size_for(gdn),
+            active_params_b=0.0,
+            fp8_kv=worker_sends_fp8,
+            model_info=None,
+        )
+        * hr
+    )
+    # reserve at least what the worker allocates. bf16_need is the sleeping-engine figure and stays
+    # the bound whenever the worker is bf16; when the catalog pins the engine resident the worker
+    # is fp8, and holding the old bf16 bound would over-reserve a pool nobody allocates.
+    assert pinned >= worker_need
+    assert bf16_need >= worker_need
+
+
+def test_opd_sizing_prices_fp8_for_a_resident_gdn_engine():
+    """OPD sizing must apply the fp8 discount to the models whose worker actually sends fp8.
+
+    ``_opd_fp8_adjust`` used to early-return on any GDN hybrid, which was right while every GDN
+    engine slept. Now that a catalog-pinned resident engine runs fp8, that blanket return reserved a
+    full-width bf16 pool the worker never allocates -- safe, but it inflates the requirement enough
+    to push a run onto extra cards. Sizing and the worker must agree on the dtype.
+
+    Non-GDN and sleeping-GDN models must be untouched, so this pins the blast radius too.
+    """
+    from unittest import mock
+
+    from flash.core.catalog import MODELS
+    from flash.engine.plan import vram as vram_module
+    from flash.engine.plan.vram import _rollout_stays_resident, model_required_vram_gb
+    from flash.engine.worker.verl.capabilities import rollout_fp8_kv
+    from flash.providers.allocator import vram_headroom
+
+    hr = vram_headroom()
+    train = {
+        "max_context_tokens": 8192,
+        "max_completion_tokens": 4096,
+        "prompts_per_step": 8,
+        "group_size": 4,
+        "lora_rank": 32,
+    }
+    resident_gdn = "Qwen/Qwen3.6-35B-A3B"
+    info = MODELS[resident_gdn]
+    assert _rollout_stays_resident(info, resident_gdn), "model must still be the resident case"
+    assert rollout_fp8_kv(True, True, resident_gdn), "worker must still send fp8 for it"
+
+    # the discount must be observable, not a no-op rewrite: compare against the bf16 figure the
+    # blanket early-return used to produce, computed here rather than hardcoded so the test does not
+    # rot when unrelated sizing constants move.
+    need = model_required_vram_gb(resident_gdn, "opd", train=train, headroom=hr)
+    with mock.patch.object(vram_module, "_rollout_stays_resident", return_value=False):
+        bf16_need = model_required_vram_gb(resident_gdn, "opd", train=train, headroom=hr)
+    assert need < bf16_need, (need, bf16_need)
+
+    # blast radius: every model whose engine is NOT pinned resident keeps its old reservation.
+    for model_id in MODELS:
+        if _rollout_stays_resident(MODELS[model_id], model_id):
+            continue
+        # a non-resident model must not pick up the discount; assert sizing still refuses it.
+        assert not rollout_fp8_kv(True, True, model_id), model_id
 
 
 def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
