@@ -1116,3 +1116,66 @@ def test_legacy_warmstart_status_fails_closed_without_private_snapshot():
     status = R.RunStatus(run_id="legacy-child", state="running", spec=public.to_dict())
     with pytest.raises(ValueError, match="original preparation snapshot is unavailable"):
         R.effective_spec_from_status(status, verify_source=True)
+
+
+@pytest.mark.parametrize("source_algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("target_algorithm", ["sft", "grpo", "opd"])
+def test_every_algorithm_pair_prepares_a_warm_start(
+    monkeypatch, source_algorithm, target_algorithm
+):
+    """All nine source/target combinations resolve a warm start identically.
+
+    Warm start never compared the two algorithms; what it had instead was a blanket refusal of SFT
+    as the TARGET, which removed three of the nine cells. This walks the whole matrix so a
+    re-introduced asymmetry -- in either direction -- fails here rather than in a paid run.
+
+    Each cell asserts the two things preparation owes the child regardless of algorithm: it adopts
+    the source's pin (with its provenance, so the child stays deployable), and it reaches artifact
+    resolution instead of stopping at a policy check. The sentinel IS the pass condition, exactly as
+    in the sibling inheritance tests above.
+    """
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": _REVISION,
+            # runner-assigned, which is the pin shape a child must be able to inherit AND deploy.
+            "model_revision_auto": True,
+            "algorithm": source_algorithm,
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = provisioned_status(R, source, state="done")
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": source.model,
+            "algorithm": target_algorithm,
+            "train": {"init_from_adapter": source.run_id},
+        }
+    )
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+
+    inherited = R._inherit_warmstart_revision(child)
+    assert inherited.model_revision == _REVISION
+    # carried, not re-derived: a self-resolved pin reads as author-supplied and deploy refuses it.
+    assert inherited.model_revision_auto is True
+
+    monkeypatch.setattr(
+        "flash.adapters.lora_rank.resolve_hf_dataset_revision",
+        lambda *_a, **_kw: "rev",
+    )
+    monkeypatch.setattr(
+        "flash.runner.results.checkpoints.adapter_artifact_exists",
+        lambda *_a, **_kw: (_ for _ in ()).throw(_ReachedArtifactResolution()),
+        raising=False,
+    )
+
+    # `_inner`, not the public wrapper: the wrapper flattens everything into
+    # WarmStartPreparationError, which would make a real rejection indistinguishable from the
+    # sentinel and let this test pass on the very block it exists to rule out.
+    with pytest.raises(_ReachedArtifactResolution):
+        R._prepare_init_from_adapter_inner(inherited, token="token")
