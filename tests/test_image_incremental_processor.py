@@ -551,3 +551,25 @@ def test_real_processor_proves_incremental_four_image_glue(real_processor, monke
             None,
         )
     assert processor_calls == calls_before_fifth
+
+
+def test_child_glue_image_limits_match_the_parent_normalizer():
+    """The child's copied limits must stay equal to the parent's.
+
+    `glue.py` is source-copied into the verl child, where `flash` is not importable, so it restates
+    the image limits as literals instead of importing them (see its module docstring). that is the
+    right call, but it leaves two independent copies of one contract: raising a cap in
+    `flash.content.multimodal` alone would let the parent normalize and ship an image the child then
+    rejects mid-rollout, and lowering one alone would silently re-validate already-accepted media.
+    nothing else pins the two together, so pin them here.
+    """
+    from flash.engine.worker.train.core.child import glue as child_glue
+
+    assert mm.MAX_IMAGES_PER_EXAMPLE == child_glue._MAX_IMAGES_PER_REPLY
+    assert mm.MAX_IMAGE_SOURCE_BYTES == child_glue._MAX_IMAGE_SOURCE_BYTES
+    assert mm.MAX_TOTAL_IMAGE_SOURCE_BYTES == child_glue._MAX_TOTAL_IMAGE_SOURCE_BYTES
+    assert mm.MAX_IMAGE_WIDTH == child_glue._MAX_IMAGE_WIDTH
+    assert mm.MAX_IMAGE_HEIGHT == child_glue._MAX_IMAGE_HEIGHT
+    assert mm.MAX_IMAGE_PIXELS == child_glue._MAX_IMAGE_PIXELS
+    assert mm.MAX_TOTAL_IMAGE_PIXELS == child_glue._MAX_TOTAL_IMAGE_PIXELS
+    assert mm.MAX_TOTAL_DECODED_BYTES == child_glue._MAX_TOTAL_DECODED_BYTES
