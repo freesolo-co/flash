@@ -66,7 +66,6 @@ def prepare_job(
         owner_key_id=owner_key_id,
     )
     spec = _runner()._resolve_model_revision(spec, required=spec.algorithm == "sft")
-    _runner()._require_supported_adapter_continuation(spec)
     if spec.algorithm == "sft":
         spec = _runner()._require_pinned_profile_environment(spec)
         spec = _runner()._require_sft_workload_profile(spec)
