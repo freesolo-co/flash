@@ -193,6 +193,13 @@ def test_dockerfile_serve_uses_existing_cuda_family_and_frozen_lock() -> None:
     base = next(line for line in worker.splitlines() if line.startswith("FROM "))
 
     assert base in source
+    # The shared base ships /usr/lib/python3.12/EXTERNALLY-MANAGED, so a pip install into the
+    # system interpreter fails with "externally-managed-environment" (PEP 668) unless this is
+    # set. Dockerfile.worker sets it for exactly that reason; Dockerfile.serve did not, and the
+    # image could never build past its uv bootstrap. Nothing in CI builds this image, so only
+    # this assertion keeps the two files' PEP 668 handling from drifting apart again.
+    assert "PIP_BREAK_SYSTEM_PACKAGES=1" in worker
+    assert "PIP_BREAK_SYSTEM_PACKAGES=1" in source
     assert "python -c 'import sys; assert sys.version_info[:2] == (3, 12)'" in source
     assert "uv sync --frozen --no-dev --extra serve-runtime" in source
     assert "COPY serve_launch.py ./serve_launch.py" in source

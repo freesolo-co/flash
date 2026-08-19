@@ -1,8 +1,14 @@
 # immutable flash serving runtime with the repository's existing cuda base family
 FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
 
+# PIP_BREAK_SYSTEM_PACKAGES matches Dockerfile.worker, which shares this base image. The base
+# ships a Debian-style PEP 668 marker (/usr/lib/python3.12/EXTERNALLY-MANAGED), so the pinned-uv
+# bootstrap below fails with "externally-managed-environment" without it and the image never
+# builds. The base already carries an older uv (0.9.26); the bootstrap exists to pin the exact
+# hash-verified version, so it replaces that one rather than installing into a bare environment.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     UV_PROJECT_ENVIRONMENT=/opt/flash-venv \
     PATH=/opt/flash-venv/bin:${PATH}
 
