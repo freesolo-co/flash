@@ -166,6 +166,30 @@ def test_engine_config_loads_served_checkpoint_not_logical_provenance() -> None:
     assert config.model_revision == manifest.engine.model_revision
 
 
+def test_unset_engine_knobs_are_omitted_rather_than_passed_as_none() -> None:
+    """an optional knob left unset must not reach vllm as None.
+
+    vllm types these as literals and validates them, so `kv_cache_dtype=None` raises a
+    CacheConfig ValidationError ("Input should be 'auto', 'float16', ...") instead of meaning
+    "use the default". that killed a live canary at engine construction, after the weights had
+    already downloaded onto the GPU. omitting the key is what "unset" has to mean: vllm's own
+    default for both of these is 'auto'.
+
+    asserted over every optional named arg rather than the one that failed, because the next knob
+    added here would reintroduce the same bug silently.
+    """
+
+    manifest = _manifest()
+    assert manifest.engine.kv_cache_dtype is None, "fixture must leave this knob unset"
+
+    config = engine_config_from_manifest(manifest)
+
+    for name in ("kv_cache_dtype", "quantization", "max_num_batched_tokens"):
+        assert config.engine_args.get(name, "__absent__") is not None, (
+            f"{name} was forwarded to vllm as None; unset knobs must be omitted entirely"
+        )
+
+
 def test_bootstrap_registers_every_revision_before_atomic_publish(
     monkeypatch, tmp_path: Path
 ) -> None:

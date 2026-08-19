@@ -70,16 +70,28 @@ def engine_config_from_manifest(manifest: ServingManifest) -> EngineConfig:
     identity = manifest.engine
     named_args: dict[str, Any] = {
         "dtype": identity.dtype,
-        "quantization": identity.quantization,
-        "kv_cache_dtype": identity.kv_cache_dtype,
         "tensor_parallel_size": identity.tensor_parallel_size,
         "max_model_len": identity.max_model_len,
         "max_num_seqs": identity.max_num_seqs,
         "gpu_memory_utilization": identity.gpu_memory_utilization,
         "cpu_offload_gb": identity.cpu_offload_gb,
     }
-    if identity.max_num_batched_tokens is not None:
-        named_args["max_num_batched_tokens"] = identity.max_num_batched_tokens
+    # an unset knob is omitted, never forwarded as None. vllm types these as literals and
+    # validates them: `kv_cache_dtype=None` fails CacheConfig with "Input should be 'auto',
+    # 'float16', ..." after the weights have already downloaded. omitting the key lets vllm apply
+    # its own default ('auto' for both), which is exactly what "unset" is meant to mean, and
+    # avoids restating a default that is vllm's to choose.
+    named_args.update(
+        {
+            name: value
+            for name, value in (
+                ("quantization", identity.quantization),
+                ("kv_cache_dtype", identity.kv_cache_dtype),
+                ("max_num_batched_tokens", identity.max_num_batched_tokens),
+            )
+            if value is not None
+        }
+    )
     named_args.update(dict(manifest.engine_args))
     return EngineConfig(
         model=identity.served_model,
