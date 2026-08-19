@@ -37,6 +37,9 @@ _COPY_CHUNK_BYTES = 1024 * 1024
 # artifact token only exists during bootstrap, so the weights are pulled into the persistent
 # volume's hub cache while it is still available and every later start reads them from there.
 BASE_WEIGHTS_CACHE_DIRNAME = "hub"
+_DIRECTORY_FLAGS = (
+    getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 class MaterializationError(RuntimeError):
@@ -358,7 +361,13 @@ def _digest_lock(path: Path):
         raise MaterializationError("adapter digest lock could not be opened safely") from exc
     try:
         details = os.fstat(fd)
-        _validate_regular_stat(details, "adapter digest lock")
+        # the lock file lives under the cache root, so its directory decides whether the mode it
+        # was created with can survive at all.
+        _validate_regular_stat(
+            details,
+            "adapter digest lock",
+            enforce_mode=_directory_enforces_permission_bits(path.parent),
+        )
         fcntl.flock(fd, fcntl.LOCK_EX)
         if os.fstat(fd) != details:
             raise MaterializationError("adapter digest lock changed while it was opened")
@@ -377,7 +386,11 @@ def _prepare_cache_root(cache_root: str | os.PathLike[str]) -> Path:
     directory_fd = os.open("/", flags)
     current = Path("/")
     try:
-        _validate_cache_ancestor_stat(os.fstat(directory_fd), "cache ancestor /")
+        _validate_cache_ancestor_stat(
+            os.fstat(directory_fd),
+            "cache ancestor /",
+            directory_fd=directory_fd,
+        )
         for part in root.parts[1:]:
             try:
                 child_fd = os.open(part, flags, dir_fd=directory_fd)
@@ -402,17 +415,25 @@ def _prepare_cache_root(cache_root: str | os.PathLike[str]) -> Path:
             _validate_cache_ancestor_stat(
                 os.fstat(directory_fd),
                 f"cache ancestor {current}",
+                directory_fd=directory_fd,
             )
         root_details = os.fstat(directory_fd)
-        _validate_trusted_directory_stat(root_details, "cache root")
+        enforce_mode = _permission_bits_are_enforceable(directory_fd)
+        _validate_trusted_directory_stat(root_details, "cache root", enforce_mode=enforce_mode)
         for name in ("adapters", ".locks", ".hf-cache"):
-            _ensure_trusted_child_directory(directory_fd, name, flags)
+            _ensure_trusted_child_directory(directory_fd, name, flags, enforce_mode=enforce_mode)
     finally:
         os.close(directory_fd)
     return root
 
 
-def _ensure_trusted_child_directory(parent_fd: int, name: str, flags: int) -> None:
+def _ensure_trusted_child_directory(
+    parent_fd: int,
+    name: str,
+    flags: int,
+    *,
+    enforce_mode: bool = True,
+) -> None:
     try:
         child_fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError as exc:
@@ -431,12 +452,21 @@ def _ensure_trusted_child_directory(parent_fd: int, name: str, flags: int) -> No
         except OSError as open_exc:
             raise MaterializationError("cache directory is unsafe") from open_exc
     try:
-        _validate_trusted_directory_stat(os.fstat(child_fd), f"cache directory {name}")
+        _validate_trusted_directory_stat(
+            os.fstat(child_fd),
+            f"cache directory {name}",
+            enforce_mode=enforce_mode,
+        )
     finally:
         os.close(child_fd)
 
 
-def _validate_cache_ancestor_stat(details: os.stat_result, name: str) -> None:
+def _validate_cache_ancestor_stat(
+    details: os.stat_result,
+    name: str,
+    *,
+    directory_fd: int | None = None,
+) -> None:
     if not stat.S_ISDIR(details.st_mode):
         raise MaterializationError(f"{name} is not a directory")
     owner = details.st_uid
@@ -450,32 +480,106 @@ def _validate_cache_ancestor_stat(details: os.stat_result, name: str) -> None:
     #
     # only root can have created or replaced an entry in a root-owned directory tree, and the cache
     # root and every directory and file inside it still go through _validate_trusted_directory_stat
-    # and _validate_regular_stat, which require our own uid and reject any group or world write bit.
-    # so the traversal below cannot be redirected by an unprivileged user either way; what the
-    # sticky bit adds here is only a restriction between non-root users, none of which own any part
-    # of this path.
+    # and _validate_regular_stat, which require our own uid. so the traversal below cannot be
+    # redirected by an unprivileged user; what the sticky bit adds here is only a restriction
+    # between non-root users, none of which own any part of this path.
+    #
+    # the mode half of those inner checks is conditional -- see _permission_bits_are_enforceable.
+    # on a filesystem that cannot store modes it is skipped, because it could never pass there. the
+    # integrity that actually protects the payload is content-addressed rather than mode-based:
+    # every adapter file is verified against the manifest's sha256 with a before/after identity
+    # check around the read, and base weights resolve through the hub's own digest-named cache.
     root_shared = owner == 0
     if owner not in {0, os.getuid()}:
         raise MaterializationError(f"{name} is owned by an untrusted uid")
-    if writable and not root_shared:
-        raise MaterializationError(f"{name} is group or world writable")
+    if not writable or root_shared:
+        return
+    # the ancestor is ours and reads as writable. that is a real finding on a filesystem that stores
+    # modes, and unsatisfiable on one that does not -- the same distinction the inner checks make.
+    # probe only here, at the point of rejection, so the common path costs no syscalls: a mount that
+    # cannot express a mode reports one it never agreed to, and we would otherwise reject a
+    # deployment for a bit the kernel invented. a deployment running as non-root on such a mount
+    # sees this before it ever reaches the cache root's own check.
+    if directory_fd is not None and not _permission_bits_are_enforceable(directory_fd):
+        return
+    raise MaterializationError(f"{name} is group or world writable")
 
 
-def _validate_trusted_directory_stat(details: os.stat_result, name: str) -> None:
+def _permission_bits_are_enforceable(directory_fd: int) -> bool:
+    """report whether this filesystem can actually express a mode, by setting one and reading back.
+
+    the mode check below is a real defence on a filesystem that stores modes, and meaningless noise
+    on one that does not. rather than carve out a provider by name, ask the filesystem: create a
+    private directory, and see whether the bits survive.
+
+    runpod mounts its network volume from moosefs over fuse, which reports a fixed 0777 for every
+    directory and 0666 for every file. `mkdir -m 700` reads back as 777 and an explicit `chmod 700`
+    reads back as 777 (both measured on a live pod), so a mode assertion there can never be
+    satisfied -- it rejected every runpod deployment about two seconds into startup, forever.
+
+    this is deliberately a capability probe rather than a filesystem-type check: a `/proc/mounts`
+    match would go stale the moment a provider changes storage, and would answer a question about
+    naming rather than the one that matters.
+    """
+
+    probe = f".flash-mode-probe-{os.getpid()}"
+    with contextlib.suppress(OSError):
+        os.rmdir(probe, dir_fd=directory_fd)
+    try:
+        os.mkdir(probe, mode=0o700, dir_fd=directory_fd)
+    except OSError:
+        # cannot tell, so assume the strict reading: an unwritable directory fails elsewhere anyway.
+        return True
+    try:
+        probe_fd = os.open(probe, os.O_RDONLY | _DIRECTORY_FLAGS, dir_fd=directory_fd)
+    except OSError:
+        return True
+    try:
+        return not (os.fstat(probe_fd).st_mode & 0o022)
+    finally:
+        os.close(probe_fd)
+        with contextlib.suppress(OSError):
+            os.rmdir(probe, dir_fd=directory_fd)
+
+
+def _directory_enforces_permission_bits(directory: Path) -> bool:
+    """probe a directory by path rather than by descriptor, for callers that only hold a path."""
+
+    try:
+        directory_fd = os.open(directory, os.O_RDONLY | _DIRECTORY_FLAGS)
+    except OSError:
+        return True
+    try:
+        return _permission_bits_are_enforceable(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _validate_trusted_directory_stat(
+    details: os.stat_result,
+    name: str,
+    *,
+    enforce_mode: bool = True,
+) -> None:
     if not stat.S_ISDIR(details.st_mode):
         raise MaterializationError(f"{name} is not a directory")
     if details.st_uid != os.getuid():
         raise MaterializationError(f"{name} is not owned by the current uid")
-    if details.st_mode & 0o022:
+    if enforce_mode and details.st_mode & 0o022:
         raise MaterializationError(f"{name} is group or world writable")
 
 
-def _validate_regular_stat(details: os.stat_result, name: str) -> None:
+def _validate_regular_stat(
+    details: os.stat_result,
+    name: str,
+    *,
+    enforce_mode: bool = True,
+) -> None:
     if not stat.S_ISREG(details.st_mode):
         raise MaterializationError(f"{name} is not a regular file")
     if details.st_uid != os.getuid():
         raise MaterializationError(f"{name} is not owned by the current uid")
-    if details.st_mode & 0o022:
+    if enforce_mode and details.st_mode & 0o022:
         raise MaterializationError(f"{name} is group or world writable")
     if details.st_nlink != 1:
         raise MaterializationError(f"{name} must have exactly one hard link")
@@ -546,7 +650,16 @@ def _read_exact_regular_files(
         raise MaterializationError("adapter cache entry is not a safe directory") from exc
     try:
         directory_stat = os.fstat(directory_fd)
-        _validate_trusted_directory_stat(directory_stat, "adapter cache entry")
+        # probe the PARENT, not this directory: the entry's exact file set and mtime are both
+        # verified below, and a probe creates and removes a child, so probing here would change
+        # the thing under verification. the parent is the same filesystem, which is all the probe
+        # is asking about.
+        enforce_mode = _directory_enforces_permission_bits(directory.parent)
+        _validate_trusted_directory_stat(
+            directory_stat,
+            "adapter cache entry",
+            enforce_mode=enforce_mode,
+        )
         expected = {entry.path: entry for entry in declarations}
         try:
             names = set(os.listdir(directory_fd))
@@ -557,7 +670,11 @@ def _read_exact_regular_files(
         snapshots: list[object] = [_stable_directory_identity(directory_stat)]
         contents: dict[str, bytes] = {}
         for declaration in declarations:
-            snapshot, content = _read_declared_file(directory_fd, declaration)
+            snapshot, content = _read_declared_file(
+                directory_fd,
+                declaration,
+                enforce_mode=enforce_mode,
+            )
             snapshots.append(snapshot)
             if content is not None:
                 contents[declaration.path] = content
@@ -571,6 +688,8 @@ def _read_exact_regular_files(
 def _read_declared_file(
     directory_fd: int,
     declaration: ArtifactFile,
+    *,
+    enforce_mode: bool = True,
 ) -> tuple[tuple[object, ...], bytes | None]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -579,7 +698,7 @@ def _read_declared_file(
         raise MaterializationError("adapter cache file could not be opened safely") from exc
     try:
         before = os.fstat(fd)
-        _validate_regular_stat(before, "adapter cache file")
+        _validate_regular_stat(before, "adapter cache file", enforce_mode=enforce_mode)
         if before.st_size != declaration.size:
             raise MaterializationError("adapter cache file size does not match the manifest")
         digest = hashlib.sha256()
@@ -726,7 +845,11 @@ def _directory_identity(path: Path) -> tuple[int, int]:
         details = os.lstat(path)
     except OSError as exc:
         raise MaterializationError("cache directory could not be inspected safely") from exc
-    _validate_trusted_directory_stat(details, "cache directory")
+    _validate_trusted_directory_stat(
+        details,
+        "cache directory",
+        enforce_mode=_directory_enforces_permission_bits(path),
+    )
     return details.st_dev, details.st_ino
 
 

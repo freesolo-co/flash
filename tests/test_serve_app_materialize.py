@@ -372,6 +372,115 @@ def test_cache_rejects_symlinked_parent_and_unsafe_mode(tmp_path: Path) -> None:
         validate_manifest_cache(manifest, cache)
 
 
+def _simulate_modeless_filesystem(monkeypatch, root: Path) -> None:
+    """make every path under root read back as 0777/0666 no matter what mode it was created with.
+
+    this is what runpod's moosefs volume does: `mkdir -m 700` and an explicit `chmod 700` both read
+    back as 777, and files read back as 666 (measured on a live pod). a mocked stat_result cannot
+    exercise this, because the behaviour under test is the interaction between creating a file and
+    reading its mode back -- so patch at the syscall boundary and let the real code run.
+    """
+
+    real_stat = os.stat
+    real_fstat = os.fstat
+    real_lstat = os.lstat
+    # compare as plain strings. Path.resolve() calls os.stat, which is the function being patched,
+    # so using it inside the wrapper recurses until the stack runs out.
+    root_prefix = os.path.abspath(root)
+
+    def _force_shared_mode(details: os.stat_result) -> os.stat_result:
+        fields = list(details)
+        if stat.S_ISDIR(details.st_mode):
+            fields[0] = stat.S_IFDIR | 0o777
+        elif stat.S_ISREG(details.st_mode):
+            fields[0] = stat.S_IFREG | 0o666
+        return os.stat_result(tuple(fields))
+
+    def _under_root(path: object) -> bool:
+        # only the cache root and its contents live on the simulated volume. the ancestors above it
+        # are the test machine's own filesystem, and forcing 0777 onto those would trip the
+        # ancestor gate instead -- a different check, guarding a different thing.
+        if isinstance(path, int):
+            return _fd_under_root(path)
+        try:
+            return os.path.abspath(os.fsdecode(path)).startswith(root_prefix)
+        except (TypeError, ValueError):
+            return False
+
+    def _fd_under_root(fd: int) -> bool:
+        # resolve the descriptor back to a path through procfs, so an fd opened on an ancestor is
+        # not mistaken for one inside the cache tree.
+        try:
+            return os.readlink(f"/proc/self/fd/{fd}").startswith(root_prefix)
+        except OSError:
+            return False
+
+    def _patched(real):
+        def wrapper(path, *args, **kwargs):
+            details = real(path, *args, **kwargs)
+            dir_fd = kwargs.get("dir_fd")
+            inside = _fd_under_root(dir_fd) if dir_fd is not None else _under_root(path)
+            return _force_shared_mode(details) if inside else details
+
+        return wrapper
+
+    def _patched_fstat(fd: int) -> os.stat_result:
+        details = real_fstat(fd)
+        return _force_shared_mode(details) if _fd_under_root(fd) else details
+
+    monkeypatch.setattr(os, "stat", _patched(real_stat))
+    monkeypatch.setattr(os, "lstat", _patched(real_lstat))
+    monkeypatch.setattr(os, "fstat", _patched_fstat)
+
+
+def test_hydration_survives_a_filesystem_that_cannot_store_modes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # runpod mounts its network volume from moosefs, which reports a fixed 0777 for directories and
+    # 0666 for files and silently discards chmod. the mode assertion can therefore NEVER be
+    # satisfied there, and it rejected every runpod deployment about two seconds into startup --
+    # a permanent restart loop that externally looks like a slow image pull.
+    #
+    # the payload's integrity does not rest on the mode bit: every adapter file is verified against
+    # the manifest's sha256 with a before/after identity check around the read.
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "modeless-cache"
+    cache.mkdir()
+    _simulate_modeless_filesystem(monkeypatch, cache)
+
+    paths = hydrate_manifest(
+        manifest,
+        cache,
+        token_fd=_token_fd(),
+        snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+    )
+
+    assert paths
+    # and a later start must revalidate from that same cache rather than failing the gate.
+    validate_manifest_cache(manifest, cache)
+
+
+def test_mode_check_still_bites_where_modes_are_honoured(tmp_path: Path) -> None:
+    # the probe must not become a blanket amnesty: on a filesystem that does store modes, a
+    # group-writable cache root is still a real finding and still has to be rejected. without this,
+    # the modeless carve-out above would silently disable the check everywhere.
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "honoured-cache"
+    hydrate_manifest(
+        manifest,
+        cache,
+        token_fd=_token_fd(),
+        snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+    )
+
+    cache.chmod(0o770)
+    with pytest.raises(MaterializationError, match="group or world writable"):
+        validate_manifest_cache(manifest, cache)
+
+
 def test_cache_rejects_hardlinked_materialized_files(tmp_path: Path) -> None:
     config_bytes, weights_bytes = _artifact_bytes(tmp_path)
     manifest = _manifest(config_bytes, weights_bytes)
