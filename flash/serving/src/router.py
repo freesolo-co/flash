@@ -9,18 +9,34 @@ imports, so the routing layer is unit-testable offline against a fake pool.
 import contextlib
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any, Protocol
+from typing import Any
 
-from flash.serving.src.model_config import (
-    base_models,
-    gpu_for,
-    image_limit_for,
-    is_supported_base_model,
-    supports_image_input,
+from flash.serving.src.http_headers import _bearer_token
+from flash.serving.src.model_config import gpu_for, is_supported_base_model
+from flash.serving.src.responses import (
+    _openai_structured_outputs,
+    _ReasoningStreamSplitter,
+    _split_reasoning,
+    _usage_block,
 )
-from flash.serving.src.multimodal import MultimodalRequestError, validate_multimodal_request
-from flash.serving.src.registry import AdapterRegistry
+from flash.serving.src.routing import AdapterRouter, EnginePool
 from flash.serving.src.schemas import AdapterRecord, internal_adapter_payload
+from flash.serving.src.serving_io import (
+    _active_checkpoint_ref,
+    _assert_supported_base_model,
+    _expected_checkpoint,
+    _get_stored,
+    _inference_json_response,
+    _insert_or_read,
+    _parse_generate,
+    _prepare_generate_request,
+    _provenance_headers,
+    _replace_stored_cas,
+    _revision_provenance,
+    _sse,
+    _validate_alias,
+    _validate_alias_target,
+)
 from flash.serving.src.structured_outputs import StructuredOutputsError
 
 _FLASH_CHECKPOINT_MODEL_RE = re.compile(
@@ -29,29 +45,6 @@ _FLASH_CHECKPOINT_MODEL_RE = re.compile(
 THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 _USAGE_REPORT_DRAIN_TIMEOUT_SECONDS = 45.0
 
-_THINK_CLOSE = "</think>"
-
-
-# Response shaping (reasoning split, streaming splitter, usage block, response_format ->
-# structured outputs) lives in responses.py. Re-exported because the FastAPI handlers below
-# and the existing tests both reference these names unqualified.
-from flash.serving.src.responses import (  # noqa: E402
-    _ReasoningStreamSplitter,
-    _openai_structured_outputs,
-    _partial_tag_suffix,
-    _response_format_to_spec,
-    _split_reasoning,
-    _THINK_CLOSE,
-    _usage_block,
-)
-
-# Routing state (EnginePool protocol, AdapterRouter) lives in routing.py; re-exported because the
-# handlers below and the tests reference these names unqualified.
-from flash.serving.src.http_headers import (  # noqa: E402
-    _bearer_token,
-    _checkpoint_headers,
-)
-from flash.serving.src.routing import AdapterRouter, EnginePool  # noqa: E402
 
 def build_serving_app(
     pool: EnginePool,
@@ -93,10 +86,8 @@ def build_serving_app(
     import uuid
     from contextlib import asynccontextmanager
 
-    import orjson
     from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
     from fastapi.responses import JSONResponse, StreamingResponse
-    from pydantic import ValidationError
 
     from flash.serving.src.persistence import PersistenceRecordError
     from flash.serving.src.schemas import (
@@ -159,13 +150,6 @@ def build_serving_app(
         title="Freesolo LoRA Serving (multi base model)", version="0.2.0", lifespan=_lifespan
     )
 
-    def _parse_generate(data: dict[str, Any]) -> GenerateRequest:
-        # Untyped dict body -> surface a bad shape as 422, not 500.
-        try:
-            return GenerateRequest.model_validate(data)
-        except ValidationError as exc:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-
     last_reload: dict[str, Any] = {"at": float("-inf"), "task": None}
     # Strong refs to fire-and-forget streaming usage tasks. asyncio only keeps a WEAK reference to
     # a bare create_task(), so without this the GC can collect a still-pending billing report mid
@@ -197,15 +181,6 @@ def build_serving_app(
         # generator short-circuits, which is the timing leak. The list is load-bearing.
         return any([hmac.compare_digest(presented, k) for k in _trusted_internal_keys])  # noqa: C419
 
-    def _assert_supported_base_model(base_model: str) -> None:
-        if is_supported_base_model(base_model):
-            return
-        allowed = ", ".join(base_models())
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"Unsupported base model: {base_model}. Supported base models: {allowed}",
-        )
-
     async def _authorize_inference(request: Request, adapter_id: str) -> "str | None":
         """Gate every chat/inference request on a Freesolo API key, and resolve its billing org.
 
@@ -229,65 +204,6 @@ def build_serving_app(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is not configured"
             )
         return await chat_authorizer(token, adapter_id)
-
-    def _active_checkpoint_ref(record: AdapterRecord) -> str:
-        checkpoint = (record.checkpoint or "").strip()
-        if checkpoint:
-            return checkpoint
-        subfolder = (record.subfolder or "").strip().strip("/")
-        if not subfolder:
-            return ""
-        match = re.search(r"(?:^|/)checkpoints/(step-\d+)(?:/|$)", subfolder)
-        if match:
-            return f"{record.adapter_id}/{match.group(1)}"
-        return record.adapter_id
-
-    def _revision_provenance(
-        target: AdapterRecord, active_checkpoint: Any
-    ) -> dict[str, str] | None:
-        # immutable-revision provenance the deploy handshake verifies and external clients read to
-        # confirm which revision answered. only concrete revisions carry it; base-model serving and
-        # records missing a revision id, hub sha, or checkpoint do not.
-        if not target.is_revision:
-            return None
-        adapter_revision = (target.adapter_id or "").strip()
-        hf_revision = (target.hf_revision or "").strip()
-        checkpoint = str(active_checkpoint or "").strip()
-        if not adapter_revision or not hf_revision or not checkpoint:
-            return None
-        return {
-            "adapter_revision": adapter_revision,
-            "checkpoint": checkpoint,
-            "hf_revision": hf_revision,
-        }
-
-    def _provenance_headers(
-        provenance: dict[str, str] | None, active_checkpoint: Any
-    ) -> dict[str, str]:
-        # full revision provenance headers for a revision, else the checkpoint-only header for
-        # base-model and unresolved records (unchanged behaviour).
-        if provenance is None:
-            return _checkpoint_headers(active_checkpoint)
-        return {
-            "X-Freesolo-Adapter-Revision": provenance["adapter_revision"],
-            "X-Freesolo-Checkpoint": provenance["checkpoint"],
-            "X-Freesolo-HF-Revision": provenance["hf_revision"],
-        }
-
-    def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> JSONResponse:
-        # attach revision provenance while keeping engine-process attribution internal to metering.
-        active_checkpoint = result.get("checkpoint")
-        provenance = _revision_provenance(target, active_checkpoint)
-        internal_fields = {"cached_tokens_reported", "engine_replica_id"}
-        public_result = {key: value for key, value in result.items() if key not in internal_fields}
-        body = (
-            {**public_result, "freesolo": provenance} if provenance is not None else public_result
-        )
-        return JSONResponse(body, headers=_provenance_headers(provenance, active_checkpoint))
-
-    def _expected_checkpoint(request: Request) -> str | None:
-        value = request.headers.get("X-Freesolo-Expected-Checkpoint")
-        return value.strip() if value is not None else None
 
     def _value_error_http(adapter_id: str, exc: ValueError) -> HTTPException:
         message = str(exc)
@@ -375,105 +291,6 @@ def build_serving_app(
             if failure is None:
                 raise
             yield {"type": "error", "message": str(failure.detail), "code": failure.status_code}
-
-    async def _get_stored(adapter_id: str) -> AdapterRecord | None:
-        from flash.serving.src.persistence import PersistenceRecordError, get_adapter
-        from flash.serving.src.settings import get_settings
-
-        try:
-            return await asyncio.to_thread(get_adapter, adapter_id, get_settings())
-        except PersistenceRecordError:
-            raise
-        except Exception as exc:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "adapter storage is unavailable"
-            ) from exc
-
-    async def _insert_stored(record: AdapterRecord) -> AdapterRecord:
-        from flash.serving.src.persistence import insert_adapter
-        from flash.serving.src.settings import get_settings
-
-        try:
-            return await asyncio.to_thread(insert_adapter, record, get_settings())
-        except Exception as exc:
-            from flash.serving.src.persistence import PersistenceConflict, PersistenceReferenceError
-
-            if isinstance(exc, PersistenceConflict):
-                raise
-            if isinstance(exc, PersistenceReferenceError):
-                # a dangling reference is permanent, not an outage: report it as the caller's
-                # unprocessable request so the client fails fast on the real cause instead of
-                # retrying an unregistrable adapter against a 503.
-                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "adapter storage is unavailable"
-            ) from exc
-
-    async def _insert_or_read(record: AdapterRecord) -> tuple[AdapterRecord, bool]:
-        from flash.serving.src.persistence import PersistenceConflict
-
-        try:
-            return await _insert_stored(record), True
-        except PersistenceConflict as exc:
-            winner = await _get_stored(record.adapter_id)
-            if winner is None:
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "adapter registration conflict could not be confirmed",
-                ) from exc
-            return winner, False
-
-    async def _replace_stored_cas(
-        record: AdapterRecord, *, expected_updated_at: str
-    ) -> AdapterRecord | None:
-        from flash.serving.src.persistence import replace_adapter_cas
-        from flash.serving.src.settings import get_settings
-
-        try:
-            return await asyncio.to_thread(
-                replace_adapter_cas,
-                record,
-                expected_updated_at=expected_updated_at,
-                settings=get_settings(),
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "adapter storage is unavailable"
-            ) from exc
-
-    def _validate_alias(alias: AdapterRecord, revision: AdapterRecord) -> None:
-        if alias.org_id != revision.org_id:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown adapter id")
-        if (
-            not alias.is_alias
-            or alias.adapter_id != revision.run_id
-            or alias.run_id != revision.run_id
-            or alias.base_model != revision.base_model
-        ):
-            raise HTTPException(status.HTTP_409_CONFLICT, "run alias namespace is occupied")
-
-    async def _validate_alias_target(
-        alias: AdapterRecord, *, allow_missing: str | None = None
-    ) -> AdapterRecord | None:
-        alias_of = alias.alias_of
-        if alias_of is None:
-            raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid")
-        try:
-            target = await _get_stored(alias_of)
-        except PersistenceRecordError as exc:
-            raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid") from exc
-        if target is None:
-            if alias.status == "disabled" and alias_of == allow_missing:
-                return None
-            raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid")
-        if (
-            not target.is_revision
-            or target.org_id != alias.org_id
-            or target.base_model != alias.base_model
-            or target.run_id != alias.run_id
-        ):
-            raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid")
-        return target
 
     async def _reload() -> None:
         # to_thread: reload_records is a sync Supabase call; don't block the event loop.
@@ -978,25 +795,6 @@ def build_serving_app(
         _pending_tasks.add(task)
         task.add_done_callback(_pending_tasks.discard)
 
-    async def _prepare_generate_request(payload: Any, target: AdapterRecord) -> None:
-        messages = getattr(payload, "messages", None)
-        # validate whenever any message uses list-form content so unsupported blocks
-        # (e.g. video) are rejected before dispatch; plain string-content requests still bypass.
-        if not isinstance(messages, list) or not any(
-            isinstance(message, dict) and isinstance(message.get("content"), list)
-            for message in messages
-        ):
-            return
-        try:
-            await asyncio.to_thread(
-                validate_multimodal_request,
-                messages,
-                supports_images=supports_image_input(target.base_model),
-                image_limit=image_limit_for(target.base_model),
-            )
-        except MultimodalRequestError as exc:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-
     async def _generate(
         payload: Any,
         requested: AdapterRecord,
@@ -1019,10 +817,6 @@ def build_serving_app(
             result = {**result, "adapter_id": requested.adapter_id}
         _schedule_usage(requested, result, caller_org)
         return result
-
-    def _sse(data: dict[str, Any] | str) -> bytes:
-        encoded = data.encode("utf-8") if isinstance(data, str) else orjson.dumps(data)
-        return b"data: " + encoded + b"\n\n"
 
     async def _openai_chat_stream(
         *,

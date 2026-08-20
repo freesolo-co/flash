@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from PIL import Image, ImageOps
 
 from flash.serving.src import multimodal
-from flash.serving.src import router as router_module
+from flash.serving.src import serving_io as serving_io_module
 from flash.serving.src.lora_engine import _LoraEngineImpl, _num_prompt_tokens
 from flash.serving.src.multimodal import (
     MultimodalRequestError,
@@ -784,9 +784,9 @@ def test_text_only_tool_history_skips_multimodal_validation(monkeypatch) -> None
     def unexpected_multimodal_work(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("text-only requests must not enter multimodal validation")
 
-    monkeypatch.setattr(router_module, "validate_multimodal_request", unexpected_multimodal_work)
-    monkeypatch.setattr(router_module, "supports_image_input", unexpected_multimodal_work)
-    monkeypatch.setattr(router_module, "image_limit_for", unexpected_multimodal_work)
+    monkeypatch.setattr(serving_io_module, "validate_multimodal_request", unexpected_multimodal_work)
+    monkeypatch.setattr(serving_io_module, "supports_image_input", unexpected_multimodal_work)
+    monkeypatch.setattr(serving_io_module, "image_limit_for", unexpected_multimodal_work)
     client, pool = _client(QWEN_2B)
     response = client.post(
         "/v1/chat/completions",
@@ -833,9 +833,9 @@ def test_all_message_entry_points_validate_against_resolved_model(
     validated: list[dict[str, Any]] = []
     supports_args: list[str] = []
     limit_args: list[str] = []
-    real_validate = router_module.validate_multimodal_request
-    real_supports = router_module.supports_image_input
-    real_limit = router_module.image_limit_for
+    real_validate = serving_io_module.validate_multimodal_request
+    real_supports = serving_io_module.supports_image_input
+    real_limit = serving_io_module.image_limit_for
 
     def spy_validate(messages: Any, **kwargs: Any) -> None:
         validated.append(kwargs)
@@ -849,9 +849,9 @@ def test_all_message_entry_points_validate_against_resolved_model(
         limit_args.append(base_model)
         return real_limit(base_model)
 
-    monkeypatch.setattr(router_module, "validate_multimodal_request", spy_validate)
-    monkeypatch.setattr(router_module, "supports_image_input", spy_supports)
-    monkeypatch.setattr(router_module, "image_limit_for", spy_limit)
+    monkeypatch.setattr(serving_io_module, "validate_multimodal_request", spy_validate)
+    monkeypatch.setattr(serving_io_module, "supports_image_input", spy_supports)
+    monkeypatch.setattr(serving_io_module, "image_limit_for", spy_limit)
     client, pool = _client(QWEN_2B)
     response = client.post(path, json=body)
 

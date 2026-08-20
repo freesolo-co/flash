@@ -15,13 +15,12 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import (
-    AdapterRouter,
+from flash.serving.src.responses import (
     _openai_structured_outputs,
     _response_format_to_spec,
     _usage_block,
-    build_serving_app,
 )
+from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
 from flash.serving.src.structured_outputs import StructuredOutputsError
 
