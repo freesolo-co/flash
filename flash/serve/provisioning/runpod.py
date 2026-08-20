@@ -159,7 +159,9 @@ def _observe(
     )
     templates = _read_call(
         lambda: transport.rest("GET", "/templates", None, mutation=False, deadline_at=deadline_at),
-        parse_templates,
+        # only flash's own template is parsed strictly; foreign rows in the customer's account may
+        # omit fields this parser requires and must not fail the whole observation.
+        lambda raw: parse_templates(raw, keep_name=plan.names.template),
     )
     volumes = _read_call(
         lambda: transport.rest(
@@ -194,7 +196,7 @@ def _observe(
             item for item in secrets if item.name == plan.names.inference_secret
         ),
         artifact_secrets=tuple(item for item in secrets if item.name == plan.names.artifact_secret),
-        templates=tuple(item for item in templates if item.name == plan.names.template),
+        templates=templates,
         volumes=tuple(item for item in volumes if item.name == plan.names.volume),
         pods=tuple(item for item in pods if item.name == plan.names.app_or_pod),
     )

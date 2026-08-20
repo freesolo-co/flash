@@ -61,7 +61,10 @@ class ServingBootstrap:
         await self.runtime.close()
 
 
-RuntimeFactory = Callable[[EngineConfig], VllmLoraRuntime]
+# the factory is called with the engine config, and with `on_engine_death` too when the caller
+# supplied one, so it cannot be pinned to a single-argument signature.
+RuntimeFactory = Callable[..., VllmLoraRuntime]
+EngineDeathHandler = Callable[[Any], Any]
 
 
 def engine_config_from_manifest(manifest: ServingManifest) -> EngineConfig:
@@ -118,10 +121,22 @@ async def bootstrap_serving(
     cache_root: str | Path,
     *,
     runtime_factory: RuntimeFactory = VllmLoraRuntime,
+    on_engine_death: EngineDeathHandler | None = None,
 ) -> ServingBootstrap:
-    """revalidate all data, register all adapters, then publish readiness once."""
+    """revalidate all data, register all adapters, then publish readiness once.
 
-    runtime = runtime_factory(engine_config_from_manifest(manifest))
+    `on_engine_death` is forwarded to the runtime so a dead vllm engine core can take the
+    container down with it. without a handler the runtime only records the death and the http
+    process stays bound, answering 503 forever, and neither the modal container nor the runpod
+    pod is ever replaced.
+    """
+
+    config = engine_config_from_manifest(manifest)
+    runtime = (
+        runtime_factory(config)
+        if on_engine_death is None
+        else runtime_factory(config, on_engine_death=on_engine_death)
+    )
     owner = ServingBootstrap(manifest, runtime)
     try:
         with locked_manifest_cache(manifest, cache_root) as paths:

@@ -80,7 +80,30 @@ async def _serve(
         bearer_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
     finally:
         token = ""
-    owner = await bootstrap_serving(manifest, args.cache_root)
+    server: uvicorn.Server | None = None
+
+    async def _exit_on_engine_death(_health: object) -> None:
+        """stop serving once the vllm engine core dies.
+
+        a dead engine core cannot be repaired in place. without this the http process stays bound
+        and answers 503 for every later request, so neither modal nor runpod ever replaces the
+        container. asking uvicorn to exit drains in-flight requests and ends the process, which
+        both providers treat as a container to restart.
+        """
+
+        print(
+            "serving: vllm engine core is dead; shutting down so the provider replaces this "
+            "container",
+            flush=True,
+        )
+        if server is not None:
+            server.should_exit = True
+        else:
+            os._exit(1)
+
+    owner = await bootstrap_serving(
+        manifest, args.cache_root, on_engine_death=_exit_on_engine_death
+    )
     try:
         app = create_app(owner, bearer_digest=bearer_digest)
         config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")

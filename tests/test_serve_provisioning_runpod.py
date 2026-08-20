@@ -1597,6 +1597,50 @@ def test_template_observation_reads_argv_and_omitted_defaults() -> None:
             )
 
 
+def test_foreign_templates_are_filtered_before_strict_parsing() -> None:
+    # the customer's account holds templates flash did not create. those rows legitimately omit
+    # dockerStartCmd (they use the image default) and env (no overrides), which the strict field
+    # parsing rejects. parsing every row meant one unrelated template failed the whole
+    # observation with transport_failed and blocked deployments with no conflicting resource.
+    foreign = {
+        "id": "tpl0000123",
+        "name": "someone-elses-template",
+        "imageName": "nginx:latest",
+        "dockerStartCmd": None,
+        "containerDiskInGb": 5,
+        "volumeMountPath": "/workspace",
+        "ports": None,
+        "env": None,
+    }
+    ours = {
+        "id": "tpl0000124",
+        "name": "flash-owned-tpl",
+        "imageName": "img:1",
+        "dockerStartCmd": ["python", "-m", "flash.serve.app"],
+        "containerDiskInGb": 300,
+        "volumeMountPath": "/workspace",
+        "ports": ["8000/http"],
+        "env": {"A": "1"},
+    }
+
+    # unfiltered, the foreign row still fails -- the strictness is intact.
+    with pytest.raises(ValueError, match="dockerStartCmd"):
+        parse_templates([foreign, ours])
+
+    kept = parse_templates([foreign, ours], keep_name="flash-owned-tpl")
+    assert [item.name for item in kept] == ["flash-owned-tpl"]
+    assert kept[0].docker_start_cmd == "python -m flash.serve.app"
+
+    # an account with only foreign templates observes no flash template rather than failing.
+    assert parse_templates([foreign], keep_name="flash-owned-tpl") == ()
+
+    # filtering must not weaken validation of flash's own row: a malformed template that carries
+    # the kept name is still rejected.
+    broken_ours = dict(ours, dockerStartCmd=None)
+    with pytest.raises(ValueError, match="dockerStartCmd"):
+        parse_templates([broken_ours], keep_name="flash-owned-tpl")
+
+
 class _InterruptingProbe:
     """Ctrl-C while polling a slow pod, which is when a user is most likely to press it."""
 

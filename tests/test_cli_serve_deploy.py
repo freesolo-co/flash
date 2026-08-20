@@ -208,6 +208,68 @@ def test_absent_hub_token_stays_absent_rather_than_becoming_an_empty_secret(
     assert seen == [("inference-key", None)]
 
 
+def test_unhydratable_private_inputs_are_rejected_before_any_provider_call(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # with no artifact token the container can only hydrate a fresh volume from repositories that
+    # need no credential. the command used to pass artifact_token=None straight through, so the
+    # launcher raised "artifact token is required when serving cache hydration is missing" only
+    # after the provider had created and started billing for the app, volume, and pod.
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("provisioning ran without a way to hydrate the cache")
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(
+        serve_deploy, "_hydration_inputs_are_reachable", lambda *_a, **_k: "Private-Co/adapters"
+    )
+    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _explode)
+
+    assert cmd_serve_deploy(_args()) == 1
+    assert "Private-Co/adapters" in capsys.readouterr().err
+
+
+def test_public_inputs_still_deploy_without_an_artifact_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the guard must not break self-hosting from public checkpoints, which is exactly the case
+    # that needs no token at all.
+    seen: list[tuple[str, str | None]] = []
+
+    def _capture(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        seen.append(secrets._reveal_for_launch())
+        return _result(bundle)
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(serve_deploy, "_hydration_inputs_are_reachable", lambda *_a, **_k: None)
+    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _capture)
+
+    assert cmd_serve_deploy(_args()) == 0
+    assert seen == [("inference-key", None)]
+
+
+def test_resolver_validation_failures_are_cli_errors_not_tracebacks(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # bad user input reaches validation below the resolver: a negative --checkpoint-step raises
+    # from format_adapter_revision and a nonimmutable revision raises from ResolvedAdapter, both
+    # as plain ValueError. catching only ResolveError let those escape as an unexpected-error
+    # traceback after the artifact files had already been downloaded.
+    _stub_environment(monkeypatch)
+
+    def _raise_plain(**_kwargs):
+        raise ValueError("invalid immutable adapter revision components")
+
+    monkeypatch.setattr("flash.serve.resolve.resolve_adapter", _raise_plain)
+    monkeypatch.setattr("flash.serve.resolve.resolve_base_revision", lambda *_a, **_k: "d" * 40)
+
+    assert cmd_serve_deploy(_args()) == 1
+    assert "invalid immutable adapter revision components" in capsys.readouterr().err
+
+
 def test_credentials_are_never_command_arguments() -> None:
     # a process list and shell history are both readable, so the token must not be expressible as
     # a flag even by mistake.
@@ -331,6 +393,11 @@ def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     """resolve against fixed hub facts so the command path is tested without the network."""
+
+    # the no-token hydration guard asks the hub whether the inputs are anonymously readable.
+    # offline tests must not make that call, and their fixed repo ids do not exist, so treat the
+    # inputs as reachable unless a test overrides this to exercise the guard itself.
+    monkeypatch.setattr(serve_deploy, "_hydration_inputs_are_reachable", lambda *_a, **_k: None)
 
     from flash.serve.app import AdapterExecutionInput, ArtifactFile, aggregate_file_digest
     from flash.serve.control import AdapterAliasIntent, ResolvedAdapter

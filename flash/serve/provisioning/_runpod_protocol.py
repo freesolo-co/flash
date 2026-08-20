@@ -304,14 +304,29 @@ def parse_deleted_secret(value: object) -> bool:
     return True
 
 
-def parse_templates(value: object) -> tuple[RunPodTemplateObservation, ...]:
+def parse_templates(
+    value: object, *, keep_name: str | None = None
+) -> tuple[RunPodTemplateObservation, ...]:
+    """read the account's templates, strictly parsing only the ones flash owns.
+
+    `keep_name` filters by template name before the per-field parsing below. the customer's
+    account holds templates flash did not create, and those rows legitimately omit
+    `dockerStartCmd` (they use the image's default command) or `env` (no overrides). parsing
+    every row strictly meant one unrelated template failed the whole observation pass with
+    `transport_failed`, blocking deployments that had no conflicting flash resource at all.
+    name is the identity flash matches on, so filter first and validate only what is ours.
+    """
+
     parsed = []
     for entry in _resource_rows(value, "templates"):
         row = _mapping(entry, "template")
+        name = _string(row.get("name"), "template name")
+        if keep_name is not None and name != keep_name:
+            continue
         parsed.append(
             RunPodTemplateObservation(
                 id=_provider_id(row.get("id"), "template id"),
-                name=_string(row.get("name"), "template name"),
+                name=name,
                 image_name=_string(row.get("imageName"), "template imageName"),
                 docker_start_cmd=_docker_start_cmd(row.get("dockerStartCmd")),
                 container_disk_gb=_positive_int(

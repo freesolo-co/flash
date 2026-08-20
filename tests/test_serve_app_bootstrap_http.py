@@ -245,6 +245,46 @@ def test_bootstrap_validation_and_registration_fail_closed(monkeypatch, tmp_path
     assert runtime.closed is True
 
 
+def test_engine_death_handler_reaches_the_runtime(monkeypatch, tmp_path: Path) -> None:
+    # when vllm's engine core dies after readiness the http process stays bound and answers 503
+    # for every later request. the packaged app built the runtime with no on_engine_death
+    # callback, so `_notify_engine_death` only marked the notification complete and neither the
+    # modal container nor the runpod pod was ever replaced.
+    manifest = _manifest()
+    monkeypatch.setattr(
+        "flash.serve.app.bootstrap.locked_manifest_cache",
+        _locked_paths({manifest.adapters[0].adapter_revision: tmp_path / "adapter"}),
+    )
+    seen: list[object] = []
+    runtime = _FakeRuntime()
+
+    def _factory(_config, **kwargs):
+        seen.append(kwargs.get("on_engine_death"))
+        return runtime
+
+    async def _handler(_health: object) -> None:
+        return None
+
+    owner = asyncio.run(
+        bootstrap_serving(manifest, tmp_path, runtime_factory=_factory, on_engine_death=_handler)
+    )
+    assert seen == [_handler]
+    asyncio.run(owner.close())
+
+    # a caller that supplies no handler must still construct the runtime the old way, so the
+    # single-argument factories every other test uses keep working.
+    seen.clear()
+    plain: list[object] = []
+
+    def _plain_factory(_config):
+        plain.append(_config)
+        return _FakeRuntime()
+
+    owner = asyncio.run(bootstrap_serving(manifest, tmp_path, runtime_factory=_plain_factory))
+    assert len(plain) == 1
+    asyncio.run(owner.close())
+
+
 def test_health_auth_models_and_no_model_fallback() -> None:
     owner, _ = _published_owner()
     app = create_app(owner, bearer_token=AUTH_TOKEN)
@@ -680,7 +720,13 @@ def test_serve_construction_failures_close_bootstrapped_runtime(
     owner = _ClosableOwner()
     seen_digest: list[str] = []
 
-    async def bootstrap(*_args):
+    bootstrap_kwargs: list[object] = []
+
+    async def bootstrap(*_args, **kwargs):
+        # the serve entrypoint must hand the runtime a way to end the process when the engine
+        # core dies; without it a dead engine serves 503 forever and the container is never
+        # replaced.
+        bootstrap_kwargs.append(kwargs.get("on_engine_death"))
         return owner
 
     def make_app(_owner, *, bearer_digest: str):
@@ -711,6 +757,48 @@ def test_serve_construction_failures_close_bootstrapped_runtime(
 
     assert owner.close_calls == 1
     assert seen_digest == [hashlib.sha256(AUTH_TOKEN.encode()).hexdigest()]
+    assert [callable(handler) for handler in bootstrap_kwargs] == [True]
+
+
+def test_engine_death_asks_the_running_server_to_exit(monkeypatch) -> None:
+    # wiring the handler is not enough: invoking it has to actually stop the http server, which
+    # is what ends the container and lets the provider start a healthy replacement.
+    import uvicorn
+
+    owner = _ClosableOwner()
+    handlers: list[object] = []
+
+    async def bootstrap(*_args, **kwargs):
+        handlers.append(kwargs.get("on_engine_death"))
+        return owner
+
+    class _Server:
+        def __init__(self, _config) -> None:
+            self.should_exit = False
+            self.capture_signals = None
+
+        async def serve(self) -> None:
+            # the engine dies while the server is running; the handler must ask it to stop.
+            await handlers[0](None)
+
+    monkeypatch.setattr(app_main, "_read_inference_token", lambda: AUTH_TOKEN)
+    monkeypatch.setattr(app_main, "bootstrap_serving", bootstrap)
+    monkeypatch.setattr(app_main, "create_app", lambda _owner, *, bearer_digest: object())
+    monkeypatch.setattr(uvicorn, "Config", lambda *_a, **_k: object())
+    built: list[_Server] = []
+
+    def _make_server(config):
+        server = _Server(config)
+        built.append(server)
+        return server
+
+    monkeypatch.setattr(uvicorn, "Server", _make_server)
+    args = SimpleNamespace(cache_root="/cache", host="127.0.0.1", port=8000)
+
+    asyncio.run(app_main._serve(args, _manifest()))
+
+    assert built[0].should_exit is True
+    assert owner.close_calls == 1
 
 
 def test_missing_inference_token_prevents_runtime_bootstrap(monkeypatch) -> None:
