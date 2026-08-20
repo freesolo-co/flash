@@ -19,6 +19,7 @@ from flash.serving.src.engine_errors import (
 )
 from flash.serving.src.http_headers import _bearer_token, assert_internal, is_trusted_internal
 from flash.serving.src.model_config import gpu_for, is_supported_base_model
+from flash.serving.src.registration import persist_revision
 from flash.serving.src.responses import (
     _openai_structured_outputs,
     _split_reasoning,
@@ -31,7 +32,6 @@ from flash.serving.src.serving_io import (
     _expected_checkpoint,
     _get_stored,
     _inference_json_response,
-    _insert_or_read,
     _parse_generate,
     _prepare_generate_request,
     _provenance_headers,
@@ -298,75 +298,7 @@ def build_serving_app(
         _assert_supported_base_model(registration.base_model)
         revision = registration.to_record()
 
-        try:
-            existing = await _get_stored(revision.adapter_id)
-        except PersistenceRecordError as exc:
-            raise HTTPException(status.HTTP_409_CONFLICT, "adapter namespace is occupied") from exc
-        if existing is not None:
-            if existing.org_id != revision.org_id:
-                raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown adapter id")
-            if (
-                not existing.is_revision
-                or existing.immutable_fingerprint() != revision.immutable_fingerprint()
-            ):
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT, "immutable adapter revision already exists"
-                )
-            stored = existing
-        else:
-            stored = revision
-
-        run_id = revision.run_id
-        assert run_id is not None
-        in_memory_namespace = router.get(run_id)
-        if in_memory_namespace is not None and in_memory_namespace.serve_base_model:
-            raise HTTPException(status.HTTP_409_CONFLICT, "run alias namespace is occupied")
-        try:
-            alias = await _get_stored(run_id)
-        except PersistenceRecordError as exc:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, "run alias namespace is occupied"
-            ) from exc
-        alias_inserted = False
-        if alias is None:
-            proposed_alias = revision.model_copy(
-                update={
-                    "adapter_id": run_id,
-                    "checkpoint": None,
-                    "status": "disabled",
-                    "metadata": {
-                        "record_type": "alias",
-                        "run_id": run_id,
-                        "alias_of": revision.adapter_id,
-                    },
-                    "created_at": None,
-                    "updated_at": None,
-                }
-            )
-            try:
-                alias, alias_inserted = await _insert_or_read(proposed_alias)
-            except PersistenceRecordError as exc:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT, "run alias namespace is occupied"
-                ) from exc
-        _validate_alias(alias, revision)
-        if not alias_inserted:
-            await _validate_alias_target(
-                alias,
-                allow_missing=revision.adapter_id if existing is None else None,
-            )
-
-        if existing is None:
-            stored, _ = await _insert_or_read(revision)
-            if stored.org_id != revision.org_id:
-                raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown adapter id")
-            if (
-                not stored.is_revision
-                or stored.immutable_fingerprint() != revision.immutable_fingerprint()
-            ):
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT, "immutable adapter revision already exists"
-                )
+        alias, stored = await persist_revision(router, revision)
 
         router.upsert(alias, revive=True)
         router.upsert(stored, revive=True)
