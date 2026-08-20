@@ -21,9 +21,9 @@ from flash.serving.src.http_headers import _bearer_token, assert_internal, is_tr
 from flash.serving.src.model_config import gpu_for, is_supported_base_model
 from flash.serving.src.registration import persist_revision
 from flash.serving.src.responses import (
-    _openai_structured_outputs,
-    _split_reasoning,
-    _usage_block,
+    openai_chat_completion,
+    openai_generate_fields,
+    openai_include_usage,
 )
 from flash.serving.src.routing import AdapterRouter, EnginePool
 from flash.serving.src.schemas import AdapterRecord, internal_adapter_payload
@@ -641,36 +641,16 @@ def build_serving_app(
         caller_org = await _authorize_inference(request, adapter_id)
         requested, target = await _lookup(adapter_id)
         try:
-            structured_outputs = _openai_structured_outputs(payload)
+            fields = openai_generate_fields(payload, adapter_id)
         except StructuredOutputsError as exc:
             # Malformed OpenAI response_format (json_schema with no schema, or an unknown type) ->
             # 422, not 500.
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-        req = _parse_generate(
-            {
-                "adapter_id": adapter_id,
-                "messages": payload.get("messages"),
-                "max_tokens": payload.get("max_tokens", 1024),
-                "temperature": payload.get("temperature", 0.0),
-                "top_p": payload.get("top_p", 0.95),
-                # Forward sanitized chat-template kwargs for OpenAI-style callers (backend
-                # /api/sample proxy, evals). The engine overwrites enable_thinking from the
-                # adapter's trained default, so callers cannot change thinking mode for adapters
-                # that have a persisted trained value.
-                "chat_template_kwargs": payload.get("chat_template_kwargs"),
-                # Structured outputs: our structured_outputs extension, or the OpenAI-standard
-                # response_format (translated to canonical at this endpoint only). Forwarded raw so
-                # GenerateRequest's validator normalizes it (consistent 422s).
-                "structured_outputs": structured_outputs,
-            }
-        )
+        req = _parse_generate(fields)
         await _prepare_generate_request(req, target)
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        stream_options = payload.get("stream_options") or {}
-        include_usage = (
-            isinstance(stream_options, dict) and stream_options.get("include_usage") is True
-        )
+        include_usage = openai_include_usage(payload)
         if payload.get("stream") is True:
             events, checkpoint_headers, thinking = await _prepare_stream(
                 req,
@@ -709,33 +689,13 @@ def build_serving_app(
         )
         active_checkpoint = generation.get("checkpoint")
         provenance = _revision_provenance(target, active_checkpoint)
-        reasoning, content = _split_reasoning(
-            str(generation["text"]), bool(generation.get("thinking"))
+        response = openai_chat_completion(
+            completion_id=completion_id,
+            created=created,
+            adapter_id=adapter_id,
+            generation=generation,
+            provenance=provenance,
         )
-        message: dict[str, Any] = {"role": "assistant", "content": content}
-        if reasoning is not None:
-            message["reasoning_content"] = reasoning
-        response = {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": adapter_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": generation.get("finish_reason"),
-                }
-            ],
-        }
-        if provenance is not None:
-            response["freesolo"] = provenance
-        prompt_tokens = generation.get("prompt_tokens")
-        completion_tokens = generation.get("completion_tokens")
-        if prompt_tokens is not None and completion_tokens is not None:
-            response["usage"] = _usage_block(
-                int(prompt_tokens), int(completion_tokens), generation.get("cached_tokens")
-            )
         return JSONResponse(response, headers=_provenance_headers(provenance, active_checkpoint))
 
     return api

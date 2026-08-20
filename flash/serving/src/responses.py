@@ -10,12 +10,12 @@ handlers whose closure-local body models are used as annotations, and the future
 those into unresolvable strings -> silent 422.
 """
 
-import re
 from typing import Any
 
 from flash.serving.src.structured_outputs import StructuredOutputsError
 
 _THINK_CLOSE = "</think>"
+
 
 def _split_reasoning(text: str, thinking: bool) -> tuple[str | None, str]:
     """Split a completion into ``(reasoning_content, content)`` for the OpenAI surface.
@@ -163,3 +163,67 @@ def _response_format_to_spec(response_format: Any) -> Any:
     )
 
 
+def openai_chat_completion(
+    *,
+    completion_id: str,
+    created: int,
+    adapter_id: str,
+    generation: dict[str, Any],
+    provenance: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Assemble the non-streaming OpenAI chat-completion body from an engine result."""
+    reasoning, content = _split_reasoning(str(generation["text"]), bool(generation.get("thinking")))
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning is not None:
+        message["reasoning_content"] = reasoning
+    response = {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": adapter_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": generation.get("finish_reason"),
+            }
+        ],
+    }
+    if provenance is not None:
+        response["freesolo"] = provenance
+    prompt_tokens = generation.get("prompt_tokens")
+    completion_tokens = generation.get("completion_tokens")
+    if prompt_tokens is not None and completion_tokens is not None:
+        response["usage"] = _usage_block(
+            int(prompt_tokens), int(completion_tokens), generation.get("cached_tokens")
+        )
+    return response
+
+
+def openai_generate_fields(payload: dict[str, Any], adapter_id: str) -> dict[str, Any]:
+    """Translate an OpenAI chat-completions body into GenerateRequest fields.
+
+    Raises ``StructuredOutputsError`` for a malformed ``response_format``; the caller maps it to
+    a 422 rather than letting it surface as a 500.
+    """
+    return {
+        "adapter_id": adapter_id,
+        "messages": payload.get("messages"),
+        "max_tokens": payload.get("max_tokens", 1024),
+        "temperature": payload.get("temperature", 0.0),
+        "top_p": payload.get("top_p", 0.95),
+        # Forward sanitized chat-template kwargs for OpenAI-style callers (backend
+        # /api/sample proxy, evals). The engine overwrites enable_thinking from the
+        # adapter's trained default, so callers cannot change thinking mode for adapters
+        # that have a persisted trained value.
+        "chat_template_kwargs": payload.get("chat_template_kwargs"),
+        # Structured outputs: our structured_outputs extension, or the OpenAI-standard
+        # response_format (translated to canonical at this endpoint only). Forwarded raw so
+        # GenerateRequest's validator normalizes it (consistent 422s).
+        "structured_outputs": _openai_structured_outputs(payload),
+    }
+
+
+def openai_include_usage(payload: dict[str, Any]) -> bool:
+    stream_options = payload.get("stream_options") or {}
+    return isinstance(stream_options, dict) and stream_options.get("include_usage") is True
