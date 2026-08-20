@@ -496,7 +496,7 @@ def test_mode_probe_leaves_no_entry_when_its_removal_does_not_take(
 
     def rmdir_that_does_not_take(path, *, dir_fd=None):
         if ".flash-mode-probe-" in str(path):
-            return  # report success, leave the entry behind
+            return None  # report success, leave the entry behind
         if dir_fd is not None:
             return real_rmdir(path, dir_fd=dir_fd)
         return real_rmdir(path)
