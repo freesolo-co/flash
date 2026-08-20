@@ -70,6 +70,10 @@ class _StepMetricState:
     loss_curve: list[float] = field(default_factory=list)
     adv_spread_history: list[float] = field(default_factory=list)
     advantage_bounds: dict[int, tuple[float, float]] = field(default_factory=dict)
+    # the last step a previous attempt already completed; 0 for a fresh run. a resumed verl child
+    # replays this step's metrics line, which belongs to the earlier attempt, so its bounds are not
+    # evidence for the steps THIS attempt executed.
+    resume_step: int = 0
     advantage_bounds_evidence: list[dict[str, int | float]] = field(default_factory=list)
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
     metrics_last: list[dict] = field(default_factory=list)
@@ -483,8 +487,12 @@ def _ingest_step_metrics(
         # key them by optimizer step so replayed lines replace rather than duplicate terminal proof.
         adv_min = step_metrics.get("advantage_min")
         adv_max = step_metrics.get("advantage_max")
-        if isinstance(adv_min, float) and isinstance(adv_max, float):
-            state.advantage_bounds[int(step_metrics["step"])] = (adv_min, adv_max)
+        step_number = int(step_metrics["step"])
+        # a resumed child replays its resume step before producing the first new one. that line
+        # describes the PREVIOUS attempt's step, and `_finalize_advantage_evidence` expects exactly
+        # `resume_step + 1 .. horizon`, so admitting it reports the resume step as an extra step.
+        if isinstance(adv_min, float) and isinstance(adv_max, float) and step_number > state.resume_step:
+            state.advantage_bounds[step_number] = (adv_min, adv_max)
             state.adv_spread_history[:] = [
                 maximum - minimum
                 for minimum, maximum in (
@@ -509,6 +517,7 @@ def _execute_rl_child(
     # every wait answers ChildProcessError for a zombie nobody will collect.
     adopt_orphaned_descendants()
     resume_step = int((files or {}).get("resume_step", 0))
+    state.resume_step = resume_step
     census = GrpoProcessCensus(
         os.getpid(),
         expected_steps=range(resume_step + 1, int(inp["steps"]) + 1),
@@ -537,6 +546,14 @@ def _execute_rl_child(
         silence_watchdog=silence_watchdog,
     )
     progress, last_dump_step = state.progress, state.last_dump_step
+    # verl replays its resume step's metrics line before producing the first NEW step
+    # (`child_io.append_step_metrics` documents the same replay). the identity ledger only
+    # registers steps `resume_step + 1 ..` horizon, so sealing the replayed step would raise
+    # "no registered rollout identity set" and kill a resumed run at its first output line.
+    # seeding the watermark at the resume boundary makes the replay a repeat of an
+    # already-dumped step, which this loop skips, exactly as it skips any other repeat.
+    if resume_step:
+        last_dump_step[0] = resume_step
     shim_markers = (files or {}).get("shim_markers")
     expected_shims = (files or {}).get("expected_shims", ())
     shims_verified = shim_markers is None

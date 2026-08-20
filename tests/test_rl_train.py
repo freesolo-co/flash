@@ -8149,3 +8149,72 @@ def test_single_turn_run_records_multi_turn_accounting_as_an_explicit_none():
     notes = rl_train._build_verl_train_notes(_notes_inp(), **_notes_common())
     assert "multi_turn_accounting" in notes
     assert notes["multi_turn_accounting"] is None
+
+
+def _verl_step_line(step: int, *, adv_min: float, adv_max: float) -> str:
+    """one verl LocalLogger step line, in the exact shape the child prints."""
+    return (
+        f"step:{step} - critic/rewards/mean:1.0 - critic/rewards/max:1.0 - "
+        f"critic/rewards/min:1.0 - critic/advantages/mean:0.0 - "
+        f"critic/advantages/max:{adv_max} - critic/advantages/min:{adv_min} - "
+        "actor/pg_loss:0.0"
+    )
+
+
+def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
+    """A resumed child replays its resume step; those bounds belong to the previous attempt.
+
+    `child_io.append_step_metrics` documents the replay, and `_finalize_advantage_evidence`
+    requires exactly `resume_step + 1 .. horizon`. Admitting the replayed line therefore reports
+    the resume step as an `extra` step and fails a healthy resumed run at its terminal verdict.
+    """
+    from flash.engine.worker import rl_train_runner
+
+    state = rl_train._StepMetricState()
+    state.resume_step = 2
+    observability = lambda: {}
+
+    # the replayed line for the step the previous attempt already completed.
+    rl_train._ingest_step_metrics(
+        _verl_step_line(2, adv_min=-0.5, adv_max=0.5),
+        _notes_inp(),
+        state,
+        observability,
+    )
+    assert 2 not in state.advantage_bounds
+
+    # the first genuinely new step is recorded.
+    rl_train._ingest_step_metrics(
+        _verl_step_line(3, adv_min=-0.25, adv_max=0.75),
+        _notes_inp(),
+        state,
+        observability,
+    )
+    assert sorted(state.advantage_bounds) == [3]
+
+    # and the terminal verdict accepts the run instead of reporting step 2 as extra.
+    rl_train_runner._finalize_advantage_evidence(state, 2, 3)
+    assert state.advantage_bounds_evidence == [
+        {"step": 3, "min": -0.25, "max": 0.75, "spread": 1.0}
+    ]
+
+
+def test_resumed_grpo_seeds_the_dump_watermark_at_the_resume_boundary():
+    """The replayed step must not be sealed: only `resume_step + 1 ..` are ever registered.
+
+    The stream loop dumps a sample and seals identities whenever the step differs from
+    `last_dump_step`. Starting that watermark at -1 makes the replayed resume step look new, so
+    `RolloutIdentityLedger.seal` raises "has no registered rollout identity set" and kills a
+    resumed run at its first output line.
+    """
+    from flash.engine.worker import rl_train_runner
+
+    source = " ".join(inspect.getsource(rl_train_runner._execute_rl_child).split())
+    assert "if resume_step: last_dump_step[0] = resume_step" in source
+
+    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+
+    # the ledger a resumed run builds: registration starts after the resume boundary.
+    ledger = RolloutIdentityLedger(1, 2)
+    with pytest.raises(ValueError, match="no registered rollout identity set"):
+        ledger.seal(2)
