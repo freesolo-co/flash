@@ -11,7 +11,13 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from flash.serving.src.http_headers import _bearer_token
+from flash.serving.src.engine_errors import (
+    engine_error_http,
+    raise_if_engine_error,
+    terminating_on_engine_error,
+    value_error_http,
+)
+from flash.serving.src.http_headers import _bearer_token, assert_internal, is_trusted_internal
 from flash.serving.src.model_config import gpu_for, is_supported_base_model
 from flash.serving.src.responses import (
     _openai_structured_outputs,
@@ -81,7 +87,6 @@ def build_serving_app(
     engines. Failures are swallowed and the task is cancelled on shutdown if still running.
     """
     import asyncio
-    import hmac
     import time
     import uuid
     from contextlib import asynccontextmanager
@@ -158,28 +163,10 @@ def build_serving_app(
     _pending_tasks: set[Any] = set()
 
     def _assert_internal(request: Request) -> None:
-        if not internal_key:
-            # No internal key configured -> the control plane can't be authenticated. Fail closed
-            # rather than serve an open /adapters surface (register/teardown). Production always sets
-            # FREESOLO_INTERNAL_KEY; an unset key is a misconfiguration, not "auth disabled".
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "serving internal key is not configured"
-            )
-        presented = request.headers.get("X-Freesolo-Internal-Key") or ""
-        # Constant-time compare on a secret header (consistent with _is_trusted_internal) so a
-        # rejected key can't be recovered via response timing.
-        if not hmac.compare_digest(presented, internal_key):
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid serving internal key")
+        assert_internal(request, internal_key)
 
     def _is_trusted_internal(request: Request) -> bool:
-        presented = request.headers.get("X-Freesolo-Internal-Key")
-        if not presented:
-            return False
-        # Evaluate every compare_digest (list comp, not a generator) so the per-key constant-time
-        # compare always runs -- a short-circuiting any() would leak which key matched via timing.
-        # C419 (prefer a generator) is exactly the rewrite the comment above forbids: a
-        # generator short-circuits, which is the timing leak. The list is load-bearing.
-        return any([hmac.compare_digest(presented, k) for k in _trusted_internal_keys])  # noqa: C419
+        return is_trusted_internal(request, _trusted_internal_keys)
 
     async def _authorize_inference(request: Request, adapter_id: str) -> "str | None":
         """Gate every chat/inference request on a Freesolo API key, and resolve its billing org.
@@ -206,91 +193,18 @@ def build_serving_app(
         return await chat_authorizer(token, adapter_id)
 
     def _value_error_http(adapter_id: str, exc: ValueError) -> HTTPException:
-        message = str(exc)
-        if message.startswith("checkpoint mismatch: "):
-            return HTTPException(
-                status.HTTP_409_CONFLICT, message.removeprefix("checkpoint mismatch: ")
-            )
-        if message.startswith("Unknown adapter id"):
-            return HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-        current = router.get(adapter_id)
-        if current is None or current.status != "ready":
-            return HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-        return HTTPException(status.HTTP_400_BAD_REQUEST, message)
+        return value_error_http(router, adapter_id, exc)
 
     def _engine_error_http(adapter_id: str, exc: Exception) -> HTTPException | None:
-        """Map an engine dispatch failure to a client-meaningful status.
-
-        Returns ``None`` when ``exc`` is not a failure this layer can identify, so the caller
-        re-raises it unchanged. That distinction matters: rewriting every exception into a 502
-        would mask router-side defects (a ``TypeError`` in the pool wrapper) and would downgrade
-        an ``HTTPException`` that already carries a deliberate status, such as the authorizer's
-        403, into a bare upstream failure.
-
-        Engine work crosses a Modal RPC boundary, so an identifiable failure arrives in one of two
-        shapes. A vLLM/engine ``ValueError`` (including ``VLLMValidationError``, which subclasses
-        it) unpickles with its type intact and keeps its 400/404/409 meaning. Modal's own
-        infrastructure errors -- ``FunctionTimeoutError`` when an input outlives the function
-        timeout, ``RemoteError``/``ExecutionError`` when the remote exception cannot be
-        deserialized -- subclass ``modal.exception.Error``, NOT ``ValueError``, so before this they
-        escaped the sole ``except ValueError`` and surfaced as unhandled 500s, blaming the server
-        for what is usually a caller-side condition (an oversized prompt).
-
-        ``modal`` is imported lazily so this module keeps the no-modal-at-import-scope contract in
-        its docstring, which is what lets the routing layer be unit-tested against a fake pool.
-        """
-        if isinstance(exc, ValueError):
-            return _value_error_http(adapter_id, exc)
-        from modal.exception import Error as ModalError
-        from modal.exception import FunctionTimeoutError
-
-        if isinstance(exc, FunctionTimeoutError):
-            # checked before the ModalError branch below, which it subclasses. 504, not 500: the
-            # request was well-formed and the upstream engine simply did not finish inside its
-            # per-input timeout.
-            return HTTPException(
-                status.HTTP_504_GATEWAY_TIMEOUT,
-                "The engine did not complete this request before its timeout. Retry with a "
-                "shorter prompt or a smaller max_tokens.",
-            )
-        if isinstance(exc, ModalError):
-            return HTTPException(
-                status.HTTP_502_BAD_GATEWAY, "The serving engine failed to handle this request."
-            )
-        return None
+        return engine_error_http(router, adapter_id, exc)
 
     def _raise_if_engine_error(adapter_id: str, exc: Exception) -> None:
-        """Re-raise ``exc`` as its mapped ``HTTPException``, or unchanged if it is not mapped."""
-        failure = _engine_error_http(adapter_id, exc)
-        if failure is None:
-            raise exc
-        raise failure from exc
+        raise_if_engine_error(router, adapter_id, exc)
 
-    async def _terminating_on_engine_error(
+    def _terminating_on_engine_error(
         events: AsyncIterator[dict[str, Any]], adapter_id: str
     ) -> AsyncIterator[dict[str, Any]]:
-        """Convert a mid-stream engine failure into a terminal ``error`` event.
-
-        Only advancing ``events`` is guarded: an exception raised by the *consumer* while rendering
-        an event propagates through this generator untouched, so a router-side defect stays an
-        unhandled server error instead of being reported to the caller as an upstream engine
-        failure. That is why this is a wrapper rather than a ``try`` around the consuming loop.
-
-        An unidentified failure is re-raised for the same reason. The caller then gets a truncated
-        stream, as it did before this existed -- worse than a clean termination, but diagnosable,
-        whereas a fabricated engine error would point every investigation at the wrong subsystem.
-
-        ``CancelledError``/``GeneratorExit`` are ``BaseException``, so a client disconnect or a
-        shutdown keeps unwinding rather than being mistaken for an engine failure.
-        """
-        try:
-            async for event in events:
-                yield event
-        except Exception as exc:
-            failure = _engine_error_http(adapter_id, exc)
-            if failure is None:
-                raise
-            yield {"type": "error", "message": str(failure.detail), "code": failure.status_code}
+        return terminating_on_engine_error(router, events, adapter_id)
 
     async def _reload() -> None:
         # to_thread: reload_records is a sync Supabase call; don't block the event loop.
