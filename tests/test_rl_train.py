@@ -3777,6 +3777,10 @@ def test_kl_ref_adapter_shim_refuses_to_run_without_a_snapshot():
     # would leave the reference on the bare base, and the run would look completely healthy while
     # training against the wrong anchor. they must raise, never fall back.
     pytest.importorskip("torch")
+    # `_load_kl_ref_engine` calls `install_kl_ref_adapter`, which imports peft. guarding only
+    # torch makes this test error instead of skip in an environment that has torch but not
+    # peft, so it must skip on both exactly like the sibling test above.
+    pytest.importorskip("peft")
     import torch
 
     engine_cls = _load_kl_ref_engine()

@@ -1,4 +1,15 @@
-"""check the patched pinned verl agent-loop actor across ray serialization."""
+"""check the patched pinned verl agent-loop actor across ray serialization.
+
+deliberately not a ci step: this imports ray and the pinned verl, neither of which is
+installed on the cpu/offline ci runners, so wiring it into `ci.yml` would only ever fail.
+run it by hand in a gpu worker environment (or any checkout with the verl extra) when
+touching `install_exact_rollout_identity`:
+
+    uv run python scripts/check_rollout_identity_actor.py
+
+it catches the failure mode unit tests cannot: a patch that closes over something
+non-picklable still passes in-process, then kills every grpo run at ray actor creation.
+"""
 
 from __future__ import annotations
 
