@@ -578,7 +578,6 @@ class TeacherClient:
                     payload = json.loads(error.read(64 * 1024 + 1).decode("utf-8"))
                     broker_error = payload.get("error") if isinstance(payload, dict) else None
                     if isinstance(broker_error, dict):
-                        structured_error = True
                         raw_code = broker_error.get("code")
                         raw_classification = broker_error.get("classification")
                         provider_status = validated_provider_status(
@@ -590,6 +589,13 @@ class TeacherClient:
                             "permanent",
                             "transient",
                         }:
+                            # authoritative only once the body actually CLASSIFIES. an
+                            # intermediary can answer a safe-to-retry status with its own generic
+                            # JSON -- `{"error": {"message": "rate limited"}}` is a dict with no
+                            # code and no classification -- and treating that shape as the
+                            # broker's verdict suppresses the status-only fallback below, so the
+                            # default `permanent` aborts a paid run the broker meant us to retry.
+                            structured_error = True
                             classification = raw_classification
                 except (
                     UnicodeDecodeError,
@@ -598,15 +604,16 @@ class TeacherClient:
                     http.client.IncompleteRead,
                 ):
                     pass
-                if (
-                    code == "broker_http_error"
-                    and not structured_error
-                    and error.code in BODY_INDEPENDENT_TRANSIENT_STATUSES
-                ):
-                    # the body was lost in transit -- an intermediary may replace it. the broker
-                    # raises a retryable failure only on these statuses precisely so the signal
-                    # survives that. 408 and 5xx stay ambiguous after dispatch and must not spend
-                    # twice. see BODY_INDEPENDENT_TRANSIENT_STATUSES.
+                if not structured_error and error.code in BODY_INDEPENDENT_TRANSIENT_STATUSES:
+                    # the body was lost or replaced in transit. the broker raises a retryable
+                    # failure only on these statuses precisely so the signal survives that. 408 and
+                    # 5xx stay ambiguous after dispatch and must not spend twice. see
+                    # BODY_INDEPENDENT_TRANSIENT_STATUSES.
+                    #
+                    # gated on the CLASSIFICATION being absent, not on the code still being the
+                    # default: an intermediary can name its own code (`gateway_rate_limited`)
+                    # without ever classifying, and requiring the default code there would leave
+                    # the same paid run aborted on a status the broker meant us to retry.
                     classification = "transient"
                 retryable = classification == "transient"
                 provider_status_detail = (

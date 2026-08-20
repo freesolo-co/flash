@@ -899,10 +899,17 @@ class _StaticResponse:
 class _LedgerBrokerTransport:
     """Drive the worker client through the real broker and sqlite ledger in-process."""
 
-    def __init__(self, token, *, drop_responses=0, strip_error_bodies=0):
+    def __init__(
+        self, token, *, drop_responses=0, strip_error_bodies=0, proxy_error_bodies=0, proxy_body=b""
+    ):
         self.token = token
         self.drop_responses = drop_responses
         self.strip_error_bodies = strip_error_bodies
+        # an intermediary that answers with its OWN json rather than deleting the body. this is
+        # the shape that is not covered by `strip_error_bodies`: the body parses, so a check that
+        # asks only "did a body arrive" reads it as the broker's verdict.
+        self.proxy_error_bodies = proxy_error_bodies
+        self.proxy_body = proxy_body
         self.request_ids = []
 
     def urlopen(self, request, *, timeout):
@@ -922,6 +929,9 @@ class _LedgerBrokerTransport:
             if self.strip_error_bodies > 0:
                 self.strip_error_bodies -= 1
                 body = b""
+            elif self.proxy_error_bodies > 0:
+                self.proxy_error_bodies -= 1
+                body = self.proxy_body
             raise urllib.error.HTTPError(
                 request.full_url,
                 error.status_code,
@@ -982,7 +992,9 @@ def broker_ledger(monkeypatch, tmp_path):
     )
 
 
-def _ledger_client(token, *, drop_responses=0, strip_error_bodies=0):
+def _ledger_client(
+    token, *, drop_responses=0, strip_error_bodies=0, proxy_error_bodies=0, proxy_body=b""
+):
     client = TeacherClient(
         token,
         "https://plane.example",
@@ -993,6 +1005,8 @@ def _ledger_client(token, *, drop_responses=0, strip_error_bodies=0):
         token,
         drop_responses=drop_responses,
         strip_error_bodies=strip_error_bodies,
+        proxy_error_bodies=proxy_error_bodies,
+        proxy_body=proxy_body,
     )
     client._transport = transport
     return client, transport
@@ -1239,3 +1253,77 @@ def test_provider_401_rejection_stays_permanent_and_never_retries(broker_ledger,
     )
     assert (state, attempts, status, error_class) == ("provider_rejected", 1, 401, "permanent")
     assert (input_tokens, output_tokens) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("label", "proxy_body"),
+    [
+        # the shape the finding names: a generic gateway body with no code and no classification.
+        ("message only", b'{"error": {"message": "rate limited"}}'),
+        # and one that names a code but still never classifies.
+        ("code without classification", b'{"error": {"code": "gateway_rate_limited"}}'),
+    ],
+)
+def test_rate_limit_survives_a_proxy_substituted_error_body(
+    broker_ledger, monkeypatch, label, proxy_body
+):
+    """A safe-to-retry 429 stays retryable when an intermediary supplies its OWN JSON body.
+
+    `strip_error_bodies` covers the body being DELETED. This is the other half: the body parses as
+    JSON and carries an `error` object, but it never classifies. Treating any dict as the broker's
+    structured verdict suppresses the status-only fallback, so the default `permanent` aborts a
+    paid OPD run the broker meant the worker to retry against the same request id.
+    """
+    del label
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+
+    outcomes = [(429, b"rate limited"), (200, _parasail_success())]
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return outcomes[len(dispatches) - 1]
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    sleeps = []
+    monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
+    client, transport = _ledger_client(
+        broker_ledger, proxy_error_bodies=1, proxy_body=proxy_body
+    )
+
+    scored = client.score("question", "answer")
+
+    assert scored.input_tokens == 1
+    # retried, and as the same logical request so the provider is billed once.
+    assert len(dispatches) == 2
+    assert len(set(transport.request_ids)) == 1
+    assert sleeps == [2.0]
+
+
+def test_proxy_body_that_does_classify_permanent_is_still_obeyed(broker_ledger, monkeypatch):
+    """The relaxation must not make a real `permanent` verdict retryable.
+
+    A body that actually classifies stays authoritative, including when it says the failure is
+    terminal on a status the bodyless fallback would otherwise rescue.
+    """
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return 429, b"rate limited"
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _s: None)
+    client, _transport = _ledger_client(
+        broker_ledger,
+        proxy_error_bodies=1,
+        proxy_body=b'{"error": {"code": "upstream_rejected", "classification": "permanent"}}',
+    )
+
+    with pytest.raises(worker_teacher.TeacherError, match="permanent"):
+        client.score("question", "answer")
+    assert len(dispatches) == 1
