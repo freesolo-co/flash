@@ -126,6 +126,10 @@ def test_persisted_decoder_tolerates_only_registered_removed_train_keys() -> Non
         ({"batch_size": 32}, 32),
         ({"prompts_per_step": 16}, 16),
         ({"batch_size": 32, "prompts_per_step": 16}, 16),
+        # a non-positive legacy value is DISCARDED, not rejected: `minimum=1` would have refused it
+        # at submission, so a persisted record carrying it is already past that gate and raising
+        # here only strands recovery and teardown on a run that can no longer be resubmitted.
+        ({"batch_size": 0}, None),
     ],
 )
 def test_persisted_rollout_batch_migrates_without_retaining_the_old_name(
@@ -140,14 +144,6 @@ def test_persisted_rollout_batch_migrates_without_retaining_the_old_name(
 
     assert restored.train.prompts_per_step == expected
     assert restored.train.batch_size is None
-
-
-def test_persisted_grpo_rejects_nonpositive_legacy_rollout_batch() -> None:
-    payload = _rollout_spec().to_internal_dict()
-    payload["train"].pop("prompts_per_step", None)
-    payload["train"]["batch_size"] = 0
-    with pytest.raises(ValueError, match="prompts_per_step must be positive"):
-        JobSpec.from_dict(payload)
 
 
 def test_versioned_envelope_reproduces_exact_historical_digest_bytes() -> None:
