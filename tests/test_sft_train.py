@@ -4965,3 +4965,129 @@ def test_sft_result_records_the_micro_batch_that_ran_not_the_one_requested():
     from flash.engine.worker import sft_train_runner
 
     assert "micro_batch" in sft_train_runner._SftChild.__dataclass_fields__
+
+
+def test_an_unuploadable_resume_checkpoint_does_not_fail_a_published_required_save(
+    monkeypatch, tmp_path
+):
+    """a required step whose adapter IS durable must survive a resume upload that cannot succeed.
+
+    the reproducer is a real one. verl saves the whole model state dict with no trainable-only
+    filtering, so a lora run of a 27.59B model writes ~55 GB into ONE `model_world_size_*.pt`, over
+    the artifact store's 50 GB per-file ceiling. the upload fails at every retry, deterministically.
+    before this fix that raised and killed a run whose two steps had converged and whose adapter was
+    already published -- destroying finished work over internal restart state nothing would read.
+
+    `uploaded=False` with `before_upload` having run is exactly that shape: the deployable landed,
+    the full-state member did not.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+    checkpoint_dir = local_dir / "global_step_1"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        worker,
+        "publish_deployable_checkpoint",
+        lambda adapter, step, **kwargs: f"sft/run/checkpoints/step-{step}/adapter",
+    )
+    # the adapter publishes, then the oversized full-state member is rejected.
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), False)[1],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(1,),
+    )
+
+    watcher._publish(1, str(checkpoint_dir))
+
+    # the product artifact is durable, so the run continues.
+    assert watcher.lifecycle.facts(1).deployable_published
+    assert watcher.lifecycle.missing_deployables(watcher.required_steps) == []
+    # and the loss of restart state is recorded rather than hidden.
+    assert watcher.lifecycle.facts(1).failed
+    assert not watcher.lifecycle.facts(1).resume_uploaded
+
+
+def test_a_required_save_whose_adapter_never_published_still_fails_the_run(monkeypatch, tmp_path):
+    """the guarantee that must NOT be weakened: no deployable adapter is still fatal.
+
+    the sibling test above stops a missing RESUME upload from failing the run. this one pins the
+    other half -- a required step that never became servable must still raise -- so that relaxation
+    can never be widened into "required saves are best effort" without turning this red.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    checkpoint_dir = local_dir / "global_step_1"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    # None is what the real transport returns when nothing was published.
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), True)[1],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(1,),
+    )
+    watcher._publish(1, str(checkpoint_dir))
+
+    assert watcher.lifecycle.missing_deployables(watcher.required_steps) == [1]
+    # stop() is where the run learns about it, and it must still raise.
+    watcher.start()
+    with pytest.raises(RuntimeError, match="required saves were not durably published"):
+        watcher.stop(require_complete=True)
+
+
+def test_resume_upload_unavailable_reports_the_oversized_member(tmp_path, capsys):
+    """the operator message must name the file that blew the limit, not just say "not uploaded".
+
+    without the size the log is indistinguishable from a transient network failure, and the real
+    cause -- one member over a hard per-file ceiling, which no retry can fix -- stays invisible.
+    """
+    from flash.engine.worker.verl.checkpoints import resume_upload_unavailable
+
+    ckpt = tmp_path / "global_step_1"
+    (ckpt / "nested").mkdir(parents=True)
+    (ckpt / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+    (ckpt / "nested" / "small.pt").write_bytes(b"x" * 8)
+
+    resume_upload_unavailable(1, str(ckpt), job_label="sft")
+
+    out = capsys.readouterr().out
+    assert "step 1 resume checkpoint was not uploaded" in out
+    assert "largest member" in out, "the size that caused the failure must be reported"
+    # the deepest file must be walked, not just the top level, or a sharded layout reports 0.
+    assert "0.0 GB" in out

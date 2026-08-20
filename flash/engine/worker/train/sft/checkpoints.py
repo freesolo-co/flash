@@ -24,7 +24,11 @@ from flash.engine.worker.backend_common import (
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.train.core.checkpoint_lifecycle import CheckpointLedger
-from flash.engine.worker.verl.checkpoints import MergeDiskExhaustedError, MergeDiskHeadroomError
+from flash.engine.worker.verl.checkpoints import (
+    MergeDiskExhaustedError,
+    MergeDiskHeadroomError,
+    resume_upload_unavailable,
+)
 
 
 def _sft_train():
@@ -259,7 +263,7 @@ class _VerlCheckpointWatcher:
             shutil.rmtree(adapter_dir, ignore_errors=True)
         if step in self.required_steps and not uploaded:
             self.lifecycle.mark_failed(step)
-            raise RuntimeError(f"required save step {step} full-state checkpoint was not published")
+            resume_upload_unavailable(step, checkpoint_dir, job_label="sft")
 
     def _run(self) -> None:
         try:

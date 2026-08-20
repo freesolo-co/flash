@@ -29,6 +29,7 @@ from flash.engine.worker.verl.checkpoints import (
     checkpoint_world_size,
     resume_checkpoint_is_loadable,
     resume_topology_matches,
+    resume_upload_unavailable,
 )
 from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import (
@@ -346,7 +347,7 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
         )
         if step in self.required_steps and not uploaded:
             self.lifecycle.mark_failed(step)
-            raise RuntimeError(f"required save step {step} full-state checkpoint was not published")
+            resume_upload_unavailable(step, checkpoint_dir, job_label="opd")
 
 
 def _restore_verl_resume(

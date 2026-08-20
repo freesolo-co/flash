@@ -376,6 +376,58 @@ def stage_verl_resume(resume_dir: str, local_dir: str, *, job_label: str, world_
     return step
 
 
+def _largest_file_bytes(checkpoint_dir: str) -> int:
+    """the biggest single file under ``checkpoint_dir``, or 0 when it cannot be walked.
+
+    per-file, not total: the artifact store rejects an oversized MEMBER, and a checkpoint whose
+    bytes are spread across many shards uploads fine at any total size.
+    """
+    largest = 0
+    for root, _dirs, names in os.walk(checkpoint_dir):
+        for name in names:
+            try:
+                size = os.path.getsize(os.path.join(root, name))
+            except OSError:
+                # a file verl retention pruned mid-walk cannot be the reason an upload failed.
+                continue
+            largest = max(largest, size)
+    return largest
+
+
+def resume_upload_unavailable(step: int, checkpoint_dir: str, *, job_label: str) -> None:
+    """report that ``step``'s resume state could not be uploaded, without failing the run.
+
+    the resume checkpoint is internal restart convenience: it exists so a preempted attempt can
+    continue instead of replaying from step 0. the artifact a required save is OWED is the
+    deployable adapter, and that is published from this upload's ``before_upload`` callback -- it
+    raises ``RequiredSaveError`` on its own when a required adapter cannot be published, and
+    ``stop(require_complete=True)`` independently re-checks ``missing_deployables`` at the end of
+    the run. so the deployable guarantee is enforced twice and neither path runs through here.
+
+    raising here instead destroyed finished work: a lora run of a large model writes one
+    ``model_world_size_*_rank_*.pt`` holding every base parameter (verl saves the whole state dict,
+    with no trainable-only filtering), which for a 27.59B model is ~55 GB in ONE file and exceeds
+    the artifact store's 50 GB per-file ceiling. that upload can never succeed at any retry count,
+    so a run whose steps had all converged and whose adapter was already durably published was
+    failed for state nothing was going to read. the frozen base weights in it are recoverable from
+    the public base checkpoint anyway -- the next attempt re-downloads them regardless.
+
+    grpo already treats this same upload as non-fatal (``rl/checkpoints.py``, "resume uploads are
+    ungated internal retry state"); this makes sft and opd agree with it rather than inventing a
+    new policy. the step stays marked failed on the ledger, so the loss of restart state is
+    recorded rather than hidden.
+    """
+    largest = _largest_file_bytes(checkpoint_dir)
+    detail = f" largest member {largest / 1e9:.1f} GB." if largest else ""
+    print(
+        f"[{job_label}] step {step} resume checkpoint was not uploaded; continuing without "
+        f"restart state for it.{detail} the deployable adapter is unaffected and is enforced "
+        "separately -- only a crash or preemption after this point would have to replay from an "
+        "earlier step.",
+        flush=True,
+    )
+
+
 def export_peft_adapter(
     ckpt_actor_dir: str,
     out_adapter_dir: str,
