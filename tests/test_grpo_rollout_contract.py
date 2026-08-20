@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from types import SimpleNamespace
 
 import pytest
 
@@ -326,21 +325,46 @@ def test_training_guide_describes_authored_admission_and_retained_execution_clam
     assert "A later retained-data clamp cannot rescue an oversized authored shape" in guide
 
 
-def test_worker_option_resolver_rejects_before_dataset_loading(monkeypatch):
+@pytest.mark.parametrize(
+    ("prompts_per_step", "group_size"),
+    [
+        (4, 3),
+        (65, 8),
+    ],
+)
+def test_persisted_legacy_shapes_reach_worker_option_resolution(
+    monkeypatch, prompts_per_step, group_size
+):
     from flash.engine.worker.train.rl import inputs
 
-    train = SimpleNamespace(
-        structured_outputs="",
-        stop_sequences=(),
-        credit_assignment="per_episode",
-        prompts_per_step=65,
-        learning_rate=None,
-        lora_rank=32,
-        lora_alpha=64,
+    spec = JobSpec.from_dict(
+        _internal_grpo_train(prompts_per_step=prompts_per_step, group_size=group_size)
     )
-    monkeypatch.setattr(inputs._w, "grpo_overrides", lambda: {"group_size": 8})
-    with pytest.raises(ValueError, match=r"must be <= 512"):
-        inputs._resolve_grpo_options(train, RECIPE.rl, False)
+    monkeypatch.setattr(
+        inputs._w,
+        "grpo_overrides",
+        lambda: {"group_size": spec.train.group_size},
+    )
 
-    source = __import__("inspect").getsource(inputs._resolve_grpo_inputs)
-    assert source.index("_resolve_grpo_options") < source.index("_load_training_records")
+    options = inputs._resolve_grpo_options(spec.train, RECIPE.rl, False)
+
+    assert (options["prompts_per_step"], options["group_size"]) == (
+        prompts_per_step,
+        group_size,
+    )
+
+
+@pytest.mark.parametrize("group_size", SUPPORTED_GRPO_GROUP_SIZES)
+def test_supported_shapes_reach_worker_option_resolution_exactly(monkeypatch, group_size):
+    from flash.engine.worker.train.rl import inputs
+
+    spec = spec_from_dict(_public_grpo_train(prompts_per_step=4, group_size=group_size))
+    monkeypatch.setattr(
+        inputs._w,
+        "grpo_overrides",
+        lambda: {"group_size": spec.train.group_size},
+    )
+
+    options = inputs._resolve_grpo_options(spec.train, RECIPE.rl, False)
+
+    assert (options["prompts_per_step"], options["group_size"]) == (4, group_size)
