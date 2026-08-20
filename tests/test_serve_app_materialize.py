@@ -19,6 +19,7 @@ from flash.serve.app.materialize import (
     _validate_cache_ancestor_stat,
     adapter_cache_path,
     base_weights_are_cached,
+    base_weights_cache_path,
     hydrate_base_weights,
     hydrate_manifest,
     locked_manifest_cache,
@@ -727,3 +728,62 @@ def test_hub_accepts_a_partial_commit_sha_snapshot_as_complete(tmp_path: Path) -
             cache_dir=str(tmp_path / "hub"),
             local_files_only=True,
         )
+
+
+def _materializing_stub(landed: list[tuple[str, str | None]], files: dict[str, bytes]):
+    """stand in for snapshot_download, but actually write the snapshot it claims to have fetched.
+
+    the other stubs return a path that never exists, so a completeness check that reads the
+    snapshot sees an empty directory either way and cannot fail. proving the marker is bound to
+    real contents needs real files.
+    """
+
+    def download(**kwargs):
+        snapshot = Path(kwargs["cache_dir"]) / "snapshot" / kwargs["repo_id"].replace("/", "--")
+        snapshot.mkdir(parents=True, exist_ok=True)
+        for name, payload in files.items():
+            (snapshot / name).write_bytes(payload)
+        landed.append((kwargs["repo_id"], kwargs.get("revision")))
+        return str(snapshot)
+
+    return download
+
+
+def test_a_shard_lost_after_hydration_is_not_reported_as_cached(tmp_path: Path) -> None:
+    """the marker must vouch for the snapshot's contents, not merely for its own existence.
+
+    `snapshot_download(local_files_only=True)` resolves the directory for an exact commit sha even
+    when only part of it is present, so a shard evicted or truncated after the marker was written
+    used to read back as hydrated. the launcher then skips rehydration and seals the hub offline
+    -- and a finalized deployment has already had its artifact secret removed, so vllm crash-loops
+    on every restart with no token left to recover.
+    """
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+    files = {"config.json": b"{}", "model-00001.safetensors": b"x" * 64}
+
+    hydrate_base_weights(
+        manifest,
+        cache,
+        token_fd=_token_fd(),
+        snapshot_download_fn=_materializing_stub([], files),
+    )
+
+    def offline(**kwargs):
+        # resolve the same directory hydration wrote, without repopulating it.
+        return str(Path(kwargs["cache_dir"]) / "snapshot" / kwargs["repo_id"].replace("/", "--"))
+
+    assert base_weights_are_cached(manifest, cache, snapshot_download_fn=offline)
+
+    # lose one shard, exactly as an eviction or a partial volume restore would.
+    served = (
+        base_weights_cache_path(cache)
+        / "snapshot"
+        / "flash-owned--served-checkpoint"
+        / "model-00001.safetensors"
+    )
+    assert served.is_file(), "the fixture must have written the shard for this to test anything"
+    served.unlink()
+
+    assert not base_weights_are_cached(manifest, cache, snapshot_download_fn=offline)

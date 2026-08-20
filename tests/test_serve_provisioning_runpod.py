@@ -28,7 +28,7 @@ from flash.serve.provisioning import (
 )
 from flash.serve.provisioning._common import serving_resource_names
 from flash.serve.provisioning._runpod_plan import build_runpod_create_plan
-from flash.serve.provisioning._runpod_probe import RunPodEndpointProbe
+from flash.serve.provisioning._runpod_probe import RunPodEndpointProbe, _provenance_matches
 from flash.serve.provisioning._runpod_protocol import (
     CREATE_SECRET,
     DELETE_SECRET,
@@ -1863,3 +1863,45 @@ def test_confirmed_runpod_interrupt_cleanup_stays_a_plain_interrupt() -> None:
 
     assert not isinstance(raised.value, InterruptedProvisioning)
     assert not transport.pods, transport.pods
+
+
+def _exact_models_payload(bundle: DeploymentBundle) -> dict[str, object]:
+    """the payload a correct runpod pod returns: every revision AND every run alias."""
+
+    from flash.serve.provisioning._modal_probe import _expected_models
+
+    return {
+        "data": [
+            {"id": model_id, "flash_provenance": provenance}
+            for model_id, provenance in _expected_models(bundle).items()
+        ]
+    }
+
+
+def test_runpod_readiness_requires_the_same_exact_provenance_as_modal() -> None:
+    """readiness must mean the same thing on both providers.
+
+    the runpod check compared only five deployment-wide fields and accepted any superset of the
+    revision ids (`expected <= observed`). a pod that omitted the run alias, served stale extra
+    models, or reported wrong per-adapter provenance therefore probed "ready", and the customer
+    got a successful deployment whose documented alias request could 404 or route to the wrong
+    adapter.
+    """
+    bundle = _bundle()
+    exact = _exact_models_payload(bundle)
+    assert _provenance_matches(exact, bundle), "a correct pod must still be accepted"
+
+    # the alias is what the documented request uses, so dropping it cannot read as ready.
+    aliases = set(bundle.manifest.aliases)
+    assert aliases, "the fixture must carry an alias for this to test anything"
+    missing_alias = {"data": [entry for entry in exact["data"] if entry["id"] not in aliases]}
+    assert not _provenance_matches(missing_alias, bundle)
+
+    # a stale extra model means the pod is not serving exactly this deployment.
+    extra = {"data": [*exact["data"], {"id": "stale-model", "flash_provenance": {}}]}
+    assert not _provenance_matches(extra, bundle)
+
+    # per-adapter provenance must match, not merely the deployment-wide fields.
+    wrong = json.loads(json.dumps(exact))
+    wrong["data"][0]["flash_provenance"]["requested_model"] = "someone-elses-model"
+    assert not _provenance_matches(wrong, bundle)

@@ -52,6 +52,8 @@ _IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _REPOSITORY_COMPONENT_RE = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
 _TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+# rfc 7235 token68, the grammar a `Bearer <credential>` value must match.
+_BEARER_TOKEN_RE = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 _ENGINE_ID_RE = re.compile(r"[0-9a-f]{64}")
 _PROVIDER_NAME_RE = re.compile(r"[a-z][a-z0-9-]*[a-z0-9]")
 _ERROR_CODES = frozenset(
@@ -84,6 +86,23 @@ def _nonempty(value: object, name: str) -> str:
     if type(value) is not str or not value or value != value.strip():
         raise ValueError(f"{name} must be a nonempty unpadded string")
     return value
+
+
+def _bearer_token(value: object, name: str) -> str:
+    """a credential that can actually be sent as, and matched from, an http bearer header.
+
+    `_nonempty` only strips the ends, so an interior space passed this boundary and provisioning
+    created billable resources -- but the serving app parses `Authorization` by splitting on
+    spaces and rejects any candidate containing whitespace, so no client could ever authenticate
+    against the endpoint that was just paid for. non-ascii fails earlier still, while the header
+    is being encoded. rfc 7235 defines the token68 grammar this checks; reject here, where nothing
+    has been created yet.
+    """
+
+    text = _nonempty(value, name)
+    if _BEARER_TOKEN_RE.fullmatch(text) is None:
+        raise ValueError(f"{name} must be a usable http bearer credential")
+    return text
 
 
 def _exact_digest(value: object, name: str) -> str:
@@ -351,7 +370,7 @@ class ServingRuntimeSecrets:
         raise TypeError("serving runtime secrets cannot be subclassed")
 
     def __init__(self, inference_token: str, artifact_token: str | None = None) -> None:
-        self.__inference_token = _nonempty(inference_token, "inference token")
+        self.__inference_token = _bearer_token(inference_token, "inference token")
         if artifact_token is not None:
             artifact_token = _nonempty(artifact_token, "artifact token")
         self.__artifact_token = artifact_token

@@ -393,7 +393,26 @@ lists them as optional: they are optional to _argparse_ because RunPod takes its
 and `placement_for` is what requires exactly one provider's set. Omitting them exits with
 `modal placement requires environment, region, workspace_name`.
 
-For RunPod, pass `--provider runpod` and export `RUNPOD_API_KEY` instead.
+For RunPod, export `RUNPOD_API_KEY` instead and swap the placement flags rather than adding to
+them -- `placement_for` rejects the other provider's inputs instead of ignoring them, so keeping
+`--modal-*` alongside `--provider runpod` fails before anything is created:
+
+```bash
+flash serve deploy \
+  --provider runpod \
+  --model Qwen/Qwen3.5-4B \
+  --run <run-id> \
+  --deployment-id my-4b-serving \
+  --image ghcr.io/freesolo-co/freesolo-flash-serve@sha256:<digest> \
+  --artifact-repo <hub-repo> \
+  --artifact-subfolder <path-within-repo> \
+  --lora-rank 32 \
+  --runpod-account <your-account-id> \
+  --runpod-data-center <data-center-id>
+```
+
+Both `--runpod-*` flags are required and must be nonempty, for the same reason the `--modal-*`
+trio is: `--help` lists them as optional only because each provider takes its own set.
 
 Provider credentials are read from the process environment for the duration of a single call and are
 never written to the deployment record, logs, or command arguments — so any later resize or teardown

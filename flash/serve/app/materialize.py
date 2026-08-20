@@ -58,6 +58,32 @@ def base_weights_cache_path(cache_root: str | os.PathLike[str]) -> Path:
     return Path(cache_root) / BASE_WEIGHTS_CACHE_DIRNAME
 
 
+def _snapshot_inventory(snapshot_path: object) -> str:
+    """one stable line per file in the snapshot: relative path and byte size.
+
+    sorted so the same snapshot always produces the same text, and sized so a truncated or
+    replaced file is caught as well as a deleted one. paths are relative to the snapshot root, so
+    the record survives the cache being mounted at a different absolute path.
+    """
+
+    root = Path(str(snapshot_path))
+    entries = [
+        f"{path.relative_to(root).as_posix()}\t{path.stat().st_size}"
+        for path in sorted(root.rglob("*"))
+        if path.is_file() or (path.is_symlink() and path.exists())
+    ]
+    return "\n".join(entries)
+
+
+def _snapshot_matches_inventory(snapshot_path: object, recorded: str) -> bool:
+    """whether the snapshot on disk still matches what the marker vouched for."""
+
+    try:
+        return _snapshot_inventory(snapshot_path) == recorded
+    except OSError:
+        return False
+
+
 def _hydration_marker(
     cache_dir: str | os.PathLike[str], repo_id: str, revision: str | None
 ) -> Path:
@@ -107,16 +133,27 @@ def base_weights_are_cached(
         snapshot_download_fn = snapshot_download
     cache_dir = str(base_weights_cache_path(cache_root))
     for repo_id, revision in _base_weight_sources(manifest):
-        if not _hydration_marker(cache_dir, repo_id, revision).is_file():
+        marker = _hydration_marker(cache_dir, repo_id, revision)
+        try:
+            recorded = marker.read_text(encoding="utf-8")
+        except OSError:
             return False
         try:
-            snapshot_download_fn(
+            snapshot_path = snapshot_download_fn(
                 repo_id=repo_id,
                 revision=revision,
                 cache_dir=cache_dir,
                 local_files_only=True,
             )
         except Exception:
+            return False
+        # the marker surviving is not proof the snapshot did. `snapshot_download` resolves the
+        # directory for an exact commit sha even when only part of it is present, so a shard or
+        # symlink lost after the marker was written would otherwise read back as hydrated: the
+        # launcher skips rehydration, seals the hub offline, and -- with the artifact secret
+        # already removed from a finalized deployment -- vllm crash-loops on every restart with no
+        # token left to recover. compare against what was actually downloaded.
+        if not _snapshot_matches_inventory(snapshot_path, recorded):
             return False
     return True
 
@@ -161,7 +198,7 @@ def hydrate_base_weights(
         cache_dir.mkdir(mode=0o755, exist_ok=True)
         for repo_id, revision in _base_weight_sources(manifest):
             try:
-                snapshot_download_fn(
+                snapshot_path = snapshot_download_fn(
                     repo_id=repo_id,
                     revision=revision,
                     token=token,
@@ -174,7 +211,13 @@ def hydrate_base_weights(
             # only after the download returns: an interrupted one raises above and leaves no
             # marker, so the next start rehydrates instead of sealing the engine against a
             # half-populated snapshot.
-            _hydration_marker(cache_dir, repo_id, revision).write_text("", encoding="utf-8")
+            #
+            # the marker records the snapshot it vouches for rather than merely existing. an empty
+            # marker only proves a download once finished; it cannot notice a shard or symlink
+            # going missing afterwards, and the readiness check would then seal the hub offline
+            # against an incomplete cache with the artifact token already gone.
+            marker = _hydration_marker(cache_dir, repo_id, revision)
+            marker.write_text(_snapshot_inventory(snapshot_path), encoding="utf-8")
     finally:
         token = ""
 

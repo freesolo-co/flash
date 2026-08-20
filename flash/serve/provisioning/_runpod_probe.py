@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 
 from ._common import DeploymentBundle
+from ._modal_probe import _provenance_matches as _modal_provenance_matches
 from ._runpod_transport import build_no_redirect_opener
 
 _MAX_PROBE_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -64,23 +65,13 @@ class RunPodEndpointProbe:
 
 
 def _provenance_matches(payload: object, bundle: DeploymentBundle) -> bool:
-    if type(payload) is not dict or type(payload.get("data")) is not list:
-        return False
-    expected = {adapter.adapter_revision for adapter in bundle.spec.adapters}
-    observed: set[str] = set()
-    for entry in payload["data"]:
-        if type(entry) is not dict or type(entry.get("id")) is not str:
-            return False
-        provenance = entry.get("flash_provenance")
-        if type(provenance) is not dict:
-            return False
-        if (
-            provenance.get("deployment_id") != bundle.spec.deployment_id
-            or provenance.get("spec_id") != bundle.spec.spec_id
-            or provenance.get("manifest_id") != bundle.manifest.manifest_id
-            or provenance.get("engine_id") != bundle.spec.engine.engine_id
-            or provenance.get("image_digest") != bundle.image.digest
-        ):
-            return False
-        observed.add(entry["id"])
-    return expected <= observed
+    """the same exact comparison the modal probe applies, not a weaker one.
+
+    readiness means the same thing on both providers, so this reuses `_modal_probe`'s check rather
+    than keeping a second implementation that can drift from it. the check this replaced compared
+    only five deployment-wide fields and accepted any superset of the revision ids, so a pod that
+    omitted the run alias, served extra models, or reported wrong per-adapter provenance still
+    passed -- and the customer got a "ready" deployment whose documented alias request could 404.
+    """
+
+    return _modal_provenance_matches(payload, bundle)

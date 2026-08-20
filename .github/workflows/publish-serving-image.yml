@@ -20,15 +20,21 @@ on:
       - main
       - dev
     paths:
-      # Dockerfile.serve COPYs `flash`, the lockfile, and the launcher, so a change to any of
-      # them changes the published image. Matching publish-image.yml, the workflow file itself
-      # is watched too, so a change to the build here republishes rather than leaving the old
-      # image serving under the same tags.
+      # Every input Dockerfile.serve reads, because a change to any of them changes the published
+      # image while the tags keep pointing at the old one. That is the whole COPY set -- `flash`,
+      # the lockfile, the launcher, and the three files copied alongside them -- plus
+      # `.dockerignore`, which decides what the build context contains at all. Matching
+      # publish-image.yml, the workflow file itself is watched too, so a change to the build here
+      # republishes rather than leaving the old image serving under the same tags.
       - "flash/**"
       - "Dockerfile.serve"
+      - ".dockerignore"
       - "serve_launch.py"
       - "pyproject.toml"
       - "uv.lock"
+      - "README.md"
+      - "LICENSE"
+      - "NOTICE"
       - ".github/workflows/publish-serving-image.yml"
   workflow_dispatch:
 

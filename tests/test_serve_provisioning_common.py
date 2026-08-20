@@ -415,3 +415,23 @@ def test_the_launcher_abi_tracks_the_wrapper_source_that_actually_runs(tmp_path)
     altered = hashlib.sha256(b"flash.serve.app.launch:v1\0" + wrapper.read_bytes() + b"# x\n")
     altered_id = "fsla1-" + base64.urlsafe_b64encode(altered.digest()).decode("ascii").rstrip("=")
     assert altered_id != _common.LAUNCHER_ABI_ID
+
+
+def test_inference_tokens_must_be_usable_as_bearer_credentials() -> None:
+    """a key the endpoint can never accept must not reach the provider.
+
+    `_nonempty` strips only the ends, so an interior space passed this boundary and modal or
+    runpod created billable gpu resources -- while `flash/serve/app/http.py::_authorize` splits
+    `Authorization` on spaces and rejects any candidate containing whitespace. the deployment was
+    therefore paid for and unusable by every client. non-ascii fails even earlier, while the
+    header is being encoded.
+    """
+    for usable in ("good-key", "tok_ABC-123.x~y+z/w==", "a"):
+        assert ServingRuntimeSecrets(usable)
+
+    for unusable in ("ab cd", "tab\there", "new\nline", "caf\u00e9-key", "has\x7fdel"):
+        with pytest.raises(ValueError, match="bearer"):
+            ServingRuntimeSecrets(unusable)
+
+    # the artifact token is a hub credential, not a bearer value, so it keeps the looser rule.
+    assert ServingRuntimeSecrets("good-key", "hf_token with space")
