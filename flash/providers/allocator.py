@@ -7,7 +7,6 @@ from dataclasses import replace
 from typing import NoReturn
 
 from flash._internal.logging import get_logger
-from flash.core.grpo import resolve_grpo_rollout_shape
 from flash.providers import (
     PROVIDER_NAMES,
     available_providers,
@@ -269,12 +268,6 @@ def _fitting_candidates(candidates, need: int, executed_width) -> list:
         if _fits(candidate, need, executed_gpu_count):
             fitting.append(replace(candidate, executed_gpu_count=executed_gpu_count))
     return fitting
-
-
-def _raw_train_value(train, name: str):
-    if train is None:
-        return None
-    return train.get(name) if isinstance(train, dict) else getattr(train, name, None)
 
 
 def _sizing_int(train, name: str, default: int) -> int:
@@ -826,11 +819,6 @@ def allocate(
 
     ``gpu_type`` and its fallbacks restrict the search without changing cheapest-cost ranking.
     """
-    if str(algorithm or "").strip().lower() in {"grpo", "rl"}:
-        resolve_grpo_rollout_shape(
-            _raw_train_value(train, "prompts_per_step"),
-            _raw_train_value(train, "group_size"),
-        )
     # the same profile knobs ranking prices on: VRAM must be sized for the work that will RUN, not
     # the authored request. an exact-unpacked run executes batch 1 at the measured length, so sizing
     # off the authored batch over-reserves (4 GB on a 4B at batch 8 / 4096) and can reject a card the

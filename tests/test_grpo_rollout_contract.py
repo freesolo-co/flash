@@ -89,7 +89,22 @@ def test_recipe_uses_shared_grpo_defaults():
     assert RECIPE.rl.group_size == DEFAULT_GRPO_GROUP_SIZE
 
 
-def test_public_parser_rejects_shape_before_gpu_validation(monkeypatch):
+@pytest.mark.parametrize("group_size", [16, 3, 0, 10**9])
+def test_public_parser_rejects_unsupported_group_before_gpu_validation(monkeypatch, group_size):
+    import flash.schema as schema
+
+    calls = []
+    monkeypatch.setattr(
+        schema,
+        "_validate_gpu_section",
+        lambda *_args, **_kwargs: calls.append("gpu") or pytest.fail("gpu validation ran"),
+    )
+    with pytest.raises(ConfigError, match=r"must be one of \{2, 4, 8\}"):
+        spec_from_dict(_public_grpo_train(prompts_per_step=4, group_size=group_size))
+    assert calls == []
+
+
+def test_public_parser_rejects_completion_ceiling_before_gpu_validation(monkeypatch):
     import flash.schema as schema
 
     calls = []
@@ -180,32 +195,65 @@ def test_direct_runconfig_validates_and_normalizes_shared_grpo_shape():
         RunConfig("Qwen/Qwen3.5-4B", "grpo", 1, batch_size=129, group_size=4)
 
 
-def test_allocator_rejects_before_sizing_provider_or_capacity_calls(monkeypatch):
+@pytest.mark.parametrize("group_size", SUPPORTED_GRPO_GROUP_SIZES)
+def test_supported_authored_groups_reach_allocation(group_size):
     import flash.providers.allocator as allocator
 
-    calls = []
-    monkeypatch.setattr(
-        allocator,
-        "required_vram_gb",
-        lambda *_args, **_kwargs: calls.append("sizing") or 1,
+    spec = spec_from_dict(
+        _public_grpo_train(prompts_per_step=4, group_size=group_size),
+        run_id=f"supported-{group_size}",
     )
-    monkeypatch.setattr(
-        allocator,
-        "available_providers",
-        lambda: calls.append("providers") or (),
+    allocation = allocator.allocate(
+        spec.model,
+        spec.algorithm,
+        train=spec.train,
+        providers=("runpod",),
+        gpu_type="H100",
     )
-    monkeypatch.setattr(
-        allocator,
-        "_gather_candidates",
-        lambda *_args, **_kwargs: calls.append("capacity") or ([], False, {}),
-    )
-    with pytest.raises(ValueError, match=r"must be <= 512"):
-        allocator.allocate(
-            "Qwen/Qwen3.5-4B",
-            "grpo",
-            train={"prompts_per_step": 257, "group_size": 2},
+
+    assert spec.train.group_size == group_size
+    assert allocation.provider == "runpod"
+    assert allocation.gpu == "H100"
+
+
+@pytest.mark.parametrize(
+    ("prompts_per_step", "group_size"),
+    [
+        (4, 3),
+        (65, 8),
+        (64, 16),
+    ],
+)
+def test_persisted_legacy_shapes_reach_allocation(prompts_per_step, group_size):
+    import flash.providers.allocator as allocator
+
+    spec = JobSpec.from_dict(
+        _internal_grpo_train(
+            prompts_per_step=prompts_per_step,
+            group_size=group_size,
+            max_context_tokens=4096,
+            max_completion_tokens=2048,
         )
-    assert calls == []
+    )
+    expected_vram = allocator.required_vram_gb(spec.model, spec.algorithm, train=spec.train)
+    allocation = allocator.allocate(
+        spec.model,
+        spec.algorithm,
+        train=spec.train,
+        providers=("runpod",),
+        gpu_type="H100",
+    )
+
+    assert allocation.provider == "runpod"
+    assert allocation.gpu == "H100"
+    assert allocation.min_vram_gb == expected_vram
+    if group_size == 16:
+        default_vram = allocator.required_vram_gb(
+            spec.model,
+            spec.algorithm,
+            train={**asdict(spec.train), "group_size": DEFAULT_GRPO_GROUP_SIZE},
+        )
+        assert expected_vram > default_vram
 
 
 @pytest.mark.parametrize(
