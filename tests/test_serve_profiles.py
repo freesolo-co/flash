@@ -253,6 +253,9 @@ def test_incomplete_placement_inputs_are_rejected(provider: str, supplied: dict)
         ),
         ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "environment": "dev"}),
         ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "region": "us-east"}),
+        # a modal web suffix is as foreign to runpod as a modal region: dropping it would let
+        # `--modal-web-suffix --provider runpod` look accepted while changing nothing.
+        ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "web_suffix": "team"}),
     ],
 )
 def test_foreign_provider_inputs_are_rejected_rather_than_ignored(

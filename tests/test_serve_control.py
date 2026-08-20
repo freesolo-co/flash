@@ -829,6 +829,37 @@ def test_deployment_result_equality_and_serialization_include_public_provenance(
     assert sanitized_dict(first)["placement"] == sanitized_dict(first_spec)["placement"]
 
 
+def test_two_placements_differing_only_in_web_suffix_are_two_specs() -> None:
+    """The web suffix is part of the spec identity, because it is part of the public URL.
+
+    Modal builds a web url as `<workspace>-<web_suffix>--<label>.modal.run`, so a placement that
+    differs only in its suffix names a different endpoint. If `_placement_payload` omits it, the
+    two hash to one `spec_id`: a serialized spec no longer round-trips to the origin it describes,
+    and the probe's `provenance["spec_id"]` check would accept a deployment reachable at a
+    different url than the one that was planned.
+    """
+    without = plan_deployment(_modal_request())
+    with_suffix = plan_deployment(
+        DeploymentRequest(
+            deployment_id="deployment-1",
+            generation=2,
+            provider="modal",
+            placement=ModalPlacement(
+                workspace_name="workspace-1",
+                environment="main",
+                gpu="B200",
+                region="us-east",
+                web_suffix="team",
+            ),
+            engine=without.engine,
+            adapters=without.adapters,
+        )
+    )
+
+    assert without.spec_id != with_suffix.spec_id
+    assert sanitized_dict(without)["placement"] != sanitized_dict(with_suffix)["placement"]
+
+
 @pytest.mark.parametrize(
     "pod_id",
     [

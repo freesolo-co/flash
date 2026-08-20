@@ -376,6 +376,9 @@ def placement_for(
                 ("workspace_name", workspace_name),
                 ("environment", environment),
                 ("region", region),
+                # `None` is the real "this environment has no suffix" value, so normalize it to the
+                # empty string the guard treats as absent rather than letting `None.strip()` raise.
+                ("web_suffix", web_suffix or ""),
             ),
         )
         _require_inputs(provider, (("account_id", account_id), ("data_center_id", data_center_id)))

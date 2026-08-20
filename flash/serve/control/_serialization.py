@@ -114,6 +114,10 @@ def _placement_payload(value: ModalPlacement | RunPodPlacement) -> dict[str, obj
         return {
             "workspace_name": value.workspace_name,
             "environment": value.environment,
+            # part of the identity, not decoration: the suffix is what makes the public url
+            # `<workspace>-<suffix>--<label>.modal.run`, so two placements that differ only here
+            # are two different endpoints. omitting it would collapse them to one `spec_id`.
+            "web_suffix": value.web_suffix,
             "gpu": value.gpu,
             "region": value.region,
             "gpu_count": value.gpu_count,
