@@ -28,7 +28,10 @@ def _import_worker(monkeypatch):
     return worker
 
 
-def _wrapper_tensors(prefix, pair, factor_leaves=("default.weight", "default.weight")):
+_SERIALIZED_LEAVES = ("weight", "weight")
+
+
+def _wrapper_tensors(prefix, pair, factor_leaves=_SERIALIZED_LEAVES):
     shape_a, shape_b = pair
     leaf_a, leaf_b = factor_leaves
     return {
@@ -40,7 +43,7 @@ def _wrapper_tensors(prefix, pair, factor_leaves=("default.weight", "default.wei
 def _ordinary_tensors(
     target="q_proj",
     pair=((32, 2048), (2048, 32)),
-    factor_leaves=("default.weight", "default.weight"),
+    factor_leaves=_SERIALIZED_LEAVES,
 ):
     prefix = f"base_model.model.layers.0.self_attn.{target}"
     return _wrapper_tensors(prefix, pair, factor_leaves)
@@ -51,7 +54,7 @@ def _complete_expert_tensors(
     owner_segment="mlp.experts",
     pairs=_EXPECTED_PAIRS,
     swap_rungs=False,
-    factor_leaves=("default.weight", "default.weight"),
+    factor_leaves=_SERIALIZED_LEAVES,
     include_ordinary=True,
 ):
     tensors = {}
@@ -356,20 +359,19 @@ def test_tensor_analyzer_rejects_swapped_qwen36_rungs():
     )
 
 
-def test_tensor_analyzer_requires_matching_adapter_namespaces_across_all_exact_owners():
+def test_tensor_analyzer_rejects_every_adapter_namespace_on_disk():
+    """No namespaced spelling is a real serialized artifact, uniform or not.
+
+    PEFT strips the namespace on save and re-inserts it on load, so a file that still carries one
+    loads with the namespace doubled and matches no module.
+    """
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
     config = _valid_config()
-    assert has_complete_fused_expert_tensors(
-        _complete_expert_tensors(factor_leaves=("foo.weight", "foo.weight")),
-        config,
-        _MODEL_ID,
-    )
-    assert not has_complete_fused_expert_tensors(
-        _complete_expert_tensors(factor_leaves=("foo.weight", "bar.weight")),
-        config,
-        _MODEL_ID,
-    )
+    for leaves in (("foo.weight", "foo.weight"), ("foo.weight", "bar.weight")):
+        assert not has_complete_fused_expert_tensors(
+            _complete_expert_tensors(factor_leaves=leaves), config, _MODEL_ID
+        )
 
 
 def test_tensor_analyzer_rejects_namespace_changes_across_wrapper_rungs():
@@ -426,11 +428,7 @@ def test_tensor_analyzer_requires_every_catalog_layer_and_both_lora_factors():
         _MODEL_ID,
     )
     assert not has_complete_fused_expert_tensors(
-        {
-            key: shape
-            for key, shape in complete.items()
-            if not key.endswith("lora_B.default.weight")
-        },
+        {key: shape for key, shape in complete.items() if not key.endswith("lora_B.weight")},
         config,
         _MODEL_ID,
     )
@@ -463,8 +461,7 @@ def _expert_namespace_mismatch(rung):
     tensors = _complete_expert_tensors()
     suffix = "" if rung == "outer" else ".base_layer"
     prefix = f"base_model.model.layers.0.mlp.experts{suffix}"
-    default_key = f"{prefix}.lora_B.default.weight"
-    tensors[f"{prefix}.lora_B.other.weight"] = tensors.pop(default_key)
+    tensors[f"{prefix}.lora_B.other.weight"] = tensors.pop(f"{prefix}.lora_B.weight")
     return tensors
 
 
@@ -651,13 +648,10 @@ def test_tensor_analyzer_rejects_non_peft_fused_shapes(tensors, config):
     assert not has_complete_fused_expert_tensors(tensors, config, _MODEL_ID)
 
 
-_SERIALIZED_LEAVES = ("weight", "weight")
-
-
 def test_tensor_analyzer_accepts_the_grammar_peft_and_verl_actually_write():
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
-    stripped = _complete_expert_tensors(factor_leaves=_SERIALIZED_LEAVES)
+    stripped = _complete_expert_tensors()
 
     assert not any(".default." in key for key in stripped)
     assert has_complete_fused_expert_tensors(stripped, _valid_config(), _MODEL_ID)
@@ -666,8 +660,8 @@ def test_tensor_analyzer_accepts_the_grammar_peft_and_verl_actually_write():
 def test_export_stamps_an_adapter_serialized_without_the_adapter_namespace(monkeypatch, tmp_path):
     import flash.engine.worker.verl.checkpoints as checkpoints
 
-    tensors = _complete_expert_tensors(factor_leaves=_SERIALIZED_LEAVES)
-    tensors.update(_ordinary_tensors(target="v_proj", factor_leaves=_SERIALIZED_LEAVES))
+    tensors = _complete_expert_tensors()
+    tensors.update(_ordinary_tensors(target="v_proj"))
     monkeypatch.setattr(checkpoints, "_read_adapter_tensor_metadata", lambda _path: tensors)
     config = {
         "peft_type": "LORA",
@@ -690,7 +684,7 @@ def test_warmstart_accepts_an_adapter_serialized_without_the_adapter_namespace(
     import flash.engine.worker.model.adapter as adapter
 
     worker = _import_worker(monkeypatch)
-    tensors = _complete_expert_tensors(factor_leaves=_SERIALIZED_LEAVES)
+    tensors = _complete_expert_tensors()
     monkeypatch.setattr(adapter, "_read_adapter_tensor_metadata", lambda _path: tensors)
 
     worker.validate_warmstart_adapter(_valid_config(), _MODEL_ID, str(tmp_path))
@@ -700,7 +694,7 @@ def test_warmstart_accepts_an_adapter_serialized_without_the_adapter_namespace(
 def test_tensor_analyzer_still_rejects_cross_namespace_pairs_when_serialized(rung):
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
-    tensors = _complete_expert_tensors(factor_leaves=_SERIALIZED_LEAVES)
+    tensors = _complete_expert_tensors()
     suffix = "" if rung == "outer" else ".base_layer"
     prefix = f"base_model.model.layers.0.mlp.experts{suffix}"
     tensors[f"{prefix}.lora_B.other.weight"] = tensors.pop(f"{prefix}.lora_B.weight")
@@ -712,8 +706,8 @@ def test_tensor_analyzer_still_rejects_cross_namespace_pairs_when_serialized(run
     ("leaf", "expected"),
     [
         pytest.param("weight", ("default", "weight"), id="serialized-bare-leaf"),
-        pytest.param("default.weight", ("default", "weight"), id="namespaced-leaf"),
-        pytest.param("other.weight", ("other", "weight"), id="non-default-namespace"),
+        pytest.param("default.weight", None, id="explicit-default-does-not-roundtrip"),
+        pytest.param("other.weight", None, id="explicit-namespace-does-not-roundtrip"),
         pytest.param("not_peft", None, id="wrong-parameter-name"),
         pytest.param("default.not_peft", None, id="namespaced-wrong-parameter-name"),
         pytest.param("default.weight.extra", None, id="extra-segment"),
@@ -748,20 +742,37 @@ def test_parse_lora_tensor_requires_exactly_one_factor_infix():
     assert _parse_lora_tensor("lora_A.weight", (8, 16)) is None
 
 
-def test_tensor_analyzer_rejects_an_artifact_mixing_both_leaf_spellings():
-    """A real export is uniformly one grammar; a mixed file aliases two keys onto one identity."""
+def test_tensor_analyzer_rejects_an_artifact_carrying_the_adapter_namespace():
+    """Only the stripped grammar round-trips through PEFT, so a namespaced file must not validate.
+
+    Verified against the locked peft 0.19.1 ``_insert_adapter_name_into_state_dict``: a stripped
+    ``...lora_A.weight`` loads as ``...lora_A.default.weight`` and matches the live module, while
+    ``...lora_A.default.weight`` loads as ``...lora_A.default.default.weight`` and matches nothing.
+    """
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
-    tensors = _complete_expert_tensors(factor_leaves=("weight", "default.weight"))
+    for leaves in (("default.weight", "default.weight"), ("other.weight", "other.weight")):
+        tensors = _complete_expert_tensors(factor_leaves=leaves)
 
-    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+        assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
 
 
-def test_tensor_analyzer_rejects_the_same_tensor_under_both_spellings():
-    """The stripped and namespaced keys of one tensor collapse together and must not validate."""
+def test_tensor_analyzer_rejects_an_unparseable_lora_key():
+    """An unrecognized lora key must fail the artifact rather than be skipped.
+
+    Dropping it would let a malformed tensor ride along beside a complete canonical set, and a
+    trailing-dot module alias would then collapse onto the outer rung and make the verdict depend
+    on mapping iteration order.
+    """
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
-    tensors = _complete_expert_tensors(factor_leaves=_SERIALIZED_LEAVES)
-    tensors.update(_complete_expert_tensors())
+    owner = "base_model.model.layers.0.mlp.experts"
+    for alias in (f"{owner}..lora_A.weight", f"{owner}.lora_A.not_peft"):
+        for alias_first in (True, False):
+            tensors = _complete_expert_tensors()
+            if alias_first:
+                tensors = {alias: (1, 1), **tensors}
+            else:
+                tensors[alias] = (1, 1)
 
-    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+            assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)

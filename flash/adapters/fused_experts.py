@@ -14,6 +14,9 @@ from flash.adapters.lora_rank import (
 )
 from flash.core.catalog import get_model
 
+_LORA_FACTOR_PATTERN = re.compile(r"\.lora_[AB]\.")
+_LORA_PARAMETER = "weight"
+_PEFT_DEFAULT_ADAPTER = "default"
 _QWEN36_MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
 _QWEN36_EXPERT_TARGET_PARAMETERS = (
     "mlp.experts.gate_up_proj",
@@ -166,42 +169,32 @@ def has_complete_fused_expert_tensors(
     expected = _expected_fused_expert_rungs(config, model_id)
     if expected is None:
         return False
+    lora_keys = {key: shape for key, shape in tensors.items() if _LORA_FACTOR_PATTERN.search(key)}
     parsed = [
         tensor
-        for key, shape in tensors.items()
+        for key, shape in lora_keys.items()
         if (tensor := _parse_lora_tensor(key, shape)) is not None
     ]
-    if len({adapter_name for _, _, adapter_name, _, _ in parsed}) != 1:
+    if len(parsed) != len(lora_keys):
         return False
-    if not _uses_one_serialization_grammar(parsed):
+    if len({adapter_name for _, _, adapter_name, _, _ in parsed}) != 1:
         return False
     return _has_complete_fused_rungs(parsed, expected, model_id) and _has_ordinary_evidence(
         parsed, config, expected
     )
 
 
-def _uses_one_serialization_grammar(tensors: list[_LoraTensor]) -> bool:
-    """Reject an artifact that mixes the stripped and namespaced leaf spellings.
-
-    A real export is uniformly one grammar: PEFT and verl's merger strip every key or none. A
-    stripped leaf is read as the ``default`` namespace, so a file carrying BOTH spellings collapses
-    two distinct keys onto one identity and the topology maps below would silently keep whichever
-    the metadata yielded last. Such a file also does not load as validated, since PEFT re-inserts
-    the namespace and turns an explicit ``lora_A.default.weight`` into
-    ``lora_A.default.default.weight``. Accept it only when every parsed key agrees on one spelling.
-    """
-    spellings = {key.endswith(f".{adapter_name}.weight") for _, _, adapter_name, key, _ in tensors}
-    return len(spellings) <= 1
-
-
 def _parse_lora_tensor(key: str, shape: tuple[int, ...]) -> _LoraTensor | None:
     """Parse one canonical PEFT LoRA tensor key.
 
-    PEFT strips the adapter namespace when it serializes (``get_peft_model_state_dict`` documents
-    ``lora_A.default.weight`` becoming ``lora_A.weight``), and verl's merger reproduces that strip,
-    so every real artifact carries the bare leaf and the namespaced form only survives in older
-    hand-built adapters. Accept both and treat a stripped leaf as the ``default`` namespace PEFT
-    re-inserts on load, so the namespace-agreement checks downstream still compare like with like.
+    Accept exactly the grammar PEFT writes: a bare ``lora_A.weight`` leaf with no adapter
+    namespace. ``get_peft_model_state_dict`` documents stripping the namespace on save, verl's
+    merger reproduces that strip, and ``_insert_adapter_name_into_state_dict`` re-inserts it on
+    load, so the stripped form is the only spelling that round-trips. Verified against peft 0.19.1:
+    ``...lora_A.weight`` loads as ``...lora_A.default.weight`` and matches the live module, while a
+    file that already carries the namespace loads as ``...lora_A.default.default.weight`` and
+    matches nothing. Report the ``default`` namespace PEFT will insert so the namespace-agreement
+    checks downstream compare like with like.
     """
     matches = [
         (factor, infix) for factor, infix in (("A", ".lora_A."), ("B", ".lora_B.")) if infix in key
@@ -210,13 +203,9 @@ def _parse_lora_tensor(key: str, shape: tuple[int, ...]) -> _LoraTensor | None:
         return None
     factor, infix = matches[0]
     module_path, _, leaf = key.partition(infix)
-    leaf_parts = leaf.split(".")
-    if not module_path or len(leaf_parts) not in (1, 2):
+    if not module_path or module_path.endswith(".") or leaf != _LORA_PARAMETER:
         return None
-    adapter_name, parameter = ("default", leaf_parts[0]) if len(leaf_parts) == 1 else leaf_parts
-    if not adapter_name or parameter != "weight":
-        return None
-    return module_path, factor, adapter_name, key, shape
+    return module_path, factor, _PEFT_DEFAULT_ADAPTER, key, shape
 
 
 def _expected_fused_expert_rungs(
