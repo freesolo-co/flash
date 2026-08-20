@@ -1169,7 +1169,7 @@ def test_worker_keeps_unstructured_502_terminal(monkeypatch, body):
     assert len(request_ids) == 1
 
 
-@pytest.mark.parametrize("status", [409, 429])
+@pytest.mark.parametrize("status", [429])
 def test_worker_retries_unstructured_proven_pre_dispatch_http_status(monkeypatch, status):
     import urllib.error
 
@@ -1206,7 +1206,7 @@ def test_worker_retries_unstructured_proven_pre_dispatch_http_status(monkeypatch
     assert len(set(request_ids)) == 1
 
 
-@pytest.mark.parametrize("status", [408, 500, 502, 599])
+@pytest.mark.parametrize("status", [408, 409, 500, 502, 599])
 def test_worker_keeps_unstructured_post_dispatch_ambiguity_terminal(monkeypatch, status):
     import urllib.error
 
@@ -2087,6 +2087,35 @@ def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypa
         ("revoke", "run-1"),
         ("revoke", "run-1"),
     ]
+
+
+def test_fingerprint_migration_skips_a_run_with_no_durable_record(tmp_path, monkeypatch):
+    """An unknown run has no persisted fingerprint, so migrating it is a no-op, not a failure.
+
+    Cancellation fences teacher authority before it resolves the run, so a raise here would
+    replace `cancel_run`'s own unknown-run error with a migration one.
+    """
+    import flash.runner as runner
+    from flash.providers.runpod.jobs import migrate_persisted_legacy_key_fingerprints
+
+    monkeypatch.setattr(runner, "runs_file_path", lambda run_id, suffix: str(tmp_path / "absent"))
+
+    assert migrate_persisted_legacy_key_fingerprints("run-1") == {}
+
+
+def test_fingerprint_migration_still_raises_on_an_unreadable_record(tmp_path, monkeypatch):
+    """Only a MISSING record is nothing to migrate. A record that exists but cannot be read is a
+    real failure: skipping it would leave a legacy fingerprint that every later lifecycle path
+    silently no-ops on, which is the exact condition the migration exists to prevent."""
+    import flash.runner as runner
+    from flash.providers.runpod.jobs import migrate_persisted_legacy_key_fingerprints
+
+    corrupt = tmp_path / "run-1.json"
+    corrupt.write_text("{not valid json")
+    monkeypatch.setattr(runner, "runs_file_path", lambda run_id, suffix: str(corrupt))
+
+    with pytest.raises(json.JSONDecodeError):
+        migrate_persisted_legacy_key_fingerprints("run-1")
 
 
 def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monkeypatch):

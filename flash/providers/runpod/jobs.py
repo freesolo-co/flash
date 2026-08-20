@@ -143,7 +143,13 @@ def apply_disk_gb(config, disk_gb: int | None) -> None:
 
 
 def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, str], str]:
-    """Rewrite endpoint-confirmed legacy owner prefixes in one durable run record."""
+    """Rewrite endpoint-confirmed legacy owner prefixes in one durable run record.
+
+    A run with no durable record has no persisted fingerprint to rewrite, so an unknown run is
+    nothing to migrate rather than an error. Callers run this before resolving the run itself --
+    cancellation fences authority before it waits on any lock -- and raising here would replace
+    the caller's own unknown-run failure with a migration one.
+    """
     import flash.runner as runner
 
     def legacy_target(remote: object) -> tuple[str, str] | None:
@@ -175,7 +181,10 @@ def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, st
         return {**remote, "key_fingerprint": upgrades[target]}
 
     while True:
-        raw = runner._load_status_json(run_id)
+        try:
+            raw = runner._load_status_json(run_id)
+        except FileNotFoundError:
+            return {}
         unresolved = legacy_targets(raw) - upgrades.keys()
         if not unresolved:
             break
