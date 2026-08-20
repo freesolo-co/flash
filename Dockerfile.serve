@@ -38,8 +38,9 @@ RUN uv sync --frozen --no-dev --extra serve-runtime
 # lockfile a single cross-platform resolution while the image states the CUDA its base provides,
 # the same way Dockerfile.worker version-matches torch to this base.
 #
-# --no-deps so pip cannot walk the graph and re-resolve anything uv already pinned.
-RUN /opt/flash-venv/bin/python -m pip install --no-cache-dir --no-deps \
+# `uv pip`, not `python -m pip`: uv builds the venv without pip in it, so `python -m pip` here
+# fails with "No module named pip". --no-deps so nothing re-resolves what uv already pinned.
+RUN uv pip install --no-cache --no-deps \
         --index-url https://download.pytorch.org/whl/cu128 \
         torch==2.11.0+cu128 torchvision==0.26.0+cu128 torchaudio==2.11.0+cu128 \
     && /opt/flash-venv/bin/python -c "import torch; v=torch.version.cuda; assert v and v.startswith('12.8'), f'expected a cu128 torch, got {torch.__version__} (cuda {v})'; print('torch', torch.__version__, 'cuda', v)"
