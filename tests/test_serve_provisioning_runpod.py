@@ -1595,3 +1595,37 @@ def test_template_observation_reads_argv_and_omitted_defaults() -> None:
                     }
                 ]
             )
+
+
+class _InterruptingProbe:
+    """Ctrl-C while polling a slow pod, which is when a user is most likely to press it."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, url: str, token: str, bundle: DeploymentBundle, timeout: float) -> bool:
+        self.calls += 1
+        raise KeyboardInterrupt
+
+
+def test_interrupting_a_slow_readiness_poll_still_cleans_up_created_resources() -> None:
+    """Ctrl-C after the creates succeed must not strand live, billable RunPod resources.
+
+    `KeyboardInterrupt` derives from BaseException, so an `except RunPodTransportFailure` never
+    sees it. The pod, its network volume, and its secrets stay live with no cleanup and no outcome
+    warning -- the user reads the traceback as "it didn't happen" while the pod keeps billing.
+    """
+    bundle = _bundle()
+    transport = _FakeTransport()
+    probe = _InterruptingProbe()
+
+    with pytest.raises(KeyboardInterrupt):
+        _provision(bundle, transport, probe=probe)
+
+    assert probe.calls == 1
+    # everything the ledger recorded must have been torn back down before the interrupt propagates.
+    operations = [operation for _kind, operation, mutation, _payload in transport.calls if mutation]
+    assert "DELETE /pods" in " ".join(operations), operations
+    assert not transport.pods, transport.pods
+    assert not transport.volumes, transport.volumes
+    assert not transport.secrets, transport.secrets

@@ -811,6 +811,27 @@ def provision_runpod_deployment(
             clock=clock,
             sleep=sleep,
         )
+    except BaseException:
+        # Ctrl-C is the realistic case: it derives from BaseException, so the handler above never
+        # sees it, and a user who interrupts a slow readiness poll leaves the pod, its volume, and
+        # its secrets live and billing with nothing printed to say so. The ledger already holds
+        # exactly what bounded cleanup needs, so run the same teardown, then re-raise -- the
+        # interrupt is still the outcome, it just no longer strands resources.
+        # `readiness_failed` rather than a new code: the failure codes are a public serialization
+        # surface, and this result is discarded anyway -- the interrupt propagates, so nothing reads
+        # it. Only the cleanup it drives matters.
+        if transport is not None and ledger.has_attempted_creations:
+            _failure_after_create_attempt(
+                plan,
+                transport,
+                ledger,
+                _LifecycleFailure("readiness_failed"),
+                handle=handle,
+                deadline_at=deadline_at,
+                clock=clock,
+                sleep=sleep,
+            )
+        raise
 
 
 def _validate_handle(plan: RunPodCreatePlan, handle: RunPodProviderHandle) -> None:
