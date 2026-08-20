@@ -1754,7 +1754,15 @@ def test_loopback_image_registries_are_rejected_before_any_runpod_call() -> None
     # code path uploads the image or tunnels to the operator's host, so the pull fails only once
     # the pod exists and bills. reject it while the plan is still local.
     original = _bundle()
-    for registry in ("localhost", "localhost:5000", "127.0.0.1", "10.20.30.40", "169.254.1.2"):
+    for registry in (
+        "localhost",
+        "localhost:5000",
+        "registry.localhost",
+        "localhost.localdomain",
+        "127.0.0.1",
+        "10.20.30.40",
+        "169.254.1.2",
+    ):
         bundle = DeploymentBundle(
             spec=original.spec,
             manifest=original.manifest,
@@ -1767,3 +1775,13 @@ def test_loopback_image_registries_are_rejected_before_any_runpod_call() -> None
             build_runpod_create_plan(bundle)
 
     assert build_runpod_create_plan(original)
+
+    reachable = DeploymentBundle(
+        spec=original.spec,
+        manifest=original.manifest,
+        image=ServingImage(
+            reference=f"notlocalhost.example/flash/serve@{original.image.digest}",
+            digest=original.image.digest,
+        ),
+    )
+    assert build_runpod_create_plan(reachable)

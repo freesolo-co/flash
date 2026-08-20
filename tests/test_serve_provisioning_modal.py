@@ -1376,7 +1376,15 @@ def test_loopback_image_registries_are_rejected_before_any_modal_call() -> None:
     # tunnel back, so the pull would fail only after the app and its resources already exist and
     # bill. the plan builder is the last point where rejecting it costs nothing.
     original = _bundle()
-    for registry in ("localhost", "localhost:5000", "127.0.0.1", "10.20.30.40", "169.254.1.2"):
+    for registry in (
+        "localhost",
+        "localhost:5000",
+        "registry.localhost",
+        "localhost.localdomain",
+        "127.0.0.1",
+        "10.20.30.40",
+        "169.254.1.2",
+    ):
         bundle = DeploymentBundle(
             spec=original.spec,
             manifest=original.manifest,
@@ -1389,3 +1397,13 @@ def test_loopback_image_registries_are_rejected_before_any_modal_call() -> None:
             build_modal_create_plan(bundle)
 
     assert build_modal_create_plan(original)
+
+    reachable = DeploymentBundle(
+        spec=original.spec,
+        manifest=original.manifest,
+        image=ServingImage(
+            reference=f"notlocalhost.example/flash/serve@{original.image.digest}",
+            digest=original.image.digest,
+        ),
+    )
+    assert build_modal_create_plan(reachable)

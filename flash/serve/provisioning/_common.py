@@ -140,7 +140,11 @@ def reject_unreachable_registry(image: ServingImage) -> None:
 
     registry = image.reference.rsplit("@", 1)[0].split("/", 1)[0]
     host = registry.rsplit(":", 1)[0] if registry.count(":") == 1 else registry
-    if host in _LOOPBACK_REGISTRY_HOSTS:
+    if host in _LOOPBACK_REGISTRY_HOSTS or host.endswith(".localhost"):
+        # rfc 6761 reserves the whole `.localhost` tld for loopback, and
+        # `flash/cli/commands/__init__.py` already treats it that way when deciding whether
+        # plaintext is safe. `registry.localhost` resolves to the operator's own machine for the
+        # same reason bare `localhost` does.
         raise ValueError("remote provider image registry cannot be a loopback host")
     try:
         address = ipaddress.IPv4Address(host)
