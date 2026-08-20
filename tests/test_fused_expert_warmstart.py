@@ -754,6 +754,82 @@ def test_non_moe_export_canonicalizes_targeting_without_changing_other_fields(
     assert "target_parameters" not in saved
 
 
+def test_non_moe_export_rejects_a_fully_absent_declared_target(tmp_path):
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    tensors = _text_pair(
+        "self_attn.q_proj",
+        np.ones((1, 2), dtype=np.float16),
+        np.ones((2, 1), dtype=np.float16),
+    )
+    config = {
+        "peft_type": "LORA",
+        "r": 1,
+        "target_modules": ["q_proj", "k_proj"],
+    }
+    _write_small_safetensors(tmp_path / "adapter_model.safetensors", tensors)
+    config_path = tmp_path / "adapter_config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"has no tensors for declared target_modules \['k_proj'\]",
+    ):
+        stamp_adapter_dir_provenance(
+            str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
+
+    assert config_path.read_bytes() == before
+
+
+def test_non_moe_export_accepts_complete_pairs_for_every_declared_target(tmp_path):
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    factor_a = np.ones((1, 2), dtype=np.float16)
+    factor_b = np.ones((2, 1), dtype=np.float16)
+    tensors = {
+        **_text_pair("self_attn.q_proj", factor_a, factor_b),
+        **_text_pair("self_attn.k_proj", factor_a, factor_b),
+    }
+    config = {
+        "peft_type": "LORA",
+        "r": 1,
+        "target_modules": ["q_proj", "k_proj"],
+    }
+    _write_small_safetensors(tmp_path / "adapter_model.safetensors", tensors)
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    stamp_adapter_dir_provenance(
+        str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
+
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["target_modules"] == "all-linear"
+
+
+def test_non_moe_export_preserves_the_orphan_pair_rejection_message(tmp_path):
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    config = {
+        "peft_type": "LORA",
+        "r": 1,
+        "target_modules": ["q_proj", "v_proj"],
+    }
+    _write_expert_adapter(tmp_path, config=config, tensor_mode="orphan_a", text_rank=1)
+
+    with pytest.raises(RuntimeError) as error:
+        stamp_adapter_dir_provenance(
+            str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
+
+    assert str(error.value) == (
+        "exported text adapter must contain at least one complete LoRA A/B pair and no orphan "
+        "factors; incomplete_modules="
+        "['base_model.model.layers.0.self_attn.q_proj']"
+    )
+
+
 def test_non_moe_export_enforces_applicable_rank_pattern(tmp_path):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 

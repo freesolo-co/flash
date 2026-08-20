@@ -634,6 +634,7 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
 
     pairs: dict[str, dict[str, str]] = {}
     language_pairs: dict[str, dict[str, str]] = {}
+    target_evidence: set[str] = set()
     for key, shape in metadata.items():
         segments = set(key.lower().split("."))
         non_language = bool(segments & _NON_LANGUAGE_ADAPTER_SEGMENTS)
@@ -643,10 +644,14 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
         if match is None:
             raise RuntimeError(f"{label} contains a non-canonical tensor key {key!r}")
         module = match.group("module")
-        if not any(module == target or module.endswith(f".{target}") for target in targets):
+        matched_targets = {
+            target for target in targets if module == target or module.endswith(f".{target}")
+        }
+        if not matched_targets:
             raise RuntimeError(
                 f"{label} tensor module {module!r} is not declared in target_modules"
             )
+        target_evidence.update(matched_targets)
         if (
             not isinstance(shape, (list, tuple))
             or len(shape) != 2
@@ -677,6 +682,13 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
 
     pair_keys = {module: (factors["A"], factors["B"]) for module, factors in pairs.items()}
     _validate_adapter_tensor_values(adapter_dir, metadata, pair_keys, label=label)
+    # the concrete list is peft's attached surface, including vision modules for multimodal runs;
+    # fused-expert targets use their separate topology validator instead of this path.
+    missing_targets = sorted(set(targets) - target_evidence)
+    if missing_targets:
+        raise RuntimeError(
+            f"{label} has no tensors for declared target_modules {missing_targets[:4]}"
+        )
 
 
 def stamp_adapter_dir_provenance(
