@@ -67,3 +67,47 @@ def test_image_installs_from_a_pyproject_that_exists() -> None:
     ]
     for extra in ("serve-runtime", "serving"):
         assert declared[extra], extra
+
+
+def test_image_ships_the_package_under_its_real_import_path() -> None:
+    """The container must be able to `import flash.serving.src.X`.
+
+    Before the move these modules imported each other as `src.X`, so shipping the bare directory
+    to `/root/src` was enough. They import each other as `flash.serving.src.X` now, and a `/root/src`
+    tree cannot satisfy that: the container raises `ModuleNotFoundError: No module named
+    'flash.serving'` on the first engine call -- *after* `modal deploy` has already reported success,
+    which is why no offline test or deploy-time import catches it.
+    """
+    tree = _module()
+    calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    # a bare directory mount cannot reconstruct the `flash.serving.src` package path.
+    assert "add_local_dir" not in calls
+    assert "add_local_python_source" in calls
+
+    call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_local_python_source"
+    )
+    assert [ast.literal_eval(arg) for arg in call.args] == ["flash"]
+
+    # every module the engine imports must actually live under that package, or the mount ships a
+    # tree that still cannot satisfy the imports.
+    src = ROOT / "flash" / "serving" / "src"
+    assert (ROOT / "flash" / "__init__.py").is_file()
+    assert (ROOT / "flash" / "serving" / "__init__.py").is_file()
+    assert (src / "__init__.py").is_file()
+
+    # and modal_app's own module-scope flash imports must resolve inside that same package.
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("flash."):
+            relative = Path(node.module.replace(".", "/"))
+            assert (ROOT / f"{relative}.py").is_file() or (
+                ROOT / relative / "__init__.py"
+            ).is_file(), node.module

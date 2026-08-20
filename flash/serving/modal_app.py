@@ -256,18 +256,27 @@ image = (
             "VLLM_MOE_USE_DEEP_GEMM": "0",
         }
     )
-    .add_local_dir(SERVING_DIR / "src", remote_path="/root/src")
+    # Ship the package under its REAL import path. This used to be
+    # `add_local_dir(src, remote_path="/root/src")`, which was correct when the app was its own
+    # repo and its modules imported each other as `src.X`. After the move they import each other
+    # as `flash.serving.src.X`, and a bare `/root/src` tree cannot satisfy that -- the container
+    # would raise `ModuleNotFoundError: No module named 'flash.serving'` on the first engine call,
+    # long after `modal deploy` reported success. `add_local_python_source` mounts `flash/` into
+    # /root (which is on the container PYTHONPATH), so the in-container import path matches the
+    # one the test suite exercises. Only .py files are included, per the method's default `ignore`.
+    .add_local_python_source("flash")
 )
 
 app = modal.App(APP_NAME, image=image)
 hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
 
-# ``_LoraEngineImpl`` lives in the ``src.lora_engine`` module (kept free of any ``modal`` import so
-# it registers nothing, and under ``src/`` so the image's ``add_local_dir(src)`` ships it to the
-# remote container), re-exported here so ``_build_engine`` can subclass it.
-# Its stateless helpers live in ``src.engine_support``; re-exported so modal_app's historical
-# ``from modal_app import _*`` surface is unchanged.
+# ``_LoraEngineImpl`` lives in ``flash.serving.src.lora_engine`` (kept free of any ``modal`` import
+# so it registers nothing, and inside the ``flash`` package so the image's
+# ``add_local_python_source("flash")`` ships it to the remote container under the same import path
+# it has here), re-exported so ``_build_engine`` can subclass it.
+# Its stateless helpers live in ``flash.serving.src.engine_support``; re-exported so modal_app's
+# historical ``from modal_app import _*`` surface is unchanged.
 from flash.serving.src.engine_support import (  # noqa: E402
     _RESERVED_CHAT_TEMPLATE_KWARGS,  # noqa: F401
     _adapter_cache_ready,  # noqa: F401
