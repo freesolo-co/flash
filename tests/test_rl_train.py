@@ -1270,9 +1270,7 @@ def test_build_verl_overrides_halves_agent_loop_workers_for_multimodal_runs():
     # the authored knobs are untouched: only scheduling parallelism narrows.
     assert "actor_rollout_ref.rollout.n=4" in image
     # and the cap still yields an exact divisor of the rollout batch, which verl asserts on.
-    workers = int(
-        next(o for o in image if "agent.num_workers=" in o).rsplit("=", 1)[1]
-    )
+    workers = int(next(o for o in image if "agent.num_workers=" in o).rsplit("=", 1)[1])
     assert (batch["prompts_per_step"] * batch["group_size"]) % workers == 0
 
 
