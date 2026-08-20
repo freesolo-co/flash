@@ -408,7 +408,9 @@ def test_unclassified_storage_conflict_does_not_trigger_duplicate_readback(
         if reads > 2:
             pytest.fail("unclassified 409 must not enter conflict readback")
 
-    monkeypatch.setattr("flash.serving.src.persistence.insert_adapter", _reject_unclassified_conflict)
+    monkeypatch.setattr(
+        "flash.serving.src.persistence.insert_adapter", _reject_unclassified_conflict
+    )
     monkeypatch.setattr("flash.serving.src.persistence.get_adapter", _read_required_namespaces)
 
     result = _register(client, _registration())

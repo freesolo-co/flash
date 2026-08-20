@@ -14,7 +14,8 @@ from PIL import Image, ImageOps
 
 from flash.serving.src import multimodal
 from flash.serving.src import serving_io as serving_io_module
-from flash.serving.src.lora_engine import _LoraEngineImpl, _num_prompt_tokens
+from flash.serving.src.engine_support import _num_prompt_tokens
+from flash.serving.src.lora_engine import _LoraEngineImpl
 from flash.serving.src.multimodal import (
     MultimodalRequestError,
     has_image_blocks,
@@ -784,7 +785,9 @@ def test_text_only_tool_history_skips_multimodal_validation(monkeypatch) -> None
     def unexpected_multimodal_work(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("text-only requests must not enter multimodal validation")
 
-    monkeypatch.setattr(serving_io_module, "validate_multimodal_request", unexpected_multimodal_work)
+    monkeypatch.setattr(
+        serving_io_module, "validate_multimodal_request", unexpected_multimodal_work
+    )
     monkeypatch.setattr(serving_io_module, "supports_image_input", unexpected_multimodal_work)
     monkeypatch.setattr(serving_io_module, "image_limit_for", unexpected_multimodal_work)
     client, pool = _client(QWEN_2B)

@@ -12,7 +12,6 @@ import hashlib
 import inspect
 import json
 import os
-import re
 import shutil
 import sys
 import time
@@ -21,33 +20,30 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
-from flash.serving.src.model_config import engine_overrides_for, gpu_for, image_limit_for, supports_image_input
-
-# apply_chat_template args we always pass explicitly (re-supplying any via chat_template_kwargs
-# raises "got multiple values for keyword argument" -> a 500), plus the ones that change the return
-# TYPE/shape (e.g. return_tensors -> a tensor, return_dict -> a mapping) and would break
-# list(prompt_token_ids)/vLLM. A caller's chat_template_kwargs must never re-supply any of these.
-# Adapter-cache paths, token accounting and engine-arg probes live in engine_support.py;
-# re-exported because the engine class below and the tests reference them unqualified.
-from flash.serving.src.engine_support import (  # noqa: E402
-    active_checkpoint_ref,
-    enforce_expected_checkpoint,
+# Adapter-cache paths and token accounting live in engine_support.py, alongside
+# _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
+# the vllm build probes engine_boot uses.
+from flash.serving.src.engine_support import (
     _adapter_cache_path,
     _adapter_cache_ready,
     _adapter_source_cache_dir,
     _adapter_source_ident,
     _assert_source_cache_containment,
-    _async_engine_arg_names,
     _cached_tokens_reported,
     _engine_is_dead,
-    _is_adapter_tensor_file,
     _load_adapters_for_base,
     _num_cached_tokens,
     _num_prompt_tokens,
-    _require_reasoning_api_compatibility,
-    _RESERVED_CHAT_TEMPLATE_KWARGS,
     _safe_chat_template_kwargs,
     _stream_text_delta,
+    active_checkpoint_ref,
+    enforce_expected_checkpoint,
+)
+from flash.serving.src.model_config import (
+    engine_overrides_for,
+    gpu_for,
+    image_limit_for,
+    supports_image_input,
 )
 
 
@@ -73,10 +69,14 @@ class _LoraEngineImpl:
         # async so the cached-LoRA preload (and the engine's first async use) run on the SAME event
         # loop that serves requests. A one-off asyncio.run() here would bind vLLM's AsyncLLMEngine
         # to a loop that's then closed, breaking generate() on the real serving loop.
-        from transformers import AutoProcessor, AutoTokenizer
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
         from flash.serving.src import settings as cfg
+        from flash.serving.src.engine_boot import (
+            engine_args_for,
+            load_tokenizer,
+            pin_loras_default,
+        )
         from flash.serving.src.model_config import engine_overrides_for
         from flash.serving.src.registry import AdapterRegistry
         from flash.serving.src.settings import ADAPTER_CACHE_DIR, Settings
@@ -96,122 +96,15 @@ class _LoraEngineImpl:
         self.registry.hydrate(base_model_adapters)
         ADAPTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.processor = None
-        if supports_image_input(self.base_model):
-            self.processor = AutoProcessor.from_pretrained(
-                self.base_model,
-                token=self.settings.hf_api_key,
-                trust_remote_code=cfg.TRUST_REMOTE_CODE,
-            )
-            self.tokenizer = getattr(self.processor, "tokenizer", None)
-            if self.tokenizer is None:
-                raise RuntimeError("image-capable model processor has no tokenizer")
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.base_model,
-                token=self.settings.hf_api_key,
-                trust_remote_code=cfg.TRUST_REMOTE_CODE,
-            )
-        if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.processor, self.tokenizer = load_tokenizer(self.base_model, self.settings, cfg)
 
         # Per-base-model engine-arg overrides. Larger pre-quantized tiers use real-GPU-validated
         # rank-32 LoRA sizing and, where needed, tighter scheduler/memory caps.
         overrides = engine_overrides_for(self.base_model)
-        # serve_model_id: load a PRE-QUANTIZED FP8 checkpoint instead of online-quantizing the bf16
-        # base (avoids the bf16 load transient — see model_config). Adapters still key off base_model;
-        # the tokenizer above stays the base model's (canonical). vLLM auto-detects the checkpoint's
-        # FP8, so a pre-quant base passes NO quantization (online quantization=fp8 only when absent).
-        _served_model = overrides.get("serve_model_id") or self.base_model
-        _quant_default = None if overrides.get("serve_model_id") else cfg.QUANTIZATION
-        _max_loras = int(overrides.get("max_loras", cfg.MAX_LORAS))
-        # Pinning makes an adapter non-evictable, so it only makes sense when the GPU hot pool covers
-        # the whole deployable CPU pool. Otherwise >max_loras registered adapters must remain unpinned
-        # so vLLM can LRU-swap them from max_cpu_loras on demand.
-        _pin_default = _max_loras >= cfg.MAX_CPU_LORAS
-        self._pin_loras = bool(overrides.get("pin_loras", _pin_default))
-        # max_num_seqs is left at vLLM's (large) default unless a model overrides it. vLLM's startup
-        # memory-PROFILING forward runs max_num_seqs sequences at once; for the 35B MoE (248k-vocab
-        # logits + all-expert activations) the default (~256) spikes the profiling peak to nearly the
-        # whole card and the subsequent LoRA-module creation OOMs — so the 35B caps it low.
-        _extra: dict[str, Any] = {}
-        if "max_num_seqs" in overrides:
-            _extra["max_num_seqs"] = int(overrides["max_num_seqs"])
-        image_limit = image_limit_for(self.base_model)
-        if image_limit is not None:
-            _extra["limit_mm_per_prompt"] = {"image": image_limit}
-            _extra["mm_processor_cache_gb"] = 0
-            _extra["enable_tower_connector_lora"] = True
-
-        # some engine args are newer than our floor or build-specific, so forward them only when this
-        # vllm build exposes them.
-        engine_arg_names = _async_engine_arg_names(AsyncEngineArgs)
-
-        def _arg_supported(name: str) -> bool:
-            return name in engine_arg_names
-
-        parser = overrides.get("reasoning_parser")
-        self.reasoning_parser = str(parser) if parser else None
-        _require_reasoning_api_compatibility(
-            AsyncEngineArgs, AsyncLLMEngine.generate, self.reasoning_parser
-        )
-        if self.reasoning_parser is not None:
-            _extra["reasoning_parser"] = self.reasoning_parser
-
-        # max_num_batched_tokens: the 35B's attention block size is 2096 tokens, so vLLM rejects the
-        # default 2048 token budget. Forward the validated 4096 override only on builds exposing it.
-        if "max_num_batched_tokens" in overrides:
-            if _arg_supported("max_num_batched_tokens"):
-                _extra["max_num_batched_tokens"] = int(overrides["max_num_batched_tokens"])
-            else:
-                print(
-                    f"serving: vLLM build has no max_num_batched_tokens arg; {self.base_model} "
-                    "may fail if its attention block size exceeds the default scheduler budget",
-                    flush=True,
-                )
-        # moe_backend: optional fused-MoE backend override. Current 35B validation PASSED
-        # only with this unset/auto; keep the forwarding path for future canaries and emergency
-        # overrides, but do not set it in the catalog unless real-GPU validation proves the value.
-        if overrides.get("moe_backend"):
-            if _arg_supported("moe_backend"):
-                _extra["moe_backend"] = str(overrides["moe_backend"])
-            else:
-                print(
-                    f"serving: vLLM build has no moe_backend arg; {self.base_model} FP8 MoE + LoRA "
-                    "may crash-loop (needs vLLM>=0.19, or set quantization=None for bf16 weights)",
-                    flush=True,
-                )
-        engine_args = AsyncEngineArgs(
-            model=_served_model,
-            trust_remote_code=cfg.TRUST_REMOTE_CODE,
-            dtype=cfg.DTYPE,
-            # FP8 weights: ONLINE E4M3 quant of the bf16 base (default), or auto-detected from a
-            # pre-quantized serve_model_id checkpoint (then _quant_default is None). `overrides.get` returns
-            # the override's value even when it is None, so a base can also opt out to bf16 explicitly
-            # (the documented 35B H200 fallback). See settings.QUANTIZATION / model_config.serve_model_for.
-            quantization=overrides.get("quantization", _quant_default),
-            # FP8 KV cache (E4M3) for every base, including pre-quant checkpoints and explicit bf16
-            # fallbacks: ~half the KV VRAM, LoRA/MoE-safe. See settings.KV_CACHE_DTYPE.
-            # calculate_kv_scales stays off (default) on purpose.
-            kv_cache_dtype=overrides.get("kv_cache_dtype", cfg.KV_CACHE_DTYPE),
-            tensor_parallel_size=cfg.TENSOR_PARALLEL_SIZE,
-            gpu_memory_utilization=overrides.get(
-                "gpu_memory_utilization", cfg.GPU_MEMORY_UTILIZATION
-            ),
-            max_model_len=overrides.get("max_model_len", cfg.MAX_MODEL_LEN),
-            # CUDA graphs default ON (disabling them measured -31% throughput), but a per-model
-            # override can disable them — the 35B MoE's CUDA-graph capture (specialize_lora over many
-            # sizes) costs ~20+ GiB and tips the LoRA-module creation into OOM.
-            enforce_eager=bool(overrides.get("enforce_eager", False)),
-            enable_lora=True,
-            max_loras=_max_loras,
-            max_lora_rank=overrides.get("max_lora_rank", cfg.MAX_LORA_RANK),
-            max_cpu_loras=cfg.MAX_CPU_LORAS,
-            **_extra,
-            **cfg.vllm_engine_kwargs(),
-        )
-        self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+        self._pin_loras = pin_loras_default(overrides, cfg)
+        kwargs = engine_args_for(self.base_model, overrides, cfg)
+        self.reasoning_parser = kwargs.get("reasoning_parser")
+        self.engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**kwargs))
         # No in-engine kernel-patching hook runs here (2026-07-05 35B outage post-mortem): under
         # vLLM V1 the model executes in a SEPARATE EngineCore process, so patching this process's
         # vLLM classes never reaches the running model — and a prior attempt's extra CUDA context +

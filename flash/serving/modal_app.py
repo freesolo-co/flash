@@ -253,11 +253,12 @@ app = modal.App(APP_NAME, image=image)
 hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
 
-# ``_LoraEngineImpl`` and its stateless helpers live in the ``src.lora_engine`` module (kept free of
-# any ``modal`` import so it registers nothing, and under ``src/`` so the image's
-# ``add_local_dir(src)`` ships it to the remote container), re-exported here so ``_build_engine`` can
-# subclass the impl and modal_app's historical ``from modal_app import _*`` surface is unchanged.
-from flash.serving.src.lora_engine import (  # noqa: E402
+# ``_LoraEngineImpl`` lives in the ``src.lora_engine`` module (kept free of any ``modal`` import so
+# it registers nothing, and under ``src/`` so the image's ``add_local_dir(src)`` ships it to the
+# remote container), re-exported here so ``_build_engine`` can subclass it.
+# Its stateless helpers live in ``src.engine_support``; re-exported so modal_app's historical
+# ``from modal_app import _*`` surface is unchanged.
+from flash.serving.src.engine_support import (  # noqa: E402
     _RESERVED_CHAT_TEMPLATE_KWARGS,  # noqa: F401
     _adapter_cache_ready,  # noqa: F401
     _adapter_source_cache_dir,  # noqa: F401
@@ -266,11 +267,11 @@ from flash.serving.src.lora_engine import (  # noqa: E402
     _engine_is_dead,  # noqa: F401
     _is_adapter_tensor_file,  # noqa: F401
     _load_adapters_for_base,  # noqa: F401
-    _LoraEngineImpl,
     _num_cached_tokens,  # noqa: F401
     _safe_chat_template_kwargs,  # noqa: F401
     _stream_text_delta,  # noqa: F401
 )
+from flash.serving.src.lora_engine import _LoraEngineImpl  # noqa: E402
 
 # ---- One Modal LoraEngine class per GPU tier -----------------------------------------------------
 # model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for

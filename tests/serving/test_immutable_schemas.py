@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from flash.serving.src.schemas import AdapterRecord, ImmutableAdapterRegistration, PersistedAdapterRecord
+from flash.serving.src.schemas import (
+    AdapterRecord,
+    ImmutableAdapterRegistration,
+    PersistedAdapterRecord,
+)
 
 SHA = "a" * 40
 RUN_ID = "flash-1234567890-abcdef12"

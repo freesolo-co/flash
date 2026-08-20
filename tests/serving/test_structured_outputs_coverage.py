@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import pytest
 
-from flash.serving.src.structured_outputs import StructuredOutputsError, normalize_structured_outputs
+from flash.serving.src.structured_outputs import (
+    StructuredOutputsError,
+    normalize_structured_outputs,
+)
 
 
 def test_choice_tuple_normalizes_to_list() -> None:

@@ -1,11 +1,12 @@
-"""FP8 wiring is structural, so lock exact engine-arg expressions by parsing the source.
+"""FP8 wiring is structural, so pin what the engine is actually built with.
 
-Functional tests execute ``_load()`` with a vLLM stub; this file keeps AST-level guards around the
-AsyncEngineArgs call so quantization/KV-cache settings stay overridable per model and
-calculate_kv_scales stays off.
+``engine_boot.engine_args_for`` returns the AsyncEngineArgs kwargs as a plain dict, so these assert
+the resolved values for a real catalog model rather than matching source text: quantization and KV
+cache stay overridable per model, calculate_kv_scales stays off, and a build-specific arg is
+forwarded only when this vLLM exposes it.
 
-The engine (``_LoraEngineImpl._load`` and its AsyncEngineArgs wiring) lives in the
-``src.lora_engine`` module; the image-level ``VLLM_*`` env still lives in ``modal_app.py``.
+The image-level ``VLLM_*`` env still lives in ``modal_app.py`` and is pinned by source below,
+because it is literal image configuration with no function to call.
 """
 
 from __future__ import annotations
@@ -13,108 +14,109 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 MODAL_APP = Path(__file__).resolve().parents[2] / "flash" / "serving" / "modal_app.py"
-LORA_ENGINE = Path(__file__).resolve().parents[2] / "flash" / "serving" / "src" / "lora_engine.py"
+
+# Every catalog model currently ships a pre-quantized serve_model_id, so the online-quantization
+# default is exercised by clearing it rather than by picking a different model.
+MODEL = "Qwen/Qwen3.5-4B"
 
 
-def _engine_args_call() -> ast.Call:
-    tree = ast.parse(LORA_ENGINE.read_text())
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "AsyncEngineArgs"
-        ):
-            return node
-    raise AssertionError("AsyncEngineArgs(...) call not found in lora_engine.py")
+@pytest.fixture
+def engine_args():
+    """``engine_args_for`` for a catalog model, with ad-hoc override tweaks applied on top.
+
+    The conftest installs the vLLM stub at import, so this resolves against the same
+    ``AsyncEngineArgs`` field set the engine would see on a build missing newer args.
+    """
+    from flash.serving.src import settings as cfg
+    from flash.serving.src.engine_boot import engine_args_for
+    from flash.serving.src.model_config import engine_overrides_for
+
+    def _for(model: str, **overrides):
+        resolved = {**engine_overrides_for(model), **overrides}
+        return engine_args_for(model, resolved, cfg)
+
+    return _for
 
 
-def _kwargs(call: ast.Call) -> dict[str, ast.expr]:
-    return {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
+def test_engine_args_wires_fp8_weights_and_kv(engine_args) -> None:
+    from flash.serving.src import settings as cfg
+
+    # FP8 weights: with no pre-quantized checkpoint the base is online-quantized to cfg.QUANTIZATION
+    # and serves itself.
+    kwargs = engine_args(MODEL, serve_model_id=None)
+    assert kwargs["quantization"] == cfg.QUANTIZATION
+    assert kwargs["model"] == MODEL
+    # FP8 KV cache, default cfg.KV_CACHE_DTYPE.
+    assert kwargs["kv_cache_dtype"] == cfg.KV_CACHE_DTYPE
 
 
-def _is_ov_get_defaulting_to(value: ast.expr, *, cfg_attr: str) -> bool:
-    """True if ``value`` is ``overrides.get("<key>", cfg.<cfg_attr>)`` — a per-model override that
-    falls back to the baked-in global. Using ``.get`` (not ``in``) is what lets a model override
-    the value to ``None`` for pre-quantized checkpoint auto-detection or an explicit bf16 fallback."""
-    if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)):
-        return False
-    if value.func.attr != "get" or not isinstance(value.func.value, ast.Name):
-        return False
-    if value.func.value.id != "overrides" or len(value.args) != 2:
-        return False
-    default = value.args[1]
-    return (
-        isinstance(default, ast.Attribute)
-        and default.attr == cfg_attr
-        and isinstance(default.value, ast.Name)
-        and default.value.id == "cfg"
-    )
+def test_prequantized_base_passes_no_quantization(engine_args) -> None:
+    # A pre-quantized serve_model_id checkpoint is served directly and vLLM auto-detects its FP8, so
+    # passing quantization on top would re-quantize an already-quantized checkpoint.
+    kwargs = engine_args(MODEL)
+    assert kwargs["model"] == "Freesolo-Co/Qwen3.5-4B-FP8"
+    assert kwargs["quantization"] is None
 
 
-def _is_ov_get_of(value: ast.expr, key: str) -> bool:
-    """True if ``value`` is ``overrides.get("<key>", ...)`` — a per-model override lookup (any default)."""
-    return (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Attribute)
-        and value.func.attr == "get"
-        and isinstance(value.func.value, ast.Name)
-        and value.func.value.id == "overrides"
-        and len(value.args) == 2
-        and isinstance(value.args[0], ast.Constant)
-        and value.args[0].value == key
-    )
+def test_a_model_can_opt_out_to_bf16_explicitly(engine_args) -> None:
+    # `.get` (not a truthiness test) is load-bearing: a model overriding quantization to None must
+    # reach vLLM as None (the documented 35B H200 bf16 fallback), not fall back to the global FP8
+    # default. serve_model_id is cleared first, or the default would already be None and this could
+    # not tell the two apart.
+    from flash.serving.src import settings as cfg
+
+    assert engine_args(MODEL, serve_model_id=None)["quantization"] == cfg.QUANTIZATION
+    opted_out = engine_args(MODEL, serve_model_id=None, quantization=None)
+    assert opted_out["quantization"] is None
 
 
-def test_engine_args_wires_fp8_weights_and_kv() -> None:
-    kwargs = _kwargs(_engine_args_call())
-    src = LORA_ENGINE.read_text()
-    # FP8 weights: quantization is a per-model override lookup. Its default (_quant_default) is None
-    # for a pre-quant serve_model_id base (vLLM auto-detects the checkpoint's FP8) else cfg.QUANTIZATION.
-    assert "quantization" in kwargs, "engine must pass quantization (FP8)"
-    assert _is_ov_get_of(kwargs["quantization"], "quantization")
-    assert '_quant_default = None if overrides.get("serve_model_id") else cfg.QUANTIZATION' in src
-    # The served checkpoint is serve_model_id when set, else the base model.
-    assert '_served_model = overrides.get("serve_model_id") or self.base_model' in src
-    assert _engine_arg_is_name(kwargs.get("model"), "_served_model")
-    # FP8 KV cache, default cfg.KV_CACHE_DTYPE (unchanged shape).
-    assert "kv_cache_dtype" in kwargs, "engine must pass kv_cache_dtype (FP8)"
-    assert _is_ov_get_defaulting_to(kwargs["kv_cache_dtype"], cfg_attr="KV_CACHE_DTYPE")
-
-
-def _engine_arg_is_name(value: ast.expr | None, name: str) -> bool:
-    return isinstance(value, ast.Name) and value.id == name
-
-
-def test_engine_never_enables_calculate_kv_scales() -> None:
+def test_engine_never_enables_calculate_kv_scales(engine_args) -> None:
     # Warmup-estimated KV scales corrupt the Qwen3 GDN-hybrid's recurrent state — uncalibrated
     # dynamic e4m3 is the safe path, so the flag must never be passed to the engine.
-    assert "calculate_kv_scales" not in _kwargs(_engine_args_call()), (
+    assert "calculate_kv_scales" not in engine_args(MODEL), (
         "do not pass calculate_kv_scales — it corrupts the GDN-hybrid KV scales"
     )
 
 
-def test_moe_backend_override_is_guarded() -> None:
+def test_moe_backend_override_is_guarded(engine_args, monkeypatch, capsys) -> None:
     # The catalog currently leaves the 35B MoE backend unset/auto, but the engine keeps a guarded
     # forwarding path for future canaries or emergency overrides. It must never crash an older build
-    # on an unknown kwarg — same guard as language_model_only.
-    src = LORA_ENGINE.read_text()
-    assert '_extra["moe_backend"]' in src
-    assert '_arg_supported("moe_backend")' in src
+    # on an unknown kwarg.
+    assert engine_args(MODEL, moe_backend="triton")["moe_backend"] == "triton"
+
+    monkeypatch.setattr("flash.serving.src.engine_boot._async_engine_arg_names", lambda _t: set())
+    assert "moe_backend" not in engine_args(MODEL, moe_backend="triton")
+    assert "no moe_backend arg" in capsys.readouterr().out
 
 
-def test_max_num_batched_tokens_override_is_guarded() -> None:
+def test_max_num_batched_tokens_override_is_guarded(engine_args, monkeypatch, capsys) -> None:
     # The 35B needs max_num_batched_tokens=4096 because its attention block size (2096 tokens)
     # exceeds vLLM's 2048 default. Forward it only when this AsyncEngineArgs build exposes the field.
-    src = LORA_ENGINE.read_text()
-    assert '_extra["max_num_batched_tokens"]' in src
-    assert '_arg_supported("max_num_batched_tokens")' in src
+    assert engine_args(MODEL, max_num_batched_tokens=4096)["max_num_batched_tokens"] == 4096
+
+    monkeypatch.setattr("flash.serving.src.engine_boot._async_engine_arg_names", lambda _t: set())
+    assert "max_num_batched_tokens" not in engine_args(MODEL, max_num_batched_tokens=4096)
+    assert "no max_num_batched_tokens arg" in capsys.readouterr().out
 
 
-def test_reasoning_parser_forwarding_fails_closed_on_incompatible_vllm() -> None:
-    src = LORA_ENGINE.read_text()
-    assert '_extra["reasoning_parser"] = self.reasoning_parser' in src
-    assert "_require_reasoning_api_compatibility(" in src
+def test_reasoning_parser_forwarding_fails_closed_on_incompatible_vllm(
+    engine_args, monkeypatch
+) -> None:
+    assert engine_args(MODEL, reasoning_parser="qwen3")["reasoning_parser"] == "qwen3"
+    # An unset parser must not be forwarded at all, so an older build never sees the kwarg.
+    assert "reasoning_parser" not in engine_args(MODEL, reasoning_parser=None)
+
+    def _incompatible(*_args, **_kwargs):
+        raise RuntimeError("vllm build cannot forward reasoning_parser")
+
+    monkeypatch.setattr(
+        "flash.serving.src.engine_boot._require_reasoning_api_compatibility", _incompatible
+    )
+    with pytest.raises(RuntimeError):
+        engine_args(MODEL, reasoning_parser="qwen3")
 
 
 def test_image_keeps_deepgemm_out_of_moe_backend_race() -> None:

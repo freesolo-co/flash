@@ -6,12 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.serving.src.lora_engine import (
+from flash.serving.src.engine_support import (
     _adapter_source_cache_dir,
     _adapter_source_ident,
     _load_adapters_for_base,
-    _LoraEngineImpl,
 )
+from flash.serving.src.lora_engine import _LoraEngineImpl
 from flash.serving.src.registry import AdapterRegistry
 from flash.serving.src.schemas import AdapterRecord
 

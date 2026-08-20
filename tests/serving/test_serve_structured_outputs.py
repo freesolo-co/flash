@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from flash.serving.src.lora_engine import _require_reasoning_api_compatibility
+from flash.serving.src.engine_support import _require_reasoning_api_compatibility
 from flash.serving.src.model_config import reasoning_parser_for
 from flash.serving.src.registry import AdapterRegistry
 from flash.serving.src.schemas import AdapterRecord
