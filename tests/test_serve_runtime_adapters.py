@@ -145,7 +145,11 @@ def test_generations_on_one_incarnation_run_concurrently(adapter_dir: Path) -> N
         await asyncio.gather(generation("first"), generation("second"))
 
     asyncio.run(exercise())
-    assert order == ["first:enter", "second:enter", "first:exit", "second:exit"]
+    # both entered before either exited: that is the overlap, and it is what a serializing gate
+    # cannot produce. the order the two then wake in is an asyncio scheduling detail that differs
+    # between interpreter versions, so only the enter/exit split is pinned.
+    assert set(order[:2]) == {"first:enter", "second:enter"}
+    assert set(order[2:]) == {"first:exit", "second:exit"}
 
 
 def test_eviction_waits_for_inflight_generations(adapter_dir: Path) -> None:
