@@ -18,6 +18,7 @@ from flash.serving.src.engine_errors import (
     value_error_http,
 )
 from flash.serving.src.http_headers import _bearer_token, assert_internal, is_trusted_internal
+from flash.serving.src.lookup import AdapterLookup
 from flash.serving.src.model_config import gpu_for, is_supported_base_model
 from flash.serving.src.registration import persist_revision
 from flash.serving.src.responses import (
@@ -146,7 +147,9 @@ def build_serving_app(
         title="Freesolo LoRA Serving (multi base model)", version="0.2.0", lifespan=_lifespan
     )
 
-    last_reload: dict[str, Any] = {"at": float("-inf"), "task": None}
+    _lookup_state = AdapterLookup(
+        router, reload_records, reload_interval_seconds=reload_interval_seconds
+    )
     _usage = UsageReporter(
         usage_reporter,
         deployment_id=deployment_id,
@@ -198,55 +201,17 @@ def build_serving_app(
         return terminating_on_engine_error(router, events, adapter_id)
 
     async def _reload() -> None:
-        # to_thread: reload_records is a sync Supabase call; don't block the event loop.
-        assert reload_records is not None
-        records = await asyncio.to_thread(reload_records)
-        router.hydrate(records)
-        last_reload["at"] = time.monotonic()
-
-    async def _reload_safe() -> None:
-        try:
-            await _reload()
-        except Exception as exc:  # background refresh cannot fail a cached hit
-            print(f"adapter background refresh skipped: {exc!r}", flush=True)
-
-    def _schedule_reload() -> None:
-        task = last_reload.get("task")
-        if task is not None and not task.done():
-            return
-        last_reload["task"] = asyncio.create_task(_reload_safe())
+        await _lookup_state.reload()
 
     async def _lookup(
         adapter_id: str, *, require_supported_base_model: bool = True
     ) -> tuple[AdapterRecord, AdapterRecord]:
-        resolved = router.resolve(adapter_id)
-        age = time.monotonic() - last_reload["at"]
-        stale = resolved is not None and age >= reload_interval_seconds
-        if stale and reload_records is not None:
-            _schedule_reload()
-        if resolved is None and reload_records is not None:
-            await _reload()
-            resolved = router.resolve(adapter_id)
-        if resolved is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-        if require_supported_base_model:
-            _assert_supported_base_model(resolved[1].base_model)
-        return resolved
+        return await _lookup_state.resolve(
+            adapter_id, require_supported_base_model=require_supported_base_model
+        )
 
     async def _lookup_exact(adapter_id: str) -> AdapterRecord:
-        record = router.get(adapter_id)
-        age = time.monotonic() - last_reload["at"]
-        cached_ready = record is not None and record.status == "ready"
-        if cached_ready and age >= reload_interval_seconds and reload_records is not None:
-            _schedule_reload()
-        if not cached_ready and reload_records is not None:
-            await _reload()
-            record = router.get(adapter_id)
-        if record is None or record.status != "ready":
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-        if not record.serve_base_model and not (record.is_alias or record.is_revision):
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-        return record
+        return await _lookup_state.get_exact(adapter_id)
 
     @api.get("/healthz", tags=["system"])
     async def healthz() -> dict[str, Any]:

@@ -1,0 +1,85 @@
+"""Adapter lookup with a bounded background refresh.
+
+Split out of router.py's app builder. Owns the reload bookkeeping the app factory used to hold as
+a bare dict: when the router last rehydrated, and the in-flight refresh task.
+
+A container that missed a (un)registration performed on another container still has to resolve the
+adapter, so a miss reloads once before 404-ing, and a hit reloads at most once per interval in the
+background.
+"""
+
+import asyncio
+import time
+from typing import Any
+
+from fastapi import HTTPException, status
+
+from flash.serving.src.routing import AdapterRouter
+from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.serving_io import _assert_supported_base_model
+
+
+class AdapterLookup:
+    def __init__(
+        self,
+        router: AdapterRouter,
+        reload_records: Any = None,
+        *,
+        reload_interval_seconds: float = 30.0,
+    ) -> None:
+        self._router = router
+        self._reload_records = reload_records
+        self._reload_interval_seconds = reload_interval_seconds
+        self._last_reload: dict[str, Any] = {"at": float("-inf"), "task": None}
+
+    async def reload(self) -> None:
+        # to_thread: reload_records is a sync Supabase call; don't block the event loop.
+        assert self._reload_records is not None
+        records = await asyncio.to_thread(self._reload_records)
+        self._router.hydrate(records)
+        self._last_reload["at"] = time.monotonic()
+
+    async def _reload_safe(self) -> None:
+        try:
+            await self.reload()
+        except Exception as exc:  # background refresh cannot fail a cached hit
+            print(f"adapter background refresh skipped: {exc!r}", flush=True)
+
+    def _schedule_reload(self) -> None:
+        task = self._last_reload.get("task")
+        if task is not None and not task.done():
+            return
+        self._last_reload["task"] = asyncio.create_task(self._reload_safe())
+
+    def _is_stale(self) -> bool:
+        return time.monotonic() - self._last_reload["at"] >= self._reload_interval_seconds
+
+    async def resolve(
+        self, adapter_id: str, *, require_supported_base_model: bool = True
+    ) -> tuple[AdapterRecord, AdapterRecord]:
+        resolved = self._router.resolve(adapter_id)
+        stale = resolved is not None and self._is_stale()
+        if stale and self._reload_records is not None:
+            self._schedule_reload()
+        if resolved is None and self._reload_records is not None:
+            await self.reload()
+            resolved = self._router.resolve(adapter_id)
+        if resolved is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+        if require_supported_base_model:
+            _assert_supported_base_model(resolved[1].base_model)
+        return resolved
+
+    async def get_exact(self, adapter_id: str) -> AdapterRecord:
+        record = self._router.get(adapter_id)
+        cached_ready = record is not None and record.status == "ready"
+        if cached_ready and self._is_stale() and self._reload_records is not None:
+            self._schedule_reload()
+        if not cached_ready and self._reload_records is not None:
+            await self.reload()
+            record = self._router.get(adapter_id)
+        if record is None or record.status != "ready":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+        if not record.serve_base_model and not (record.is_alias or record.is_revision):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+        return record
