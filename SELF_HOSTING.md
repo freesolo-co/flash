@@ -359,22 +359,37 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Serving
 
-`flash serve setup` generates a self-hosted Modal backend for one catalog base model and many LoRA
-adapters. Deploy one app per base model. Training and export remain independent of serving. Catalog
-serving checkpoint repositories are informational only and are never resolved by the training path.
+`flash serve deploy` provisions serving in **your own** Modal or RunPod account, running the
+published worker image against one base model and one run's adapter. Training and export remain
+independent of serving. Catalog serving checkpoint repositories are informational only and are never
+resolved by the training path.
 
 ```bash
-pip install 'freesolo-flash[serve-modal]'
-modal setup
-export FREESOLO_INTERNAL_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
-modal secret create flash-serving HF_TOKEN=hf_... \
-  FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"
-flash serve setup --model Qwen/Qwen3.5-4B
+pip install freesolo-flash
+export HF_TOKEN=hf_...
+export FLASH_SERVING_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+
+# modal: `modal token new` writes these, or set them directly
+export MODAL_TOKEN_ID=... MODAL_TOKEN_SECRET=...
+
+flash serve deploy \
+  --provider modal \
+  --model Qwen/Qwen3.5-4B \
+  --run <run-id> \
+  --deployment-id my-4b-serving \
+  --image ghcr.io/freesolo-co/flash-serve@sha256:<digest> \
+  --artifact-repo <hub-repo> \
+  --artifact-subfolder <path-within-repo> \
+  --lora-rank 32
 ```
 
-`serve-modal` installs Modal and FastAPI so the generated file can be discovered locally. The GPU
-image installs the exact matching `serve-runtime` package. The Modal secret must contain both
-`HF_TOKEN` and `FLASH_SERVING_KEY`; the generated app fails closed without either one.
+For RunPod, pass `--provider runpod` and export `RUNPOD_API_KEY` instead.
+
+Provider credentials are read from the process environment for the duration of a single call and are
+never written to the deployment record, logs, or command arguments — so any later resize or teardown
+requires exporting them again. `--image` must be digest-qualified (`name@sha256:...`) so the
+deployment is pinned to an exact immutable image. Add `--dry-run` to resolve and validate every
+input, including the adapter's provenance, without provisioning anything or incurring cost.
 
 Set the printed URL and the same generated key in the **`flash-server` process environment**, then
 restart the server:
@@ -385,8 +400,8 @@ export FREESOLO_INTERNAL_KEY=<the FLASH_SERVING_KEY value>
 flash-server --host 0.0.0.0 --port 8080
 ```
 
-The shared runtime supports bounded multimodal preparation. The generated reference wrapper remains
-text-only and returns `400` for image-bearing requests until that wrapper is wired and GPU-validated.
+The shared runtime supports bounded multimodal preparation. The packaged serving app remains
+text-only and returns `400` for image-bearing requests until that path is wired and GPU-validated.
 
 Standalone serving commands refuse an unset or Freesolo-hosted serving URL so the plane never sends
 its root key to infrastructure you do not operate. Any other compatible backend is allowed. See

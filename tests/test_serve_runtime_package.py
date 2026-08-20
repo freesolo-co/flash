@@ -11,8 +11,8 @@ from pathlib import Path
 from flash.engine.worker.backend_common import TRANSFORMERS_REQUIREMENT
 
 ROOT = Path(__file__).resolve().parents[1]
-# the generated self-hosted app is rendered from this resource at runtime, so a wheel that omits it
-# leaves `flash serve setup` broken on every install that is not an editable checkout.
+# the packaged serving app runs from these modules, so a wheel that omits them leaves
+# `flash serve deploy` broken on every install that is not an editable checkout.
 CONTROL_FILES = {
     "flash/serve/control/__init__.py",
     "flash/serve/control/_canonical.py",

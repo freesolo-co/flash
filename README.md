@@ -33,10 +33,10 @@ point of use; install it with `pip install freesolo`.
 
 Two components stay Freesolo-operated and are **not** in this repository:
 
-| Component                 | Where it lives                                                                     | Self-hosted equivalent                                                   |
-| ------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| Multi-tenant identity     | `api.freesolo.co`; verifies keys and owns projects/orgs                            | `FLASH_STANDALONE=1` runs single-tenant on your own key                  |
-| Hosted Multi-LoRA serving | `serve.freesolo.co`; `flash/serve/` owns the client, shared runtime, and generator | `flash serve setup` deploys a single-model backend to your Modal account |
+| Component                 | Where it lives                                                                                         | Self-hosted equivalent                                                      |
+| ------------------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
+| Multi-tenant identity     | `api.freesolo.co`; verifies keys and owns projects/orgs                                                | `FLASH_STANDALONE=1` runs single-tenant on your own key                     |
+| Hosted Multi-LoRA serving | `serve.freesolo.co`, deployed from `flash/serving/`; `flash/serve/` owns the client and shared runtime | `flash serve deploy` provisions serving in your own Modal or RunPod account |
 
 So there are three ways to use Flash: against the **hosted service**, **self-hosted** against
 your own GPU accounts, or as **training and provider code to read and modify**. The training
@@ -181,7 +181,8 @@ into `dev`**.
   SFT targets and RL rewards route through the active environment, so task-specific grading
   lives with the example, not in the engine
 - `flash/envs/` — environment registry and the Freesolo SDK adapter
-- `flash/serve/` — serving client, shared runtime, and generated Modal backend
+- `flash/serve/` — serving client, shared runtime, and customer-owned provider deployment
+- `flash/serving/` — the hosted multi-LoRA Modal app behind `serve.freesolo.co`
 - `flash/server/` — the FastAPI control plane (run via the separate `flash-server` command)
 - `tests/` — pytest suite, CPU-only and offline
 
@@ -217,7 +218,7 @@ External bearer tokens are rejected rather than accepted unverified. A standalon
 **single-tenant** — whoever holds that key can spend your GPU budget, so keep it off
 untrusted networks. See [the security model](SELF_HOSTING.md#the-security-model).
 
-`flash serve setup` deploys a serving backend to your own Modal account, implementing the
+`flash serve deploy` provisions serving in your own Modal or RunPod account, implementing the
 same contract `flash/serve/` speaks; [docs/serving-contract.md](docs/serving-contract.md)
 documents it if you would rather write your own.
 

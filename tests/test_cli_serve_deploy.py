@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import pathlib
+import re
+import tomllib
 
 import pytest
 
@@ -365,3 +368,44 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("flash.serve.resolve.resolve_adapter", _fake_resolve)
     monkeypatch.setattr("flash.serve.resolve.resolve_base_revision", _fake_base_revision)
+
+
+def test_self_hosting_docs_document_a_command_that_exists() -> None:
+    """The documented serving procedure must be runnable as written.
+
+    SELF_HOSTING.md previously walked operators through `flash serve setup` and a `serve-modal`
+    extra. Both are deleted, so anyone following that section installed a nonexistent extra and then
+    hit "invalid choice" on the first command -- a self-hosting doc that cannot be followed at all.
+    """
+    root = pathlib.Path(__file__).resolve().parents[1]
+    doc = (root / "SELF_HOSTING.md").read_text(encoding="utf-8")
+
+    extras = tomllib.loads((root / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]
+    for gone in ("flash serve setup", "serve-modal"):
+        assert gone not in doc, gone
+    assert "serve-modal" not in extras
+
+    # every flag the documented example passes must be one the parser actually accepts, and every
+    # required flag must appear -- otherwise the example fails at parse time.
+    example = doc.split("flash serve deploy \\")[1].split("```")[0]
+    documented = set(re.findall(r"--[a-z-]+", example))
+
+    parser = argparse.ArgumentParser()
+    _add_serve_commands(parser.add_subparsers(dest="cmd", required=True))
+    deploy = (
+        parser._subparsers._group_actions[0]
+        .choices["serve"]
+        ._subparsers._group_actions[0]
+        .choices["deploy"]
+    )
+    accepted = {option for action in deploy._actions for option in action.option_strings}
+    required = {
+        action.option_strings[0]
+        for action in deploy._actions
+        if action.required and action.option_strings
+    }
+
+    assert documented <= accepted, documented - accepted
+    assert required <= documented, required - documented

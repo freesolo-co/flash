@@ -392,8 +392,8 @@ def test_a_credentialed_loader_may_still_populate_a_cold_cache(
 ) -> None:
     """with a credential the loader must stay allowed to download.
 
-    the generated app from `flash serve setup` is the other consumer of this runtime. it starts
-    against an empty volume and fetches the base model with HF_TOKEN, so forcing local-only
+    the packaged app deployed by `flash serve deploy` is the other consumer of this runtime. it
+    starts against an empty volume and fetches the base model with HF_TOKEN, so forcing local-only
     unconditionally would make its very first start fail closed instead of populating the cache.
     """
 

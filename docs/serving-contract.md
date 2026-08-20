@@ -1,10 +1,11 @@
 # The Flash serving contract
 
 `flash models deploy`, `chat`, and `undeploy` use an HTTP serving backend. `flash/serve/` owns the
-client, shared runtime, and generated Modal backend. Freesolo's hosted backend is another
-implementation of this contract.
-A generated app serves one base model and many LoRA adapters. Use `flash serve setup` to create one,
-or implement these endpoints and run the conformance suite below.
+client, shared runtime, and customer-owned provider deployment. Freesolo's hosted backend
+(`flash/serving/`) is another implementation of this contract.
+A deployment serves one base model and its LoRA adapters. Use `flash serve deploy` to provision one
+in your own Modal or RunPod account, or implement these endpoints and run the conformance suite
+below.
 
 ## Identity model
 
@@ -141,7 +142,7 @@ Every successful response reports the exact revision, checkpoint, and Hugging Fa
   `choices[0].delta.content`, followed by `data: [DONE]`. Preserve stop handling and provenance headers.
   A cold adapter may return `503` with a top-level retryable `adapter_unavailable` /
   `adapter_loading` error envelope and a `Retry-After` header.
-  The shared runtime supports bounded multimodal preparation. The generated reference wrapper is
+  The shared runtime supports bounded multimodal preparation. The packaged serving app is
   intentionally text-only and returns `400` for image-bearing requests rather than answering without
   seeing the image.
 
@@ -158,7 +159,7 @@ Every successful response reports the exact revision, checkpoint, and Hugging Fa
 ```
 
 An unknown run returns `404`. After success, records are disabled or absent and chat no longer
-succeeds. The generated app performs cold undeploy without starting the GPU, deletes only
+succeeds. The packaged serving app performs cold undeploy without starting the GPU, deletes only
 `adapters/<digest>` cache paths, and returns a retryable failure if cache cleanup must be retried.
 Warm residents are unloaded later using the exact revision incarnation.
 
