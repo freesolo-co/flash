@@ -1,0 +1,126 @@
+"""hydrate or serve one externally bound immutable serving manifest."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import os
+import signal
+from collections.abc import Callable
+from contextlib import contextmanager
+from pathlib import Path
+
+from .bootstrap import bootstrap_serving
+from .http import create_app
+from .manifest import ServingManifest, load_serving_manifest
+from .materialize import hydrate_manifest, read_artifact_token_fd
+
+_MANIFEST_ENV = "FLASH_SERVING_MANIFEST"
+_MANIFEST_ID_ENV = "FLASH_SERVING_MANIFEST_ID"
+_IMAGE_DIGEST_ENV = "FLASH_SERVING_IMAGE_DIGEST"
+_CACHE_ROOT_ENV = "FLASH_SERVING_CACHE_ROOT"
+_INFERENCE_TOKEN_FD_ENV = "FLASH_INFERENCE_TOKEN_FD"
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="python -m flash.serve.app")
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+    for mode in ("hydrate", "serve"):
+        command = subparsers.add_parser(mode)
+        command.add_argument(
+            "--manifest",
+            default=os.environ.get(_MANIFEST_ENV, "/etc/flash/serving-manifest.json"),
+        )
+        command.add_argument(
+            "--cache-root",
+            default=os.environ.get(_CACHE_ROOT_ENV, "/var/lib/flash-serving"),
+        )
+    serve = subparsers.choices["serve"]
+    serve.add_argument("--host", default="0.0.0.0")
+    serve.add_argument("--port", type=int, default=8000)
+    return parser
+
+
+def _bound_manifest(path: str) -> ServingManifest:
+    manifest = load_serving_manifest(Path(path).read_bytes())
+    expected_manifest = os.environ.get(_MANIFEST_ID_ENV)
+    expected_image = os.environ.get(_IMAGE_DIGEST_ENV)
+    if expected_manifest != manifest.manifest_id:
+        raise RuntimeError("serving manifest id does not match its external binding")
+    if expected_image != manifest.expected_oci_digest:
+        raise RuntimeError("serving image digest does not match its external binding")
+    return manifest
+
+
+def _read_inference_token(fd: int | None = None) -> str:
+    if fd is None:
+        raw_fd = os.environ.get(_INFERENCE_TOKEN_FD_ENV)
+        if raw_fd is None or not raw_fd.isdecimal():
+            raise RuntimeError("inference token fd is not configured")
+        fd = int(raw_fd)
+    return read_artifact_token_fd(fd)
+
+
+async def _serve(
+    args: argparse.Namespace,
+    manifest: ServingManifest,
+    *,
+    inference_token_fd: int | None = None,
+    on_signals_installed: Callable[[], dict[int, object]] | None = None,
+) -> None:
+    import uvicorn
+
+    token = (
+        _read_inference_token()
+        if inference_token_fd is None
+        else _read_inference_token(inference_token_fd)
+    )
+    try:
+        bearer_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    finally:
+        token = ""
+    owner = await bootstrap_serving(manifest, args.cache_root)
+    try:
+        app = create_app(owner, bearer_digest=bearer_digest)
+        config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+        server = uvicorn.Server(config)
+        if on_signals_installed is not None:
+
+            @contextmanager
+            def capture_with_handoff():
+                startup_handlers = {
+                    signum: signal.signal(signum, server.handle_exit)
+                    for signum in uvicorn.server.HANDLED_SIGNALS
+                }
+                try:
+                    restore_handlers = on_signals_installed()
+                except BaseException:
+                    for signum, handler in startup_handlers.items():
+                        signal.signal(signum, handler)
+                    raise
+                try:
+                    yield
+                finally:
+                    for signum, handler in restore_handlers.items():
+                        signal.signal(signum, handler)
+                for captured_signal in reversed(server._captured_signals):
+                    signal.raise_signal(captured_signal)
+
+            server.capture_signals = capture_with_handoff
+        await server.serve()
+    finally:
+        await owner.close()
+
+
+def main() -> None:
+    args = _parser().parse_args()
+    manifest = _bound_manifest(args.manifest)
+    if args.mode == "hydrate":
+        hydrate_manifest(manifest, args.cache_root)
+        return
+    asyncio.run(_serve(args, manifest))
+
+
+if __name__ == "__main__":
+    main()

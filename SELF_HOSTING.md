@@ -359,31 +359,39 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Serving
 
-`flash/serve/` is a **client** for a multi-LoRA serving app (a Modal app that serves every
-adapter on one GPU per base model, scaling to zero when idle). This repository does not
-include that serving backend.
+`flash serve setup` generates a self-hosted Modal backend for one catalog base model and many LoRA
+adapters. Deploy one app per base model. Training and export remain independent of serving. Catalog
+serving checkpoint repositories are informational only and are never resolved by the training path.
 
-Training, checkpoint streaming, and adapter export are fully self-hostable and do not
-depend on it. Your trained adapters land in your own HuggingFace repos and can be served
-by any stack that loads LoRA adapters - vLLM, TGI, or your own. Point `FREESOLO_SERVING_URL`
-at a compatible deployment if you want `flash models deploy` and `flash models chat` to work
-end to end.
+```bash
+pip install 'freesolo-flash[serve-modal]'
+modal setup
+export FREESOLO_INTERNAL_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+modal secret create flash-serving HF_TOKEN=hf_... \
+  FLASH_SERVING_KEY="$FREESOLO_INTERNAL_KEY"
+flash serve setup --model Qwen/Qwen3.5-4B
+```
 
-On a standalone plane those three commands **error out** until you point it at a backend
-you operate. Every serving request carries `FREESOLO_INTERNAL_KEY`, and on your plane that
-key is what grants full control of it - so reaching Freesolo's serving app would hand your
-plane's credential to a service you do not run. Export the adapter and serve it yourself if
-you do not have a compatible backend.
+`serve-modal` installs Modal and FastAPI so the generated file can be discovered locally. The GPU
+image installs the exact matching `serve-runtime` package. The Modal secret must contain both
+`HF_TOKEN` and `FLASH_SERVING_KEY`; the generated app fails closed without either one.
 
-Setting it to a Freesolo-hosted URL is refused exactly like leaving it unset: a value copied
-from a managed `.env` is the likelier way to end up there, so both paths raise rather than
-only the fallback. Any other host, including `localhost`, is yours to use.
+Set the printed URL and the same generated key in the **`flash-server` process environment**, then
+restart the server:
 
-The catalog reports a `serving.serve_model_id` per model - the pre-quantized FP8 checkpoint
-Freesolo's serving app loads, and most of those repos are private. They are **informational
-only**: nothing in the training path reads them, so they cannot block a run. If you stand up
-your own serving backend, quantize the base model yourself (or serve it unquantized) rather
-than expecting to pull those repo names.
+```bash
+export FREESOLO_SERVING_URL=https://<your-app>.modal.run
+export FREESOLO_INTERNAL_KEY=<the FLASH_SERVING_KEY value>
+flash-server --host 0.0.0.0 --port 8080
+```
+
+The shared runtime supports bounded multimodal preparation. The generated reference wrapper remains
+text-only and returns `400` for image-bearing requests until that wrapper is wired and GPU-validated.
+
+Standalone serving commands refuse an unset or Freesolo-hosted serving URL so the plane never sends
+its root key to infrastructure you do not operate. Any other compatible backend is allowed. See
+[docs/serving-contract.md](docs/serving-contract.md) for the normative endpoints and conformance
+command.
 
 ## The worker image
 

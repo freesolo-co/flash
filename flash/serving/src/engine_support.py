@@ -211,7 +211,6 @@ def _engine_is_dead(engine: Any) -> bool:
     return bool(engine is not None and getattr(engine, "errored", False))
 
 
-
 def active_checkpoint_ref(record: Any) -> str:
     """Which checkpoint an adapter record is actually serving.
 

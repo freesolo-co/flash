@@ -5,7 +5,11 @@ from typing import Any, Literal
 
 import httpx
 
-from flash.serving.src.schemas import AdapterRecord, PersistedAdapterRecord, internal_adapter_payload
+from flash.serving.src.schemas import (
+    AdapterRecord,
+    PersistedAdapterRecord,
+    internal_adapter_payload,
+)
 from flash.serving.src.settings import ADAPTER_TABLE, Settings
 from flash.serving.src.supabase_rest import (
     postgrest_error,

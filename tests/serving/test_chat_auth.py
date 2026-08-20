@@ -184,7 +184,8 @@ def test_adapter_listing_is_gated_and_never_exposes_org_id() -> None:
     adapters = client.get("/adapters", headers={"X-Freesolo-Internal-Key": INTERNAL_KEY}).json()[
         "adapters"
     ]
-    assert adapters and all("org_id" not in a and "org_id" not in a for a in adapters)
+    assert adapters
+    assert all("org_id" not in a and "org_id" not in a for a in adapters)
     assert router.get("qa").org_id == "org-secret"
 
 

@@ -1,0 +1,354 @@
+"""authenticated FastAPI surface for one immutable packaged serving runtime."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import inspect
+import json
+from collections.abc import AsyncIterator
+from contextlib import suppress
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from flash.serve.runtime import (
+    AdapterNotFoundError,
+    EngineDeadError,
+    PromptError,
+    RuntimeConfigurationError,
+    RuntimeNotReadyError,
+    ServingRuntimeError,
+    StreamDelta,
+    StreamFinished,
+    StreamReady,
+)
+
+from .bootstrap import PublishedAdapter, ServingBootstrap
+from .openai import (
+    OpenAIRequestError,
+    ReasoningDeltaSplitter,
+    nonstream_response,
+    parse_chat_request,
+    provenance_headers,
+    provenance_payload,
+    sse_data,
+    stream_chunk,
+    usage_stream_chunk,
+)
+
+# 16 mib of compressed images expands below 22 mib in base64, leaving over 2 mib for json and text.
+_MAX_CHAT_REQUEST_BYTES = 24 * 1024 * 1024
+_REJECTED_AUTH_DIGEST = hashlib.sha256(b"flash-rejected-authorization").digest()
+
+
+class _RequestBodyTooLarge(ValueError):
+    """the observed request body exceeded the application byte ceiling."""
+
+
+class _HttpState:
+    __slots__ = ("auth_digest", "bootstrap")
+
+    def __init__(self, bootstrap: ServingBootstrap, auth_digest: bytes) -> None:
+        self.bootstrap = bootstrap
+        self.auth_digest = auth_digest
+
+
+def create_app(
+    bootstrap: ServingBootstrap,
+    *,
+    bearer_token: str | None = None,
+    bearer_digest: str | None = None,
+) -> FastAPI:
+    """create an app retaining only the credential digest and immutable bootstrap owner."""
+
+    digest = _auth_digest(bearer_token=bearer_token, bearer_digest=bearer_digest)
+    state = _HttpState(bootstrap, digest)
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        ok = state.bootstrap.ready
+        return JSONResponse({"ok": ok}, status_code=200 if ok else 503)
+
+    @app.get("/v1/models")
+    async def models(request: Request) -> JSONResponse:
+        unauthorized = _authorize(request, state)
+        if unauthorized is not None:
+            return unauthorized
+        if not state.bootstrap.ready:
+            return _error(503, "service_unavailable", "serving runtime is not ready")
+        data = []
+        for model_id in sorted(state.bootstrap.models):
+            resolved = state.bootstrap.models[model_id]
+            data.append(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "owned_by": "flash",
+                    "flash_provenance": provenance_payload(state.bootstrap.manifest, resolved),
+                }
+            )
+        return JSONResponse({"object": "list", "data": data})
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request):
+        unauthorized = _authorize(request, state)
+        if unauthorized is not None:
+            return unauthorized
+        if not state.bootstrap.ready:
+            return _error(503, "service_unavailable", "serving runtime is not ready")
+        try:
+            payload = _strict_json(await _read_request_body(request))
+        except _RequestBodyTooLarge:
+            return _error(413, "request_too_large", "request body exceeds the byte limit")
+        except ValueError:
+            return _error(400, "invalid_json", "request body is not valid json")
+        if type(payload) is not dict:
+            return _error(422, "invalid_request", "request body must be an object")
+        model = payload.get("model")
+        if type(model) is not str or not model:
+            return _error(422, "invalid_request", "model is required")
+        resolved = state.bootstrap.resolve(model)
+        if resolved is None:
+            return _error(404, "model_not_found", "requested model is not deployed")
+        try:
+            parsed = parse_chat_request(payload, resolved)
+        except (OpenAIRequestError, PromptError, RuntimeConfigurationError, ValueError):
+            return _error(422, "invalid_request", "request validation failed")
+        provenance = provenance_payload(state.bootstrap.manifest, resolved)
+        headers = provenance_headers(provenance)
+        if not parsed.stream:
+            try:
+                result = await state.bootstrap.runtime.generate(parsed.generation)
+            except AdapterNotFoundError:
+                return _error(404, "model_not_found", "requested model is not deployed")
+            except (PromptError, RuntimeConfigurationError):
+                return _error(400, "invalid_request", "generation request was rejected")
+            except (EngineDeadError, RuntimeNotReadyError, ServingRuntimeError):
+                return _error(503, "service_unavailable", "generation service is unavailable")
+            except Exception:
+                return _error(503, "service_unavailable", "generation service is unavailable")
+            if (
+                result.adapter_id != resolved.adapter_revision
+                or result.incarnation != resolved.incarnation
+                or result.thinking != resolved.adapter.thinking_default
+                or result.finish_reason is None
+            ):
+                return _error(503, "service_unavailable", "generation identity is invalid")
+            return JSONResponse(
+                nonstream_response(result, state.bootstrap.manifest, resolved),
+                headers=headers,
+            )
+
+        event_stream = state.bootstrap.runtime.stream(parsed.generation)
+        try:
+            first = await anext(event_stream)
+        except AdapterNotFoundError:
+            await _close_iterator(event_stream)
+            return _error(404, "model_not_found", "requested model is not deployed")
+        except (PromptError, RuntimeConfigurationError):
+            await _close_iterator(event_stream)
+            return _error(400, "invalid_request", "generation request was rejected")
+        except (EngineDeadError, RuntimeNotReadyError, ServingRuntimeError, Exception):
+            await _close_iterator(event_stream)
+            return _error(503, "service_unavailable", "generation service is unavailable")
+        if (
+            type(first) is not StreamReady
+            or first.adapter_id != resolved.adapter_revision
+            or first.incarnation != resolved.incarnation
+            or first.thinking != resolved.adapter.thinking_default
+        ):
+            await _close_iterator(event_stream)
+            return _error(503, "service_unavailable", "generation stream did not become ready")
+        body = _stream_body(
+            event_stream,
+            first,
+            resolved,
+            provenance,
+            include_usage=parsed.include_usage,
+        )
+        return StreamingResponse(body, media_type="text/event-stream", headers=headers)
+
+    return app
+
+
+def _auth_digest(*, bearer_token: str | None, bearer_digest: str | None) -> bytes:
+    if (bearer_token is None) == (bearer_digest is None):
+        raise ValueError("provide exactly one bearer token or bearer digest")
+    if bearer_token is not None:
+        if type(bearer_token) is not str or not bearer_token:
+            raise ValueError("bearer token must be nonempty")
+        return hashlib.sha256(bearer_token.encode("utf-8")).digest()
+    assert bearer_digest is not None
+    if (
+        type(bearer_digest) is not str
+        or len(bearer_digest) != 64
+        or any(character not in "0123456789abcdef" for character in bearer_digest)
+    ):
+        raise ValueError("bearer digest must be an exact lowercase sha-256 digest")
+    return bytes.fromhex(bearer_digest)
+
+
+def _authorize(request: Request, state: _HttpState) -> JSONResponse | None:
+    headers = request.headers.getlist("authorization")
+    valid = False
+    candidate = _REJECTED_AUTH_DIGEST
+    if len(headers) == 1:
+        parts = headers[0].split(" ")
+        if (
+            len(parts) == 2
+            and parts[0].casefold() == "bearer"
+            and parts[1]
+            and not any(character.isspace() for character in parts[1])
+        ):
+            valid = True
+            candidate = hashlib.sha256(parts[1].encode("utf-8")).digest()
+    matched = hmac.compare_digest(candidate, state.auth_digest)
+    if valid and matched:
+        return None
+    return JSONResponse(
+        {"error": {"message": "authentication required", "type": "authentication_error"}},
+        status_code=401,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def _read_request_body(request: Request) -> bytes:
+    lengths = request.headers.getlist("content-length")
+    if len(lengths) == 1 and _decimal_exceeds_limit(lengths[0], _MAX_CHAT_REQUEST_BYTES):
+        raise _RequestBodyTooLarge
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > _MAX_CHAT_REQUEST_BYTES:
+            raise _RequestBodyTooLarge
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _decimal_exceeds_limit(value: str, limit: int) -> bool:
+    if not value.isdecimal():
+        return False
+    normalized = value.lstrip("0") or "0"
+    boundary = str(limit)
+    return len(normalized) > len(boundary) or (
+        len(normalized) == len(boundary) and normalized > boundary
+    )
+
+
+def _strict_json(raw: bytes) -> Any:
+    try:
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid json") from exc
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate json key")
+        result[key] = value
+    return result
+
+
+def _error(status: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"message": message, "type": "invalid_request_error", "code": code}},
+        status_code=status,
+    )
+
+
+async def _stream_body(
+    event_stream: AsyncIterator[Any],
+    ready: StreamReady,
+    resolved: PublishedAdapter,
+    provenance: dict[str, Any],
+    *,
+    include_usage: bool,
+) -> AsyncIterator[bytes]:
+    splitter = ReasoningDeltaSplitter(thinking=bool(ready.thinking))
+    finished: StreamFinished | None = None
+    succeeded = False
+    try:
+        yield sse_data(
+            stream_chunk(
+                request_id=ready.request_id,
+                model=resolved.requested_model,
+                delta={"role": "assistant", "content": ""},
+                provenance=provenance,
+            )
+        )
+        async for event in event_stream:
+            if type(event) is StreamDelta and finished is None:
+                for key, value in splitter.feed(event.text):
+                    yield sse_data(
+                        stream_chunk(
+                            request_id=ready.request_id,
+                            model=resolved.requested_model,
+                            delta={key: value},
+                        )
+                    )
+                continue
+            if type(event) is StreamFinished and finished is None:
+                finished = event
+                continue
+            raise RuntimeError("invalid stream event order")
+        if finished is None or finished.finish_reason is None:
+            raise RuntimeError("stream ended without a real terminal event")
+        if (
+            finished.request_id != ready.request_id
+            or finished.runtime_id != ready.runtime_id
+            or finished.adapter_id != resolved.adapter_revision
+            or finished.incarnation != resolved.incarnation
+            or finished.thinking != ready.thinking
+        ):
+            raise RuntimeError("stream terminal identity mismatch")
+        for key, value in splitter.finish():
+            yield sse_data(
+                stream_chunk(
+                    request_id=ready.request_id,
+                    model=resolved.requested_model,
+                    delta={key: value},
+                )
+            )
+        yield sse_data(
+            stream_chunk(
+                request_id=ready.request_id,
+                model=resolved.requested_model,
+                delta={},
+                finish_reason=finished.finish_reason,
+                provenance=provenance,
+            )
+        )
+        if include_usage:
+            yield sse_data(usage_stream_chunk(finished, resolved.requested_model, provenance))
+        succeeded = True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        yield sse_data(
+            {
+                "error": {
+                    "message": "generation stream terminated",
+                    "type": "server_error",
+                    "code": "stream_terminated",
+                }
+            }
+        )
+    finally:
+        await _close_iterator(event_stream)
+    if succeeded:
+        yield sse_data("[DONE]")
+
+
+async def _close_iterator(iterator: AsyncIterator[Any]) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    with suppress(Exception):
+        result = close()
+        if inspect.isawaitable(result):
+            await result

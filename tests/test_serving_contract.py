@@ -6,6 +6,13 @@ import types
 
 import pytest
 
+from flash.serve.contract import (
+    ADAPTER_REVISION_PATTERN,
+    REFERENCE_SERVING_CAPABILITIES,
+    REQUIRED_SERVING_CAPABILITIES,
+    ServingHealthError,
+    parse_serving_health,
+)
 from flash.serve.deploy import (
     Deployment,
     deploy_adapter,
@@ -24,6 +31,45 @@ def _stub_shared_http_client(monkeypatch):
 
     client = _Client()
     monkeypatch.setattr(deploy, "_http_client", lambda: client)
+
+
+def test_dependency_light_health_parser_normalizes_the_serving_contract():
+    health = parse_serving_health(
+        {
+            "ok": True,
+            "requires_key": False,
+            "base_models": ["Qwen/Qwen3.5-4B"],
+            "capabilities": list(REFERENCE_SERVING_CAPABILITIES),
+        }
+    )
+    assert health.ok is True
+    assert health.requires_key is False
+    assert health.base_models == ("Qwen/Qwen3.5-4B",)
+    assert set(health.capabilities) >= REQUIRED_SERVING_CAPABILITIES
+
+
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    [
+        ([], "non_object"),
+        ({}, "capabilities_not_list"),
+        ({"capabilities": [1]}, "capabilities_not_strings"),
+    ],
+)
+def test_dependency_light_health_parser_rejects_malformed_payloads(payload, code):
+    with pytest.raises(ServingHealthError) as exc_info:
+        parse_serving_health(payload)
+    assert exc_info.value.code == code
+
+
+def test_schema_and_generated_backends_share_the_adapter_revision_pattern():
+    import re
+
+    from flash.schema import parse_adapter_revision
+
+    revision = "flash-1@step-2." + "a" * 40
+    assert re.fullmatch(ADAPTER_REVISION_PATTERN, revision)
+    assert parse_adapter_revision(revision) == ("flash-1", 2, "a" * 40)
 
 
 def test_serving_base_url_default_and_override(monkeypatch):

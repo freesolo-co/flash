@@ -1,0 +1,133 @@
+name: Publish serving image
+
+# The customer-owned serving path pins a digest-qualified OCI reference: `ServingImage`
+# (flash/serve/provisioning/_common.py) rejects a tag-only reference, so a deployment cannot
+# name "whatever :dev points at today". That digest has to come from somewhere, and nothing
+# published `Dockerfile.serve` -- which is why the provisioning code had no reachable caller.
+#
+# This mirrors publish-image.yml, which already pushes ghcr.io/freesolo-co/freesolo-flash from
+# ./Dockerfile, so GHCR is the established registry for this repo rather than a new external
+# surface.
+#
+# The digest is deliberately only an OUTPUT here and is never written back into the repository.
+# Dockerfile.serve COPYs the whole `flash` package, so recording the digest inside that package
+# would change the image inputs and invalidate the digest it just recorded. Whatever consumes
+# this (a profile, a release manifest) must live outside the image build context.
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      # Dockerfile.serve COPYs `flash`, the lockfile, and the launcher, so a change to any of
+      # them changes the published image. Matching publish-image.yml, the workflow file itself
+      # is watched too, so a change to the build here republishes rather than leaving the old
+      # image serving under the same tags.
+      - "flash/**"
+      - "Dockerfile.serve"
+      - "serve_launch.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/publish-serving-image.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: publish-serving-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish-serving-image:
+    name: Build and push serving image
+    # Upstream only, for the same reason as publish-image.yml: the push target is in our org
+    # namespace, so a fork's GITHUB_TOKEN cannot write it and the build would burn its runner
+    # and then fail at the push.
+    if: github.repository == 'freesolo-co/flash'
+    # NOT ubuntu-latest, despite publish-image.yml using it: that workflow builds a
+    # `python:3.12-slim` image, while Dockerfile.serve shares the WORKER image's
+    # `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel` base and then installs vllm on top. A standard
+    # hosted runner only guarantees ~14 GB free, so this needs the same larger runner and the same
+    # disk reclaim as worker-image.yml or it dies with ENOSPC and never publishes a digest.
+    runs-on: ubuntu-24.04-8core
+    # The serving image installs the vLLM/torch runtime extra on a CUDA devel base, so it is
+    # substantially heavier than the control-plane image. 90 minutes covers a cold cache.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/freesolo-co/freesolo-flash-serve
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same reclaim as worker-image.yml, which builds the same CUDA devel base. The runner ships
+      # several GB of toolchains this build never uses, and the image does not fit without them
+      # removed first.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache /usr/share/swift \
+            /usr/local/share/boost /usr/local/lib/node_modules \
+            /usr/local/share/powershell /usr/share/miniconda || true
+          sudo apt-get clean || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          # Same scheme as publish-image.yml: main publishes :main + :latest, any other branch
+          # publishes :<branch>, and every build gets an immutable :sha-<short> tag. Deployments
+          # pin the digest, not these tags; the tags exist for humans reading the registry.
+          short_sha="$(git rev-parse --short HEAD)"
+          branch="${GITHUB_REF_NAME}"
+          {
+            echo "tags<<EOF"
+            if [ "$branch" = "main" ]; then
+              echo "${IMAGE}:main"
+              echo "${IMAGE}:latest"
+            else
+              echo "${IMAGE}:${branch}"
+            fi
+            echo "${IMAGE}:sha-${short_sha}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile.serve
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      # The digest is the whole point of this workflow: it is the one value a deployment can
+      # pin that cannot be moved under it later. Surface it in the job summary so the exact
+      # reference can be copied into a serving profile without digging through build logs.
+      - name: Report the digest-qualified reference
+        run: |
+          reference="${IMAGE}@${{ steps.build.outputs.digest }}"
+          {
+            echo "### Serving image published"
+            echo
+            echo '```'
+            echo "${reference}"
+            echo '```'
+            echo
+            echo "Pin this exact reference. Tags move; the digest does not."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "${reference}"

@@ -189,7 +189,7 @@ def test_grammar_and_structural_tag_are_rejected(bad):
 
 
 def test_unknown_key_error_lists_allowed_keys():
-    with pytest.raises(StructuredOutputsError, match="allowed keys.*json_object"):
+    with pytest.raises(StructuredOutputsError, match=r"allowed keys.*json_object"):
         normalize_structured_outputs({"json": SCHEMA, "bogus": 1})
 
 
@@ -252,9 +252,13 @@ def test_generate_request_normalizes_structured_outputs():
     assert req.structured_outputs == {"json_object": True}
 
 
-@pytest.mark.parametrize("key", ["structured_outputs", "structured_outputs"])
-def test_generate_request_accepts_both_spellings(key):
-    req = GenerateRequest.model_validate({"adapter_id": "a", "prompt": "hi", key: SCHEMA})
+def test_generate_request_accepts_a_raw_json_schema():
+    # `structured_outputs` is the only accepted key -- `response_format` was dropped as an alias
+    # (see the test below). This was parametrized over two spellings until the alias was removed,
+    # after which both cases named the same key and the second proved nothing.
+    req = GenerateRequest.model_validate(
+        {"adapter_id": "a", "prompt": "hi", "structured_outputs": SCHEMA}
+    )
     assert req.structured_outputs == {"json": SCHEMA}
 
 

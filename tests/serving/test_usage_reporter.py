@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -218,7 +218,7 @@ def test_lora_engine_builds_tokenized_chat_prompt(modal_app_module):
             return [1, 2, 3]
 
     class _Payload:
-        messages = [{"role": "user", "content": "hi"}]
+        messages: ClassVar[list[dict[str, str]]] = [{"role": "user", "content": "hi"}]
         prompt = None
 
     engine.tokenizer = _Tokenizer()
@@ -289,9 +289,9 @@ def test_lora_engine_filters_reserved_chat_template_kwargs(modal_app_module):
             return [9]
 
     class _Payload:
-        messages = [{"role": "user", "content": "hi"}]
+        messages: ClassVar[list[dict[str, str]]] = [{"role": "user", "content": "hi"}]
         prompt = None
-        chat_template_kwargs = {
+        chat_template_kwargs: ClassVar[dict[str, object]] = {
             "enable_thinking": False,
             "add_generation_prompt": False,  # reserved -> dropped, not duplicated
             "tokenize": False,
@@ -325,7 +325,7 @@ def test_lora_engine_cache_key_uses_adapter_thinking_default(modal_app_module):
             return [1] if kwargs.get("enable_thinking") else [2]
 
     class _Payload:
-        messages = [{"role": "user", "content": "hi"}]
+        messages: ClassVar[list[dict[str, str]]] = [{"role": "user", "content": "hi"}]
         prompt = None
 
         def __init__(self, thinking: bool) -> None:
@@ -354,7 +354,7 @@ def test_lora_engine_requires_trained_thinking_default(modal_app_module):
             return [1]
 
     class _Payload:
-        messages = [{"role": "user", "content": "hi"}]
+        messages: ClassVar[list[dict[str, str]]] = [{"role": "user", "content": "hi"}]
         prompt = None
 
         def __init__(self, thinking: bool) -> None:
@@ -379,7 +379,7 @@ def test_lora_engine_drops_return_shape_chat_template_kwargs(modal_app_module):
             return [7]
 
     class _Payload:
-        messages = [{"role": "user", "content": "hi"}]
+        messages: ClassVar[list[dict[str, str]]] = [{"role": "user", "content": "hi"}]
         prompt = None
 
         def __init__(self, ctk) -> None:
@@ -437,7 +437,7 @@ def test_lora_engine_cache_key_ignores_reserved_chat_template_kwargs(modal_app_m
             return [3]
 
     class _Payload:
-        messages = [{"role": "user", "content": "hi"}]
+        messages: ClassVar[list[dict[str, str]]] = [{"role": "user", "content": "hi"}]
         prompt = None
 
         def __init__(self, ctk) -> None:

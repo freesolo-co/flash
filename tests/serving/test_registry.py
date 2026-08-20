@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from flash.serving.src.registry import AdapterRegistry, lora_int_id
 from flash.serving.src.schemas import AdapterRecord
 
@@ -122,13 +124,16 @@ def test_remove_tombstones_block_hydrate_and_lazy_upsert() -> None:
     registry.hydrate([_record("a")])
     removed = registry.remove("a")
     assert removed is not None
-    assert registry.get("a") is None and not registry.has("a")
+    assert registry.get("a") is None
+    assert not registry.has("a")
 
     registry.hydrate([_record("a")])  # reload still has the not-yet-disabled ready row
-    assert registry.get("a") is None and not registry.has("a")
+    assert registry.get("a") is None
+    assert not registry.has("a")
 
     registry.upsert(_record("a"))  # generate-path lazy adopt
-    assert registry.get("a") is None and not registry.has("a")
+    assert registry.get("a") is None
+    assert not registry.has("a")
 
 
 def test_explicit_revive_clears_tombstone() -> None:
@@ -188,7 +193,8 @@ def test_tombstone_same_instant_mixed_iso_does_not_resurrect() -> None:
     registry.upsert(_record("a", updated_at=None), revive=True)  # POST: no in-memory timestamp
     registry.remove("a")  # tombstone backfilled with _utc_now_iso() => "+00:00" rendering
     tombstone_iso = registry._tombstones["a"]
-    assert tombstone_iso is not None and tombstone_iso.endswith("+00:00")
+    assert tombstone_iso is not None
+    assert tombstone_iso.endswith("+00:00")
     same_instant_z = tombstone_iso.replace("+00:00", "Z")  # PostgREST rendering, same instant
     registry.hydrate([_record("a", updated_at=same_instant_z)])
     assert not registry.has("a")
@@ -294,9 +300,6 @@ def test_aliases_never_acquire_local_paths() -> None:
     registry = AdapterRegistry()
     registry.upsert(alias)
     assert registry.local_path(alias) is None
-    try:
+    with pytest.raises(ValueError, match="alias records") as exc_info:
         registry.set_local_path(alias, Path("/tmp/alias"))
-    except ValueError as exc:
-        assert "alias records" in str(exc)
-    else:
-        raise AssertionError("alias path assignment must fail")
+    assert "alias records" in str(exc_info.value)

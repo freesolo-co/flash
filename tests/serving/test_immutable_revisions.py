@@ -370,7 +370,7 @@ def test_unresolvable_org_is_permanent_not_a_retryable_outage(setup, monkeypatch
     answer 503 -- which the flash client retries (it only fails fast below 500). The registration
     can never succeed, so the caller must be told permanently and told which value is wrong.
     """
-    client, pool, _, persistence = setup
+    client, pool, _, _persistence = setup
 
     def _reject_unknown_org(record: AdapterRecord, _settings: object) -> AdapterRecord:
         raise PersistenceReferenceError(

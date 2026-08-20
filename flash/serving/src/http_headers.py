@@ -50,4 +50,3 @@ def _bearer_token(request: Request) -> str | None:
 def _checkpoint_headers(active_checkpoint: Any) -> dict[str, str]:
     checkpoint = str(active_checkpoint or "").strip()
     return {"X-Freesolo-Checkpoint": checkpoint} if checkpoint else {}
-

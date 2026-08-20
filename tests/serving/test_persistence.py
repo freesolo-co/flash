@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
@@ -64,14 +64,14 @@ def _record(**overrides: object) -> AdapterRecord:
 
 
 class FakeClient:
-    requests: list[dict[str, Any]] = []
-    get_rows: list[dict[str, object]] = []
+    requests: ClassVar[list[dict[str, Any]]] = []
+    get_rows: ClassVar[list[dict[str, object]]] = []
     post_status = 201
-    post_rows: list[dict[str, object]] = []
+    post_rows: ClassVar[list[dict[str, object]]] = []
     # error payload for a failing POST. `None` sends a non-JSON body, which is how a proxy or
     # gateway error arrives -- the code must not read a sqlstate out of it.
     post_body: dict[str, object] | None = None
-    patch_rows: list[dict[str, object]] = []
+    patch_rows: ClassVar[list[dict[str, object]]] = []
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
@@ -148,7 +148,8 @@ def test_load_uses_explicit_projected_columns_and_ready_filter() -> None:
 def test_targeted_get_reads_disabled_revision_without_status_filter() -> None:
     FakeClient.get_rows = [_row(status="disabled")]
     record = get_adapter(REVISION_ID, _settings())
-    assert record is not None and record.status == "disabled"
+    assert record is not None
+    assert record.status == "disabled"
     assert "status" not in FakeClient.requests[0]["params"]
 
 
@@ -217,7 +218,8 @@ def test_replace_adapter_uses_updated_at_cas() -> None:
         "adapter_id": f"eq.{REVISION_ID}",
         "updated_at": "eq.2026-07-14T00:00:01+00:00",
     }
-    assert committed is not None and committed.status == "ready"
+    assert committed is not None
+    assert committed.status == "ready"
 
 
 def test_status_cas_patches_only_status_and_updated_at() -> None:
@@ -232,7 +234,8 @@ def test_status_cas_patches_only_status_and_updated_at() -> None:
     assert request["params"]["select"] == _PERSISTED_COLUMNS
     assert set(request["json"]) == {"status", "updated_at"}
     assert request["json"]["status"] == "ready"
-    assert committed is not None and committed.status == "ready"
+    assert committed is not None
+    assert committed.status == "ready"
 
 
 def test_cas_miss_returns_none() -> None:

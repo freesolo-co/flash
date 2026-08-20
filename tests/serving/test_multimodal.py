@@ -418,7 +418,7 @@ def test_multi_image_decoded_memory_counts_resident_not_summed_peaks(monkeypatch
             ],
         }
     ]
-    template_messages, images = prepare_multimodal_request(messages, image_limit=4)
+    _template_messages, images = prepare_multimodal_request(messages, image_limit=4)
     try:
         assert len(images) == 2
     finally:
@@ -450,7 +450,7 @@ def test_unknown_content_blocks_are_rejected(block_type: str | None) -> None:
 
 
 @pytest.mark.parametrize(
-    "messages,detail",
+    ("messages", "detail"),
     [
         (["not an object"], "message 0"),
         ([{"role": "user", "content": ["not an object"]}], "content block 0"),
@@ -821,7 +821,7 @@ def test_chat_immutable_id_and_alias_use_resolved_target_and_echo_requested_id(m
 
 
 @pytest.mark.parametrize(
-    "path,body",
+    ("path", "body"),
     [
         ("/generate", {"adapter_id": RUN_ID, "messages": _messages()}),
         (f"/adapters/{RUN_ID}/generate", {"messages": _messages()}),

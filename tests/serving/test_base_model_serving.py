@@ -162,7 +162,8 @@ def test_lora_adapter_still_requires_a_key_and_bills_by_adapter_id() -> None:
     assert _chat(client, "qa").status_code == 401  # still gated
     assert _chat(client, "qa", Authorization="Bearer k").status_code == 200
     assert auth.calls == [("k", "qa")]
-    assert reports and reports[0]["adapterId"] == "qa"
+    assert reports
+    assert reports[0]["adapterId"] == "qa"
     assert "orgId" not in reports[0]  # LoRA bills by adapterId (owner resolved by backend)
 
 

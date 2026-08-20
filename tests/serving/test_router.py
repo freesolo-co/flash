@@ -1265,7 +1265,7 @@ def test_undeploy_unknown_adapter_is_404(app_setup):
 def test_generate_forwards_record_for_lazy_engine_load(app_setup):
     # The engine container may not have seen the adapter (registration can land on a
     # different / cold container), so the full record is forwarded on the generate path.
-    client, pool, router = app_setup
+    client, pool, _router = app_setup
     captured: list = []
 
     async def _capture(base_model, payload, record, **_kwargs):

@@ -5,6 +5,8 @@ Each assertion uses public Pydantic validation so failures match the API-facing 
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from pydantic import ValidationError
 
@@ -113,7 +115,7 @@ def test_persisted_alias_id_must_equal_run_id() -> None:
 
     with pytest.raises(
         ValidationError,
-        match="persisted alias adapter_id must equal metadata.run_id",
+        match=re.escape("persisted alias adapter_id must equal metadata.run_id"),
     ):
         PersistedAdapterRecord.model_validate(payload)
 
