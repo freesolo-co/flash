@@ -7,7 +7,6 @@ import pathlib
 import re
 import shlex
 import tomllib
-from types import SimpleNamespace
 
 import pytest
 
@@ -187,98 +186,60 @@ def test_hub_token_reaches_provisioning_so_the_container_can_hydrate(
     assert seen == [("inference-key", "hf-token")]
 
 
-def test_absent_hub_token_stays_absent_rather_than_becoming_an_empty_secret(
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_blank_hub_token_is_treated_as_absent_not_as_a_secret(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # a public artifact repo needs no token, and the provisioning layer reads absence as "skip the
-    # bootstrap phase entirely". a blank string is not absence: `ServingRuntimeSecrets` rejects an
-    # empty artifact token outright, so forwarding one would turn an unset variable into a hard
-    # failure for exactly the deployments that need no token at all.
-    seen: list[tuple[str, str | None]] = []
-
-    def _capture(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        seen.append(secrets._reveal_for_launch())
-        return _result(bundle)
+    # a blank string is not a credential: `_optional_env` normalizes it to absence, and
+    # `ServingRuntimeSecrets` rejects an empty artifact token outright. a whitespace-only
+    # variable must therefore take the same rejection path as an unset one rather than being
+    # forwarded as a secret or crashing inside the secret boundary.
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("provisioning ran with a blank artifact token")
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
     monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "   ")
-    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _capture)
+    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _explode)
 
-    assert cmd_serve_deploy(_args()) == 0
-    assert seen == [("inference-key", None)]
+    assert serve_deploy._optional_env(serve_deploy.ARTIFACT_TOKEN_ENV) is None
+    assert cmd_serve_deploy(_args()) == 1
+    assert serve_deploy.ARTIFACT_TOKEN_ENV in capsys.readouterr().err
 
 
-def test_unhydratable_private_inputs_are_rejected_before_any_provider_call(
+def test_missing_artifact_token_is_rejected_before_any_provider_call(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # with no artifact token the container can only hydrate a fresh volume from repositories that
-    # need no credential. the command used to pass artifact_token=None straight through, so the
-    # launcher raised "artifact token is required when serving cache hydration is missing" only
-    # after the provider had created and started billing for the app, volume, and pod.
+    # a fresh volume must hydrate before the engine starts, and that path is token-only end to
+    # end: `launch._prepare_cache` rejects every cache miss when the artifact token is None, and
+    # `read_artifact_token_fd` refuses an empty descriptor. the command used to pass
+    # artifact_token=None straight through, so the launcher raised "artifact token is required
+    # when serving cache hydration is missing" only after the provider had created and started
+    # billing for the app, volume, and pod. a public repository does not change that, so the
+    # rejection is unconditional rather than conditioned on repository visibility.
     def _explode(*_args, **_kwargs):
         raise AssertionError("provisioning ran without a way to hydrate the cache")
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
-    monkeypatch.setattr(
-        serve_deploy, "_anonymously_unreadable", lambda *_a, **_k: "Private-Co/adapters"
-    )
     monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _explode)
 
-    assert cmd_serve_deploy(_args()) == 1
-    assert "Private-Co/adapters" in capsys.readouterr().err
+    # unset and blank alike mean "no token": `_optional_env` maps both to absence, and a blank
+    # one would be rejected inside `ServingRuntimeSecrets` anyway.
+    for value in (None, "", "   "):
+        if value is None:
+            monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
+        else:
+            monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, value)
+
+        assert cmd_serve_deploy(_args()) == 1
+        assert serve_deploy.ARTIFACT_TOKEN_ENV in capsys.readouterr().err
 
 
-def test_the_guard_probes_the_repos_hydration_actually_downloads(
+def test_the_deploy_proceeds_once_a_token_is_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # the other two tests stub `_anonymously_unreadable` wholesale, so they pin that the guard is
-    # consulted -- not which repositories it consults. that gap let the guard probe the catalog
-    # `--model` while `materialize.py` hydrates `served_model` and `tokenizer_model`, which every
-    # profile remaps to a different checkpoint. the guard then answered a question no hydration
-    # asks: it would clear a deploy whose real checkpoint is private and reject one whose real
-    # checkpoint is public. drive the real function and assert on the repo ids it asks about.
-    from flash.serve.profiles import get_profile
-
-    profile = get_profile(MODEL)
-    probed: list[str] = []
-
-    class _Api:
-        def __init__(self, *, token):
-            # `token=False` is what suppresses a cached `hf auth login`; `None` would fall back to
-            # it and `""` would build an illegal `Bearer ` header.
-            assert token is False
-
-        def repo_info(self, *, repo_id, repo_type):
-            probed.append(repo_id)
-            return object()
-
-    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
-
-    # a minimal stand-in for the resolved adapter: the guard only reads these two fields, and
-    # building it directly avoids `_stub_resolution`, which replaces the function under test.
-    adapter = SimpleNamespace(
-        artifact_repo_id="Freesolo-Co/artifacts", artifact_repo_type="dataset"
-    )
-    resolved = SimpleNamespace(adapter=adapter)
-
-    assert serve_deploy._anonymously_unreadable(profile, resolved) is None
-
-    assert profile.served_model in probed, (
-        f"hydration downloads {profile.served_model}, but the guard never probed it: {probed}"
-    )
-    assert MODEL not in probed, (
-        f"the guard probed the catalog base model {MODEL}, which hydration never downloads"
-    )
-
-
-def test_public_inputs_still_deploy_without_an_artifact_token(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # the guard must not break self-hosting from public checkpoints, which is exactly the case
-    # that needs no token at all.
+    # the guard must reject only the unhydratable case: with a token the deploy runs and that
+    # token reaches provisioning so the container can hydrate.
     seen: list[tuple[str, str | None]] = []
 
     def _capture(bundle, credentials, secrets, *, deadline_at, **_kwargs):
@@ -287,12 +248,11 @@ def test_public_inputs_still_deploy_without_an_artifact_token(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
-    monkeypatch.setattr(serve_deploy, "_anonymously_unreadable", lambda *_a, **_k: None)
+    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
     monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _capture)
 
     assert cmd_serve_deploy(_args()) == 0
-    assert seen == [("inference-key", None)]
+    assert seen == [("inference-key", "hf-token")]
 
 
 def test_resolver_validation_failures_are_cli_errors_not_tracebacks(
@@ -433,15 +393,14 @@ def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, "token-secret")
     monkeypatch.setenv(serve_deploy.RUNPOD_API_KEY_ENV, "api-key")
     monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, "inference-key")
+    # a deployable environment includes the artifact token: hydration on a fresh volume is
+    # token-only, so the command rejects a missing one before contacting any provider. tests
+    # about that rejection unset it explicitly.
+    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
 
 
 def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     """resolve against fixed hub facts so the command path is tested without the network."""
-
-    # the no-token hydration guard asks the hub whether the inputs are anonymously readable.
-    # offline tests must not make that call, and their fixed repo ids do not exist, so treat the
-    # inputs as reachable unless a test overrides this to exercise the guard itself.
-    monkeypatch.setattr(serve_deploy, "_anonymously_unreadable", lambda *_a, **_k: None)
 
     from flash.serve.app import AdapterExecutionInput, ArtifactFile, aggregate_file_digest
     from flash.serve.control import AdapterAliasIntent, ResolvedAdapter

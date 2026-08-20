@@ -33,47 +33,6 @@ INFERENCE_KEY_ENV = "FLASH_SERVING_KEY"
 ARTIFACT_TOKEN_ENV = "HF_TOKEN"
 
 
-def _anonymously_unreadable(profile, resolved) -> str | None:
-    """name the first hydration input an anonymous client cannot read, or None if all are public.
-
-    a deployment with no artifact token can only hydrate from repositories that need no
-    credential, so readability -- not repo visibility metadata -- is the question. the check runs
-    without a token on purpose: the operator's own cached login must not make a private repo look
-    reachable to the container, which gets no such login. `token=False` is what suppresses that
-    cached login; `None` would silently fall back to it, and `""` builds an illegal `Bearer `
-    header.
-
-    the probed repositories are the ones `materialize.py` actually downloads -- `served_model` and
-    `tokenizer_model` -- not the catalog `--model` the operator typed. every profile remaps that
-    name to a different served checkpoint, so probing the base model would answer a question no
-    hydration ever asks: it would pass a deploy whose real checkpoint is private, and fail one
-    whose real checkpoint is public.
-
-    tests stub this name to keep the offline suite off the network.
-    """
-
-    from huggingface_hub import HfApi
-    from huggingface_hub.utils import HfHubHTTPError
-
-    anonymous = HfApi(token=False)
-    tokenizer_model = getattr(profile, "tokenizer_model", None) or profile.served_model
-    targets = (
-        (profile.served_model, "model"),
-        (tokenizer_model, "model"),
-        (resolved.adapter.artifact_repo_id, str(resolved.adapter.artifact_repo_type)),
-    )
-    for repo_id, repo_type in targets:
-        try:
-            anonymous.repo_info(repo_id=repo_id, repo_type=repo_type)
-        except HfHubHTTPError:
-            return repo_id
-        except Exception:
-            # a transport problem is not proof the repo is private; let provisioning proceed
-            # rather than blocking a deployment on a flaky lookup.
-            continue
-    return None
-
-
 def _err(message: str) -> int:
     print(f"error: {message}", file=sys.stderr)
     return 1
@@ -261,18 +220,18 @@ def cmd_serve_deploy(args) -> int:
         )
 
     if _optional_env(ARTIFACT_TOKEN_ENV) is None:
-        # a fresh volume holds neither adapters nor base weights, so the container must hydrate
-        # both from the hub. with no transferable token that only works when every input is
-        # anonymously readable. checking here keeps the public self-hosting path working while
-        # ending the private-repo case before any resource is created -- otherwise the launcher
-        # raises "artifact token is required..." after the provider is already billing.
-        unreadable = _anonymously_unreadable(profile, resolved)
-        if unreadable:
-            return _err(
-                f"{ARTIFACT_TOKEN_ENV} is not set and {unreadable} is not readable anonymously. "
-                f"a new deployment hydrates its cache from the hub, so set {ARTIFACT_TOKEN_ENV} "
-                f"to a token that can read it"
-            )
+        # a fresh volume holds neither adapters nor base weights, so the container hydrates both
+        # from the hub on its first start -- and that path is token-only end to end:
+        # `launch._prepare_cache` rejects every cache miss outright when the artifact token is
+        # None, and both hydration functions read the token from a descriptor that
+        # `read_artifact_token_fd` refuses to treat as empty. a public repository does not change
+        # that, so permitting the deploy would create and bill provider resources for a container
+        # that cannot reach readiness. reject it here instead, where nothing has been created.
+        return _err(
+            f"{ARTIFACT_TOKEN_ENV} is not set. a new deployment hydrates its serving cache from "
+            f"the hub before the engine starts, and that hydration requires a token even when "
+            f"the repositories are public"
+        )
 
     deadline_at = time.monotonic() + float(args.timeout)
     if provider == "modal":
