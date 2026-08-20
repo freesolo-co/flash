@@ -20,7 +20,10 @@ except ImportError:  # pragma: no cover - only relevant for global modal install
 
 
 SERVING_DIR = Path(__file__).resolve().parent
-REPO_DIR = SERVING_DIR.parent
+# flash/serving/ -> flash/ -> repo root. the app used to sit one level below its repo root; after the
+# move it is two, so walking up a single parent would look for .env inside the flash package and load
+# nothing, leaving a production deploy silently unconfigured.
+REPO_DIR = SERVING_DIR.parent.parent
 
 # deployment identity is resolved before dotenv so development can never inherit production wiring.
 _ALLOWED_SERVING_DEPLOYMENT_MODES = frozenset({"production", "development"})
@@ -198,7 +201,14 @@ image = (
         add_python="3.12",
     )
     .apt_install("build-essential", "git", "ninja-build")
-    .pip_install_from_pyproject(str(SERVING_DIR / "pyproject.toml"))
+    # the app's own pyproject went away with the move; flash's `serve-runtime` extra now carries the
+    # same model-path bounds (vllm pinned exactly, transformers ranged), and `serving` carries the
+    # app's own deps. the image resolves from these bounds, NOT uv.lock, so the bounds are the
+    # contract -- see the notes on both extras in pyproject.toml.
+    .pip_install_from_pyproject(
+        str(REPO_DIR / "pyproject.toml"),
+        optional_dependencies=["serve-runtime", "serving"],
+    )
     # No in-engine kernel-patching hook is installed in this image (see the note at the engine call
     # site): under vLLM V1 the model runs in a separate EngineCore process, so patches applied in THIS
     # process never reach the model, and a prior attempt's extra CUDA context + GPU self-tests stole

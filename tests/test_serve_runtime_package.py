@@ -65,6 +65,16 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
     assert project["tool"]["uv"]["conflicts"] == [[{"extra": "gpu"}, {"extra": "serve-runtime"}]]
     lock = (ROOT / "uv.lock").read_text()
     assert 'name = "modal"\nversion = "1.5.4"' in lock
+    # the lockfile must actually RESOLVE the extra, not merely mention it: Dockerfile.serve runs
+    # `uv sync --frozen --extra serve-runtime`, and --frozen refuses to re-resolve. adding the extra
+    # to pyproject without re-locking leaves provides-extras stale, and the image build dies at that
+    # step even though every assertion above still passes.
+    assert 'provides-extras = ["gpu", "server", "serving", "serve-runtime", "dev"]' in lock
+    # both vllm builds are recorded side by side; that is what the gpu/serve-runtime conflict buys.
+    assert (
+        '{ name = "vllm", marker = "extra == \'serve-runtime\'", specifier = "==0.23.0" }' in lock
+    )
+    assert '{ name = "vllm", marker = "extra == \'gpu\'", specifier = "==0.19.1" }' in lock
 
 
 def test_wheel_contains_runtime_and_declares_extra(tmp_path: Path) -> None:
