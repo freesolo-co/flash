@@ -84,6 +84,37 @@ def test_identity_ledger_retains_exact_p64_g2_terminal_evidence_and_returns_deep
     assert fresh["steps"][0]["registered"][0]["sample_index"] == 0
 
 
+def test_sealed_evidence_retains_one_identity_tuple_per_step():
+    """the ledger must not keep a second copy of a set it has already proven equal.
+
+    `seal` raises unless registered == observed, so retaining both makes parent memory scale
+    with steps x completions_per_step for no added evidence, and `train.max_steps` has no
+    ceiling. this pins the retention itself, since the published payload still emits both keys
+    and therefore cannot distinguish one stored tuple from two.
+    """
+    ledger = RolloutIdentityLedger(64, 2)
+    for step in (1, 2):
+        expected = _expected(step, tuple(range(64)), 2)
+        ledger.register(expected)
+        for identity in expected:
+            ledger.record(identity, identity["sample_index"])
+        ledger.seal(step)
+
+    retained = ledger._sealed_evidence
+    assert set(retained) == {1, 2}
+    for step, sealed in retained.items():
+        # a bare tuple of identities, not a (registered, observed) pair of tuples
+        assert isinstance(sealed, tuple)
+        assert len(sealed) == 128
+        assert not any(isinstance(entry, tuple) for entry in sealed)
+
+    # the published contract is unchanged: both keys are still emitted, still equal
+    evidence = ledger.finalize({1, 2})
+    for step in evidence["steps"]:
+        assert step["registered"] == step["observed"]
+        assert len(step["registered"]) == 128
+
+
 def test_failed_identity_seal_does_not_publish_terminal_evidence():
     ledger = RolloutIdentityLedger(1, 2)
     expected = _expected(3, (0,), 2)

@@ -69,10 +69,13 @@ class RolloutIdentityLedger:
         self._registered: dict[int, frozenset[RolloutIdentity]] = {}
         self._observed: dict[int, set[RolloutIdentity]] = {}
         self._sealed_steps: set[int] = set()
-        self._sealed_evidence: dict[
-            int,
-            tuple[tuple[RolloutIdentity, ...], tuple[RolloutIdentity, ...]],
-        ] = {}
+        # one tuple per sealed step, not two. `seal` has already proven the registered and
+        # observed sets are EQUAL, so keeping a second copy stores the same identities twice and
+        # makes parent memory scale with steps x completions_per_step for no added evidence.
+        # `train.max_steps` has no ceiling, so the duplicate is what exhausts the worker during
+        # finalization after training already succeeded. the published payload still carries both
+        # keys, rebuilt from this one tuple.
+        self._sealed_evidence: dict[int, tuple[RolloutIdentity, ...]] = {}
         self._finalized = False
 
     def _reject_finalized(self) -> None:
@@ -88,10 +91,10 @@ class RolloutIdentityLedger:
             "steps": [
                 {
                     "optimizer_step": step,
-                    "registered": [identity.to_dict() for identity in registered],
-                    "observed": [identity.to_dict() for identity in observed],
+                    "registered": [identity.to_dict() for identity in sealed],
+                    "observed": [identity.to_dict() for identity in sealed],
                 }
-                for step, (registered, observed) in sorted(self._sealed_evidence.items())
+                for step, sealed in sorted(self._sealed_evidence.items())
             ],
             "validation": [],
         }
@@ -221,10 +224,7 @@ class RolloutIdentityLedger:
                     f"GRPO step {step} observed identity set does not equal registration: "
                     f"missing={missing}, unexpected={unexpected}"
                 )
-            self._sealed_evidence[step] = (
-                tuple(sorted(expected)),
-                tuple(sorted(observed)),
-            )
+            self._sealed_evidence[step] = tuple(sorted(expected))
             self._sealed_steps.add(step)
             del self._registered[step]
             del self._observed[step]
