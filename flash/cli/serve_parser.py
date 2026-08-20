@@ -99,6 +99,14 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction) -> None:
     # modal placement
     deploy.add_argument("--modal-workspace", default="", help="modal workspace name")
     deploy.add_argument("--modal-environment", default="", help="modal environment name")
+    # modal builds web urls as `<workspace>-<web-suffix>--<label>.modal.run`. the suffix is a
+    # per-environment setting the operator chooses, NOT the environment name, and one environment
+    # per workspace may have none -- so it cannot be derived and is omitted for that environment.
+    deploy.add_argument(
+        "--modal-web-suffix",
+        default="",
+        help="modal environment web suffix, if the environment has one (see `modal environment`)",
+    )
     # modal prices a pinned region above an unpinned one and a narrower region draws on a smaller
     # capacity pool, so prefer a broad value ("us-east") over a specific one ("us-east-1").
     deploy.add_argument(

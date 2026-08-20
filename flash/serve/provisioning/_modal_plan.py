@@ -119,8 +119,23 @@ def _modal_resource_names(bundle: DeploymentBundle) -> ServingResourceNames:
     )
 
 
+def _url_source(placement: ModalPlacement) -> str:
+    """the `<source>` in `https://<source>--<label>.modal.run`.
+
+    Modal disambiguates environments with a per-environment web suffix, so the source is
+    `<workspace>-<suffix>` unless the environment is the one allowed to have none. Deriving it from
+    the workspace alone made every suffixed environment's expected url wrong, which surfaces as an
+    identity mismatch in `_modal_resources` rather than as a bad url: the app deploys, and then the
+    deployment is rejected as not ours.
+    """
+
+    if placement.web_suffix is None:
+        return placement.workspace_name
+    return f"{placement.workspace_name}-{placement.web_suffix}"
+
+
 def _endpoint_label(bundle: DeploymentBundle, placement: ModalPlacement) -> str:
-    max_length = 63 - len(placement.workspace_name) - 2
+    max_length = 63 - len(_url_source(placement)) - 2
     prefix = "fsw-"
     if max_length < len(prefix) + 16:
         raise ValueError("modal workspace_name is too long for a deterministic endpoint label")
@@ -252,7 +267,7 @@ def validate_modal_plan(plan: ModalCreatePlan) -> None:
         or plan.buffer_containers != 0
     ):
         raise ValueError("modal topology does not match the fixed serving contract")
-    combined_label = f"{plan.placement.workspace_name}--{plan.endpoint_label}"
+    combined_label = f"{_url_source(plan.placement)}--{plan.endpoint_label}"
     if (
         _SUBDOMAIN_RE.fullmatch(plan.endpoint_label) is None
         or len(combined_label) > 63
@@ -296,7 +311,7 @@ def build_modal_create_plan(
         gpu_request=f"{placement.gpu}:{placement.gpu_count}",
         function_name=names.template,
         endpoint_label=endpoint_label,
-        expected_public_url=f"https://{placement.workspace_name}--{endpoint_label}.modal.run",
+        expected_public_url=f"https://{_url_source(placement)}--{endpoint_label}.modal.run",
         wrapper_local_path=str(Path(__file__).with_name("_modal_wrapper.py")),
     )
     validate_modal_plan(plan)

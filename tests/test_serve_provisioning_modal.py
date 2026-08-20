@@ -61,6 +61,7 @@ def _bundle(
     *,
     region: str | None = "us-east-1",
     workspace_name: str = "workspace",
+    web_suffix: str | None = None,
 ) -> DeploymentBundle:
     original, inputs = _spec_and_inputs()
     spec = DeploymentSpec(
@@ -73,6 +74,7 @@ def _bundle(
             gpu="B200",
             region=region,
             gpu_count=1,
+            web_suffix=web_suffix,
         ),
         engine=original.engine,
         adapters=original.adapters,
@@ -1271,3 +1273,23 @@ def test_interrupting_after_the_modal_app_is_ready_leaves_the_deployment_standin
     assert "delete_volume" not in operations, operations
     assert "delete_inference" not in operations, operations
     assert sdk.volumes, "the ready deployment's volume must survive the interrupt"
+
+
+def test_environment_web_suffix_is_part_of_the_expected_public_url() -> None:
+    """Modal builds web urls as `<workspace>-<web_suffix>--<label>.modal.run`.
+
+    The suffix is a per-environment field the operator sets; it is NOT the environment name and is
+    not derivable from it (one environment per workspace may have none). Deriving the url from the
+    workspace alone made every suffixed environment's expected url wrong, and because
+    `_modal_resources.exact_core_resources` matches on `public_url`, the app deploys and is then
+    rejected as not ours -- an identity mismatch, not an obviously bad url.
+    """
+    plan = build_modal_create_plan(_bundle(web_suffix="dev"))
+
+    assert plan.expected_public_url == f"https://workspace-dev--{plan.endpoint_label}.modal.run"
+    # the suffix also spends the 63-char dns budget, so the label must shrink to make room.
+    unsuffixed = build_modal_create_plan(_bundle())
+    assert unsuffixed.expected_public_url == (
+        f"https://workspace--{unsuffixed.endpoint_label}.modal.run"
+    )
+    assert len(f"workspace-dev--{plan.endpoint_label}") <= 63

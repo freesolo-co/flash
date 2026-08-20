@@ -159,7 +159,7 @@ class ServingProfile:
         )
 
     def modal_placement(
-        self, *, workspace_name: str, environment: str, region: str
+        self, *, workspace_name: str, environment: str, region: str, web_suffix: str | None = None
     ) -> ModalPlacement:
         """build the exact modal placement for this profile's validated gpu.
 
@@ -175,6 +175,7 @@ class ServingProfile:
             gpu=self.modal_gpu,
             region=region,
             gpu_count=self.tensor_parallel_size,
+            web_suffix=web_suffix,
         )
 
     def runpod_placement(self, *, account_id: str, data_center_id: str) -> RunPodPlacement:
@@ -342,6 +343,7 @@ def placement_for(
     workspace_name: str = "",
     environment: str = "",
     region: str = "",
+    web_suffix: str | None = None,
     account_id: str = "",
     data_center_id: str = "",
 ) -> ModalPlacement | RunPodPlacement:
@@ -362,7 +364,10 @@ def placement_for(
             ),
         )
         return profile.modal_placement(
-            workspace_name=workspace_name, environment=environment, region=region
+            workspace_name=workspace_name,
+            environment=environment,
+            region=region,
+            web_suffix=web_suffix,
         )
     if provider == "runpod":
         _reject_foreign(

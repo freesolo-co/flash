@@ -114,6 +114,9 @@ def cmd_serve_deploy(args) -> int:
             workspace_name=getattr(args, "modal_workspace", "") or "",
             environment=getattr(args, "modal_environment", "") or "",
             region=getattr(args, "modal_region", "") or "",
+            # "" means the no-suffix environment, which is a real modal configuration, so it maps
+            # to None rather than being rejected as missing.
+            web_suffix=(getattr(args, "modal_web_suffix", "") or "") or None,
             account_id=getattr(args, "runpod_account", "") or "",
             data_center_id=getattr(args, "runpod_data_center", "") or "",
         )

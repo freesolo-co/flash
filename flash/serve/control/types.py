@@ -374,6 +374,11 @@ class ModalPlacement:
     gpu: str
     region: str | None
     gpu_count: int = 1
+    # modal builds a web url as `<workspace>-<web_suffix>--<label>.modal.run`, where the suffix is
+    # a per-environment field the operator sets -- NOT the environment name, and not derivable
+    # from it. one environment per workspace may have an empty suffix, which is the `<workspace>--`
+    # form. None means exactly that no-suffix environment.
+    web_suffix: str | None = None
 
     def __post_init__(self) -> None:
         validate_modal_placement(self)
@@ -388,6 +393,7 @@ def validate_modal_placement(placement: ModalPlacement) -> None:
         raise ValueError("modal requests require ModalPlacement")
     _require_nonempty(placement.workspace_name, "modal workspace_name")
     _require_nonempty(placement.environment, "modal environment")
+    _require_optional_nonempty(placement.web_suffix, "modal web_suffix")
     _require_nonempty(placement.gpu, "modal gpu")
     _require_positive_int(placement.gpu_count, "modal gpu_count")
     _require_optional_nonempty(placement.region, "modal region")
