@@ -30,7 +30,6 @@ from flash.serving.src.schemas import AdapterRecord, internal_adapter_payload
 from flash.serving.src.serving_io import (
     _assert_supported_base_model,
     _expected_checkpoint,
-    _get_stored,
     _inference_json_response,
     _parse_generate,
     _prepare_generate_request,
@@ -40,7 +39,12 @@ from flash.serving.src.serving_io import (
 )
 from flash.serving.src.streaming import openai_chat_stream, prepare_stream
 from flash.serving.src.structured_outputs import StructuredOutputsError
-from flash.serving.src.undeploy import apply_teardown, disable_matched
+from flash.serving.src.undeploy import (
+    apply_teardown,
+    disable_matched,
+    get_authoritative,
+    resolve_undeploy_target,
+)
 from flash.serving.src.usage import UsageReporter
 
 _FLASH_CHECKPOINT_MODEL_RE = re.compile(
@@ -92,7 +96,6 @@ def build_serving_app(
     from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
     from fastapi.responses import JSONResponse, StreamingResponse
 
-    from flash.serving.src.persistence import PersistenceRecordError
     from flash.serving.src.schemas import (
         AdapterActivationRequest,
         GenerateRequest,
@@ -313,27 +316,16 @@ def build_serving_app(
         if reload_records is not None:
             await _reload()
 
-        async def _get_authoritative(adapter_id: str) -> AdapterRecord | None:
-            try:
-                return await _get_stored(adapter_id)
-            except PersistenceRecordError as exc:
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "adapter storage is unavailable",
-                ) from exc
-
-        record = router.get(adapter_id)
-        if record is None:
-            record = await _get_authoritative(adapter_id)
-        if record is not None and record.status == "ready" and record.serve_base_model:
-            base_model = record.base_model
+        base_record, run_id, matches = await resolve_undeploy_target(router, adapter_id)
+        if base_record is not None:
+            base_model = base_record.base_model
             router.remove(adapter_id)
             # return after durable routing cleanup; gpu eviction continues after the response.
             background_tasks.add_task(
                 _unregister_safe,
                 base_model,
                 adapter_id,
-                record.deployment_generation,
+                base_record.deployment_generation,
             )
             return {
                 "ok": True,
@@ -344,29 +336,10 @@ def build_serving_app(
                 "disabled_revisions": [],
             }
 
-        if (
-            record is not None
-            and (record.is_alias or record.is_revision)
-            and record.run_id is not None
-        ):
-            run_id = record.run_id
-        elif record is None and "@" not in adapter_id:
-            run_id = adapter_id
-        else:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-        matches = [
-            candidate
-            for candidate in router.ready_records()
-            if (candidate.is_alias and candidate.adapter_id == run_id)
-            or (candidate.is_revision and candidate.run_id == run_id)
-        ]
-        if not matches:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-
         # phase 1: compare-and-swap every matched row to "disabled" in persistence first, collecting
         # the rows that durably converged.
         disabled_aliases, disabled_revisions, stuck_ready, pending_teardown = await disable_matched(
-            matches, get_authoritative=_get_authoritative
+            matches, get_authoritative=get_authoritative
         )
 
         # phase 2: remove every durably disabled row from routing immediately. gpu eviction is

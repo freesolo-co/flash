@@ -99,3 +99,49 @@ def apply_teardown(
         cleanup_record = current or candidate
         cleanup_records.append((cleanup_record, cleanup_record.deployment_generation))
     return cleanup_records
+
+
+async def get_authoritative(adapter_id: str) -> AdapterRecord | None:
+    """Read the persisted row, mapping a storage failure to 503 rather than a 500."""
+    try:
+        return await _get_stored(adapter_id)
+    except PersistenceRecordError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "adapter storage is unavailable",
+        ) from exc
+
+
+async def resolve_undeploy_target(
+    router: AdapterRouter, adapter_id: str
+) -> tuple[AdapterRecord | None, str, list[AdapterRecord]]:
+    """Resolve what a delete targets: ``(base_model_record, run_id, matched_rows)``.
+
+    A base-model serve is its own single target and is returned as the first element with no
+    matches. Otherwise every alias and revision sharing the run id is a match, because undeploying
+    a run tears down the whole cascade rather than one row.
+    """
+    record = router.get(adapter_id)
+    if record is None:
+        record = await get_authoritative(adapter_id)
+    if record is not None and record.status == "ready" and record.serve_base_model:
+        return record, adapter_id, []
+
+    if record is not None and (record.is_alias or record.is_revision) and record.run_id is not None:
+        run_id = record.run_id
+    elif record is None and "@" not in adapter_id:
+        # a bare run id with no cached row: the alias may exist only in persistence, so the match
+        # scan below still gets a chance rather than 404-ing on the cache alone.
+        run_id = adapter_id
+    else:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+
+    matches = [
+        candidate
+        for candidate in router.ready_records()
+        if (candidate.is_alias and candidate.adapter_id == run_id)
+        or (candidate.is_revision and candidate.run_id == run_id)
+    ]
+    if not matches:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+    return None, run_id, matches
