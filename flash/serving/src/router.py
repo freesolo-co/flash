@@ -44,6 +44,7 @@ from flash.serving.src.serving_io import (
     _validate_alias_target,
 )
 from flash.serving.src.structured_outputs import StructuredOutputsError
+from flash.serving.src.usage import UsageReporter
 
 _FLASH_CHECKPOINT_MODEL_RE = re.compile(
     r"(?P<run_id>flash-[0-9]{1,20}-[0-9a-f]{8})/step-[0-9]{1,18}"
@@ -130,17 +131,8 @@ def build_serving_app(
                 pass
             except Exception:  # best-effort cleanup must not fail shutdown
                 pass
-        # drain detached usage reports before closing their shared client. the timeout bounds
-        # graceful shutdown; any remainder is cancelled and settled so no task can wake against a
-        # closed client after a rolling deployment.
-        if _pending_tasks:
-            _, pending = await asyncio.wait(
-                tuple(_pending_tasks), timeout=_USAGE_REPORT_DRAIN_TIMEOUT_SECONDS
-            )
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+        # drain detached usage reports before closing their shared client.
+        await _usage.drain()
 
         # Close persistent httpx clients (usage reporter + chat authorizer) on shutdown so
         # long-lived containers don't leak sockets / emit "Unclosed client" ResourceWarnings.
@@ -156,11 +148,11 @@ def build_serving_app(
     )
 
     last_reload: dict[str, Any] = {"at": float("-inf"), "task": None}
-    # Strong refs to fire-and-forget streaming usage tasks. asyncio only keeps a WEAK reference to
-    # a bare create_task(), so without this the GC can collect a still-pending billing report mid
-    # event loop (silently dropping it and emitting "Task was destroyed but it is pending"). The
-    # done-callback discards each task once it settles, so the set stays bounded by in-flight count.
-    _pending_tasks: set[Any] = set()
+    _usage = UsageReporter(
+        usage_reporter,
+        deployment_id=deployment_id,
+        drain_timeout_seconds=_USAGE_REPORT_DRAIN_TIMEOUT_SECONDS,
+    )
 
     def _assert_internal(request: Request) -> None:
         assert_internal(request, internal_key)
@@ -644,70 +636,12 @@ def build_serving_app(
             "disabled_revisions": sorted(disabled_revisions),
         }
 
-    async def _report_usage_safe(usage: dict[str, Any]) -> None:
-        # fire-and-forget: the reporter performs its bounded idempotent retries, and any final
-        # failure remains isolated from the response that has already been sent.
-        assert usage_reporter is not None
-        try:
-            await usage_reporter(usage)
-        except Exception as exc:  # never fail the (already-sent) response
-            print(f"serving usage report dropped for {usage.get('requestId')}: {exc!r}", flush=True)
-
-    def _usage_payload(
-        record: AdapterRecord, result: dict[str, Any], caller_org: str | None
-    ) -> dict[str, Any] | None:
-        """Backend usage-report body, or None when there's nothing billable to report.
-
-        A LoRA serve reports by ``adapterId`` — the backend resolves the OWNING org and bills it. A
-        base-model serve has no owner, so it carries the CALLER's ``orgId`` and OMITS ``adapterId``
-        (which is authoritative when present and would fail to resolve for a base model); the backend
-        bills that org. When a base serve has no known caller org (an internal-key server-to-server
-        caller), it is dropped rather than misbilled.
-        """
-        # The engine result is snake_case (the serving API's internal contract); this OUTBOUND
-        # billing payload keeps the platform backend's camelCase keys (a separate service's
-        # contract), so we read snake here and write camel below.
-        prompt_tokens = result.get("prompt_tokens")
-        completion_tokens = result.get("completion_tokens")
-        # The engine reports token counts; without them there is nothing to meter.
-        if prompt_tokens is None or completion_tokens is None:
-            return None
-        payload: dict[str, Any] = {
-            "baseModel": record.base_model,
-            "promptTokens": int(prompt_tokens),
-            "completionTokens": int(completion_tokens),
-            # Prefix-cached subset of the prompt (engine num_cached_tokens); billed at a
-            # discount by the backend. Defaults to 0 when the engine doesn't report it.
-            "cachedTokens": int(result.get("cached_tokens") or 0),
-            "cachedTokensReported": result.get("cached_tokens_reported") is True,
-            "gpuSeconds": result.get("inference_time_seconds"),
-            # stable per-generation id from the engine is the backend idempotency key for retries.
-            # fall back to a fresh id only when an offline test pool did not supply one.
-            "requestId": result.get("request_id") or str(uuid.uuid4()),
-            "engineReplicaId": result.get("engine_replica_id"),
-            "servingDeploymentId": deployment_id or None,
-        }
-        if record.serve_base_model:
-            if not caller_org:
-                return None
-            payload["orgId"] = caller_org
-        else:
-            payload["adapterId"] = record.adapter_id
-        return payload
-
     def _schedule_usage(
         record: AdapterRecord,
         result: dict[str, Any],
         caller_org: str | None,
     ) -> None:
-        if usage_reporter is None:
-            return
-        payload = _usage_payload(record, result, caller_org)
-        if payload is None:
-            return
-        task = asyncio.create_task(_report_usage_safe(payload))
-        _pending_tasks.add(task)
-        task.add_done_callback(_pending_tasks.discard)
+        _usage.schedule(record, result, caller_org)
 
     async def _generate(
         payload: Any,
