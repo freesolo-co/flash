@@ -137,6 +137,22 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
     assert "data.messages_key" not in overrides
 
 
+def test_overrides_point_verl_at_a_warm_start_adapter():
+    """A warm-started SFT run hands verl the staged source adapter.
+
+    verl's SFT engine only continues an existing LoRA when ``model.lora_adapter_path`` is a real
+    path -- it builds a fresh adapter otherwise -- so this override IS the warm start. SFT was
+    rejected as a warm-start target for long enough that only the fresh (``null``) shape was
+    covered; the matching GRPO assertion is
+    ``test_build_verl_overrides_warmstart_adapter_path`` in tests/test_rl_train.py.
+    """
+    fresh = _as_map(build_sft_overrides(_cfg()))
+    assert fresh["model.lora_adapter_path"] == "null"
+
+    warm = _as_map(build_sft_overrides(_cfg(lora_adapter_path="/w/source_adapter")))
+    assert warm["model.lora_adapter_path"] == "/w/source_adapter"
+
+
 def test_overrides_carry_fused_expert_target_parameters():
     overrides = _as_map(
         build_sft_overrides(

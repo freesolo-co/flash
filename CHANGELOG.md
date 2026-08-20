@@ -21,6 +21,13 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- `[train] init_from_adapter` now works for every source/target algorithm pair. SFT was rejected as
+  a warm-start target, so an adapter could be continued only by GRPO or OPD; that restriction
+  described the retired trl SFT backend, and the verl backend that replaced it loads a warm-start
+  adapter exactly like the other two. All nine combinations of `sft`, `grpo`, and `opd` are
+  supported, including same-algorithm continuation. A warm-started SFT run also inherits its
+  source's base-model pin instead of resolving its own, so it stays deployable and no longer breaks
+  when the base model's hub tip moves.
 - Managed attempts now pin, verify, and report one immutable Flash source archive across retries and recovery.
 - Multi-turn GRPO now clones each sibling rollout from the task state that produced its prepared
   prompt. Environments that record randomized episode choices on the task during `start_episode`

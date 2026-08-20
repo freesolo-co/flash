@@ -54,28 +54,34 @@ def _cached_model_path(model_id: str, model_revision: str) -> str:
 
 
 def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: int) -> str | None:
+    """Stage and verify this run's warm-start source adapter; None when it is not a warm start.
+
+    Shared by the SFT and OPD runners (see ``opd_train``), and the source adapter may come from a
+    run of any algorithm, so nothing here may describe either end as SFT: warm start continues one
+    LoRA in place across every algorithm pair.
+    """
     spec = _w.JOB_SPEC
     source = spec.train.init_from_adapter if spec else ""
     if not source:
         return None
     adapter_dir = _w._download_adapter(source)
     if not adapter_dir:
-        raise RuntimeError("the prepared SFT warm-start adapter could not be downloaded")
+        raise RuntimeError("the prepared warm-start adapter could not be downloaded")
     with open(os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8") as file:
         config = json.load(file)
     rank = rank_from_adapter_config(config, source=os.path.join(adapter_dir, "adapter_config.json"))
     if rank != expected_rank:
         raise ValueError(
-            f"SFT warm-start adapter rank {rank} does not match the prepared train.lora_rank "
+            f"warm-start adapter rank {rank} does not match the prepared train.lora_rank "
             f"{expected_rank}; rank changes are not supported"
         )
     _w.validate_warmstart_adapter(config, model_id, adapter_dir)
     base = str(config.get("base_model_name_or_path") or "").strip()
     if base and base != model_id:
-        raise ValueError("SFT warm-start adapter base model does not match the target model")
+        raise ValueError("warm-start adapter base model does not match the target model")
     revision = str(config.get("revision") or "").strip()
     if revision and model_revision and revision != model_revision:
-        raise ValueError("SFT warm-start adapter revision does not match the target model revision")
+        raise ValueError("warm-start adapter revision does not match the target model revision")
     return adapter_dir
 
 

@@ -139,10 +139,21 @@ def test_worker_hard_exits_zero_on_success(monkeypatch):
     assert raised.code == 0, "must exit 0 on success"
 
 
-def test_worker_rejects_sft_adapter_continuation_before_handler(monkeypatch):
+def test_worker_dispatches_sft_adapter_continuation_to_the_handler(monkeypatch):
+    """A warm-started SFT run must reach run_sft, not be refused at dispatch.
+
+    ``sft_train._warmstart_adapter_path`` downloads and validates the source adapter and
+    ``sft_train_runner`` hands it to verl as ``model.lora_adapter_path``; the handler has to be
+    entered for any of that to happen.
+    """
     from flash.core.spec import JobSpec, TrainSpec
 
-    _patch_common(monkeypatch, lambda code=0: None)
+    ran = {"v": False}
+
+    def fake_exit(code=0):
+        raise _HardExit(code)
+
+    _patch_common(monkeypatch, fake_exit)
     monkeypatch.setattr(
         worker,
         "JOB_SPEC",
@@ -151,17 +162,16 @@ def test_worker_rejects_sft_adapter_continuation_before_handler(monkeypatch):
             train=TrainSpec(init_from_adapter="owner/runs:sft/source-run"),
         ),
     )
-    monkeypatch.setattr(worker, "gpu_diagnostics", lambda **k: {})
-    monkeypatch.setattr(worker, "error_artifact_name", lambda *a, **k: "error.txt")
-    monkeypatch.setattr(worker, "hf_upload_file", lambda *a, **k: None)
-    monkeypatch.setattr(
-        worker,
-        "run_sft",
-        lambda: pytest.fail("sft handler must not run for adapter continuation"),
-    )
+    monkeypatch.setattr(worker, "run_sft", lambda: ran.__setitem__("v", True))
 
-    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
+    raised = None
+    try:
         worker.main()
+    except _HardExit as e:
+        raised = e
+    assert ran["v"] is True, "a warm-started sft run must invoke run_sft"
+    assert raised is not None
+    assert raised.code == 0
 
 
 def test_worker_dispatches_opd_run_mode(monkeypatch):
