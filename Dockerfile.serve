@@ -39,12 +39,13 @@ RUN uv sync --frozen --no-dev --extra serve-runtime
 # bump that silently drops back to CUDA 12 into a build failure instead of a crashloop on every
 # rented pod. The host driver is constrained separately, in the runpod pod plan -- a gpu type alone
 # does not ask for a driver.
+#
 # The check reads vllm's extension as a file rather than importing it: `import vllm._C` also needs
 # libcuda.so.1, the driver stub, which no GPU-less build machine has -- it would fail here for a
 # reason that says nothing about the CUDA pairing. Reading the DT_NEEDED strings out of the binary
 # asks exactly the question that matters and needs no GPU.
 RUN /opt/flash-venv/bin/python -c "\
-import glob, re, sys, torch; \
+import glob, re, torch; \
 v = torch.version.cuda; \
 assert v and v.startswith('13.'), f'vllm _C links libcudart.so.13, so this image needs a cuda 13 torch, got {torch.__version__} (cuda {v})'; \
 ext = glob.glob('/opt/flash-venv/lib/python3.12/site-packages/vllm/_C*.so'); \
