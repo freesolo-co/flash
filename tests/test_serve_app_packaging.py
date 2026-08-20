@@ -190,9 +190,20 @@ def test_manifest_requires_external_manifest_and_image_bindings(
 def test_dockerfile_serve_uses_existing_cuda_family_and_frozen_lock() -> None:
     source = (ROOT / "Dockerfile.serve").read_text()
     worker = (ROOT / "Dockerfile.worker").read_text()
-    base = next(line for line in worker.splitlines() if line.startswith("FROM "))
+    base = next(line for line in source.splitlines() if line.startswith("FROM "))
 
-    assert base in source
+    # the two images deliberately no longer share one base. the worker is pinned to torch 2.10 /
+    # cu12.8 because that is what its FlashAttention wheels are built for; the serving image runs
+    # vllm 0.23.0, whose compiled vllm/_C extension links libcudart.so.13, so a cuda 12 base fails
+    # at import with "ImportError: libcudart.so.13". asserting the two FROM lines were identical
+    # therefore asserted something that cannot be true -- what actually has to hold is that each
+    # image states a pytorch base whose cuda matches its own stack.
+    assert base.startswith("FROM pytorch/pytorch:")
+    assert "-cuda13." in base, "serving needs a cuda 13 base for vllm's compiled extension"
+    assert next(line for line in worker.splitlines() if line.startswith("FROM ")).startswith(
+        "FROM pytorch/pytorch:"
+    )
+    assert "libcudart.so.13" in source, "the cuda pairing must be asserted at build time"
     # The shared base ships /usr/lib/python3.12/EXTERNALLY-MANAGED, so a pip install into the
     # system interpreter fails with "externally-managed-environment" (PEP 668) unless this is
     # set. Dockerfile.worker sets it for exactly that reason; Dockerfile.serve did not, and the
