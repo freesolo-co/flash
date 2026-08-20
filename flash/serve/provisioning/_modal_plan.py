@@ -19,6 +19,7 @@ from ._common import (
     _resource_name,
     base64url_identity,
     encode_manifest_environment,
+    reject_unreachable_registry,
 )
 
 MODAL_VOLUME_MOUNT = "/modal-volume"
@@ -299,6 +300,7 @@ def build_modal_create_plan(
     bundle.__post_init__()
     if bundle.spec.provider != "modal" or type(bundle.spec.placement) is not ModalPlacement:
         raise ValueError("modal provisioning requires a modal deployment bundle")
+    reject_unreachable_registry(bundle.image)
     placement = bundle.spec.placement
     _validate_placement(placement)
     names = _modal_resource_names(bundle)

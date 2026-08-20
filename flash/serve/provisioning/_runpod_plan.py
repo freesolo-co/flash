@@ -12,6 +12,7 @@ from ._common import (
     DeploymentBundle,
     ServingResourceNames,
     encode_manifest_environment,
+    reject_unreachable_registry,
     serving_resource_names,
 )
 from ._runpod_protocol import (
@@ -124,6 +125,7 @@ def build_runpod_create_plan(bundle: DeploymentBundle) -> RunPodCreatePlan:
     bundle.__post_init__()
     if bundle.spec.provider != "runpod" or type(bundle.spec.placement) is not RunPodPlacement:
         raise ValueError("runpod provisioning requires a runpod deployment bundle")
+    reject_unreachable_registry(bundle.image)
     placement = bundle.spec.placement
     names = serving_resource_names(
         bundle.spec.deployment_id,

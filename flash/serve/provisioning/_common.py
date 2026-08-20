@@ -125,6 +125,31 @@ def _validate_registry(value: str) -> None:
         raise ValueError("image reference registry dns name is not canonical")
 
 
+_LOOPBACK_REGISTRY_HOSTS = frozenset({"localhost", "localhost.localdomain"})
+
+
+def reject_unreachable_registry(image: ServingImage) -> None:
+    """reject a registry only the operator's machine can reach.
+
+    `_validate_registry` accepts loopback and private hosts because a local registry is a
+    legitimate target for a locally executed pull. modal and runpod resolve the reference inside
+    their own build or pod infrastructure instead, and neither path uploads the image or opens a
+    tunnel back, so such a reference fails only after provider resources exist and bill. reject it
+    while building the plan, before any provider call.
+    """
+
+    registry = image.reference.rsplit("@", 1)[0].split("/", 1)[0]
+    host = registry.rsplit(":", 1)[0] if registry.count(":") == 1 else registry
+    if host in _LOOPBACK_REGISTRY_HOSTS:
+        raise ValueError("remote provider image registry cannot be a loopback host")
+    try:
+        address = ipaddress.IPv4Address(host)
+    except ipaddress.AddressValueError:
+        return
+    if address.is_loopback or address.is_private or address.is_link_local:
+        raise ValueError("remote provider image registry cannot be a loopback or private address")
+
+
 def base64url_identity(identity: bytes) -> str:
     """encode one exact 32-byte identity without base64 padding."""
 

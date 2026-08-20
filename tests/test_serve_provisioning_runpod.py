@@ -1746,3 +1746,24 @@ def test_interrupting_after_the_pod_is_ready_does_not_tear_down_the_live_pod() -
     assert transport.volumes, "the volume backing the ready pod must survive the interrupt"
     operations = [operation for _kind, operation, mutation, _payload in transport.calls if mutation]
     assert "DELETE /pods" not in " ".join(operations), operations
+
+
+def test_loopback_image_registries_are_rejected_before_any_runpod_call() -> None:
+    # the same reasoning as the modal case: `ServingImage` allows a loopback registry because a
+    # local pull is legitimate, but a runpod pod resolves `imageName` on the provider side. no
+    # code path uploads the image or tunnels to the operator's host, so the pull fails only once
+    # the pod exists and bills. reject it while the plan is still local.
+    original = _bundle()
+    for registry in ("localhost", "localhost:5000", "127.0.0.1", "10.20.30.40", "169.254.1.2"):
+        bundle = DeploymentBundle(
+            spec=original.spec,
+            manifest=original.manifest,
+            image=ServingImage(
+                reference=f"{registry}/flash/serve@{original.image.digest}",
+                digest=original.image.digest,
+            ),
+        )
+        with pytest.raises(ValueError, match=r"loopback|private"):
+            build_runpod_create_plan(bundle)
+
+    assert build_runpod_create_plan(original)

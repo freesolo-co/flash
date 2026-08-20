@@ -1367,3 +1367,25 @@ def test_a_wellformed_web_suffix_still_builds_its_plan() -> None:
     plan = build_modal_create_plan(_bundle(web_suffix="dev-2"), phase="finalized")
 
     assert "-dev-2--" in plan.expected_public_url
+
+
+def test_loopback_image_registries_are_rejected_before_any_modal_call() -> None:
+    # `ServingImage` accepts a loopback registry on purpose: pulling from a local registry is
+    # legitimate when the pull happens on the operator's machine. modal resolves the reference
+    # inside its own build infrastructure instead, and nothing here uploads the image or opens a
+    # tunnel back, so the pull would fail only after the app and its resources already exist and
+    # bill. the plan builder is the last point where rejecting it costs nothing.
+    original = _bundle()
+    for registry in ("localhost", "localhost:5000", "127.0.0.1", "10.20.30.40", "169.254.1.2"):
+        bundle = DeploymentBundle(
+            spec=original.spec,
+            manifest=original.manifest,
+            image=ServingImage(
+                reference=f"{registry}/flash/serve@{original.image.digest}",
+                digest=original.image.digest,
+            ),
+        )
+        with pytest.raises(ValueError, match=r"loopback|private"):
+            build_modal_create_plan(bundle)
+
+    assert build_modal_create_plan(original)
