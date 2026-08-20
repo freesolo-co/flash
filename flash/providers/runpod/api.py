@@ -41,15 +41,29 @@ def _is_legacy_key_fingerprint(fingerprint: object) -> bool:
     )
 
 
+def _unique_matching_key(matches: list[str], message: str) -> str:
+    """The sole distinct credential among fingerprint matches.
+
+    Uniqueness is counted over distinct key VALUES, not pool entries: an operator who repeats
+    the same credential in the comma-separated ``RUNPOD_API_KEY`` still has unambiguous
+    ownership, and refusing to resolve it would strand submission, polling, cancellation and
+    endpoint deletion on a benign configuration typo.
+    """
+    distinct = set(matches)
+    if len(distinct) != 1:
+        raise RunpodApiError(message)
+    return next(iter(distinct))
+
+
 def _key_for_fingerprint(fingerprint: str) -> str:
     """Resolve a full key fingerprint back to its unique raw pool key."""
     if not _is_valid_key_fingerprint(fingerprint):
         raise RunpodApiError("persisted RunPod key fingerprint is invalid")
     configured_keys = _keys.keys()
     matches = [key for key in configured_keys if key_fingerprint(key) == fingerprint]
-    if len(matches) != 1:
-        raise RunpodApiError("expected exactly one RunPod pool key for the persisted fingerprint")
-    return matches[0]
+    return _unique_matching_key(
+        matches, "expected exactly one RunPod pool key for the persisted fingerprint"
+    )
 
 
 class RunpodApiError(RuntimeError):
@@ -135,11 +149,11 @@ def resolve_legacy_key_fingerprint(endpoint_id: str, fingerprint: str) -> str:
         for key in configured_keys
         if (full_fingerprint := key_fingerprint(key)).startswith(fingerprint)
     ]
-    if len(matches) != 1:
-        raise RunpodApiError(
-            "expected exactly one RunPod pool key matching the persisted legacy fingerprint"
-        )
-    key, full_fingerprint = matches[0]
+    key = _unique_matching_key(
+        [match_key for match_key, _ in matches],
+        "expected exactly one RunPod pool key matching the persisted legacy fingerprint",
+    )
+    full_fingerprint = key_fingerprint(key)
     try:
         endpoints = _list_endpoints_for_key(key)
     except Exception:

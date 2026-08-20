@@ -60,6 +60,39 @@ def test_key_lookup_rejects_colliding_configured_fingerprints(monkeypatch):
     assert all(key not in str(exc_info.value) for key in keys)
 
 
+def test_repeated_identical_pool_key_still_resolves_its_fingerprint(monkeypatch):
+    """A duplicated credential is a config typo, not an ownership ambiguity.
+
+    ``RUNPOD_API_KEY`` is a comma-separated pool, so the same key pasted twice yields two
+    exact fingerprint matches. Ownership is still unambiguous (equal sha256 => equal key),
+    and refusing to resolve it would break submit/poll/cancel/delete for that account.
+    """
+    from flash.providers.runpod import api
+
+    _reset_pool(monkeypatch, "secretA,secretB,secretA")
+
+    assert api._key_for_fingerprint(api.key_fingerprint("secretA")) == "secretA"
+    assert api._key_for_fingerprint(api.key_fingerprint("secretB")) == "secretB"
+
+
+def test_repeated_identical_pool_key_still_resolves_a_legacy_prefix(monkeypatch):
+    """The legacy-prefix resolver counts distinct credentials for the same reason."""
+    from flash.providers.runpod import api
+
+    key = "legacy-owner"
+    _reset_pool(monkeypatch, f"{key},{key}")
+    monkeypatch.setattr(
+        api._CLIENT,
+        "request_with_retries_for_key",
+        lambda *_args, **_kwargs: [{"id": "ep-legacy"}],
+    )
+
+    full_fingerprint = api.key_fingerprint(key)
+    resolved = api.resolve_legacy_key_fingerprint("ep-legacy", full_fingerprint[:16])
+
+    assert resolved == full_fingerprint
+
+
 def test_rotated_sole_replacement_with_same_48_bit_prefix_cannot_confirm_absence(monkeypatch):
     from flash.providers.runpod import api
 
