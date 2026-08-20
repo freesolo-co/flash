@@ -332,10 +332,15 @@ def _fused_artifact_with_visual_pair(monkeypatch, tmp_path):
     monkeypatch.setattr(
         checkpoints, "_validate_adapter_tensor_values", lambda *args, **kwargs: None
     )
+    # peft expands `all-linear` into the concrete module list at model-creation time, and the
+    # exporter re-canonicalizes it back to the shorthand only after validation. so the config a
+    # real multimodal export presents names the vision suffix alongside the language modules.
+    # declaring only the language ones would make the validator reject for an undeclared ordinary
+    # target rather than for the modality property these two tests are about.
     config = {
         "peft_type": "LORA",
         "r": 32,
-        "target_modules": ["q_proj", "experts", "base_layer"],
+        "target_modules": ["q_proj", "experts", "base_layer", "proj"],
         "target_parameters": None,
     }
     _write_expert_adapter(tmp_path, config=config)
@@ -1114,6 +1119,35 @@ def test_text_only_export_rejects_complete_non_language_pairs(monkeypatch, tmp_p
     assert config_path.read_bytes() == before
 
 
+def test_fused_multimodal_export_keeps_vision_tensors_as_ordinary_evidence():
+    """a declared vision target must be satisfiable, and its tensors must still be validated.
+
+    a vision module never matches a fused expert owner, so it falls through the fused-rung walk on
+    its own and reaches `_has_ordinary_evidence` -- which requires evidence for every declared
+    ordinary target and applies the A/B, rank, and shape checks. skipping such tensors anywhere in
+    this function would fail a healthy multimodal export whose merger config names a vision suffix,
+    and would leave those tensors unchecked.
+    """
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    vision = "base_model.model.visual.blocks.0.attn.qkv"
+    config = _merger_config(target_modules=["q_proj", "gate_proj", "up_proj", "down_proj", "qkv"])
+
+    healthy = _merger_expert_tensors()
+    healthy.update(_wrapper_tensors(vision, ((32, 2048), (2048, 32))))
+    assert has_complete_fused_expert_tensors(healthy, config, _MODEL_ID)
+
+    # the vision pair is ordinary evidence, so a rank that disagrees with the config rejects.
+    bad_rank = _merger_expert_tensors()
+    bad_rank.update(_wrapper_tensors(vision, ((7, 2048), (2048, 7))))
+    assert not has_complete_fused_expert_tensors(bad_rank, config, _MODEL_ID)
+
+    # and an orphan factor rejects, exactly as it would for a language module.
+    orphan = _merger_expert_tensors()
+    orphan[f"{vision}.lora_A.weight"] = (32, 2048)
+    assert not has_complete_fused_expert_tensors(orphan, config, _MODEL_ID)
+
+
 @pytest.mark.parametrize(
     "module",
     [
@@ -1124,31 +1158,25 @@ def test_text_only_export_rejects_complete_non_language_pairs(monkeypatch, tmp_p
         "mtp.layers.0.proj",
     ],
 )
-def test_fused_topology_check_ignores_well_formed_non_language_pairs(module):
-    """the topology check describes the language stack, so a valid vision pair does not fail it.
+def test_fused_topology_check_requires_a_declared_target_for_a_non_language_pair(module):
+    """a non-language pair is ordinary evidence, so it must be declared like any other module.
 
-    it still describes the fused expert rungs exactly: the language tensors are unchanged, so the
-    verdict is driven by them alone. rejecting here would fail a multimodal run whose own targeting
-    selected these weights.
+    these modules are not expert rungs, so the fused walk classifies them as "elsewhere" and they
+    go through `_has_ordinary_evidence`. an undeclared one therefore rejects -- the same verdict a
+    stray undeclared language module gets -- while a declared one is accepted and fully validated
+    (see `test_fused_multimodal_export_keeps_vision_tensors_as_ordinary_evidence`).
     """
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
     tensors = _complete_expert_tensors()
-    tensors.update(
-        _wrapper_tensors(
-            f"base_model.model.{module}",
-            ((32, 2048), (2048, 32)),
-        )
-    )
+    tensors.update(_wrapper_tensors(f"base_model.model.{module}", ((32, 2048), (2048, 32))))
 
-    assert has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+    # `_valid_config()` declares only `q_proj`, so this pair is undeclared.
+    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
 
-    # and the language stack is still what decides: break one expert rung and it rejects again,
-    # so this is not a check that has been widened into accepting anything.
-    broken = dict(tensors)
-    expert_key = next(key for key in _complete_expert_tensors() if ".mlp.experts." in key)
-    broken.pop(expert_key)
-    assert not has_complete_fused_expert_tensors(broken, _valid_config(), _MODEL_ID)
+    # declaring its suffix makes the same artifact a healthy multimodal export.
+    declared = _valid_config(target_modules=["q_proj", module.rsplit(".", 1)[-1]])
+    assert has_complete_fused_expert_tensors(tensors, declared, _MODEL_ID)
 
 
 def test_tensor_analyzer_rejects_unparsed_and_undeclared_ordinary_tensors():

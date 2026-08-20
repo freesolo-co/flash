@@ -169,18 +169,9 @@ def fused_expert_lora_tensor_pairs(
         return None
     parsed = []
     for key, shape in tensors.items():
-        # parse FIRST: an unparseable key rejects the whole adapter even when it names a vision
-        # module, so a `modules_to_save` full-weight copy cannot ride along by being non-language.
         tensor = _parse_lora_tensor(key, shape)
         if tensor is None:
             return None
-        # a multimodal run targets `all-linear` with no exclude regex, so the merger writes vision
-        # linears next to the language ones. this check describes the language stack's fused expert
-        # topology only, so a well-formed non-language pair is skipped rather than read as a
-        # malformed export. whether it belongs at all is the export boundary's call: it knows the
-        # run's modality and rejects one a text-only run never targeted.
-        if is_non_language_lora_key(tensor[0]):
-            continue
         parsed.append(tensor)
     if not parsed:
         return None
