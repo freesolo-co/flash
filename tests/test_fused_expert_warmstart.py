@@ -424,6 +424,179 @@ def test_fused_export_accepts_a_finite_nonzero_actual_payload(monkeypatch, tmp_p
     assert saved["target_parameters"] == _TARGETS
 
 
+def _merger_expert_tensors(*, include_ordinary=True, drop_last_layer_rung=False):
+    """Build the tensor map the PINNED verl merger actually writes.
+
+    Deliberately NOT `_complete_expert_tensors()`: that helper names its leaves
+    ``default.weight``, which is the in-memory PEFT form. Pinned verl's merger runs
+    ``name.replace(".default.weight", ".weight")`` before ``save_file``, and PEFT's own
+    ``save_and_load`` strips the adapter name the same way, so **no adapter namespace reaches
+    disk**. A fixture carrying one cannot detect a validator that requires one.
+
+    Also models the `shared_expert*` linears an `all-linear` run picks up, which is what makes the
+    real artifact's expert-ish tensor count 480 (160 routed-fused + 240 shared MLP + 80 gate)
+    rather than the 160 routed-fused rungs the topology check counts.
+    """
+    leaves = ("weight", "weight")
+    tensors = {}
+    for layer in range(40):
+        owner = f"base_model.model.layers.{layer}.mlp.experts"
+        first, second = _EXPECTED_PAIRS
+        if drop_last_layer_rung and layer == 39:
+            continue
+        tensors.update(_wrapper_tensors(owner, first, leaves))
+        tensors.update(_wrapper_tensors(f"{owner}.base_layer", second, leaves))
+        if include_ordinary:
+            for shared in ("gate_proj", "up_proj", "down_proj"):
+                tensors.update(
+                    _wrapper_tensors(
+                        f"base_model.model.layers.{layer}.mlp.shared_expert.{shared}",
+                        ((32, 2048), (2048, 32)),
+                        leaves,
+                    )
+                )
+    if include_ordinary:
+        tensors.update(_ordinary_tensors(factor_leaves=leaves))
+    return tensors
+
+
+def _merger_config(**overrides):
+    """The config that accompanies `_merger_expert_tensors()` on disk.
+
+    peft resolves ``target_modules="all-linear"`` into the concrete module list at model-creation
+    time (`_maybe_include_all_linear_layers` assigns `peft_config.target_modules`), and the exporter
+    only re-canonicalizes it back to the shorthand *after* validation
+    (`checkpoints.stamp_adapter_dir_provenance`). So the config the validator sees names every
+    targeted module -- including the `shared_expert` linears this fixture models. Declaring only
+    `q_proj` against a 402-tensor artifact is a pair no real run produces, and it makes the
+    validator reject for a config mismatch rather than for the property under test.
+    """
+    config = _valid_config(
+        target_modules=["q_proj", "gate_proj", "up_proj", "down_proj"],
+    )
+    config.update(overrides)
+    return config
+
+
+def test_fused_completeness_accepts_the_namespace_free_keys_verl_actually_writes():
+    """Pinned verl strips `.default` from every LoRA key before saving, so the on-disk grammar is
+    `...lora_A.weight`. Requiring the namespace rejected every real 35B-A3B adapter -- training
+    completed, then the export guard refused to stamp it."""
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _merger_expert_tensors()
+    assert all(".default.weight" not in key for key in tensors)
+
+    assert has_complete_fused_expert_tensors(tensors, _merger_config(), _MODEL_ID)
+
+
+def test_fused_completeness_still_accepts_the_legacy_namespaced_keys():
+    """The in-memory PEFT form must keep working: a caller may hand us a live state dict."""
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    assert has_complete_fused_expert_tensors(_complete_expert_tensors(), _valid_config(), _MODEL_ID)
+
+
+def test_fused_completeness_rejects_mixed_namespaced_and_bare_keys():
+    """One artifact carries one serialization. A mix means two adapters were merged into one
+    directory, which is exactly what the single-namespace invariant exists to catch -- and it must
+    survive the namespace becoming optional."""
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _merger_expert_tensors()
+    stale = {
+        key.replace(".lora_A.weight", ".lora_A.other.weight").replace(
+            ".lora_B.weight", ".lora_B.other.weight"
+        ): shape
+        for key, shape in _ordinary_tensors(
+            target="v_proj", factor_leaves=("weight", "weight")
+        ).items()
+    }
+    tensors.update(stale)
+
+    assert not has_complete_fused_expert_tensors(tensors, _merger_config(), _MODEL_ID)
+
+
+@pytest.mark.parametrize(
+    "smuggled",
+    [
+        {"base_model.model.visual.proj.modules_to_save.default.weight": (2, 2)},
+        {"base_model.model.mtp.proj.modules_to_save.default.weight": (2, 2)},
+        {"base_model.model.layers.0.self_attn.q_proj.lora_A.bias": (32, 2048)},
+        {"attacker.layers.0.q_proj.lora_A.weight": (32, 2048)},
+    ],
+)
+def test_fused_completeness_still_rejects_unparseable_keys(smuggled):
+    """SABOTAGE GUARD. Making the namespace optional must not widen the grammar enough to admit a
+    key it was built to refuse. Any tensor that fails to parse rejects the whole adapter -- skipping
+    it would let a `modules_to_save` vision tensor ride along inside an otherwise-valid artifact."""
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _merger_expert_tensors()
+    assert has_complete_fused_expert_tensors(tensors, _merger_config(), _MODEL_ID)
+    tensors.update(smuggled)
+
+    assert not has_complete_fused_expert_tensors(tensors, _merger_config(), _MODEL_ID)
+
+
+def test_fused_completeness_rejects_a_genuinely_incomplete_merger_artifact():
+    """SABOTAGE GUARD. The fix must not turn the check into one that accepts anything: a real
+    merger artifact missing a layer's rungs is still incomplete."""
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    assert has_complete_fused_expert_tensors(_merger_expert_tensors(), _merger_config(), _MODEL_ID)
+    tensors = _merger_expert_tensors(drop_last_layer_rung=True)
+
+    assert not has_complete_fused_expert_tensors(tensors, _merger_config(), _MODEL_ID)
+
+
+def test_fused_export_stamps_a_real_namespace_free_artifact_end_to_end(tmp_path):
+    """The reported failure, reproduced through the real export boundary.
+
+    Unlike `_patch_export_metadata`, this writes an ACTUAL safetensors file and lets
+    `stamp_adapter_dir_provenance` read its real header -- no monkeypatched metadata reader and no
+    no-op value validator. Before the namespace fix this raised
+    `does not contain complete fused expert LoRA weights`.
+    """
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    payload = {}
+    for key, shape in _merger_expert_tensors().items():
+        array = np.zeros(shape, dtype=np.float16)
+        array[0, 0] = 1.0
+        payload[key] = array
+    _write_small_safetensors(tmp_path / "adapter_model.safetensors", payload)
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "r": 32,
+                "lora_alpha": 64,
+                # the synthetic `experts`/`base_layer` entries are stripped by
+                # `normalize_verl_fused_expert_export`; the rest is the resolved all-linear list
+                # peft wrote, which must name every ordinary module the artifact carries.
+                "target_modules": [
+                    "q_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                    "experts",
+                    "base_layer",
+                ],
+                "target_parameters": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["target_parameters"] == _TARGETS
+    assert saved["target_modules"] == "all-linear"
+    assert saved["base_model_name_or_path"] == _MODEL_ID
+
+
 def test_export_rejects_malformed_modules_after_normalization_without_writing(tmp_path):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 

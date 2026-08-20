@@ -493,6 +493,10 @@ def export_peft_adapter(
         shutil.rmtree(merge_out, ignore_errors=True)
 
 
+# bare `lora_A.weight` ONLY, deliberately. this validates the verl merger's output at the export
+# boundary, and that producer always strips the adapter name, so a namespaced key here means the
+# directory holds something the merger did not write. the fused validator accepts both because it
+# also runs at the warm-start boundary over previously published adapters.
 _TEXT_LORA_KEY_RE = re.compile(
     r"^(?P<module>base_model\.model\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+)"
     r"(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+))*)\.lora_(?P<factor>[AB])\.weight$"

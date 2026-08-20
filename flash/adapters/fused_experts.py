@@ -42,10 +42,15 @@ _NON_LANGUAGE_LORA_SEGMENTS = frozenset(
     }
 )
 _INVALID_FUSED_LOCATION = object()
+# the adapter namespace is OPTIONAL because neither producer writes it. pinned verl's merger does
+# `name.replace(".default.weight", ".weight")` before `save_file`, and peft's own `save_and_load`
+# strips the adapter name the same way -- `lora_A.default.weight` is the in-memory form, and
+# `lora_A.weight` is what lands on disk. requiring the segment rejected every real fused adapter.
+_DEFAULT_LORA_ADAPTER_NAME = "default"
 _FUSED_LORA_KEY_RE = re.compile(
     r"^(?P<module>base_model\.model\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+)"
-    r"(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+))*)\.lora_(?P<factor>[AB])\."
-    r"(?P<adapter>[A-Za-z0-9_-]+)\.weight$"
+    r"(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+))*)\.lora_(?P<factor>[AB])"
+    r"(?:\.(?P<adapter>[A-Za-z0-9_-]+))?\.weight$"
 )
 
 _LoraTensor = tuple[str, str, str, str, tuple[int, ...]]
@@ -183,11 +188,17 @@ def has_complete_fused_expert_tensors(
 
 
 def _parse_lora_tensor(key: str, shape: tuple[int, ...]) -> _LoraTensor | None:
-    """Parse one canonical PEFT LoRA tensor key."""
+    """Parse one canonical PEFT LoRA tensor key.
+
+    The saved form carries no adapter namespace, so an absent one reads as ``default`` -- the name
+    PEFT strips on save. Keeping it explicit preserves the single-namespace invariant downstream,
+    which would otherwise be satisfied trivially by every key reporting the same empty name.
+    """
     match = _FUSED_LORA_KEY_RE.fullmatch(key)
     if match is None:
         return None
-    return match.group("module"), match.group("factor"), match.group("adapter"), key, shape
+    adapter = match.group("adapter") or _DEFAULT_LORA_ADAPTER_NAME
+    return match.group("module"), match.group("factor"), adapter, key, shape
 
 
 def _expected_fused_expert_rungs(
