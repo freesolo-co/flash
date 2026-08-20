@@ -9,6 +9,7 @@ offline conftest.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import multiprocessing
@@ -313,6 +314,70 @@ def test_chat_messages_from_payload_validation():
         serving._chat_messages_from_payload({"messages": [{"role": "user"}, "oops"]})
     assert bad_item.value.status_code == 400
     assert "messages[1]" in bad_item.value.detail
+
+
+def _png_data_uri(image_format: str = "PNG") -> str:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "red").save(buffer, format=image_format)
+    mime = {"PNG": "image/png", "GIF": "image/gif"}[image_format]
+    return f"data:{mime};base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _image_block(url: str) -> dict:
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_detail"),
+    [
+        pytest.param(
+            [{"role": "user", "content": [_image_block(_png_data_uri()) for _ in range(5)]}],
+            "exceeding the 4-image limit",
+            id="fifth_image",
+        ),
+        pytest.param(
+            [{"role": "assistant", "content": [_image_block(_png_data_uri())]}],
+            "allowed only in user messages",
+            id="assistant_image",
+        ),
+        pytest.param(
+            [{"role": "user", "content": [_image_block(_png_data_uri("GIF"))]}],
+            "unsupported MIME type",
+            id="unsupported_mime",
+        ),
+        pytest.param(
+            [{"role": "user", "content": [_image_block("https://example.com/a.png")]}],
+            "remote image URLs are not supported",
+            id="remote_url",
+        ),
+    ],
+)
+def test_chat_payload_rejects_images_training_would_refuse(messages, expected_detail):
+    """serving admits exactly the images training does, so a request cannot bypass the contract.
+
+    without this the chat route forwarded any caller content straight upstream: training enforced
+    the count, role, mime, byte, and decoded-memory limits while serving enforced none of them.
+    """
+    with pytest.raises(HTTPException) as rejected:
+        serving._chat_messages_from_payload({"messages": messages})
+    assert rejected.value.status_code == 400
+    assert expected_detail in rejected.value.detail
+
+
+def test_chat_payload_forwards_admitted_messages_unchanged():
+    """the caller's own messages go upstream verbatim, including a legal four-image request.
+
+    the normalizer rewrites scalar ``content`` into block form; forwarding that rewritten shape
+    would change the wire format of every existing text-only request, so it is used to validate
+    and its output is deliberately discarded.
+    """
+    text_only = [{"role": "user", "content": "hi"}]
+    assert serving._chat_messages_from_payload({"messages": text_only}) is text_only
+
+    four_images = [{"role": "user", "content": [_image_block(_png_data_uri()) for _ in range(4)]}]
+    assert serving._chat_messages_from_payload({"messages": four_images}) is four_images
 
 
 def test_validate_hf_repo_id_accepts_valid_and_rejects_malformed():
