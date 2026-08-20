@@ -15,6 +15,7 @@ from ._common import (
     serving_resource_names,
 )
 from ._runpod_protocol import (
+    ALLOWED_CUDA_VERSIONS,
     LAUNCH_COMMAND_ARGV,
     NETWORK_VOLUME_MOUNT,
     PROXY_PORT,
@@ -171,6 +172,7 @@ def build_runpod_create_plan(bundle: DeploymentBundle) -> RunPodCreatePlan:
         return {**template_base, "env": dict(environment)}
 
     pod_static = {
+        "allowedCudaVersions": list(ALLOWED_CUDA_VERSIONS),
         "containerDiskInGb": placement.container_disk_gb,
         "dataCenterIds": [placement.data_center_id],
         "gpuCount": placement.gpu_count,

@@ -1,5 +1,6 @@
-# immutable flash serving runtime with the repository's existing cuda base family
-FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
+# immutable flash serving runtime. the cuda major version is set by the serve-runtime vllm pin,
+# whose compiled extension links libcudart.so.13 -- see the assertion below.
+FROM pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel
 
 # PIP_BREAK_SYSTEM_PACKAGES matches Dockerfile.worker, which shares this base image. The base
 # ships a Debian-style PEP 668 marker (/usr/lib/python3.12/EXTERNALLY-MANAGED), so the pinned-uv
@@ -27,23 +28,30 @@ COPY flash ./flash
 COPY serve_launch.py ./serve_launch.py
 RUN uv sync --frozen --no-dev --extra serve-runtime
 
-# vllm 0.23.0 requires torch==2.11.0 exactly, and PyPI's default torch 2.11.0 wheel is built for
-# CUDA 13. This base image is cuda12.8, and a RunPod L4 host reports driver 12080, so that wheel
-# aborts engine init with "The NVIDIA driver on your system is too old (found version 12080)" --
-# every pod died there, ~2s in, restarting forever.
+# The CUDA this image runs on is decided by vllm's own compiled extension, not by us: every vllm
+# wheel from 0.20.2 onward (0.23.0 included) ships a vllm/_C.abi3.so linked against
+# libcudart.so.13. Measured across the published wheels -- 0.19.1 links libcudart.so.12, 0.20.2 and
+# later link .13 -- so no pin inside the 0.2x line escapes CUDA 13, and downgrading torch to a
+# cu128 build only breaks the pair: vllm's extension still needs cudart 13 and fails at import with
+# "ImportError: libcudart.so.13: cannot open shared object file".
 #
-# Same versions, CUDA-matched build: PyTorch's own cu128 index publishes 2.11.0+cu128 (and the
-# matching torchvision/torchaudio), so this keeps the resolved dependency graph intact and only
-# swaps the CUDA the binaries were compiled against. Pinning here rather than in uv.lock keeps the
-# lockfile a single cross-platform resolution while the image states the CUDA its base provides,
-# the same way Dockerfile.worker version-matches torch to this base.
-#
-# `uv pip`, not `python -m pip`: uv builds the venv without pip in it, so `python -m pip` here
-# fails with "No module named pip". --no-deps so nothing re-resolves what uv already pinned.
-RUN uv pip install --no-cache --no-deps \
-        --index-url https://download.pytorch.org/whl/cu128 \
-        torch==2.11.0+cu128 torchvision==0.26.0+cu128 torchaudio==2.11.0+cu128 \
-    && /opt/flash-venv/bin/python -c "import torch; v=torch.version.cuda; assert v and v.startswith('12.8'), f'expected a cu128 torch, got {torch.__version__} (cuda {v})'; print('torch', torch.__version__, 'cuda', v)"
+# So the base tracks vllm rather than the other way round. Asserting it here turns a future base
+# bump that silently drops back to CUDA 12 into a build failure instead of a crashloop on every
+# rented pod. The host driver is constrained separately, in the runpod pod plan -- a gpu type alone
+# does not ask for a driver.
+# The check reads vllm's extension as a file rather than importing it: `import vllm._C` also needs
+# libcuda.so.1, the driver stub, which no GPU-less build machine has -- it would fail here for a
+# reason that says nothing about the CUDA pairing. Reading the DT_NEEDED strings out of the binary
+# asks exactly the question that matters and needs no GPU.
+RUN /opt/flash-venv/bin/python -c "\
+import glob, re, sys, torch; \
+v = torch.version.cuda; \
+assert v and v.startswith('13.'), f'vllm _C links libcudart.so.13, so this image needs a cuda 13 torch, got {torch.__version__} (cuda {v})'; \
+ext = glob.glob('/opt/flash-venv/lib/python3.12/site-packages/vllm/_C*.so'); \
+assert ext, 'vllm compiled extension not found'; \
+needed = sorted({m.decode() for m in re.findall(rb'libcudart\.so\.[0-9]+', open(ext[0], 'rb').read())}); \
+assert needed == ['libcudart.so.13'], f'vllm links {needed}, which does not match this cuda 13 base'; \
+print('torch', torch.__version__, 'cuda', v, '| vllm needs', needed[0])"
 
 EXPOSE 8000
 CMD ["python", "/app/serve_launch.py"]

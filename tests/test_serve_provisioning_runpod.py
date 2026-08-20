@@ -21,6 +21,7 @@ from flash.serve.control import (
 )
 from flash.serve.provisioning import DeploymentBundle, ServingImage, ServingRuntimeSecrets, _common
 from flash.serve.provisioning._common import serving_resource_names
+from flash.serve.provisioning._runpod_plan import build_runpod_create_plan
 from flash.serve.provisioning._runpod_probe import RunPodEndpointProbe
 from flash.serve.provisioning._runpod_protocol import (
     CREATE_SECRET,
@@ -514,6 +515,27 @@ def test_oversized_manifest_fails_before_secret_reveal_or_provider_construction(
     assert revealed is False
     assert factory.accepted_keys == []
     assert transport.calls == []
+
+
+def test_pod_creation_constrains_the_host_cuda_version() -> None:
+    # the serving image's vllm ships a compiled extension linked against libcudart.so.13. runpod
+    # documents allowedCudaVersions as "if not set, any CUDA version is acceptable", so omitting it
+    # let it place a pod on an L4 host reporting driver 12080: the container died at engine init and
+    # restarted forever, which externally is indistinguishable from a slow image pull. asking for a
+    # gpu type does not ask for a driver, so the constraint has to be stated on every create path.
+    bundle = _bundle()
+    names = serving_resource_names(
+        bundle.spec.deployment_id,
+        bundle.spec.generation,
+        bundle.spec.engine.engine_id,
+        workload_role="pod",
+    )
+
+    direct = pod_payload(bundle, names, template_id="template01", volume_id="volume01")
+    planned = json.loads(build_runpod_create_plan(bundle).pod_static_json)
+
+    assert direct["allowedCudaVersions"] == ["13.0"]
+    assert planned["allowedCudaVersions"] == ["13.0"]
 
 
 def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:

@@ -21,6 +21,12 @@ SERVING_CACHE_ROOT = "/runpod-volume/flash-serving"
 # splitting to recover the argv the api actually wants.
 LAUNCH_COMMAND_ARGV = ("python", "/app/serve_launch.py")
 LAUNCH_COMMAND = " ".join(LAUNCH_COMMAND_ARGV)
+# the serving image's vllm ships a compiled extension linked against libcudart.so.13, so the host
+# has to expose a CUDA 13 driver. runpod's PodCreateInput documents allowedCudaVersions as "if not
+# set, any CUDA version is acceptable", so leaving it off let it place the pod on an L4 host
+# reporting driver 12080 -- the container then died at engine init and restarted forever. asking a
+# gpu type alone does not ask for a driver.
+ALLOWED_CUDA_VERSIONS = ("13.0",)
 
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,127}")
 
@@ -482,6 +488,7 @@ def pod_payload(
         "imageName": bundle.image.reference,
         "gpuTypeIds": [placement.gpu_type_id],
         "gpuCount": placement.gpu_count,
+        "allowedCudaVersions": list(ALLOWED_CUDA_VERSIONS),
         "dataCenterIds": [placement.data_center_id],
         "containerDiskInGb": placement.container_disk_gb,
         "networkVolumeId": volume_id,
