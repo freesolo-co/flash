@@ -49,6 +49,10 @@ jobs:
     # this only constrains manual dispatches; a non-main dispatch skips without running `modal deploy`.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # the job's own bounded waits are two 300s readiness polls plus the remote image build; 30
+    # minutes clears that with room while keeping a wedged deploy from holding the runner for
+    # GitHub's 6-hour default.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

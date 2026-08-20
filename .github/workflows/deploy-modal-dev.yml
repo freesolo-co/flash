@@ -11,6 +11,9 @@ jobs:
     name: Deploy development serving Modal app
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
+    # same bound as the production deploy: its own readiness polls plus the remote image build fit
+    # well inside this, and a wedged job releases the runner instead of holding it for 6 hours.
+    timeout-minutes: 30
     concurrency:
       group: deploy-modal-dev-serving
       cancel-in-progress: false
