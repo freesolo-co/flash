@@ -569,4 +569,61 @@ def test_text_export_passes_only_when_training_targeting_omits_the_visual_tensor
     bad_keys = _write_adapter_from_targeting(bad, sabotaged)
     assert any("visual" in key for key in bad_keys)
     with pytest.raises(RuntimeError, match="contains non-language tensor"):
-        stamp_adapter_dir_provenance(str(bad), "Qwen/Qwen3.5-0.8B")
+        # the artifact is sabotaged, not the run: this is still a text-only export, so it is
+        # stamped with the same real exclude regex the good case used. dropping it here would
+        # make the call announce a multimodal run and legitimize the vision tensors.
+        stamp_adapter_dir_provenance(
+            str(bad), "Qwen/Qwen3.5-0.8B", exclude_modules=targeting.exclude_modules
+        )
+
+
+def test_multimodal_export_publishes_the_vision_tensors_it_was_told_to_train(tmp_path):
+    """a multimodal run trains vision linears on purpose, so publish must not reject them.
+
+    `resolve_lora_targeting(multimodal=True)` emits no exclude regex, so `all-linear` covers the
+    vision tower and the merger writes those tensors. rejecting them at the export boundary would
+    fail a healthy image run at publish for weights its own targeting selected.
+    """
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    targeting = resolve_lora_targeting("Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=True)
+    assert targeting.exclude_modules is None
+
+    adapter = tmp_path / "multimodal"
+    keys = _write_adapter_from_targeting(adapter, targeting)
+    assert any("visual" in key for key in keys), "fixture must carry a real vision tensor"
+    assert any("language_model" in key for key in keys), "fixture must carry a language tensor"
+
+    stamp_adapter_dir_provenance(
+        str(adapter),
+        "Qwen/Qwen3.5-0.8B",
+        exclude_modules=targeting.exclude_modules,
+    )
+
+    saved = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["target_modules"] == "all-linear"
+    assert "exclude_modules" not in saved
+
+
+def test_multimodal_export_still_requires_a_trained_language_tensor(tmp_path):
+    """a payload that is entirely vision would serve as a text model with no learned text delta."""
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    adapter = tmp_path / "vision-only"
+    adapter.mkdir()
+    module = "base_model.model.model.visual.blocks.0.attn.proj"
+    (adapter / "adapter_model.safetensors").write_bytes(
+        save(
+            {
+                f"{module}.lora_A.weight": np.array([[1.0, 0.0]], dtype=np.float16),
+                f"{module}.lora_B.weight": np.array([[1.0], [0.0]], dtype=np.float16),
+            }
+        )
+    )
+    (adapter / "adapter_config.json").write_text(
+        json.dumps({"peft_type": "LORA", "r": 1, "lora_alpha": 2, "target_modules": ["proj"]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="no language-stack LoRA pair"):
+        stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", exclude_modules=None)

@@ -7826,6 +7826,86 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
     assert env.prompt_opens_thinking is expected_opened
 
 
+def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch):
+    """a row dropped for length must not decide the run-level thinking flag.
+
+    the flag is run-level and latched once, and it drives `strip_think` during grading. deriving it
+    from a row the student never sees can grade a retained prompt-opened completion as if the model
+    had emitted its own `<think>`, returning the reasoning as the answer. grpo already derives it
+    from the first RETAINED prompt (`_build_grpo_prompts`); opd must match.
+    """
+    from flash.engine.worker import opd_train as opd_mod
+    from flash.engine.worker import opd_train_runner
+    from flash.engine.worker.model.decoding import prompt_opens_thinking
+    from flash.engine.worker.train.opd.state import _OpdRequest
+
+    # row 0 renders WITHOUT an open think tag and is over budget; row 1 renders WITH one and fits.
+    rows = {
+        "too-long": ("<|im_start|>assistant\n", list(range(4096))),
+        "kept": ("<|im_start|>assistant\n<think>\n", [10, 11]),
+    }
+
+    class _Tokenizer:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+
+        def apply_chat_template(
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+        ):
+            rendered, ids = rows[messages[0]["content"]]
+            return ids if tokenize else rendered
+
+    class _TeacherClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    env = SimpleNamespace(thinking=None, prompt_opens_thinking=None, package_root=None)
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(
+            THINKING=True,
+            load_tokenizer=lambda model_id, revision: _Tokenizer(),
+            prompt_opens_thinking=prompt_opens_thinking,
+        ),
+    )
+    monkeypatch.setattr(opd_mod, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(opd_mod, "clamp_engine_len", lambda requested, _limit: requested)
+    monkeypatch.setattr(opd_mod, "model_max_position_embeddings", lambda *_args: None)
+    monkeypatch.setattr(opd_mod, "validate_glue_template", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        opd_mod, "liveness_heartbeat", lambda *_args, **_kwargs: contextlib.nullcontext()
+    )
+    import flash.engine.worker.teacher.client as teacher_client
+
+    monkeypatch.setattr(teacher_client, "TeacherClient", _TeacherClient)
+    request = _OpdRequest(
+        spec=None,
+        env=env,
+        multi_turn=True,
+        max_turns=2,
+        knobs=SimpleNamespace(teacher_model="teacher", max_length=128, max_completion=8),
+        model_id="model",
+        model_revision="revision",
+    )
+
+    state = opd_train_runner._prepare_prompts(
+        request,
+        [
+            ({}, [{"role": "user", "content": "too-long"}]),
+            ({}, [{"role": "user", "content": "kept"}]),
+        ],
+        False,
+        "capability",
+        "https://control.invalid",
+    )
+
+    assert len(state.prompts) == 1, "the over-budget row must be dropped"
+    assert env.thinking is True
+    # the retained row opens thinking; the dropped one did not.
+    assert env.prompt_opens_thinking is True
+
+
 def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice():
     """`prompt_messages` is user code, and it must be called once per example.
 

@@ -258,6 +258,13 @@ def _prepare_prompts(
                             enable_thinking=_opd_train._w.THINKING,
                         )
                     )
+            if len(prompt_ids) > prompt_budget:
+                dropped_long += 1
+                continue
+            # derive the run-level flag from the first RETAINED prompt, as grpo does. a row dropped
+            # for length never reaches the student, so latching on it can describe the run by a
+            # prompt no rollout ever sees: a retained prompt that does open thinking would then be
+            # graded as if it did not, and `strip_think` would return the reasoning as the answer.
             if not thinking_semantics_set:
                 thinking = bool(_opd_train._w.THINKING)
                 if hasattr(request.env, "thinking"):
@@ -267,9 +274,6 @@ def _prepare_prompts(
                         thinking and _opd_train._w.prompt_opens_thinking(rendered_prompt)
                     )
                 thinking_semantics_set = True
-            if len(prompt_ids) > prompt_budget:
-                dropped_long += 1
-                continue
             prompts.append(
                 _opd_train._BridgePrompt(
                     student_messages=student_messages,

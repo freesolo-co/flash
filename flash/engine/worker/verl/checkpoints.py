@@ -20,6 +20,7 @@ from collections.abc import Mapping
 
 from flash.adapters.fused_experts import (
     fused_expert_lora_tensor_pairs,
+    is_non_language_lora_key,
     lora_target_parameters,
     normalize_verl_fused_expert_export,
     validate_fused_expert_adapter_config,
@@ -602,12 +603,19 @@ def _validate_adapter_tensor_values(
             raise RuntimeError(f"{label} has no nonzero composed LoRA delta")
 
 
-def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
-    """validate the actual non-moe LoRA payload before canonicalizing its config."""
+def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal: bool) -> None:
+    """validate the actual non-moe LoRA payload before canonicalizing its config.
+
+    a text-only run carries `resolve_lora_targeting`'s exclude regex, so a vision tensor in the
+    artifact means the merger wrote something the run never targeted and the export is rejected. a
+    multimodal run targets `all-linear` with no exclusion on purpose, so its vision linears are
+    trained weights: they are validated like any other tensor rather than treated as contamination.
+    """
+    label = "exported multimodal adapter" if multimodal else "exported text adapter"
     try:
         metadata = _read_adapter_tensor_metadata(adapter_dir) or {}
     except ValueError as exc:
-        raise RuntimeError("exported text adapter tensor artifact is invalid") from exc
+        raise RuntimeError(f"{label} tensor artifact is invalid") from exc
 
     targets = config.get("target_modules")
     if (
@@ -625,17 +633,19 @@ def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
         raise RuntimeError(str(exc)) from exc
 
     pairs: dict[str, dict[str, str]] = {}
+    language_pairs: dict[str, dict[str, str]] = {}
     for key, shape in metadata.items():
         segments = set(key.lower().split("."))
-        if segments & _NON_LANGUAGE_ADAPTER_SEGMENTS:
-            raise RuntimeError(f"exported text adapter contains non-language tensor {key!r}")
+        non_language = bool(segments & _NON_LANGUAGE_ADAPTER_SEGMENTS)
+        if non_language and not multimodal:
+            raise RuntimeError(f"{label} contains non-language tensor {key!r}")
         match = _TEXT_LORA_KEY_RE.fullmatch(key)
         if match is None:
-            raise RuntimeError(f"exported text adapter contains a non-canonical tensor key {key!r}")
+            raise RuntimeError(f"{label} contains a non-canonical tensor key {key!r}")
         module = match.group("module")
         if not any(module == target or module.endswith(f".{target}") for target in targets):
             raise RuntimeError(
-                f"exported text adapter tensor module {module!r} is not declared in target_modules"
+                f"{label} tensor module {module!r} is not declared in target_modules"
             )
         if (
             not isinstance(shape, (list, tuple))
@@ -645,26 +655,28 @@ def _validate_text_adapter_tensors(adapter_dir: str, config: dict) -> None:
                 for dimension in shape
             )
         ):
-            raise RuntimeError(f"exported text adapter tensor {key!r} is not positive and 2-D")
+            raise RuntimeError(f"{label} tensor {key!r} is not positive and 2-D")
         if _rank_for_module(module, declared) is None:
-            raise RuntimeError(
-                f"exported text adapter tensor module {module!r} has no configured LoRA rank"
-            )
+            raise RuntimeError(f"{label} tensor module {module!r} has no configured LoRA rank")
         if lora_tensor_rank_disagrees(key, shape, declared):
-            raise RuntimeError(
-                f"exported text adapter tensor {key!r} disagrees with its configured LoRA rank"
-            )
+            raise RuntimeError(f"{label} tensor {key!r} disagrees with its configured LoRA rank")
         pairs.setdefault(module, {})[match.group("factor")] = key
+        if not non_language:
+            language_pairs.setdefault(module, {})[match.group("factor")] = key
 
     incomplete = sorted(module for module, factors in pairs.items() if set(factors) != {"A", "B"})
     if not pairs or incomplete:
         raise RuntimeError(
-            "exported text adapter must contain at least one complete LoRA A/B pair and no orphan "
+            f"{label} must contain at least one complete LoRA A/B pair and no orphan "
             f"factors; incomplete_modules={incomplete[:4]}"
         )
+    # even a multimodal adapter must have trained the language stack: a run whose whole payload is
+    # vision would serve as a text model with no learned text delta at all.
+    if not language_pairs:
+        raise RuntimeError(f"{label} contains no language-stack LoRA pair")
 
     pair_keys = {module: (factors["A"], factors["B"]) for module, factors in pairs.items()}
-    _validate_adapter_tensor_values(adapter_dir, metadata, pair_keys, label="exported text adapter")
+    _validate_adapter_tensor_values(adapter_dir, metadata, pair_keys, label=label)
 
 
 def stamp_adapter_dir_provenance(
@@ -672,7 +684,7 @@ def stamp_adapter_dir_provenance(
     model_id: str,
     model_revision: str = "",
     *,
-    exclude_modules: str | None = None,
+    exclude_modules: str | None,
 ) -> None:
     """stamp the saved adapter's immutable base identity into adapter_config.json.
 
@@ -682,7 +694,14 @@ def stamp_adapter_dir_provenance(
     also normalizes fused-expert targeting at the exporter boundary. this is the one call every
     export path (sft and rl, final publish and per-step staging) already funnels through, so every
     published adapter carries the current loadable config shape.
+
+    ``exclude_modules`` also names the run's modality. `resolve_lora_targeting` emits the language
+    prefix regex exactly when the run is text-only and leaves it None for a multimodal one, which
+    targets `all-linear` and trains vision linears on purpose. the tensor validation below reads it
+    that way: a vision tensor is contamination in a text-only export and a trained weight in a
+    multimodal one. it is required rather than defaulted so a new export path must state which.
     """
+    multimodal = exclude_modules is None
     cfg_path = os.path.join(adapter_dir, "adapter_config.json")
     with open(cfg_path) as f:
         cfg = json.load(f)
@@ -707,6 +726,15 @@ def stamp_adapter_dir_provenance(
             tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
         except ValueError as exc:
             raise RuntimeError("exported fused-expert adapter tensor artifact is invalid") from exc
+        # `fused_expert_lora_tensor_pairs` skips non-language keys because it describes the
+        # language stack's topology only. a text-only run never targets them, so their presence is
+        # still an invalid export here; a multimodal run trains them under `all-linear` on purpose.
+        if not multimodal:
+            for key in tensors:
+                if is_non_language_lora_key(key):
+                    raise RuntimeError(
+                        f"exported text adapter contains non-language tensor {key!r}"
+                    )
         pairs = fused_expert_lora_tensor_pairs(tensors, cfg, model_id)
         if pairs is None:
             raise RuntimeError(
@@ -717,7 +745,7 @@ def stamp_adapter_dir_provenance(
             adapter_dir, tensors, pairs, label="exported fused-expert adapter"
         )
     else:
-        _validate_text_adapter_tensors(adapter_dir, cfg)
+        _validate_lora_adapter_tensors(adapter_dir, cfg, multimodal=multimodal)
     cfg["target_modules"] = "all-linear"
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)

@@ -10,6 +10,10 @@ import pytest
 from safetensors.numpy import save
 
 _MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
+# every export in this file is a text-only run, and the exporter reads the modality off
+# `exclude_modules`: the language-prefix regex `resolve_lora_targeting` emits for a text-only run,
+# None for a multimodal one. stating it keeps these artifacts under the strict text contract.
+_TEXT_ONLY_EXCLUDE = r"^(?!model\.language_model(?:\.|$)).*$"
 _TARGETS = [
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
@@ -299,7 +303,9 @@ def test_verl_fused_export_canonicalizes_suffix_order_to_all_linear(
     }
     _write_expert_adapter(tmp_path, config=config)
 
-    stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "c" * 40)
+    stamp_adapter_dir_provenance(
+        str(tmp_path), _MODEL_ID, "c" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_parameters"] == _TARGETS
@@ -311,7 +317,8 @@ def test_verl_fused_export_canonicalizes_suffix_order_to_all_linear(
     assert saved["flash_provenance"] == {"source": "verl"}
 
 
-def test_fused_export_rejects_complete_visual_pair_before_stamping(monkeypatch, tmp_path):
+def _fused_artifact_with_visual_pair(monkeypatch, tmp_path):
+    """stage a fused-expert artifact that also carries one complete visual LoRA pair."""
     import flash.engine.worker.verl.checkpoints as checkpoints
 
     tensors = _complete_expert_tensors()
@@ -332,13 +339,41 @@ def test_fused_export_rejects_complete_visual_pair_before_stamping(monkeypatch, 
         "target_parameters": None,
     }
     _write_expert_adapter(tmp_path, config=config)
+    return checkpoints
+
+
+def test_fused_export_rejects_complete_visual_pair_before_stamping(monkeypatch, tmp_path):
+    checkpoints = _fused_artifact_with_visual_pair(monkeypatch, tmp_path)
     config_path = tmp_path / "adapter_config.json"
     before = config_path.read_bytes()
 
-    with pytest.raises(RuntimeError, match="complete fused expert LoRA weights"):
-        checkpoints.stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+    # a text-only run carries the language-prefix exclude regex, so it never targeted the vision
+    # tower: a visual pair in its artifact is contamination and must not be stamped.
+    with pytest.raises(RuntimeError, match="contains non-language tensor"):
+        checkpoints.stamp_adapter_dir_provenance(
+            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before
+
+
+def test_fused_export_accepts_the_visual_pair_a_multimodal_run_trained(monkeypatch, tmp_path):
+    """the same artifact is a healthy export when the run actually targeted the vision tower.
+
+    a multimodal run gets no exclude regex, so `all-linear` covers the vision linears and the
+    merger writes them. the fused topology check describes the language stack only, so those
+    tensors are separated out rather than read as an incomplete expert export.
+    """
+    checkpoints = _fused_artifact_with_visual_pair(monkeypatch, tmp_path)
+
+    checkpoints.stamp_adapter_dir_provenance(
+        str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=None
+    )
+
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["target_modules"] == "all-linear"
+    assert "exclude_modules" not in saved
+    assert saved["base_model_name_or_path"] == _MODEL_ID
 
 
 def test_export_refuses_incomplete_expert_weights_before_changing_config(tmp_path):
@@ -355,7 +390,9 @@ def test_export_refuses_incomplete_expert_weights_before_changing_config(tmp_pat
     before = config_path.read_bytes()
 
     with pytest.raises(RuntimeError, match="complete fused expert LoRA weights"):
-        stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+        stamp_adapter_dir_provenance(
+            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before
 
@@ -390,7 +427,9 @@ def test_fused_export_validates_actual_tensor_values_before_stamping(
     before = config_path.read_bytes()
 
     with pytest.raises(RuntimeError, match=message):
-        checkpoints.stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+        checkpoints.stamp_adapter_dir_provenance(
+            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before
 
@@ -417,7 +456,9 @@ def test_fused_export_accepts_a_finite_nonzero_actual_payload(monkeypatch, tmp_p
 
     monkeypatch.setattr(checkpoints, "fused_expert_lora_tensor_pairs", pair_keys)
 
-    checkpoints.stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+    checkpoints.stamp_adapter_dir_provenance(
+        str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
@@ -589,7 +630,9 @@ def test_fused_export_stamps_a_real_namespace_free_artifact_end_to_end(tmp_path)
         encoding="utf-8",
     )
 
-    stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+    stamp_adapter_dir_provenance(
+        str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_parameters"] == _TARGETS
@@ -611,7 +654,9 @@ def test_export_rejects_malformed_modules_after_normalization_without_writing(tm
     before = config_path.read_bytes()
 
     with pytest.raises(ValueError, match="target_modules"):
-        stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+        stamp_adapter_dir_provenance(
+            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before
 
@@ -630,7 +675,9 @@ def test_export_rejects_debris_only_modules_without_writing(tmp_path):
     before = config_path.read_bytes()
 
     with pytest.raises(ValueError, match="non-empty"):
-        stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+        stamp_adapter_dir_provenance(
+            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before
 
@@ -649,7 +696,9 @@ def test_export_rejects_direct_parameter_only_config_without_writing(tmp_path):
     before = config_path.read_bytes()
 
     with pytest.raises(ValueError, match="ordinary LoRA target_modules"):
-        stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+        stamp_adapter_dir_provenance(
+            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before
 
@@ -679,7 +728,9 @@ def test_non_moe_export_canonicalizes_targeting_without_changing_other_fields(
     }
     _write_expert_adapter(tmp_path, config=config, tensor_mode="mixed", text_rank=rank)
 
-    stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+    stamp_adapter_dir_provenance(
+        str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
@@ -714,7 +765,9 @@ def test_non_moe_export_enforces_applicable_rank_pattern(tmp_path):
     _write_small_safetensors(tmp_path / "adapter_model.safetensors", tensors)
     (tmp_path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
 
-    stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+    stamp_adapter_dir_provenance(
+        str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["rank_pattern"] == {"v_proj": 3}
@@ -742,7 +795,9 @@ def test_non_moe_export_uses_strict_shared_rank_declarations(tmp_path, overrides
     before_weights = (tmp_path / "adapter_model.safetensors").read_bytes()
 
     with pytest.raises(RuntimeError, match="positive integer"):
-        stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+        stamp_adapter_dir_provenance(
+            str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before_config
     assert (tmp_path / "adapter_model.safetensors").read_bytes() == before_weights
@@ -784,7 +839,9 @@ def test_non_moe_export_rejects_invalid_actual_tensor_artifacts(
     before = config_path.read_bytes()
 
     with pytest.raises(RuntimeError, match=message):
-        stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+        stamp_adapter_dir_provenance(
+            str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before
 
@@ -800,7 +857,9 @@ def test_non_moe_export_rejects_declared_multimodal_projector_lora(tmp_path):
     _write_expert_adapter(tmp_path, config=config, tensor_mode="projector_lora", text_rank=2)
 
     with pytest.raises(RuntimeError, match="contains non-language tensor"):
-        stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+        stamp_adapter_dir_provenance(
+            str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
 
 def test_exported_targeting_validates_the_actual_mixed_delta_artifact(tmp_path):
@@ -816,7 +875,9 @@ def test_exported_targeting_validates_the_actual_mixed_delta_artifact(tmp_path):
     }
     _write_expert_adapter(tmp_path, config=config, tensor_mode="mixed", text_rank=2)
 
-    stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+    stamp_adapter_dir_provenance(
+        str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
@@ -846,7 +907,9 @@ def test_non_moe_export_accepts_sharded_bf16_without_torch(monkeypatch, tmp_path
     before_weights = [path.read_bytes() for path in weight_paths]
     monkeypatch.setitem(sys.modules, "torch", None)
 
-    stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+    stamp_adapter_dir_provenance(
+        str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
@@ -865,7 +928,9 @@ def test_non_moe_export_rejects_nonfinite_bf16_without_writing(tmp_path, bad_val
     before_weights = [path.read_bytes() for path in weight_paths]
 
     with pytest.raises(RuntimeError, match="contains non-finite values"):
-        stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+        stamp_adapter_dir_provenance(
+            str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before_config
     assert [path.read_bytes() for path in weight_paths] == before_weights
@@ -882,7 +947,9 @@ def test_non_moe_export_rejects_zero_bf16_delta_without_writing(tmp_path):
     before_weights = [path.read_bytes() for path in weight_paths]
 
     with pytest.raises(RuntimeError, match="no nonzero composed LoRA delta"):
-        stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40)
+        stamp_adapter_dir_provenance(
+            str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before_config
     assert [path.read_bytes() for path in weight_paths] == before_weights
@@ -994,7 +1061,9 @@ def test_export_rejects_structurally_compatible_wrong_shapes(monkeypatch, tmp_pa
     before = config_path.read_bytes()
 
     with pytest.raises(RuntimeError, match="complete fused expert LoRA weights"):
-        checkpoints.stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+        checkpoints.stamp_adapter_dir_provenance(
+            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
     assert config_path.read_bytes() == before
 
@@ -1015,7 +1084,53 @@ def test_tensor_analyzer_accepts_canonical_qwen36_rung_geometry():
         "mtp.layers.0.proj",
     ],
 )
-def test_tensor_analyzer_rejects_complete_non_language_pairs(module):
+def test_text_only_export_rejects_complete_non_language_pairs(monkeypatch, tmp_path, module):
+    """a text-only run never targets these modules, so their tensors must not reach publish.
+
+    the check lives at the export boundary rather than in `has_complete_fused_expert_tensors`,
+    because only the boundary knows the run's modality: the same tensor is contamination in a
+    text-only export and a trained weight in a multimodal one.
+    """
+    import flash.engine.worker.verl.checkpoints as checkpoints
+
+    tensors = _complete_expert_tensors()
+    tensors.update(
+        _wrapper_tensors(
+            f"base_model.model.{module}",
+            ((32, 2048), (2048, 32)),
+        )
+    )
+    monkeypatch.setattr(checkpoints, "_read_adapter_tensor_metadata", lambda _path: tensors)
+    monkeypatch.setattr(checkpoints, "_validate_adapter_tensor_values", lambda *a, **k: None)
+    _write_expert_adapter(tmp_path, config=_valid_config())
+    config_path = tmp_path / "adapter_config.json"
+    before = config_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="contains non-language tensor"):
+        checkpoints.stamp_adapter_dir_provenance(
+            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
+
+    assert config_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "visual.blocks.0.attn.proj",
+        "vision_tower.blocks.0.proj",
+        "multi_modal_projector.linear",
+        "patch_embed.proj",
+        "mtp.layers.0.proj",
+    ],
+)
+def test_fused_topology_check_ignores_well_formed_non_language_pairs(module):
+    """the topology check describes the language stack, so a valid vision pair does not fail it.
+
+    it still describes the fused expert rungs exactly: the language tensors are unchanged, so the
+    verdict is driven by them alone. rejecting here would fail a multimodal run whose own targeting
+    selected these weights.
+    """
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
     tensors = _complete_expert_tensors()
@@ -1026,7 +1141,14 @@ def test_tensor_analyzer_rejects_complete_non_language_pairs(module):
         )
     )
 
-    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+    assert has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+
+    # and the language stack is still what decides: break one expert rung and it rejects again,
+    # so this is not a check that has been widened into accepting anything.
+    broken = dict(tensors)
+    expert_key = next(key for key in _complete_expert_tensors() if ".mlp.experts." in key)
+    broken.pop(expert_key)
+    assert not has_complete_fused_expert_tensors(broken, _valid_config(), _MODEL_ID)
 
 
 def test_tensor_analyzer_rejects_unparsed_and_undeclared_ordinary_tensors():
@@ -1181,7 +1303,9 @@ def test_boundaries_reject_cross_namespace_fused_pairs(monkeypatch, tmp_path, bo
         }
 
         def validate():
-            checkpoints.stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40)
+            checkpoints.stamp_adapter_dir_provenance(
+                str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+            )
 
         expected_error = RuntimeError
     else:

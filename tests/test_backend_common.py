@@ -33,6 +33,10 @@ from flash.engine.worker import rl_train
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
 from flash.engine.worker.train.core.child import runtime as child_runtime
 
+# the stamp reads the run's modality off `exclude_modules`: the language-prefix regex for a
+# text-only run, None for a multimodal one. these artifacts are text-only.
+_TEXT_ONLY_EXCLUDE = r"^(?!model\.language_model(?:\.|$)).*$"
+
 # several tests below drive real subprocesses that import flash from a checkout, not from the venv.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -304,7 +308,9 @@ def test_stamp_adapter_dir_provenance_sets_base_and_revision(tmp_path):
             }
         )
     )
-    vc.stamp_adapter_dir_provenance(str(tmp_path), "org/model", "deadbeef")
+    vc.stamp_adapter_dir_provenance(
+        str(tmp_path), "org/model", "deadbeef", exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
     out = json.loads(cfg.read_text())
     assert out["base_model_name_or_path"] == "org/model"
     assert out["revision"] == "deadbeef"
@@ -316,7 +322,9 @@ def test_stamp_adapter_dir_provenance_rejects_base_mismatch(tmp_path):
     cfg = tmp_path / "adapter_config.json"
     cfg.write_text(json.dumps({"base_model_name_or_path": "org/other"}))
     with pytest.raises(RuntimeError, match="does not match validated target"):
-        vc.stamp_adapter_dir_provenance(str(tmp_path), "org/model")
+        vc.stamp_adapter_dir_provenance(
+            str(tmp_path), "org/model", exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
 
 def test_resolve_verl_python_prefers_preset(monkeypatch, tmp_path):

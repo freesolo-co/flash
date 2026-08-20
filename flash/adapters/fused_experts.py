@@ -155,6 +155,11 @@ def normalize_verl_fused_expert_export(config: dict[str, Any], model_id: str) ->
         ]
 
 
+def is_non_language_lora_key(key: str) -> bool:
+    """whether a LoRA tensor key names a non-language (vision, projector, mtp) module."""
+    return bool(set(key.lower().split(".")) & _NON_LANGUAGE_LORA_SEGMENTS)
+
+
 def fused_expert_lora_tensor_pairs(
     tensors: Mapping[str, tuple[int, ...]], config: Mapping[str, Any], model_id: str
 ) -> dict[tuple[str, str], _LoraPairKeys] | None:
@@ -164,13 +169,21 @@ def fused_expert_lora_tensor_pairs(
         return None
     parsed = []
     for key, shape in tensors.items():
+        # parse FIRST: an unparseable key rejects the whole adapter even when it names a vision
+        # module, so a `modules_to_save` full-weight copy cannot ride along by being non-language.
         tensor = _parse_lora_tensor(key, shape)
         if tensor is None:
             return None
-        module_path = tensor[0]
-        if set(module_path.lower().split(".")) & _NON_LANGUAGE_LORA_SEGMENTS:
-            return None
+        # a multimodal run targets `all-linear` with no exclude regex, so the merger writes vision
+        # linears next to the language ones. this check describes the language stack's fused expert
+        # topology only, so a well-formed non-language pair is skipped rather than read as a
+        # malformed export. whether it belongs at all is the export boundary's call: it knows the
+        # run's modality and rejects one a text-only run never targeted.
+        if is_non_language_lora_key(tensor[0]):
+            continue
         parsed.append(tensor)
+    if not parsed:
+        return None
     if len({adapter_name for _, _, adapter_name, _, _ in parsed}) != 1:
         return None
     if not _has_complete_fused_rungs(parsed, expected, model_id) or not _has_ordinary_evidence(
