@@ -305,11 +305,12 @@ def test_warmstart_rejects_an_alpha_change(monkeypatch, tmp_path):
     different alpha rescales every trained delta. grpo already rereads both from the source; sft
     and opd share this guard, which failed closed on rank and open on alpha.
     """
-    with pytest.raises(ValueError) as mismatch:
+    with pytest.raises(
+        ValueError, match=r"alpha 19 does not match the prepared train\.lora_alpha 77"
+    ):
         _warmstart_guard_call(
             monkeypatch, tmp_path, rank=8, alpha=19, expected_rank=8, expected_alpha=77
         )
-    assert "alpha 19 does not match the prepared train.lora_alpha 77" in str(mismatch.value)
 
 
 def test_warmstart_accepts_a_matching_rank_and_alpha(monkeypatch, tmp_path):
