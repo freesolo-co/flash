@@ -685,6 +685,26 @@ def _cancellation_billing(
     }
 
 
+def _prepare_cancellation(run_id: str) -> list[Exception]:
+    """Fence teacher authority and upgrade a legacy remote handle before teardown begins.
+
+    Both must happen before we wait on the deployment lock or on slow provider teardown: the
+    fence revokes authority the run could still spend, and a persisted legacy fingerprint has to
+    become resolvable or every later lifecycle path silently no-ops on it. Returns the fencing
+    errors to re-raise once teardown has run, so a fencing failure never skips teardown.
+    """
+    from flash.providers.runpod.jobs import migrate_persisted_legacy_key_fingerprints
+    from flash.server.platform import db as server_db
+
+    deferred_fencing_errors: list[Exception] = []
+    try:
+        server_db.revoke_teacher_capabilities_for_run(run_id)
+    except Exception as exc:
+        deferred_fencing_errors.append(exc)
+    migrate_persisted_legacy_key_fingerprints(run_id)
+    return deferred_fencing_errors
+
+
 def cancel_run(run_id: str) -> RunStatus:
     """Cancel training while preserving verified serving and durable cleanup targets."""
     from flash.runner import (
@@ -697,16 +717,7 @@ def cancel_run(run_id: str) -> RunStatus:
     from flash.server.platform import db as server_db
     from flash.server.platform.locks import _deploy_lock
 
-    # fence teacher authority before waiting on deployment locks or slow provider teardown.
-    deferred_fencing_errors: list[Exception] = []
-    try:
-        server_db.revoke_teacher_capabilities_for_run(run_id)
-    except Exception as exc:
-        deferred_fencing_errors.append(exc)
-
-    from flash.providers.runpod.jobs import migrate_persisted_legacy_key_fingerprints
-
-    migrate_persisted_legacy_key_fingerprints(run_id)
+    deferred_fencing_errors = _prepare_cancellation(run_id)
 
     def _clear_exact_remote(expected_remote: dict) -> bool:
         return _clear_remote_if_unchanged(run_id, expected_remote)
