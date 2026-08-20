@@ -1256,6 +1256,26 @@ def test_build_verl_overrides_sizes_agent_loop_workers_to_the_rollout_batch():
     assert "actor_rollout_ref.rollout.agent.num_workers=8" in big
 
 
+def test_build_verl_overrides_halves_agent_loop_workers_for_multimodal_runs():
+    # every agent worker is a ray actor with its own processor copy. on an image run that is a
+    # full image processor, and eight of them beside the vllm engine exhausted the worker
+    # container: `libgomp: Thread creation failed`. the actor died mid-grading, so the rollouts
+    # generated (reward_completions=8) but none were graded (reward_grading_depth=0) and the run
+    # hung until the 1200s child-silence watchdog killed it.
+    batch = {"prompts_per_step": 2, "group_size": 4}
+    text = rl_train.build_verl_overrides(_overrides_cfg(**batch))
+    assert "actor_rollout_ref.rollout.agent.num_workers=8" in text
+    image = rl_train.build_verl_overrides(_overrides_cfg(**batch, multimodal=True))
+    assert "actor_rollout_ref.rollout.agent.num_workers=4" in image
+    # the authored knobs are untouched: only scheduling parallelism narrows.
+    assert "actor_rollout_ref.rollout.n=4" in image
+    # and the cap still yields an exact divisor of the rollout batch, which verl asserts on.
+    workers = int(
+        next(o for o in image if "agent.num_workers=" in o).rsplit("=", 1)[1]
+    )
+    assert (batch["prompts_per_step"] * batch["group_size"]) % workers == 0
+
+
 @pytest.mark.parametrize(("count", "expected"), [(None, 1), (1, 1), (2, 2), (8, 8)])
 def test_run_rl_train_sizes_the_run_from_the_spec_gpu_count(count, expected):
     # the wiring, not just the builder: a spec that rents N cards must configure verl for N.
