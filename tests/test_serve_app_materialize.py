@@ -481,6 +481,42 @@ def test_mode_check_still_bites_where_modes_are_honoured(tmp_path: Path) -> None
         validate_manifest_cache(manifest, cache)
 
 
+def test_mode_probe_leaves_no_entry_when_its_removal_does_not_take(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # the probe creates and removes a child directory. hydration stages into a directory whose
+    # exact entry set is then compared against the manifest, so a probe entry that outlives its own
+    # rmdir -- which a fuse mount may well do -- fails that comparison and aborts hydration with
+    # "adapter cache file set does not exactly match the manifest". probing the parent keeps the
+    # directory under verification untouched.
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    real_rmdir = os.rmdir
+
+    def rmdir_that_does_not_take(path, *, dir_fd=None):
+        if ".flash-mode-probe-" in str(path):
+            return  # report success, leave the entry behind
+        if dir_fd is not None:
+            return real_rmdir(path, dir_fd=dir_fd)
+        return real_rmdir(path)
+
+    monkeypatch.setattr(os, "rmdir", rmdir_that_does_not_take)
+
+    paths = hydrate_manifest(
+        manifest,
+        tmp_path / "cache",
+        token_fd=_token_fd(),
+        snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+    )
+
+    destination = paths[manifest.adapters[0].adapter_revision]
+    assert {path.name for path in destination.iterdir()} == {
+        "adapter_config.json",
+        "adapter_model.safetensors",
+    }
+
+
 def test_cache_rejects_hardlinked_materialized_files(tmp_path: Path) -> None:
     config_bytes, weights_bytes = _artifact_bytes(tmp_path)
     manifest = _manifest(config_bytes, weights_bytes)

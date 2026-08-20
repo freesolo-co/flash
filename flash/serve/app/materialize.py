@@ -531,13 +531,18 @@ def _permission_bits_are_enforceable(directory_fd: int) -> bool:
         # cannot tell, so assume the strict reading: an unwritable directory fails elsewhere anyway.
         return True
     try:
-        probe_fd = os.open(probe, os.O_RDONLY | _DIRECTORY_FLAGS, dir_fd=directory_fd)
-    except OSError:
-        return True
-    try:
-        return not (os.fstat(probe_fd).st_mode & 0o022)
+        try:
+            probe_fd = os.open(probe, os.O_RDONLY | _DIRECTORY_FLAGS, dir_fd=directory_fd)
+        except OSError:
+            return True
+        try:
+            return not (os.fstat(probe_fd).st_mode & 0o022)
+        finally:
+            os.close(probe_fd)
     finally:
-        os.close(probe_fd)
+        # mkdir succeeded, so every exit past it has to remove the entry -- including the one
+        # where the open fails. a probe left behind adds an entry to a directory a caller may be
+        # about to compare against an exact manifest.
         with contextlib.suppress(OSError):
             os.rmdir(probe, dir_fd=directory_fd)
 
@@ -848,7 +853,12 @@ def _directory_identity(path: Path) -> tuple[int, int]:
     _validate_trusted_directory_stat(
         details,
         "cache directory",
-        enforce_mode=_directory_enforces_permission_bits(path),
+        # probe the PARENT, not this directory, for the same reason _read_exact_regular_files does:
+        # a probe creates and removes a child, and one caller here is the staging directory whose
+        # exact entry set is compared against the manifest. a probe entry that outlives its own
+        # rmdir -- which is exactly what a fuse mount may do -- would fail that comparison and
+        # abort hydration. the parent is the same filesystem, which is all the probe asks about.
+        enforce_mode=_directory_enforces_permission_bits(path.parent),
     )
     return details.st_dev, details.st_ino
 
