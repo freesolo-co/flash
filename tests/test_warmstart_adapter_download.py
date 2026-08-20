@@ -276,3 +276,45 @@ def test_snapshot_success_but_adapter_never_complete_raises_retriable(monkeypatc
     assert len(calls) == adapter._ADAPTER_DOWNLOAD_RETRIES
     assert sleeps == [5.0, 10.0, 15.0]
     assert len(deadline_checks) == adapter._ADAPTER_DOWNLOAD_RETRIES
+
+
+def _warmstart_guard_call(monkeypatch, tmp_path, *, rank, alpha, expected_rank, expected_alpha):
+    """Drive the real sft/opd warm-start guard against an on-disk adapter config."""
+    import flash.engine.worker.sft_train as sft_train
+
+    adapter_dir = tmp_path / "src-adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(
+        f'{{"peft_type":"LORA","r":{rank},"lora_alpha":{alpha}}}', encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        sft_train._w,
+        "JOB_SPEC",
+        SimpleNamespace(train=SimpleNamespace(init_from_adapter=_ADAPTER_REF)),
+        raising=False,
+    )
+    monkeypatch.setattr(sft_train._w, "_download_adapter", lambda _ref: str(adapter_dir))
+    monkeypatch.setattr(sft_train._w, "validate_warmstart_adapter", lambda *_a, **_k: None)
+    return sft_train._warmstart_adapter_path("m", "", expected_rank, expected_alpha)
+
+
+def test_warmstart_rejects_an_alpha_change(monkeypatch, tmp_path):
+    """A warm start may not silently rescale the adapter it continues.
+
+    rank and alpha together set the LoRA scaling, so continuing at the source rank under a
+    different alpha rescales every trained delta. grpo already rereads both from the source; sft
+    and opd share this guard, which failed closed on rank and open on alpha.
+    """
+    with pytest.raises(ValueError) as mismatch:
+        _warmstart_guard_call(
+            monkeypatch, tmp_path, rank=8, alpha=19, expected_rank=8, expected_alpha=77
+        )
+    assert "alpha 19 does not match the prepared train.lora_alpha 77" in str(mismatch.value)
+
+
+def test_warmstart_accepts_a_matching_rank_and_alpha(monkeypatch, tmp_path):
+    """The guard stays open for the ordinary continue-this-adapter case."""
+    resolved = _warmstart_guard_call(
+        monkeypatch, tmp_path, rank=8, alpha=19, expected_rank=8, expected_alpha=19
+    )
+    assert resolved is not None
