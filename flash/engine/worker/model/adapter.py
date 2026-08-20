@@ -10,6 +10,7 @@ from typing import Any
 
 from flash.adapters.fused_experts import (
     has_complete_fused_expert_tensors,
+    is_non_language_lora_key,
     lora_target_parameters,
     validate_fused_expert_adapter_config,
 )
@@ -40,9 +41,17 @@ def validate_warmstart_adapter(
     targeting: LoraTargeting,
 ) -> None:
     """Validate a downloaded warm-start adapter without changing its config or files."""
-    source_is_multimodal = config.get("exclude_modules") is None
+    tensors: Mapping[str, tuple[int, ...]] | None = None
+    source_is_multimodal: bool | None
+    if "exclude_modules" in config:
+        source_is_multimodal = config.get("exclude_modules") is None
+    else:
+        tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
+        source_is_multimodal = (
+            any(is_non_language_lora_key(key) for key in tensors) if tensors else None
+        )
     run_is_multimodal = targeting.exclude_modules is None
-    if source_is_multimodal != run_is_multimodal:
+    if source_is_multimodal is not None and source_is_multimodal != run_is_multimodal:
         source_modality = "multimodal (image-trained)" if source_is_multimodal else "text-only"
         run_modality = "multimodal" if run_is_multimodal else "text-only"
         raise ValueError(
@@ -52,7 +61,8 @@ def validate_warmstart_adapter(
     validate_fused_expert_adapter_config(config, model_id)
     if not lora_target_parameters(model_id):
         return
-    tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
+    if tensors is None:
+        tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
     if not has_complete_fused_expert_tensors(tensors, config, model_id):
         raise ValueError(
             f"warm-start adapter for {model_id} does not contain complete fused expert LoRA weights"

@@ -184,10 +184,65 @@ def test_every_campaign_multimodal_trainer_keeps_the_existing_all_linear_surface
         assert targeting.target_parameters is None
 
 
+def test_legacy_text_adapter_warmstarts_a_text_run_from_its_tensor_namespace(tmp_path):
+    from flash.engine.worker.model.adapter import validate_warmstart_adapter
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
+    adapter = tmp_path / "legacy-text"
+    keys = _write_adapter_from_targeting(adapter, targeting)
+    source_config = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
+
+    assert "exclude_modules" not in source_config
+    assert all("visual" not in key for key in keys)
+    validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
+
+
+def test_legacy_vision_adapter_still_cannot_warmstart_a_text_run(monkeypatch, tmp_path):
+    import flash.engine.worker.model.adapter as adapter_module
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
+    adapter = tmp_path / "legacy-multimodal"
+    keys = _write_adapter_from_targeting(
+        adapter,
+        resolve_lora_targeting(model_id, algorithm="sft", multimodal=True),
+    )
+    source_config = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
+    read_metadata = adapter_module._read_adapter_tensor_metadata
+    inspected = []
+
+    def record_metadata_read(path):
+        inspected.append(path)
+        return read_metadata(path)
+
+    monkeypatch.setattr(adapter_module, "_read_adapter_tensor_metadata", record_metadata_read)
+
+    assert "exclude_modules" not in source_config
+    assert any("visual" in key for key in keys)
+    with pytest.raises(
+        ValueError,
+        match=r"text-only run cannot continue a multimodal \(image-trained\) adapter",
+    ):
+        adapter_module.validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
+    assert inspected == [str(adapter)], "the legacy modality decision must inspect tensor metadata"
+
+
+def test_modern_text_adapter_warmstarts_a_text_run_without_tensor_inference(tmp_path):
+    from flash.engine.worker.model.adapter import validate_warmstart_adapter
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
+    source_config = {
+        "target_modules": "all-linear",
+        "exclude_modules": r"^(?!model\.language_model(?:\.|$)).*$",
+    }
+
+    validate_warmstart_adapter(source_config, model_id, str(tmp_path), targeting)
+
+
 @pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.6-35B-A3B"])
-def test_text_warmstart_rejects_an_image_trained_adapter_before_artifact_validation(
-    tmp_path, model_id
-):
+def test_modern_multimodal_adapter_still_cannot_warmstart_a_text_run(tmp_path, model_id):
     from flash.engine.worker.model.adapter import validate_warmstart_adapter
 
     targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
@@ -200,35 +255,21 @@ def test_text_warmstart_rejects_an_image_trained_adapter_before_artifact_validat
         validate_warmstart_adapter(source_config, model_id, str(tmp_path), targeting)
 
 
-@pytest.mark.parametrize(
-    ("source_exclude_modules", "multimodal"),
-    [(r"^(?!model\.language_model(?:\.|$)).*$", False), (None, True)],
-)
-def test_warmstart_accepts_a_matching_source_modality(tmp_path, source_exclude_modules, multimodal):
+def test_legacy_text_adapter_cannot_warmstart_a_multimodal_run(tmp_path):
     from flash.engine.worker.model.adapter import validate_warmstart_adapter
 
     model_id = "Qwen/Qwen3.5-0.8B"
-    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=multimodal)
-    source_config = {
-        "target_modules": "all-linear",
-        "exclude_modules": source_exclude_modules,
-    }
-
-    validate_warmstart_adapter(source_config, model_id, str(tmp_path), targeting)
-
-
-def test_multimodal_warmstart_rejects_a_text_only_adapter(tmp_path):
-    from flash.engine.worker.model.adapter import validate_warmstart_adapter
-
-    model_id = "Qwen/Qwen3.5-0.8B"
+    text_targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
     targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=True)
-    source_config = {
-        "target_modules": "all-linear",
-        "exclude_modules": r"^(?!model\.language_model(?:\.|$)).*$",
-    }
+    adapter = tmp_path / "legacy-text"
+    keys = _write_adapter_from_targeting(adapter, text_targeting)
+    source_config = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
 
+    assert "exclude_modules" not in source_config
+    assert all("visual" not in key for key in keys)
+    # a nonempty legacy payload whose tensors are all language-stack weights is unambiguously text-only.
     with pytest.raises(ValueError, match="multimodal run cannot continue a text-only adapter"):
-        validate_warmstart_adapter(source_config, model_id, str(tmp_path), targeting)
+        validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
 
 
 @dataclass(frozen=True)
