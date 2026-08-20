@@ -191,3 +191,25 @@ def test_image_ships_the_package_under_its_real_import_path() -> None:
             assert (ROOT / f"{relative}.py").is_file() or (
                 ROOT / relative / "__init__.py"
             ).is_file(), node.module
+
+
+def test_self_hosting_docs_name_the_image_the_workflow_actually_publishes() -> None:
+    """The documented `--image` must be the repository the publish workflow pushes to.
+
+    These are two independent strings with no shared constant: the docs said
+    `ghcr.io/freesolo-co/flash-serve` while the workflow publishes
+    `ghcr.io/freesolo-co/freesolo-flash-serve`. A wrong image name is not caught by the deploy
+    dry-run, which only validates that the digest is syntactically well formed -- it fails at
+    provisioning, against the customer's own provider account.
+    """
+    workflow = (ROOT / ".github" / "workflows" / "publish-serving-image.yml").read_text(
+        encoding="utf-8"
+    )
+    published = re.search(r"IMAGE:\s*(\S+)", workflow)
+    assert published is not None, "the publish workflow must state the image it pushes"
+    image = published.group(1)
+
+    docs = (ROOT / "SELF_HOSTING.md").read_text(encoding="utf-8")
+    cited = re.findall(r"ghcr\.io/[\w./-]+(?=@sha256:)", docs)
+    assert cited, "SELF_HOSTING.md must show a pinned --image to deploy"
+    assert set(cited) == {image}, (cited, image)

@@ -377,7 +377,7 @@ flash serve deploy \
   --model Qwen/Qwen3.5-4B \
   --run <run-id> \
   --deployment-id my-4b-serving \
-  --image ghcr.io/freesolo-co/flash-serve@sha256:<digest> \
+  --image ghcr.io/freesolo-co/freesolo-flash-serve@sha256:<digest> \
   --artifact-repo <hub-repo> \
   --artifact-subfolder <path-within-repo> \
   --lora-rank 32
