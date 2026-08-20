@@ -173,9 +173,25 @@ def has_complete_fused_expert_tensors(
     ]
     if len({adapter_name for _, _, adapter_name, _, _ in parsed}) != 1:
         return False
+    if not _uses_one_serialization_grammar(parsed):
+        return False
     return _has_complete_fused_rungs(parsed, expected, model_id) and _has_ordinary_evidence(
         parsed, config, expected
     )
+
+
+def _uses_one_serialization_grammar(tensors: list[_LoraTensor]) -> bool:
+    """Reject an artifact that mixes the stripped and namespaced leaf spellings.
+
+    A real export is uniformly one grammar: PEFT and verl's merger strip every key or none. A
+    stripped leaf is read as the ``default`` namespace, so a file carrying BOTH spellings collapses
+    two distinct keys onto one identity and the topology maps below would silently keep whichever
+    the metadata yielded last. Such a file also does not load as validated, since PEFT re-inserts
+    the namespace and turns an explicit ``lora_A.default.weight`` into
+    ``lora_A.default.default.weight``. Accept it only when every parsed key agrees on one spelling.
+    """
+    spellings = {key.endswith(f".{adapter_name}.weight") for _, _, adapter_name, key, _ in tensors}
+    return len(spellings) <= 1
 
 
 def _parse_lora_tensor(key: str, shape: tuple[int, ...]) -> _LoraTensor | None:

@@ -651,19 +651,13 @@ def test_tensor_analyzer_rejects_non_peft_fused_shapes(tensors, config):
     assert not has_complete_fused_expert_tensors(tensors, config, _MODEL_ID)
 
 
-def _peft_serialized(tensors):
-    """Re-key a namespaced fixture the way PEFT and verl's merger actually serialize it.
-
-    ``get_peft_model_state_dict`` documents dropping the adapter name, and verl's merger repeats
-    the same strip, so this is the only grammar a real exported artifact ever has.
-    """
-    return {key.replace(".default.weight", ".weight"): shape for key, shape in tensors.items()}
+_SERIALIZED_LEAVES = ("weight", "weight")
 
 
 def test_tensor_analyzer_accepts_the_grammar_peft_and_verl_actually_write():
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
-    stripped = _peft_serialized(_complete_expert_tensors())
+    stripped = _complete_expert_tensors(factor_leaves=_SERIALIZED_LEAVES)
 
     assert not any(".default." in key for key in stripped)
     assert has_complete_fused_expert_tensors(stripped, _valid_config(), _MODEL_ID)
@@ -672,8 +666,8 @@ def test_tensor_analyzer_accepts_the_grammar_peft_and_verl_actually_write():
 def test_export_stamps_an_adapter_serialized_without_the_adapter_namespace(monkeypatch, tmp_path):
     import flash.engine.worker.verl.checkpoints as checkpoints
 
-    tensors = _peft_serialized(_complete_expert_tensors())
-    tensors.update(_peft_serialized(_ordinary_tensors(target="v_proj")))
+    tensors = _complete_expert_tensors(factor_leaves=_SERIALIZED_LEAVES)
+    tensors.update(_ordinary_tensors(target="v_proj", factor_leaves=_SERIALIZED_LEAVES))
     monkeypatch.setattr(checkpoints, "_read_adapter_tensor_metadata", lambda _path: tensors)
     config = {
         "peft_type": "LORA",
@@ -696,7 +690,7 @@ def test_warmstart_accepts_an_adapter_serialized_without_the_adapter_namespace(
     import flash.engine.worker.model.adapter as adapter
 
     worker = _import_worker(monkeypatch)
-    tensors = _peft_serialized(_complete_expert_tensors())
+    tensors = _complete_expert_tensors(factor_leaves=_SERIALIZED_LEAVES)
     monkeypatch.setattr(adapter, "_read_adapter_tensor_metadata", lambda _path: tensors)
 
     worker.validate_warmstart_adapter(_valid_config(), _MODEL_ID, str(tmp_path))
@@ -706,7 +700,7 @@ def test_warmstart_accepts_an_adapter_serialized_without_the_adapter_namespace(
 def test_tensor_analyzer_still_rejects_cross_namespace_pairs_when_serialized(rung):
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
-    tensors = _peft_serialized(_complete_expert_tensors())
+    tensors = _complete_expert_tensors(factor_leaves=_SERIALIZED_LEAVES)
     suffix = "" if rung == "outer" else ".base_layer"
     prefix = f"base_model.model.layers.0.mlp.experts{suffix}"
     tensors[f"{prefix}.lora_B.other.weight"] = tensors.pop(f"{prefix}.lora_B.weight")
@@ -715,19 +709,59 @@ def test_tensor_analyzer_still_rejects_cross_namespace_pairs_when_serialized(run
 
 
 @pytest.mark.parametrize(
-    "leaf",
+    ("leaf", "expected"),
     [
-        pytest.param("not_peft", id="wrong-parameter-name"),
-        pytest.param("default.weight.extra", id="extra-segment"),
-        pytest.param(".weight", id="empty-adapter-name"),
+        pytest.param("weight", ("default", "weight"), id="serialized-bare-leaf"),
+        pytest.param("default.weight", ("default", "weight"), id="namespaced-leaf"),
+        pytest.param("other.weight", ("other", "weight"), id="non-default-namespace"),
+        pytest.param("not_peft", None, id="wrong-parameter-name"),
+        pytest.param("default.not_peft", None, id="namespaced-wrong-parameter-name"),
+        pytest.param("default.weight.extra", None, id="extra-segment"),
+        pytest.param(".weight", None, id="empty-adapter-name"),
+        pytest.param("", None, id="empty-leaf"),
     ],
 )
-def test_tensor_analyzer_still_rejects_malformed_serialized_leaves(leaf):
+def test_parse_lora_tensor_pins_the_exact_accepted_leaf_grammar(leaf, expected):
+    """Pin the grammar directly.
+
+    Routing these through the whole-artifact analyzer is inert: a malformed key merely fails to
+    parse, and the surviving tensors still satisfy every downstream check, so the assertion passes
+    for the wrong reason. Sabotaging the parser to accept an empty adapter name left the
+    artifact-level version green.
+    """
+    from flash.adapters.fused_experts import _parse_lora_tensor
+
+    parsed = _parse_lora_tensor(f"module.lora_A.{leaf}", (8, 16))
+
+    if expected is None:
+        assert parsed is None
+    else:
+        _, factor, adapter_name, _, _ = parsed
+        assert factor == "A"
+        assert (adapter_name, "weight") == expected
+
+
+def test_parse_lora_tensor_requires_exactly_one_factor_infix():
+    from flash.adapters.fused_experts import _parse_lora_tensor
+
+    assert _parse_lora_tensor("m.lora_A.lora_B.weight", (8, 16)) is None
+    assert _parse_lora_tensor("lora_A.weight", (8, 16)) is None
+
+
+def test_tensor_analyzer_rejects_an_artifact_mixing_both_leaf_spellings():
+    """A real export is uniformly one grammar; a mixed file aliases two keys onto one identity."""
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
-    tensors = {
-        (f"{key[: -len('weight')]}{leaf}" if key.endswith(".lora_A.weight") else key): shape
-        for key, shape in _peft_serialized(_complete_expert_tensors()).items()
-    }
+    tensors = _complete_expert_tensors(factor_leaves=("weight", "default.weight"))
+
+    assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
+
+
+def test_tensor_analyzer_rejects_the_same_tensor_under_both_spellings():
+    """The stripped and namespaced keys of one tensor collapse together and must not validate."""
+    from flash.adapters.fused_experts import has_complete_fused_expert_tensors
+
+    tensors = _complete_expert_tensors(factor_leaves=_SERIALIZED_LEAVES)
+    tensors.update(_complete_expert_tensors())
 
     assert not has_complete_fused_expert_tensors(tensors, _valid_config(), _MODEL_ID)
