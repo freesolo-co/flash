@@ -21,14 +21,12 @@ from flash.serving.src.http_headers import _bearer_token, assert_internal, is_tr
 from flash.serving.src.model_config import gpu_for, is_supported_base_model
 from flash.serving.src.responses import (
     _openai_structured_outputs,
-    _ReasoningStreamSplitter,
     _split_reasoning,
     _usage_block,
 )
 from flash.serving.src.routing import AdapterRouter, EnginePool
 from flash.serving.src.schemas import AdapterRecord, internal_adapter_payload
 from flash.serving.src.serving_io import (
-    _active_checkpoint_ref,
     _assert_supported_base_model,
     _expected_checkpoint,
     _get_stored,
@@ -39,10 +37,10 @@ from flash.serving.src.serving_io import (
     _provenance_headers,
     _replace_stored_cas,
     _revision_provenance,
-    _sse,
     _validate_alias,
     _validate_alias_target,
 )
+from flash.serving.src.streaming import openai_chat_stream, prepare_stream
 from flash.serving.src.structured_outputs import StructuredOutputsError
 from flash.serving.src.undeploy import disable_matched
 from flash.serving.src.usage import UsageReporter
@@ -623,7 +621,7 @@ def build_serving_app(
         _schedule_usage(requested, result, caller_org)
         return result
 
-    async def _openai_chat_stream(
+    def _openai_chat_stream(
         *,
         record: AdapterRecord,
         events: AsyncIterator[dict[str, Any]],
@@ -634,99 +632,18 @@ def build_serving_app(
         caller_org: str | None,
         thinking: bool = False,
     ) -> AsyncIterator[bytes]:
-        yield _sse(
-            {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": adapter_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant"},
-                        "finish_reason": None,
-                    }
-                ],
-            }
+        return openai_chat_stream(
+            router,
+            _schedule_usage,
+            record=record,
+            events=events,
+            adapter_id=adapter_id,
+            completion_id=completion_id,
+            created=created,
+            include_usage=include_usage,
+            caller_org=caller_org,
+            thinking=thinking,
         )
-
-        def _delta_chunk(delta: dict[str, Any]) -> bytes:
-            return _sse(
-                {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": adapter_id,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-                }
-            )
-
-        splitter = _ReasoningStreamSplitter(thinking)
-        final: dict[str, Any] = {}
-        async for event in _terminating_on_engine_error(events, adapter_id):
-            kind = event.get("type")
-            if kind == "delta":
-                text = event.get("text") or ""
-                if not text:
-                    continue
-                reasoning_delta, content_delta = splitter.feed(text)
-                if reasoning_delta:
-                    yield _delta_chunk({"reasoning_content": reasoning_delta})
-                if content_delta:
-                    yield _delta_chunk({"content": content_delta})
-            elif kind == "final":
-                final = event
-            elif kind == "error":
-                # The 200 and its headers went out with the first chunk, so the status can no
-                # longer carry the failure. Without this the failure would propagate and Starlette
-                # would drop the connection: the caller receives a well-formed but SILENTLY
-                # TRUNCATED stream with no error and no [DONE], indistinguishable from a short
-                # completion. Emit the error into the stream and then close the protocol normally
-                # -- the same shape vLLM's own OpenAI server uses -- so the failure is detectable
-                # by an unmodified OpenAI client.
-                yield _sse(
-                    {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": adapter_id,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
-                        "error": {
-                            "message": event["message"],
-                            "type": "engine_error",
-                            "code": event["code"],
-                        },
-                    }
-                )
-                yield _sse("[DONE]")
-                return
-        trailing = splitter.flush()
-        if trailing:
-            yield _delta_chunk({"reasoning_content": trailing})
-
-        _schedule_usage(record, final, caller_org)
-        done_chunk: dict[str, Any] = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": adapter_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": final.get("finish_reason"),
-                }
-            ],
-        }
-        if include_usage:
-            prompt_tokens = final.get("prompt_tokens")
-            completion_tokens = final.get("completion_tokens")
-            if prompt_tokens is not None and completion_tokens is not None:
-                done_chunk["usage"] = _usage_block(
-                    int(prompt_tokens), int(completion_tokens), final.get("cached_tokens")
-                )
-        yield _sse(done_chunk)
-        yield _sse("[DONE]")
 
     async def _prepare_stream(
         payload: Any,
@@ -735,45 +652,9 @@ def build_serving_app(
         *,
         expected_checkpoint: str | None,
     ) -> tuple[AsyncIterator[dict[str, Any]], dict[str, str], bool]:
-        engine_payload = payload.model_copy(update={"adapter_id": target.adapter_id})
-        try:
-            # construction is inside the try with the first advance: ``EnginePool.stream_generate``
-            # is declared as an ordinary method returning an AsyncIterator, so a conforming pool may
-            # raise while building the iterator rather than on first advance. The current Modal pool
-            # is an async generator (whose body is deferred to ``anext``), but the protocol does not
-            # require that, and a dispatch failure must map identically either way.
-            events = pool.stream_generate(
-                target.base_model,
-                engine_payload,
-                target,
-                expected_checkpoint=expected_checkpoint,
-            )
-            first = await anext(events)
-        except Exception as exc:
-            _raise_if_engine_error(requested.adapter_id, exc)
-        if first.get("type") == "ready":
-            active_checkpoint = first.get("checkpoint")
-            provenance = _revision_provenance(target, active_checkpoint)
-            # the ready event carries the rendered thinking mode; it precedes every delta, so the
-            # openai layer can route the first chunk correctly.
-            return (
-                events,
-                _provenance_headers(provenance, active_checkpoint),
-                bool(first.get("thinking")),
-            )
-
-        async def replay() -> AsyncIterator[dict[str, Any]]:
-            yield first
-            async for event in events:
-                yield event
-
-        active_checkpoint = _active_checkpoint_ref(target)
-        provenance = _revision_provenance(target, active_checkpoint)
-        # no ready event, so the rendered mode is unknown. report it as non-thinking rather than
-        # guessing from ``target.thinking``: a base-model serve honors a caller enable_thinking
-        # override, so the record can disagree with what was actually rendered, and splitting a
-        # non-thinking completion that merely quotes </think> would tear the answer in half.
-        return replay(), _provenance_headers(provenance, active_checkpoint), False
+        return await prepare_stream(
+            pool, router, payload, requested, target, expected_checkpoint=expected_checkpoint
+        )
 
     @api.post("/generate", tags=["inference"])
     async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:

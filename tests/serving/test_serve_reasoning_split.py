@@ -17,12 +17,8 @@ import orjson
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import (
-    AdapterRouter,
-    _ReasoningStreamSplitter,
-    _split_reasoning,
-    build_serving_app,
-)
+from flash.serving.src.responses import _ReasoningStreamSplitter, _split_reasoning
+from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
 
 QWEN = "Qwen/Qwen3.5-0.8B"
