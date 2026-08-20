@@ -380,6 +380,34 @@ class ServingRuntimeSecrets:
         return self.__inference_token, self.__artifact_token
 
 
+class InterruptedProvisioning(KeyboardInterrupt):
+    """one interrupt whose provider cleanup could not be confirmed.
+
+    subclasses `KeyboardInterrupt` because it stands in for the interrupt the user actually
+    caused. that keeps both existing handlers correct without touching either: the `except
+    Exception` in `flash/cli/__init__.py` still lets it through, and the `except KeyboardInterrupt`
+    beside it still exits 130 with "aborted". a bare `BaseException` subclass would escape both and
+    dump a traceback instead.
+
+    `_abort_created_resources` is deliberately best-effort -- it suppresses each provider error so
+    one failed delete cannot stop the rest, and so a provider exception never replaces the
+    interrupt the user actually caused. that leaves nobody holding the knowledge that a stop or
+    delete failed, and the generic cli handler prints only "aborted", which reads as "nothing was
+    created". the gpu may still be live and billing. carrying the ambiguity out lets the cli say so.
+    """
+
+    __slots__ = ("provider",)
+
+    def __init__(self, provider: str) -> None:
+        if provider not in ("modal", "runpod"):
+            raise ValueError("interrupted provisioning requires a known provider")
+        self.provider = provider
+        super().__init__(
+            f"interrupted before the {provider} deployment was ready, and its cleanup could not "
+            f"be confirmed"
+        )
+
+
 class SanitizedProviderFailure(RuntimeError):
     """one fixed provider failure without retained response or cause data."""
 

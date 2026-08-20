@@ -18,6 +18,7 @@ import sys
 import time
 
 from flash.serve.control import ModalCredentials, RunPodCredentials
+from flash.serve.provisioning import InterruptedProvisioning
 
 MODAL_TOKEN_ID_ENV = "MODAL_TOKEN_ID"
 MODAL_TOKEN_SECRET_ENV = "MODAL_TOKEN_SECRET"
@@ -234,16 +235,34 @@ def cmd_serve_deploy(args) -> int:
         )
 
     deadline_at = time.monotonic() + float(args.timeout)
-    if provider == "modal":
-        from flash.serve.provisioning.modal import provision_modal_deployment
+    try:
+        if provider == "modal":
+            from flash.serve.provisioning.modal import provision_modal_deployment
 
-        result = provision_modal_deployment(
-            bundle, credentials, runtime_secrets, deadline_at=deadline_at
-        )
-    else:
-        from flash.serve.provisioning.runpod import provision_runpod_deployment
+            result = provision_modal_deployment(
+                bundle, credentials, runtime_secrets, deadline_at=deadline_at
+            )
+        else:
+            from flash.serve.provisioning.runpod import provision_runpod_deployment
 
-        result = provision_runpod_deployment(
-            bundle, credentials, runtime_secrets, deadline_at=deadline_at
-        )
+            result = provision_runpod_deployment(
+                bundle, credentials, runtime_secrets, deadline_at=deadline_at
+            )
+    except InterruptedProvisioning as interrupted:
+        # the interrupt still propagates -- the user pressed Ctrl-C and the exit code must say so.
+        # but the generic handler prints only "aborted", which reads as "nothing was created",
+        # and here something was: cleanup ran and could not confirm the resources are gone.
+        _warn_unconfirmed_cleanup(interrupted.provider, args.deployment_id)
+        raise
     return _report(result)
+
+
+def _warn_unconfirmed_cleanup(provider: str, deployment_id: str) -> None:
+    """say what ctrl-c actually left behind, before the generic handler says "aborted"."""
+
+    print(
+        f"\nwarning: interrupted before ready, and {provider} cleanup could not be confirmed for "
+        f"{deployment_id}. resources may still exist and bill; reconcile before retrying rather "
+        f"than provisioning again.",
+        file=sys.stderr,
+    )

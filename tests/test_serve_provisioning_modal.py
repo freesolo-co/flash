@@ -22,7 +22,12 @@ from flash.serve.control import (
     ModalProviderHandle,
     sanitized_dict,
 )
-from flash.serve.provisioning import DeploymentBundle, ServingImage, ServingRuntimeSecrets
+from flash.serve.provisioning import (
+    DeploymentBundle,
+    InterruptedProvisioning,
+    ServingImage,
+    ServingRuntimeSecrets,
+)
 from flash.serve.provisioning._modal_plan import (
     MODAL_APP_TAG_LIMIT,
     MODAL_DEPLOYMENT_TAG_LIMIT,
@@ -1407,3 +1412,41 @@ def test_loopback_image_registries_are_rejected_before_any_modal_call() -> None:
         ),
     )
     assert build_modal_create_plan(reachable)
+
+
+def test_a_failed_abort_delete_reports_that_cleanup_was_not_confirmed() -> None:
+    """a suppressed teardown failure must still reach the caller as ambiguity.
+
+    every abort step is suppressed individually so one failure cannot stop the rest, which used to
+    mean nobody held the knowledge that a step failed. the cli then printed "aborted", which reads
+    as "nothing was created" while the gpu is still live and billing. the interrupt still
+    propagates -- `InterruptedProvisioning` subclasses `KeyboardInterrupt` -- but it now names the
+    provider so the cli can warn before the generic handler exits 130.
+    """
+
+    class _StopAppFailsSdk(_FakeSdk):
+        def __init__(self, plan) -> None:
+            super().__init__(plan)
+            self.fail_operation = "stop_app"
+
+    factory = _Factory()
+    factory.sdk_class = _StopAppFailsSdk
+
+    with pytest.raises(InterruptedProvisioning) as raised:
+        _provision(_bundle(), factory, probe=_InterruptingProbe())
+
+    assert raised.value.provider == "modal"
+    # still an interrupt, so the existing cli handler keeps exiting 130 rather than tracebacking.
+    assert isinstance(raised.value, KeyboardInterrupt)
+
+
+def test_a_fully_confirmed_abort_leaves_the_interrupt_unchanged() -> None:
+    # the carrier must mean "cleanup could not be confirmed", not merely "an interrupt happened".
+    # when every teardown step succeeds there is nothing ambiguous to report, and raising the
+    # carrier anyway would warn about billing resources that were provably removed.
+    factory = _Factory()
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _provision(_bundle(), factory, probe=_InterruptingProbe())
+
+    assert not isinstance(raised.value, InterruptedProvisioning)

@@ -19,7 +19,13 @@ from flash.serve.control import (
     RunPodProviderHandle,
     sanitized_dict,
 )
-from flash.serve.provisioning import DeploymentBundle, ServingImage, ServingRuntimeSecrets, _common
+from flash.serve.provisioning import (
+    DeploymentBundle,
+    InterruptedProvisioning,
+    ServingImage,
+    ServingRuntimeSecrets,
+    _common,
+)
 from flash.serve.provisioning._common import serving_resource_names
 from flash.serve.provisioning._runpod_plan import build_runpod_create_plan
 from flash.serve.provisioning._runpod_probe import RunPodEndpointProbe
@@ -1785,3 +1791,75 @@ def test_loopback_image_registries_are_rejected_before_any_runpod_call() -> None
         ),
     )
     assert build_runpod_create_plan(reachable)
+
+
+class _CleanupFailsAfterInterruptTransport(_FakeTransport):
+    """Ctrl-C during the readiness poll, then a cleanup delete that cannot be confirmed.
+
+    the interrupt fires from the probe, and the teardown delete this drives then fails ambiguously
+    -- the shape a real expired deadline produces, since the abort reuses the original deadline.
+    """
+
+    def __init__(self, account_id: str = "account-01") -> None:
+        super().__init__(account_id)
+        self.interrupted = False
+
+    def rest(
+        self,
+        method,
+        path,
+        payload,
+        *,
+        mutation: bool,
+        deadline_at: float,
+        query: dict[str, str] | None = None,
+    ):
+        # `query` must be accepted even though this override ignores it: the listing reads pass it,
+        # and omitting it makes them fail with a TypeError long before the interrupt.
+        #
+        # only the pod delete that runs AFTER the interrupt fails, and ambiguously. an
+        # unconditional failure would fire during creation rollback instead, so provisioning would
+        # return `transport_failed` and the probe -- and therefore the interrupt path -- would
+        # never run at all. failing reads would break the observation the abort depends on and
+        # make it bail out before reaching the branch under test.
+        if self.interrupted and mutation and method == "DELETE" and path.startswith("/pods/"):
+            raise RunPodTransportFailure("resource_ambiguous", outcome_unknown=True)
+        return super().rest(
+            method, path, payload, mutation=mutation, deadline_at=deadline_at, query=query
+        )
+
+
+def test_unconfirmed_runpod_interrupt_cleanup_is_reported_not_discarded() -> None:
+    """the cleanup result must reach the caller when it cannot prove the pod is gone.
+
+    `_failure_after_create_attempt` already distinguishes "confirmed absent" from
+    "outcome_unknown", but the interrupt path discarded its return value and re-raised, so the cli
+    printed only "aborted" while the pod and volume could still be live and billing. the interrupt
+    still propagates -- `InterruptedProvisioning` subclasses `KeyboardInterrupt` -- and now names
+    the provider so the cli can warn first.
+    """
+    bundle = _bundle()
+    transport = _CleanupFailsAfterInterruptTransport()
+
+    def _interrupt(url: str, token: str, probed, timeout: float) -> bool:
+        transport.interrupted = True
+        raise KeyboardInterrupt
+
+    with pytest.raises(InterruptedProvisioning) as raised:
+        _provision(bundle, transport, probe=_interrupt)
+
+    assert raised.value.provider == "runpod"
+    assert isinstance(raised.value, KeyboardInterrupt)
+
+
+def test_confirmed_runpod_interrupt_cleanup_stays_a_plain_interrupt() -> None:
+    # when teardown proves every resource is gone there is no ambiguity to report, and raising the
+    # carrier would warn about billing resources that were provably removed.
+    bundle = _bundle()
+    transport = _FakeTransport()
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _provision(bundle, transport, probe=_InterruptingProbe())
+
+    assert not isinstance(raised.value, InterruptedProvisioning)
+    assert not transport.pods, transport.pods

@@ -16,7 +16,12 @@ from flash.serve.control import (
 )
 from flash.serve.control.types import validate_runpod_handle
 
-from ._common import DeploymentBundle, ServingRuntimeSecrets, failed_deployment_result
+from ._common import (
+    DeploymentBundle,
+    InterruptedProvisioning,
+    ServingRuntimeSecrets,
+    failed_deployment_result,
+)
 from ._runpod_mutations import MutationKind, MutationLedger
 from ._runpod_plan import RunPodCreatePlan, build_runpod_create_plan
 from ._runpod_probe import RunPodEndpointProbe
@@ -820,13 +825,14 @@ def provision_runpod_deployment(
         # slow readiness poll leaves the pod, volume, and secrets live and billing, silently. The
         # ledger already holds what bounded cleanup needs, so tear down, then re-raise.
         # `readiness_failed` rather than a new code: failure codes are a public serialization
-        # surface and this result is discarded anyway -- only the cleanup it drives matters.
+        # surface and nothing serializes this one -- only the cleanup it drives, and whether that
+        # cleanup could be confirmed, matter here.
         # `not reached_ready` bounds this to the half-built window. After the probe reports healthy
         # the only work left is deleting the hydration secret, and tearing down there would destroy
         # a live pod the user just paid to warm up. A leftover secret is recoverable by re-running;
         # a deleted pod is not.
         if transport is not None and ledger.has_attempted_creations and not reached_ready:
-            _failure_after_create_attempt(
+            cleanup = _failure_after_create_attempt(
                 plan,
                 transport,
                 ledger,
@@ -836,6 +842,12 @@ def provision_runpod_deployment(
                 clock=clock,
                 sleep=sleep,
             )
+            if cleanup.status == "outcome_unknown":
+                # cleanup could not prove the pod and volume are gone -- often because the
+                # original deadline already expired -- so they may still be live and billing.
+                # the generic cli handler prints "aborted", which reads as "nothing was created";
+                # this carrier is what lets the cli say the outcome is actually unknown.
+                raise InterruptedProvisioning("runpod") from None
         raise
 
 
