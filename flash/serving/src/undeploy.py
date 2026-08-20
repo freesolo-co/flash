@@ -6,6 +6,7 @@ shape, so this function touches neither the router nor the engine pool.
 """
 
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import HTTPException, status
 
@@ -145,3 +146,42 @@ async def resolve_undeploy_target(
     if not matches:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
     return None, run_id, matches
+
+
+def undeploy_body(
+    adapter_id: str,
+    run_id: str,
+    base_model: str,
+    disabled_aliases: list[str],
+    disabled_revisions: list[str],
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "removed": adapter_id,
+        "base_model": base_model,
+        "run_id": run_id,
+        "disabled_aliases": sorted(disabled_aliases),
+        "disabled_revisions": sorted(disabled_revisions),
+    }
+
+
+def undeploy_conflict_detail(
+    run_id: str,
+    disabled_aliases: list[str],
+    disabled_revisions: list[str],
+    stuck_ready: list[str],
+) -> dict[str, Any]:
+    """409 body for a partially converged cascade.
+
+    Same ``detail`` shape as an HTTPException, but returned as a response so the deferred gpu
+    eviction still runs after the conflict is reported.
+    """
+    return {
+        "detail": {
+            "error": "adapter changed concurrently",
+            "run_id": run_id,
+            "disabled_aliases": sorted(disabled_aliases),
+            "disabled_revisions": sorted(disabled_revisions),
+            "stuck": sorted(stuck_ready),
+        }
+    }

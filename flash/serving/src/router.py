@@ -44,6 +44,8 @@ from flash.serving.src.undeploy import (
     disable_matched,
     get_authoritative,
     resolve_undeploy_target,
+    undeploy_body,
+    undeploy_conflict_detail,
 )
 from flash.serving.src.usage import UsageReporter
 
@@ -327,14 +329,7 @@ def build_serving_app(
                 adapter_id,
                 base_record.deployment_generation,
             )
-            return {
-                "ok": True,
-                "removed": adapter_id,
-                "base_model": base_model,
-                "run_id": adapter_id,
-                "disabled_aliases": [],
-                "disabled_revisions": [],
-            }
+            return undeploy_body(adapter_id, adapter_id, base_model, [], [])
 
         # phase 1: compare-and-swap every matched row to "disabled" in persistence first, collecting
         # the rows that durably converged.
@@ -354,30 +349,21 @@ def build_serving_app(
             )
 
         if stuck_ready:
-            # some rows are durably disabled while others could not converge. return the same detail
-            # shape as an httpexception while allowing cleanup to run after the conflict response.
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
-                content={
-                    "detail": {
-                        "error": "adapter changed concurrently",
-                        "run_id": run_id,
-                        "disabled_aliases": sorted(disabled_aliases),
-                        "disabled_revisions": sorted(disabled_revisions),
-                        "stuck": sorted(stuck_ready),
-                    }
-                },
+                content=undeploy_conflict_detail(
+                    run_id, disabled_aliases, disabled_revisions, stuck_ready
+                ),
                 background=background_tasks,
             )
 
-        return {
-            "ok": True,
-            "removed": adapter_id,
-            "base_model": matches[0].base_model,
-            "run_id": run_id,
-            "disabled_aliases": sorted(disabled_aliases),
-            "disabled_revisions": sorted(disabled_revisions),
-        }
+        return undeploy_body(
+            adapter_id,
+            run_id,
+            matches[0].base_model,
+            disabled_aliases,
+            disabled_revisions,
+        )
 
     def _schedule_usage(
         record: AdapterRecord,
