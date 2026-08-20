@@ -411,6 +411,32 @@ def test_self_hosting_docs_document_a_command_that_exists() -> None:
     assert required <= documented, required - documented
 
 
+def test_self_hosting_docs_do_not_route_the_plane_key_to_a_customer_endpoint() -> None:
+    """The documented way to call a `serve deploy` endpoint must be the one it authenticates.
+
+    The packaged app's `_authorize` reads `Authorization: Bearer` and nothing else -- there is no
+    internal-key acceptance anywhere in `flash/serve/app/`. `FREESOLO_SERVING_URL` drives the
+    separate multi-LoRA backend, and every request it sends carries `FREESOLO_INTERNAL_KEY` via
+    `X-Freesolo-Internal-Key`. So documenting the deployment URL under `FREESOLO_SERVING_URL` does
+    not merely fail `401`: it first sends the key that controls the whole plane to a provider
+    endpoint, which `docs/serving-contract.md` forbids ("must never be sent to a customer-owned
+    endpoint"). Asserting on the app's real check rather than on prose keeps the two in step.
+    """
+    root = pathlib.Path(__file__).resolve().parents[1]
+    doc = (root / "SELF_HOSTING.md").read_text(encoding="utf-8")
+
+    app = (root / "flash" / "serve" / "app" / "http.py").read_text(encoding="utf-8")
+    assert "internal-key" not in app.casefold(), "the packaged app must not read the plane key"
+    assert '"bearer"' in app.casefold(), "the packaged app must authenticate with bearer"
+
+    # the deployment section must show the bearer call, and must not hand its url to the command
+    # family that authenticates with the plane key.
+    section = doc.split("## Serving")[1]
+    assert "Authorization: Bearer $FLASH_SERVING_KEY" in section
+    exported = re.findall(r"export FREESOLO_SERVING_URL=(\S+)", section)
+    assert not any("modal.run" in value or "proxy.runpod" in value for value in exported), exported
+
+
 @pytest.mark.parametrize("bad", ["0", "-1", "-0.5", "nan", "inf", "-inf"])
 def test_timeout_that_cannot_describe_a_future_deadline_is_rejected_at_parse(bad: str) -> None:
     """A bad `--timeout` must fail as an argument error, before any resolution or download.

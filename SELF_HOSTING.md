@@ -391,22 +391,30 @@ requires exporting them again. `--image` must be digest-qualified (`name@sha256:
 deployment is pinned to an exact immutable image. Add `--dry-run` to resolve and validate every
 input, including the adapter's provenance, without provisioning anything or incurring cost.
 
-Set the printed URL and the same generated key in the **`flash-server` process environment**, then
-restart the server:
+The command prints the endpoint URL. Call it directly with the key you generated, which is scoped to
+that one deployment:
 
 ```bash
-export FREESOLO_SERVING_URL=https://<your-app>.modal.run
-export FREESOLO_INTERNAL_KEY=<the FLASH_SERVING_KEY value>
-flash-server --host 0.0.0.0 --port 8080
+curl https://<your-app>.modal.run/v1/chat/completions \
+  -H "Authorization: Bearer $FLASH_SERVING_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<run-id>", "messages": [{"role": "user", "content": "hello"}]}'
 ```
+
+Do **not** point `FREESOLO_SERVING_URL` at this endpoint. Those commands authenticate with
+`X-Freesolo-Internal-Key` and carry `FREESOLO_INTERNAL_KEY`, the key that controls your whole plane;
+a customer-owned deployment does not read that header at all, so the request would fail `401` after
+sending a plane-wide credential to a provider endpoint. The deployment serves `/healthz`,
+`/v1/models`, and `/v1/chat/completions` -- it receives its adapters in an immutable manifest at
+boot and has no `/adapters` surface for `flash models deploy` to drive.
 
 The shared runtime supports bounded multimodal preparation. The packaged serving app remains
 text-only and returns `400` for image-bearing requests until that path is wired and GPU-validated.
 
-Standalone serving commands refuse an unset or Freesolo-hosted serving URL so the plane never sends
-its root key to infrastructure you do not operate. Any other compatible backend is allowed. See
-[docs/serving-contract.md](docs/serving-contract.md) for the normative endpoints and conformance
-command.
+`FREESOLO_SERVING_URL` belongs to the separate multi-LoRA backend behind `flash models deploy` /
+`chat` / `undeploy`; standalone refuses an unset or Freesolo-hosted value there for the same reason.
+See [docs/serving-contract.md](docs/serving-contract.md) for both credential rules, the normative
+endpoints, and the conformance command.
 
 ## The worker image
 
