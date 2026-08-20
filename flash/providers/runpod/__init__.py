@@ -114,6 +114,7 @@ class RunpodProvider:
         from flash.providers.runpod.jobs import (
             make_hf_failure_detail_reader,
             make_hf_heartbeat_reader,
+            migrate_persisted_legacy_key_fingerprints,
             poll_job,
             stall_kwargs,
         )
@@ -122,6 +123,14 @@ class RunpodProvider:
         hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}"
         hd = handle.to_dict()
+        upgrades = {}
+        with contextlib.suppress(FileNotFoundError):
+            upgrades = migrate_persisted_legacy_key_fingerprints(spec.run_id)
+        fingerprint = hd.get("key_fingerprint")
+        endpoint_id = hd.get("endpoint_id")
+        upgraded_fingerprint = upgrades.get((endpoint_id, fingerprint))
+        if upgraded_fingerprint is not None:
+            hd["key_fingerprint"] = upgraded_fingerprint
         rh = RunpodJobHandle.from_dict(hd)
         if not rh.job_id:
             raise ValueError("endpoint-only RunPod handles cannot be polled")

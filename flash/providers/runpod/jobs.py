@@ -142,6 +142,78 @@ def apply_disk_gb(config, disk_gb: int | None) -> None:
     template.containerDiskInGb = max(int(disk_gb), int(template.containerDiskInGb or 0))
 
 
+def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, str], str]:
+    """Rewrite endpoint-confirmed legacy owner prefixes in one durable run record."""
+    import flash.runner as runner
+
+    def legacy_target(remote: object) -> tuple[str, str] | None:
+        if not isinstance(remote, dict) or remote.get("provider") != "runpod":
+            return None
+        fingerprint = remote.get("key_fingerprint")
+        if not runpod_api._is_legacy_key_fingerprint(fingerprint):
+            return None
+        endpoint_id = remote.get("endpoint_id")
+        if not isinstance(endpoint_id, str) or not endpoint_id:
+            raise ValueError("persisted RunPod endpoint identity is invalid")
+        return endpoint_id, fingerprint
+
+    def legacy_targets(raw: dict) -> set[tuple[str, str]]:
+        cleanup_remotes = raw.get(runner._CLEANUP_REMOTES_KEY)
+        cleanup_records = cleanup_remotes if isinstance(cleanup_remotes, list) else []
+        return {
+            target
+            for remote in [raw.get("remote"), *cleanup_records]
+            if (target := legacy_target(remote)) is not None
+        }
+
+    upgrades: dict[tuple[str, str], str] = {}
+
+    def upgrade(remote: object) -> object:
+        target = legacy_target(remote)
+        if target is None or target not in upgrades:
+            return remote
+        return {**remote, "key_fingerprint": upgrades[target]}
+
+    while True:
+        raw = runner._load_status_json(run_id)
+        unresolved = legacy_targets(raw) - upgrades.keys()
+        if not unresolved:
+            break
+        for endpoint_id, fingerprint in unresolved:
+            try:
+                upgrades[(endpoint_id, fingerprint)] = (
+                    runpod_api.resolve_legacy_key_fingerprint(endpoint_id, fingerprint)
+                )
+            except runpod_api.RunpodApiError:
+                raise ValueError("persisted RunPod key fingerprint is invalid") from None
+    if not upgrades:
+        return upgrades
+
+    with runner._status_guard(run_id):
+        current = runner._load_status_json(run_id)
+        current_cleanup_remotes = current.get(runner._CLEANUP_REMOTES_KEY)
+        if current_cleanup_remotes is not None and not isinstance(current_cleanup_remotes, list):
+            raise RuntimeError("stored cleanup remotes are invalid")
+        remaining = legacy_targets(current) - upgrades.keys()
+        if remaining:
+            raise RuntimeError("persisted RunPod owner changed during fingerprint migration")
+        status = runner._runstatus_from_json(current)
+        upgraded_remote = upgrade(status.remote)
+        upgraded_cleanup_remotes = (
+            [upgrade(remote) for remote in current_cleanup_remotes]
+            if current_cleanup_remotes is not None
+            else None
+        )
+        if (
+            upgraded_remote == status.remote
+            and upgraded_cleanup_remotes == current_cleanup_remotes
+        ):
+            return upgrades
+        status.remote = upgraded_remote
+        runner._save_status_unlocked(status, _cleanup_remotes=upgraded_cleanup_remotes)
+    return upgrades
+
+
 @dataclass
 class JobHandle:
     endpoint_id: str
@@ -184,6 +256,13 @@ class JobHandle:
         if not isinstance(endpoint_name, str) or not endpoint_name:
             raise ValueError("persisted RunPod endpoint name is invalid")
         fingerprint = d.get("key_fingerprint")
+        if runpod_api._is_legacy_key_fingerprint(fingerprint):
+            try:
+                fingerprint = runpod_api.resolve_legacy_key_fingerprint(
+                    endpoint_id, fingerprint
+                )
+            except runpod_api.RunpodApiError:
+                raise ValueError("persisted RunPod key fingerprint is invalid") from None
         if not runpod_api._is_valid_key_fingerprint(fingerprint):
             raise ValueError("persisted RunPod key fingerprint is invalid")
         job_id = d.get("job_id")

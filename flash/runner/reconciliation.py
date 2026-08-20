@@ -272,6 +272,9 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
 
 def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     """Teardown every tracked resource independently, removing only confirmed exact records."""
+    from flash.providers.runpod.jobs import migrate_persisted_legacy_key_fingerprints
+
+    migrate_persisted_legacy_key_fingerprints(run_id)
     records = runner._snapshot_cleanup_remotes(run_id)
     attempted = set()
     if not records:

@@ -763,6 +763,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     """Re-attach to a run's remote job from any process (after a client crash/restart)."""
     import sys
 
+    from flash.providers.runpod.jobs import migrate_persisted_legacy_key_fingerprints
     from flash.runner import (
         TERMINAL_STATES,
         _compare_and_fail_remote,
@@ -776,6 +777,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     )
     from flash.runner.supervise.lifecycle import _CompletedAttemptPending
 
+    migrate_persisted_legacy_key_fingerprints(run_id)
     cleanup_terminal = False
 
     def status_for_return() -> RunStatus:

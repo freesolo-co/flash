@@ -32,6 +32,15 @@ def _is_valid_key_fingerprint(fingerprint: object) -> bool:
     )
 
 
+def _is_legacy_key_fingerprint(fingerprint: object) -> bool:
+    return (
+        isinstance(fingerprint, str)
+        and len(fingerprint) == 16
+        and fingerprint.startswith("rpk-")
+        and all(char in "0123456789abcdef" for char in fingerprint[4:])
+    )
+
+
 def _key_for_fingerprint(fingerprint: str) -> str:
     """Resolve a full key fingerprint back to its unique raw pool key."""
     if not _is_valid_key_fingerprint(fingerprint):
@@ -98,6 +107,55 @@ def list_endpoints(*, deadline_at: float | None = None) -> list[dict]:
     return all_endpoints
 
 
+def _list_endpoints_for_key(
+    key: str,
+    *,
+    deadline_at: float | None = None,
+) -> list[dict]:
+    out = _CLIENT.request_with_retries_for_key(
+        key,
+        f"{REST_BASE}/endpoints",
+        retries=2,
+        deadline_at=deadline_at,
+    )
+    if not isinstance(out, list):
+        raise RunpodApiError(
+            f"unexpected /endpoints response for a pool key (got {type(out).__name__}, want list)"
+        )
+    return out
+
+
+def resolve_legacy_key_fingerprint(endpoint_id: str, fingerprint: str) -> str:
+    """Upgrade a historical prefix only after its sole matching key proves endpoint ownership."""
+    if not _is_legacy_key_fingerprint(fingerprint):
+        raise RunpodApiError("persisted legacy RunPod key fingerprint is invalid")
+    configured_keys = _keys.keys()
+    matches = [
+        (key, full_fingerprint)
+        for key in configured_keys
+        if (full_fingerprint := key_fingerprint(key)).startswith(fingerprint)
+    ]
+    if len(matches) != 1:
+        raise RunpodApiError(
+            "expected exactly one RunPod pool key matching the persisted legacy fingerprint"
+        )
+    key, full_fingerprint = matches[0]
+    try:
+        endpoints = _list_endpoints_for_key(key)
+    except Exception:
+        raise RunpodApiError(
+            f"runpod endpoint ownership lookup failed for {endpoint_id}; owner unconfirmed"
+        ) from None
+    if not any(
+        isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id
+        for endpoint in endpoints
+    ):
+        raise RunpodApiError(
+            f"runpod endpoint {endpoint_id} is not owned by the legacy fingerprint match"
+        )
+    return full_fingerprint
+
+
 def list_endpoints_by_key(
     *,
     deadline_at: float | None = None,
@@ -118,19 +176,9 @@ def list_endpoints_by_key(
     for key in pool:
         fp = key_fingerprint(key)
         try:
-            out = _CLIENT.request_with_retries_for_key(
-                key,
-                f"{REST_BASE}/endpoints",
-                retries=2,
-                deadline_at=deadline_at,
-            )
+            by_fingerprint[fp] = _list_endpoints_for_key(key, deadline_at=deadline_at)
         except RunpodApiError:
             failed.append(fp)
-            continue
-        if not isinstance(out, list):
-            failed.append(fp)
-            continue
-        by_fingerprint[fp] = out
     return by_fingerprint, failed
 
 

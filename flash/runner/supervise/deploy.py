@@ -704,6 +704,10 @@ def cancel_run(run_id: str) -> RunStatus:
     except Exception as exc:
         deferred_fencing_errors.append(exc)
 
+    from flash.providers.runpod.jobs import migrate_persisted_legacy_key_fingerprints
+
+    migrate_persisted_legacy_key_fingerprints(run_id)
+
     def _clear_exact_remote(expected_remote: dict) -> bool:
         return _clear_remote_if_unchanged(run_id, expected_remote)
 
