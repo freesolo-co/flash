@@ -81,6 +81,10 @@ server = [
 # (vllm==0.23.0, held exactly by a 25h 35B outage on 0.21.0), and the offline tests substitute a
 # stub whenever the real package is unimportable, so CI exercises the app without it.
 serving = [
+    # the hosted app talks to supabase (durable adapter registry) and the platform backend (usage
+    # billing) over httpx, at module scope in src/persistence.py and src/supabase_rest.py. it is
+    # NOT transitively guaranteed by the other bounds, so the image must state it.
+    "httpx>=0.27.0",
     "modal>=1.0.0",
     "orjson>=3.10.0",
     "pydantic-settings>=2.6.0",

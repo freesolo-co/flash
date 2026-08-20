@@ -10,6 +10,8 @@ the source text because importing `modal_app` requires live Modal configuration.
 from __future__ import annotations
 
 import ast
+import re
+import sys
 import tomllib
 from pathlib import Path
 
@@ -67,6 +69,55 @@ def test_image_installs_from_a_pyproject_that_exists() -> None:
     ]
     for extra in ("serve-runtime", "serving"):
         assert declared[extra], extra
+
+
+def test_image_extras_cover_every_directly_imported_third_party_package() -> None:
+    """The image resolves from these extras, not uv.lock, so a dropped bound is a production break.
+
+    The app used to carry its own `pyproject.toml` listing its full dependency set; splitting that
+    across flash's `serve-runtime` + `serving` extras silently dropped `httpx`, which
+    `src/persistence.py` and `src/supabase_rest.py` import at module scope for the durable adapter
+    registry and usage billing. Nothing offline catches that: the test suite installs the dev extra,
+    which brings httpx in anyway.
+    """
+    declared = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]
+    named = set()
+    for extra in ("serve-runtime", "serving"):
+        for spec in declared[extra]:
+            named.add(re.split(r"[<>=!\[;]", spec, maxsplit=1)[0].strip().replace("_", "-"))
+
+    imported: set[str] = set()
+    for path in (ROOT / "flash" / "serving").rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                modules = [node.module]
+            else:
+                continue
+            for module in modules:
+                root = module.split(".")[0]
+                if root != "flash" and root not in sys.stdlib_module_names:
+                    imported.add(root)
+
+    # import name -> distribution name, where they differ.
+    distribution = {
+        "PIL": "pillow",
+        "huggingface_hub": "huggingface-hub",
+        "dotenv": "python-dotenv",
+    }
+    # guaranteed by a hard dependency of something already named above, so they need no own bound:
+    # anyio is a required starlette dep (via fastapi); torch/PIL/pydantic ship with vllm.
+    transitive = {"anyio", "torch", "PIL", "pydantic"}
+
+    missing = {
+        module
+        for module in imported - transitive
+        if distribution.get(module, module).replace("_", "-") not in named
+    }
+    assert not missing, f"imported by flash/serving but absent from the image extras: {missing}"
 
 
 def test_image_ships_the_package_under_its_real_import_path() -> None:
