@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict
 
 import pytest
@@ -185,13 +186,100 @@ def test_direct_jobspec_omitted_shape_keeps_serialized_fields_omitted():
     assert asdict(spec.train)["prompts_per_step"] is None
 
 
-def test_direct_runconfig_validates_and_normalizes_shared_grpo_shape():
+def test_runconfig_normalizes_defaults_and_preserves_persisted_grpo_shapes():
     config = RunConfig("Qwen/Qwen3.5-4B", "grpo", 1)
     normalized = config.normalized()
     assert normalized.batch_size == DEFAULT_GRPO_PROMPTS_PER_STEP
     assert normalized.group_size == DEFAULT_GRPO_GROUP_SIZE
-    with pytest.raises(ValueError, match=r"must be <= 512"):
-        RunConfig("Qwen/Qwen3.5-4B", "grpo", 1, batch_size=129, group_size=4)
+
+    for prompts_per_step, group_size in ((4, 3), (65, 8)):
+        legacy = RunConfig(
+            "Qwen/Qwen3.5-4B",
+            "grpo",
+            10,
+            batch_size=prompts_per_step,
+            group_size=group_size,
+        ).normalized()
+        assert (legacy.batch_size, legacy.group_size) == (prompts_per_step, group_size)
+
+
+@pytest.mark.parametrize(("prompts_per_step", "group_size"), [(4, 3), (65, 8)])
+def test_persisted_legacy_shapes_price_finite_nonzero(prompts_per_step, group_size):
+    import flash.runner as runner
+
+    spec = JobSpec.from_dict(
+        _internal_grpo_train(
+            max_steps=10,
+            prompts_per_step=prompts_per_step,
+            group_size=group_size,
+        )
+    )
+
+    full = runner.charge_usd_for_spec(spec, fallback=float("nan"))
+    partial = runner.charge_usd_for_spec(spec, steps=5, fallback=float("nan"))
+    assert math.isfinite(full)
+    assert full > 0
+    assert math.isfinite(partial)
+    assert 0 < partial < full
+
+
+def test_cancellation_billing_does_not_zero_a_completed_legacy_run():
+    import flash.runner as runner
+
+    spec = JobSpec.from_dict(_internal_grpo_train(max_steps=10, prompts_per_step=4, group_size=3))
+    status = runner.RunStatus(
+        run_id="legacy-cancel",
+        state="cancelled",
+        spec={},
+        estimated_cost_usd=8.0,
+    )
+
+    charge = runner.cancelled_charge_usd(status, spec, steps=5)
+    assert math.isfinite(charge)
+    assert 0 < charge < status.estimated_cost_usd
+
+
+def test_supported_grpo_shape_pricing_is_numerically_unchanged():
+    from flash.cost import estimate_cost
+
+    expected = {
+        2: 0.22565183513227507,
+        4: 0.2578620035978836,
+        8: 0.3222823405291006,
+    }
+
+    actual = {
+        group_size: estimate_cost(
+            RunConfig(
+                "Qwen/Qwen3.5-4B",
+                "grpo",
+                10,
+                batch_size=4,
+                group_size=group_size,
+                gpu_type="A100 PCIe",
+            )
+        ).total_usd
+        for group_size in SUPPORTED_GRPO_GROUP_SIZES
+    }
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("prompts_per_step", "group_size", "message"),
+    [
+        (4, 3, r"must be one of \{2, 4, 8\}"),
+        (4, 16, r"must be one of \{2, 4, 8\}"),
+        (65, 8, r"must be <= 512"),
+    ],
+)
+def test_authoring_still_rejects_every_legacy_shape(prompts_per_step, group_size, message):
+    with pytest.raises(ConfigError, match=message):
+        spec_from_dict(
+            _public_grpo_train(
+                prompts_per_step=prompts_per_step,
+                group_size=group_size,
+            )
+        )
 
 
 @pytest.mark.parametrize("group_size", SUPPORTED_GRPO_GROUP_SIZES)
