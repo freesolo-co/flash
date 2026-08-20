@@ -260,11 +260,14 @@ class _Factory:
         self.sdk: _FakeSdk | None = None
         self.workspace_override: str | None = None
         self.environment_override: str | None = None
+        # lets a test swap in a _FakeSdk subclass that fails one exact operation, without
+        # reimplementing the factory's credential assertions.
+        self.sdk_class: type[_FakeSdk] = _FakeSdk
 
     def __call__(self, credentials: ModalCredentials, plan) -> _FakeSdk:
         token_id, token_secret = credentials.reveal()
         self.calls.append((token_id == PROVIDER_ID, token_secret == PROVIDER_SECRET))
-        sdk = _FakeSdk(plan)
+        sdk = self.sdk_class(plan)
         if self.workspace_override is not None:
             sdk.workspace_name = self.workspace_override
         if self.environment_override is not None:
@@ -1209,3 +1212,62 @@ assert "modal" not in sys.modules
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+class _InterruptingProbe(_Probe):
+    """Ctrl-C while polling a slow app, which is when a user is most likely to press it."""
+
+    def __call__(self, url, token, bundle, timeout_seconds):
+        raise KeyboardInterrupt
+
+
+def test_interrupting_a_slow_modal_readiness_poll_cleans_up_created_resources() -> None:
+    """Ctrl-C after the creates succeed must not strand a live, billable Modal deployment.
+
+    `KeyboardInterrupt` derives from BaseException, so neither `except ModalResourceConflict` nor
+    `except ModalSdkFailure` sees it. Without an explicit handler the app, its volume, and its
+    secrets stay live in the customer's own Modal account and keep billing, while the user reads
+    the traceback as "it didn't happen".
+    """
+    factory = _Factory()
+
+    with pytest.raises(KeyboardInterrupt):
+        _provision(_bundle(), factory, probe=_InterruptingProbe())
+
+    sdk = factory.sdk
+    assert sdk is not None
+    operations = [name for name, _payload in sdk.calls]
+    assert "delete_volume" in operations, operations
+    assert "delete_inference" in operations, operations
+    assert not sdk.volumes, sdk.volumes
+    assert not sdk.inference, sdk.inference
+    assert not sdk.artifact, sdk.artifact
+
+
+def test_interrupting_after_the_modal_app_is_ready_leaves_the_deployment_standing() -> None:
+    """Ctrl-C once the app has answered the probe must not delete a working deployment.
+
+    After readiness the only work left is swapping the bootstrap phase for the finalized one.
+    Tearing down there would destroy an app the user just waited to warm up, whereas a
+    half-finalized deployment is recoverable by re-running the command.
+    """
+
+    class _InterruptOnFinalizeSdk(_FakeSdk):
+        def deploy_app(self, plan) -> str:
+            # the finalized redeploy only runs after the bootstrap phase probed ready.
+            if plan.phase == "finalized":
+                raise KeyboardInterrupt
+            return super().deploy_app(plan)
+
+    factory = _Factory()
+    factory.sdk_class = _InterruptOnFinalizeSdk
+
+    with pytest.raises(KeyboardInterrupt):
+        _provision(_bundle(), factory)
+
+    sdk = factory.sdk
+    assert sdk is not None
+    operations = [name for name, _payload in sdk.calls]
+    assert "delete_volume" not in operations, operations
+    assert "delete_inference" not in operations, operations
+    assert sdk.volumes, "the ready deployment's volume must survive the interrupt"

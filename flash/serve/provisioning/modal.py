@@ -71,6 +71,23 @@ class _ExpectedResources:
     artifact_secret_id: str | None
 
 
+@dataclass(slots=True)
+class _CreatedResources:
+    """what this invocation actually created, recorded as each create returns.
+
+    Mutable and written in place so an interrupt handler can read it: the create sequence may be
+    abandoned between any two steps, and only the resources already made need tearing down.
+    """
+
+    inference: ModalNamedResource | None = None
+    artifact: ModalNamedResource | None = None
+    volume: ModalNamedResource | None = None
+
+    @property
+    def any_created(self) -> bool:
+        return any((self.inference, self.artifact, self.volume))
+
+
 @dataclass(frozen=True, slots=True)
 class _PhaseProof:
     handle: ModalProviderHandle
@@ -317,12 +334,20 @@ def _create_resources(
     sdk: ModalSdk,
     inference_token: str,
     artifact_token: str | None,
+    created: _CreatedResources | None = None,
 ) -> _ExpectedResources:
+    # each resource is recorded the instant it exists, before the next create runs. an interrupt
+    # between two creates has to tear down what already landed, so "what did we build" cannot be
+    # assembled only at the end of a function that may not reach its end.
+    record = created if created is not None else _CreatedResources()
     inference = _mutation(lambda: sdk.create_inference_secret(plan, inference_token))
+    record.inference = inference
     artifact = None
     if artifact_token is not None:
         artifact = _mutation(lambda: sdk.create_artifact_secret(plan, artifact_token))
+        record.artifact = artifact
     volume = _mutation(lambda: sdk.create_volume(plan))
+    record.volume = volume
     assert type(inference) is ModalNamedResource
     assert artifact is None or type(artifact) is ModalNamedResource
     assert type(volume) is ModalNamedResource
@@ -607,6 +632,8 @@ def provision_modal_deployment(
     bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
     finalized_plan = build_modal_create_plan(bundle, phase="finalized")
     sdk: ModalSdk | None = None
+    created = _CreatedResources()
+    reached_ready = False
     try:
         sdk = _open_sdk(sdk_factory, credentials, finalized_plan)
         observation = _observe(finalized_plan, sdk)
@@ -630,6 +657,7 @@ def provision_modal_deployment(
             sdk,
             inference_token,
             artifact_token,
+            created,
         )
         try:
             phase = _deploy_once_then_wait(
@@ -648,6 +676,10 @@ def provision_modal_deployment(
             return _unknown_result(finalized_plan)
         if phase is None:
             return _unknown_result(finalized_plan)
+        # the app is deployed and has answered the readiness probe. from here the only remaining
+        # work is swapping the bootstrap phase out for the finalized one, so an interrupt must
+        # leave the deployment standing rather than delete what the user just waited for.
+        reached_ready = True
         if artifact_token is None:
             return DeploymentResult.from_spec(
                 bundle.spec,
@@ -669,6 +701,18 @@ def provision_modal_deployment(
         return _failure_result(finalized_plan, _LifecycleFailure("conflict"))
     except ModalSdkFailure as exc:
         return _failure_result(finalized_plan, _from_sdk_failure(exc))
+    except BaseException:
+        # Ctrl-C derives from BaseException, so neither handler above sees it. Without this the
+        # app, its volume, and its secrets stay live in the customer's Modal account and keep
+        # billing, with nothing but a traceback that reads like nothing happened.
+        # Bounded by `not reached_ready` for the same reason as the RunPod path: once the probe has
+        # answered, tearing down would destroy a working deployment, and a half-finalized app is
+        # recoverable by re-running the command.
+        if sdk is not None and created.any_created and not reached_ready:
+            _delete_teardown_resources(
+                finalized_plan, sdk, created.volume, created.inference, created.artifact
+            )
+        raise
     finally:
         if sdk is not None:
             sdk.close()
