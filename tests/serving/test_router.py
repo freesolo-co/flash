@@ -14,6 +14,7 @@ import pytest
 from fastapi import BackgroundTasks, Request
 from fastapi.testclient import TestClient
 
+from flash.serving.src.adapter_routes import remove_adapter
 from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
 
@@ -893,12 +894,9 @@ def test_base_model_delete_defers_gpu_cleanup_until_after_response() -> None:
     router = AdapterRouter([record])
     pool = FakePool()
     app = build_serving_app(pool, router, internal_key="sekret", chat_authorizer=_allow)
-    route = next(
-        route
-        for route in app.routes
-        if getattr(route, "path", None) == "/adapters/{adapter_id}"
-        and "DELETE" in getattr(route, "methods", set())
-    )
+    # call the handler directly rather than through the client: the point is that the response is
+    # produced BEFORE the gpu unregister runs, which is only observable by holding the
+    # BackgroundTasks and running it afterwards.
     request = Request(
         {
             "type": "http",
@@ -906,12 +904,13 @@ def test_base_model_delete_defers_gpu_cleanup_until_after_response() -> None:
             "path": f"/adapters/{QWEN}",
             "headers": [(b"x-freesolo-internal-key", b"sekret")],
             "query_string": b"",
+            "app": app,
         }
     )
     background_tasks = BackgroundTasks()
 
     result = asyncio.run(
-        route.endpoint(
+        remove_adapter(
             adapter_id=QWEN,
             request=request,
             background_tasks=background_tasks,

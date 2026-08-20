@@ -176,3 +176,35 @@ async def prepare_stream(
     # override, so the record can disagree with what was actually rendered, and splitting a
     # non-thinking completion that merely quotes </think> would tear the answer in half.
     return replay(), _provenance_headers(provenance, active_checkpoint), False
+
+
+async def generate_once(
+    pool: EnginePool,
+    router: AdapterRouter,
+    schedule_usage: Callable[[AdapterRecord, dict[str, Any], str | None], None],
+    payload: Any,
+    requested: AdapterRecord,
+    target: AdapterRecord,
+    *,
+    expected_checkpoint: str | None = None,
+    caller_org: str | None = None,
+) -> dict[str, Any]:
+    """Dispatch one non-streaming generation and meter it.
+
+    The result echoes the REQUESTED adapter id rather than the resolved target's, so an alias
+    caller sees the id it asked for instead of the revision behind it.
+    """
+    engine_payload = payload.model_copy(update={"adapter_id": target.adapter_id})
+    try:
+        result = await pool.generate(
+            target.base_model,
+            engine_payload,
+            target,
+            expected_checkpoint=expected_checkpoint,
+        )
+    except Exception as exc:
+        raise_if_engine_error(router, requested.adapter_id, exc)
+    if "adapter_id" in result:
+        result = {**result, "adapter_id": requested.adapter_id}
+    schedule_usage(requested, result, caller_org)
+    return result
