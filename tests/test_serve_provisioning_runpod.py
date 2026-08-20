@@ -1641,6 +1641,44 @@ def test_foreign_templates_are_filtered_before_strict_parsing() -> None:
         parse_templates([broken_ours], keep_name="flash-owned-tpl")
 
 
+def test_observation_survives_a_foreign_template_in_the_customers_account() -> None:
+    # the parser-level test above proves `keep_name` filters, but not that the observation path
+    # passes it. filtering after strict parsing type-checks and reads fine, so only driving the
+    # real lifecycle catches a call site that parses the whole account first: one unrelated
+    # template in the customer's account then fails observation with `transport_failed` and
+    # blocks a deployment that has no conflicting flash resource at all.
+    bundle = _bundle()
+    transport = _FakeTransport()
+    transport.templates.append(
+        {
+            "id": "tpl0000999",
+            "name": "someone-elses-template",
+            "imageName": "nginx:latest",
+            # a template that relies on its image's default command and sets no overrides. both
+            # are legitimate on runpod and both are rejected by flash's strict field parsing.
+            "dockerStartCmd": None,
+            "containerDiskInGb": 5,
+            "volumeMountPath": "/workspace",
+            "ports": None,
+            "env": None,
+        }
+    )
+    clock = _Clock()
+
+    confirmed = confirm_runpod_absence(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        clock=clock,
+    )
+
+    # absent, not transport_failed: flash owns nothing here, and the foreign row is not flash's
+    # business to validate.
+    assert confirmed.status == "absent"
+    assert confirmed.error_code is None
+
+
 class _InterruptingProbe:
     """Ctrl-C while polling a slow pod, which is when a user is most likely to press it."""
 

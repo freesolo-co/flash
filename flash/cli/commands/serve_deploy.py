@@ -39,7 +39,11 @@ def _anonymously_unreadable(base_model: str, resolved) -> str | None:
     a deployment with no artifact token can only hydrate from repositories that need no
     credential, so readability -- not repo visibility metadata -- is the question. the check runs
     without a token on purpose: the operator's own cached login must not make a private repo look
-    reachable to the container, which gets no such login.
+    reachable to the container, which gets no such login. `token=False` is what suppresses that
+    cached login; `None` would silently fall back to it, and `""` builds an illegal `Bearer `
+    header.
+
+    tests stub this name to keep the offline suite off the network.
     """
 
     from huggingface_hub import HfApi
@@ -60,16 +64,6 @@ def _anonymously_unreadable(base_model: str, resolved) -> str | None:
             # rather than blocking a deployment on a flaky lookup.
             continue
     return None
-
-
-def _hydration_inputs_are_reachable(base_model: str, resolved) -> str | None:
-    """module-level seam for the anonymous readability probe.
-
-    provisioning tests stub this so they neither reach the network nor depend on the visibility
-    of a real repository; the default implementation is the live check above.
-    """
-
-    return _anonymously_unreadable(base_model, resolved)
 
 
 def _err(message: str) -> int:
@@ -264,7 +258,7 @@ def cmd_serve_deploy(args) -> int:
         # anonymously readable. checking here keeps the public self-hosting path working while
         # ending the private-repo case before any resource is created -- otherwise the launcher
         # raises "artifact token is required..." after the provider is already billing.
-        unreadable = _hydration_inputs_are_reachable(args.model, resolved)
+        unreadable = _anonymously_unreadable(args.model, resolved)
         if unreadable:
             return _err(
                 f"{ARTIFACT_TOKEN_ENV} is not set and {unreadable} is not readable anonymously. "

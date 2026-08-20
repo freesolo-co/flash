@@ -222,7 +222,7 @@ def test_unhydratable_private_inputs_are_rejected_before_any_provider_call(
     _stub_environment(monkeypatch)
     monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
     monkeypatch.setattr(
-        serve_deploy, "_hydration_inputs_are_reachable", lambda *_a, **_k: "Private-Co/adapters"
+        serve_deploy, "_anonymously_unreadable", lambda *_a, **_k: "Private-Co/adapters"
     )
     monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _explode)
 
@@ -244,7 +244,7 @@ def test_public_inputs_still_deploy_without_an_artifact_token(
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
     monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
-    monkeypatch.setattr(serve_deploy, "_hydration_inputs_are_reachable", lambda *_a, **_k: None)
+    monkeypatch.setattr(serve_deploy, "_anonymously_unreadable", lambda *_a, **_k: None)
     monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _capture)
 
     assert cmd_serve_deploy(_args()) == 0
@@ -397,7 +397,7 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     # the no-token hydration guard asks the hub whether the inputs are anonymously readable.
     # offline tests must not make that call, and their fixed repo ids do not exist, so treat the
     # inputs as reachable unless a test overrides this to exercise the guard itself.
-    monkeypatch.setattr(serve_deploy, "_hydration_inputs_are_reachable", lambda *_a, **_k: None)
+    monkeypatch.setattr(serve_deploy, "_anonymously_unreadable", lambda *_a, **_k: None)
 
     from flash.serve.app import AdapterExecutionInput, ArtifactFile, aggregate_file_digest
     from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
