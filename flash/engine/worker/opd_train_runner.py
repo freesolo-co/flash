@@ -501,6 +501,42 @@ def _spec_gpu_type(spec: Any) -> str:
     return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
 
 
+def _resolve_opd_gpu_mem_util(
+    request: _OpdRequest,
+    prompt_state: _PromptState,
+    runtime: _RuntimeState,
+    model_id: str,
+    fp8_kv: bool,
+) -> float:
+    """Size vLLM's colocated executor budget from this run's geometry, as the GRPO path does.
+
+    Left unset, verl substitutes its own default of 0.5 and the engine claims half the CARD on
+    every wake regardless of what the trainer already holds. That is not a spare-capacity request:
+    `wake_up` re-acquires the physical pages it released to sleep, so an overcommit is a hard
+    `CUDA Error: out of memory` in cumem_allocator rather than a smaller pool. Observed on a 27B
+    image OPD run on one H200 -- the trainer reserved 83.35 GB, the default handed vLLM 70.5 GB of
+    a 141 GB card, and the weight-sync wake after step 2 died 12.85 GB short.
+
+    Shares GRPO's resolver rather than restating it: both run the same colocated sleep/wake path,
+    so a second equation here could only drift from the one preflight admits against.
+    """
+    from flash.engine.worker.backend_common import rollout_sleep_unsupported
+    from flash.engine.worker.train.rl.verl_config import resolve_gpu_mem_util
+
+    return resolve_gpu_mem_util(
+        {
+            "model_id": model_id,
+            "model_revision": str(getattr(request, "model_revision", "") or ""),
+            "engine_len": int(prompt_state.max_model_len),
+            "group_size": int(request.knobs.group_size),
+        },
+        gpu_type=_spec_gpu_type(getattr(request, "spec", None)),
+        n_gpus=int(runtime.gpu_count),
+        fp8_kv=bool(fp8_kv),
+        sleep_unsupported=rollout_sleep_unsupported(model_id),
+    )
+
+
 def _build_base_config(
     request: _OpdRequest,
     prompt_state: _PromptState,
@@ -716,6 +752,16 @@ def _run_child(
                 )
                 training_completed = return_code == 0
     finally:
+        # the watcher stamps checkpoints, and stamping BLOCKS on this run's accounting. a child
+        # that died before printing its last step will never record it, so tell the gate the run
+        # is over first -- otherwise `watcher.stop` waits out the accounting timeout and reports a
+        # bookkeeping stall in place of the exit that actually ended the run.
+        if not training_completed:
+            progress_state.fail(
+                f"verl child exited with code {return_code}"
+                if return_code
+                else "verl child ended without completing training"
+            )
         try:
             watcher.stop(require_complete=training_completed)
         finally:

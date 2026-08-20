@@ -6086,6 +6086,8 @@ def _config(**overrides):
         "local_dir": "/w/checkpoints",
         "save_freq": 20,
         "n_gpus_per_node": 4,
+        # sized per run by resolve_gpu_mem_util; verl's own default of 0.5 overcommits the card.
+        "gpu_mem_util": 0.44,
         # opd shards by data: ulysses is pinned off while all 4 cards stay in play as dp ranks.
         "ulysses_sequence_parallel_size": 1,
         "seed": 42,
@@ -8835,3 +8837,63 @@ def test_step_media_identity_requires_the_child_to_attest_its_media():
 
     with pytest.raises(ValueError, match="list of strings"):
         step_media_identity({"image_count": 1, "image_digests": [b"not-a-str"]})
+
+
+def test_build_opd_overrides_sizes_the_rollout_memory_budget():
+    # opd emitted no gpu_memory_utilization at all, so verl substituted its own default of 0.5 and
+    # the engine claimed half the CARD on every wake regardless of what the trainer held. this is
+    # not a spare-capacity request: vllm's `wake_up` re-acquires the physical pages it released to
+    # sleep, so an overcommit is a hard `CUDA Error: out of memory` in cumem_allocator rather than a
+    # smaller pool. a 27B image opd run on one H200 died exactly there -- trainer 83.35 GB, engine
+    # budget 70.5 GB of a 141 GB card, 12.85 GB short -- on the weight sync after step 2.
+    overrides = dict(
+        value.split("=", 1) for value in build_opd_overrides(_config(gpu_mem_util=0.37))
+    )
+    assert overrides["actor_rollout_ref.rollout.gpu_memory_utilization"] == "0.37"
+
+
+def test_build_opd_overrides_requires_a_sized_rollout_memory_budget():
+    # the sizing must be load-bearing, not a defaulted key: silently falling back to verl's 0.5 is
+    # the exact failure this guards, and it surfaces only as an OOM on real hardware.
+    config = _config()
+    config.pop("gpu_mem_util")
+    with pytest.raises(KeyError, match="gpu_mem_util"):
+        build_opd_overrides(config)
+
+
+def test_build_opd_overrides_halves_agent_loop_workers_for_multimodal_runs():
+    # same fan-out that exhausted the grpo worker container with `libgomp: Thread creation failed`:
+    # every agent worker is a ray actor holding its own processor copy, and on an image run that is
+    # a full image processor sitting beside the vllm engine, enginecore, load balancer and http
+    # server in one container.
+    batch = {"train_batch_size": 2, "group_size": 4}
+    text = build_opd_overrides(_config(**batch))
+    assert "actor_rollout_ref.rollout.agent.num_workers=8" in text
+    image = build_opd_overrides(_config(**batch, multimodal=True))
+    assert "actor_rollout_ref.rollout.agent.num_workers=4" in image
+    # the authored knobs are untouched: only scheduling parallelism narrows.
+    assert "actor_rollout_ref.rollout.n=4" in image
+    # and the cap still yields an exact divisor of the rollout batch, which verl asserts on.
+    workers = int(next(o for o in image if "agent.num_workers=" in o).rsplit("=", 1)[1])
+    assert (batch["train_batch_size"] * batch["group_size"]) % workers == 0
+
+
+def test_opd_accounting_gate_reports_a_dead_child_instead_of_a_timeout():
+    # a crashed child never records its last step, so the gate used to burn its full timeout and
+    # then blame accounting for a failure that happened elsewhere. the 27B run's real cause was a
+    # vllm wake_up CUDA OOM two frames deeper, and the reported error named none of it.
+    state = opd_train._OpdProgressState()
+    state.fail("verl child exited with code 1")
+    with pytest.raises(RuntimeError, match="exited before accounting for checkpoint step 3"):
+        # the timeout is long: if the gate were still waiting on it, this test would hang rather
+        # than fail, which is what makes the assertion meaningful.
+        state.checkpoint_state(3, timeout_s=600.0)
+
+
+def test_opd_accounting_gate_keeps_the_first_failure_reason():
+    # later errors are usually fallout of the first; reporting the newest would bury the cause.
+    state = opd_train._OpdProgressState()
+    state.fail("verl child exited with code 1")
+    state.fail("bridge shutdown")
+    with pytest.raises(RuntimeError, match="exited with code 1"):
+        state.checkpoint_state(1, timeout_s=600.0)

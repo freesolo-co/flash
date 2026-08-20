@@ -40,6 +40,7 @@ _REQUIRED_OVERRIDE_KEYS = (
     "local_dir",
     "save_freq",
     "n_gpus_per_node",
+    "gpu_mem_util",
     "ulysses_sequence_parallel_size",
     "seed",
     "project_name",
@@ -185,6 +186,11 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         # lands in the same vllm_async_server sleep(). the flagged model declares algos including
         # opd and the parse-time gate admits it, so without this an opd run on it wedges.
         *rollout_resident_overrides(bool(config.get("sleep_unsupported"))),
+        # size the colocated executor budget from this run's geometry, as the grpo path does.
+        # verl's default is 0.5, i.e. half the CARD, claimed on every wake no matter what the
+        # trainer already holds -- and `wake_up` re-acquires released physical pages, so an
+        # overcommit is a hard cumem_allocator OOM rather than a smaller pool.
+        f"actor_rollout_ref.rollout.gpu_memory_utilization={_hydra_val(config['gpu_mem_util'])}",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={_hydra_val(config['n_gpus_per_node'])}",
         f"actor_rollout_ref.rollout.n={_hydra_val(config['group_size'])}",
         # `++`, not a bare key: limit_images is a real RolloutConfig field but is absent from the
@@ -205,7 +211,7 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         # whenever that product is not a multiple of 8. size the pool to the batch instead.
         (
             "actor_rollout_ref.rollout.agent.num_workers="
-            f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']))}"
+            f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']), cap=4 if config.get('multimodal') else 8)}"
         ),
     ]
 

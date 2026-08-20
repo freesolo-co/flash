@@ -117,6 +117,7 @@ class _OpdProgressState:
         self._prev_no_signal_skipped_steps = int(state.get("no_signal_skipped_steps", 0))
         self._train_started_at: float | None = None
         self._step_states: dict[int, dict] = {}
+        self._terminal_error: str = ""
         if resume_state is not None:
             self._step_states[int(state["opt_steps"])] = dict(state)
 
@@ -211,10 +212,31 @@ class _OpdProgressState:
                 max_completion=max_completion,
             )
 
+    def fail(self, reason: str) -> None:
+        """Record that the verl child died, and wake anything waiting on its accounting.
+
+        Without this a crash is indistinguishable from slowness: `checkpoint_state` blocks on a
+        condition only `record_step` notifies, so a child that exits before printing the step's
+        metrics leaves the waiter to burn its full timeout and then blame accounting for a failure
+        that happened elsewhere. Observed on a 27B image OPD run whose real cause was a vLLM
+        `wake_up` CUDA OOM two frames deeper.
+        """
+        with self._condition:
+            # keep the FIRST reason: it is the cause, and later ones are usually its fallout.
+            self._terminal_error = self._terminal_error or str(reason).strip()
+            self._condition.notify_all()
+
     def checkpoint_state(self, step: int, *, timeout_s: float = 300.0) -> dict:
         deadline = time.monotonic() + timeout_s
         with self._condition:
             while step not in self._step_states:
+                # a dead child will never record this step, so report why it died rather than
+                # waiting out a timeout and attributing the failure to accounting.
+                if self._terminal_error:
+                    raise RuntimeError(
+                        f"OPD child exited before accounting for checkpoint step {step}: "
+                        f"{self._terminal_error}"
+                    )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError(
@@ -348,6 +370,12 @@ def run_opd_train(spec=None) -> None:
                 "attention_backend": attention_backend,
                 "mm_encoder_attn_backend": mm_encoder_attn_backend,
                 "sleep_unsupported": rollout_sleep_unsupported(model_id),
+                # caps the agent-worker fan-out: each is a ray actor with its own processor copy,
+                # and on an image run that fan-out exhausted the grpo worker container's threads.
+                "multimodal": bool(multimodal),
+                "gpu_mem_util": _resolve_opd_gpu_mem_util(
+                    request, prompt_state, runtime, model_id, fp8_kv
+                ),
                 "loggers": runtime.loggers,
                 # resolved from the out-of-process capability probe, never by opening cuda in this parent -- see fused_ce_backend.
                 "fused_ce_backend": fused_ce_backend(caps),
@@ -433,6 +461,7 @@ from flash.engine.worker.opd_train_runner import (  # noqa: E402
     _prepare_workload,
     _render_prompt_rows,
     _report_training_complete,
+    _resolve_opd_gpu_mem_util,
     _run_child,
     _validate_aligned_sequences,
     _validate_teacher_transport,
