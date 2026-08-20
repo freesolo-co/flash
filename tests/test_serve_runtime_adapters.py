@@ -115,6 +115,69 @@ def test_replacement_waits_for_inflight_incarnation(adapter_dir: Path) -> None:
     assert len(engine.added) == 2
 
 
+def test_generations_on_one_incarnation_run_concurrently(adapter_dir: Path) -> None:
+    """two generations on the same adapter must overlap, not queue behind each other.
+
+    holding the adapter's lock across `acquire`'s yield capped every adapter at one in-flight
+    request, so an engine configured for `max_num_seqs` batching served them one at a time. asserted
+    by interleaving rather than by elapsed time so the test cannot go green on a slow machine.
+    """
+
+    manager = AdapterManager(_Engine(), EngineConfig(model="model"))
+    order: list[str] = []
+
+    async def exercise() -> None:
+        await manager.register(_spec(adapter_dir, "one"))
+        both_inside = asyncio.Event()
+        inside = 0
+
+        async def generation(name: str) -> None:
+            nonlocal inside
+            async with manager.acquire("adapter", "one"):
+                order.append(f"{name}:enter")
+                inside += 1
+                if inside == 2:
+                    both_inside.set()
+                # a serializing gate never lets the second reader in, so this waits forever.
+                await asyncio.wait_for(both_inside.wait(), timeout=5)
+                order.append(f"{name}:exit")
+
+        await asyncio.gather(generation("first"), generation("second"))
+
+    asyncio.run(exercise())
+    assert order == ["first:enter", "second:enter", "first:exit", "second:exit"]
+
+
+def test_eviction_waits_for_inflight_generations(adapter_dir: Path) -> None:
+    """concurrent readers must not let eviction pull lora state out from under a generation."""
+
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    async def exercise() -> None:
+        await manager.register(_spec(adapter_dir, "one"))
+        acquired = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold_generation() -> None:
+            async with manager.acquire("adapter", "one"):
+                acquired.set()
+                await release.wait()
+
+        generation = asyncio.create_task(hold_generation())
+        await acquired.wait()
+        eviction = asyncio.create_task(manager.evict("adapter", "one"))
+        await asyncio.sleep(0)
+        assert eviction.done() is False
+        assert engine.removed == []
+        release.set()
+        await generation
+        assert await eviction is True
+
+    asyncio.run(exercise())
+    assert engine.removed == [engine.added[0].lora_int_id]
+
+
 def test_same_incarnation_rejects_different_runtime_state(adapter_dir: Path) -> None:
     other = adapter_dir.parent / "other"
     other.mkdir()

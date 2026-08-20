@@ -17,6 +17,7 @@ from flash.serve.runtime import (
     EngineConfig,
     EngineDeadError,
     GenerationRequest,
+    PromptError,
     RuntimeNotReadyError,
     StreamDelta,
     StreamFinished,
@@ -721,6 +722,13 @@ def test_stream_preserves_repeated_prefix_delta_chunks() -> None:
 
 
 def test_stream_engine_error_occurs_before_ready_event() -> None:
+    """a rejected request fails before `StreamReady`, as a caller error carrying vllm's message.
+
+    `PromptError` rather than a bare `ValueError`: vllm rejects an over-length prompt with a plain
+    `ValueError`, and an unclassified exception is answered 503 by the http layer -- telling the
+    client to retry a request that cannot ever succeed.
+    """
+
     runtime = VllmLoraRuntime(EngineConfig(model="model"))
     asyncio.run(runtime.start())
     engine = _Engine.latest
@@ -730,8 +738,37 @@ def test_stream_engine_error_occurs_before_ready_event() -> None:
     async def first_event():
         return await anext(runtime.stream(GenerationRequest(prompt="hello")))
 
-    with pytest.raises(ValueError, match="context length"):
+    with pytest.raises(PromptError, match="context length"):
         asyncio.run(first_event())
+    asyncio.run(runtime.close())
+
+
+def test_generate_rejection_is_a_prompt_error_not_an_engine_failure() -> None:
+    """the non-streaming path classifies a rejected request the same way the stream path does."""
+
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append(ValueError("This model's maximum context length is 32768 tokens"))
+
+    with pytest.raises(PromptError, match="maximum context length"):
+        asyncio.run(runtime.generate(GenerationRequest(prompt="hello")))
+    asyncio.run(runtime.close())
+
+
+def test_engine_failure_is_not_reclassified_as_a_prompt_error() -> None:
+    """only `ValueError` is rewritten: an engine defect must not be blamed on the caller."""
+
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append(TypeError("engine-side defect"))
+
+    with pytest.raises(TypeError, match="engine-side defect"):
+        asyncio.run(runtime.generate(GenerationRequest(prompt="hello")))
+    assert isinstance(engine.responses, list)
     asyncio.run(runtime.close())
 
 

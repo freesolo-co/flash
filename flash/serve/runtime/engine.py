@@ -14,7 +14,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from .adapters import AdapterBinding, AdapterManager
-from .errors import EngineDeadError, PromptError, RuntimeNotReadyError
+from .errors import (
+    EngineDeadError,
+    PromptError,
+    RuntimeNotReadyError,
+    ServingRuntimeError,
+)
 from .prompt import PreparedPrompt, PromptPreparer, resolve_thinking
 from .types import (
     AdapterSpec,
@@ -169,6 +174,30 @@ def _has_hub_credential(configured_token: str | None) -> bool:
         return False
 
 
+@asynccontextmanager
+async def _rejection_as_prompt_error() -> AsyncIterator[None]:
+    """re-raise vllm's request-rejection `ValueError` as a `PromptError`.
+
+    vllm signals an intrinsically invalid request -- most commonly a prompt longer than
+    `max_model_len` -- by raising a plain `ValueError` from `generate`. Without this it reaches the
+    http layer as an unclassified exception and is answered 503, which tells the client the service
+    is temporarily unavailable and invites a retry that must fail identically, re-tokenizing and
+    re-dispatching to the gpu every time. `PromptError` maps to 400, matching what the router this
+    runtime replaces already returned for the same condition.
+
+    Deliberately narrow: only `ValueError` is rewritten. A `TypeError` or an engine crash keeps its
+    own meaning rather than being blamed on the caller's prompt. Errors that are already runtime
+    errors pass through untouched, so `PromptError` (itself a `ValueError`) is not re-wrapped.
+    """
+
+    try:
+        yield
+    except ServingRuntimeError:
+        raise
+    except ValueError as exc:
+        raise PromptError(str(exc)) from exc
+
+
 class VllmLoraRuntime:
     """one lazy, process-local vllm engine with exact adapter incarnations."""
 
@@ -253,14 +282,15 @@ class VllmLoraRuntime:
             prompt = await self._prepare_prompt(request, thinking)
             final_output = None
             try:
-                async for output in self._generate_stream(
-                    prompt,
-                    sampling,
-                    request_id,
-                    lora_request,
-                    structured,
-                ):
-                    final_output = output
+                async with _rejection_as_prompt_error():
+                    async for output in self._generate_stream(
+                        prompt,
+                        sampling,
+                        request_id,
+                        lora_request,
+                        structured,
+                    ):
+                        final_output = output
             except Exception:
                 await self._notify_if_dead()
                 raise
@@ -307,7 +337,8 @@ class VllmLoraRuntime:
                 structured,
             )
             try:
-                first_output = await self._first_stream_output(output_stream)
+                async with _rejection_as_prompt_error():
+                    first_output = await self._first_stream_output(output_stream)
                 yield StreamReady(
                     request_id=request_id,
                     runtime_id=self.runtime_id,

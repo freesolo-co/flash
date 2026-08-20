@@ -30,6 +30,7 @@ from flash.serve.app.manifest import build_serving_manifest
 from flash.serve.app.openai import ReasoningDeltaSplitter, split_reasoning
 from flash.serve.runtime import (
     GenerationResult,
+    PromptError,
     StreamDelta,
     StreamFinished,
     StreamReady,
@@ -47,6 +48,7 @@ class _FakeRuntime:
         self.registered = []
         self.fail_registration_at: int | None = None
         self.generation_requests = []
+        self.generate_error: BaseException | None = None
         self.stream_events = []
         self.stream_closed = False
 
@@ -67,6 +69,8 @@ class _FakeRuntime:
 
     async def generate(self, request):
         self.generation_requests.append(request)
+        if self.generate_error is not None:
+            raise self.generate_error
         return GenerationResult(
             request_id="request-1",
             runtime_id="runtime-1",
@@ -652,6 +656,36 @@ def test_stream_missing_duplicate_or_failed_terminal_is_sanitized_without_fake_s
             for item in payloads
         )
         assert "secret engine failure" not in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_rejected_prompt_is_400_not_a_retryable_503(stream: bool) -> None:
+    """an over-length prompt is a caller error on both paths, so clients do not retry it.
+
+    503 invites a retry that must fail identically, re-tokenizing and re-dispatching to the gpu
+    each time. the runtime raises `PromptError` for a vllm rejection; this pins that it reaches the
+    client as 400 rather than being swept into the catch-all below it.
+    """
+
+    owner, runtime = _published_owner()
+    failure = PromptError("This model's maximum context length is 32768 tokens")
+    if stream:
+        runtime.stream_events = [failure]
+    else:
+        runtime.generate_error = failure
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(stream=stream),
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 def test_stream_failure_before_ready_returns_503_and_cancellation_closes_iterator() -> None:

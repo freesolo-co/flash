@@ -38,6 +38,34 @@ class _AdapterEntry:
     loaded: bool
 
 
+@dataclass(slots=True)
+class _AdapterGate:
+    """the per-adapter mutual exclusion between generations and lifecycle changes.
+
+    Generations only read an incarnation, so any number may run at once -- vllm batches them, and
+    holding a plain lock across a whole generation capped every adapter at one in-flight request
+    regardless of `max_num_seqs`. Registration, eviction, and unload mutate the incarnation vllm is
+    serving, so they need the adapter to themselves.
+
+    Writers are exclusive against each other via `lock`, and against readers via `drained`, which is
+    set exactly while `readers == 0`. A writer holds `lock` for its whole operation, so no reader can
+    enter behind it: `acquire` waits on `lock` before counting itself in.
+    """
+
+    lock: asyncio.Lock
+    drained: asyncio.Event
+    readers: int = 0
+
+    def enter(self) -> None:
+        self.readers += 1
+        self.drained.clear()
+
+    def leave(self) -> None:
+        self.readers -= 1
+        if self.readers == 0:
+            self.drained.set()
+
+
 def lora_int_id(adapter_id: str) -> int:
     """return a positive int32-compatible deterministic starting id."""
     digest = hashlib.sha1(adapter_id.encode("utf-8")).digest()
@@ -84,8 +112,8 @@ class AdapterManager:
         self._config = config
         self._entries: dict[str, _AdapterEntry] = {}
         self._ids: dict[int, str] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._locks_guard = asyncio.Lock()
+        self._gates: dict[str, _AdapterGate] = {}
+        self._gates_guard = asyncio.Lock()
         self._state_lock = asyncio.Lock()
 
     @property
@@ -100,8 +128,7 @@ class AdapterManager:
         """load an exact incarnation, replacing the prior incarnation atomically per id."""
         path = await asyncio.to_thread(validate_adapter_path, spec.path)
         normalized = replace(spec, path=str(path))
-        lock = await self._adapter_lock(normalized.adapter_id)
-        async with lock:
+        async with self._exclusive(normalized.adapter_id):
             current = self._entries.get(normalized.adapter_id)
             if current is not None and current.spec.incarnation == normalized.incarnation:
                 if current.spec != normalized:
@@ -132,16 +159,25 @@ class AdapterManager:
         adapter_id: str,
         expected_incarnation: str | None,
     ) -> AsyncIterator[AdapterBinding]:
-        """hold the adapter lock for the full operation so replacement cannot cross-wire it."""
-        lock = await self._adapter_lock(adapter_id)
-        async with lock:
+        """pin one incarnation for the full operation so replacement cannot cross-wire it.
+
+        Held as a reader: concurrent generations on the same adapter run together, while a
+        replacement or eviction waits for them to finish rather than interleaving with them.
+        """
+        gate = await self._adapter_gate(adapter_id)
+        async with gate.lock:
             entry = self._entries.get(adapter_id)
             if entry is None:
                 raise AdapterNotFoundError(f"adapter is not registered: {adapter_id}")
             self._require_incarnation(entry, expected_incarnation)
             if not entry.loaded:
                 await self._load_entry(entry)
-            yield AdapterBinding(spec=entry.spec, lora_request=entry.lora_request)
+            binding = AdapterBinding(spec=entry.spec, lora_request=entry.lora_request)
+            gate.enter()
+        try:
+            yield binding
+        finally:
+            gate.leave()
 
     async def evict(
         self,
@@ -149,8 +185,7 @@ class AdapterManager:
         expected_incarnation: str | None = None,
     ) -> bool:
         """remove lora state from vllm while retaining the registration for lazy reload."""
-        lock = await self._adapter_lock(adapter_id)
-        async with lock:
+        async with self._exclusive(adapter_id):
             entry = self._entries.get(adapter_id)
             if entry is None:
                 return False
@@ -167,8 +202,7 @@ class AdapterManager:
         expected_incarnation: str | None = None,
     ) -> bool:
         """remove one registration and all vllm lora state for its exact incarnation."""
-        lock = await self._adapter_lock(adapter_id)
-        async with lock:
+        async with self._exclusive(adapter_id):
             entry = self._entries.get(adapter_id)
             if entry is None:
                 return False
@@ -184,13 +218,27 @@ class AdapterManager:
         for adapter_id in list(self._entries):
             await self.unload(adapter_id)
 
-    async def _adapter_lock(self, adapter_id: str) -> asyncio.Lock:
-        async with self._locks_guard:
-            lock = self._locks.get(adapter_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._locks[adapter_id] = lock
-            return lock
+    async def _adapter_gate(self, adapter_id: str) -> _AdapterGate:
+        async with self._gates_guard:
+            gate = self._gates.get(adapter_id)
+            if gate is None:
+                gate = _AdapterGate(lock=asyncio.Lock(), drained=asyncio.Event())
+                gate.drained.set()
+                self._gates[adapter_id] = gate
+            return gate
+
+    @asynccontextmanager
+    async def _exclusive(self, adapter_id: str) -> AsyncIterator[None]:
+        """hold one adapter against every other operation, including in-flight generations.
+
+        Taking `lock` first is what makes the wait terminate: it stops new readers from entering, so
+        the reader count can only fall while we wait on `drained`.
+        """
+
+        gate = await self._adapter_gate(adapter_id)
+        async with gate.lock:
+            await gate.drained.wait()
+            yield
 
     async def _reserve_id(
         self,
