@@ -409,3 +409,69 @@ def test_self_hosting_docs_document_a_command_that_exists() -> None:
 
     assert documented <= accepted, documented - accepted
     assert required <= documented, required - documented
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "-0.5", "nan", "inf", "-inf"])
+def test_timeout_that_cannot_describe_a_future_deadline_is_rejected_at_parse(bad: str) -> None:
+    """A bad `--timeout` must fail as an argument error, before any resolution or download.
+
+    `time.monotonic() + float(args.timeout)` turns each of these into an already-expired or
+    non-finite deadline, which the provider's `_validate_deadline` raises `ValueError` for -- outside
+    the lifecycle error handling, so the user saw a traceback after the Hub inputs had already been
+    resolved and downloaded.
+    """
+    with pytest.raises(SystemExit):
+        _parse(
+            [
+                "serve",
+                "deploy",
+                "--provider",
+                "modal",
+                "--model",
+                MODEL,
+                "--run",
+                "run1",
+                "--deployment-id",
+                "deployment1",
+                "--image",
+                IMAGE,
+                "--artifact-repo",
+                "Freesolo-Co/artifacts",
+                "--artifact-subfolder",
+                "adapter",
+                "--lora-rank",
+                "32",
+                "--timeout",
+                bad,
+            ]
+        )
+
+
+def test_a_positive_finite_timeout_is_accepted() -> None:
+    # parsed, not set post-hoc: _args assigns attributes after parsing, which would skip the
+    # argparse type entirely and pass no matter what the type does.
+    args = _parse(
+        [
+            "serve",
+            "deploy",
+            "--provider",
+            "modal",
+            "--model",
+            MODEL,
+            "--run",
+            "run1",
+            "--deployment-id",
+            "deployment1",
+            "--image",
+            IMAGE,
+            "--artifact-repo",
+            "Freesolo-Co/artifacts",
+            "--artifact-subfolder",
+            "adapter",
+            "--lora-rank",
+            "32",
+            "--timeout",
+            "0.5",
+        ]
+    )
+    assert args.timeout == 0.5

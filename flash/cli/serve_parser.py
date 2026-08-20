@@ -8,6 +8,23 @@ standing one up. A hosted-plane user never needs this.
 from __future__ import annotations
 
 import argparse
+import math
+
+
+def _positive_finite_seconds(raw: str) -> float:
+    """Reject a timeout that cannot describe a future deadline.
+
+    Without this, `--timeout 0`, a negative, `nan`, or `inf` parses fine and only fails inside the
+    provider's `_validate_deadline`, which raises `ValueError` outside the lifecycle error handling
+    -- so the CLI prints a traceback *after* resolving and downloading the Hub inputs, instead of
+    the ordinary argument error the user should get before any work happens.
+    """
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(
+            f"must be a positive, finite number of seconds, not {raw!r}"
+        )
+    return value
 
 
 def _add_serve_commands(sub: argparse._SubParsersAction) -> None:
@@ -92,7 +109,7 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction) -> None:
     deploy.add_argument("--runpod-data-center", default="", help="runpod data center id")
     deploy.add_argument(
         "--timeout",
-        type=float,
+        type=_positive_finite_seconds,
         default=1800.0,
         help="seconds to wait for the deployment to become ready (default: 1800)",
     )
