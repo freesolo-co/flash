@@ -2642,9 +2642,18 @@ class _RaisingEnv:
 
 @pytest.fixture
 def _identity_graded(monkeypatch):
-    monkeypatch.setattr(W, "graded_text", lambda text, prompt_opened_thinking=False: text)
-    monkeypatch.setattr(W, "thinking_text", lambda text, prompt_opened_thinking=False: "")
-    monkeypatch.setattr(W, "think_token_count", lambda text, tok, prompt_opened_thinking=False: 3)
+    # patch through the live proxy, not the module-level alias: a sibling test file that pops
+    # flash.engine.worker and re-imports it leaves that alias bound to the dead module object,
+    # so setattr would land somewhere the scorer never reads.
+    from flash.engine.worker.runtime.pkg_proxy import W as live_worker
+
+    worker = sys.modules["flash.engine.worker"]
+    monkeypatch.setattr(worker, "graded_text", lambda text, prompt_opened_thinking=False: text)
+    monkeypatch.setattr(worker, "thinking_text", lambda text, prompt_opened_thinking=False: "")
+    monkeypatch.setattr(
+        worker, "think_token_count", lambda text, tok, prompt_opened_thinking=False: 3
+    )
+    assert live_worker.think_token_count("x", None) == 3, "patch missed the live worker module"
 
 
 @pytest.mark.usefixtures("_identity_graded")
