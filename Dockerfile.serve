@@ -27,5 +27,22 @@ COPY flash ./flash
 COPY serve_launch.py ./serve_launch.py
 RUN uv sync --frozen --no-dev --extra serve-runtime
 
+# vllm 0.23.0 requires torch==2.11.0 exactly, and PyPI's default torch 2.11.0 wheel is built for
+# CUDA 13. This base image is cuda12.8, and a RunPod L4 host reports driver 12080, so that wheel
+# aborts engine init with "The NVIDIA driver on your system is too old (found version 12080)" --
+# every pod died there, ~2s in, restarting forever.
+#
+# Same versions, CUDA-matched build: PyTorch's own cu128 index publishes 2.11.0+cu128 (and the
+# matching torchvision/torchaudio), so this keeps the resolved dependency graph intact and only
+# swaps the CUDA the binaries were compiled against. Pinning here rather than in uv.lock keeps the
+# lockfile a single cross-platform resolution while the image states the CUDA its base provides,
+# the same way Dockerfile.worker version-matches torch to this base.
+#
+# --no-deps so pip cannot walk the graph and re-resolve anything uv already pinned.
+RUN /opt/flash-venv/bin/python -m pip install --no-cache-dir --no-deps \
+        --index-url https://download.pytorch.org/whl/cu128 \
+        torch==2.11.0+cu128 torchvision==0.26.0+cu128 torchaudio==2.11.0+cu128 \
+    && /opt/flash-venv/bin/python -c "import torch; v=torch.version.cuda; assert v and v.startswith('12.8'), f'expected a cu128 torch, got {torch.__version__} (cuda {v})'; print('torch', torch.__version__, 'cuda', v)"
+
 EXPOSE 8000
 CMD ["python", "/app/serve_launch.py"]
