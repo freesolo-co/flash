@@ -1629,3 +1629,38 @@ def test_interrupting_a_slow_readiness_poll_still_cleans_up_created_resources() 
     assert not transport.pods, transport.pods
     assert not transport.volumes, transport.volumes
     assert not transport.secrets, transport.secrets
+
+
+class _InterruptOnArtifactDeleteTransport(_FakeTransport):
+    """Ctrl-C in the one window where the pod is already live and serving.
+
+    `secretDelete` for the artifact secret is only reached after the probe reports ready, so
+    raising here reproduces an interrupt during the final hydration-secret cleanup and nowhere
+    else.
+    """
+
+    def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
+        if mutation and "secretDelete" in document:
+            raise KeyboardInterrupt
+        return super().graphql(document, variables, mutation=mutation, deadline_at=deadline_at)
+
+
+def test_interrupting_after_the_pod_is_ready_does_not_tear_down_the_live_pod() -> None:
+    """Ctrl-C once the pod probes healthy must leave the deployment standing.
+
+    The abort cleanup exists for an interrupt during a slow readiness poll, where the resources are
+    half-built and worthless. After readiness the only work left is deleting the hydration secret,
+    and treating an interrupt there as "abandon it" destroys a live, warmed, billable pod the user
+    just waited for. A leftover artifact secret is recoverable by re-running the command; a deleted
+    pod is not, so the cleanup must not reach into this window.
+    """
+    bundle = _bundle()
+    transport = _InterruptOnArtifactDeleteTransport()
+
+    with pytest.raises(KeyboardInterrupt):
+        _provision(bundle, transport)
+
+    assert transport.pods, "the ready pod must survive the interrupt"
+    assert transport.volumes, "the volume backing the ready pod must survive the interrupt"
+    operations = [operation for _kind, operation, mutation, _payload in transport.calls if mutation]
+    assert "DELETE /pods" not in " ".join(operations), operations
