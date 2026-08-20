@@ -58,6 +58,30 @@ def base_weights_cache_path(cache_root: str | os.PathLike[str]) -> Path:
     return Path(cache_root) / BASE_WEIGHTS_CACHE_DIRNAME
 
 
+def _hydration_marker(
+    cache_dir: str | os.PathLike[str], repo_id: str, revision: str | None
+) -> Path:
+    """the file written only after one (repo, revision) finished downloading completely.
+
+    `snapshot_download(local_files_only=True)` cannot answer "is this complete?" when the revision
+    is an exact commit sha: it resolves the snapshot directory straight from the cache layout and
+    returns it even when only some files landed. (It raises only for a *branch* revision, which
+    needs a ref it has no way to resolve offline -- which is why this looks safe under a casual
+    test.) Every revision this app hydrates is a 40-hex sha, enforced by the manifest, so the
+    permissive path is the one that always runs. An interrupted download would therefore read back
+    as ready, skip rehydration while the bootstrap token is still available, and seal the engine
+    offline -- vllm then dies on the missing shard on every restart, with no token left to retry.
+
+    The marker lives in the same hub directory it vouches for, so it is keyed on the cache dir the
+    caller actually passed to the hub rather than on the cache root: hydration absolutizes its root
+    and readiness does not, and a marker written under one spelling must still be found under the
+    other. Co-locating it also means wiping the cache wipes the claim with it.
+    """
+
+    digest = hashlib.sha256(f"{repo_id}@{revision or ''}".encode()).hexdigest()[:32]
+    return Path(cache_dir) / f".flash-complete-{digest}"
+
+
 def base_weights_are_cached(
     manifest: ServingManifest,
     cache_root: str | os.PathLike[str],
@@ -66,10 +90,13 @@ def base_weights_are_cached(
 ) -> bool:
     """report whether the exact served base revision resolves offline from the volume cache.
 
-    this asks huggingface_hub itself rather than looking for a directory, because only the hub
-    knows whether every file of that revision landed. a partial download leaves the directory in
-    place, and treating that as cached would defer the failure to vllm on a container with no
-    token left to retry with.
+    readiness is the AND of two independent checks, because neither is sufficient alone:
+
+    * a completion marker this module wrote, which is the only positive evidence that a download
+      finished rather than merely started -- see `_hydration_marker` for why the hub's own offline
+      resolution cannot answer that for a commit-sha revision;
+    * the hub's offline resolution, which is what notices the cache being emptied or evicted
+      underneath a marker that survived.
     """
 
     if type(manifest) is not ServingManifest:
@@ -80,6 +107,8 @@ def base_weights_are_cached(
         snapshot_download_fn = snapshot_download
     cache_dir = str(base_weights_cache_path(cache_root))
     for repo_id, revision in _base_weight_sources(manifest):
+        if not _hydration_marker(cache_dir, repo_id, revision).is_file():
+            return False
         try:
             snapshot_download_fn(
                 repo_id=repo_id,
@@ -142,6 +171,10 @@ def hydrate_base_weights(
                 # the repo id is manifest data and safe to name, but the exception can carry the
                 # request headers, so it is dropped rather than chained.
                 raise MaterializationError(f"base weight download failed for {repo_id}") from None
+            # only after the download returns: an interrupted one raises above and leaves no
+            # marker, so the next start rehydrates instead of sealing the engine against a
+            # half-populated snapshot.
+            _hydration_marker(cache_dir, repo_id, revision).write_text("", encoding="utf-8")
     finally:
         token = ""
 

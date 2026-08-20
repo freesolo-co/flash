@@ -18,6 +18,8 @@ from flash.serve.app.materialize import (
     MaterializationError,
     _validate_cache_ancestor_stat,
     adapter_cache_path,
+    base_weights_are_cached,
+    hydrate_base_weights,
     hydrate_manifest,
     locked_manifest_cache,
     validate_manifest_cache,
@@ -593,4 +595,135 @@ def test_lora_tensor_key_with_extra_leaf_segments_is_still_refused(tmp_path: Pat
             cache,
             token_fd=_token_fd(),
             snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+        )
+
+
+def _base_download_stub(landed: list[tuple[str, str | None]], *, fail_on: str | None = None):
+    """stand in for snapshot_download, recording what it was asked to fetch."""
+
+    def download(**kwargs):
+        repo_id = kwargs["repo_id"]
+        if repo_id == fail_on:
+            raise RuntimeError("connection reset")
+        landed.append((repo_id, kwargs.get("revision")))
+        return str(Path(kwargs["cache_dir"]) / "snapshot")
+
+    return download
+
+
+def _offline_stub(available: set[str]):
+    """stand in for the hub's offline resolution, which only sees whether the repo is present."""
+
+    def download(**kwargs):
+        if kwargs["repo_id"] not in available:
+            raise OSError("not cached")
+        return str(Path(kwargs["cache_dir"]) / "snapshot")
+
+    return download
+
+
+def test_interrupted_base_weight_download_is_not_reported_as_cached(tmp_path: Path) -> None:
+    # the failure this guards: the tokenizer lands, the model download dies mid-flight, and the
+    # next start reads the cache back as ready. it then seals the engine offline with the
+    # bootstrap token already gone, so vllm dies on the missing shard on every restart.
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+    landed: list[tuple[str, str | None]] = []
+
+    with pytest.raises(MaterializationError, match="base weight download failed"):
+        hydrate_base_weights(
+            manifest,
+            cache,
+            token_fd=_token_fd(),
+            snapshot_download_fn=_base_download_stub(landed, fail_on="flash-owned/tokenizer"),
+        )
+
+    assert landed == [("flash-owned/served-checkpoint", "1" * 40)]
+    # the hub resolves both repos offline -- a partial snapshot directory is exactly what it
+    # returns for a commit-sha revision -- so only the missing marker can catch this.
+    assert not base_weights_are_cached(
+        manifest,
+        cache,
+        snapshot_download_fn=_offline_stub(
+            {"flash-owned/served-checkpoint", "flash-owned/tokenizer"}
+        ),
+    )
+
+
+def test_completed_base_weight_download_is_reported_as_cached(tmp_path: Path) -> None:
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+    landed: list[tuple[str, str | None]] = []
+
+    hydrate_base_weights(
+        manifest,
+        cache,
+        token_fd=_token_fd(),
+        snapshot_download_fn=_base_download_stub(landed),
+    )
+
+    assert landed == [
+        ("flash-owned/served-checkpoint", "1" * 40),
+        ("flash-owned/tokenizer", "2" * 40),
+    ]
+    assert base_weights_are_cached(
+        manifest,
+        cache,
+        snapshot_download_fn=_offline_stub(
+            {"flash-owned/served-checkpoint", "flash-owned/tokenizer"}
+        ),
+    )
+
+
+def test_marker_alone_does_not_survive_an_emptied_cache(tmp_path: Path) -> None:
+    # the marker is a claim about a download, not about the bytes still being there. an evicted or
+    # wiped volume must still read as not-cached, which is what the hub check contributes.
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+
+    hydrate_base_weights(
+        manifest,
+        cache,
+        token_fd=_token_fd(),
+        snapshot_download_fn=_base_download_stub([]),
+    )
+
+    assert not base_weights_are_cached(
+        manifest,
+        cache,
+        snapshot_download_fn=_offline_stub({"flash-owned/tokenizer"}),
+    )
+
+
+def test_hub_accepts_a_partial_commit_sha_snapshot_as_complete(tmp_path: Path) -> None:
+    # this is the upstream behavior the marker exists for, pinned against the real library so a
+    # future huggingface_hub cannot quietly make the guard look unnecessary. for a *branch*
+    # revision the same call raises, which is why this is easy to disprove with a casual probe.
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    revision = "d" * 40
+    repo_dir = tmp_path / "hub" / "models--acme--partial"
+    snapshot = repo_dir / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    (repo_dir / "refs").mkdir()
+
+    resolved = snapshot_download(
+        repo_id="acme/partial",
+        revision=revision,
+        cache_dir=str(tmp_path / "hub"),
+        local_files_only=True,
+    )
+    assert Path(resolved) == snapshot
+
+    with pytest.raises(LocalEntryNotFoundError):
+        snapshot_download(
+            repo_id="acme/partial",
+            revision="main",
+            cache_dir=str(tmp_path / "hub"),
+            local_files_only=True,
         )
