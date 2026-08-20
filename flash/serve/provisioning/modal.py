@@ -3,26 +3,26 @@
 from __future__ import annotations
 
 import contextlib
-import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
 from flash.serve.control import (
-    DeploymentErrorCode,
     DeploymentResult,
     ModalCredentials,
     ModalProviderHandle,
 )
 from flash.serve.control.types import validate_modal_handle
 
+from . import _modal_lifecycle
 from ._common import (
     DeploymentBundle,
     InterruptedProvisioning,
     ServingRuntimeSecrets,
     failed_deployment_result,
 )
+from ._modal_lifecycle import Clock, LifecycleFailure, Sleeper
 from ._modal_plan import ModalCreatePlan, build_modal_create_plan
 from ._modal_probe import ModalEndpointProbe
 from ._modal_resources import (
@@ -45,8 +45,15 @@ from ._modal_sdk import (
 _READINESS_POLL_SECONDS = 2.0
 _MAX_PROBE_TIMEOUT_SECONDS = 30.0
 
-Clock = Callable[[], float]
-Sleeper = Callable[[float], None]
+# the shared primitives moved to `_modal_lifecycle` when this file reached the 1000-line limit.
+# bound to the private names the lifecycle below already used, so the split stayed a move rather
+# than a rename touching every call site.
+_LifecycleFailure = LifecycleFailure
+_mutation = _modal_lifecycle.mutation
+_observe = _modal_lifecycle.observe
+_open_sdk = _modal_lifecycle.open_sdk
+_validate_control_inputs = _modal_lifecycle.validate_control_inputs
+_validate_runtime_inputs = _modal_lifecycle.validate_runtime_inputs
 
 
 class EndpointProbe(Protocol):
@@ -60,12 +67,6 @@ class EndpointProbe(Protocol):
 
 
 _DEFAULT_ENDPOINT_PROBE = ModalEndpointProbe()
-
-
-@dataclass(frozen=True, slots=True)
-class _LifecycleFailure:
-    code: DeploymentErrorCode
-    outcome_unknown: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,36 +112,6 @@ class _TransientPhase:
     artifact_present: bool
 
 
-def _validate_deadline(deadline_at: float, clock: Clock) -> None:
-    if type(deadline_at) not in {int, float} or not math.isfinite(float(deadline_at)):
-        raise ValueError("deadline_at must be finite")
-    if float(deadline_at) <= clock():
-        raise ValueError("deadline_at must be in the future")
-
-
-def _validate_runtime_inputs(
-    credentials: ModalCredentials,
-    runtime_secrets: ServingRuntimeSecrets,
-    deadline_at: float,
-    clock: Clock,
-) -> None:
-    if type(credentials) is not ModalCredentials:
-        raise ValueError("modal credentials must use the exact credential type")
-    if type(runtime_secrets) is not ServingRuntimeSecrets:
-        raise ValueError("runtime secrets must use the exact secret boundary")
-    _validate_deadline(deadline_at, clock)
-
-
-def _validate_control_inputs(
-    credentials: ModalCredentials,
-    deadline_at: float,
-    clock: Clock,
-) -> None:
-    if type(credentials) is not ModalCredentials:
-        raise ValueError("modal credentials must use the exact credential type")
-    _validate_deadline(deadline_at, clock)
-
-
 def _failure_result(
     plan: ModalCreatePlan,
     failure: _LifecycleFailure,
@@ -169,59 +140,6 @@ def _unknown_result(
 
 def _from_sdk_failure(exc: ModalSdkFailure) -> _LifecycleFailure:
     return _LifecycleFailure(exc.code, exc.outcome_unknown)
-
-
-def _open_sdk(
-    factory: ModalSdkFactory,
-    credentials: ModalCredentials,
-    plan: ModalCreatePlan,
-) -> ModalSdk:
-    try:
-        sdk = factory(credentials, plan)
-    except ModalSdkFailure:
-        raise
-    except Exception:
-        raise ModalSdkFailure("transport_failed") from None
-    if sdk.workspace_name != plan.placement.workspace_name:
-        with contextlib.suppress(Exception):
-            sdk.close()
-        raise ModalSdkFailure("authentication_failed")
-    if sdk.environment_name != plan.placement.environment:
-        with contextlib.suppress(Exception):
-            sdk.close()
-        raise ModalSdkFailure("conflict")
-    return sdk
-
-
-def _observe(
-    plan: ModalCreatePlan,
-    sdk: ModalSdk,
-    *,
-    app_id_hint: str | None = None,
-) -> ModalObservation:
-    try:
-        observation = sdk.observe(plan, app_id_hint=app_id_hint)
-    except ModalSdkFailure:
-        raise
-    except Exception:
-        raise ModalSdkFailure("transport_failed") from None
-    if type(observation) is not ModalObservation:
-        raise ModalSdkFailure("transport_failed")
-    if (
-        observation.workspace_name != plan.placement.workspace_name
-        or observation.environment_name != plan.placement.environment
-    ):
-        raise ModalSdkFailure("authentication_failed")
-    return observation
-
-
-def _mutation(operation: Callable[[], object]) -> object:
-    try:
-        return operation()
-    except ModalSdkFailure:
-        raise
-    except Exception:
-        raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True) from None
 
 
 def _sleep_until_poll(deadline_at: float, clock: Clock, sleep: Sleeper) -> bool:

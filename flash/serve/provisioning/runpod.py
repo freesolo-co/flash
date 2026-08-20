@@ -2,26 +2,24 @@
 
 from __future__ import annotations
 
-import math
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Protocol
 
 from flash.serve.control import (
-    DeploymentErrorCode,
     DeploymentResult,
     RunPodCredentials,
     RunPodProviderHandle,
 )
 from flash.serve.control.types import validate_runpod_handle
 
+from . import _runpod_lifecycle
 from ._common import (
     DeploymentBundle,
     InterruptedProvisioning,
     ServingRuntimeSecrets,
     failed_deployment_result,
 )
+from ._runpod_lifecycle import Clock, LifecycleFailure, Sleeper, TransportFactory
 from ._runpod_mutations import MutationKind, MutationLedger
 from ._runpod_plan import RunPodCreatePlan, build_runpod_create_plan
 from ._runpod_probe import RunPodEndpointProbe
@@ -64,9 +62,16 @@ from ._runpod_transport import (
 _READINESS_POLL_SECONDS = 2.0
 _MAX_PROBE_TIMEOUT_SECONDS = 30.0
 
-TransportFactory = Callable[[str], RunPodTransport]
-Clock = Callable[[], float]
-Sleeper = Callable[[float], None]
+# the shared primitives moved to `_runpod_lifecycle` when this file reached the 1000-line limit.
+# bound to the private names the lifecycle below already used, so the split stayed a move rather
+# than a rename touching every call site.
+_LifecycleFailure = LifecycleFailure
+_identity = _runpod_lifecycle.identity
+_mutation_call = _runpod_lifecycle.mutation_call
+_read_call = _runpod_lifecycle.read_call
+_transport = _runpod_lifecycle.open_transport
+_validate_control_inputs = _runpod_lifecycle.validate_control_inputs
+_validate_runtime_inputs = _runpod_lifecycle.validate_runtime_inputs
 
 
 class EndpointProbe(Protocol):
@@ -80,71 +85,6 @@ class EndpointProbe(Protocol):
 
 
 _DEFAULT_ENDPOINT_PROBE = RunPodEndpointProbe()
-
-
-@dataclass(frozen=True, slots=True)
-class _LifecycleFailure:
-    code: DeploymentErrorCode
-    outcome_unknown: bool = False
-
-
-def _validate_deadline(deadline_at: float, clock: Clock) -> None:
-    if type(deadline_at) not in {int, float} or not math.isfinite(float(deadline_at)):
-        raise ValueError("deadline_at must be finite")
-    if float(deadline_at) <= clock():
-        raise ValueError("deadline_at must be in the future")
-
-
-def _validate_runtime_inputs(
-    credentials: RunPodCredentials,
-    runtime_secrets: ServingRuntimeSecrets,
-    deadline_at: float,
-    clock: Clock,
-) -> None:
-    if type(credentials) is not RunPodCredentials:
-        raise ValueError("runpod credentials must use the exact credential type")
-    if type(runtime_secrets) is not ServingRuntimeSecrets:
-        raise ValueError("runtime secrets must use the exact secret boundary")
-    _validate_deadline(deadline_at, clock)
-
-
-def _validate_control_inputs(
-    credentials: RunPodCredentials,
-    deadline_at: float,
-    clock: Clock,
-) -> None:
-    if type(credentials) is not RunPodCredentials:
-        raise ValueError("runpod credentials must use the exact credential type")
-    _validate_deadline(deadline_at, clock)
-
-
-def _transport(factory: TransportFactory, credentials: RunPodCredentials) -> RunPodTransport:
-    try:
-        return factory(credentials.reveal())
-    except Exception:
-        raise RunPodTransportFailure("transport_failed") from None
-
-
-def _read_call(operation: Callable[[], object], parser: Callable[[object], object]):
-    try:
-        return parser(operation())
-    except RunPodTransportFailure:
-        raise
-    except Exception:
-        raise RunPodTransportFailure("transport_failed") from None
-
-
-def _mutation_call(operation: Callable[[], object], parser: Callable[[object], object]):
-    try:
-        return parser(operation())
-    except RunPodTransportFailure:
-        raise
-    except Exception:
-        raise RunPodTransportFailure("resource_ambiguous", outcome_unknown=True) from None
-
-
-def _identity(value: object) -> object:
-    return value
 
 
 def _observe(

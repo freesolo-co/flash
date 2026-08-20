@@ -15,7 +15,7 @@ def _positive_finite_seconds(raw: str) -> float:
     """Reject a timeout that cannot describe a future deadline.
 
     Without this, `--timeout 0`, a negative, `nan`, or `inf` parses fine and only fails inside the
-    provider's `_validate_deadline`, which raises `ValueError` outside the lifecycle error handling
+    provider's `validate_deadline`, which raises `ValueError` outside the lifecycle error handling
     -- so the CLI prints a traceback *after* resolving and downloading the Hub inputs, instead of
     the ordinary argument error the user should get before any work happens.
     """
