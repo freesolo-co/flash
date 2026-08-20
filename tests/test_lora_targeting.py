@@ -204,9 +204,7 @@ def test_text_warmstart_rejects_an_image_trained_adapter_before_artifact_validat
     ("source_exclude_modules", "multimodal"),
     [(r"^(?!model\.language_model(?:\.|$)).*$", False), (None, True)],
 )
-def test_warmstart_accepts_a_matching_source_modality(
-    tmp_path, source_exclude_modules, multimodal
-):
+def test_warmstart_accepts_a_matching_source_modality(tmp_path, source_exclude_modules, multimodal):
     from flash.engine.worker.model.adapter import validate_warmstart_adapter
 
     model_id = "Qwen/Qwen3.5-0.8B"

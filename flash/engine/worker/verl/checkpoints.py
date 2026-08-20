@@ -726,9 +726,10 @@ def stamp_adapter_dir_provenance(
             tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
         except ValueError as exc:
             raise RuntimeError("exported fused-expert adapter tensor artifact is invalid") from exc
-        # `fused_expert_lora_tensor_pairs` skips non-language keys because it describes the
-        # language stack's topology only. a text-only run never targets them, so their presence is
-        # still an invalid export here; a multimodal run trains them under `all-linear` on purpose.
+        # a text-only run never targets non-language modules, so their presence is an invalid
+        # export; a multimodal run trains them under `all-linear` on purpose. this rejection is
+        # what enforces that, and it must run BEFORE `fused_expert_lora_tensor_pairs`, which
+        # returns non-language pairs as ordinary evidence rather than skipping them.
         if not multimodal:
             for key in tensors:
                 if is_non_language_lora_key(key):
