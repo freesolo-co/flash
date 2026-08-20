@@ -28,7 +28,7 @@ unit-tested in `tests/test_router.py` (multi-base-model dispatch, shared-GPU mul
 register-routing, OpenAI shape, auth, 404s) — run with `pytest tests/`.
 
 Persistence is only for hydration and recovery. On startup each base model's engine loads
-*its* ready adapters from the `hosted_lora_adapters` Supabase table; `POST /adapters`
+_its_ ready adapters from the `hosted_lora_adapters` Supabase table; `POST /adapters`
 registers a new adapter on its base model's engine and tracks it in the router.
 
 ## Deployment environments
@@ -51,10 +51,11 @@ and the custom domain `https://serve.freesolo.co`. The production workflow remai
 `.github/workflows/deploy-modal.yml` and deploys without an environment flag:
 
 ```bash
-cd serving
-uv sync
-set -a && source ../.env && set +a
-uv run modal deploy modal_app.py
+# from the repo root: modal's CLI puts the working directory on sys.path, and modal_app.py
+# imports `flash.serving.src...`, so deploying from anywhere else fails at import.
+uv sync --extra serving
+set -a && source .env && set +a
+uv run modal deploy flash/serving/modal_app.py
 ```
 
 Required production wiring is `HF_API_KEY` or `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
@@ -87,8 +88,8 @@ mode intentionally ignores the repository root `.env`, so production values cann
 variable. It also requires the production and development Supabase refs to be present and different:
 
 ```bash
-cd serving
-uv sync
+# from the repo root, for the same reason as the production block above.
+uv sync --extra serving
 uv run modal environment create dev  # once, if absent
 uv run modal environment update dev --set-web-suffix dev
 export SERVING_DEPLOYMENT_MODE=development
@@ -100,7 +101,7 @@ export SUPABASE_URL=https://${SUPABASE_PROJECT_REF_DEV}.supabase.co
 export SUPABASE_SERVICE_ROLE_KEY="replace-with-development-server-key"
 export FREESOLO_INTERNAL_KEY="replace-with-shared-internal-key"
 export HF_API_KEY="replace-with-hugging-face-token"
-uv run modal deploy --env dev modal_app.py
+uv run modal deploy --env dev flash/serving/modal_app.py
 ```
 
 Explicitly warm one development model without changing the zero floor:
@@ -145,11 +146,12 @@ GPUs, so there's nothing to tune at deploy time:
   original precision) and already published to the operator HF org. Native FP8 tensor cores need
   compute capability ≥ 8.9; every dense FP8 tier runs on an L4, L40S, or H100 (all native). No serving
   tier runs on A100 now that the 35B is bf16 on H200.
+
 - **The real memory lever — LoRA buffers:** vLLM PRE-ALLOCATES the GPU LoRA buffers at `max_loras ×
-  max_lora_rank`, regardless of how many adapters load. Both are linear levers. **The dense tiers keep
+max_lora_rank`, regardless of how many adapters load. Both are linear levers. **The dense tiers keep
   `max_loras = 16`** and move the rank instead: the 0.8B/2B/4B/9B tiers run **16 × 128** (0.8B/2B/4B on
   L4, 9B on L40S) and the 27B runs **16 × 64** on H100, while the 35B MoE is
-  the exception at **6 × 64** bf16 on H200. (Holding hot slots at 16 keeps the 4B/9B buffers *below*
+  the exception at **6 × 64** bf16 on H200. (Holding hot slots at 16 keeps the 4B/9B buffers _below_
   their old 64 × 32 / 44 × 32 shapes even with rank doubled.) Adapters trained above the effective rank are rejected at load; a base regularly serving
   more distinct adapters than its hot limit pays a swap latency from the CPU pool unless its hot
   limit equals `MAX_CPU_LORAS`.
@@ -165,13 +167,13 @@ sizing determine the GPU tier. Tiers live in `src/model_config.py`; only catalog
 and a catalog entry with no explicit GPU uses `DEFAULT_GPU` (L4). Every tier needs a one-time real-GPU
 cold-boot smoke test first.
 
-| Base model | Checkpoint | GPU | Hot LoRA shape | Context |
-| --- | --- | --- | --- | --- |
-| 0.8B, 2B | owned FP8 (`Freesolo-Co/*-FP8`) | **L4**‡ | 16 × 128 | 32768 |
-| Qwen3.5-4B | owned FP8 (`Freesolo-Co/*-FP8`) | **L4**§ | 16 × 128 | 32768 |
-| Qwen3.5-9B | owned FP8 (`Freesolo-Co/*-FP8`) | **L40S**§ | 16 × 128 | 32768 |
-| Qwen3.6-27B | owned FP8 (`Freesolo-Co/*-FP8`) | **H100**§ | 16 × 64 | 32768 |
-| Qwen3.6-35B-A3B (MoE, VL) | official **bf16** (`Qwen/Qwen3.6-35B-A3B`) | **H200**† | 6 × 64 | 32768 |
+| Base model                | Checkpoint                                 | GPU       | Hot LoRA shape | Context |
+| ------------------------- | ------------------------------------------ | --------- | -------------- | ------- |
+| 0.8B, 2B                  | owned FP8 (`Freesolo-Co/*-FP8`)            | **L4**‡   | 16 × 128       | 32768   |
+| Qwen3.5-4B                | owned FP8 (`Freesolo-Co/*-FP8`)            | **L4**§   | 16 × 128       | 32768   |
+| Qwen3.5-9B                | owned FP8 (`Freesolo-Co/*-FP8`)            | **L40S**§ | 16 × 128       | 32768   |
+| Qwen3.6-27B               | owned FP8 (`Freesolo-Co/*-FP8`)            | **H100**§ | 16 × 64        | 32768   |
+| Qwen3.6-35B-A3B (MoE, VL) | official **bf16** (`Qwen/Qwen3.6-35B-A3B`) | **H200**† | 6 × 64         | 32768   |
 
 ‡ L4 (24 GiB, Ada sm89) is the floor — the cheapest vLLM-capable card. **T4 is NOT usable** (sm75
 Turing is below vLLM V1's compute-capability ≥ 8.0 floor → vLLM ≥ 0.19 won't init; no FP8). The tiny
@@ -194,7 +196,7 @@ not the FP8 checkpoint every other tier uses:
 - **FP8 on A100** materializes the fused-MoE experts back to bf16 (~76 GiB on the 80 GiB card),
   leaving no room for CUDA-graph capture, so it is forced eager at ~4-10 tok/s.
 - **FP8 on H200/B200** fails outright: the fused-MoE LoRA kernel dies with `Unsupported lhs dtype
-  fp8e4nv` (only A100's Marlin kernel runs this MoE's LoRA), so full-expert LoRA will not even load.
+fp8e4nv` (only A100's Marlin kernel runs this MoE's LoRA), so full-expert LoRA will not even load.
 - **bf16 on H200** sidesteps the fp8 kernel: ~107 GiB weights+LoRA + ~17 GiB KV + graph capture all
   fit the 141 GiB card, every expert gets its LoRA and graphs (~129 tok/s single-stream, canaried
   2026-07-06). `gpu_memory_utilization=0.90`, `max_model_len=32768` (32k; the real-GPU canary held a
@@ -255,8 +257,8 @@ Every inference endpoint supports structured outputs (vLLM guided decoding via
   JSON-schema dict (e.g. `{"type": "object", ...}`) is accepted directly.
 - **OpenAI `response_format`** (on `/v1/chat/completions` only) — the standard OpenAI shapes are
   accepted so an OpenAI-SDK client works unchanged: `{"type": "json_object"}`, `{"type":
-  "json_schema", "json_schema": {"schema": {...}}}` (or the flattened `{"type": "json_schema",
-  "schema": {...}}`), and `{"type": "text"}` (unconstrained). Translated to the canonical form at
+"json_schema", "json_schema": {"schema": {...}}}` (or the flattened `{"type": "json_schema",
+"schema": {...}}`), and `{"type": "text"}` (unconstrained). Translated to the canonical form at
   that endpoint; `structuredOutputs` takes precedence when both are sent.
 
 The spec normalizes to the canonical form at the router (a bad spec is a 422 naming the problem),
@@ -296,9 +298,18 @@ open `<think>` block for generation to close.
 ```json
 {
   "adapterId": "people-search-lora",
-  "messages": [{"role": "user", "content": "Find senior search engineers in SF"}],
+  "messages": [
+    { "role": "user", "content": "Find senior search engineers in SF" }
+  ],
   "maxTokens": 512,
   "temperature": 0,
-  "structuredOutputs": {"json": {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}}}}}
+  "structuredOutputs": {
+    "json": {
+      "type": "object",
+      "properties": {
+        "names": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
 }
 ```

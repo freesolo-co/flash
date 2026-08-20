@@ -17,6 +17,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 MODAL_APP = ROOT / "flash" / "serving" / "modal_app.py"
+SERVING_README = ROOT / "flash" / "serving" / "README.md"
+DEPLOY_WORKFLOWS = ("deploy-modal.yml", "deploy-modal-dev.yml")
 
 
 def _module() -> ast.Module:
@@ -69,6 +71,33 @@ def test_image_installs_from_a_pyproject_that_exists() -> None:
     ]
     for extra in ("serve-runtime", "serving"):
         assert declared[extra], extra
+
+
+def test_hosted_deploy_docs_and_workflows_point_at_paths_that_exist() -> None:
+    """The documented deploy commands and the workflows that run them must match the move.
+
+    The README's blocks were written when the app was a top-level `serving/` directory, so they said
+    `cd serving` and `modal deploy modal_app.py`. Both are now wrong in a way that fails only when an
+    operator follows them during an incident: there is no repo-root `serving/`, and deploying from
+    the package directory raises `ModuleNotFoundError: No module named 'flash'` because modal's CLI
+    puts the *working directory* on sys.path.
+    """
+    readme = SERVING_README.read_text(encoding="utf-8")
+    assert "cd serving" not in readme
+    # both documented deploys must name the app by its repo-root-relative path.
+    assert readme.count("modal deploy flash/serving/modal_app.py") == 1
+    assert readme.count("modal deploy --env dev flash/serving/modal_app.py") == 1
+
+    for workflow in DEPLOY_WORKFLOWS:
+        path = ROOT / ".github" / "workflows" / workflow
+        # the README cites these by name; a citation that resolves to nothing stranded the hosted
+        # fleet with no redeploy path, which is why they were ported alongside the app.
+        assert path.is_file(), workflow
+        assert workflow in readme, workflow
+        body = path.read_text(encoding="utf-8")
+        assert "modal deploy" in body
+        # run from the repo root, for the sys.path reason above.
+        assert "working-directory: ." in body
 
 
 def test_image_extras_cover_every_directly_imported_third_party_package() -> None:
