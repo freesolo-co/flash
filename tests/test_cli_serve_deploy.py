@@ -7,6 +7,7 @@ import pathlib
 import re
 import shlex
 import tomllib
+from types import SimpleNamespace
 
 import pytest
 
@@ -228,6 +229,49 @@ def test_unhydratable_private_inputs_are_rejected_before_any_provider_call(
 
     assert cmd_serve_deploy(_args()) == 1
     assert "Private-Co/adapters" in capsys.readouterr().err
+
+
+def test_the_guard_probes_the_repos_hydration_actually_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the other two tests stub `_anonymously_unreadable` wholesale, so they pin that the guard is
+    # consulted -- not which repositories it consults. that gap let the guard probe the catalog
+    # `--model` while `materialize.py` hydrates `served_model` and `tokenizer_model`, which every
+    # profile remaps to a different checkpoint. the guard then answered a question no hydration
+    # asks: it would clear a deploy whose real checkpoint is private and reject one whose real
+    # checkpoint is public. drive the real function and assert on the repo ids it asks about.
+    from flash.serve.profiles import get_profile
+
+    profile = get_profile(MODEL)
+    probed: list[str] = []
+
+    class _Api:
+        def __init__(self, *, token):
+            # `token=False` is what suppresses a cached `hf auth login`; `None` would fall back to
+            # it and `""` would build an illegal `Bearer ` header.
+            assert token is False
+
+        def repo_info(self, *, repo_id, repo_type):
+            probed.append(repo_id)
+            return object()
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+
+    # a minimal stand-in for the resolved adapter: the guard only reads these two fields, and
+    # building it directly avoids `_stub_resolution`, which replaces the function under test.
+    adapter = SimpleNamespace(
+        artifact_repo_id="Freesolo-Co/artifacts", artifact_repo_type="dataset"
+    )
+    resolved = SimpleNamespace(adapter=adapter)
+
+    assert serve_deploy._anonymously_unreadable(profile, resolved) is None
+
+    assert profile.served_model in probed, (
+        f"hydration downloads {profile.served_model}, but the guard never probed it: {probed}"
+    )
+    assert MODEL not in probed, (
+        f"the guard probed the catalog base model {MODEL}, which hydration never downloads"
+    )
 
 
 def test_public_inputs_still_deploy_without_an_artifact_token(

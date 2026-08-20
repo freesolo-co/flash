@@ -33,7 +33,7 @@ INFERENCE_KEY_ENV = "FLASH_SERVING_KEY"
 ARTIFACT_TOKEN_ENV = "HF_TOKEN"
 
 
-def _anonymously_unreadable(base_model: str, resolved) -> str | None:
+def _anonymously_unreadable(profile, resolved) -> str | None:
     """name the first hydration input an anonymous client cannot read, or None if all are public.
 
     a deployment with no artifact token can only hydrate from repositories that need no
@@ -43,6 +43,12 @@ def _anonymously_unreadable(base_model: str, resolved) -> str | None:
     cached login; `None` would silently fall back to it, and `""` builds an illegal `Bearer `
     header.
 
+    the probed repositories are the ones `materialize.py` actually downloads -- `served_model` and
+    `tokenizer_model` -- not the catalog `--model` the operator typed. every profile remaps that
+    name to a different served checkpoint, so probing the base model would answer a question no
+    hydration ever asks: it would pass a deploy whose real checkpoint is private, and fail one
+    whose real checkpoint is public.
+
     tests stub this name to keep the offline suite off the network.
     """
 
@@ -50,8 +56,10 @@ def _anonymously_unreadable(base_model: str, resolved) -> str | None:
     from huggingface_hub.utils import HfHubHTTPError
 
     anonymous = HfApi(token=False)
+    tokenizer_model = getattr(profile, "tokenizer_model", None) or profile.served_model
     targets = (
-        (base_model, "model"),
+        (profile.served_model, "model"),
+        (tokenizer_model, "model"),
         (resolved.adapter.artifact_repo_id, str(resolved.adapter.artifact_repo_type)),
     )
     for repo_id, repo_type in targets:
@@ -258,7 +266,7 @@ def cmd_serve_deploy(args) -> int:
         # anonymously readable. checking here keeps the public self-hosting path working while
         # ending the private-repo case before any resource is created -- otherwise the launcher
         # raises "artifact token is required..." after the provider is already billing.
-        unreadable = _anonymously_unreadable(args.model, resolved)
+        unreadable = _anonymously_unreadable(profile, resolved)
         if unreadable:
             return _err(
                 f"{ARTIFACT_TOKEN_ENV} is not set and {unreadable} is not readable anonymously. "
