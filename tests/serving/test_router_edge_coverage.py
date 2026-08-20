@@ -267,3 +267,38 @@ def test_stream_first_event_value_error_is_translated() -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"] == "stream checkpoint differs"
+
+
+def test_teardown_drops_a_row_that_vanished_from_persistence() -> None:
+    """A matched row whose authoritative record is gone must leave routing.
+
+    ``disable_matched`` reports ``current=None`` when the row disappeared (or stopped being
+    ready) between enumeration and the compare-and-swap. Leaving it in the router would keep
+    serving an adapter that no longer exists in persistence, and the next reload would not
+    correct it: a reload only hydrates rows that ARE present, so it cannot remove one that is not.
+    """
+    from flash.serving.src.undeploy import apply_teardown
+
+    revision = _revision()
+    router = AdapterRouter([revision, _alias(revision)])
+    assert router.get(revision.adapter_id) is not None
+
+    cleanup = apply_teardown(router, [(revision, None)])
+
+    assert router.get(revision.adapter_id) is None
+    assert [record.adapter_id for record, _ in cleanup] == [revision.adapter_id]
+
+
+def test_teardown_keeps_the_authoritative_row_when_one_came_back() -> None:
+    """The disabled row returned by the CAS replaces the enumerated one in routing."""
+    from flash.serving.src.undeploy import apply_teardown
+
+    revision = _revision()
+    disabled = revision.model_copy(update={"status": "disabled"})
+    router = AdapterRouter([revision, _alias(revision)])
+
+    cleanup = apply_teardown(router, [(revision, disabled)])
+
+    assert router.get(revision.adapter_id) is not None
+    assert router.get(revision.adapter_id).status == "disabled"
+    assert [record.adapter_id for record, _ in cleanup] == [revision.adapter_id]
