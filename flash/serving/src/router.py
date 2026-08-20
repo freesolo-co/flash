@@ -42,7 +42,7 @@ from flash.serving.src.serving_io import (
 )
 from flash.serving.src.streaming import openai_chat_stream, prepare_stream
 from flash.serving.src.structured_outputs import StructuredOutputsError
-from flash.serving.src.undeploy import disable_matched
+from flash.serving.src.undeploy import apply_teardown, disable_matched
 from flash.serving.src.usage import UsageReporter
 
 _FLASH_CHECKPOINT_MODEL_RE = re.compile(
@@ -470,26 +470,18 @@ def build_serving_app(
             matches, get_authoritative=_get_authoritative
         )
 
-        # phase 2: remove every durably disabled row from routing immediately. gpu eviction is deferred
-        # until after either the success or conflict response, so a scaled-to-zero engine's cold start
-        # cannot make undeploy callers time out.
-        cleanup_records: list[tuple[AdapterRecord, str | None]] = []
-        for candidate, current in pending_teardown:
-            if current is None:
-                router.remove(candidate.adapter_id)
-            else:
-                router.upsert(current)
-            cleanup_record = current or candidate
-            cleanup_records.append((cleanup_record, cleanup_record.deployment_generation))
+        # phase 2: remove every durably disabled row from routing immediately. gpu eviction is
+        # deferred until after either the success or conflict response, so a scaled-to-zero
+        # engine's cold start cannot make undeploy callers time out.
+        for cleanup_record, expected_generation in apply_teardown(router, pending_teardown):
+            background_tasks.add_task(
+                _unregister_safe,
+                cleanup_record.base_model,
+                cleanup_record.adapter_id,
+                expected_generation,
+            )
 
         if stuck_ready:
-            for cleanup_record, expected_generation in cleanup_records:
-                background_tasks.add_task(
-                    _unregister_safe,
-                    cleanup_record.base_model,
-                    cleanup_record.adapter_id,
-                    expected_generation,
-                )
             # some rows are durably disabled while others could not converge. return the same detail
             # shape as an httpexception while allowing cleanup to run after the conflict response.
             return JSONResponse(
@@ -504,14 +496,6 @@ def build_serving_app(
                     }
                 },
                 background=background_tasks,
-            )
-
-        for cleanup_record, expected_generation in cleanup_records:
-            background_tasks.add_task(
-                _unregister_safe,
-                cleanup_record.base_model,
-                cleanup_record.adapter_id,
-                expected_generation,
             )
 
         return {

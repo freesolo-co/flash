@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from fastapi import HTTPException, status
 
 from flash.serving.src.persistence import PersistenceRecordError
+from flash.serving.src.routing import AdapterRouter
 from flash.serving.src.schemas import AdapterRecord
 from flash.serving.src.serving_io import _get_stored, _replace_stored_cas
 
@@ -77,3 +78,24 @@ async def disable_matched(
             disabled_revisions.append(candidate.adapter_id)
 
     return disabled_aliases, disabled_revisions, stuck_ready, pending_teardown
+
+
+def apply_teardown(
+    router: AdapterRouter,
+    pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None]],
+) -> list[tuple[AdapterRecord, str | None]]:
+    """Remove every durably disabled row from routing, returning the rows still to evict.
+
+    Routing is updated synchronously; gpu eviction is left to the caller to defer until after
+    either the success or the conflict response, so a scaled-to-zero engine's cold start cannot
+    make undeploy callers time out.
+    """
+    cleanup_records: list[tuple[AdapterRecord, str | None]] = []
+    for candidate, current in pending_teardown:
+        if current is None:
+            router.remove(candidate.adapter_id)
+        else:
+            router.upsert(current)
+        cleanup_record = current or candidate
+        cleanup_records.append((cleanup_record, cleanup_record.deployment_generation))
+    return cleanup_records
