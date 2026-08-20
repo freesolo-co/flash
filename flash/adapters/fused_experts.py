@@ -179,7 +179,14 @@ def has_complete_fused_expert_tensors(
 
 
 def _parse_lora_tensor(key: str, shape: tuple[int, ...]) -> _LoraTensor | None:
-    """Parse one canonical PEFT LoRA tensor key."""
+    """Parse one canonical PEFT LoRA tensor key.
+
+    PEFT strips the adapter namespace when it serializes (``get_peft_model_state_dict`` documents
+    ``lora_A.default.weight`` becoming ``lora_A.weight``), and verl's merger reproduces that strip,
+    so every real artifact carries the bare leaf and the namespaced form only survives in older
+    hand-built adapters. Accept both and treat a stripped leaf as the ``default`` namespace PEFT
+    re-inserts on load, so the namespace-agreement checks downstream still compare like with like.
+    """
     matches = [
         (factor, infix) for factor, infix in (("A", ".lora_A."), ("B", ".lora_B.")) if infix in key
     ]
@@ -188,9 +195,9 @@ def _parse_lora_tensor(key: str, shape: tuple[int, ...]) -> _LoraTensor | None:
     factor, infix = matches[0]
     module_path, _, leaf = key.partition(infix)
     leaf_parts = leaf.split(".")
-    if not module_path or len(leaf_parts) != 2:
+    if not module_path or len(leaf_parts) not in (1, 2):
         return None
-    adapter_name, parameter = leaf_parts
+    adapter_name, parameter = ("default", leaf_parts[0]) if len(leaf_parts) == 1 else leaf_parts
     if not adapter_name or parameter != "weight":
         return None
     return module_path, factor, adapter_name, key, shape
