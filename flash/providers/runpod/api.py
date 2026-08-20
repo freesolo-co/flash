@@ -147,8 +147,7 @@ def resolve_legacy_key_fingerprint(endpoint_id: str, fingerprint: str) -> str:
             f"runpod endpoint ownership lookup failed for {endpoint_id}; owner unconfirmed"
         ) from None
     if not any(
-        isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id
-        for endpoint in endpoints
+        isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id for endpoint in endpoints
     ):
         raise RunpodApiError(
             f"runpod endpoint {endpoint_id} is not owned by the legacy fingerprint match"

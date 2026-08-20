@@ -149,9 +149,7 @@ def test_legacy_handle_with_confirmed_owner_supports_poll_cancel_and_destroy(mon
     monkeypatch.setattr(
         api,
         "delete_endpoint_for_fingerprint",
-        lambda endpoint_id, fingerprint: (
-            destroyed.append((endpoint_id, fingerprint)) or True
-        ),
+        lambda endpoint_id, fingerprint: destroyed.append((endpoint_id, fingerprint)) or True,
     )
     handle = base.JobHandle.from_dict(
         {

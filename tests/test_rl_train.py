@@ -5117,7 +5117,15 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
 
     adapter_dir = tmp_path / "warmstart"
     adapter_dir.mkdir()
-    (adapter_dir / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32}))
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 16,
+                "lora_alpha": 32,
+                "exclude_modules": r"^(?!model\.language_model(?:\.|$)).*$",
+            }
+        )
+    )
     monkeypatch.setattr(_adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
 
     inp = _capability_resolve(
@@ -5130,13 +5138,44 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
     assert inp["kl_coef"] == pytest.approx(0.1)
 
 
+def test_grpo_checks_warmstart_modality_after_resolving_image_prompts(monkeypatch, tmp_path):
+    import flash.engine.worker.model.adapter as adapter_mod
+
+    adapter_dir = tmp_path / "warmstart"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 16,
+                "lora_alpha": 32,
+                "exclude_modules": r"^(?!model\.language_model(?:\.|$)).*$",
+            }
+        )
+    )
+    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
+
+    with pytest.raises(ValueError, match="multimodal run cannot continue a text-only adapter"):
+        _capability_resolve(
+            monkeypatch,
+            _capability_env(image_uri=_capability_image_uri()),
+            train={"init_from_adapter": "org/text-only-adapter"},
+        )
+
+
 def test_35b_grpo_warm_start_requires_fused_expert_targets(monkeypatch, tmp_path):
     import flash.engine.worker.model.adapter as adapter_mod
 
     adapter_dir = tmp_path / "warmstart"
     adapter_dir.mkdir()
     (adapter_dir / "adapter_config.json").write_text(
-        json.dumps({"r": 32, "lora_alpha": 64}), encoding="utf-8"
+        json.dumps(
+            {
+                "r": 32,
+                "lora_alpha": 64,
+                "exclude_modules": r"^(?!model\.language_model(?:\.|$)).*$",
+            }
+        ),
+        encoding="utf-8",
     )
     monkeypatch.setattr(adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
 
@@ -8172,7 +8211,7 @@ def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
 
     state = rl_train._StepMetricState()
     state.resume_step = 2
-    observability = lambda: {}
+    observability = dict
 
     # the replayed line for the step the previous attempt already completed.
     rl_train._ingest_step_metrics(

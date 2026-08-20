@@ -102,7 +102,7 @@ def test_sealed_evidence_retains_one_identity_tuple_per_step():
 
     retained = ledger._sealed_evidence
     assert set(retained) == {1, 2}
-    for step, sealed in retained.items():
+    for sealed in retained.values():
         # a bare tuple of identities, not a (registered, observed) pair of tuples
         assert isinstance(sealed, tuple)
         assert len(sealed) == 128

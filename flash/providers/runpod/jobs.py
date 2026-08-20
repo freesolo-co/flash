@@ -181,8 +181,8 @@ def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, st
             break
         for endpoint_id, fingerprint in unresolved:
             try:
-                upgrades[(endpoint_id, fingerprint)] = (
-                    runpod_api.resolve_legacy_key_fingerprint(endpoint_id, fingerprint)
+                upgrades[(endpoint_id, fingerprint)] = runpod_api.resolve_legacy_key_fingerprint(
+                    endpoint_id, fingerprint
                 )
             except runpod_api.RunpodApiError:
                 raise ValueError("persisted RunPod key fingerprint is invalid") from None
@@ -204,10 +204,7 @@ def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, st
             if current_cleanup_remotes is not None
             else None
         )
-        if (
-            upgraded_remote == status.remote
-            and upgraded_cleanup_remotes == current_cleanup_remotes
-        ):
+        if upgraded_remote == status.remote and upgraded_cleanup_remotes == current_cleanup_remotes:
             return upgrades
         status.remote = upgraded_remote
         runner._save_status_unlocked(status, _cleanup_remotes=upgraded_cleanup_remotes)
@@ -258,9 +255,7 @@ class JobHandle:
         fingerprint = d.get("key_fingerprint")
         if runpod_api._is_legacy_key_fingerprint(fingerprint):
             try:
-                fingerprint = runpod_api.resolve_legacy_key_fingerprint(
-                    endpoint_id, fingerprint
-                )
+                fingerprint = runpod_api.resolve_legacy_key_fingerprint(endpoint_id, fingerprint)
             except runpod_api.RunpodApiError:
                 raise ValueError("persisted RunPod key fingerprint is invalid") from None
         if not runpod_api._is_valid_key_fingerprint(fingerprint):

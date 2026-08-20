@@ -491,7 +491,11 @@ def _ingest_step_metrics(
         # a resumed child replays its resume step before producing the first new one. that line
         # describes the PREVIOUS attempt's step, and `_finalize_advantage_evidence` expects exactly
         # `resume_step + 1 .. horizon`, so admitting it reports the resume step as an extra step.
-        if isinstance(adv_min, float) and isinstance(adv_max, float) and step_number > state.resume_step:
+        if (
+            isinstance(adv_min, float)
+            and isinstance(adv_max, float)
+            and step_number > state.resume_step
+        ):
             state.advantage_bounds[step_number] = (adv_min, adv_max)
             state.adv_spread_history[:] = [
                 maximum - minimum

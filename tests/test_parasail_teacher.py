@@ -1288,9 +1288,7 @@ def test_rate_limit_survives_a_proxy_substituted_error_body(
     monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
     sleeps = []
     monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
-    client, transport = _ledger_client(
-        broker_ledger, proxy_error_bodies=1, proxy_body=proxy_body
-    )
+    client, transport = _ledger_client(broker_ledger, proxy_error_bodies=1, proxy_body=proxy_body)
 
     scored = client.score("question", "answer")
 
