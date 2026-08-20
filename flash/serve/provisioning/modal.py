@@ -77,15 +77,21 @@ class _CreatedResources:
 
     Mutable and written in place so an interrupt handler can read it: the create sequence may be
     abandoned between any two steps, and only the resources already made need tearing down.
+
+    `app_deployed` is the expensive one. The secrets and the volume are cheap storage; the app is
+    the live GPU deployment, and it starts billing the moment `deploy_app` returns, which is well
+    before the readiness probe the user is waiting on. Tracking it separately from the named
+    resources is what lets abort stop compute first, the same order canonical teardown uses.
     """
 
     inference: ModalNamedResource | None = None
     artifact: ModalNamedResource | None = None
     volume: ModalNamedResource | None = None
+    app_deployed: bool = False
 
     @property
     def any_created(self) -> bool:
-        return any((self.inference, self.artifact, self.volume))
+        return any((self.inference, self.artifact, self.volume)) or self.app_deployed
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,9 +377,16 @@ def _deploy_once_then_wait(
     probe: EndpointProbe,
     clock: Clock,
     sleep: Sleeper,
+    created: _CreatedResources | None = None,
 ) -> _PhaseProof | None:
     deployed_app_id: str | None = None
     try:
+        # marked before the call, not after: an interrupt or an ambiguous failure can land with the
+        # app already deployed and billing, and cleanup that only knows about confirmed returns
+        # would walk past it. `stop_app` on an app that never deployed is a no-op the abort path
+        # already suppresses, so over-recording is safe and under-recording leaks a live gpu.
+        if created is not None:
+            created.app_deployed = True
         deployed = _mutation(lambda: sdk.deploy_app(plan))
         if type(deployed) is not str:
             raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True)
@@ -671,6 +684,7 @@ def provision_modal_deployment(
                 probe=probe,
                 clock=clock,
                 sleep=sleep,
+                created=created,
             )
         except (ModalResourceConflict, ModalSdkFailure):
             return _unknown_result(finalized_plan)
@@ -709,9 +723,7 @@ def provision_modal_deployment(
         # answered, tearing down would destroy a working deployment, and a half-finalized app is
         # recoverable by re-running the command.
         if sdk is not None and created.any_created and not reached_ready:
-            _delete_teardown_resources(
-                finalized_plan, sdk, created.volume, created.inference, created.artifact
-            )
+            _abort_created_resources(finalized_plan, sdk, created)
         raise
     finally:
         if sdk is not None:
@@ -830,6 +842,35 @@ def _wait_for_terminal_app(
             return observation if app.running_containers == 0 else None
         if not _sleep_until_poll(deadline_at, clock, sleep):
             return None
+
+
+def _abort_created_resources(
+    plan: ModalCreatePlan, sdk: ModalSdk, created: _CreatedResources
+) -> None:
+    """best-effort teardown of a half-built deployment, stopping compute first.
+
+    Every step is suppressed individually. This runs from an interrupt handler, so a failure here
+    must neither replace the exception that brought us in -- the user pressed Ctrl-C, and a
+    `ModalSdkFailure` surfacing instead would read as an unrelated provider bug -- nor stop the
+    remaining deletes from being attempted. `Exception` rather than `BaseException`, so a second
+    Ctrl-C during cleanup still gets out.
+    """
+
+    if created.app_deployed:
+        # the app is the billable gpu deployment and it starts charging when `deploy_app` returns,
+        # long before the readiness probe the user is waiting on. it also holds the volume mount,
+        # and modal refuses to delete a volume an app still has attached, so stopping it first is
+        # what makes the deletes below able to succeed at all. canonical teardown uses this order
+        # for the same reason.
+        with contextlib.suppress(Exception):
+            _mutation(lambda: sdk.stop_app(plan))
+    for secret in (created.artifact, created.inference):
+        if secret is not None:
+            with contextlib.suppress(Exception):
+                _mutation(lambda name=secret.name: sdk.delete_secret(plan, name))
+    if created.volume is not None:
+        with contextlib.suppress(Exception):
+            _mutation(lambda: sdk.delete_volume(plan))
 
 
 def _delete_teardown_resources(

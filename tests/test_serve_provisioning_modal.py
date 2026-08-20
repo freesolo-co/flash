@@ -1246,6 +1246,58 @@ def test_interrupting_a_slow_modal_readiness_poll_cleans_up_created_resources() 
     assert not sdk.artifact, sdk.artifact
 
 
+def test_interrupting_a_slow_modal_readiness_poll_stops_the_billing_app() -> None:
+    """the deployed app is the gpu, and deleting only secrets and the volume leaves it running.
+
+    `deploy_app` returns well before the readiness probe answers, so by the time a user gives up
+    and presses Ctrl-C the compute is already live and billing. Cleanup that walks only the named
+    resources it created hands the customer a running gpu app with no record that it exists.
+    Compute must be stopped first, which is also the order canonical teardown uses.
+    """
+    factory = _Factory()
+
+    with pytest.raises(KeyboardInterrupt):
+        _provision(_bundle(), factory, probe=_InterruptingProbe())
+
+    sdk = factory.sdk
+    assert sdk is not None
+    operations = [name for name, _payload in sdk.calls]
+    assert "stop_app" in operations, operations
+    assert operations.index("stop_app") < operations.index("delete_volume"), operations
+    assert sdk.apps, "the deployed app must still be observable after the interrupt"
+    assert sdk.apps[0].state == "stopped", sdk.apps
+
+
+def test_a_failed_abort_delete_does_not_replace_the_interrupt() -> None:
+    """cleanup runs from the interrupt handler, so its own failure must not become the exception.
+
+    Modal refuses to delete a volume an app still holds attached, so a delete failing during abort
+    is the expected case rather than an exotic one. If that error propagated it would replace the
+    `KeyboardInterrupt` with what reads like an unrelated provider bug, and it would also skip
+    whatever cleanup steps came after it.
+    """
+
+    class _VolumeDeleteFailsSdk(_FakeSdk):
+        def __init__(self, plan) -> None:
+            super().__init__(plan)
+            self.fail_operation = "delete_volume"
+
+    factory = _Factory()
+    factory.sdk_class = _VolumeDeleteFailsSdk
+
+    # the interrupt survives: pytest.raises would report the provider error instead.
+    with pytest.raises(KeyboardInterrupt):
+        _provision(_bundle(), factory, probe=_InterruptingProbe())
+
+    sdk = factory.sdk
+    assert sdk is not None
+    operations = [name for name, _payload in sdk.calls]
+    # the failing delete does not stop the app from being stopped, nor the secrets from going.
+    assert "stop_app" in operations, operations
+    assert "delete_inference" in operations, operations
+    assert not sdk.inference, sdk.inference
+
+
 def test_interrupting_after_the_modal_app_is_ready_leaves_the_deployment_standing() -> None:
     """Ctrl-C once the app has answered the probe must not delete a working deployment.
 
