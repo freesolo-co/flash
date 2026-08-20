@@ -44,6 +44,7 @@ from flash.serving.src.serving_io import (
     _validate_alias_target,
 )
 from flash.serving.src.structured_outputs import StructuredOutputsError
+from flash.serving.src.undeploy import disable_matched
 from flash.serving.src.usage import UsageReporter
 
 _FLASH_CHECKPOINT_MODEL_RE = re.compile(
@@ -533,55 +534,11 @@ def build_serving_app(
         if not matches:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
 
-        disabled_aliases: list[str] = []
-        disabled_revisions: list[str] = []
-        stuck_ready: list[str] = []
         # phase 1: compare-and-swap every matched row to "disabled" in persistence first, collecting
-        # the rows that durably converged. the cascade spans multiple rows with no cross-row
-        # transaction, so a sibling can stay stuck-ready. we still tear down every converged row in
-        # phase 2 below (even on the conflict path) rather than deferring: _reload() only rehydrates
-        # "ready" rows, so a row we leave disabled-but-registered here would never be re-enumerated
-        # by a retry and its gpu lora registration would leak permanently.
-        pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None]] = []
-        for candidate in matches:
-            current: AdapterRecord | None = candidate
-            converged = False
-            for _ in range(3):
-                if current.updated_at is None:
-                    current = await _get_authoritative(candidate.adapter_id)
-                    if current is None or current.status != "ready":
-                        converged = True
-                        break
-                    if current.updated_at is None:
-                        break
-
-                committed = await _replace_stored_cas(
-                    current.model_copy(update={"status": "disabled"}),
-                    expected_updated_at=current.updated_at,
-                )
-                if committed is not None:
-                    current = committed
-                    converged = True
-                    break
-                try:
-                    current = await _get_stored(candidate.adapter_id)
-                except PersistenceRecordError as exc:
-                    raise HTTPException(
-                        status.HTTP_503_SERVICE_UNAVAILABLE,
-                        "adapter storage is unavailable",
-                    ) from exc
-                if current is None or current.status != "ready":
-                    converged = True
-                    break
-
-            if not converged:
-                stuck_ready.append(candidate.adapter_id)
-                continue
-            pending_teardown.append((candidate, current))
-            if candidate.is_alias:
-                disabled_aliases.append(candidate.adapter_id)
-            else:
-                disabled_revisions.append(candidate.adapter_id)
+        # the rows that durably converged.
+        disabled_aliases, disabled_revisions, stuck_ready, pending_teardown = await disable_matched(
+            matches, get_authoritative=_get_authoritative
+        )
 
         # phase 2: remove every durably disabled row from routing immediately. gpu eviction is deferred
         # until after either the success or conflict response, so a scaled-to-zero engine's cold start
