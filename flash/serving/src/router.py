@@ -1,0 +1,1568 @@
+"""Adapter -> base-model routing for multi-LoRA serving. CPU-side front door: tracks which
+base model each adapter belongs to and dispatches to that base model's engine. No modal/vllm
+imports, so the routing layer is unit-testable offline against a fake pool.
+"""
+
+# Do NOT add `from __future__ import annotations`: the FastAPI handlers use closure-local body
+# models as annotations, which the future import turns into unresolvable strings -> silent 422.
+
+import contextlib
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any, Protocol
+
+from flash.serving.src.model_config import (
+    base_models,
+    gpu_for,
+    image_limit_for,
+    is_supported_base_model,
+    supports_image_input,
+)
+from flash.serving.src.multimodal import MultimodalRequestError, validate_multimodal_request
+from flash.serving.src.registry import AdapterRegistry
+from flash.serving.src.schemas import AdapterRecord, internal_adapter_payload
+from flash.serving.src.structured_outputs import StructuredOutputsError
+
+_FLASH_CHECKPOINT_MODEL_RE = re.compile(
+    r"(?P<run_id>flash-[0-9]{1,20}-[0-9a-f]{8})/step-[0-9]{1,18}"
+)
+THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_deferred_v1"
+_USAGE_REPORT_DRAIN_TIMEOUT_SECONDS = 45.0
+
+_THINK_CLOSE = "</think>"
+
+
+def _split_reasoning(text: str, thinking: bool) -> tuple[str | None, str]:
+    """Split a completion into ``(reasoning_content, content)`` for the OpenAI surface.
+
+    The chat template opens the reasoning block in the PROMPT, so a thinking completion begins
+    inside the block and its text is ``<reasoning></think><answer>`` -- a closing tag with no
+    opener. Returned verbatim, the caller sees a stray ``</think>`` glued to the answer and an
+    empty ``reasoning_content``, and every downstream parser that keys off the opening tag fails.
+
+    ``thinking`` is the mode the generation was RENDERED with, reported by the engine. It is
+    required rather than inferred: a non-thinking completion that merely quotes ``</think>`` must
+    not be silently torn in half.
+    """
+    if not thinking:
+        return None, text
+    head, sep, tail = text.partition(_THINK_CLOSE)
+    if not sep:
+        # thinking mode, but the block never closed (hit max_tokens mid-reasoning). all of it is
+        # reasoning; there is no answer yet. an empty content is the honest report.
+        return head, ""
+    return head, tail
+
+
+def _partial_tag_suffix(text: str) -> int:
+    """Length of the longest suffix of ``text`` that is a proper prefix of the closing tag."""
+    for size in range(min(len(text), len(_THINK_CLOSE) - 1), 0, -1):
+        if _THINK_CLOSE.startswith(text[-size:]):
+            return size
+    return 0
+
+
+class _ReasoningStreamSplitter:
+    """Routes streamed deltas to ``reasoning_content`` until the reasoning block closes.
+
+    Streaming cannot reuse :func:`_split_reasoning`: the closing tag arrives token by token and
+    can straddle a chunk boundary, so a trailing partial match is held back rather than emitted
+    as reasoning text it might turn out not to be.
+    """
+
+    def __init__(self, thinking: bool) -> None:
+        self._closed = not thinking
+        self._pending = ""
+
+    def feed(self, text: str) -> tuple[str, str]:
+        """Split one delta into ``(reasoning_delta, content_delta)``."""
+        if self._closed:
+            return "", text
+        buffer = self._pending + text
+        head, sep, tail = buffer.partition(_THINK_CLOSE)
+        if sep:
+            self._closed = True
+            self._pending = ""
+            return head, tail
+        hold = _partial_tag_suffix(buffer)
+        split = len(buffer) - hold
+        self._pending = buffer[split:]
+        return buffer[:split], ""
+
+    def flush(self) -> str:
+        """Held-back text at end of stream.
+
+        Reaching here means the block never closed (the generation stopped mid-reasoning), so the
+        remainder is reasoning with no answer -- the same call :func:`_split_reasoning` makes.
+        """
+        pending, self._pending = self._pending, ""
+        return pending
+
+
+def _usage_block(prompt_tokens: int, completion_tokens: int, cached_tokens: Any) -> dict[str, Any]:
+    """OpenAI-style ``usage`` object for a completion response.
+
+    Mirrors the OpenAI schema, including ``prompt_tokens_details.cached_tokens`` (the
+    prefix-cached subset of the prompt) so a client can see how many prompt tokens were served
+    from cache — the same count the backend bills at a discount. ``cached_tokens`` is clamped to
+    ``prompt_tokens`` and the details block is omitted entirely when there were no cached tokens.
+    """
+    usage: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    try:
+        cached = max(0, min(int(cached_tokens or 0), prompt_tokens))
+    except (TypeError, ValueError):
+        cached = 0
+    if cached > 0:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    return usage
+
+
+def _openai_structured_outputs(payload: dict[str, Any]) -> Any:
+    """The structured-outputs spec carried by an OpenAI-style chat payload, or None.
+
+    Our first-class extension (``structured_outputs``) wins; failing that,
+    the OpenAI-standard ``response_format`` is accepted — but ONLY here, at the OpenAI-compatible
+    ``/v1/chat/completions`` boundary — and translated to our canonical spec, so an OpenAI-SDK
+    client gets structured output with no code change. The result is returned RAW so
+    GenerateRequest's validator normalizes it (consistent 422s across every entry point). Checked
+    with ``is not None``, not truthiness: ``{}`` / ``false`` are explicit "unconstrained" markers,
+    distinct from an absent field.
+    """
+    if (spec := payload.get("structured_outputs")) is not None:
+        return spec
+    response_format = payload.get("response_format")
+    if response_format is not None:
+        return _response_format_to_spec(response_format)
+    return None
+
+
+def _response_format_to_spec(response_format: Any) -> Any:
+    """Translate an OpenAI ``response_format`` object to our canonical structured-outputs spec.
+
+    Kept at this endpoint only (the core normalizer stays strict-canonical). ``{"type": "text"}``
+    -> ``{}`` (explicit "unconstrained", overriding any adapter default); ``{"type":
+    "json_object"}`` -> ``{"json_object": True}``; ``{"type": "json_schema", "json_schema":
+    {"schema": {...}}}`` (or the flattened ``{"type": "json_schema", "schema": {...}}``) ->
+    ``{"json": schema}``. An unrecognized ``type`` is rejected here with a clean 422 (rather than
+    letting the greedy normalizer silently wrap it as a schema); a non-dict is returned as-is for
+    the GenerateRequest validator to normalize.
+    """
+    if not isinstance(response_format, dict):
+        return response_format
+    rf_type = response_format.get("type")
+    if rf_type == "text":
+        return {}
+    if rf_type == "json_object":
+        return {"json_object": True}
+    if rf_type == "json_schema":
+        wrapper = response_format.get("json_schema")
+        schema = (
+            wrapper.get("schema") if isinstance(wrapper, dict) else response_format.get("schema")
+        )
+        if schema is None:
+            raise StructuredOutputsError(
+                'response_format {"type": "json_schema"} requires a schema '
+                "(json_schema.schema = {...} or schema = {...})"
+            )
+        return {"json": schema}
+    # OpenAI response_format has exactly these three types. Reject anything else here (a typo'd type
+    # or a bare schema) with a clean 422, rather than letting the greedy normalizer silently wrap the
+    # whole object as a JSON schema; to pass a raw schema, use the structured_outputs field instead.
+    raise StructuredOutputsError(
+        f'unsupported response_format type {rf_type!r}; use "text", "json_object", or '
+        '"json_schema" (or pass a raw schema via the structured_outputs field)'
+    )
+
+
+class EnginePool(Protocol):
+    """One vLLM engine per base model (Modal container in prod, fake in tests)."""
+
+    async def generate(
+        self,
+        base_model: str,
+        payload: Any,
+        record: AdapterRecord,
+        *,
+        expected_checkpoint: str | None = None,
+    ) -> dict[str, Any]:
+        # record is forwarded so the engine can lazy-load an adapter it hasn't seen.
+        ...
+
+    def stream_generate(
+        self,
+        base_model: str,
+        payload: Any,
+        record: AdapterRecord,
+        *,
+        expected_checkpoint: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        # Streaming variant of generate(), yielding delta/final events.
+        ...
+
+    async def register(self, base_model: str, record: AdapterRecord) -> None: ...
+    async def unregister(
+        self,
+        base_model: str,
+        adapter_id: str,
+        expected_generation: str | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+
+class AdapterRouter:
+    """Tracks adapter -> base_model so a request naming an adapter routes to its engine."""
+
+    def __init__(self, records: list[AdapterRecord] | None = None) -> None:
+        self._registry = AdapterRegistry()
+        if records:
+            self._registry.hydrate(records)
+
+    def hydrate(self, records: list[AdapterRecord]) -> None:
+        self._registry.hydrate(records)
+
+    def upsert(self, record: AdapterRecord, *, revive: bool = False) -> AdapterRecord:
+        return self._registry.upsert(record, revive=revive)
+
+    def get(self, adapter_id: str) -> AdapterRecord | None:
+        return self._registry.get(adapter_id)
+
+    def has(self, adapter_id: str) -> bool:
+        return self._registry.has(adapter_id)
+
+    def remove(self, adapter_id: str) -> AdapterRecord | None:
+        return self._registry.remove(adapter_id)
+
+    def resolve(self, adapter_id: str) -> tuple[AdapterRecord, AdapterRecord] | None:
+        requested = self._registry.get(adapter_id)
+        if requested is None or requested.status != "ready":
+            return None
+        if requested.serve_base_model:
+            return requested, requested
+        if requested.is_revision and requested.org_id is not None:
+            return requested, requested
+        if not requested.is_alias or requested.org_id is None or requested.alias_of is None:
+            return None
+        target = self._registry.get(requested.alias_of)
+        if target is None or target.status != "ready" or not target.is_revision:
+            return None
+        if (
+            target.org_id != requested.org_id
+            or target.base_model != requested.base_model
+            or target.run_id != requested.run_id
+            or requested.adapter_id != requested.run_id
+        ):
+            return None
+        return requested, target
+
+    def base_model_for(self, adapter_id: str) -> str | None:
+        resolved = self.resolve(adapter_id)
+        return resolved[1].base_model if resolved is not None else None
+
+    def base_models(self) -> list[str]:
+        return sorted({target.base_model for _, target in self._resolved_ready()})
+
+    def ready_adapters(self) -> list[AdapterRecord]:
+        return [requested for requested, _ in self._resolved_ready()]
+
+    def ready_records(self) -> list[AdapterRecord]:
+        return self._registry.list_ready()
+
+    def _resolved_ready(self) -> list[tuple[AdapterRecord, AdapterRecord]]:
+        resolved: list[tuple[AdapterRecord, AdapterRecord]] = []
+        for record in self._registry.list_ready():
+            pair = self.resolve(record.adapter_id)
+            if pair is not None:
+                resolved.append(pair)
+        return resolved
+
+
+def build_serving_app(
+    pool: EnginePool,
+    router: AdapterRouter,
+    *,
+    internal_key: str | None = None,
+    deployment_sha: str = "",
+    deployment_id: str = "",
+    reload_records: Callable[[], list[AdapterRecord]] | None = None,
+    reload_interval_seconds: float = 30.0,
+    usage_reporter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,
+    on_startup: Callable[[], Awaitable[None]] | None = None,
+):
+    """Front-door FastAPI app. ``reload_records`` re-reads persisted ready adapters so a router
+    that missed a (un)registration on another container still resolves it: reload once on a miss
+    before 404-ing, and at most once per ``reload_interval_seconds`` on a hit.
+
+    ``usage_reporter`` (optional) is called fire-and-forget after each successful generation with
+    a usage dict (adapterId, baseModel, promptTokens, completionTokens, cachedTokens, gpuSeconds,
+    requestId, engineReplicaId, servingDeploymentId, cachedTokensReported) so the backend can
+    meter/bill it. It runs as a managed detached task, and its failures are swallowed so metering
+    never affects serving latency or success. Pending reports drain before the shared client closes.
+
+    External chat/inference auth is ALWAYS enforced. ``chat_authorizer`` authorizes a user request:
+    it is called with ``(freesolo_api_key, adapter_id)`` and must raise an ``HTTPException`` (401/403)
+    when the key's org does not own the adapter (a base-model serve is authorized for any valid key).
+    It returns the caller's org id, which bills a base-model serve to the caller (no adapter owner).
+    Trusted server-to-server callers presenting the shared internal key bypass it. If no
+    ``chat_authorizer`` is wired, a non-internal request fails closed (503) — prod always wires it.
+
+    ``on_startup`` (optional) runs once as a background task without blocking readiness. Serving wires
+    the optional warm-floor hook here; at the production zero floor it returns without starting gpu
+    engines. Failures are swallowed and the task is cancelled on shutdown if still running.
+    """
+    import asyncio
+    import hmac
+    import time
+    import uuid
+    from contextlib import asynccontextmanager
+
+    import orjson
+    from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
+    from fastapi.responses import JSONResponse, StreamingResponse
+    from pydantic import ValidationError
+
+    from flash.serving.src.persistence import PersistenceRecordError
+    from flash.serving.src.schemas import (
+        AdapterActivationRequest,
+        GenerateRequest,
+        ImmutableAdapterRegistration,
+    )
+
+    # the shared internal key lets a trusted server-to-server caller skip external chat auth: it
+    # guards /adapters and is presented by the flash control plane (registration) and the backend
+    # /api/sample proxy. compared with hmac.compare_digest to avoid timing leaks.
+    _trusted_internal_keys = (internal_key,) if internal_key else ()
+
+    @asynccontextmanager
+    async def _lifespan(_app: "FastAPI"):
+        # run optional startup work without blocking router readiness. the cpu router must accept
+        # traffic immediately, and any background startup failure must not crash it.
+        startup_task = None
+        if on_startup is not None:
+
+            async def _run_startup() -> None:
+                # startup work is best-effort and must never crash the router
+                with contextlib.suppress(Exception):
+                    await on_startup()
+
+            startup_task = asyncio.create_task(_run_startup())
+        yield
+        if startup_task is not None and not startup_task.done():
+            startup_task.cancel()
+            try:
+                await startup_task
+            except asyncio.CancelledError:
+                # shutdown raced our own cancel of the startup task — expected when the
+                # container is told to stop mid-startup; nothing to clean up, so swallow it.
+                pass
+            except Exception:  # best-effort cleanup must not fail shutdown
+                pass
+        # drain detached usage reports before closing their shared client. the timeout bounds
+        # graceful shutdown; any remainder is cancelled and settled so no task can wake against a
+        # closed client after a rolling deployment.
+        if _pending_tasks:
+            _, pending = await asyncio.wait(
+                tuple(_pending_tasks), timeout=_USAGE_REPORT_DRAIN_TIMEOUT_SECONDS
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        # Close persistent httpx clients (usage reporter + chat authorizer) on shutdown so
+        # long-lived containers don't leak sockets / emit "Unclosed client" ResourceWarnings.
+        for client_owner in (usage_reporter, chat_authorizer):
+            aclose = getattr(client_owner, "aclose", None)
+            if aclose is not None:
+                # best-effort cleanup must not fail shutdown
+                with contextlib.suppress(Exception):
+                    await aclose()
+
+    api = FastAPI(
+        title="Freesolo LoRA Serving (multi base model)", version="0.2.0", lifespan=_lifespan
+    )
+
+    def _parse_generate(data: dict[str, Any]) -> GenerateRequest:
+        # Untyped dict body -> surface a bad shape as 422, not 500.
+        try:
+            return GenerateRequest.model_validate(data)
+        except ValidationError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    last_reload: dict[str, Any] = {"at": float("-inf"), "task": None}
+    # Strong refs to fire-and-forget streaming usage tasks. asyncio only keeps a WEAK reference to
+    # a bare create_task(), so without this the GC can collect a still-pending billing report mid
+    # event loop (silently dropping it and emitting "Task was destroyed but it is pending"). The
+    # done-callback discards each task once it settles, so the set stays bounded by in-flight count.
+    _pending_tasks: set[Any] = set()
+
+    def _assert_internal(request: Request) -> None:
+        if not internal_key:
+            # No internal key configured -> the control plane can't be authenticated. Fail closed
+            # rather than serve an open /adapters surface (register/teardown). Production always sets
+            # FREESOLO_INTERNAL_KEY; an unset key is a misconfiguration, not "auth disabled".
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "serving internal key is not configured"
+            )
+        presented = request.headers.get("X-Freesolo-Internal-Key") or ""
+        # Constant-time compare on a secret header (consistent with _is_trusted_internal) so a
+        # rejected key can't be recovered via response timing.
+        if not hmac.compare_digest(presented, internal_key):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid serving internal key")
+
+    def _is_trusted_internal(request: Request) -> bool:
+        presented = request.headers.get("X-Freesolo-Internal-Key")
+        if not presented:
+            return False
+        # Evaluate every compare_digest (list comp, not a generator) so the per-key constant-time
+        # compare always runs — a short-circuiting any() would leak which key matched via timing.
+        # C419 (prefer a generator) is exactly the rewrite the comment above forbids: a
+        # generator short-circuits, which is the timing leak. The list is load-bearing.
+        return any([hmac.compare_digest(presented, k) for k in _trusted_internal_keys])  # noqa: C419
+
+    def _bearer_token(request: Request) -> str | None:
+        header = request.headers.get("Authorization") or ""
+        scheme, _, value = header.partition(" ")
+        if scheme.lower() != "bearer":
+            return None
+        token = value.strip()
+        return token or None
+
+    def _assert_supported_base_model(base_model: str) -> None:
+        if is_supported_base_model(base_model):
+            return
+        allowed = ", ".join(base_models())
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Unsupported base model: {base_model}. Supported base models: {allowed}",
+        )
+
+    async def _authorize_inference(request: Request, adapter_id: str) -> "str | None":
+        """Gate every chat/inference request on a Freesolo API key, and resolve its billing org.
+
+        Always enforced: a valid Freesolo API key is required. For a LoRA adapter the key's org must
+        own it; for a base-model serve any valid key is accepted (no owner) — the backend decides.
+        The authorizer returns the caller's org id, which bills a base-model serve to the caller (no
+        adapter owner). Trusted internal callers (the backend proxy / control plane) bypass via the
+        internal key and return None. With no authorizer wired we fail closed (503).
+        """
+        if _is_trusted_internal(request):
+            return None
+        token = _bearer_token(request)
+        if not token:
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED,
+                "Missing Freesolo API key (send 'Authorization: Bearer <key>')",
+            )
+        if chat_authorizer is None:
+            # No authorizer wired -> fail closed rather than serve open (prod always wires it).
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is not configured"
+            )
+        return await chat_authorizer(token, adapter_id)
+
+    def _active_checkpoint_ref(record: AdapterRecord) -> str:
+        checkpoint = (record.checkpoint or "").strip()
+        if checkpoint:
+            return checkpoint
+        subfolder = (record.subfolder or "").strip().strip("/")
+        if not subfolder:
+            return ""
+        match = re.search(r"(?:^|/)checkpoints/(step-\d+)(?:/|$)", subfolder)
+        if match:
+            return f"{record.adapter_id}/{match.group(1)}"
+        return record.adapter_id
+
+    def _checkpoint_headers(active_checkpoint: Any) -> dict[str, str]:
+        checkpoint = str(active_checkpoint or "").strip()
+        return {"X-Freesolo-Checkpoint": checkpoint} if checkpoint else {}
+
+    def _revision_provenance(
+        target: AdapterRecord, active_checkpoint: Any
+    ) -> dict[str, str] | None:
+        # immutable-revision provenance the deploy handshake verifies and external clients read to
+        # confirm which revision answered. only concrete revisions carry it; base-model serving and
+        # records missing a revision id, hub sha, or checkpoint do not.
+        if not target.is_revision:
+            return None
+        adapter_revision = (target.adapter_id or "").strip()
+        hf_revision = (target.hf_revision or "").strip()
+        checkpoint = str(active_checkpoint or "").strip()
+        if not adapter_revision or not hf_revision or not checkpoint:
+            return None
+        return {
+            "adapter_revision": adapter_revision,
+            "checkpoint": checkpoint,
+            "hf_revision": hf_revision,
+        }
+
+    def _provenance_headers(
+        provenance: dict[str, str] | None, active_checkpoint: Any
+    ) -> dict[str, str]:
+        # full revision provenance headers for a revision, else the checkpoint-only header for
+        # base-model and unresolved records (unchanged behaviour).
+        if provenance is None:
+            return _checkpoint_headers(active_checkpoint)
+        return {
+            "X-Freesolo-Adapter-Revision": provenance["adapter_revision"],
+            "X-Freesolo-Checkpoint": provenance["checkpoint"],
+            "X-Freesolo-HF-Revision": provenance["hf_revision"],
+        }
+
+    def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> JSONResponse:
+        # attach revision provenance while keeping engine-process attribution internal to metering.
+        active_checkpoint = result.get("checkpoint")
+        provenance = _revision_provenance(target, active_checkpoint)
+        internal_fields = {"cached_tokens_reported", "engine_replica_id"}
+        public_result = {key: value for key, value in result.items() if key not in internal_fields}
+        body = (
+            {**public_result, "freesolo": provenance} if provenance is not None else public_result
+        )
+        return JSONResponse(body, headers=_provenance_headers(provenance, active_checkpoint))
+
+    def _expected_checkpoint(request: Request) -> str | None:
+        value = request.headers.get("X-Freesolo-Expected-Checkpoint")
+        return value.strip() if value is not None else None
+
+    def _value_error_http(adapter_id: str, exc: ValueError) -> HTTPException:
+        message = str(exc)
+        if message.startswith("checkpoint mismatch: "):
+            return HTTPException(
+                status.HTTP_409_CONFLICT, message.removeprefix("checkpoint mismatch: ")
+            )
+        if message.startswith("Unknown adapter id"):
+            return HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+        current = router.get(adapter_id)
+        if current is None or current.status != "ready":
+            return HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+        return HTTPException(status.HTTP_400_BAD_REQUEST, message)
+
+    def _engine_error_http(adapter_id: str, exc: Exception) -> HTTPException | None:
+        """Map an engine dispatch failure to a client-meaningful status.
+
+        Returns ``None`` when ``exc`` is not a failure this layer can identify, so the caller
+        re-raises it unchanged. That distinction matters: rewriting every exception into a 502
+        would mask router-side defects (a ``TypeError`` in the pool wrapper) and would downgrade
+        an ``HTTPException`` that already carries a deliberate status, such as the authorizer's
+        403, into a bare upstream failure.
+
+        Engine work crosses a Modal RPC boundary, so an identifiable failure arrives in one of two
+        shapes. A vLLM/engine ``ValueError`` (including ``VLLMValidationError``, which subclasses
+        it) unpickles with its type intact and keeps its 400/404/409 meaning. Modal's own
+        infrastructure errors -- ``FunctionTimeoutError`` when an input outlives the function
+        timeout, ``RemoteError``/``ExecutionError`` when the remote exception cannot be
+        deserialized -- subclass ``modal.exception.Error``, NOT ``ValueError``, so before this they
+        escaped the sole ``except ValueError`` and surfaced as unhandled 500s, blaming the server
+        for what is usually a caller-side condition (an oversized prompt).
+
+        ``modal`` is imported lazily so this module keeps the no-modal-at-import-scope contract in
+        its docstring, which is what lets the routing layer be unit-tested against a fake pool.
+        """
+        if isinstance(exc, ValueError):
+            return _value_error_http(adapter_id, exc)
+        from modal.exception import Error as ModalError
+        from modal.exception import FunctionTimeoutError
+
+        if isinstance(exc, FunctionTimeoutError):
+            # checked before the ModalError branch below, which it subclasses. 504, not 500: the
+            # request was well-formed and the upstream engine simply did not finish inside its
+            # per-input timeout.
+            return HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT,
+                "The engine did not complete this request before its timeout. Retry with a "
+                "shorter prompt or a smaller max_tokens.",
+            )
+        if isinstance(exc, ModalError):
+            return HTTPException(
+                status.HTTP_502_BAD_GATEWAY, "The serving engine failed to handle this request."
+            )
+        return None
+
+    def _raise_if_engine_error(adapter_id: str, exc: Exception) -> None:
+        """Re-raise ``exc`` as its mapped ``HTTPException``, or unchanged if it is not mapped."""
+        failure = _engine_error_http(adapter_id, exc)
+        if failure is None:
+            raise exc
+        raise failure from exc
+
+    async def _terminating_on_engine_error(
+        events: AsyncIterator[dict[str, Any]], adapter_id: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Convert a mid-stream engine failure into a terminal ``error`` event.
+
+        Only advancing ``events`` is guarded: an exception raised by the *consumer* while rendering
+        an event propagates through this generator untouched, so a router-side defect stays an
+        unhandled server error instead of being reported to the caller as an upstream engine
+        failure. That is why this is a wrapper rather than a ``try`` around the consuming loop.
+
+        An unidentified failure is re-raised for the same reason. The caller then gets a truncated
+        stream, as it did before this existed -- worse than a clean termination, but diagnosable,
+        whereas a fabricated engine error would point every investigation at the wrong subsystem.
+
+        ``CancelledError``/``GeneratorExit`` are ``BaseException``, so a client disconnect or a
+        shutdown keeps unwinding rather than being mistaken for an engine failure.
+        """
+        try:
+            async for event in events:
+                yield event
+        except Exception as exc:
+            failure = _engine_error_http(adapter_id, exc)
+            if failure is None:
+                raise
+            yield {"type": "error", "message": str(failure.detail), "code": failure.status_code}
+
+    async def _get_stored(adapter_id: str) -> AdapterRecord | None:
+        from flash.serving.src.persistence import PersistenceRecordError, get_adapter
+        from flash.serving.src.settings import get_settings
+
+        try:
+            return await asyncio.to_thread(get_adapter, adapter_id, get_settings())
+        except PersistenceRecordError:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "adapter storage is unavailable"
+            ) from exc
+
+    async def _insert_stored(record: AdapterRecord) -> AdapterRecord:
+        from flash.serving.src.persistence import insert_adapter
+        from flash.serving.src.settings import get_settings
+
+        try:
+            return await asyncio.to_thread(insert_adapter, record, get_settings())
+        except Exception as exc:
+            from flash.serving.src.persistence import PersistenceConflict, PersistenceReferenceError
+
+            if isinstance(exc, PersistenceConflict):
+                raise
+            if isinstance(exc, PersistenceReferenceError):
+                # a dangling reference is permanent, not an outage: report it as the caller's
+                # unprocessable request so the client fails fast on the real cause instead of
+                # retrying an unregistrable adapter against a 503.
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "adapter storage is unavailable"
+            ) from exc
+
+    async def _insert_or_read(record: AdapterRecord) -> tuple[AdapterRecord, bool]:
+        from flash.serving.src.persistence import PersistenceConflict
+
+        try:
+            return await _insert_stored(record), True
+        except PersistenceConflict as exc:
+            winner = await _get_stored(record.adapter_id)
+            if winner is None:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "adapter registration conflict could not be confirmed",
+                ) from exc
+            return winner, False
+
+    async def _replace_stored_cas(
+        record: AdapterRecord, *, expected_updated_at: str
+    ) -> AdapterRecord | None:
+        from flash.serving.src.persistence import replace_adapter_cas
+        from flash.serving.src.settings import get_settings
+
+        try:
+            return await asyncio.to_thread(
+                replace_adapter_cas,
+                record,
+                expected_updated_at=expected_updated_at,
+                settings=get_settings(),
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "adapter storage is unavailable"
+            ) from exc
+
+    def _validate_alias(alias: AdapterRecord, revision: AdapterRecord) -> None:
+        if alias.org_id != revision.org_id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown adapter id")
+        if (
+            not alias.is_alias
+            or alias.adapter_id != revision.run_id
+            or alias.run_id != revision.run_id
+            or alias.base_model != revision.base_model
+        ):
+            raise HTTPException(status.HTTP_409_CONFLICT, "run alias namespace is occupied")
+
+    async def _validate_alias_target(
+        alias: AdapterRecord, *, allow_missing: str | None = None
+    ) -> AdapterRecord | None:
+        alias_of = alias.alias_of
+        if alias_of is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid")
+        try:
+            target = await _get_stored(alias_of)
+        except PersistenceRecordError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid") from exc
+        if target is None:
+            if alias.status == "disabled" and alias_of == allow_missing:
+                return None
+            raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid")
+        if (
+            not target.is_revision
+            or target.org_id != alias.org_id
+            or target.base_model != alias.base_model
+            or target.run_id != alias.run_id
+        ):
+            raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid")
+        return target
+
+    async def _reload() -> None:
+        # to_thread: reload_records is a sync Supabase call; don't block the event loop.
+        assert reload_records is not None
+        records = await asyncio.to_thread(reload_records)
+        router.hydrate(records)
+        last_reload["at"] = time.monotonic()
+
+    async def _reload_safe() -> None:
+        try:
+            await _reload()
+        except Exception as exc:  # background refresh cannot fail a cached hit
+            print(f"adapter background refresh skipped: {exc!r}", flush=True)
+
+    def _schedule_reload() -> None:
+        task = last_reload.get("task")
+        if task is not None and not task.done():
+            return
+        last_reload["task"] = asyncio.create_task(_reload_safe())
+
+    async def _lookup(
+        adapter_id: str, *, require_supported_base_model: bool = True
+    ) -> tuple[AdapterRecord, AdapterRecord]:
+        resolved = router.resolve(adapter_id)
+        age = time.monotonic() - last_reload["at"]
+        stale = resolved is not None and age >= reload_interval_seconds
+        if stale and reload_records is not None:
+            _schedule_reload()
+        if resolved is None and reload_records is not None:
+            await _reload()
+            resolved = router.resolve(adapter_id)
+        if resolved is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+        if require_supported_base_model:
+            _assert_supported_base_model(resolved[1].base_model)
+        return resolved
+
+    async def _lookup_exact(adapter_id: str) -> AdapterRecord:
+        record = router.get(adapter_id)
+        age = time.monotonic() - last_reload["at"]
+        cached_ready = record is not None and record.status == "ready"
+        if cached_ready and age >= reload_interval_seconds and reload_records is not None:
+            _schedule_reload()
+        if not cached_ready and reload_records is not None:
+            await _reload()
+            record = router.get(adapter_id)
+        if record is None or record.status != "ready":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+        if not record.serve_base_model and not (record.is_alias or record.is_revision):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+        return record
+
+    @api.get("/healthz", tags=["system"])
+    async def healthz() -> dict[str, Any]:
+        models = router.base_models()
+        supported_models = [m for m in models if is_supported_base_model(m)]
+        unsupported_models = [m for m in models if not is_supported_base_model(m)]
+        # report configured per-model gpu tiers rather than live container counts, which modal does
+        # not expose here. ``gpus`` is the supported base-model engine count and remains stable when
+        # demand-driven containers scale to zero.
+        gpu_by_model = {m: gpu_for(m) for m in supported_models}
+        body = {
+            "ok": True,
+            "deployment_sha": deployment_sha,
+            "deployment_id": deployment_id,
+            "capabilities": [
+                "immutable_adapter_revisions",
+                "alias_compare_and_swap",
+                "revision_provenance",
+                THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY,
+            ],
+            "base_models": models,
+            "gpus": len(supported_models),
+            "gpu_by_model": gpu_by_model,
+            "gpu_tiers": sorted(set(gpu_by_model.values())),
+            "adapters": len(router.ready_adapters()),
+        }
+        if unsupported_models:
+            body["unsupported_base_models"] = unsupported_models
+        return body
+
+    @api.get("/adapters", tags=["adapters"])
+    async def list_adapters(request: Request) -> dict[str, Any]:
+        # Gate the listing behind the internal key, same as register/teardown. Even with org_id
+        # excluded from the schema, repo_id + url still leak the adapter->tenant mapping and HF
+        # namespaces to anon callers. Internal consumers (backend/deployment) already send
+        # X-Freesolo-Internal-Key, so this preserves their access while blocking enumeration.
+        _assert_internal(request)
+        if reload_records is not None:
+            await _reload()
+        return {"ok": True, "adapters": router.ready_adapters()}
+
+    @api.post("/adapters", tags=["adapters"])
+    async def add_adapter(
+        registration: ImmutableAdapterRegistration,
+        request: Request,
+        background: BackgroundTasks,
+    ) -> AdapterRecord:
+        _assert_internal(request)
+        _assert_supported_base_model(registration.base_model)
+        revision = registration.to_record()
+
+        try:
+            existing = await _get_stored(revision.adapter_id)
+        except PersistenceRecordError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "adapter namespace is occupied") from exc
+        if existing is not None:
+            if existing.org_id != revision.org_id:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown adapter id")
+            if (
+                not existing.is_revision
+                or existing.immutable_fingerprint() != revision.immutable_fingerprint()
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "immutable adapter revision already exists"
+                )
+            stored = existing
+        else:
+            stored = revision
+
+        run_id = revision.run_id
+        assert run_id is not None
+        in_memory_namespace = router.get(run_id)
+        if in_memory_namespace is not None and in_memory_namespace.serve_base_model:
+            raise HTTPException(status.HTTP_409_CONFLICT, "run alias namespace is occupied")
+        try:
+            alias = await _get_stored(run_id)
+        except PersistenceRecordError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "run alias namespace is occupied"
+            ) from exc
+        alias_inserted = False
+        if alias is None:
+            proposed_alias = revision.model_copy(
+                update={
+                    "adapter_id": run_id,
+                    "checkpoint": None,
+                    "status": "disabled",
+                    "metadata": {
+                        "record_type": "alias",
+                        "run_id": run_id,
+                        "alias_of": revision.adapter_id,
+                    },
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            )
+            try:
+                alias, alias_inserted = await _insert_or_read(proposed_alias)
+            except PersistenceRecordError as exc:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "run alias namespace is occupied"
+                ) from exc
+        _validate_alias(alias, revision)
+        if not alias_inserted:
+            await _validate_alias_target(
+                alias,
+                allow_missing=revision.adapter_id if existing is None else None,
+            )
+
+        if existing is None:
+            stored, _ = await _insert_or_read(revision)
+            if stored.org_id != revision.org_id:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown adapter id")
+            if (
+                not stored.is_revision
+                or stored.immutable_fingerprint() != revision.immutable_fingerprint()
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "immutable adapter revision already exists"
+                )
+
+        router.upsert(alias, revive=True)
+        router.upsert(stored, revive=True)
+
+        async def _register_revision() -> None:
+            if stored.status == "ready" or stored.updated_at is None:
+                return
+            # the disabled row's cas timestamp is the lifecycle generation. concurrent registration
+            # attempts for this same row share it; a later disable writes a new timestamp.
+            registration = stored.model_copy(update={"deployment_generation": stored.updated_at})
+            try:
+                await pool.register(registration.base_model, registration)
+            except Exception:  # a failed load leaves the revision disabled
+                return
+            try:
+                committed = await _replace_stored_cas(
+                    registration.model_copy(update={"status": "ready"}),
+                    expected_updated_at=registration.updated_at,
+                )
+            except HTTPException:
+                return
+            if committed is not None:
+                router.upsert(committed, revive=True)
+
+        background.add_task(_register_revision)
+        return stored
+
+    @api.get("/adapters/{adapter_id}", tags=["adapters"])
+    async def get_adapter(adapter_id: str, request: Request) -> dict[str, Any]:
+        _assert_internal(request)
+        record = await _lookup_exact(adapter_id)
+        return {
+            "ok": True,
+            "adapter": {
+                **internal_adapter_payload(record),
+                "lifecycle_state": "ready",
+            },
+        }
+
+    @api.post("/adapters/{revision_id}/activate", tags=["adapters"])
+    async def activate_adapter(
+        revision_id: str, payload: AdapterActivationRequest, request: Request
+    ) -> dict[str, Any]:
+        _assert_internal(request)
+        try:
+            revision = await _get_stored(revision_id)
+        except PersistenceRecordError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "invalid revision record") from exc
+        if revision is None or not revision.is_revision:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown adapter id")
+        if revision.status != "ready":
+            raise HTTPException(status.HTTP_409_CONFLICT, "adapter revision is not ready")
+        run_id = revision.run_id
+        assert run_id is not None
+        try:
+            alias = await _get_stored(run_id)
+        except PersistenceRecordError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "invalid run alias") from exc
+        if alias is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "run alias is missing")
+        _validate_alias(alias, revision)
+        await _validate_alias_target(alias)
+        previous = None if alias.status == "disabled" else alias.alias_of
+        if payload.expected_adapter_revision != previous:
+            raise HTTPException(status.HTTP_409_CONFLICT, "stale adapter revision expectation")
+        if alias.updated_at is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "run alias has no CAS authority")
+
+        replacement = alias.model_copy(
+            update={
+                "status": "ready",
+                "metadata": {
+                    "record_type": "alias",
+                    "run_id": run_id,
+                    "alias_of": revision.adapter_id,
+                },
+            }
+        )
+        committed = await _replace_stored_cas(
+            replacement,
+            expected_updated_at=alias.updated_at,
+        )
+        if committed is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "run alias changed concurrently")
+        router.upsert(committed, revive=True)
+        router.upsert(revision, revive=True)
+        return {
+            "adapter_id": run_id,
+            "target_adapter_revision": revision.adapter_id,
+            "previous_adapter_revision": previous,
+            "checkpoint": revision.checkpoint,
+            "updated_at": internal_adapter_payload(committed)["updated_at"],
+        }
+
+    async def _unregister_safe(
+        base_model: str,
+        adapter_id: str,
+        expected_generation: str | None,
+    ) -> None:
+        # gpu cleanup is best-effort and may cold-start a scaled-to-zero engine. the engine compares
+        # this deployment generation under its per-adapter lock so stale cleanup cannot remove a
+        # redeployment of the same immutable revision id.
+        with contextlib.suppress(Exception):
+            await pool.unregister(base_model, adapter_id, expected_generation)
+
+    @api.delete("/adapters/{adapter_id}", tags=["adapters"])
+    async def remove_adapter(
+        adapter_id: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> dict[str, Any]:
+        _assert_internal(request)
+        if reload_records is not None:
+            await _reload()
+
+        async def _get_authoritative(adapter_id: str) -> AdapterRecord | None:
+            try:
+                return await _get_stored(adapter_id)
+            except PersistenceRecordError as exc:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "adapter storage is unavailable",
+                ) from exc
+
+        record = router.get(adapter_id)
+        if record is None:
+            record = await _get_authoritative(adapter_id)
+        if record is not None and record.status == "ready" and record.serve_base_model:
+            base_model = record.base_model
+            router.remove(adapter_id)
+            # return after durable routing cleanup; gpu eviction continues after the response.
+            background_tasks.add_task(
+                _unregister_safe,
+                base_model,
+                adapter_id,
+                record.deployment_generation,
+            )
+            return {
+                "ok": True,
+                "removed": adapter_id,
+                "base_model": base_model,
+                "run_id": adapter_id,
+                "disabled_aliases": [],
+                "disabled_revisions": [],
+            }
+
+        if (
+            record is not None
+            and (record.is_alias or record.is_revision)
+            and record.run_id is not None
+        ):
+            run_id = record.run_id
+        elif record is None and "@" not in adapter_id:
+            run_id = adapter_id
+        else:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+        matches = [
+            candidate
+            for candidate in router.ready_records()
+            if (candidate.is_alias and candidate.adapter_id == run_id)
+            or (candidate.is_revision and candidate.run_id == run_id)
+        ]
+        if not matches:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+
+        disabled_aliases: list[str] = []
+        disabled_revisions: list[str] = []
+        stuck_ready: list[str] = []
+        # phase 1: compare-and-swap every matched row to "disabled" in persistence first, collecting
+        # the rows that durably converged. the cascade spans multiple rows with no cross-row
+        # transaction, so a sibling can stay stuck-ready. we still tear down every converged row in
+        # phase 2 below (even on the conflict path) rather than deferring: _reload() only rehydrates
+        # "ready" rows, so a row we leave disabled-but-registered here would never be re-enumerated
+        # by a retry and its gpu lora registration would leak permanently.
+        pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None]] = []
+        for candidate in matches:
+            current: AdapterRecord | None = candidate
+            converged = False
+            for _ in range(3):
+                if current.updated_at is None:
+                    current = await _get_authoritative(candidate.adapter_id)
+                    if current is None or current.status != "ready":
+                        converged = True
+                        break
+                    if current.updated_at is None:
+                        break
+
+                committed = await _replace_stored_cas(
+                    current.model_copy(update={"status": "disabled"}),
+                    expected_updated_at=current.updated_at,
+                )
+                if committed is not None:
+                    current = committed
+                    converged = True
+                    break
+                try:
+                    current = await _get_stored(candidate.adapter_id)
+                except PersistenceRecordError as exc:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "adapter storage is unavailable",
+                    ) from exc
+                if current is None or current.status != "ready":
+                    converged = True
+                    break
+
+            if not converged:
+                stuck_ready.append(candidate.adapter_id)
+                continue
+            pending_teardown.append((candidate, current))
+            if candidate.is_alias:
+                disabled_aliases.append(candidate.adapter_id)
+            else:
+                disabled_revisions.append(candidate.adapter_id)
+
+        # phase 2: remove every durably disabled row from routing immediately. gpu eviction is deferred
+        # until after either the success or conflict response, so a scaled-to-zero engine's cold start
+        # cannot make undeploy callers time out.
+        cleanup_records: list[tuple[AdapterRecord, str | None]] = []
+        for candidate, current in pending_teardown:
+            if current is None:
+                router.remove(candidate.adapter_id)
+            else:
+                router.upsert(current)
+            cleanup_record = current or candidate
+            cleanup_records.append((cleanup_record, cleanup_record.deployment_generation))
+
+        if stuck_ready:
+            for cleanup_record, expected_generation in cleanup_records:
+                background_tasks.add_task(
+                    _unregister_safe,
+                    cleanup_record.base_model,
+                    cleanup_record.adapter_id,
+                    expected_generation,
+                )
+            # some rows are durably disabled while others could not converge. return the same detail
+            # shape as an httpexception while allowing cleanup to run after the conflict response.
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "detail": {
+                        "error": "adapter changed concurrently",
+                        "run_id": run_id,
+                        "disabled_aliases": sorted(disabled_aliases),
+                        "disabled_revisions": sorted(disabled_revisions),
+                        "stuck": sorted(stuck_ready),
+                    }
+                },
+                background=background_tasks,
+            )
+
+        for cleanup_record, expected_generation in cleanup_records:
+            background_tasks.add_task(
+                _unregister_safe,
+                cleanup_record.base_model,
+                cleanup_record.adapter_id,
+                expected_generation,
+            )
+
+        return {
+            "ok": True,
+            "removed": adapter_id,
+            "base_model": matches[0].base_model,
+            "run_id": run_id,
+            "disabled_aliases": sorted(disabled_aliases),
+            "disabled_revisions": sorted(disabled_revisions),
+        }
+
+    async def _report_usage_safe(usage: dict[str, Any]) -> None:
+        # fire-and-forget: the reporter performs its bounded idempotent retries, and any final
+        # failure remains isolated from the response that has already been sent.
+        assert usage_reporter is not None
+        try:
+            await usage_reporter(usage)
+        except Exception as exc:  # never fail the (already-sent) response
+            print(f"serving usage report dropped for {usage.get('requestId')}: {exc!r}", flush=True)
+
+    def _usage_payload(
+        record: AdapterRecord, result: dict[str, Any], caller_org: str | None
+    ) -> dict[str, Any] | None:
+        """Backend usage-report body, or None when there's nothing billable to report.
+
+        A LoRA serve reports by ``adapterId`` — the backend resolves the OWNING org and bills it. A
+        base-model serve has no owner, so it carries the CALLER's ``orgId`` and OMITS ``adapterId``
+        (which is authoritative when present and would fail to resolve for a base model); the backend
+        bills that org. When a base serve has no known caller org (an internal-key server-to-server
+        caller), it is dropped rather than misbilled.
+        """
+        # The engine result is snake_case (the serving API's internal contract); this OUTBOUND
+        # billing payload keeps the platform backend's camelCase keys (a separate service's
+        # contract), so we read snake here and write camel below.
+        prompt_tokens = result.get("prompt_tokens")
+        completion_tokens = result.get("completion_tokens")
+        # The engine reports token counts; without them there is nothing to meter.
+        if prompt_tokens is None or completion_tokens is None:
+            return None
+        payload: dict[str, Any] = {
+            "baseModel": record.base_model,
+            "promptTokens": int(prompt_tokens),
+            "completionTokens": int(completion_tokens),
+            # Prefix-cached subset of the prompt (engine num_cached_tokens); billed at a
+            # discount by the backend. Defaults to 0 when the engine doesn't report it.
+            "cachedTokens": int(result.get("cached_tokens") or 0),
+            "cachedTokensReported": result.get("cached_tokens_reported") is True,
+            "gpuSeconds": result.get("inference_time_seconds"),
+            # stable per-generation id from the engine is the backend idempotency key for retries.
+            # fall back to a fresh id only when an offline test pool did not supply one.
+            "requestId": result.get("request_id") or str(uuid.uuid4()),
+            "engineReplicaId": result.get("engine_replica_id"),
+            "servingDeploymentId": deployment_id or None,
+        }
+        if record.serve_base_model:
+            if not caller_org:
+                return None
+            payload["orgId"] = caller_org
+        else:
+            payload["adapterId"] = record.adapter_id
+        return payload
+
+    def _schedule_usage(
+        record: AdapterRecord,
+        result: dict[str, Any],
+        caller_org: str | None,
+    ) -> None:
+        if usage_reporter is None:
+            return
+        payload = _usage_payload(record, result, caller_org)
+        if payload is None:
+            return
+        task = asyncio.create_task(_report_usage_safe(payload))
+        _pending_tasks.add(task)
+        task.add_done_callback(_pending_tasks.discard)
+
+    async def _prepare_generate_request(payload: Any, target: AdapterRecord) -> None:
+        messages = getattr(payload, "messages", None)
+        # validate whenever any message uses list-form content so unsupported blocks
+        # (e.g. video) are rejected before dispatch; plain string-content requests still bypass.
+        if not isinstance(messages, list) or not any(
+            isinstance(message, dict) and isinstance(message.get("content"), list)
+            for message in messages
+        ):
+            return
+        try:
+            await asyncio.to_thread(
+                validate_multimodal_request,
+                messages,
+                supports_images=supports_image_input(target.base_model),
+                image_limit=image_limit_for(target.base_model),
+            )
+        except MultimodalRequestError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    async def _generate(
+        payload: Any,
+        requested: AdapterRecord,
+        target: AdapterRecord,
+        *,
+        expected_checkpoint: str | None = None,
+        caller_org: str | None = None,
+    ) -> dict[str, Any]:
+        engine_payload = payload.model_copy(update={"adapter_id": target.adapter_id})
+        try:
+            result = await pool.generate(
+                target.base_model,
+                engine_payload,
+                target,
+                expected_checkpoint=expected_checkpoint,
+            )
+        except Exception as exc:
+            _raise_if_engine_error(requested.adapter_id, exc)
+        if "adapter_id" in result:
+            result = {**result, "adapter_id": requested.adapter_id}
+        _schedule_usage(requested, result, caller_org)
+        return result
+
+    def _sse(data: dict[str, Any] | str) -> bytes:
+        encoded = data.encode("utf-8") if isinstance(data, str) else orjson.dumps(data)
+        return b"data: " + encoded + b"\n\n"
+
+    async def _openai_chat_stream(
+        *,
+        record: AdapterRecord,
+        events: AsyncIterator[dict[str, Any]],
+        adapter_id: str,
+        completion_id: str,
+        created: int,
+        include_usage: bool,
+        caller_org: str | None,
+        thinking: bool = False,
+    ) -> AsyncIterator[bytes]:
+        yield _sse(
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": adapter_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+
+        def _delta_chunk(delta: dict[str, Any]) -> bytes:
+            return _sse(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": adapter_id,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                }
+            )
+
+        splitter = _ReasoningStreamSplitter(thinking)
+        final: dict[str, Any] = {}
+        async for event in _terminating_on_engine_error(events, adapter_id):
+            kind = event.get("type")
+            if kind == "delta":
+                text = event.get("text") or ""
+                if not text:
+                    continue
+                reasoning_delta, content_delta = splitter.feed(text)
+                if reasoning_delta:
+                    yield _delta_chunk({"reasoning_content": reasoning_delta})
+                if content_delta:
+                    yield _delta_chunk({"content": content_delta})
+            elif kind == "final":
+                final = event
+            elif kind == "error":
+                # The 200 and its headers went out with the first chunk, so the status can no
+                # longer carry the failure. Without this the failure would propagate and Starlette
+                # would drop the connection: the caller receives a well-formed but SILENTLY
+                # TRUNCATED stream with no error and no [DONE], indistinguishable from a short
+                # completion. Emit the error into the stream and then close the protocol normally
+                # -- the same shape vLLM's own OpenAI server uses -- so the failure is detectable
+                # by an unmodified OpenAI client.
+                yield _sse(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": adapter_id,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                        "error": {
+                            "message": event["message"],
+                            "type": "engine_error",
+                            "code": event["code"],
+                        },
+                    }
+                )
+                yield _sse("[DONE]")
+                return
+        trailing = splitter.flush()
+        if trailing:
+            yield _delta_chunk({"reasoning_content": trailing})
+
+        _schedule_usage(record, final, caller_org)
+        done_chunk: dict[str, Any] = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": adapter_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": final.get("finish_reason"),
+                }
+            ],
+        }
+        if include_usage:
+            prompt_tokens = final.get("prompt_tokens")
+            completion_tokens = final.get("completion_tokens")
+            if prompt_tokens is not None and completion_tokens is not None:
+                done_chunk["usage"] = _usage_block(
+                    int(prompt_tokens), int(completion_tokens), final.get("cached_tokens")
+                )
+        yield _sse(done_chunk)
+        yield _sse("[DONE]")
+
+    async def _prepare_stream(
+        payload: Any,
+        requested: AdapterRecord,
+        target: AdapterRecord,
+        *,
+        expected_checkpoint: str | None,
+    ) -> tuple[AsyncIterator[dict[str, Any]], dict[str, str], bool]:
+        engine_payload = payload.model_copy(update={"adapter_id": target.adapter_id})
+        try:
+            # construction is inside the try with the first advance: ``EnginePool.stream_generate``
+            # is declared as an ordinary method returning an AsyncIterator, so a conforming pool may
+            # raise while building the iterator rather than on first advance. The current Modal pool
+            # is an async generator (whose body is deferred to ``anext``), but the protocol does not
+            # require that, and a dispatch failure must map identically either way.
+            events = pool.stream_generate(
+                target.base_model,
+                engine_payload,
+                target,
+                expected_checkpoint=expected_checkpoint,
+            )
+            first = await anext(events)
+        except Exception as exc:
+            _raise_if_engine_error(requested.adapter_id, exc)
+        if first.get("type") == "ready":
+            active_checkpoint = first.get("checkpoint")
+            provenance = _revision_provenance(target, active_checkpoint)
+            # the ready event carries the rendered thinking mode; it precedes every delta, so the
+            # openai layer can route the first chunk correctly.
+            return (
+                events,
+                _provenance_headers(provenance, active_checkpoint),
+                bool(first.get("thinking")),
+            )
+
+        async def replay() -> AsyncIterator[dict[str, Any]]:
+            yield first
+            async for event in events:
+                yield event
+
+        active_checkpoint = _active_checkpoint_ref(target)
+        provenance = _revision_provenance(target, active_checkpoint)
+        # no ready event, so the rendered mode is unknown. report it as non-thinking rather than
+        # guessing from ``target.thinking``: a base-model serve honors a caller enable_thinking
+        # override, so the record can disagree with what was actually rendered, and splitting a
+        # non-thinking completion that merely quotes </think> would tear the answer in half.
+        return replay(), _provenance_headers(provenance, active_checkpoint), False
+
+    @api.post("/generate", tags=["inference"])
+    async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
+        caller_org = await _authorize_inference(request, payload.adapter_id)
+        requested, target = await _lookup(payload.adapter_id)
+        await _prepare_generate_request(payload, target)
+        result = await _generate(
+            payload,
+            requested,
+            target,
+            expected_checkpoint=_expected_checkpoint(request),
+            caller_org=caller_org,
+        )
+        return _inference_json_response(result, target)
+
+    @api.post("/adapters/{adapter_id}/generate", tags=["inference"])
+    async def generate_for_adapter(
+        adapter_id: str, payload: dict[str, Any], request: Request
+    ) -> JSONResponse:
+        # Parse first so the GenerateRequest validator normalizes (strips) the adapter id, then
+        # authorize and route against that same normalized value (not the raw path parameter).
+        req = _parse_generate({**payload, "adapter_id": adapter_id})
+        caller_org = await _authorize_inference(request, req.adapter_id)
+        requested, target = await _lookup(req.adapter_id)
+        await _prepare_generate_request(req, target)
+        result = await _generate(
+            req,
+            requested,
+            target,
+            expected_checkpoint=_expected_checkpoint(request),
+            caller_org=caller_org,
+        )
+        return _inference_json_response(result, target)
+
+    @api.post("/v1/chat/completions", tags=["openai"])
+    async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
+        # time/uuid come from the build_serving_app closure (imported once at app construction);
+        # no per-request re-import.
+        adapter_id = payload.get("model")
+        if not isinstance(adapter_id, str) or not adapter_id.strip():
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "model must be the adapter id")
+        # use the stripped id consistently for validation, auth, routing, and the echoed response
+        # model, so a caller that sends "  qa  " is authorized against and routed to "qa".
+        adapter_id = adapter_id.strip()
+        match = _FLASH_CHECKPOINT_MODEL_RE.fullmatch(adapter_id)
+        if match is not None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "This is a checkpoint identifier, not a serving model identifier. "
+                f"Deploy it first or use model {match.group('run_id')}.",
+            )
+        caller_org = await _authorize_inference(request, adapter_id)
+        requested, target = await _lookup(adapter_id)
+        try:
+            structured_outputs = _openai_structured_outputs(payload)
+        except StructuredOutputsError as exc:
+            # Malformed OpenAI response_format (json_schema with no schema, or an unknown type) ->
+            # 422, not 500.
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        req = _parse_generate(
+            {
+                "adapter_id": adapter_id,
+                "messages": payload.get("messages"),
+                "max_tokens": payload.get("max_tokens", 1024),
+                "temperature": payload.get("temperature", 0.0),
+                "top_p": payload.get("top_p", 0.95),
+                # Forward sanitized chat-template kwargs for OpenAI-style callers (backend
+                # /api/sample proxy, evals). The engine overwrites enable_thinking from the
+                # adapter's trained default, so callers cannot change thinking mode for adapters
+                # that have a persisted trained value.
+                "chat_template_kwargs": payload.get("chat_template_kwargs"),
+                # Structured outputs: our structured_outputs extension, or the OpenAI-standard
+                # response_format (translated to canonical at this endpoint only). Forwarded raw so
+                # GenerateRequest's validator normalizes it (consistent 422s).
+                "structured_outputs": structured_outputs,
+            }
+        )
+        await _prepare_generate_request(req, target)
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        stream_options = payload.get("stream_options") or {}
+        include_usage = (
+            isinstance(stream_options, dict) and stream_options.get("include_usage") is True
+        )
+        if payload.get("stream") is True:
+            events, checkpoint_headers, thinking = await _prepare_stream(
+                req,
+                requested,
+                target,
+                expected_checkpoint=_expected_checkpoint(request),
+            )
+            return StreamingResponse(
+                _openai_chat_stream(
+                    record=requested,
+                    events=events,
+                    adapter_id=adapter_id,
+                    completion_id=completion_id,
+                    created=created,
+                    include_usage=include_usage,
+                    caller_org=caller_org,
+                    thinking=thinking,
+                ),
+                media_type="text/event-stream",
+                # Disable proxy and CDN buffering so each SSE chunk reaches the client
+                # immediately. Without X-Accel-Buffering, Nginx accumulates tokens until its
+                # output buffer fills, adding 100+ ms of hidden TTFT for small completions.
+                headers={
+                    "X-Accel-Buffering": "no",
+                    "Cache-Control": "no-cache",
+                    **checkpoint_headers,
+                },
+            )
+
+        generation = await _generate(
+            req,
+            requested,
+            target,
+            expected_checkpoint=_expected_checkpoint(request),
+            caller_org=caller_org,
+        )
+        active_checkpoint = generation.get("checkpoint")
+        provenance = _revision_provenance(target, active_checkpoint)
+        reasoning, content = _split_reasoning(
+            str(generation["text"]), bool(generation.get("thinking"))
+        )
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if reasoning is not None:
+            message["reasoning_content"] = reasoning
+        response = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": adapter_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": generation.get("finish_reason"),
+                }
+            ],
+        }
+        if provenance is not None:
+            response["freesolo"] = provenance
+        prompt_tokens = generation.get("prompt_tokens")
+        completion_tokens = generation.get("completion_tokens")
+        if prompt_tokens is not None and completion_tokens is not None:
+            response["usage"] = _usage_block(
+                int(prompt_tokens), int(completion_tokens), generation.get("cached_tokens")
+            )
+        return JSONResponse(response, headers=_provenance_headers(provenance, active_checkpoint))
+
+    return api

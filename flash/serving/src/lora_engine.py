@@ -1,0 +1,1234 @@
+"""The vLLM multi-LoRA engine implementation for the Modal serving app, plus its pure helpers.
+
+``_LoraEngineImpl`` is the plain (non-Modal) base class that ``modal_app._build_engine`` wraps in
+one ``@app.cls`` per GPU tier; the ``_``-prefixed module functions are the stateless helpers it
+depends on. Kept import-light — no ``modal`` import (so importing this module triggers no Modal
+registration, which all still happens at import of ``modal_app``) and vllm/transformers stay lazy
+inside the engine methods; only ``src.model_config`` (pure stdlib) is imported at module scope.
+"""
+
+import asyncio
+import hashlib
+import inspect
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import uuid
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any
+
+from flash.serving.src.model_config import engine_overrides_for, gpu_for, image_limit_for, supports_image_input
+
+# apply_chat_template args we always pass explicitly (re-supplying any via chat_template_kwargs
+# raises "got multiple values for keyword argument" -> a 500), plus the ones that change the return
+# TYPE/shape (e.g. return_tensors -> a tensor, return_dict -> a mapping) and would break
+# list(prompt_token_ids)/vLLM. A caller's chat_template_kwargs must never re-supply any of these.
+_RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
+    {
+        "tokenize",
+        "add_generation_prompt",
+        "return_dict",
+        "return_tensors",
+        "return_assistant_tokens_mask",
+        "conversation",
+        "documents",
+        "chat_template",
+        "padding",
+        "truncation",
+        "max_length",
+    }
+)
+
+
+def _safe_chat_template_kwargs(raw: Any) -> dict[str, Any]:
+    """Caller-supplied chat_template_kwargs, sanitized for apply_chat_template.
+
+    Returns {} for a non-dict value (defends against malformed/untrusted requests) and drops the
+    keys we pass explicitly or that would change the return shape. Using the *same* sanitized view
+    to both render the prompt and key the prompt-token cache keeps genuine template controls distinct
+    while never splitting identical rendered prompts into separate cache entries over reserved/
+    ignored keys. ``enable_thinking`` is normalized later from the adapter record.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if k not in _RESERVED_CHAT_TEMPLATE_KWARGS}
+
+
+def _load_adapters_for_base(settings: Any, base_model: str) -> list[Any]:
+    from flash.serving.src.persistence import load_adapters
+
+    try:
+        return [
+            adapter
+            for adapter in load_adapters(settings)
+            if adapter.base_model == base_model
+            and adapter.status == "ready"
+            and adapter.is_revision
+        ]
+    except Exception as exc:  # forwarded records still allow request-time serving
+        print(
+            f"adapter hydration skipped for base_model={base_model!r}: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return []
+
+
+def _adapter_source_ident(record: Any) -> tuple[str, str, str, str | None]:
+    return (
+        record.repo_id,
+        getattr(record, "repo_type", "model") or "model",
+        record.hf_revision or "",
+        getattr(record, "subfolder", None),
+    )
+
+
+def _adapter_source_cache_dir(root: Path, record: Any) -> Path:
+    repo_id, repo_type, hf_revision, subfolder = _adapter_source_ident(record)
+    raw = "\0".join((repo_id, repo_type, hf_revision, subfolder or ""))
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    slug = "".join(c if c.isalnum() or c in "-_." else "-" for c in repo_id)[:80].strip("-")
+    return root / "sources" / f"{slug or 'adapter'}-{digest}"
+
+
+def _assert_source_cache_containment(root: Path, path: Path) -> Path:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise ValueError("adapter subfolder escapes its exact-SHA source cache") from exc
+    return path
+
+
+def _adapter_cache_path(root: Path, subfolder: str | None) -> Path:
+    path = root / subfolder if subfolder else root
+    return _assert_source_cache_containment(root, path)
+
+
+def _is_adapter_tensor_file(path: Path) -> bool:
+    name = path.name
+    return name in {"adapter_model.safetensors", "adapter_model.bin"} or (
+        name.startswith("adapter_model-") and name.endswith((".safetensors", ".bin"))
+    )
+
+
+def _adapter_cache_ready(path: Path) -> bool:
+    if not (path / "adapter_config.json").is_file():
+        return False
+    try:
+        return any(
+            child.is_file() and _is_adapter_tensor_file(child) and child.stat().st_size > 0
+            for child in path.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _stream_text_delta(
+    text: str, previous_text: str, *, cumulative_output: bool | None
+) -> tuple[str, str]:
+    if not text:
+        return "", previous_text
+    if cumulative_output is not False and text.startswith(previous_text):
+        return text[len(previous_text) :], text
+    return text, previous_text + text
+
+
+def _num_prompt_tokens(request_output: Any) -> int:
+    prompt_token_ids = getattr(request_output, "prompt_token_ids", None)
+    if prompt_token_ids:
+        return len(prompt_token_ids)
+    value = getattr(request_output, "num_prompt_tokens", None)
+    if value is None:
+        if prompt_token_ids is not None:
+            return len(prompt_token_ids)
+        raise RuntimeError("vLLM did not report the expanded prompt token count")
+    try:
+        count = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("vLLM reported an invalid expanded prompt token count") from exc
+    if count < 0:
+        raise RuntimeError("vLLM reported a negative expanded prompt token count")
+    return count
+
+
+def _num_cached_tokens(request_output: Any) -> int:
+    """Prefix-cached prompt tokens for a finished request (vLLM ``RequestOutput.num_cached_tokens``).
+
+    With prefix caching on, vLLM reports how many of the prompt's tokens were served from the KV
+    cache (prefill skipped) — the count the backend bills at a discount. Returns 0 when the
+    attribute is absent (an engine that doesn't expose it) or None (not computed), so it is always
+    a safe non-negative int.
+    """
+    value = getattr(request_output, "num_cached_tokens", None)
+    if value is None:
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cached_tokens_reported(request_output: Any) -> bool:
+    """Whether the engine returned a valid cached-token measurement, including an explicit zero."""
+    value = getattr(request_output, "num_cached_tokens", None)
+    if value is None:
+        return False
+    try:
+        return int(value) >= 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _async_engine_arg_names(async_engine_args_type: Any) -> set[str]:
+    import dataclasses
+
+    try:
+        return {field.name for field in dataclasses.fields(async_engine_args_type)}
+    except TypeError:
+        try:
+            return set(inspect.signature(async_engine_args_type).parameters)
+        except (TypeError, ValueError):
+            return set()
+
+
+def _require_reasoning_api_compatibility(
+    async_engine_args_type: Any, generate: Any, reasoning_parser: str | None
+) -> None:
+    """Fail closed when a configured parser cannot receive request-local reasoning state."""
+    if reasoning_parser is None:
+        return
+    engine_args = _async_engine_arg_names(async_engine_args_type)
+    try:
+        generate_args = inspect.signature(generate).parameters
+    except (TypeError, ValueError):
+        generate_args = {}
+    missing = [
+        name
+        for name, available in (
+            ("reasoning_parser", "reasoning_parser" in engine_args),
+            ("reasoning_ended", "reasoning_ended" in generate_args),
+            ("reasoning_parser_kwargs", "reasoning_parser_kwargs" in generate_args),
+        )
+        if not available
+    ]
+    if missing:
+        raise RuntimeError("vLLM reasoning API is incompatible; missing " + ", ".join(missing))
+
+
+def _engine_is_dead(engine: Any) -> bool:
+    """True once vLLM's EngineCore worker process has died. In V1 the engine is an ``AsyncLLM``
+    (``AsyncLLMEngine`` aliases it) whose ``errored`` property is
+    ``engine_core.resources.engine_dead or not is_running``; once set the engine is unrecoverable
+    in-process, so the only fix is to replace the container. Accepts ``None`` (engine not built yet)
+    so it is safe to call before ``_load`` completes."""
+    return bool(engine is not None and getattr(engine, "errored", False))
+
+
+class _LoraEngineImpl:
+    """Implementation of one vLLM multi-LoRA engine for a base model.
+
+    Plain base class: the GPU is chosen per base model (see ``model_config.gpu_for``), and Modal
+    fixes a class's GPU at decoration time, so ``_build_engine`` wraps this in one ``@app.cls`` per
+    distinct GPU tier and the router dispatches each base model to its tier's class. The Modal
+    entrypoints (load/register/generate/stream_generate/unregister/health) live on the thin per-tier
+    subclass and forward to the ``_``-prefixed methods here."""
+
+    base_model: str  # set by the per-GPU Modal subclass via modal.parameter()
+
+    def _replica_identifier(self) -> str:
+        replica_id = getattr(self, "_replica_id", None)
+        if replica_id is None:
+            replica_id = uuid.uuid4().hex
+            self._replica_id = replica_id
+        return replica_id
+
+    async def _load(self) -> None:
+        # async so the cached-LoRA preload (and the engine's first async use) run on the SAME event
+        # loop that serves requests. A one-off asyncio.run() here would bind vLLM's AsyncLLMEngine
+        # to a loop that's then closed, breaking generate() on the real serving loop.
+        from transformers import AutoProcessor, AutoTokenizer
+        from vllm import AsyncEngineArgs, AsyncLLMEngine
+
+        from flash.serving.src import settings as cfg
+        from flash.serving.src.model_config import engine_overrides_for
+        from flash.serving.src.registry import AdapterRegistry
+        from flash.serving.src.settings import ADAPTER_CACHE_DIR, Settings
+
+        self._replica_id = uuid.uuid4().hex
+        self.settings = Settings()
+        self.registry = AdapterRegistry()
+        self._adapter_locks: dict[str, asyncio.Lock] = {}
+        self._adapter_locks_guard = asyncio.Lock()
+        self._source_locks: dict[tuple[str, str, str, str | None], asyncio.Lock] = {}
+        self._source_locks_guard = asyncio.Lock()
+        self._source_paths: dict[tuple[str, str, str, str | None], Path] = {}
+        self._lora_requests: dict[str, tuple[tuple[str, str, str, str | None], Any]] = {}
+        self._prompt_token_cache: OrderedDict[tuple[str, str], tuple[int, ...]] = OrderedDict()
+        self._prompt_cache_size = cfg.PROMPT_TOKEN_CACHE_SIZE
+        base_model_adapters = _load_adapters_for_base(self.settings, self.base_model)
+        self.registry.hydrate(base_model_adapters)
+        ADAPTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.processor = None
+        if supports_image_input(self.base_model):
+            self.processor = AutoProcessor.from_pretrained(
+                self.base_model,
+                token=self.settings.hf_api_key,
+                trust_remote_code=cfg.TRUST_REMOTE_CODE,
+            )
+            self.tokenizer = getattr(self.processor, "tokenizer", None)
+            if self.tokenizer is None:
+                raise RuntimeError("image-capable model processor has no tokenizer")
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.base_model,
+                token=self.settings.hf_api_key,
+                trust_remote_code=cfg.TRUST_REMOTE_CODE,
+            )
+        if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        # Per-base-model engine-arg overrides. Larger pre-quantized tiers use real-GPU-validated
+        # rank-32 LoRA sizing and, where needed, tighter scheduler/memory caps.
+        overrides = engine_overrides_for(self.base_model)
+        # serve_model_id: load a PRE-QUANTIZED FP8 checkpoint instead of online-quantizing the bf16
+        # base (avoids the bf16 load transient — see model_config). Adapters still key off base_model;
+        # the tokenizer above stays the base model's (canonical). vLLM auto-detects the checkpoint's
+        # FP8, so a pre-quant base passes NO quantization (online quantization=fp8 only when absent).
+        _served_model = overrides.get("serve_model_id") or self.base_model
+        _quant_default = None if overrides.get("serve_model_id") else cfg.QUANTIZATION
+        _max_loras = int(overrides.get("max_loras", cfg.MAX_LORAS))
+        # Pinning makes an adapter non-evictable, so it only makes sense when the GPU hot pool covers
+        # the whole deployable CPU pool. Otherwise >max_loras registered adapters must remain unpinned
+        # so vLLM can LRU-swap them from max_cpu_loras on demand.
+        _pin_default = _max_loras >= cfg.MAX_CPU_LORAS
+        self._pin_loras = bool(overrides.get("pin_loras", _pin_default))
+        # max_num_seqs is left at vLLM's (large) default unless a model overrides it. vLLM's startup
+        # memory-PROFILING forward runs max_num_seqs sequences at once; for the 35B MoE (248k-vocab
+        # logits + all-expert activations) the default (~256) spikes the profiling peak to nearly the
+        # whole card and the subsequent LoRA-module creation OOMs — so the 35B caps it low.
+        _extra: dict[str, Any] = {}
+        if "max_num_seqs" in overrides:
+            _extra["max_num_seqs"] = int(overrides["max_num_seqs"])
+        image_limit = image_limit_for(self.base_model)
+        if image_limit is not None:
+            _extra["limit_mm_per_prompt"] = {"image": image_limit}
+            _extra["mm_processor_cache_gb"] = 0
+            _extra["enable_tower_connector_lora"] = True
+
+        # some engine args are newer than our floor or build-specific, so forward them only when this
+        # vllm build exposes them.
+        engine_arg_names = _async_engine_arg_names(AsyncEngineArgs)
+
+        def _arg_supported(name: str) -> bool:
+            return name in engine_arg_names
+
+        parser = overrides.get("reasoning_parser")
+        self.reasoning_parser = str(parser) if parser else None
+        _require_reasoning_api_compatibility(
+            AsyncEngineArgs, AsyncLLMEngine.generate, self.reasoning_parser
+        )
+        if self.reasoning_parser is not None:
+            _extra["reasoning_parser"] = self.reasoning_parser
+
+        # max_num_batched_tokens: the 35B's attention block size is 2096 tokens, so vLLM rejects the
+        # default 2048 token budget. Forward the validated 4096 override only on builds exposing it.
+        if "max_num_batched_tokens" in overrides:
+            if _arg_supported("max_num_batched_tokens"):
+                _extra["max_num_batched_tokens"] = int(overrides["max_num_batched_tokens"])
+            else:
+                print(
+                    f"serving: vLLM build has no max_num_batched_tokens arg; {self.base_model} "
+                    "may fail if its attention block size exceeds the default scheduler budget",
+                    flush=True,
+                )
+        # moe_backend: optional fused-MoE backend override. Current 35B validation PASSED
+        # only with this unset/auto; keep the forwarding path for future canaries and emergency
+        # overrides, but do not set it in the catalog unless real-GPU validation proves the value.
+        if overrides.get("moe_backend"):
+            if _arg_supported("moe_backend"):
+                _extra["moe_backend"] = str(overrides["moe_backend"])
+            else:
+                print(
+                    f"serving: vLLM build has no moe_backend arg; {self.base_model} FP8 MoE + LoRA "
+                    "may crash-loop (needs vLLM>=0.19, or set quantization=None for bf16 weights)",
+                    flush=True,
+                )
+        engine_args = AsyncEngineArgs(
+            model=_served_model,
+            trust_remote_code=cfg.TRUST_REMOTE_CODE,
+            dtype=cfg.DTYPE,
+            # FP8 weights: ONLINE E4M3 quant of the bf16 base (default), or auto-detected from a
+            # pre-quantized serve_model_id checkpoint (then _quant_default is None). `overrides.get` returns
+            # the override's value even when it is None, so a base can also opt out to bf16 explicitly
+            # (the documented 35B H200 fallback). See settings.QUANTIZATION / model_config.serve_model_for.
+            quantization=overrides.get("quantization", _quant_default),
+            # FP8 KV cache (E4M3) for every base, including pre-quant checkpoints and explicit bf16
+            # fallbacks: ~half the KV VRAM, LoRA/MoE-safe. See settings.KV_CACHE_DTYPE.
+            # calculate_kv_scales stays off (default) on purpose.
+            kv_cache_dtype=overrides.get("kv_cache_dtype", cfg.KV_CACHE_DTYPE),
+            tensor_parallel_size=cfg.TENSOR_PARALLEL_SIZE,
+            gpu_memory_utilization=overrides.get(
+                "gpu_memory_utilization", cfg.GPU_MEMORY_UTILIZATION
+            ),
+            max_model_len=overrides.get("max_model_len", cfg.MAX_MODEL_LEN),
+            # CUDA graphs default ON (disabling them measured -31% throughput), but a per-model
+            # override can disable them — the 35B MoE's CUDA-graph capture (specialize_lora over many
+            # sizes) costs ~20+ GiB and tips the LoRA-module creation into OOM.
+            enforce_eager=bool(overrides.get("enforce_eager", False)),
+            enable_lora=True,
+            max_loras=_max_loras,
+            max_lora_rank=overrides.get("max_lora_rank", cfg.MAX_LORA_RANK),
+            max_cpu_loras=cfg.MAX_CPU_LORAS,
+            **_extra,
+            **cfg.vllm_engine_kwargs(),
+        )
+        self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+        # No in-engine kernel-patching hook runs here (2026-07-05 35B outage post-mortem): under
+        # vLLM V1 the model executes in a SEPARATE EngineCore process, so patching this process's
+        # vLLM classes never reaches the running model — and a prior attempt's extra CUDA context +
+        # GPU self-tests in this process stole the post-init headroom EngineCore needs for
+        # FlashInfer's first-request decode-workspace allocation, OOM-killing the 35B engine on its
+        # first request. Any future in-engine kernel work must patch INSIDE EngineCore (a vLLM
+        # plugin/worker extension) and be gated behind a real-GPU canary that runs a real generation,
+        # not just engine warmup.
+        #
+        # Self-healing liveness. vLLM V1 runs the model in a SEPARATE EngineCore worker process; if
+        # that process dies (e.g. an OOM under load, or a bad build that first-request-OOMs), the
+        # AsyncLLM in THIS process is permanently unusable — every later request raises
+        # EngineDeadError. Modal has no per-method liveness probe, so a container with a dead engine
+        # would otherwise stay in rotation serving fast 500s indefinitely (exactly the 2026-07-06
+        # regression: a dead 35B container looped EngineDeadError 500s until a human redeployed). A
+        # background monitor detects the death and drains this container. subsequent demand starts a
+        # fresh engine instead of leaving a permanently dead container in rotation.
+        self._self_heal_triggered = False
+        self._liveness_task = asyncio.create_task(self._liveness_monitor())
+        if cfg.PRELOAD_CACHED_LORAS:
+            await self._preload_cached_loras()
+
+    def _engine_dead(self) -> bool:
+        """Instance-bound view of :func:`_engine_is_dead` for the live engine."""
+        return _engine_is_dead(getattr(self, "engine", None))
+
+    def _self_heal_if_dead(self, reason: str) -> None:
+        """Drain a dead engine container so later demand can start a fresh one.
+
+        The first caller, either a failing request or the liveness monitor, wins. Later calls are
+        no-ops.
+        """
+        if getattr(self, "_self_heal_triggered", False) or not self._engine_dead():
+            return
+        self._self_heal_triggered = True
+        print(
+            f"serving: EngineCore dead on {self.base_model} ({reason}); draining container so "
+            "subsequent demand starts a healthy engine",
+            flush=True,
+        )
+        try:
+            # stop pulling new inputs and let in-flight ones return cleanly before the container exits.
+            # subsequent demand starts the replacement without severing active connections.
+            from modal.experimental import stop_fetching_inputs
+
+            stop_fetching_inputs()
+        except Exception:  # fall back to a hard exit if the graceful API is unavailable
+            os._exit(1)
+
+    async def _liveness_monitor(self) -> None:
+        """Poll EngineCore liveness so a dead container is recycled even when no request arrives to
+        surface the death. Cheap: a boolean property check every few seconds."""
+        try:
+            while True:
+                await asyncio.sleep(5.0)
+                if self._engine_dead():
+                    self._self_heal_if_dead("liveness monitor")
+                    return
+        except asyncio.CancelledError:  # container shutting down — let it stop
+            raise
+        except Exception:  # a monitor bug must never take serving down
+            return
+
+    async def _adapter_lock(self, adapter_id: str) -> asyncio.Lock:
+        async with self._adapter_locks_guard:
+            lock = self._adapter_locks.get(adapter_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._adapter_locks[adapter_id] = lock
+            return lock
+
+    async def _source_lock(self, record: Any) -> asyncio.Lock:
+        ident = _adapter_source_ident(record)
+        async with self._source_locks_guard:
+            lock = self._source_locks.get(ident)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._source_locks[ident] = lock
+            return lock
+
+    async def _evict_loaded_lora(self, adapter_id: str) -> None:
+        # Best-effort: drop this id's LoRA from the engine (vLLM caches by int id, so a redeploy
+        # under the same id must evict the old one). Caller holds the per-adapter lock.
+        try:
+            from flash.serving.src.registry import lora_int_id
+
+            remove = getattr(self.engine, "remove_lora", None)
+            if remove is not None:
+                # Use the int id this adapter was actually loaded with (collision-probing may have
+                # shifted it off the raw lora_int_id), falling back to the raw hash when it was never
+                # cached. Otherwise a probed adapter's LoRA never frees its engine slot.
+                cached = self._lora_requests.get(adapter_id)
+                int_id = cached[1].lora_int_id if cached is not None else lora_int_id(adapter_id)
+                # remove_lora is a coroutine in vllm>=0.11 — must await or it never frees the slot.
+                result = remove(int_id)
+                if inspect.isawaitable(result):
+                    await result
+        except Exception:  # best-effort; not all vLLM versions expose removal
+            pass
+        finally:
+            self._lora_requests.pop(adapter_id, None)
+
+    async def _pin_lora(self, lora_request: Any) -> None:
+        pin = getattr(self.engine, "pin_lora", None)
+        if pin is None:
+            return
+        result = pin(lora_request.lora_int_id)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _add_lora_locked(self, record: Any, path: Path) -> None:
+        lora_request = self._cached_lora_request_locked(record, path)
+        await self.engine.add_lora(lora_request)
+        # Pin only when the hot GPU pool covers the deployable CPU pool. Capped-max_loras models leave
+        # adapters unpinned so >max_loras adapters can register and LRU-swap in on demand instead of
+        # the surplus failing to claim one of the few GPU slots.
+        if self._pin_loras:
+            await self._pin_lora(lora_request)
+
+    async def _preload_cached_loras(self) -> None:
+        from flash.serving.src.settings import ADAPTER_CACHE_DIR
+
+        for record in self.registry.list_ready():
+            source_ident = _adapter_source_ident(record)
+            local_dir = _adapter_source_cache_dir(ADAPTER_CACHE_DIR, record)
+            subfolder = getattr(record, "subfolder", None)
+            path = _adapter_cache_path(local_dir, subfolder)
+            if not _adapter_cache_ready(path):
+                continue
+            lock = await self._adapter_lock(record.adapter_id)
+            async with lock:
+                self._source_paths[source_ident] = path
+                self.registry.set_local_path(record, path)
+                try:
+                    await self._add_lora_locked(record, path)
+                except Exception as exc:  # a bad cached LoRA must not kill startup
+                    print(
+                        f"cached LoRA preload skipped for {record.adapter_id}: {exc!r}",
+                        flush=True,
+                    )
+
+    async def _ensure_adapter_local_locked(self, record: Any) -> Path:
+        # Download body; caller must already hold self._adapter_lock(record.adapter_id).
+        import anyio
+        from huggingface_hub import snapshot_download
+
+        from flash.serving.src.settings import ADAPTER_CACHE_DIR
+
+        adapter_id = record.adapter_id
+        local_dir = _adapter_source_cache_dir(ADAPTER_CACHE_DIR, record)
+        subfolder = getattr(record, "subfolder", None)
+        cached_path = _adapter_cache_path(local_dir, subfolder)
+        # Stale cached path (source changed) -> evict the old LoRA before re-downloading; check
+        # before local_path(), which clears the stale entry.
+        if self.registry.local_path_is_stale(record):
+            # _evict_loaded_lora already drops adapter_id from _lora_requests in its finally block.
+            await self._evict_loaded_lora(adapter_id)
+        path = self.registry.local_path(record)
+        if path is not None:
+            _assert_source_cache_containment(local_dir, path)
+            # TTFT: this is the STEADY-STATE hit for an already-downloaded adapter, on the path of
+            # every generation. _adapter_cache_ready stats + iterdirs the adapter directory, and here
+            # that directory lives on a NETWORK-backed Modal Volume, so the syscalls can block far
+            # longer than the local-disk floor. Off the event loop it can't stall co-resident requests.
+            if await asyncio.to_thread(_adapter_cache_ready, path):
+                return path
+
+        source_ident = _adapter_source_ident(record)
+        source_lock = await self._source_lock(record)
+        async with source_lock:
+            path = self.registry.local_path(record)
+            if path is not None:
+                _assert_source_cache_containment(local_dir, path)
+                if _adapter_cache_ready(path):
+                    return path
+            if cached := self._source_paths.get(source_ident):
+                _assert_source_cache_containment(local_dir, cached)
+                if _adapter_cache_ready(cached):
+                    self.registry.set_local_path(record, cached)
+                    return cached
+                self._source_paths.pop(source_ident, None)
+
+            local_dir.parent.mkdir(parents=True, exist_ok=True)
+            repo_type = getattr(record, "repo_type", "model") or "model"
+            allow = [f"{subfolder}/**", f"{subfolder}/*"] if subfolder else None
+            if _adapter_cache_ready(cached_path):
+                self._source_paths[source_ident] = cached_path
+                self.registry.set_local_path(record, cached_path)
+                return cached_path
+            if (cached_path / "adapter_config.json").exists():
+                shutil.rmtree(local_dir, ignore_errors=True)
+
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    downloaded = await anyio.to_thread.run_sync(
+                        lambda: snapshot_download(
+                            repo_id=record.repo_id,
+                            repo_type=repo_type,
+                            revision=record.hf_revision,
+                            local_dir=str(local_dir),
+                            token=self.settings.hf_api_key,
+                            allow_patterns=allow,
+                        )
+                    )
+                    downloaded_root = Path(downloaded)
+                    # Cheap local stat guarding a path escape, on a path the download above
+                    # already materialized; not worth an extra thread hop.
+                    if downloaded_root.resolve() != local_dir.resolve():  # noqa: ASYNC240
+                        raise RuntimeError("snapshot download escaped its exact-SHA source cache")
+                    path = _adapter_cache_path(local_dir, subfolder)
+                    if not _adapter_cache_ready(path):
+                        raise RuntimeError(
+                            f"downloaded adapter cache is incomplete: {path} has no "
+                            "non-empty adapter_model tensor file"
+                        )
+                    self._source_paths[source_ident] = path
+                    self.registry.set_local_path(record, path)
+                    return path
+                except Exception as exc:  # Hub/network errors are often transient
+                    last_exc = exc
+                    if attempt == 2:
+                        break
+                    await asyncio.sleep(0.5 * (2**attempt))
+
+            assert last_exc is not None
+            raise last_exc
+
+    def _cached_lora_request_locked(self, record: Any, path: Path) -> Any:
+        from vllm.lora.request import LoRARequest
+
+        from flash.serving.src.registry import lora_int_id
+
+        source_ident = _adapter_source_ident(record)
+        adapter_id = record.adapter_id
+        cached = self._lora_requests.get(adapter_id)
+        if cached is not None and cached[0] == source_ident:
+            return cached[1]
+
+        # lora_int_id masks a sha1 to 31 bits (int32-fitting positive id vLLM requires), so distinct
+        # adapter_ids can collide to the same int id and cross-wire two orgs' LoRAs on one engine.
+        # Detect a collision against a DIFFERENT adapter already loaded here and linear-probe to the
+        # next free id. Runs under the per-adapter lock and (asyncio) atomically vs other adapters'
+        # sync sections, so the used-set is a consistent snapshot.
+        used = {
+            req.lora_int_id: aid
+            for aid, (_ident, req) in self._lora_requests.items()
+            if aid != adapter_id
+        }
+        int_id = lora_int_id(adapter_id)
+        while int_id in used:
+            int_id = int_id + 1 if int_id < 0x7FFFFFFF else 1
+
+        lora_request = LoRARequest(adapter_id, int_id, str(path))
+        self._lora_requests[adapter_id] = (source_ident, lora_request)
+        return lora_request
+
+    async def _lora_request(
+        self, adapter_id: str, record_dict: dict[str, Any] | None = None
+    ) -> tuple[Any, Any]:
+        """Resolve (LoRARequest, record) for ``adapter_id`` under the adapter lock.
+
+        Returns the RESOLVED record alongside the request so the caller can bind the prompt's
+        thinking default to the SAME record the weights came from — a later registry re-read could
+        observe a different record after a concurrent same-id redeploy (see
+        ``_effective_chat_template_kwargs``).
+        """
+        from flash.serving.src.schemas import AdapterRecord
+
+        # Lock across read + download so a concurrent unregister can't slip in between.
+        lock = await self._adapter_lock(adapter_id)
+        async with lock:
+            if record_dict is not None:
+                self.registry.upsert(AdapterRecord.model_validate(record_dict))
+            record = self.registry.get(adapter_id)
+            if record is None or record.status != "ready":
+                raise ValueError(f"Unknown adapter id on {self.base_model}: {adapter_id}")
+            if not record.serve_base_model and not record.is_revision:
+                raise ValueError(f"Unknown adapter id on {self.base_model}: {adapter_id}")
+            if record.serve_base_model:
+                # No LoRA to resolve: generate against the base weights the engine already has.
+                return None, record
+            path = await self._ensure_adapter_local_locked(record)
+            return self._cached_lora_request_locked(record, path), record
+
+    def _thinking_default(self, record: Any, payload: Any) -> bool:
+        """The ``enable_thinking`` to render with. A trained LoRA forces its own value; a base-model
+        serve has none, so it honors the caller's chat_template_kwargs enable_thinking when given."""
+        if getattr(record, "serve_base_model", False):
+            caller = _safe_chat_template_kwargs(getattr(payload, "chat_template_kwargs", None))
+            override = caller.get("enable_thinking")
+            if isinstance(override, bool):
+                return override
+        return record.thinking
+
+    def _structured_outputs_state(
+        self, payload: Any, record: Any, enable_thinking: bool
+    ) -> tuple[Any, bool | None, dict[str, Any] | None]:
+        """Resolve fresh request-local grammar params and reasoning state."""
+        request_spec = getattr(payload, "structured_outputs", None)
+        spec = request_spec if request_spec is not None else record.structured_outputs
+        if not spec:
+            return None, None, None
+
+        if enable_thinking:
+            if self.reasoning_parser is None:
+                raise ValueError(
+                    "structured outputs with thinking enabled require a parser-enabled base model"
+                )
+            if not getattr(payload, "messages", None):
+                raise ValueError(
+                    "structured outputs with thinking enabled require messages; raw prompt reasoning "
+                    "state is ambiguous"
+                )
+
+        from vllm.sampling_params import StructuredOutputsParams
+
+        try:
+            params = StructuredOutputsParams(**spec)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid structured outputs spec {spec!r}: {exc}") from exc
+
+        parser_kwargs = None
+        if self.reasoning_parser is not None:
+            parser_kwargs = {
+                "chat_template_kwargs": self._effective_chat_template_kwargs(
+                    payload, enable_thinking
+                )
+            }
+        return params, not enable_thinking, parser_kwargs
+
+    def _effective_chat_template_kwargs(
+        self, payload: Any, thinking_default: bool | None = None
+    ) -> dict[str, Any]:
+        """Sanitized caller chat_template_kwargs, with ``enable_thinking`` fixed per-adapter.
+
+        ``enable_thinking`` is not a caller knob: always inject the adapter's trained value even if
+        the caller tried to supply an override. This is the parity fix: without it the template can
+        run in a mode other than the adapter's training mode, so a thinking=false adapter may emit a
+        reasoning preamble ("…</think>{json}") for callers that omit or override the flag.
+
+        ``thinking_default`` is the value RESOLVED alongside the LoRA weights (carried out of
+        ``_lora_request`` under its adapter lock), so prompt rendering stays bound to the same
+        record as the weights during same-id redeploys.
+        """
+        ctk = _safe_chat_template_kwargs(getattr(payload, "chat_template_kwargs", None))
+        if not isinstance(thinking_default, bool):
+            raise ValueError("adapter thinking default is required")
+        return {**ctk, "enable_thinking": thinking_default}
+
+    def _prompt_cache_key(
+        self, payload: Any, thinking_default: bool | None = None
+    ) -> tuple[str, str] | None:
+        # Key on a fixed-size hash of the prompt/messages, not the raw text: with up to
+        # _prompt_cache_size entries, storing full prompt strings as keys could retain a lot of
+        # duplicated text (and risk OOM) for long prompts. blake2b is fast; 128-bit is collision-safe
+        # for a cache key.
+        if getattr(self, "_prompt_cache_size", 0) <= 0:
+            return None
+        if payload.messages:
+            try:
+                raw = json.dumps(
+                    payload.messages, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                )
+                # chat_template_kwargs changes the rendered prompt, so it MUST be part of the key
+                # — otherwise the same messages with thinking on vs off collide and the wrong cached
+                # token IDs are reused. Use the SAME *effective* view _tokenize_prompt splats
+                # (caller kwargs sanitized, then enable_thinking resolved per-adapter), so two
+                # adapters on the same base model with different thinking defaults don't collide,
+                # while
+                # reserved/ignored keys still don't split identical prompts (unnecessary misses).
+                ctk = self._effective_chat_template_kwargs(payload, thinking_default)
+                if ctk:
+                    raw += "\x00" + json.dumps(
+                        ctk,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                        default=str,
+                    )
+            except TypeError:
+                return None
+            kind = "messages"
+        elif payload.prompt:
+            raw, kind = payload.prompt, "prompt"
+        else:
+            return None
+        return (kind, hashlib.blake2b(raw.encode("utf-8"), digest_size=16).hexdigest())
+
+    async def _prompt_input(
+        self, payload: Any, thinking_default: bool | None = None
+    ) -> dict[str, Any]:
+        # TTFT: an LRU hit is microseconds, so it is served inline - a thread hop would cost more
+        # than the work. A MISS runs the chat template + tokenizer, which is 10 ms at 6k tokens and
+        # ~51 ms at 24k (measured, Qwen3.5 fast tokenizer). Every tier serves 32k context and
+        # modal.concurrent packs up to max_inputs requests onto ONE container, so tokenizing on the
+        # event loop head-of-line blocks EVERY co-resident request's TTFT, not just this one. HF
+        # fast tokenizers are Rust and release the GIL (measured 5.6x on 8 threads), so the offload
+        # buys real parallelism instead of just moving the stall.
+        # Only _tokenize_prompt moves to the worker thread, so the cache is still read and written
+        # solely from the loop thread and needs no lock. The await does mean two identical
+        # concurrent misses can both tokenize; that is idempotent (same messages + same effective
+        # kwargs -> same ids), and the duplicate now costs a worker thread rather than the loop.
+        key = self._prompt_cache_key(payload, thinking_default)
+        cache = getattr(self, "_prompt_token_cache", None)
+        if key is not None and cache is not None:
+            cached = cache.get(key)
+            if cached is not None:
+                cache.move_to_end(key)
+                return {"prompt_token_ids": list(cached)}
+
+        prompt_token_ids = await asyncio.to_thread(self._tokenize_prompt, payload, thinking_default)
+        if key is not None and cache is not None:
+            cache[key] = tuple(prompt_token_ids)
+            cache.move_to_end(key)
+            max_size = getattr(self, "_prompt_cache_size", 0)
+            while len(cache) > max_size:
+                cache.popitem(last=False)
+        return {"prompt_token_ids": prompt_token_ids}
+
+    def _tokenize_prompt(self, payload: Any, thinking_default: bool | None = None) -> list[int]:
+        if payload.messages:
+            # Forward sanitized chat_template_kwargs, but force enable_thinking from the adapter's
+            # trained ``thinking`` value so every caller renders in the mode this LoRA was trained
+            # with. Reserved/return-shape kwargs are dropped before rendering to avoid 500s.
+            ctk = self._effective_chat_template_kwargs(payload, thinking_default)
+            prompt_token_ids = self.tokenizer.apply_chat_template(
+                payload.messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=False,
+                **ctk,
+            )
+            return list(prompt_token_ids)
+        if payload.prompt:
+            prompt_token_ids = self.tokenizer.encode(payload.prompt, add_special_tokens=False)
+            return list(prompt_token_ids)
+        raise ValueError("prompt or messages is required")
+
+    async def _prepare_prompt_input(
+        self, payload: Any, thinking_default: bool | None = None
+    ) -> dict[str, Any]:
+        # imported lazily so `modal deploy` (which imports this module on a pillow-free
+        # runner) does not require pillow; the remote image installs pillow from pyproject.
+        from flash.serving.src.multimodal import (
+            MultimodalRequestError,
+            has_image_blocks,
+            prepare_multimodal_request,
+        )
+
+        if not has_image_blocks(getattr(payload, "messages", None)):
+            return await self._prompt_input(payload, thinking_default)
+        processor = getattr(self, "processor", None)
+        if not supports_image_input(self.base_model) or processor is None:
+            raise MultimodalRequestError(
+                "image input requires an initialized processor on an image-capable engine"
+            )
+        template_messages, images = await asyncio.to_thread(
+            prepare_multimodal_request,
+            payload.messages,
+            image_limit=image_limit_for(self.base_model),
+        )
+        try:
+            # Stays INSIDE the try: _effective_chat_template_kwargs raises on a missing thinking
+            # default, and the decoded images above must still be closed on that path.
+            ctk = self._effective_chat_template_kwargs(payload, thinking_default)
+            # Same head-of-line reason as the text path: rendering an image chat template is jinja
+            # over the message list, and its sibling image decode above already runs off-loop.
+            rendered = await asyncio.to_thread(
+                lambda: processor.apply_chat_template(
+                    template_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    **ctk,
+                )
+            )
+        except BaseException:
+            for image in images:
+                image.close()
+            raise
+        if not isinstance(rendered, str):
+            for image in images:
+                image.close()
+            raise MultimodalRequestError("image processor chat template did not return text")
+        image_data: Any = images[0] if len(images) == 1 else images
+        return {"prompt": rendered, "multi_modal_data": {"image": image_data}}
+
+    @staticmethod
+    def _close_prompt_images(prompt_input: dict[str, Any]) -> None:
+        image_data = (prompt_input.get("multi_modal_data") or {}).get("image")
+        images = image_data if isinstance(image_data, list) else [image_data]
+        for image in images:
+            close = getattr(image, "close", None)
+            if close is not None:
+                close()
+
+    async def _register(
+        self,
+        record_dict: dict[str, Any],
+        deployment_generation: str | None = None,
+    ) -> dict[str, Any]:
+        """Download + register an adapter into this engine's cache."""
+        from flash.serving.src.schemas import AdapterRecord
+
+        record = AdapterRecord.model_validate(record_dict).model_copy(
+            update={"deployment_generation": deployment_generation}
+        )
+        if not record.serve_base_model and not record.is_revision:
+            raise ValueError("only immutable adapter revisions can be registered")
+        lock = await self._adapter_lock(record.adapter_id)
+        async with lock:  # _locked variant: we hold the lock (the public one would deadlock)
+            if record.serve_base_model:
+                # No LoRA to download or add — the base weights are already loaded; just track the id.
+                self.registry.upsert(record, revive=True)
+                return {"ok": True, "adapter_id": record.adapter_id, "base_model": self.base_model}
+            path = await self._ensure_adapter_local_locked(record)
+            self.registry.upsert(record, revive=True)  # explicit (re)deploy clears a tombstone
+            await self._add_lora_locked(record, path)
+        return {"ok": True, "adapter_id": record.adapter_id, "base_model": self.base_model}
+
+    def _active_checkpoint_ref(self, record: Any) -> str:
+        checkpoint = str(getattr(record, "checkpoint", "") or "").strip()
+        if checkpoint:
+            return checkpoint
+        subfolder = str(getattr(record, "subfolder", "") or "").strip().strip("/")
+        if not subfolder:
+            return ""
+        match = re.search(r"(?:^|/)checkpoints/(step-\d+)(?:/|$)", subfolder)
+        if match:
+            return f"{record.adapter_id}/{match.group(1)}"
+        return str(record.adapter_id)
+
+    def _enforce_expected_checkpoint(self, record: Any, expected_checkpoint: str | None) -> str:
+        active_checkpoint = self._active_checkpoint_ref(record)
+        if expected_checkpoint is not None and expected_checkpoint.strip() != active_checkpoint:
+            expected = expected_checkpoint.strip()
+            raise ValueError(
+                "checkpoint mismatch: "
+                f"adapter {record.adapter_id} is serving checkpoint "
+                f"{active_checkpoint or '<none>'}, not the expected "
+                f"{expected or '<none>'}; a concurrent deploy likely replaced it. "
+                "Re-deploy the intended step or drop the expectation."
+            )
+        return active_checkpoint
+
+    async def _generate(
+        self,
+        payload_dict: dict[str, Any],
+        record_dict: dict[str, Any] | None = None,
+        expected_checkpoint: str | None = None,
+    ) -> dict[str, Any]:
+        from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
+
+        from flash.serving.src.schemas import GenerateRequest
+
+        payload = GenerateRequest.model_validate(payload_dict)
+        # Modal may route here to a container that never saw the registration -> adopt the forwarded
+        # record (revive=False, so it can't resurrect an id just undeployed here). Carry the resolved
+        # record so the prompt's thinking default binds to the SAME record the weights came from.
+        lora_request, record = await self._lora_request(payload.adapter_id, record_dict)
+        active_checkpoint = self._enforce_expected_checkpoint(record, expected_checkpoint)
+        thinking_default = self._thinking_default(record, payload)
+        structured_outputs, reasoning_ended, reasoning_parser_kwargs = (
+            self._structured_outputs_state(payload, record, thinking_default)
+        )
+        # FINAL_ONLY: the non-streaming caller only wants the completed text, so tell vLLM to emit a
+        # single terminal RequestOutput instead of one cumulative object per decoded token. Saves N
+        # Python-object allocations + detokenizations per request on the hot path.
+        sampling_params = SamplingParams(
+            temperature=payload.temperature,
+            max_tokens=payload.max_tokens,
+            top_p=payload.top_p,
+            output_kind=RequestOutputKind.FINAL_ONLY,
+            structured_outputs=structured_outputs,
+        )
+        request_id = str(uuid.uuid4())
+        start = time.time()
+        final_output = None
+        prompt_input = await self._prepare_prompt_input(payload, thinking_default)
+        try:
+            async for out in self.engine.generate(
+                prompt_input,
+                sampling_params,
+                request_id,
+                lora_request=lora_request,
+                reasoning_ended=reasoning_ended,
+                reasoning_parser_kwargs=reasoning_parser_kwargs,
+            ):
+                final_output = out
+        except Exception:
+            # A dead EngineCore raises here (EngineDeadError). Recycle this container immediately so
+            # the NEXT request lands on a fresh engine instead of looping 500s on a corpse (the
+            # background liveness monitor is the backstop; this makes the common path instant).
+            self._self_heal_if_dead("generate")
+            raise
+        finally:
+            self._close_prompt_images(prompt_input)
+        if final_output is None:
+            raise RuntimeError("vLLM returned no output")
+        output = final_output.outputs[0]
+        completion_token_ids = list(getattr(output, "token_ids", []) or [])
+        prompt_tokens = _num_prompt_tokens(final_output)
+        return {
+            "ok": True,
+            "adapter_id": payload.adapter_id,
+            "text": output.text,
+            "finish_reason": getattr(output, "finish_reason", None),
+            "token_ids": completion_token_ids,
+            # token counts for per-token billing; the router forwards these to the backend.
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": len(completion_token_ids),
+            # Prefix-cached prompt tokens (served from the KV cache, prefill skipped). With
+            # prefix caching ON this is non-zero whenever a prompt shares a prefix with an
+            # earlier one; the backend bills these at a discount. 0 on a build that omits it.
+            "cached_tokens": _num_cached_tokens(final_output),
+            "cached_tokens_reported": _cached_tokens_reported(final_output),
+            "inference_time_seconds": time.time() - start,
+            # stable per-generation id: the router uses it as the usage-report idempotency key so
+            # a future report retry can't double-bill the same generation.
+            "request_id": request_id,
+            "engine_replica_id": self._replica_identifier(),
+            "checkpoint": active_checkpoint,
+            # the thinking mode this generation was RENDERED with. the chat template opens the
+            # reasoning block in the prompt, so a thinking completion carries only the closing
+            # </think> and cannot be classified from its own text. the openai layer needs that
+            # distinction to split reasoning from content; the raw /generate contract keeps
+            # ``text`` verbatim.
+            "thinking": thinking_default,
+        }
+
+    async def _stream_generate(
+        self,
+        payload_dict: dict[str, Any],
+        record_dict: dict[str, Any] | None = None,
+        expected_checkpoint: str | None = None,
+    ):
+        from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
+
+        from flash.serving.src.schemas import GenerateRequest
+
+        payload = GenerateRequest.model_validate(payload_dict)
+        lora_request, record = await self._lora_request(payload.adapter_id, record_dict)
+        active_checkpoint = self._enforce_expected_checkpoint(record, expected_checkpoint)
+        # resolve structured outputs and advance vllm before the ready event so validation failures
+        # remain clean responses instead of surfacing after streaming has started.
+        thinking_default = self._thinking_default(record, payload)
+        structured_outputs, reasoning_ended, reasoning_parser_kwargs = (
+            self._structured_outputs_state(payload, record, thinking_default)
+        )
+        sampling_params = SamplingParams(
+            temperature=payload.temperature,
+            max_tokens=payload.max_tokens,
+            top_p=payload.top_p,
+            output_kind=RequestOutputKind.DELTA,
+            structured_outputs=structured_outputs,
+        )
+        request_id = str(uuid.uuid4())
+        start = time.time()
+        prompt_input = await self._prepare_prompt_input(payload, thinking_default)
+        output_stream = None
+        try:
+            try:
+                output_stream = self.engine.generate(
+                    prompt_input,
+                    sampling_params,
+                    request_id,
+                    lora_request=lora_request,
+                    reasoning_ended=reasoning_ended,
+                    reasoning_parser_kwargs=reasoning_parser_kwargs,
+                )
+                first_output = await anext(output_stream)
+            except StopAsyncIteration as exc:
+                raise RuntimeError("vLLM returned no output") from exc
+            except Exception:
+                self._self_heal_if_dead("stream_generate")
+                raise
+
+            # ``thinking`` rides the ready event because it must be known BEFORE the first delta:
+            # the openai layer routes deltas to reasoning_content or content as they arrive, so
+            # learning the mode at "final" would be too late.
+            yield {
+                "type": "ready",
+                "checkpoint": active_checkpoint,
+                "thinking": thinking_default,
+            }
+            final_output = None
+            completion_token_ids: list[int] = []
+            previous_text = ""
+            out = first_output
+            try:
+                while True:
+                    final_output = out
+                    output = out.outputs[0]
+                    text = output.text or ""
+                    token_ids = list(getattr(output, "token_ids", []) or [])
+                    cumulative_output = None
+                    if token_ids:
+                        if token_ids[: len(completion_token_ids)] == completion_token_ids:
+                            # cumulative: this chunk is a prefix-extension of what we've accumulated
+                            # (>= in length, prefix matches). replace rather than extend. using >= (not
+                            # >) means a repeated cumulative chunk of the same length is a no-op replace,
+                            # never a double-count. defensive fallback for a vllm build that ignores
+                            # delta; current vllm returns true deltas, which take the extend branch below.
+                            completion_token_ids = token_ids
+                            cumulative_output = True
+                        else:
+                            completion_token_ids.extend(token_ids)
+                            cumulative_output = False
+                    if text:
+                        delta, previous_text = _stream_text_delta(
+                            text, previous_text, cumulative_output=cumulative_output
+                        )
+                        if delta:
+                            yield {"type": "delta", "text": delta}
+                    try:
+                        out = await anext(output_stream)
+                    except StopAsyncIteration:
+                        break
+            except Exception:
+                self._self_heal_if_dead("stream_generate")
+                raise
+            if final_output is None:
+                raise RuntimeError("vLLM returned no output")
+            output = final_output.outputs[0]
+            prompt_tokens = _num_prompt_tokens(final_output)
+            yield {
+                "type": "final",
+                "ok": True,
+                "adapter_id": payload.adapter_id,
+                "finish_reason": getattr(output, "finish_reason", None),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": len(completion_token_ids),
+                # prefix-cached prompt tokens (see generate()); billed at a discount by the backend.
+                "cached_tokens": _num_cached_tokens(final_output),
+                "cached_tokens_reported": _cached_tokens_reported(final_output),
+                "inference_time_seconds": time.time() - start,
+                "request_id": request_id,
+                "engine_replica_id": self._replica_identifier(),
+                "checkpoint": active_checkpoint,
+                # see generate(): the rendered thinking mode, which the streamed text alone
+                # cannot reveal.
+                "thinking": thinking_default,
+            }
+        finally:
+            try:
+                if output_stream is not None:
+                    close = getattr(output_stream, "aclose", None)
+                    if close is not None:
+                        active_exception = sys.exc_info()[0] is not None
+                        try:
+                            result = close()
+                            if inspect.isawaitable(result):
+                                await result
+                        # only swallow ordinary close errors while already unwinding;
+                        # control-flow exceptions (CancelledError, KeyboardInterrupt,
+                        # SystemExit) must always propagate rather than be masked here.
+                        except Exception:
+                            if not active_exception:
+                                raise
+            finally:
+                self._close_prompt_images(prompt_input)
+
+    async def _unregister(
+        self,
+        adapter_id: str,
+        expected_generation: str | None = None,
+    ) -> dict[str, Any]:
+        # undeploy under the per-adapter lock so register and stale background cleanup have one order.
+        lock = await self._adapter_lock(adapter_id)
+        async with lock:
+            current = self.registry.get(adapter_id)
+            current_generation = current.deployment_generation if current is not None else None
+            stale = current is not None and (
+                current_generation is not None
+                if expected_generation is None
+                else current_generation != expected_generation
+            )
+            if stale:
+                return {
+                    "ok": True,
+                    "removed": None,
+                    "skipped_stale_generation": True,
+                    "base_model": self.base_model,
+                }
+            self.registry.remove(adapter_id)
+            await self._evict_loaded_lora(adapter_id)
+        return {"ok": True, "removed": adapter_id, "base_model": self.base_model}
+
+    def _health(self) -> dict[str, Any]:
+        cuda_available: bool | None = None
+        device_name: str | None = None
+        try:
+            import torch
+
+            cuda_available = torch.cuda.is_available()
+            if cuda_available:
+                device_name = torch.cuda.get_device_name(0)
+        except Exception:  # health should still return if torch probing fails
+            pass
+
+        from flash.serving.src import settings as cfg
+
+        _ov = engine_overrides_for(self.base_model)
+        _served_model = _ov.get("serve_model_id") or self.base_model
+        # Report real EngineCore liveness, not a static True: a V1 engine whose worker process died
+        # still runs this container, so an unconditional ok:True masked the dead 35B tier during the
+        # 2026-07-06 outage. ``start_all``/monitoring can now see the death, and the liveness monitor
+        # recycles the container regardless. Read the engine directly (not via ``self._engine_dead``)
+        # so ``_health`` stays callable on a degraded/partial ``self``.
+        engine_dead = _engine_is_dead(getattr(self, "engine", None))
+        return {
+            "ok": not engine_dead,
+            "engine_dead": engine_dead,
+            "base_model": self.base_model,
+            # The checkpoint this engine actually loaded: the pre-quantized serve_model_id (owned FP8,
+            # or the official 35B FP8). Surfaced so ops can confirm which weights came up.
+            "served_model": _served_model,
+            # Effective weight quantization of the served checkpoint. Every base now serves a
+            # pre-quantized FP8 checkpoint (vLLM auto-detects, so the engine arg is None).
+            "quantization": (
+                "fp8" if _ov.get("serve_model_id") else _ov.get("quantization", cfg.QUANTIZATION)
+            ),
+            # KV-cache dtype this engine was built with (FP8 for every base; a model may override).
+            "kv_cache_dtype": _ov.get("kv_cache_dtype", cfg.KV_CACHE_DTYPE),
+            "adapters": len(self.registry.list_ready()),
+            # The GPU tier this engine class was ACTUALLY pinned to in _build_engine (a class
+            # attribute on the per-tier subclass), preferred over re-deriving it from the base model
+            # name so misrouting onto the wrong tier's class shows up here. Falls back to the
+            # expected tier for the bare _LoraEngineImpl (no pinned class), which has no fixed GPU.
+            "configured_gpu": getattr(self, "pinned_gpu", None) or gpu_for(self.base_model),
+            "cuda_available": cuda_available,
+            "device_name": device_name,
+            "enable_prefix_caching": cfg.ENABLE_PREFIX_CACHING,
+            "prompt_token_cache_size": getattr(
+                self, "_prompt_cache_size", cfg.PROMPT_TOKEN_CACHE_SIZE
+            ),
+            "prompt_token_cache_entries": len(getattr(self, "_prompt_token_cache", {})),
+            # Report the EFFECTIVE context limit this engine was built with, not the global default:
+            # a per-model override (every tier now pins 32k) must be reflected here, or
+            # health/monitoring misreports the limit vLLM actually serves.
+            "max_model_len": _ov.get("max_model_len", cfg.MAX_MODEL_LEN),
+        }
