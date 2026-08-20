@@ -241,6 +241,80 @@ def test_legacy_fingerprint_rejects_multiple_prefix_matches(monkeypatch):
         api.resolve_legacy_key_fingerprint("ep-legacy", "rpk-" + "a" * 12)
 
 
+def test_legacy_fingerprint_upgrades_an_already_deleted_endpoint(monkeypatch):
+    """A cleanup record whose endpoint is already gone must still migrate.
+
+    A process that dies between deleting the endpoint and clearing its durable cleanup record
+    leaves the endpoint absent from the owner's listing. Refusing the upgrade there stranded the
+    record forever, because `_drain_cleanup_remotes` never reached the authenticated absence
+    check. Absence is adjudicated by the owner's own 404, not by list membership.
+    """
+    import io
+    import urllib.error
+
+    from flash.providers.runpod import api
+
+    key = "legacy-owner"
+    full_fingerprint = api.key_fingerprint(key)
+    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+
+    def owner_sees_no_such_endpoint(_key, url, **_kwargs):
+        if url.endswith("/endpoints"):
+            return []
+        raise api.RunpodApiError("not found") from urllib.error.HTTPError(
+            url, 404, "not found", {}, io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", owner_sees_no_such_endpoint)
+
+    assert (
+        api.resolve_legacy_key_fingerprint("ep-legacy", full_fingerprint[:16]) == full_fingerprint
+    )
+
+
+def test_legacy_fingerprint_still_refuses_an_endpoint_that_exists_elsewhere(monkeypatch):
+    """Absent from the listing but alive on lookup means another account owns it."""
+    from flash.providers.runpod import api
+
+    key = "legacy-owner"
+    full_fingerprint = api.key_fingerprint(key)
+    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+
+    def listing_empty_but_endpoint_alive(_key, url, **_kwargs):
+        return [] if url.endswith("/endpoints") else {"id": "ep-legacy"}
+
+    monkeypatch.setattr(
+        api._CLIENT, "request_with_retries_for_key", listing_empty_but_endpoint_alive
+    )
+
+    with pytest.raises(api.RunpodApiError, match="not owned"):
+        api.resolve_legacy_key_fingerprint("ep-legacy", full_fingerprint[:16])
+
+
+def test_legacy_fingerprint_refuses_when_absence_cannot_be_confirmed(monkeypatch):
+    """A failed ownership lookup is not proof of deletion, so the upgrade must still refuse."""
+    import io
+    import urllib.error
+
+    from flash.providers.runpod import api
+
+    key = "legacy-owner"
+    full_fingerprint = api.key_fingerprint(key)
+    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+
+    def lookup_fails(_key, url, **_kwargs):
+        if url.endswith("/endpoints"):
+            return []
+        raise api.RunpodApiError("boom") from urllib.error.HTTPError(
+            url, 500, "server error", {}, io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", lookup_fails)
+
+    with pytest.raises(api.RunpodApiError, match="not owned"):
+        api.resolve_legacy_key_fingerprint("ep-legacy", full_fingerprint[:16])
+
+
 def test_rotated_sole_legacy_prefix_match_cannot_claim_endpoint(monkeypatch):
     from flash.providers.runpod import api
 
