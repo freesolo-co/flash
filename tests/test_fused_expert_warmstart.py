@@ -705,7 +705,7 @@ def test_tensor_analyzer_still_rejects_cross_namespace_pairs_when_serialized(run
 @pytest.mark.parametrize(
     ("leaf", "expected"),
     [
-        pytest.param("weight", ("default", "weight"), id="serialized-bare-leaf"),
+        pytest.param("weight", "module", id="serialized-bare-leaf"),
         pytest.param("default.weight", None, id="explicit-default-does-not-roundtrip"),
         pytest.param("other.weight", None, id="explicit-namespace-does-not-roundtrip"),
         pytest.param("not_peft", None, id="wrong-parameter-name"),
@@ -718,10 +718,10 @@ def test_tensor_analyzer_still_rejects_cross_namespace_pairs_when_serialized(run
 def test_parse_lora_tensor_pins_the_exact_accepted_leaf_grammar(leaf, expected):
     """Pin the grammar directly.
 
-    Routing these through the whole-artifact analyzer is inert: a malformed key merely fails to
-    parse, and the surviving tensors still satisfy every downstream check, so the assertion passes
-    for the wrong reason. Sabotaging the parser to accept an empty adapter name left the
-    artifact-level version green.
+    Routing these through the whole-artifact analyzer used to be inert: a malformed key merely
+    failed to parse, and the surviving tensors still satisfied every downstream check, so the
+    assertion passed for the wrong reason. Sabotaging the parser to accept an empty adapter name
+    left the artifact-level version green.
     """
     from flash.adapters.fused_experts import _parse_lora_tensor
 
@@ -730,9 +730,9 @@ def test_parse_lora_tensor_pins_the_exact_accepted_leaf_grammar(leaf, expected):
     if expected is None:
         assert parsed is None
     else:
-        _, factor, adapter_name, _, _ = parsed
-        assert factor == "A"
-        assert (adapter_name, "weight") == expected
+        module_path, factor, key, shape = parsed
+        assert (module_path, factor) == (expected, "A")
+        assert (key, shape) == (f"module.lora_A.{leaf}", (8, 16))
 
 
 def test_parse_lora_tensor_requires_exactly_one_factor_infix():
