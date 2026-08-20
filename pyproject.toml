@@ -73,6 +73,17 @@ server = [
     # multimodal opd run. the gpu extra gets Pillow transitively via vllm; server does not.
     "pillow>=11",
 ]
+# The serving app (flash/serving/) that runs inside the GPU container. Kept out of `server` because
+# the control plane never imports it: only the container image and the offline serving tests need
+# these. vLLM is deliberately absent -- it is a multi-GB CUDA wheel that the container image pins
+# (vllm==0.23.0, held exactly by a 25h 35B outage on 0.21.0), and the offline tests substitute a
+# stub whenever the real package is unimportable, so CI exercises the app without it.
+serving = [
+    "modal>=1.0.0",
+    "orjson>=3.10.0",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.0",
+]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
     "mypy>=1.13.0",

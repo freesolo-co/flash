@@ -32,253 +32,26 @@ _USAGE_REPORT_DRAIN_TIMEOUT_SECONDS = 45.0
 _THINK_CLOSE = "</think>"
 
 
-def _split_reasoning(text: str, thinking: bool) -> tuple[str | None, str]:
-    """Split a completion into ``(reasoning_content, content)`` for the OpenAI surface.
+# Response shaping (reasoning split, streaming splitter, usage block, response_format ->
+# structured outputs) lives in responses.py. Re-exported because the FastAPI handlers below
+# and the existing tests both reference these names unqualified.
+from flash.serving.src.responses import (  # noqa: E402
+    _ReasoningStreamSplitter,
+    _openai_structured_outputs,
+    _partial_tag_suffix,
+    _response_format_to_spec,
+    _split_reasoning,
+    _THINK_CLOSE,
+    _usage_block,
+)
 
-    The chat template opens the reasoning block in the PROMPT, so a thinking completion begins
-    inside the block and its text is ``<reasoning></think><answer>`` -- a closing tag with no
-    opener. Returned verbatim, the caller sees a stray ``</think>`` glued to the answer and an
-    empty ``reasoning_content``, and every downstream parser that keys off the opening tag fails.
-
-    ``thinking`` is the mode the generation was RENDERED with, reported by the engine. It is
-    required rather than inferred: a non-thinking completion that merely quotes ``</think>`` must
-    not be silently torn in half.
-    """
-    if not thinking:
-        return None, text
-    head, sep, tail = text.partition(_THINK_CLOSE)
-    if not sep:
-        # thinking mode, but the block never closed (hit max_tokens mid-reasoning). all of it is
-        # reasoning; there is no answer yet. an empty content is the honest report.
-        return head, ""
-    return head, tail
-
-
-def _partial_tag_suffix(text: str) -> int:
-    """Length of the longest suffix of ``text`` that is a proper prefix of the closing tag."""
-    for size in range(min(len(text), len(_THINK_CLOSE) - 1), 0, -1):
-        if _THINK_CLOSE.startswith(text[-size:]):
-            return size
-    return 0
-
-
-class _ReasoningStreamSplitter:
-    """Routes streamed deltas to ``reasoning_content`` until the reasoning block closes.
-
-    Streaming cannot reuse :func:`_split_reasoning`: the closing tag arrives token by token and
-    can straddle a chunk boundary, so a trailing partial match is held back rather than emitted
-    as reasoning text it might turn out not to be.
-    """
-
-    def __init__(self, thinking: bool) -> None:
-        self._closed = not thinking
-        self._pending = ""
-
-    def feed(self, text: str) -> tuple[str, str]:
-        """Split one delta into ``(reasoning_delta, content_delta)``."""
-        if self._closed:
-            return "", text
-        buffer = self._pending + text
-        head, sep, tail = buffer.partition(_THINK_CLOSE)
-        if sep:
-            self._closed = True
-            self._pending = ""
-            return head, tail
-        hold = _partial_tag_suffix(buffer)
-        split = len(buffer) - hold
-        self._pending = buffer[split:]
-        return buffer[:split], ""
-
-    def flush(self) -> str:
-        """Held-back text at end of stream.
-
-        Reaching here means the block never closed (the generation stopped mid-reasoning), so the
-        remainder is reasoning with no answer -- the same call :func:`_split_reasoning` makes.
-        """
-        pending, self._pending = self._pending, ""
-        return pending
-
-
-def _usage_block(prompt_tokens: int, completion_tokens: int, cached_tokens: Any) -> dict[str, Any]:
-    """OpenAI-style ``usage`` object for a completion response.
-
-    Mirrors the OpenAI schema, including ``prompt_tokens_details.cached_tokens`` (the
-    prefix-cached subset of the prompt) so a client can see how many prompt tokens were served
-    from cache — the same count the backend bills at a discount. ``cached_tokens`` is clamped to
-    ``prompt_tokens`` and the details block is omitted entirely when there were no cached tokens.
-    """
-    usage: dict[str, Any] = {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    }
-    try:
-        cached = max(0, min(int(cached_tokens or 0), prompt_tokens))
-    except (TypeError, ValueError):
-        cached = 0
-    if cached > 0:
-        usage["prompt_tokens_details"] = {"cached_tokens": cached}
-    return usage
-
-
-def _openai_structured_outputs(payload: dict[str, Any]) -> Any:
-    """The structured-outputs spec carried by an OpenAI-style chat payload, or None.
-
-    Our first-class extension (``structured_outputs``) wins; failing that,
-    the OpenAI-standard ``response_format`` is accepted — but ONLY here, at the OpenAI-compatible
-    ``/v1/chat/completions`` boundary — and translated to our canonical spec, so an OpenAI-SDK
-    client gets structured output with no code change. The result is returned RAW so
-    GenerateRequest's validator normalizes it (consistent 422s across every entry point). Checked
-    with ``is not None``, not truthiness: ``{}`` / ``false`` are explicit "unconstrained" markers,
-    distinct from an absent field.
-    """
-    if (spec := payload.get("structured_outputs")) is not None:
-        return spec
-    response_format = payload.get("response_format")
-    if response_format is not None:
-        return _response_format_to_spec(response_format)
-    return None
-
-
-def _response_format_to_spec(response_format: Any) -> Any:
-    """Translate an OpenAI ``response_format`` object to our canonical structured-outputs spec.
-
-    Kept at this endpoint only (the core normalizer stays strict-canonical). ``{"type": "text"}``
-    -> ``{}`` (explicit "unconstrained", overriding any adapter default); ``{"type":
-    "json_object"}`` -> ``{"json_object": True}``; ``{"type": "json_schema", "json_schema":
-    {"schema": {...}}}`` (or the flattened ``{"type": "json_schema", "schema": {...}}``) ->
-    ``{"json": schema}``. An unrecognized ``type`` is rejected here with a clean 422 (rather than
-    letting the greedy normalizer silently wrap it as a schema); a non-dict is returned as-is for
-    the GenerateRequest validator to normalize.
-    """
-    if not isinstance(response_format, dict):
-        return response_format
-    rf_type = response_format.get("type")
-    if rf_type == "text":
-        return {}
-    if rf_type == "json_object":
-        return {"json_object": True}
-    if rf_type == "json_schema":
-        wrapper = response_format.get("json_schema")
-        schema = (
-            wrapper.get("schema") if isinstance(wrapper, dict) else response_format.get("schema")
-        )
-        if schema is None:
-            raise StructuredOutputsError(
-                'response_format {"type": "json_schema"} requires a schema '
-                "(json_schema.schema = {...} or schema = {...})"
-            )
-        return {"json": schema}
-    # OpenAI response_format has exactly these three types. Reject anything else here (a typo'd type
-    # or a bare schema) with a clean 422, rather than letting the greedy normalizer silently wrap the
-    # whole object as a JSON schema; to pass a raw schema, use the structured_outputs field instead.
-    raise StructuredOutputsError(
-        f'unsupported response_format type {rf_type!r}; use "text", "json_object", or '
-        '"json_schema" (or pass a raw schema via the structured_outputs field)'
-    )
-
-
-class EnginePool(Protocol):
-    """One vLLM engine per base model (Modal container in prod, fake in tests)."""
-
-    async def generate(
-        self,
-        base_model: str,
-        payload: Any,
-        record: AdapterRecord,
-        *,
-        expected_checkpoint: str | None = None,
-    ) -> dict[str, Any]:
-        # record is forwarded so the engine can lazy-load an adapter it hasn't seen.
-        ...
-
-    def stream_generate(
-        self,
-        base_model: str,
-        payload: Any,
-        record: AdapterRecord,
-        *,
-        expected_checkpoint: str | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
-        # Streaming variant of generate(), yielding delta/final events.
-        ...
-
-    async def register(self, base_model: str, record: AdapterRecord) -> None: ...
-    async def unregister(
-        self,
-        base_model: str,
-        adapter_id: str,
-        expected_generation: str | None = None,
-    ) -> None:
-        raise NotImplementedError
-
-
-class AdapterRouter:
-    """Tracks adapter -> base_model so a request naming an adapter routes to its engine."""
-
-    def __init__(self, records: list[AdapterRecord] | None = None) -> None:
-        self._registry = AdapterRegistry()
-        if records:
-            self._registry.hydrate(records)
-
-    def hydrate(self, records: list[AdapterRecord]) -> None:
-        self._registry.hydrate(records)
-
-    def upsert(self, record: AdapterRecord, *, revive: bool = False) -> AdapterRecord:
-        return self._registry.upsert(record, revive=revive)
-
-    def get(self, adapter_id: str) -> AdapterRecord | None:
-        return self._registry.get(adapter_id)
-
-    def has(self, adapter_id: str) -> bool:
-        return self._registry.has(adapter_id)
-
-    def remove(self, adapter_id: str) -> AdapterRecord | None:
-        return self._registry.remove(adapter_id)
-
-    def resolve(self, adapter_id: str) -> tuple[AdapterRecord, AdapterRecord] | None:
-        requested = self._registry.get(adapter_id)
-        if requested is None or requested.status != "ready":
-            return None
-        if requested.serve_base_model:
-            return requested, requested
-        if requested.is_revision and requested.org_id is not None:
-            return requested, requested
-        if not requested.is_alias or requested.org_id is None or requested.alias_of is None:
-            return None
-        target = self._registry.get(requested.alias_of)
-        if target is None or target.status != "ready" or not target.is_revision:
-            return None
-        if (
-            target.org_id != requested.org_id
-            or target.base_model != requested.base_model
-            or target.run_id != requested.run_id
-            or requested.adapter_id != requested.run_id
-        ):
-            return None
-        return requested, target
-
-    def base_model_for(self, adapter_id: str) -> str | None:
-        resolved = self.resolve(adapter_id)
-        return resolved[1].base_model if resolved is not None else None
-
-    def base_models(self) -> list[str]:
-        return sorted({target.base_model for _, target in self._resolved_ready()})
-
-    def ready_adapters(self) -> list[AdapterRecord]:
-        return [requested for requested, _ in self._resolved_ready()]
-
-    def ready_records(self) -> list[AdapterRecord]:
-        return self._registry.list_ready()
-
-    def _resolved_ready(self) -> list[tuple[AdapterRecord, AdapterRecord]]:
-        resolved: list[tuple[AdapterRecord, AdapterRecord]] = []
-        for record in self._registry.list_ready():
-            pair = self.resolve(record.adapter_id)
-            if pair is not None:
-                resolved.append(pair)
-        return resolved
-
+# Routing state (EnginePool protocol, AdapterRouter) lives in routing.py; re-exported because the
+# handlers below and the tests reference these names unqualified.
+from flash.serving.src.http_headers import (  # noqa: E402
+    _bearer_token,
+    _checkpoint_headers,
+)
+from flash.serving.src.routing import AdapterRouter, EnginePool  # noqa: E402
 
 def build_serving_app(
     pool: EnginePool,
@@ -419,18 +192,10 @@ def build_serving_app(
         if not presented:
             return False
         # Evaluate every compare_digest (list comp, not a generator) so the per-key constant-time
-        # compare always runs — a short-circuiting any() would leak which key matched via timing.
+        # compare always runs -- a short-circuiting any() would leak which key matched via timing.
         # C419 (prefer a generator) is exactly the rewrite the comment above forbids: a
         # generator short-circuits, which is the timing leak. The list is load-bearing.
         return any([hmac.compare_digest(presented, k) for k in _trusted_internal_keys])  # noqa: C419
-
-    def _bearer_token(request: Request) -> str | None:
-        header = request.headers.get("Authorization") or ""
-        scheme, _, value = header.partition(" ")
-        if scheme.lower() != "bearer":
-            return None
-        token = value.strip()
-        return token or None
 
     def _assert_supported_base_model(base_model: str) -> None:
         if is_supported_base_model(base_model):
@@ -476,10 +241,6 @@ def build_serving_app(
         if match:
             return f"{record.adapter_id}/{match.group(1)}"
         return record.adapter_id
-
-    def _checkpoint_headers(active_checkpoint: Any) -> dict[str, str]:
-        checkpoint = str(active_checkpoint or "").strip()
-        return {"X-Freesolo-Checkpoint": checkpoint} if checkpoint else {}
 
     def _revision_provenance(
         target: AdapterRecord, active_checkpoint: Any

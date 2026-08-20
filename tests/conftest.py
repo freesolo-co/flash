@@ -438,3 +438,20 @@ def stub_serving_registry(monkeypatch):
         monkeypatch.setattr(_deploy.httpx, "get", lambda *a, **k: _RegistryResp())
 
     return _stub
+
+
+def pytest_configure(config) -> None:
+    """Install the serving suite's vLLM stub before any test module imports.
+
+    tests/serving/conftest.py installs it at import, which is enough for a plain run: pytest loads
+    that conftest before collecting the directory. It is NOT enough under `-n 2 --dist loadfile`,
+    which is what CI runs: a worker handed only tests/serving/test_per_model_gpu.py imports the
+    module without necessarily having loaded the serving conftest first, and the module-scope
+    `import vllm` inside its tests then raises ModuleNotFoundError. Installing from the root
+    conftest -- which every worker loads -- makes the stub independent of collection order.
+
+    No-op when real vLLM is importable, so the serving image's own environment is untouched.
+    """
+    from tests.serving.conftest import _install_vllm_stub
+
+    _install_vllm_stub()

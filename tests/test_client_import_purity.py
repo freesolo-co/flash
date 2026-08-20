@@ -30,6 +30,10 @@ SERVER_ONLY_PREFIXES = (
     "flash.serve.deploy",
     "flash.serve.export",
     "flash.serve.preflight",
+    # The serving app runs only inside the GPU container built from Dockerfile.serve, which
+    # installs the `serving` extra (modal, orjson, pydantic-settings) plus vLLM. Nothing a client
+    # imports reaches it, so its fastapi/pydantic/PIL imports stay at module scope.
+    "flash.serving",
 )
 
 _PROBE = r"""

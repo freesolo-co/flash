@@ -239,6 +239,12 @@ def test_real_qwen_processor_renders_preserved_tool_history() -> None:
         processor = AutoProcessor.from_pretrained(QWEN, local_files_only=True)
     except OSError:
         pytest.skip("Qwen processor is not cached locally")
+    except ImportError as exc:
+        # The Qwen3-VL processor pulls in a video processor that requires torch/torchvision. The
+        # flash offline test env installs neither (torch lives in the `gpu` extra), so without this
+        # the test FAILS there rather than skipping -- a red required check for a missing optional
+        # dependency, not a defect in the code under test.
+        pytest.skip(f"Qwen processor needs torch/torchvision: {exc}")
     template_messages, images = prepare_multimodal_request(
         _tool_history_messages(with_image=True),
         image_limit=4,
