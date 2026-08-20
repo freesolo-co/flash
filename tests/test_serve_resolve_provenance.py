@@ -125,3 +125,51 @@ def test_an_unreadable_config_is_a_resolve_error(monkeypatch, tmp_path) -> None:
 
     with pytest.raises(ResolveError):
         _resolve()
+
+
+@pytest.mark.parametrize("unset", ["", "   ", None])
+def test_absent_hub_token_is_none_rather_than_an_empty_bearer(monkeypatch, unset) -> None:
+    """No token must mean *no credential*, not an empty one.
+
+    `huggingface_hub` sends any non-None token, building the literal header `Bearer `, which httpx
+    rejects as an illegal header value. The request therefore dies with `LocalProtocolError` before
+    it leaves the process, which surfaces as the same "could not resolve the commit" message a
+    genuinely private repo produces. That made every PUBLIC serving checkpoint unreadable to a
+    self-hoster who has no `HF_TOKEN` at all -- the exact user this path exists for.
+
+    Asserted on the value handed to `HfApi`, because that is where the malformed header is built;
+    a test that only checked `_token()` would keep passing if a caller reintroduced `or ""`.
+    """
+    if unset is None:
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("HF_TOKEN", unset)
+
+    seen: list[object] = []
+
+    class _Api:
+        def __init__(self, token=None):
+            seen.append(token)
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+
+    resolve_module._hub_api()
+
+    assert seen == [None], seen
+
+
+def test_a_real_hub_token_is_still_forwarded(monkeypatch) -> None:
+    """The fix must not stop sending a credential that exists -- private repos still need it."""
+    monkeypatch.setenv("HF_TOKEN", "  hf_realtoken  ")
+
+    seen: list[object] = []
+
+    class _Api:
+        def __init__(self, token=None):
+            seen.append(token)
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+
+    resolve_module._hub_api()
+
+    assert seen == ["hf_realtoken"], seen

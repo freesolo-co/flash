@@ -1345,3 +1345,25 @@ def test_environment_web_suffix_is_part_of_the_expected_public_url() -> None:
         f"https://workspace--{unsuffixed.endpoint_label}.modal.run"
     )
     assert len(f"workspace-dev--{plan.endpoint_label}") <= 63
+
+
+@pytest.mark.parametrize("bad", ["dev_test", "Dev", "-dev", "dev-", "dev.test", "dev test"])
+def test_a_malformed_web_suffix_is_rejected_before_any_resource_is_created(bad: str) -> None:
+    """A suffix that cannot appear in a hostname must fail while planning, not after billing.
+
+    `web_suffix` is concatenated into the same hostname label as the workspace
+    (`<workspace>-<suffix>--<label>.modal.run`). `validate_modal_placement` only required it to be
+    nonempty, so `dev_test` produced an `expected_public_url` that no real Modal hostname can ever
+    equal -- and `validate_modal_plan` accepted it. The mismatch would surface only when the probe
+    compared against Modal's actual URL, by which point the secrets, volume, and app exist and the
+    GPU is billing, and the run ends `outcome_unknown` with live resources.
+    """
+    with pytest.raises(ValueError, match="web_suffix"):
+        build_modal_create_plan(_bundle(web_suffix=bad), phase="finalized")
+
+
+def test_a_wellformed_web_suffix_still_builds_its_plan() -> None:
+    """The guard must not reject the suffixes Modal actually issues."""
+    plan = build_modal_create_plan(_bundle(web_suffix="dev-2"), phase="finalized")
+
+    assert "-dev-2--" in plan.expected_public_url

@@ -23,9 +23,30 @@ from flash.serve.control.types import validate_deployment_spec
 
 MAX_CANONICAL_MANIFEST_BYTES = 48 * 1024
 MAX_ENCODED_MANIFEST_BYTES = 64 * 1024
-LAUNCHER_ABI_ID = "fsla1-" + base64.urlsafe_b64encode(
-    hashlib.sha256(b"flash.serve.app.launch:v1").digest()
-).decode("ascii").rstrip("=")
+
+
+def _launcher_abi_id() -> str:
+    """The launcher ABI, bound to the wrapper source that will actually run.
+
+    `deploy_app` copies the *local* `_modal_wrapper.py` over the file in the pinned image
+    (`add_local_file`), so the code the container executes is not covered by
+    `bundle.image.digest`. Hashing a fixed literal here meant a CLI and an image from different
+    releases produced identical provenance -- the manifest, engine id, handle, and readiness proof
+    all still reported only the registry digest, so modified or incompatible wrapper code could run
+    (or crash) under provenance claiming immutability it did not have.
+
+    Hashing the file's bytes folds the injected source into the engine identity, so a wrapper
+    change is a different deployment rather than a silent substitution.
+    """
+
+    from pathlib import Path
+
+    wrapper = (Path(__file__).with_name("_modal_wrapper.py")).read_bytes()
+    digest = hashlib.sha256(b"flash.serve.app.launch:v1\0" + wrapper).digest()
+    return "fsla1-" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+LAUNCHER_ABI_ID = _launcher_abi_id()
 
 _IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")

@@ -98,6 +98,19 @@ def _report(result) -> int:
     return 1
 
 
+def _build_provider_plan(provider: str, bundle) -> None:
+    """run the provider's own plan validation without contacting it."""
+
+    if provider == "modal":
+        from flash.serve.provisioning._modal_plan import build_modal_create_plan
+
+        build_modal_create_plan(bundle, phase="finalized")
+        return
+    from flash.serve.provisioning._runpod_plan import build_runpod_create_plan
+
+    build_runpod_create_plan(bundle)
+
+
 def cmd_serve_deploy(args) -> int:
     from flash.serve.control import DeploymentRequest
     from flash.serve.profiles import ProfileError, get_profile, placement_for
@@ -169,6 +182,16 @@ def cmd_serve_deploy(args) -> int:
         return _err(str(exc))
 
     if getattr(args, "dry_run", False):
+        try:
+            # build the provider plan too, not just the bundle. the generic placement types accept
+            # any nonempty string, while the provider-specific `_validate_placement` is what
+            # enforces the hostname charset -- so an uppercase workspace or an underscored region
+            # passed the dry run and then raised an uncaught ValueError during a real deployment,
+            # after hub resolution. "validated every input" has to mean the ones the provider
+            # applies.
+            _build_provider_plan(provider, bundle)
+        except (ValueError, TypeError) as exc:
+            return _err(str(exc))
         for key, value in dry_run_deployment(bundle).items():
             print(f"{key:18} {value}")
         print("\ndry run: no provider was contacted and nothing was provisioned.")

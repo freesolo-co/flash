@@ -42,8 +42,17 @@ class ResolvedDeploymentInputs:
     execution: AdapterExecutionInput
 
 
-def _token() -> str:
-    return os.environ.get("HF_TOKEN", "")
+def _token() -> str | None:
+    """the hub credential, or None when there is genuinely none.
+
+    `None` and `""` are not interchangeable here. `huggingface_hub` treats a falsy-but-present
+    token as a credential to send, and builds the literal header `Bearer `, which `httpx` rejects
+    as an illegal header value -- so an unset `HF_TOKEN` raised `LocalProtocolError` before any
+    request left the process. That failure is indistinguishable from the repo being private, and it
+    made every PUBLIC serving checkpoint unreadable to a self-hoster who has no token at all.
+    """
+
+    return os.environ.get("HF_TOKEN", "").strip() or None
 
 
 def _hub_api():

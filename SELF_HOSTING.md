@@ -365,7 +365,9 @@ independent of serving. Catalog serving checkpoint repositories are informationa
 resolved by the training path.
 
 ```bash
-pip install freesolo-flash
+# the `server` extra, not the bare install: `serve deploy` resolves the adapter through
+# huggingface_hub and drives modal's sdk, and `[project].dependencies` is empty by design.
+pip install 'freesolo-flash[server]'
 export HF_TOKEN=hf_...
 export FLASH_SERVING_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
 
@@ -380,8 +382,16 @@ flash serve deploy \
   --image ghcr.io/freesolo-co/freesolo-flash-serve@sha256:<digest> \
   --artifact-repo <hub-repo> \
   --artifact-subfolder <path-within-repo> \
-  --lora-rank 32
+  --lora-rank 32 \
+  --modal-workspace <your-workspace> \
+  --modal-environment main \
+  --modal-region us-east
 ```
+
+The three `--modal-*` placement flags are required for `--provider modal` even though `--help`
+lists them as optional: they are optional to *argparse* because RunPod takes its own pair instead,
+and `placement_for` is what requires exactly one provider's set. Omitting them exits with
+`modal placement requires environment, region, workspace_name`.
 
 For RunPod, pass `--provider runpod` and export `RUNPOD_API_KEY` instead.
 

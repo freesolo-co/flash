@@ -385,3 +385,33 @@ def test_manifest_codec_rejects_trailing_malformed_noncanonical_and_wrong_identi
     ).decode("ascii")
     with pytest.raises(ValueError, match="not canonical"):
         decode_manifest_environment(noncanonical)
+
+
+def test_the_launcher_abi_tracks_the_wrapper_source_that_actually_runs(tmp_path) -> None:
+    """A changed wrapper must change the deployment identity.
+
+    `deploy_app` copies the CLI's local `_modal_wrapper.py` over the copy inside the pinned image,
+    so the executed code is NOT covered by `bundle.image.digest`. While the ABI was a hash of a
+    fixed literal, a CLI and an image from different releases produced byte-identical provenance:
+    the manifest, engine id, provider handle, and readiness proof all reported only the registry
+    digest, so substituted wrapper code ran under an immutability claim it did not satisfy.
+
+    Recomputed from bytes rather than asserting a pinned constant, so this keeps testing the
+    binding itself instead of freezing today's digest.
+    """
+    import base64
+    import hashlib
+    from pathlib import Path
+
+    from flash.serve.provisioning import _common
+
+    wrapper = Path(_common.__file__).with_name("_modal_wrapper.py")
+    expected = "fsla1-" + base64.urlsafe_b64encode(
+        hashlib.sha256(b"flash.serve.app.launch:v1\0" + wrapper.read_bytes()).digest()
+    ).decode("ascii").rstrip("=")
+    assert expected == _common.LAUNCHER_ABI_ID
+
+    # and a different wrapper yields a different id -- the property that makes it provenance.
+    altered = hashlib.sha256(b"flash.serve.app.launch:v1\0" + wrapper.read_bytes() + b"# x\n")
+    altered_id = "fsla1-" + base64.urlsafe_b64encode(altered.digest()).decode("ascii").rstrip("=")
+    assert altered_id != _common.LAUNCHER_ABI_ID

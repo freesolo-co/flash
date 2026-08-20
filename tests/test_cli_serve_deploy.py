@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import pathlib
 import re
+import shlex
 import tomllib
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from flash.cli.commands import serve_deploy
 from flash.cli.commands.serve_deploy import cmd_serve_deploy
 from flash.cli.serve_parser import _add_serve_commands
+from flash.serve.profiles import get_profile, placement_for
 
 DIGEST = "sha256:" + "a" * 64
 IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{DIGEST}"
@@ -410,6 +412,26 @@ def test_self_hosting_docs_document_a_command_that_exists() -> None:
     assert documented <= accepted, documented - accepted
     assert required <= documented, required - documented
 
+    # argparse-required is not the same as runnable. The `--modal-*` placement flags are optional
+    # to argparse (RunPod takes its own pair instead), but `placement_for` requires exactly one
+    # provider's full set, so a modal example without them exits with "modal placement requires
+    # environment, region, workspace_name". Drive the real resolver rather than re-listing flags.
+    parsed = deploy.parse_args(shlex.split(example.replace("\\\n", " ")))
+    placement_for(
+        get_profile(parsed.model),
+        parsed.provider,
+        workspace_name=parsed.modal_workspace,
+        environment=parsed.modal_environment,
+        region=parsed.modal_region,
+        web_suffix=(parsed.modal_web_suffix or None),
+        account_id=parsed.runpod_account,
+        data_center_id=parsed.runpod_data_center,
+    )
+
+    # and the documented install must supply what the command imports: the base install has no
+    # dependencies at all, so `pip install freesolo-flash` alone dies in `_hub_api`.
+    assert "pip install 'freesolo-flash[server]'" in doc
+
 
 def test_self_hosting_docs_do_not_route_the_plane_key_to_a_customer_endpoint() -> None:
     """The documented way to call a `serve deploy` endpoint must be the one it authenticates.
@@ -501,3 +523,28 @@ def test_a_positive_finite_timeout_is_accepted() -> None:
         ]
     )
     assert args.timeout == 0.5
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [("modal_workspace", "UPPER"), ("modal_region", "us_east"), ("modal_web_suffix", "dev_test")],
+)
+def test_dry_run_rejects_placement_a_real_deployment_would_reject(
+    monkeypatch: pytest.MonkeyPatch, field: str, bad: str
+) -> None:
+    """A dry run that prints success must not be followed by a deploy that dies on the same input.
+
+    `ModalPlacement` and `placement_for` accept any nonempty string; the hostname charset is
+    enforced by `_validate_placement` inside `build_modal_create_plan`, which a dry run never
+    reached. So `--dry-run` reported "validated every input" for an uppercase workspace or an
+    underscored region, and the real deployment then raised an uncaught `ValueError` -- as a
+    traceback, after Hub resolution had already run.
+    """
+    _stub_resolution(monkeypatch)
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("a dry run must not reach the provider")
+
+    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _explode)
+
+    assert cmd_serve_deploy(_args(dry_run=True, **{field: bad})) == 1

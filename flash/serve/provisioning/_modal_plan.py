@@ -63,6 +63,13 @@ def _canonical_hash(value: dict[str, object]) -> str:
 def _validate_placement(placement: ModalPlacement) -> None:
     if _SUBDOMAIN_RE.fullmatch(placement.workspace_name) is None:
         raise ValueError("modal workspace_name must be an exact lowercase subdomain label")
+    # the suffix is concatenated into the same hostname label as the workspace
+    # (`<workspace>-<suffix>--<label>.modal.run`), so it needs the workspace's charset, not merely
+    # "nonempty". `dev_test` builds a syntactically valid-looking expected url that no modal
+    # hostname can ever equal, and nothing downstream rejects it: the mismatch is only discovered
+    # against modal's real url, after the secrets, volume, and app already exist and bill.
+    if placement.web_suffix is not None and _SUBDOMAIN_RE.fullmatch(placement.web_suffix) is None:
+        raise ValueError("modal web_suffix must be an exact lowercase subdomain label")
     if _ENVIRONMENT_RE.fullmatch(
         placement.environment
     ) is None or placement.environment.lower().startswith("en-"):
