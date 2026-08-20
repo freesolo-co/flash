@@ -14,7 +14,7 @@ from flash.adapters.fused_experts import (
     validate_fused_expert_adapter_config,
 )
 from flash.adapters.lora_rank import resolve_adapter_ref
-from flash.adapters.targets import resolve_lora_targeting
+from flash.adapters.targets import LoraTargeting, resolve_lora_targeting
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.worker.io.hf import (
     RetriableInfraError,
@@ -33,8 +33,22 @@ _ADAPTER_DOWNLOAD_RETRIES = 4
 _ADAPTER_DOWNLOAD_BACKOFF_S = 5.0
 
 
-def validate_warmstart_adapter(config: Mapping[str, Any], model_id: str, adapter_dir: str) -> None:
+def validate_warmstart_adapter(
+    config: Mapping[str, Any],
+    model_id: str,
+    adapter_dir: str,
+    targeting: LoraTargeting,
+) -> None:
     """Validate a downloaded warm-start adapter without changing its config or files."""
+    source_is_multimodal = config.get("exclude_modules") is None
+    run_is_multimodal = targeting.exclude_modules is None
+    if source_is_multimodal != run_is_multimodal:
+        source_modality = "multimodal (image-trained)" if source_is_multimodal else "text-only"
+        run_modality = "multimodal" if run_is_multimodal else "text-only"
+        raise ValueError(
+            f"warm-start modality mismatch: a {run_modality} run cannot continue a "
+            f"{source_modality} adapter; start a fresh run or use a matching-modality source adapter"
+        )
     validate_fused_expert_adapter_config(config, model_id)
     if not lora_target_parameters(model_id):
         return

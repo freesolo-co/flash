@@ -351,7 +351,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
         if isinstance(target_modules, set | frozenset):
             target_modules = sorted(target_modules)
         warmstart_adapter = _sft_train._warmstart_adapter_path(
-            options.model_id, options.model_revision, lora_rank
+            options.model_id, options.model_revision, lora_rank, targeting
         )
         vocab_size = _sft_train._resolve_sft_vocab_size(options.model_id, options.model_revision)
         # hoisted into the span: on a PINNED revision this falls through to a live AutoConfig read

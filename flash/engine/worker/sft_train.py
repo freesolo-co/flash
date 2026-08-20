@@ -53,7 +53,9 @@ def _cached_model_path(model_id: str, model_revision: str) -> str:
     )
 
 
-def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: int) -> str | None:
+def _warmstart_adapter_path(
+    model_id: str, model_revision: str, expected_rank: int, targeting
+) -> str | None:
     """Stage and verify this run's warm-start source adapter; None when it is not a warm start.
 
     Shared by the SFT and OPD runners (see ``opd_train``), and the source adapter may come from a
@@ -75,7 +77,7 @@ def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: i
             f"warm-start adapter rank {rank} does not match the prepared train.lora_rank "
             f"{expected_rank}; rank changes are not supported"
         )
-    _w.validate_warmstart_adapter(config, model_id, adapter_dir)
+    _w.validate_warmstart_adapter(config, model_id, adapter_dir, targeting)
     base = str(config.get("base_model_name_or_path") or "").strip()
     if base and base != model_id:
         raise ValueError("warm-start adapter base model does not match the target model")

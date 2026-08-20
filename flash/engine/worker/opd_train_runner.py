@@ -389,7 +389,9 @@ def _prepare_workload(
         int(lora_config.lora_alpha),
         target_modules,
         targeting.exclude_modules,
-        _opd_train._warmstart_adapter_path(request.model_id, request.model_revision, lora_rank),
+        _opd_train._warmstart_adapter_path(
+            request.model_id, request.model_revision, lora_rank, targeting
+        ),
     )
 
 

@@ -9,11 +9,14 @@ import numpy as np
 import pytest
 from safetensors.numpy import save
 
+from flash.adapters.targets import resolve_lora_targeting
+
 _MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
 # every export in this file is a text-only run, and the exporter reads the modality off
 # `exclude_modules`: the language-prefix regex `resolve_lora_targeting` emits for a text-only run,
 # None for a multimodal one. stating it keeps these artifacts under the strict text contract.
 _TEXT_ONLY_EXCLUDE = r"^(?!model\.language_model(?:\.|$)).*$"
+_TEXT_TARGETING = resolve_lora_targeting(_MODEL_ID, algorithm="sft", multimodal=False)
 _TARGETS = [
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
@@ -251,6 +254,7 @@ def _valid_config(**overrides):
         "r": 32,
         "target_modules": ["q_proj"],
         "target_parameters": list(_TARGETS),
+        "exclude_modules": _TEXT_ONLY_EXCLUDE,
     }
     config.update(overrides)
     return config
@@ -970,7 +974,7 @@ def test_strict_worker_accepts_current_config_without_changing_memory_or_disk(
     before_config = copy.deepcopy(config)
     before_file = (tmp_path / "adapter_config.json").read_bytes()
 
-    worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path))
+    worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path), _TEXT_TARGETING)
 
     assert config == before_config
     assert (tmp_path / "adapter_config.json").read_bytes() == before_file
@@ -986,7 +990,7 @@ def test_strict_worker_rejects_missing_targets_without_changing_memory_or_disk(
     before_file = (tmp_path / "adapter_config.json").read_bytes()
 
     with pytest.raises(ValueError, match="omits required expert targets"):
-        worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path))
+        worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path), _TEXT_TARGETING)
 
     assert config == before_config
     assert (tmp_path / "adapter_config.json").read_bytes() == before_file
@@ -1003,7 +1007,7 @@ def test_strict_worker_rejects_synthetic_modules_without_changing_memory_or_disk
     before_file = (tmp_path / "adapter_config.json").read_bytes()
 
     with pytest.raises(ValueError, match="invalid synthetic target_modules"):
-        worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path))
+        worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path), _TEXT_TARGETING)
 
     assert config == before_config
     assert (tmp_path / "adapter_config.json").read_bytes() == before_file
@@ -1027,7 +1031,7 @@ def test_strict_worker_rejects_bad_tensor_artifacts_without_changing_config_or_f
     before_weights = (tmp_path / "adapter_model.safetensors").read_bytes()
 
     with pytest.raises(ValueError, match=message):
-        worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path))
+        worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path), _TEXT_TARGETING)
 
     assert config == before_config
     assert (tmp_path / "adapter_config.json").read_bytes() == before_config_file
@@ -1045,7 +1049,7 @@ def test_strict_worker_rejects_structurally_compatible_wrong_shapes(monkeypatch,
     before = (tmp_path / "adapter_config.json").read_bytes()
 
     with pytest.raises(ValueError, match="complete fused expert LoRA weights"):
-        worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path))
+        worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path), _TEXT_TARGETING)
 
     assert (tmp_path / "adapter_config.json").read_bytes() == before
 
@@ -1344,7 +1348,7 @@ def test_boundaries_reject_cross_namespace_fused_pairs(monkeypatch, tmp_path, bo
         config = _valid_config()
 
         def validate():
-            worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path))
+            worker.validate_warmstart_adapter(config, _MODEL_ID, str(tmp_path), _TEXT_TARGETING)
 
         expected_error = ValueError
 

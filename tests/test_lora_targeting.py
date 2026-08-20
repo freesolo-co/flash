@@ -184,6 +184,55 @@ def test_every_campaign_multimodal_trainer_keeps_the_existing_all_linear_surface
         assert targeting.target_parameters is None
 
 
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.6-35B-A3B"])
+def test_text_warmstart_rejects_an_image_trained_adapter_before_artifact_validation(
+    tmp_path, model_id
+):
+    from flash.engine.worker.model.adapter import validate_warmstart_adapter
+
+    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
+    source_config = {"target_modules": "all-linear", "exclude_modules": None}
+
+    with pytest.raises(
+        ValueError,
+        match=r"text-only run cannot continue a multimodal \(image-trained\) adapter",
+    ):
+        validate_warmstart_adapter(source_config, model_id, str(tmp_path), targeting)
+
+
+@pytest.mark.parametrize(
+    ("source_exclude_modules", "multimodal"),
+    [(r"^(?!model\.language_model(?:\.|$)).*$", False), (None, True)],
+)
+def test_warmstart_accepts_a_matching_source_modality(
+    tmp_path, source_exclude_modules, multimodal
+):
+    from flash.engine.worker.model.adapter import validate_warmstart_adapter
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=multimodal)
+    source_config = {
+        "target_modules": "all-linear",
+        "exclude_modules": source_exclude_modules,
+    }
+
+    validate_warmstart_adapter(source_config, model_id, str(tmp_path), targeting)
+
+
+def test_multimodal_warmstart_rejects_a_text_only_adapter(tmp_path):
+    from flash.engine.worker.model.adapter import validate_warmstart_adapter
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=True)
+    source_config = {
+        "target_modules": "all-linear",
+        "exclude_modules": r"^(?!model\.language_model(?:\.|$)).*$",
+    }
+
+    with pytest.raises(ValueError, match="multimodal run cannot continue a text-only adapter"):
+        validate_warmstart_adapter(source_config, model_id, str(tmp_path), targeting)
+
+
 @dataclass(frozen=True)
 class _FrozenModelConfig:
     target_modules: object = "all-linear"
