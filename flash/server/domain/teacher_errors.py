@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from flash.teacher.provider_status import (
-    BODY_INDEPENDENT_TRANSIENT_STATUSES,
+    BROKER_TRANSIENT_STATUSES,
     DEFAULT_TRANSIENT_STATUS,
     validated_provider_status,
 )
@@ -29,12 +29,11 @@ class TeacherBrokerError(RuntimeError):
     ) -> None:
         super().__init__(code)
         self.code = code
-        # a retryable failure must announce itself in the status line, because the structured body
-        # below can be replaced by any intermediary before it reaches the worker. see
-        # BODY_INDEPENDENT_TRANSIENT_STATUSES.
+        # preserve broker statuses whose structured classification makes them retryable. all other
+        # retryable failures use an unambiguous status so the signal survives a replaced body.
         self.status_code = (
             status_code
-            if not retryable or status_code in BODY_INDEPENDENT_TRANSIENT_STATUSES
+            if not retryable or status_code in BROKER_TRANSIENT_STATUSES
             else DEFAULT_TRANSIENT_STATUS
         )
         self.retryable = retryable

@@ -1118,6 +1118,119 @@ def test_rate_limit_survives_a_stripped_error_body(broker_ledger, monkeypatch):
     assert sleeps == [2.0]
 
 
+def _worker_client_after_http_error(monkeypatch, *, status, reason, body):
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    request_ids = []
+
+    def urlopen(_transport, request, timeout=None):
+        del timeout
+        request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
+        if len(request_ids) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                status,
+                reason,
+                {},
+                io.BytesIO(body),
+            )
+        return _StaticResponse(_parasail_success())
+
+    sleeps = []
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
+    client = worker_teacher.TeacherClient(
+        "capability-value",
+        "https://broker.example",
+        "parasail-glm-52",
+        tokenizer=_WholeTextTokenizer(),
+    )
+    return client, request_ids, sleeps
+
+
+@pytest.mark.parametrize(
+    "ledger_code",
+    ["outcome_unknown", "provider_rejected", "provider_contract_error"],
+)
+def test_bodyless_terminal_409_fails_closed_without_retry(monkeypatch, ledger_code):
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+    from flash.server.platform import db
+
+    broker_error = teacher_broker._map_ledger_error(
+        db.TeacherLedgerError(ledger_code), "request-terminal-conflict-001"
+    )
+    assert broker_error.status_code == 409
+    assert broker_error.retryable is False
+    client, request_ids, sleeps = _worker_client_after_http_error(
+        monkeypatch,
+        status=broker_error.status_code,
+        reason=broker_error.code,
+        body=b"",
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert len(request_ids) == 1
+    assert sleeps == []
+
+
+def test_bodyless_request_in_progress_409_fails_closed(monkeypatch):
+    from flash.engine.worker.teacher import client as worker_teacher
+    from flash.server.domain import teacher_broker
+    from flash.server.platform import db
+
+    broker_error = teacher_broker._map_ledger_error(
+        db.TeacherLedgerError("request_in_progress", retryable=True),
+        "request-in-progress-001",
+    )
+    assert broker_error.status_code == 409
+    assert broker_error.retryable is True
+    client, request_ids, sleeps = _worker_client_after_http_error(
+        monkeypatch,
+        status=broker_error.status_code,
+        reason=broker_error.code,
+        body=b"",
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert len(request_ids) == 1
+    assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    ("classification", "code", "should_retry"),
+    [
+        ("transient", "request_in_progress", True),
+        ("permanent", "provider_rejected", False),
+    ],
+)
+def test_classified_409_obeys_the_body(monkeypatch, classification, code, should_retry):
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    body = json.dumps({"error": {"code": code, "classification": classification}}).encode()
+    client, request_ids, sleeps = _worker_client_after_http_error(
+        monkeypatch, status=409, reason="conflict", body=body
+    )
+
+    if should_retry:
+        assert client.score("question", "answer").input_tokens == 1
+        assert len(request_ids) == 2
+        assert len(set(request_ids)) == 1
+        assert sleeps == [2.0]
+    else:
+        with pytest.raises(worker_teacher.TeacherError) as error:
+            client.score("question", "answer")
+        assert error.value.permanent is True
+        assert len(request_ids) == 1
+        assert sleeps == []
+
+
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
 def test_stripped_ambiguous_5xx_stays_terminal_and_never_redispatches(
     broker_ledger, monkeypatch, status

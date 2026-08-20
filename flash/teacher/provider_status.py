@@ -11,19 +11,21 @@ from __future__ import annotations
 # paid opd run. the worker cannot fall back to "5xx means retry", because a 5xx can arrive after
 # the provider already began work and redispatching would bill the same teacher request twice.
 #
-# so retryability travels in the status code, which every intermediary preserves. 409 marks an
-# in-progress replay the broker already owns, and 429 proves rejection before execution; neither
-# can be produced by an intermediary in a way that hides completed provider work, so both are safe
-# to retry without double-spending. the broker reports every retryable failure with one of these,
-# and the worker rescues only these when the body is missing. both sides read this definition.
+# so retryability travels in the status code, which every intermediary preserves. 429 proves
+# rejection before execution and is safe to retry without double-spending. 409 is overloaded by
+# the broker: it carries both an in-progress replay and terminal ledger conflicts, so it is
+# retryable only when its structured body says so.
 #
 # a status belongs here ONLY if a worker seeing it bare -- with no body, from an unknown hop --
-# can still conclude the provider did not begin work. that excludes 5xx, the ambiguous case that
-# bills twice on retry. it also excludes 408: the broker's own ingress timeout is pre-dispatch and
-# retryable, but a proxy between the broker and the worker emits 408 for its own timeout after
-# dispatch, and the worker cannot tell those apart. so the broker reports its ingress timeout as
-# 429 (the condition is a concurrency limit) rather than asking the worker to trust a bare 408.
-BODY_INDEPENDENT_TRANSIENT_STATUSES = frozenset({409, 429})
+# can still conclude the provider did not begin work. that excludes 409, 5xx, and 408. 5xx can
+# follow completed provider work. 408 can come from a proxy after dispatch. 409 can represent an
+# ambiguous or terminal ledger outcome. the broker reports retryable ingress limits as 429 rather
+# than asking the worker to trust one of those ambiguous statuses.
+BODY_INDEPENDENT_TRANSIENT_STATUSES = frozenset({429})
+
+# structured broker errors may preserve 409 for request_in_progress compatibility. unlike a bare
+# 409, its transient classification is authoritative and retries the same ledger request.
+BROKER_TRANSIENT_STATUSES = BODY_INDEPENDENT_TRANSIENT_STATUSES | {409}
 DEFAULT_TRANSIENT_STATUS = 429
 
 
