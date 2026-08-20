@@ -19,14 +19,13 @@ from flash.serving.src.engine_errors import (
 )
 from flash.serving.src.http_headers import _bearer_token, assert_internal, is_trusted_internal
 from flash.serving.src.lookup import AdapterLookup
-from flash.serving.src.model_config import gpu_for, is_supported_base_model
-from flash.serving.src.registration import persist_revision
+from flash.serving.src.registration import activate_revision, persist_revision
 from flash.serving.src.responses import (
     openai_chat_completion,
     openai_generate_fields,
     openai_include_usage,
 )
-from flash.serving.src.routing import AdapterRouter, EnginePool
+from flash.serving.src.routing import AdapterRouter, EnginePool, health_body
 from flash.serving.src.schemas import AdapterRecord, internal_adapter_payload
 from flash.serving.src.serving_io import (
     _assert_supported_base_model,
@@ -38,8 +37,6 @@ from flash.serving.src.serving_io import (
     _provenance_headers,
     _replace_stored_cas,
     _revision_provenance,
-    _validate_alias,
-    _validate_alias_target,
 )
 from flash.serving.src.streaming import openai_chat_stream, prepare_stream
 from flash.serving.src.structured_outputs import StructuredOutputsError
@@ -215,32 +212,17 @@ def build_serving_app(
 
     @api.get("/healthz", tags=["system"])
     async def healthz() -> dict[str, Any]:
-        models = router.base_models()
-        supported_models = [m for m in models if is_supported_base_model(m)]
-        unsupported_models = [m for m in models if not is_supported_base_model(m)]
-        # report configured per-model gpu tiers rather than live container counts, which modal does
-        # not expose here. ``gpus`` is the supported base-model engine count and remains stable when
-        # demand-driven containers scale to zero.
-        gpu_by_model = {m: gpu_for(m) for m in supported_models}
-        body = {
-            "ok": True,
-            "deployment_sha": deployment_sha,
-            "deployment_id": deployment_id,
-            "capabilities": [
+        return health_body(
+            router,
+            deployment_sha=deployment_sha,
+            deployment_id=deployment_id,
+            capabilities=[
                 "immutable_adapter_revisions",
                 "alias_compare_and_swap",
                 "revision_provenance",
                 THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY,
             ],
-            "base_models": models,
-            "gpus": len(supported_models),
-            "gpu_by_model": gpu_by_model,
-            "gpu_tiers": sorted(set(gpu_by_model.values())),
-            "adapters": len(router.ready_adapters()),
-        }
-        if unsupported_models:
-            body["unsupported_base_models"] = unsupported_models
-        return body
+        )
 
     @api.get("/adapters", tags=["adapters"])
     async def list_adapters(request: Request) -> dict[str, Any]:
@@ -308,55 +290,7 @@ def build_serving_app(
         revision_id: str, payload: AdapterActivationRequest, request: Request
     ) -> dict[str, Any]:
         _assert_internal(request)
-        try:
-            revision = await _get_stored(revision_id)
-        except PersistenceRecordError as exc:
-            raise HTTPException(status.HTTP_409_CONFLICT, "invalid revision record") from exc
-        if revision is None or not revision.is_revision:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown adapter id")
-        if revision.status != "ready":
-            raise HTTPException(status.HTTP_409_CONFLICT, "adapter revision is not ready")
-        run_id = revision.run_id
-        assert run_id is not None
-        try:
-            alias = await _get_stored(run_id)
-        except PersistenceRecordError as exc:
-            raise HTTPException(status.HTTP_409_CONFLICT, "invalid run alias") from exc
-        if alias is None:
-            raise HTTPException(status.HTTP_409_CONFLICT, "run alias is missing")
-        _validate_alias(alias, revision)
-        await _validate_alias_target(alias)
-        previous = None if alias.status == "disabled" else alias.alias_of
-        if payload.expected_adapter_revision != previous:
-            raise HTTPException(status.HTTP_409_CONFLICT, "stale adapter revision expectation")
-        if alias.updated_at is None:
-            raise HTTPException(status.HTTP_409_CONFLICT, "run alias has no CAS authority")
-
-        replacement = alias.model_copy(
-            update={
-                "status": "ready",
-                "metadata": {
-                    "record_type": "alias",
-                    "run_id": run_id,
-                    "alias_of": revision.adapter_id,
-                },
-            }
-        )
-        committed = await _replace_stored_cas(
-            replacement,
-            expected_updated_at=alias.updated_at,
-        )
-        if committed is None:
-            raise HTTPException(status.HTTP_409_CONFLICT, "run alias changed concurrently")
-        router.upsert(committed, revive=True)
-        router.upsert(revision, revive=True)
-        return {
-            "adapter_id": run_id,
-            "target_adapter_revision": revision.adapter_id,
-            "previous_adapter_revision": previous,
-            "checkpoint": revision.checkpoint,
-            "updated_at": internal_adapter_payload(committed)["updated_at"],
-        }
+        return await activate_revision(router, revision_id, payload.expected_adapter_revision)
 
     async def _unregister_safe(
         base_model: str,

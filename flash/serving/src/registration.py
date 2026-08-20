@@ -5,14 +5,17 @@ revision; the caller owns routing upserts and the deferred gpu registration. Per
 reached through serving_io, and the adapter router is passed in rather than captured.
 """
 
+from typing import Any
+
 from fastapi import HTTPException, status
 
 from flash.serving.src.persistence import PersistenceRecordError
 from flash.serving.src.routing import AdapterRouter
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.schemas import AdapterRecord, internal_adapter_payload
 from flash.serving.src.serving_io import (
     _get_stored,
     _insert_or_read,
+    _replace_stored_cas,
     _validate_alias,
     _validate_alias_target,
 )
@@ -96,3 +99,62 @@ async def persist_revision(
         _assert_matches_existing(stored, revision)
 
     return alias, stored
+
+
+async def activate_revision(
+    router: AdapterRouter,
+    revision_id: str,
+    expected_adapter_revision: str | None,
+) -> dict[str, Any]:
+    """Point a run alias at ``revision_id``, compare-and-swapping against the caller's expectation.
+
+    ``expected_adapter_revision`` is the revision the caller believes is live; a disabled alias
+    reads as ``None``. A mismatch means someone else activated in between, which is a conflict
+    rather than a silent overwrite.
+    """
+    try:
+        revision = await _get_stored(revision_id)
+    except PersistenceRecordError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "invalid revision record") from exc
+    if revision is None or not revision.is_revision:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown adapter id")
+    if revision.status != "ready":
+        raise HTTPException(status.HTTP_409_CONFLICT, "adapter revision is not ready")
+    run_id = revision.run_id
+    assert run_id is not None
+    try:
+        alias = await _get_stored(run_id)
+    except PersistenceRecordError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "invalid run alias") from exc
+    if alias is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "run alias is missing")
+    _validate_alias(alias, revision)
+    await _validate_alias_target(alias)
+    previous = None if alias.status == "disabled" else alias.alias_of
+    if expected_adapter_revision != previous:
+        raise HTTPException(status.HTTP_409_CONFLICT, "stale adapter revision expectation")
+    if alias.updated_at is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "run alias has no CAS authority")
+
+    replacement = alias.model_copy(
+        update={
+            "status": "ready",
+            "metadata": {
+                "record_type": "alias",
+                "run_id": run_id,
+                "alias_of": revision.adapter_id,
+            },
+        }
+    )
+    committed = await _replace_stored_cas(replacement, expected_updated_at=alias.updated_at)
+    if committed is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "run alias changed concurrently")
+    router.upsert(committed, revive=True)
+    router.upsert(revision, revive=True)
+    return {
+        "adapter_id": run_id,
+        "target_adapter_revision": revision.adapter_id,
+        "previous_adapter_revision": previous,
+        "checkpoint": revision.checkpoint,
+        "updated_at": internal_adapter_payload(committed)["updated_at"],
+    }

@@ -9,12 +9,12 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from flash.serving.src.model_config import (
-    base_models,
     gpu_for,
     is_supported_base_model,
 )
 from flash.serving.src.registry import AdapterRegistry
 from flash.serving.src.schemas import AdapterRecord
+
 
 class EnginePool(Protocol):
     """One vLLM engine per base model (Modal container in prod, fake in tests)."""
@@ -118,3 +118,32 @@ class AdapterRouter:
         return resolved
 
 
+def health_body(
+    router: AdapterRouter,
+    *,
+    deployment_sha: str,
+    deployment_id: str,
+    capabilities: list[str],
+) -> dict[str, Any]:
+    """/healthz body: what this deployment is, and which base models it can serve."""
+    models = router.base_models()
+    supported_models = [m for m in models if is_supported_base_model(m)]
+    unsupported_models = [m for m in models if not is_supported_base_model(m)]
+    # report configured per-model gpu tiers rather than live container counts, which modal does
+    # not expose here. ``gpus`` is the supported base-model engine count and remains stable when
+    # demand-driven containers scale to zero.
+    gpu_by_model = {m: gpu_for(m) for m in supported_models}
+    body = {
+        "ok": True,
+        "deployment_sha": deployment_sha,
+        "deployment_id": deployment_id,
+        "capabilities": capabilities,
+        "base_models": models,
+        "gpus": len(supported_models),
+        "gpu_by_model": gpu_by_model,
+        "gpu_tiers": sorted(set(gpu_by_model.values())),
+        "adapters": len(router.ready_adapters()),
+    }
+    if unsupported_models:
+        body["unsupported_base_models"] = unsupported_models
+    return body
