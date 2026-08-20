@@ -389,7 +389,7 @@ flash serve deploy \
 ```
 
 The three `--modal-*` placement flags are required for `--provider modal` even though `--help`
-lists them as optional: they are optional to *argparse* because RunPod takes its own pair instead,
+lists them as optional: they are optional to _argparse_ because RunPod takes its own pair instead,
 and `placement_for` is what requires exactly one provider's set. Omitting them exits with
 `modal placement requires environment, region, workspace_name`.
 
@@ -418,8 +418,9 @@ sending a plane-wide credential to a provider endpoint. The deployment serves `/
 `/v1/models`, and `/v1/chat/completions` -- it receives its adapters in an immutable manifest at
 boot and has no `/adapters` surface for `flash models deploy` to drive.
 
-The shared runtime supports bounded multimodal preparation. The packaged serving app remains
-text-only and returns `400` for image-bearing requests until that path is wired and GPU-validated.
+The shared runtime supports bounded multimodal preparation. A profile that declares `image_limit`
+loads a processor and accepts image-bearing requests up to that limit; a text profile declares none
+and returns `400` for them.
 
 `FREESOLO_SERVING_URL` belongs to the separate multi-LoRA backend behind `flash models deploy` /
 `chat` / `undeploy`; standalone refuses an unset or Freesolo-hosted value there for the same reason.

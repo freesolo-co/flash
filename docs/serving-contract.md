@@ -142,9 +142,10 @@ Every successful response reports the exact revision, checkpoint, and Hugging Fa
   `choices[0].delta.content`, followed by `data: [DONE]`. Preserve stop handling and provenance headers.
   A cold adapter may return `503` with a top-level retryable `adapter_unavailable` /
   `adapter_loading` error envelope and a `Retry-After` header.
-  The shared runtime supports bounded multimodal preparation. The packaged serving app is
-  intentionally text-only and returns `400` for image-bearing requests rather than answering without
-  seeing the image.
+  The shared runtime supports bounded multimodal preparation. An image-capable profile declares
+  `image_limit`, loads a processor, and accepts image-bearing requests up to that limit; a text
+  profile declares no `image_limit` and returns `400` for them rather than answering without seeing
+  the image.
 
 ## Undeploy
 
