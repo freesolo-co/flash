@@ -109,15 +109,34 @@ def test_public_parser_preserves_authored_shape_exactly():
     assert spec.train.group_size == 4
 
 
-def test_direct_jobspec_and_persisted_decode_reject_unsupported_historical_shapes():
-    with pytest.raises(ValueError, match="must be one of"):
-        JobSpec(
-            algorithm="grpo",
-            environment=EnvironmentSpec(id="owner/project/env"),
-            train=TrainSpec(prompts_per_step=64, group_size=16),
-        )
-    with pytest.raises(ValueError, match="must be one of"):
-        JobSpec.from_dict(_internal_grpo_train(prompts_per_step=64, group_size=16))
+def test_persisted_decode_reads_back_shapes_an_older_flash_accepted():
+    """The persisted decoder must not apply the authored-shape admission rule.
+
+    `spec_persistence` states the split: authored config goes through the STRICT
+    `schema.spec_from_dict`, while `JobSpec.from_dict` reads back immutable history that an older
+    Flash already wrote and never rewrites. The supported-group and completion-ceiling rules bound
+    what may be newly SUBMITTED; applying them on read makes a run recorded under the old schema
+    (every value >= 2, no completion ceiling) undecodable, and status, recovery, retry, deploy and
+    teardown all reconstruct existing runs through this decoder -- so an upgrade would strand them
+    with their endpoints still billing.
+    """
+    legacy_group = JobSpec.from_dict(_internal_grpo_train(prompts_per_step=64, group_size=16))
+    assert legacy_group.train.group_size == 16
+    assert legacy_group.train.prompts_per_step == 64
+
+    # and a historical run over today's completion ceiling reads back at its recorded shape.
+    legacy_width = JobSpec.from_dict(_internal_grpo_train(prompts_per_step=128, group_size=8))
+    assert legacy_width.train.prompts_per_step * legacy_width.train.group_size == 1024
+
+
+def test_authoring_still_rejects_the_shapes_persistence_reads_back():
+    """Relaxing the decoder must not relax what a user can newly submit."""
+    for train in (
+        {"prompts_per_step": 64, "group_size": 16},
+        {"prompts_per_step": 128, "group_size": 8},
+    ):
+        with pytest.raises(ConfigError):
+            spec_from_dict(_public_grpo_train(**train))
 
 
 @pytest.mark.parametrize(
@@ -129,7 +148,12 @@ def test_direct_jobspec_and_persisted_decode_reject_unsupported_historical_shape
         ("group_size", "8"),
     ],
 )
-def test_persisted_grpo_decode_rejects_permissive_integer_coercions(key, value):
+def test_persisted_grpo_decode_still_rejects_non_integer_shapes(key, value):
+    """Tolerating a historical VALUE is not tolerating a malformed TYPE.
+
+    A bool or string here was never written by any Flash; it is a corrupt record, and decoding it
+    would put a non-integer into arithmetic the runner does on these fields.
+    """
     with pytest.raises(TypeError, match=f"{key} must be an integer"):
         JobSpec.from_dict(_internal_grpo_train(**{key: value}))
 

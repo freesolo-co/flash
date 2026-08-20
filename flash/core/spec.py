@@ -27,7 +27,7 @@ from uuid import UUID
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
-from flash.core.grpo import GRPO_NATIVE_THREAD_ENV, resolve_grpo_rollout_shape
+from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec_persistence import (
     DROPPED_TOP_LEVEL_KEYS,
     REMOVED_PERSISTED_TRAIN_KEYS,
@@ -564,11 +564,6 @@ class JobSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
-        if str(self.algorithm or "").strip().lower() in {"grpo", "rl"}:
-            resolve_grpo_rollout_shape(
-                self.train.prompts_per_step,
-                self.train.group_size,
-            )
         # the marker qualifies a pin; it cannot outlive one. a spec carrying it with no revision
         # would let a later edit that clears model_revision leave a True marker behind, and the
         # deploy guard reads the pair.
@@ -723,10 +718,20 @@ class JobSpec:
         project = require_project_id(project_raw) if project_raw.strip() else ""
         algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
         if algorithm == "grpo":
+            # TYPE only, never the authored-shape rule. a persisted record is history an older
+            # Flash wrote under a looser schema (any group >= 2, no completion ceiling), so
+            # rejecting its VALUES here would strand a still-running job's status, recovery and
+            # teardown paths. a bool or string was never written by any Flash: that is a corrupt
+            # record, and the runner does arithmetic on both fields.
             persisted_prompts = train.get("prompts_per_step")
             if persisted_prompts is None and "batch_size" in train:
                 persisted_prompts = train.get("batch_size")
-            resolve_grpo_rollout_shape(persisted_prompts, train.get("group_size"))
+            for name, value in (
+                ("prompts_per_step", persisted_prompts),
+                ("group_size", train.get("group_size")),
+            ):
+                if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                    raise TypeError(f"train.{name} must be an integer or omitted for GRPO")
         # one reading of the optimizer batch for both keys: the rollout spelling changed in 1.1.43
         # and a persisted spec can still carry the old one.
         batch_size, prompts_per_step = migrated_optimizer_batch(train, algorithm)
