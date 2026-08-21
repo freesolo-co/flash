@@ -30,6 +30,7 @@ from fastapi import HTTPException
 import flash.server.routes.serving as serving
 import flash.server.routes.serving_completion as serving_completion
 import flash.server.routes.serving_smoke as serving_smoke
+from flash.content import multimodal
 from flash.engine.plan.recipe import RECIPE
 from flash.serve.deploy import AliasThinkingSilent, ServingError
 
@@ -330,6 +331,26 @@ def _image_block(url: str) -> dict:
     return {"type": "image_url", "image_url": {"url": url}}
 
 
+def _sized_png_data_uri(width: int, height: int) -> str:
+    """A real PNG of exact dimensions, for the pixel and decoded-memory limits."""
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), "red").save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _oversized_source_data_uri(payload_bytes: int) -> str:
+    """A data URI whose source exceeds a byte limit before any decode is attempted.
+
+    The bytes are not a decodable image on purpose: the byte limits must reject on size
+    alone, so a test that fed a real image here would not distinguish the byte guard from
+    the decoder refusing the result.
+    """
+    blob = b"\x89PNG\r\n\x1a\n" + b"\x00" * payload_bytes
+    return "data:image/png;base64," + base64.b64encode(blob).decode("ascii")
+
+
 @pytest.mark.parametrize(
     ("messages", "expected_detail"),
     [
@@ -352,6 +373,55 @@ def _image_block(url: str) -> dict:
             [{"role": "user", "content": [_image_block("https://example.com/a.png")]}],
             "remote image URLs are not supported",
             id="remote_url",
+        ),
+        pytest.param(
+            [{"role": "user", "content": [_image_block(_sized_png_data_uri(8192, 8192))]}],
+            f"exceeding the {multimodal.MAX_IMAGE_PIXELS}-pixel limit",
+            id="per_image_pixels",
+        ),
+        pytest.param(
+            [{"role": "user", "content": [_image_block(_sized_png_data_uri(9000, 8))]}],
+            "image dimensions 9000x8 exceed the 8192x8192 limit",
+            id="dimensions",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        _image_block(
+                            _oversized_source_data_uri(multimodal.MAX_IMAGE_SOURCE_BYTES + 1)
+                        )
+                    ],
+                }
+            ],
+            f"image source exceeds the {multimodal.MAX_IMAGE_SOURCE_BYTES}-byte limit",
+            id="per_image_source_bytes",
+        ),
+        pytest.param(
+            # three 6 MiB sources: each is under the per-image cap, their total is not.
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        _image_block(_oversized_source_data_uri(6 * 1024 * 1024)) for _ in range(3)
+                    ],
+                }
+            ],
+            f"exceeding the {multimodal.MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit",
+            id="aggregate_source_bytes",
+        ),
+        pytest.param(
+            # four 2400x2400 images: each is under the per-image pixel cap, but decoding
+            # them cumulatively as RGB needs ~69 MB against a 64 MiB budget.
+            [
+                {
+                    "role": "user",
+                    "content": [_image_block(_sized_png_data_uri(2400, 2400)) for _ in range(4)],
+                }
+            ],
+            f"example decoded images exceed the {multimodal.MAX_TOTAL_DECODED_BYTES}-byte limit",
+            id="aggregate_decoded_bytes",
         ),
     ],
 )
