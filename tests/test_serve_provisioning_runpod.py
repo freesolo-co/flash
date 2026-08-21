@@ -1903,6 +1903,38 @@ def test_read_only_reconcile_reports_unproven_rather_than_failed_for_a_live_pod(
     assert _mutation_calls(transport) == [], "a read-only reconcile must not mutate provider state"
 
 
+def test_read_only_reconcile_reports_unproven_rather_than_failed_for_a_terminal_pod() -> None:
+    """A terminal pod is not discardable either: its resources are still in the customer account.
+
+    `EXITED`/`FAILED` took a branch that returned a definite `failed` regardless of the caller's
+    `unproven_is_failure` policy, so a read-only reconcile -- which mutates nothing and therefore
+    cannot undo what it doubts -- told the supervisor the deployment was finished while the pod,
+    template, volume, and secrets stayed in the account, and the cli omitted its reconciliation
+    warning.
+    """
+
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, status="EXITED")
+    clock = transport.clock
+
+    result = reconcile_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=6.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(False),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert result.handle == handle
+    assert transport.pods, "the resources are still there, so the verdict must not read as done"
+    assert _mutation_calls(transport) == [], "a read-only reconcile must not mutate provider state"
+
+
 def test_a_deployment_that_vanishes_during_artifact_cleanup_is_not_reported_ready() -> None:
     """artifact absence alone cannot distinguish "token cleaned up" from "everything is gone".
 

@@ -249,10 +249,22 @@ def test_stop_sequences_normalize_to_a_tuple() -> None:
     assert GenerationRequest(prompt="x", stop="END").stop == ("END",)
     assert GenerationRequest(prompt="x", stop=["a", "b"]).stop == ("a", "b")
     assert GenerationRequest(prompt="x", stop=("a", "b")).stop == ("a", "b")
-    assert GenerationRequest(prompt="x", stop=[" pad "]).stop == ("pad",)
 
 
-@pytest.mark.parametrize("value", ["", "   ", ["ok", ""], ["ok", "  "], [1], ["ok", None], 7, {}])
+@pytest.mark.parametrize("value", ["\n\n", " END", "   ", "\t"])
+def test_stop_sequences_preserve_whitespace(value) -> None:
+    """Stop sequences are generation delimiters, so their content must survive verbatim.
+
+    Trimming them -- correct for identifiers like `model` or `adapter_id` -- either rejects a
+    valid stop ("\n\n" strips to empty) or silently changes it (" END" becomes "END", which
+    stops on a different string than the caller asked for). The hosted serving validator
+    preserves them, and the two paths must agree.
+    """
+    assert GenerationRequest(prompt="x", stop=value).stop == (value,)
+    assert GenerationRequest(prompt="x", stop=["ok", value]).stop == ("ok", value)
+
+
+@pytest.mark.parametrize("value", ["", ["ok", ""], [1], ["ok", None], 7, {}])
 def test_stop_sequences_reject_unusable_values(value) -> None:
     with pytest.raises(RuntimeConfigurationError):
         GenerationRequest(prompt="x", stop=value)

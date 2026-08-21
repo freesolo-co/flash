@@ -152,15 +152,26 @@ def _require_int(value: Any, name: str, *, minimum: int) -> int:
     return value
 
 
+def _stop_sequence(value: Any, name: str) -> str:
+    # deliberately not `_nonempty`: that trims, which is right for identifiers but destroys stop
+    # sequences. "\n\n" is a common delimiter and would strip to empty and be rejected, and
+    # " END" would silently become "END" -- a different sequence than the caller asked to stop on.
+    if not isinstance(value, str):
+        raise RuntimeConfigurationError(f"{name} must be a string")
+    if not value:
+        raise RuntimeConfigurationError(f"{name} must not be empty")
+    return value
+
+
 def _normalize_stop(value: Any, name: str) -> tuple[str, ...]:
     # a bare string is one stop sequence, not a sequence of single characters.
     if value is None:
         return ()
     if isinstance(value, str):
-        return (_nonempty(value, name),)
+        return (_stop_sequence(value, name),)
     if not isinstance(value, Sequence):
         raise RuntimeConfigurationError(f"{name} must be a string or a sequence of strings")
-    return tuple(_nonempty(entry, name) for entry in value)
+    return tuple(_stop_sequence(entry, name) for entry in value)
 
 
 def _require_finite_number(value: Any, name: str) -> float:

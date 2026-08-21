@@ -132,6 +132,13 @@ def read_only_reconcile(
         if state == "invalid":
             return failure_result(plan, LifecycleFailure("conflict"), handle=last_handle)
         if state == "failed":
+            # same reasoning as the unproven case below: a terminal pod is only *definitely*
+            # failed to a caller that can undo what it made. adoption and the read-only
+            # reconciliation path cannot -- the pod, template, volume, and secrets are still in
+            # the customer account, so answering "failed" lets the supervisor drop the record and
+            # strand them, and suppresses the cli's outcome-unknown reconciliation warning.
+            if not unproven_is_failure:
+                return unknown_result(plan, handle=last_handle)
             return failure_result(plan, LifecycleFailure("readiness_failed"), handle=last_handle)
         if (
             state == "running"
