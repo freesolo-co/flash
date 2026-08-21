@@ -1149,3 +1149,27 @@ def test_image_request_reaches_the_engine_with_its_sources_intact() -> None:
     assert prepare_multimodal_request(sent, image_limit=4)[1], (
         "the engine must be able to decode the images it was handed"
     )
+
+
+@pytest.mark.parametrize(
+    "tool_calls", [1, "x", [], ["not-an-object"], [{"function": {"name": "f"}}, 2]]
+)
+def test_malformed_tool_calls_are_rejected_before_the_chat_template(tool_calls: Any) -> None:
+    """`tool_calls` replaces content here, so an unusable value renders nothing.
+
+    The branch only checked that the key was present, so `tool_calls: 1` reached the chat template
+    and raised a jinja error from outside the rejection handler -- answered 503, which tells the
+    caller to retry a request that must fail identically. `flash/serve/runtime/multimodal.py`
+    already rejected these; both serving paths must answer the same way.
+    """
+    with pytest.raises(MultimodalRequestError):
+        normalize_chat_messages(
+            [{"role": "assistant", "content": None, "tool_calls": tool_calls}],
+            supports_images=False,
+            image_limit=4,
+        )
+
+
+def test_a_usable_tool_call_history_still_passes() -> None:
+    messages = [{"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "f"}}]}]
+    assert normalize_chat_messages(messages, supports_images=False, image_limit=4) == messages

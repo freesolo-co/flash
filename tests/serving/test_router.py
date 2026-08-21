@@ -795,6 +795,15 @@ def test_stream_disconnect_still_schedules_terminal_usage_once():
             )
         )
         await disconnect_sent.wait()
+        # hold the terminal event past the disconnect. the response must NOT complete here: the
+        # shielded drain keeps billing inside the request's own shutdown order, so a container
+        # stopping in this window still has a task to await rather than a silently dropped charge.
+        await asyncio.sleep(0)
+        assert not response_task.done(), (
+            "the response completed while the terminal event was still pending -- "
+            "the drain is orphaned and its usage can be lost"
+        )
+        assert reports == [], "usage cannot be scheduled before the terminal event arrives"
         release_final.set()
         await response_task
         return reports

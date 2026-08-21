@@ -148,6 +148,7 @@ def _normalize_messages(messages: Any) -> tuple[list[dict[str, Any]], list[str]]
             normalized.append(dict(message))
             continue
         if content is None and role == "assistant" and "tool_calls" in message:
+            _validate_tool_calls(message["tool_calls"], message_index)
             normalized.append(dict(message))
             continue
         if not isinstance(content, list):
@@ -182,6 +183,31 @@ def _normalize_messages(messages: Any) -> tuple[list[dict[str, Any]], list[str]]
             )
         normalized.append({**message, "content": normalized_blocks})
     return normalized, sources
+
+
+def _validate_tool_calls(tool_calls: Any, message_index: int) -> None:
+    """require the shape every tool-aware template iterates over.
+
+    This branch lets an assistant message carry `tool_calls` *instead of* content, but only tested
+    that the key was present, so `tool_calls: 1` reached the chat template and raised a jinja error
+    from outside the rejection handler -- answered 503, telling the caller to retry a request that
+    must fail identically. `flash/serve/runtime/multimodal.py` already rejects these; this keeps the
+    two serving paths answering the same question the same way.
+
+    Deliberately structural and no deeper: a template's real requirements are its own, so this
+    rejects only what no template can consume. An empty list is rejected too -- it means there are
+    no calls, leaving `content: null` with nothing to render.
+    """
+
+    if not isinstance(tool_calls, list) or not tool_calls:
+        raise MultimodalRequestError(
+            f"message {message_index} tool_calls must be a nonempty list of call objects"
+        )
+    for call_index, call in enumerate(tool_calls):
+        if not isinstance(call, dict):
+            raise MultimodalRequestError(
+                f"message {message_index} tool call {call_index} must be an object"
+            )
 
 
 def _image_source(block: dict[str, Any], message_index: int, block_index: int) -> str:
