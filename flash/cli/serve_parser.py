@@ -27,6 +27,21 @@ def _positive_finite_seconds(raw: str) -> float:
     return value
 
 
+def _positive_int(raw: str) -> int:
+    """Reject a generation that cannot order one deployment after another.
+
+    Same reasoning as `_positive_finite_seconds`, one step earlier: a bare `type=int` accepts `0`
+    and negatives, and `_require_positive_int` does not see the value until `DeploymentRequest` is
+    built -- which is after `resolve_adapter` has already resolved and downloaded the Hub inputs.
+    The error it eventually produces is a clean one, so this is wasted work rather than a crash,
+    but a value argparse can reject outright should not cost a Hub round trip first.
+    """
+    value = int(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, not {raw!r}")
+    return value
+
+
 def _add_serve_commands(sub: argparse._SubParsersAction) -> None:
     serve = sub.add_parser("serve", help="host a serving deployment on your own provider account")
     serve_sub = serve.add_subparsers(dest="serve_cmd", required=True)
@@ -64,7 +79,7 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction) -> None:
     )
     deploy.add_argument(
         "--generation",
-        type=int,
+        type=_positive_int,
         default=1,
         help="generation number for this deployment (default: 1)",
     )

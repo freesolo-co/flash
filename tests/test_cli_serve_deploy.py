@@ -618,3 +618,70 @@ def test_dry_run_rejects_placement_a_real_deployment_would_reject(
     monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _explode)
 
     assert cmd_serve_deploy(_args(dry_run=True, **{field: bad})) == 1
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "-999"])
+def test_a_generation_that_cannot_order_deployments_is_rejected_at_parse(bad: str) -> None:
+    """A bad `--generation` must fail as an argument error, before any resolution or download.
+
+    Same shape as the `--timeout` case above, one step earlier in the command. A bare `type=int`
+    accepts `0` and negatives, and `_require_positive_int` does not see the value until
+    `DeploymentRequest` is constructed -- which is after `resolve_adapter` has already resolved and
+    downloaded the Hub inputs. The eventual error is a clean one rather than a traceback, so the
+    cost is a wasted Hub round trip, not a crash; argparse can refuse it outright for nothing.
+    """
+    with pytest.raises(SystemExit):
+        _parse(
+            [
+                "serve",
+                "deploy",
+                "--provider",
+                "modal",
+                "--model",
+                MODEL,
+                "--run",
+                "run1",
+                "--deployment-id",
+                "deployment1",
+                "--image",
+                IMAGE,
+                "--artifact-repo",
+                "Freesolo-Co/artifacts",
+                "--artifact-subfolder",
+                "adapter",
+                "--lora-rank",
+                "32",
+                "--generation",
+                bad,
+            ]
+        )
+
+
+def test_a_positive_generation_is_accepted() -> None:
+    # parsed, not set post-hoc: _args assigns attributes after parsing, which would skip the
+    # argparse type entirely and pass no matter what the type does.
+    args = _parse(
+        [
+            "serve",
+            "deploy",
+            "--provider",
+            "modal",
+            "--model",
+            MODEL,
+            "--run",
+            "run1",
+            "--deployment-id",
+            "deployment1",
+            "--image",
+            IMAGE,
+            "--artifact-repo",
+            "Freesolo-Co/artifacts",
+            "--artifact-subfolder",
+            "adapter",
+            "--lora-rank",
+            "32",
+            "--generation",
+            "3",
+        ]
+    )
+    assert args.generation == 3
