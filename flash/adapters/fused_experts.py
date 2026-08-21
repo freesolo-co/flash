@@ -14,6 +14,8 @@ from flash.adapters.lora_rank import (
 )
 from flash.core.catalog import get_model
 
+_LORA_FACTOR_PATTERN = re.compile(r"\.lora_[AB]\.")
+_LORA_PARAMETER = "weight"
 _QWEN36_MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
 _QWEN36_EXPERT_TARGET_PARAMETERS = (
     "mlp.experts.gate_up_proj",
@@ -31,7 +33,7 @@ _FUSED_EXPERT_SYNTHETIC_MODULES = frozenset({"experts", "base_layer"})
 _FUSED_EXPERT_WRAPPER_MODULES = ("mlp.experts", "mlp.experts.base_layer")
 _INVALID_FUSED_LOCATION = object()
 
-_LoraTensor = tuple[str, str, str, str, tuple[int, ...]]
+_LoraTensor = tuple[str, str, str, tuple[int, ...]]
 _LoraPair = tuple[tuple[int, ...], tuple[int, ...]]
 
 
@@ -166,12 +168,13 @@ def has_complete_fused_expert_tensors(
     expected = _expected_fused_expert_rungs(config, model_id)
     if expected is None:
         return False
+    lora_keys = {key: shape for key, shape in tensors.items() if _LORA_FACTOR_PATTERN.search(key)}
     parsed = [
         tensor
-        for key, shape in tensors.items()
+        for key, shape in lora_keys.items()
         if (tensor := _parse_lora_tensor(key, shape)) is not None
     ]
-    if len({adapter_name for _, _, adapter_name, _, _ in parsed}) != 1:
+    if len(parsed) != len(lora_keys):
         return False
     return _has_complete_fused_rungs(parsed, expected, model_id) and _has_ordinary_evidence(
         parsed, config, expected
@@ -179,7 +182,17 @@ def has_complete_fused_expert_tensors(
 
 
 def _parse_lora_tensor(key: str, shape: tuple[int, ...]) -> _LoraTensor | None:
-    """Parse one canonical PEFT LoRA tensor key."""
+    """Parse one canonical PEFT LoRA tensor key.
+
+    Accept exactly the grammar PEFT writes: a bare ``lora_A.weight`` leaf with no adapter
+    namespace. ``get_peft_model_state_dict`` documents stripping the namespace on save, verl's
+    merger reproduces that strip, and ``_insert_adapter_name_into_state_dict`` re-inserts it on
+    load, so the stripped form is the only spelling that round-trips. Verified against peft 0.19.1:
+    ``...lora_A.weight`` loads as ``...lora_A.default.weight`` and matches the live module, while a
+    file that already carries the namespace loads as ``...lora_A.default.default.weight`` and
+    matches nothing. Since one grammar is accepted, the adapter namespace is no longer part of the
+    parsed identity.
+    """
     matches = [
         (factor, infix) for factor, infix in (("A", ".lora_A."), ("B", ".lora_B.")) if infix in key
     ]
@@ -187,13 +200,9 @@ def _parse_lora_tensor(key: str, shape: tuple[int, ...]) -> _LoraTensor | None:
         return None
     factor, infix = matches[0]
     module_path, _, leaf = key.partition(infix)
-    leaf_parts = leaf.split(".")
-    if not module_path or len(leaf_parts) != 2:
+    if not module_path or module_path.endswith(".") or leaf != _LORA_PARAMETER:
         return None
-    adapter_name, parameter = leaf_parts
-    if not adapter_name or parameter != "weight":
-        return None
-    return module_path, factor, adapter_name, key, shape
+    return module_path, factor, key, shape
 
 
 def _expected_fused_expert_rungs(
@@ -237,31 +246,25 @@ def _expected_fused_expert_rungs(
 def _has_complete_fused_rungs(
     tensors: list[_LoraTensor], expected: Mapping[str, Mapping[str, _LoraPair]], model_id: str
 ) -> bool:
-    """Validate every concrete fused owner, rung, namespace, and factor shape."""
+    """Validate every concrete fused owner, rung, and factor shape."""
     model = get_model(model_id)
     for owner, expected_rungs in expected.items():
-        factors: dict[str, dict[str, dict[str, dict[str, tuple[int, ...]]]]] = {}
-        for module_path, factor, adapter_name, _key, shape in tensors:
+        factors: dict[str, dict[str, dict[str, tuple[int, ...]]]] = {}
+        for module_path, factor, _key, shape in tensors:
             location = _fused_tensor_location(module_path, owner, frozenset(expected_rungs))
             if location is _INVALID_FUSED_LOCATION:
                 return False
             if location is None:
                 continue
             instance, rung = location
-            factors.setdefault(instance, {}).setdefault(rung, {}).setdefault(adapter_name, {})[
-                factor
-            ] = shape
+            factors.setdefault(instance, {}).setdefault(rung, {})[factor] = shape
         if not factors:
             return False
         for seen_rungs in factors.values():
             if set(seen_rungs) != set(expected_rungs):
                 return False
             for rung, expected_pair in expected_rungs.items():
-                namespaces = seen_rungs[rung]
-                if len(namespaces) != 1:
-                    return False
-                seen_factors = next(iter(namespaces.values()))
-                if _lora_pair_shapes(seen_factors) != expected_pair:
+                if _lora_pair_shapes(seen_rungs[rung]) != expected_pair:
                     return False
         expert_layers = {
             prefix
@@ -303,28 +306,27 @@ def _has_ordinary_evidence(
     config: Mapping[str, Any],
     fused_rungs: Mapping[str, Mapping[str, _LoraPair]],
 ) -> bool:
-    """Validate concrete ordinary target evidence with per-module ranks and namespaces."""
+    """Validate concrete ordinary target evidence with per-module ranks."""
     modules = config.get("target_modules")
     all_linear = modules == "all-linear"
     targets = () if all_linear else tuple(modules) if isinstance(modules, list) else ()
-    groups: dict[str, dict[str, dict[str, tuple[str, tuple[int, ...]]]]] = {}
+    groups: dict[str, dict[str, tuple[str, tuple[int, ...]]]] = {}
     evidence: set[str] = set()
-    for module_path, factor, adapter_name, key, shape in tensors:
+    for module_path, factor, key, shape in tensors:
         if _is_fused_rung(module_path, fused_rungs):
             continue
         matched = tuple(target for target in targets if _anchored_suffix_match(module_path, target))
         if not all_linear and not matched:
             continue
         evidence.update(matched)
-        groups.setdefault(module_path, {}).setdefault(adapter_name, {})[factor] = (key, shape)
+        groups.setdefault(module_path, {})[factor] = (key, shape)
     if not groups or (not all_linear and evidence != set(targets)):
         return False
 
     declared = declared_lora_ranks(config)
-    for module_path, namespaces in groups.items():
-        if len(namespaces) != 1 or _rank_for_module(module_path, declared) is None:
+    for module_path, factors in groups.items():
+        if _rank_for_module(module_path, declared) is None:
             return False
-        factors = next(iter(namespaces.values()))
         if set(factors) != {"A", "B"}:
             return False
         for key, shape in factors.values():
