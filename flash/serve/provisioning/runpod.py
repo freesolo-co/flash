@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from typing import Protocol
 
 from flash.serve.control import (
     DeploymentResult,
@@ -17,7 +16,6 @@ from ._common import (
     DeploymentBundle,
     InterruptedProvisioning,
     ServingRuntimeSecrets,
-    failed_deployment_result,
 )
 from ._runpod_lifecycle import Clock, LifecycleFailure, Sleeper, TransportFactory
 from ._runpod_mutations import MutationKind, MutationLedger
@@ -42,6 +40,16 @@ from ._runpod_protocol import (
     parse_templates,
     parse_volumes,
 )
+from ._runpod_readiness import (
+    DeleteSecret,
+    EndpointProbe,
+    Observe,
+    await_ready_and_reclaim,
+    failure_result,
+    read_only_reconcile,
+    sleep_until_poll,
+    unknown_result,
+)
 from ._runpod_resources import (
     RunPodResourceConflict,
     build_handle,
@@ -49,7 +57,6 @@ from ._runpod_resources import (
     exact_core_resources,
     exact_teardown_resources,
     pod_identity_matches,
-    readiness_state,
     template_identity_matches,
     volume_identity_matches,
 )
@@ -58,9 +65,6 @@ from ._runpod_transport import (
     RunPodTransportFailure,
     StdlibRunPodTransport,
 )
-
-_READINESS_POLL_SECONDS = 2.0
-_MAX_PROBE_TIMEOUT_SECONDS = 30.0
 
 # the shared primitives moved to `_runpod_lifecycle` when this file reached the 1000-line limit.
 # bound to the private names the lifecycle below already used, so the split stayed a move rather
@@ -72,16 +76,6 @@ _read_call = _runpod_lifecycle.read_call
 _transport = _runpod_lifecycle.open_transport
 _validate_control_inputs = _runpod_lifecycle.validate_control_inputs
 _validate_runtime_inputs = _runpod_lifecycle.validate_runtime_inputs
-
-
-class EndpointProbe(Protocol):
-    def __call__(
-        self,
-        public_url: str,
-        inference_token: str,
-        bundle: DeploymentBundle,
-        timeout_seconds: float,
-    ) -> bool: ...
 
 
 _DEFAULT_ENDPOINT_PROBE = RunPodEndpointProbe()
@@ -147,127 +141,18 @@ def _observe(
     )
 
 
-def _failure_result(
-    plan: RunPodCreatePlan,
-    failure: _LifecycleFailure,
-    *,
-    handle: RunPodProviderHandle | None = None,
-) -> DeploymentResult:
-    return failed_deployment_result(
-        plan.bundle.spec,
-        failure.code,
-        outcome_unknown=failure.outcome_unknown,
-        handle=handle,
-    )
-
-
-def _unknown_result(
-    plan: RunPodCreatePlan,
-    *,
-    handle: RunPodProviderHandle | None = None,
-) -> DeploymentResult:
-    return _failure_result(
-        plan,
-        _LifecycleFailure("resource_ambiguous", outcome_unknown=True),
-        handle=handle,
-    )
-
-
 def _from_transport_failure(exc: RunPodTransportFailure) -> _LifecycleFailure:
     return _LifecycleFailure(exc.code, exc.outcome_unknown)
 
 
-def _sleep_until_poll(deadline_at: float, clock: Clock, sleep: Sleeper) -> bool:
-    remaining = deadline_at - clock()
-    if remaining <= 0:
-        return False
-    sleep(min(_READINESS_POLL_SECONDS, remaining))
-    return clock() < deadline_at
+def _bind_observe(transport: RunPodTransport, *, deadline_at: float) -> Observe:
+    """give the readiness module a way to re-read state without handing it the transport."""
+
+    return lambda plan: _observe(plan, transport, deadline_at=deadline_at)
 
 
-def _probe_with_deadline(
-    probe: EndpointProbe,
-    handle: RunPodProviderHandle,
-    inference_token: str,
-    plan: RunPodCreatePlan,
-    *,
-    deadline_at: float,
-    clock: Clock,
-) -> bool:
-    remaining = deadline_at - clock()
-    if remaining <= 0:
-        return False
-    try:
-        accepted = probe(
-            handle.public_url,
-            inference_token,
-            plan.bundle,
-            min(_MAX_PROBE_TIMEOUT_SECONDS, remaining),
-        )
-    except Exception:
-        return False
-    return accepted is True and clock() < deadline_at
-
-
-def _read_only_reconcile(
-    plan: RunPodCreatePlan,
-    transport: RunPodTransport,
-    inference_token: str,
-    *,
-    deadline_at: float,
-    probe: EndpointProbe,
-    clock: Clock,
-    sleep: Sleeper,
-    allow_transient_artifact: bool = False,
-) -> DeploymentResult:
-    last_handle: RunPodProviderHandle | None = None
-    while True:
-        observation = _observe(plan, transport, deadline_at=deadline_at)
-        if observation.resource_count == 0:
-            return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
-        try:
-            secret, template, volume, pod = exact_core_resources(plan, observation)
-            last_handle = build_handle(plan, secret, template, volume, pod)
-        except RunPodResourceConflict:
-            return _failure_result(plan, _LifecycleFailure("conflict"))
-        state = readiness_state(pod.desired_status)
-        if state == "invalid":
-            return _failure_result(plan, _LifecycleFailure("conflict"), handle=last_handle)
-        if state == "failed":
-            return _failure_result(plan, _LifecycleFailure("readiness_failed"), handle=last_handle)
-        if (
-            state == "running"
-            and (not observation.artifact_secrets or allow_transient_artifact)
-            and _probe_with_deadline(
-                probe,
-                last_handle,
-                inference_token,
-                plan,
-                deadline_at=deadline_at,
-                clock=clock,
-            )
-        ):
-            return DeploymentResult.from_spec(
-                plan.bundle.spec,
-                status="ready",
-                handle=last_handle,
-            )
-        if observation.artifact_secrets and not allow_transient_artifact:
-            if not _sleep_until_poll(deadline_at, clock, sleep):
-                return _unknown_result(plan, handle=last_handle)
-            continue
-        if not _sleep_until_poll(deadline_at, clock, sleep):
-            if state == "pending":
-                return DeploymentResult.from_spec(
-                    plan.bundle.spec,
-                    status="provisioning",
-                    handle=last_handle,
-                )
-            return _failure_result(
-                plan,
-                _LifecycleFailure("readiness_failed"),
-                handle=last_handle,
-            )
+def _bind_delete_secret(transport: RunPodTransport, *, deadline_at: float) -> DeleteSecret:
+    return lambda secret_id: _delete_secret_once(transport, secret_id, deadline_at=deadline_at)
 
 
 def reconcile_runpod_deployment(
@@ -288,9 +173,9 @@ def reconcile_runpod_deployment(
     inference_token, _artifact_token = runtime_secrets._reveal_for_launch()
     try:
         transport = _transport(transport_factory, credentials)
-        return _read_only_reconcile(
+        return read_only_reconcile(
             plan,
-            transport,
+            _bind_observe(transport, deadline_at=deadline_at),
             inference_token,
             deadline_at=deadline_at,
             probe=probe,
@@ -298,7 +183,7 @@ def reconcile_runpod_deployment(
             sleep=sleep,
         )
     except RunPodTransportFailure as exc:
-        return _failure_result(plan, _from_transport_failure(exc))
+        return failure_result(plan, _from_transport_failure(exc))
 
 
 def _delete_secret_once(
@@ -336,99 +221,6 @@ def _delete_rest_once(
     except RunPodTransportFailure as exc:
         if exc.code != "not_found":
             raise
-
-
-def _confirm_artifact_absence(
-    plan: RunPodCreatePlan,
-    transport: RunPodTransport,
-    *,
-    deadline_at: float,
-    clock: Clock,
-    sleep: Sleeper,
-) -> bool:
-    while True:
-        observation = _observe(plan, transport, deadline_at=deadline_at)
-        try:
-            ensure_unique_resources(observation)
-        except RunPodResourceConflict:
-            return False
-        if not observation.artifact_secrets:
-            return True
-        if not _sleep_until_poll(deadline_at, clock, sleep):
-            return False
-
-
-def _delete_artifact_and_confirm(
-    plan: RunPodCreatePlan,
-    transport: RunPodTransport,
-    artifact: RunPodSecretObservation,
-    handle: RunPodProviderHandle,
-    *,
-    deadline_at: float,
-    clock: Clock,
-    sleep: Sleeper,
-) -> DeploymentResult:
-    try:
-        _delete_secret_once(transport, artifact.id, deadline_at=deadline_at)
-    except RunPodTransportFailure:
-        return _unknown_result(plan, handle=handle)
-    try:
-        absent = _confirm_artifact_absence(
-            plan,
-            transport,
-            deadline_at=deadline_at,
-            clock=clock,
-            sleep=sleep,
-        )
-    except RunPodTransportFailure:
-        return _unknown_result(plan, handle=handle)
-    if not absent:
-        return _unknown_result(plan, handle=handle)
-    return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
-
-
-def _adopt_existing(
-    plan: RunPodCreatePlan,
-    transport: RunPodTransport,
-    observation: RunPodObservation,
-    inference_token: str,
-    *,
-    deadline_at: float,
-    probe: EndpointProbe,
-    clock: Clock,
-    sleep: Sleeper,
-) -> DeploymentResult:
-    try:
-        secret, template, volume, pod = exact_core_resources(plan, observation)
-        handle = build_handle(plan, secret, template, volume, pod)
-    except RunPodResourceConflict:
-        return _failure_result(plan, _LifecycleFailure("conflict"))
-    state = readiness_state(pod.desired_status)
-    if state == "invalid":
-        return _failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
-    if state == "failed":
-        return _failure_result(plan, _LifecycleFailure("readiness_failed"), handle=handle)
-    if state != "running" or not _probe_with_deadline(
-        probe,
-        handle,
-        inference_token,
-        plan,
-        deadline_at=deadline_at,
-        clock=clock,
-    ):
-        return _unknown_result(plan, handle=handle)
-    if not observation.artifact_secrets:
-        return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
-    artifact = observation.artifact_secrets[0]
-    return _delete_artifact_and_confirm(
-        plan,
-        transport,
-        artifact,
-        handle,
-        deadline_at=deadline_at,
-        clock=clock,
-        sleep=sleep,
-    )
 
 
 def _create_secret(
@@ -609,7 +401,7 @@ def _wait_for_pod_absence(
             return True
         if len(observation.pods) > 1:
             return False
-        if not _sleep_until_poll(deadline_at, clock, sleep):
+        if not sleep_until_poll(deadline_at, clock, sleep):
             return False
 
 
@@ -677,7 +469,7 @@ def _failure_after_create_attempt(
     sleep: Sleeper,
 ) -> DeploymentResult:
     if not ledger.has_attempted_creations:
-        return _failure_result(plan, failure, handle=handle)
+        return failure_result(plan, failure, handle=handle)
     absent = _abort_created_resources(
         plan,
         transport,
@@ -688,8 +480,8 @@ def _failure_after_create_attempt(
         sleep=sleep,
     )
     if absent and not failure.outcome_unknown:
-        return _failure_result(plan, failure)
-    return _unknown_result(plan, handle=handle)
+        return failure_result(plan, failure)
+    return unknown_result(plan, handle=handle)
 
 
 def provision_runpod_deployment(
@@ -712,19 +504,32 @@ def provision_runpod_deployment(
     handle: RunPodProviderHandle | None = None
     transport: RunPodTransport | None = None
     reached_ready = False
+
+    def _mark_ready() -> None:
+        nonlocal reached_ready
+        reached_ready = True
+
     try:
         transport = _transport(transport_factory, credentials)
         observation = _observe(plan, transport, deadline_at=deadline_at)
         try:
             ensure_unique_resources(observation)
         except RunPodResourceConflict:
-            return _failure_result(plan, _LifecycleFailure("conflict"))
+            return failure_result(plan, _LifecycleFailure("conflict"))
         if observation.resource_count:
-            return _adopt_existing(
+            try:
+                exact_core_resources(plan, observation)
+            except RunPodResourceConflict:
+                return failure_result(plan, _LifecycleFailure("conflict"))
+            return await_ready_and_reclaim(
                 plan,
-                transport,
-                observation,
+                _bind_observe(transport, deadline_at=deadline_at),
+                _bind_delete_secret(transport, deadline_at=deadline_at),
                 inference_token,
+                observation.artifact_secrets[0] if observation.artifact_secrets else None,
+                # adoption owns resources it did not create and has no ledger to undo, so an
+                # unproven pod is reported unknown rather than failed. see `_read_only_reconcile`.
+                unproven_is_failure=False,
                 deadline_at=deadline_at,
                 probe=probe,
                 clock=clock,
@@ -739,27 +544,21 @@ def provision_runpod_deployment(
             deadline_at=deadline_at,
         )
         handle = build_handle(plan, secret, template, volume, pod)
-        ready = _read_only_reconcile(
+        ready = await_ready_and_reclaim(
             plan,
-            transport,
+            _bind_observe(transport, deadline_at=deadline_at),
+            _bind_delete_secret(transport, deadline_at=deadline_at),
             inference_token,
+            artifact,
+            unproven_is_failure=True,
+            on_ready=_mark_ready,
             deadline_at=deadline_at,
             probe=probe,
             clock=clock,
             sleep=sleep,
-            allow_transient_artifact=True,
         )
-        reached_ready = ready.status == "ready"
-        if reached_ready and artifact is not None:
-            return _delete_artifact_and_confirm(
-                plan,
-                transport,
-                artifact,
-                ready.handle,
-                deadline_at=deadline_at,
-                clock=clock,
-                sleep=sleep,
-            )
+        if ready.status == "ready":
+            return ready
         if ready.status == "failed":
             return _failure_after_create_attempt(
                 plan,
@@ -775,7 +574,7 @@ def provision_runpod_deployment(
     except RunPodTransportFailure as exc:
         failure = _from_transport_failure(exc)
         if transport is None:
-            return _failure_result(plan, failure)
+            return failure_result(plan, failure)
         return _failure_after_create_attempt(
             plan,
             transport,
@@ -864,9 +663,9 @@ def grow_runpod_volume(
         observation = _observe(plan, transport, deadline_at=deadline_at)
         _secret, _template, volume, _pod = exact_core_resources(plan, observation)
         if volume.id != handle.network_volume_id:
-            return _failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
+            return failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
         if target_size_gb < volume.size_gb:
-            return _failure_result(plan, _LifecycleFailure("invalid_request"), handle=handle)
+            return failure_result(plan, _LifecycleFailure("invalid_request"), handle=handle)
         if target_size_gb == volume.size_gb:
             return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
         # reads above are honest as `failed`; past the PATCH it is not. `failed` means "nothing
@@ -898,17 +697,17 @@ def grow_runpod_volume(
             if current_volume.size_gb == target_size_gb:
                 return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
             if current_volume.size_gb > target_size_gb:
-                return _failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
-            if not _sleep_until_poll(deadline_at, clock, sleep):
-                return _unknown_result(plan, handle=handle)
+                return failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
+            if not sleep_until_poll(deadline_at, clock, sleep):
+                return unknown_result(plan, handle=handle)
     except RunPodResourceConflict:
         if mutation_attempted:
-            return _unknown_result(plan, handle=handle)
-        return _failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
+            return unknown_result(plan, handle=handle)
+        return failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
     except RunPodTransportFailure as exc:
         if mutation_attempted:
-            return _unknown_result(plan, handle=handle)
-        return _failure_result(plan, _from_transport_failure(exc), handle=handle)
+            return unknown_result(plan, handle=handle)
+        return failure_result(plan, _from_transport_failure(exc), handle=handle)
 
 
 def teardown_runpod_deployment(
@@ -949,7 +748,7 @@ def teardown_runpod_deployment(
             ):
                 # the delete was accepted but the pod was still listed at the deadline. absence was
                 # never proved, so this is ambiguous rather than a confirmed failure.
-                return _unknown_result(plan, handle=handle)
+                return unknown_result(plan, handle=handle)
         if any(resource is not None for resource in (template, volume, inference, artifact)):
             mutation_attempted = True
         if template is not None:
@@ -967,15 +766,15 @@ def teardown_runpod_deployment(
         final = _observe(plan, transport, deadline_at=deadline_at)
         if final.resource_count == 0:
             return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
-        return _unknown_result(plan, handle=handle)
+        return unknown_result(plan, handle=handle)
     except RunPodResourceConflict:
         if mutation_attempted:
-            return _unknown_result(plan, handle=handle)
-        return _failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
+            return unknown_result(plan, handle=handle)
+        return failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
     except RunPodTransportFailure as exc:
         if mutation_attempted:
-            return _unknown_result(plan, handle=handle)
-        return _failure_result(plan, _from_transport_failure(exc), handle=handle)
+            return unknown_result(plan, handle=handle)
+        return failure_result(plan, _from_transport_failure(exc), handle=handle)
 
 
 def confirm_runpod_absence(
@@ -995,6 +794,6 @@ def confirm_runpod_absence(
         observation = _observe(plan, transport, deadline_at=deadline_at)
         if observation.resource_count == 0:
             return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
-        return _failure_result(plan, _LifecycleFailure("conflict"))
+        return failure_result(plan, _LifecycleFailure("conflict"))
     except RunPodTransportFailure as exc:
-        return _failure_result(plan, _from_transport_failure(exc))
+        return failure_result(plan, _from_transport_failure(exc))

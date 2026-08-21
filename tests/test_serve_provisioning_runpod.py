@@ -1641,6 +1641,16 @@ def test_a_pod_awaiting_placement_is_still_recognized_as_ours() -> None:
     for status in ("CREATED", "PENDING"):
         assert _matches(desiredStatus=status), f"our own {status} pod was rejected as a conflict"
     assert _matches(desiredStatus="RUNNING", machine=placed)
+
+    # tolerating absence is scoped to the placement window. a RUNNING pod is on real hardware, so
+    # missing placement is no longer "not yet decided" -- and `exact_core_resources` runs right
+    # before the probe reports `ready`, so accepting it would declare the deployment ready without
+    # ever confirming the customer got the gpu and data center they asked for.
+    assert not _matches(desiredStatus="RUNNING"), (
+        "a running pod with no placement was accepted; readiness would confirm nothing"
+    )
+    # a value that *is* present must still match while pending: absence is the only tolerance.
+    assert not _matches(desiredStatus="PENDING", machine={**placed, "gpuTypeId": "NVIDIA L4"})
     assert not _matches(
         desiredStatus="RUNNING",
         machine={**placed, "gpuTypeId": "NVIDIA L4"},
@@ -1649,6 +1659,90 @@ def test_a_pod_awaiting_placement_is_still_recognized_as_ours() -> None:
         desiredStatus="RUNNING",
         machine={**placed, "dataCenterId": "CA-MTL-3"},
     )
+
+
+def _flip_to_running_after(transport: _FakeTransport, reads: int) -> dict[str, int]:
+    """let the seeded pod finish provisioning after `reads` pod listings."""
+
+    seen = {"n": 0}
+    original = transport.rest
+
+    def counting(method: str, path: str, payload, **kwargs):
+        if method == "GET" and path.startswith("/pods"):
+            seen["n"] += 1
+            if seen["n"] > reads:
+                for pod in transport.pods:
+                    pod["desiredStatus"] = "RUNNING"
+        return original(method, path, payload, **kwargs)
+
+    transport.rest = counting  # type: ignore[assignment]
+    return seen
+
+
+def test_rerunning_deploy_follows_its_own_pending_pod_to_ready() -> None:
+    """adoption must wait out the pod it already created, not give up on the first look.
+
+    `serve deploy` returns `provisioning` while the pod is still CREATED/PENDING, and rerunning it
+    is the documented way to continue. That rerun lands in the adoption branch, which used to
+    perform a single readiness check and answer `outcome_unknown` with the entire new timeout
+    unspent -- so the retry was structurally incapable of ever finishing the deployment, and a
+    RUNNING pod still loading its engine failed identically. It now shares the create path's wait.
+    """
+
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, status="PENDING")
+    # the adoption branch reads pods once itself before delegating, so the pod must stay pending
+    # past that first read -- otherwise a single-check implementation would pass this test too.
+    reads = _flip_to_running_after(transport, 2)
+    clock = _Clock()
+    probe = _Probe(True)
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=600.0,
+        transport_factory=_Factory(transport),
+        probe=probe,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "ready", "adoption abandoned a pod that became ready in time"
+    assert result.handle == handle
+    assert reads["n"] > 1, "the pod was read once, so no waiting happened"
+    assert _mutation_calls(transport) == [], "adoption must not mutate to reach readiness"
+
+
+def test_adoption_reports_unproven_rather_than_failed_when_the_deadline_expires() -> None:
+    """a pod adoption could not prove is unknown, not failed.
+
+    The create path may answer `failed` because it tears down what it made in the same breath.
+    Adoption owns resources it did not create and has no ledger to undo, so `failed` would invite
+    the supervisor to drop the deployment record while a customer's pod keeps billing.
+    """
+
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, status="RUNNING")
+    clock = _Clock()
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=6.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(False),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "resource_ambiguous"
+    assert result.handle == handle
+    assert _mutation_calls(transport) == [], "adoption must never tear down a pod it did not create"
 
 
 def test_observation_survives_a_pod_waiting_for_its_machine() -> None:

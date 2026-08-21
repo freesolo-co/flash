@@ -41,6 +41,22 @@ def normalize_structured_outputs(value: Any) -> dict[str, Any] | None:
     )
 
 
+def _decode_json(value: str) -> Any:
+    """decode an encoded constraint, refusing the constants json does not define.
+
+    A constraint may arrive as a *string* of json, which is itself valid outer json -- so the http
+    boundary's strict parser sees a plain string and waves it through, and this inner decode is the
+    only place left that can reject it. Without the same `parse_constant` policy, `NaN` / `Infinity`
+    reached vllm's grammar compiler from a request the outer guard had already approved.
+    """
+
+    return json.loads(value, parse_constant=_reject_non_finite)
+
+
+def _reject_non_finite(constant: str) -> Any:
+    raise ValueError(f"json does not define {constant}")
+
+
 def _normalize_string(value: str) -> dict[str, Any]:
     keyword = value.strip().lower()
     if keyword in _OFF_STRINGS:
@@ -48,7 +64,7 @@ def _normalize_string(value: str) -> dict[str, Any]:
     if keyword in _JSON_OBJECT_STRINGS:
         return {"json_object": True}
     try:
-        parsed = json.loads(value)
+        parsed = _decode_json(value)
     except ValueError as exc:
         raise StructuredOutputsError(
             "structured outputs string must be 'json'/'json_object', an off marker, or valid json: "
@@ -148,7 +164,7 @@ def _coerce_json_schema(value: Any) -> dict[str, Any]:
         return value
     if isinstance(value, str):
         try:
-            parsed = json.loads(value)
+            parsed = _decode_json(value)
         except ValueError as exc:
             raise StructuredOutputsError(
                 f"structured outputs 'json' string is not valid json: {exc}"

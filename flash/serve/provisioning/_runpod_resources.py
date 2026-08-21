@@ -100,10 +100,15 @@ def pod_identity_matches(
     # `includeMachine=true`. comparing `None` for equality read that as "a different gpu than we
     # asked for" -- a permanent conflict for a pod that is merely still being placed, which failed
     # every fresh creation that had not been scheduled yet and every rerun that tried to adopt one.
-    # absent means not yet known, so it cannot contradict the plan; a *present* value still must
-    # match exactly, which is what keeps this from adopting someone else's pod.
+    #
+    # tolerating absence is scoped to exactly that window. once the pod is `RUNNING` it is on real
+    # hardware, so a missing gpu type or data center is no longer "not yet decided" -- it is the one
+    # moment we could have confirmed the customer got what they asked for, and `exact_core_resources`
+    # runs immediately before the readiness probe reports `ready`. treating absence as
+    # non-conflicting there would let a pod be declared ready on unverified hardware.
+    placement_may_be_pending = readiness_state(pod.desired_status) == "pending"
     placement_contradicts = any(
-        observed is not None and observed != planned
+        observed != planned if observed is not None else not placement_may_be_pending
         for observed, planned in (
             (pod.gpu_type_id, plan.placement.gpu_type_id),
             (pod.data_center_id, plan.placement.data_center_id),
