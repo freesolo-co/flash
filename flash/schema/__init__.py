@@ -241,10 +241,6 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
 _TOP_LEVEL_KEYS = (
     frozenset(item.name for item in dataclass_fields(JobSpec)) - MANAGED_TOP_LEVEL_KEYS
 )
-# keys that WERE user-authorable and are now rejected with their own targeted error. they are absent
-# from _TOP_LEVEL_KEYS, so the unknown-key check below would otherwise report them as a typo and bury
-# the explanation of why they went away.
-_REMOVED_TOP_LEVEL_KEYS = frozenset({"model_revision"})
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
@@ -329,15 +325,7 @@ def _validate_top_level(
     raw: dict[str, Any], project_required: bool
 ) -> tuple[str, str, str, str, bool]:
     """Validate the top-level config section."""
-    if "model_revision" in raw:
-        raise ConfigError(
-            "config key `model_revision` was removed because Flash-managed serving loads a "
-            "pre-quantized FP8 checkpoint resolved per base model, so it cannot honor an arbitrary "
-            "upstream commit and an authored pin made the run undeployable. Remove the key. "
-            f"`{CLI_NAME} models export` publishes the adapter, but for a fresh GRPO or OPD run it "
-            "does not turn the moving upstream default into a fixed base revision."
-        )
-    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS - _REMOVED_TOP_LEVEL_KEYS)
+    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
         if {"grpo", "sft", "opd"} & set(unknown):

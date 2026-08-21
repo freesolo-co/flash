@@ -503,18 +503,12 @@ MANAGED_GPU_KEYS = frozenset(
 # contract: `_preparation_digest` hashes the public payload, so moving a name in or out of this set
 # invalidates the stored digest of every warm-start and workload-profile run in flight.
 #
-# not reused by `_validate_effective_spec`, which keeps its own near-identical list. the difference
-# is one name -- `model_revision` -- and it is deliberate there: the validator excludes it only
-# conditionally, so a historical authored pin stays structurally compared between the two halves.
-# substituting this set would widen that exclusion to every run and drop a real integrity check.
 MANAGED_TOP_LEVEL_KEYS = frozenset(
     {
         # server-assigned identity -- never authored in a config.
         "run_id",
-        # runner-managed, and no longer part of the public config or status spec. internal round
-        # trips keep the value and marker through to_internal_dict(). historical public specs that
-        # emitted these are replayed only while verifying a stored preparation digest, from the
-        # exact persisted bytes.
+        # runner-managed and absent from the public config and status spec. internal round trips
+        # keep the value and markers through to_internal_dict().
         "model_revision",
         "model_revision_auto",
         "model_revision_force_pin",
@@ -567,16 +561,8 @@ class JobSpec:
     # persisted and worker specs keep it for exact model loading, profiling, geometry validation, and
     # warm-start equality checks.
     model_revision: str = ""
-    # platform-managed marker: True when the runner resolved model_revision for a spec whose public
-    # input carried no pin (SFT, where `_resolve_model_revision(required=True)` pins the base so
-    # workload profiling keys on an immutable commit). An AUTHORED pin can still exist on a persisted
-    # pre-removal run and stays rejected at deploy; rejecting the auto-assigned one made every SFT run
-    # and every adapter warm-started from one permanently undeployable, unservable, and unscoreable by
-    # `flash env eval`.
-    #
-    # stripped by to_dict() like the other platform-managed carriers. Deploy reads the provenance
-    # from the internal worker spec under `effective_preparation` instead (see
-    # `_internal_spec_from_status`), which carries it verbatim.
+    # platform-managed marker for a runner-resolved immutable model revision. stripped by to_dict()
+    # like the other platform-managed carriers and retained in the internal worker spec.
     model_revision_auto: bool = False
     # transient internal request for the runner to verify an exact auto-managed immutable pin instead
     # of resolving the model's current default head. preparation clears it after successful
@@ -779,6 +765,10 @@ class JobSpec:
         if not isinstance(project_raw, str):
             raise TypeError("project must be a string")
         project = require_project_id(project_raw) if project_raw.strip() else ""
+        model_revision = _model_revision(data.get("model_revision", cls.model_revision))
+        model_revision_auto = coerce_bool(data.get("model_revision_auto", False))
+        if model_revision and not model_revision_auto:
+            raise ValueError("model_revision requires model_revision_auto=True")
         algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
         if algorithm == "grpo":
             for name, value in (
@@ -789,7 +779,7 @@ class JobSpec:
                     raise TypeError(f"train.{name} must be an integer or omitted for GRPO")
         return cls(
             model=data.get("model", cls.model),
-            model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
+            model_revision=model_revision,
             algorithm=algorithm,
             environment=EnvironmentSpec(
                 id=env.get("id", ""),
@@ -850,7 +840,7 @@ class JobSpec:
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
-            model_revision_auto=coerce_bool(data.get("model_revision_auto", False)),
+            model_revision_auto=model_revision_auto,
             model_revision_force_pin=coerce_bool(data.get("model_revision_force_pin", False)),
             gpu_count_auto=coerce_bool(data.get("gpu_count_auto", False)),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),

@@ -22,10 +22,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from jsonschema.validators import validator_for  # noqa: F401
 
-from flash._internal.channel import CLI_NAME
 from flash.core.spec import JobSpec, require_project_id
 from flash.runner import (
-    _internal_spec_from_status,
     effective_spec_from_status,
     # kept although this module no longer calls it: a deploy test patches
     # `serving.mark_deployed`, and `monkeypatch.setattr` needs the attribute to already exist.
@@ -247,31 +245,6 @@ def _validate_deploy_request(
 
     Returns the effective spec and the current deployment record for the caller to work from.
     """
-    # A pin the AUTHOR wrote before the config key was removed is a request serving cannot honour, so
-    # it stays refused for persisted runs.
-    #
-    # A pin the RUNNER assigned is different. SFT is force-pinned by
-    # `runner.submit.prepare_job` -> `_resolve_model_revision(required=True)` so workload profiling
-    # keys on an immutable commit. Rejecting those made every SFT run, and every adapter warm-started
-    # from one, permanently undeployable, which also blocks `flash models chat` and `flash env eval`,
-    # since both require a deployment.
-    #
-    # provenance and the pin are read from the INTERNAL worker spec, not `spec`: to_dict() strips both
-    # from new public specs. that includes a new child inheriting a legacy authored source pin, which
-    # must remain rejected just like its parent. `_internal_spec_from_status` falls back to the public
-    # spec for pre-upgrade runs without a worker snapshot, so historical authored pins also fail closed.
-    internal_spec = _internal_spec_from_status(status)
-    if (
-        spec.model_revision or internal_spec.model_revision
-    ) and not internal_spec.model_revision_auto:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "deployment does not support this run's legacy revision-pinned base model; "
-                f"submit a new run without the removed model_revision key, or use `{CLI_NAME} "
-                "models export` to load the adapter from Hugging Face"
-            ),
-        )
     try:
         effective_spec = effective_spec_from_status(status)
     except ValueError as exc:

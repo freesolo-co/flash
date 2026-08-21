@@ -250,7 +250,7 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
         {
             "run_id": "source-run",
             "model": "Qwen/Qwen3.5-4B",
-            "model_revision": "source-revision",
+            "model_revision": "a" * 40,
             "model_revision_auto": True,
             "algorithm": "sft",
             "train": {"hf_repo": "owner/source-runs"},
@@ -261,7 +261,8 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
         {
             "run_id": "child-run",
             "model": "Qwen/Qwen3.5-4B",
-            "model_revision": "target-revision",
+            "model_revision": "b" * 40,
+            "model_revision_auto": True,
             "algorithm": "grpo",
             "train": {"init_from_adapter": "source-run"},
         }
@@ -276,89 +277,23 @@ class _ReachedArtifactResolution(Exception):
     """Sentinel: execution got past the warm-start revision check."""
 
 
-def test_warm_start_inherits_an_authored_source_revision(monkeypatch):
-    """A child inherits an authored source pin without laundering its deploy provenance."""
-    from fastapi import HTTPException
-
-    import flash.runner as R
-    import flash.server.routes.serving as serving
+def test_unmanaged_source_revision_is_rejected_during_decode():
     from flash.core.spec import JobSpec
 
-    source = JobSpec.from_dict(
-        {
-            "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
-            "model_revision": _REVISION,
-            "algorithm": "grpo",
-            "train": {"hf_repo": "owner/source-runs"},
-        }
-    )
-    stored_public = source.to_dict()
-    source_status = R.RunStatus(
-        state="done",
-        run_id=source.run_id,
-        spec=stored_public,
-        effective_preparation={
-            "worker_spec": source.to_internal_dict(),
-            "version": 1,
-            "preparation_digest": R._preparation_digest(
-                JobSpec.from_dict(stored_public), source, None
-            ),
-        },
-    )
-    child = JobSpec.from_dict(
-        {
-            "run_id": "child-run",
-            "model": source.model,
-            "algorithm": "opd",
-            "train": {"init_from_adapter": source.run_id},
-        }
-    )
-    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
-
-    inherited = R._inherit_warmstart_revision(child)
-    assert inherited.model_revision == _REVISION
-    assert inherited.model_revision_auto is False
-
-    monkeypatch.setattr(
-        "flash.adapters.lora_rank.resolve_hf_dataset_revision",
-        lambda *_a, **_kw: "rev",
-    )
-    monkeypatch.setattr(
-        "flash.runner.results.checkpoints.adapter_artifact_exists",
-        lambda *_a, **_kw: (_ for _ in ()).throw(_ReachedArtifactResolution()),
-        raising=False,
-    )
-    with pytest.raises(_ReachedArtifactResolution):
-        R._prepare_init_from_adapter_inner(child, token="token")
-
-    deploy_status = R.RunStatus(
-        state="done",
-        run_id=inherited.run_id,
-        spec=inherited.to_dict(),
-        effective_preparation={"worker_spec": inherited.to_internal_dict()},
-    )
-    with pytest.raises(HTTPException, match="legacy revision-pinned base model"):
-        serving._validate_deploy_request(
-            inherited.run_id,
-            deploy_status,
-            JobSpec.from_dict(deploy_status.spec),
-            {},
-            True,
+    with pytest.raises(ValueError, match="model_revision requires model_revision_auto=True"):
+        JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-4B",
+                "model_revision": _REVISION,
+                "algorithm": "sft",
+                "train": {"hf_repo": "owner/source-runs"},
+            }
         )
 
 
 def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
-    """A GRPO child warm-starting off SFT inherits the parent's auto pin AND its provenance.
-
-    SFT is always force-pinned by the runner, and this check demands the child's revision equal the
-    source's. Before this, satisfying it meant the AUTHOR writing the sha into rl.toml -- which made
-    the child's pin author-supplied, which deploy refuses. So a warm start off SFT could pass this
-    check or be deployable, never both.
-
-    The paired mismatch control is `test_prepare_init_adapter_requires_exact_model_revision_match`
-    above: an already-pinned child is never overwritten, so a different target revision still raises.
-    """
+    """A GRPO child warm-starting from SFT inherits the source's runner-managed pin."""
     import flash.runner as R
     from flash.core.spec import JobSpec
 
@@ -1272,8 +1207,6 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
     # the tokenizer the profile digest keys on is the base the adapter was actually trained against
     assert profiled == [_REVISION], profiled
     assert prepared.worker_spec.model_revision == _REVISION
-    # runner-assigned, not authored: deploy refuses an authored pin, so a self-resolved one would
-    # leave every warm-started sft run undeployable.
     assert prepared.worker_spec.model_revision_auto is True
     # source metadata stays authoritative for rank/alpha on this path too
     assert prepared.worker_spec.train.lora_rank == 64
@@ -1283,9 +1216,8 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
 def test_inherited_sft_pin_survives_the_force_pin_when_the_hub_tip_moved(monkeypatch):
     """The source's sha must outlive `_resolve_model_revision`, not just `_inherit_warmstart_revision`.
 
-    SFT is force-pinned (`required=True`), and an inherited pin is marked runner-assigned, so it
-    reads as unauthored -- which sends the lookup at `revision=None` to the CURRENT hub tip. If the
-    resolver overwrites the inherited sha with that tip, warm start breaks the moment the base model
+    sft is force-pinned (`required=True`), but an inherited runner-managed pin is already resolved.
+    if the resolver overwrites that sha with the current hub tip, warm start breaks when the base model
     moves, and `_adopted_warmstart_revision` cannot repair it because the pin is already set. Stubbing
     the resolver would hide exactly that, so this test drives the real one over a moved hub.
     """

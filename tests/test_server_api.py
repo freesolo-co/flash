@@ -3191,41 +3191,8 @@ def test_internal_owned_run_still_requires_matching_org_for_deployment_managemen
     assert calls == {"deploy": 1, "undeploy": 1}
 
 
-def test_deploy_rejects_revision_pinned_base_model(api):
-    import flash.runner as runner
-
-    key = _login()
-    run_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    status = runner.get_status(run_id)
-    status.spec["model_revision"] = "a" * 40
-    runner._save_status(status)
-
-    response = api.post(
-        f"/v1/runs/{run_id}/deploy",
-        json={"dry_run": True},
-        headers=_bearer(key),
-    )
-
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert "legacy revision-pinned base model" in detail
-    assert "flash models export" in detail
-
-
 def test_deploy_allows_runner_assigned_revision_pin(api):
-    """An SFT run pinned BY THE RUNNER stays deployable.
-
-    `runner.submit.prepare_job` calls `_resolve_model_revision(required=True)` for every SFT run,
-    so its stored spec always carries a revision the user never authored and cannot opt out of.
-    Rejecting it made every SFT run -- and every adapter warm-started from one -- permanently
-    undeployable, which also blocks `flash models chat` and `flash env eval`.
-
-    The paired control is `test_deploy_rejects_revision_pinned_base_model` above: same route, same
-    revision value, marker absent -> still 400. Only the marker differs, so a pass here with a pass
-    there isolates the change to who chose the pin.
-    """
+    """An SFT run pinned by the runner stays deployable."""
     import flash.runner as runner
     from flash.core.spec import JobSpec
 
@@ -3271,24 +3238,7 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
 
 
 def test_deploy_rejects_a_forged_auto_pin_marker(api):
-    """A marker written into the snapshot without re-digesting must not buy deploy privileges.
-
-    The marker is excluded from `_validate_effective_spec`'s structural compare (the public half
-    reads False by construction), so nothing there can catch a forged one. Deploy reads it to
-    decide whether to waive the authored-pin rejection, which makes it a privilege decision taken
-    on an otherwise unverified value -- and the waiver is not the only cost: a run pinned to a
-    revision it never trained on deploys against those base weights.
-
-    The paired control is `test_deploy_allows_runner_assigned_revision_pin` above. Same forged
-    marker, same snapshot surface; the only difference is that the control re-digests the way
-    submit does. It passes, so this test is not merely rejecting everything -- it isolates the
-    forgery from the auto-pin shape itself.
-
-    The revision is written to BOTH halves here so the structural compare cannot be what rejects
-    it: equal values pass that check, and the marker is excluded from it. Verified against the
-    unfixed head -- without the digest check in `effective_spec_from_status` this deploy returns
-    200. That is also the pre-fix on-disk shape, when to_dict() still emitted a runner pin.
-    """
+    """A worker-only pin written without re-digesting fails integrity validation."""
     import flash.runner as runner
 
     key = _login()
@@ -3299,7 +3249,6 @@ def test_deploy_rejects_a_forged_auto_pin_marker(api):
     snapshot = status.effective_preparation
     assert isinstance(snapshot, dict), snapshot
     digest_before = snapshot["preparation_digest"]
-    status.spec["model_revision"] = "a" * 40
     snapshot["worker_spec"]["model_revision"] = "a" * 40
     snapshot["worker_spec"]["model_revision_auto"] = True
     assert snapshot["preparation_digest"] == digest_before  # forged: no re-digest

@@ -1468,14 +1468,19 @@ def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
         _job_from_dict({"gpu": {"type": "RTX A6000"}})
 
 
-def test_model_revision_stays_available_to_internal_round_trips() -> None:
-    persisted = {**JobSpec().to_internal_dict(), "model_revision": "  refs/pr/123  "}
+def test_runner_model_revision_stays_available_to_internal_round_trips() -> None:
+    revision = "a" * 40
+    persisted = {
+        **JobSpec().to_internal_dict(),
+        "model_revision": revision,
+        "model_revision_auto": True,
+    }
 
     spec = JobSpec.from_dict(persisted)
 
-    assert spec.model_revision == "refs/pr/123"
-    assert JobSpec.from_json(spec.to_json()).model_revision == "refs/pr/123"
-    assert spec.to_internal_dict()["model_revision"] == "refs/pr/123"
+    assert spec.model_revision == revision
+    assert JobSpec.from_json(spec.to_json()).model_revision == revision
+    assert spec.to_internal_dict()["model_revision"] == revision
     assert "model_revision" not in spec.to_dict()
 
     for value in (None, 123, False, ["main"], {"revision": "main"}):
@@ -1547,7 +1552,7 @@ def test_model_revision_markers_require_bool_for_direct_construction_and_replace
 
 @pytest.mark.parametrize(
     ("model_revision_auto", "model_revision_force_pin"),
-    [(False, False), (True, False), (True, True)],
+    [(True, False), (True, True)],
 )
 def test_model_revision_markers_accept_valid_bool_states(
     model_revision_auto, model_revision_force_pin
@@ -1568,7 +1573,6 @@ def test_model_revision_markers_accept_valid_bool_states(
     [
         ("true", "false", (True, False)),
         (1, 0, (True, False)),
-        (0, 0, (False, False)),
         ("true", "true", (True, True)),
     ],
 )
@@ -1584,22 +1588,10 @@ def test_model_revision_marker_from_dict_coercion_and_roundtrip_are_unchanged(
     assert JobSpec.from_dict(restored.to_internal_dict()) == restored
 
 
-def test_historical_internal_model_revision_marker_roundtrip_without_force_pin() -> None:
-    payload = JobSpec(model_revision="a" * 40, model_revision_auto=True).to_internal_dict()
-    payload.pop("model_revision_force_pin")
-
-    restored = JobSpec.from_dict(payload)
-
-    assert restored.model_revision_auto is True
-    assert restored.model_revision_force_pin is False
-    assert JobSpec.from_dict(restored.to_internal_dict()) == restored
-
-
 @pytest.mark.parametrize(
     "overrides",
     [
         {"model_revision_force_pin": True},
-        {"model_revision": "a" * 40, "model_revision_force_pin": True},
         {
             "model_revision": "main",
             "model_revision_auto": True,
@@ -1754,35 +1746,15 @@ def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algo
     assert resolved.model_revision_force_pin is False
 
 
-def test_authored_and_ordinary_auto_model_revision_resolution_is_unchanged(monkeypatch) -> None:
+def test_unmanaged_model_revision_is_rejected_and_runner_pin_is_unchanged() -> None:
     from flash.runner.preparation import _resolve_model_revision
 
-    resolved_sha = "e" * 40
-    calls = []
+    with pytest.raises(ValueError, match="model_revision requires model_revision_auto=True"):
+        _job_from_dict({"model_revision": "release-tag"})
+    runner_pin = _job_from_dict({"model_revision": "d" * 40, "model_revision_auto": True})
 
-    class _Api:
-        def __init__(self, *a, **k) -> None: ...
-
-        def model_info(self, model, revision=None):
-            calls.append(revision)
-            return type("_Info", (), {"sha": resolved_sha})
-
-    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
-    authored = _job_from_dict({"model_revision": "release-tag"})
-    ordinary_auto = _job_from_dict({"model_revision": "d" * 40, "model_revision_auto": True})
-
-    authored_resolved = _resolve_model_revision(authored, required=False)
-    rollout_unchanged = _resolve_model_revision(ordinary_auto, required=False)
-    sft_unchanged = _resolve_model_revision(ordinary_auto, required=True)
-
-    # only the authored pin reaches the hub. an already-resolved auto sha is returned untouched in
-    # BOTH directions: re-resolving it would look up the current tip and overwrite a pin a previous
-    # run chose, which is what breaks a warm start the moment the base model moves.
-    assert calls == ["release-tag"]
-    assert authored_resolved.model_revision == resolved_sha
-    assert authored_resolved.model_revision_auto is False
-    assert rollout_unchanged == ordinary_auto
-    assert sft_unchanged == ordinary_auto
+    assert _resolve_model_revision(runner_pin, required=False) == runner_pin
+    assert _resolve_model_revision(runner_pin, required=True) == runner_pin
 
 
 def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() -> None:

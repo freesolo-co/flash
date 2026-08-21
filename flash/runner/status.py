@@ -71,6 +71,17 @@ def source_snapshot_from_status(status: RunStatus, *, required: bool = False) ->
 
 def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
     """Load the private prepared worker spec, optionally revalidating its source artifact."""
+    managed_revision_keys = {
+        "model_revision",
+        "model_revision_auto",
+        "model_revision_force_pin",
+    }
+    leaked_revision_keys = sorted(managed_revision_keys & set(status.spec))
+    if leaked_revision_keys:
+        raise ValueError(
+            "persisted public spec contains platform-managed model revision key(s): "
+            + ", ".join(leaked_revision_keys)
+        )
     public_spec = JobSpec.from_dict(status.spec)
     snapshot = status.effective_preparation
     if not isinstance(snapshot, dict):
@@ -92,18 +103,13 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     has_workload_profile = bool(
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
-    # the auto-pin marker is excluded from the structural compare (the public half always reads
-    # False by construction), so nothing else here would catch a forged worker-half marker. deploy
-    # reads it to decide whether to relax the authored-pin rejection, which makes it a privilege
-    # decision taken on an otherwise unverified value: a plain grpo/opd run reaches neither branch
-    # below, so a forged marker would skip the 400 and deploy against base weights the run never
-    # trained on. binding it to the digest closes that -- the marker is hashed into the digest at
-    # persist time, so a snapshot claiming one cannot reproduce it.
+    # a runner-managed revision exists only in the worker half, so bind it and its provenance marker
+    # to the preparation digest. a plain grpo or opd run otherwise reaches neither digest branch.
     if has_workload_profile and snapshot.get("workload_profile") != (
         worker_spec.workload_profile or None
     ):
         raise ValueError("persisted workload profile does not match the worker spec")
-    # `gpu_count_auto` is deliberately NOT a trigger here, unlike `model_revision_auto`. The digest
+    # `gpu_count_auto` is deliberately NOT a trigger here, unlike `model_revision_auto`. the digest
     # covers the whole public spec including `gpu.type`, which the allocator legitimately rewrites
     # onto the stored status when a run is provisioned -- so gating on the marker made the digest
     # reject ordinary provisioned runs at deploy. Measured: two specs differing only in whether
