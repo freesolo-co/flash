@@ -84,7 +84,9 @@ jobs:
           # deploy-time deps only; the app image is built remotely by Modal. flash is deliberately
           # not installed - modal's CLI puts the working directory on sys.path before importing the
           # app file, so running from the repo root is what resolves `from flash.serving.src...`.
-          uv pip install --system "modal>=1.0.0" "python-dotenv>=1.0.0"
+          # pinned to the exact client pyproject declares; see deploy-modal.yml for why an
+          # unbounded range is unsafe for the deploy path.
+          uv pip install --system "modal==1.5.4" "python-dotenv>=1.0.0"
 
       - name: Verify development deployment inputs
         if: steps.gate.outputs.deploy == 'true'
