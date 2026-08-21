@@ -506,6 +506,74 @@ def test_confirmed_legacy_handle_cancel_reaches_teardown(tmp_path, monkeypatch):
     assert teardown[0][1] == spec.run_id
 
 
+def test_unverifiable_cleanup_record_does_not_block_draining_its_siblings(tmp_path, monkeypatch):
+    """One record nobody can verify must not strand teardown of every other tracked resource.
+
+    The migration raises after durably writing the upgrades it *could* resolve. `_drain_cleanup_
+    remotes` calls it before its teardown loop, so letting that raise escape skips the loop
+    entirely -- and both of this function's callers already swallow exceptions, so the error is
+    reported to nobody while the resources keep billing.
+    """
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+    from flash.providers.runpod import api
+    from flash.runner.reconciliation import _drain_cleanup_remotes
+    from flash.runner.supervise import lifecycle
+
+    key = "legacy-owner"
+    full_fingerprint = api.key_fingerprint(key)
+
+    def record(endpoint_id: str, fingerprint: str) -> dict:
+        return {
+            "provider": "runpod",
+            "endpoint_id": endpoint_id,
+            "endpoint_name": f"flash-{endpoint_id}",
+            "key_fingerprint": fingerprint,
+            "job_id": None,
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+
+    # one cleanup record resolves, one is a legacy prefix whose credential left the pool. it must
+    # be a *legacy* fingerprint: that is what makes it unresolvable-but-well-formed, so it reaches
+    # the migration's resolve loop instead of being dropped earlier as a malformed record.
+    stranger_fingerprint = api.key_fingerprint("departed-owner")[:16]
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path))
+    runner._save_status(
+        runner.RunStatus(
+            run_id="drain-partial",
+            state="failed",
+            spec=JobSpec(
+                run_id="drain-partial",
+                model="Qwen/Qwen3.5-4B",
+                algorithm="sft",
+            ).to_dict(),
+            remote=None,
+        ),
+        _cleanup_remotes=[
+            record("ep-drainable", full_fingerprint[:16]),
+            record("ep-unverifiable", stranger_fingerprint),
+        ],
+    )
+    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+    monkeypatch.setattr(
+        api._CLIENT, "request_with_retries_for_key", lambda *_a, **_k: [{"id": "ep-drainable"}]
+    )
+    torn_down = []
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        # the generic provider handle keeps the provider payload under `.data`, so read the
+        # endpoint id from there rather than off the handle.
+        lambda handle, run_id: torn_down.append(handle.data["endpoint_id"]) or True,
+    )
+
+    _drain_cleanup_remotes("drain-partial")
+
+    # the resolvable resource was actually torn down rather than stranded behind the raise.
+    assert "ep-drainable" in torn_down
+
+
 def test_list_endpoints_by_key_returns_fingerprints_not_raw_keys(monkeypatch):
     from flash.providers.runpod import api
 
