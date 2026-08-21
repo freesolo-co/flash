@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from flash.adapters.fused_experts import (
@@ -34,6 +35,43 @@ _ADAPTER_DOWNLOAD_RETRIES = 4
 _ADAPTER_DOWNLOAD_BACKOFF_S = 5.0
 
 
+def _legacy_adapter_is_multimodal(
+    adapter_dir: str, tensors: Mapping[str, tuple[int, ...]] | None
+) -> bool | None:
+    """classify legacy modality from live non-language LoRA values when readable."""
+    if not tensors:
+        return None
+    non_language_keys = {key for key in tensors if is_non_language_lora_key(key)}
+    if not non_language_keys:
+        return False
+
+    try:
+        from flash.adapters.artifacts import loadable_adapter_weight_files
+        from flash.serve.export import _non_lm_tensor_is_live, _read_safetensors_header
+
+        selected = loadable_adapter_weight_files(os.listdir(adapter_dir))
+        if not selected or any(not name.endswith(".safetensors") for name in selected):
+            return None
+        unread = set(non_language_keys)
+        for name in selected:
+            path = Path(adapter_dir, name)
+            header, data_start, file_size = _read_safetensors_header(path)
+            with path.open("rb") as source:
+                for key in unread & header.keys():
+                    if _non_lm_tensor_is_live(
+                        source,
+                        key,
+                        header[key],
+                        data_start=data_start,
+                        file_size=file_size,
+                    ):
+                        return True
+                    unread.remove(key)
+        return False if not unread else None
+    except (OSError, ValueError):
+        return None
+
+
 def validate_warmstart_adapter(
     config: Mapping[str, Any],
     model_id: str,
@@ -46,10 +84,11 @@ def validate_warmstart_adapter(
     if "exclude_modules" in config:
         source_is_multimodal = config.get("exclude_modules") is None
     else:
-        tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
-        source_is_multimodal = (
-            any(is_non_language_lora_key(key) for key in tensors) if tensors else None
-        )
+        try:
+            tensors = _read_adapter_tensor_metadata(adapter_dir)
+        except (ImportError, OSError, ValueError):
+            tensors = None
+        source_is_multimodal = _legacy_adapter_is_multimodal(adapter_dir, tensors)
     run_is_multimodal = targeting.exclude_modules is None
     if source_is_multimodal is not None and source_is_multimodal != run_is_multimodal:
         source_modality = "multimodal (image-trained)" if source_is_multimodal else "text-only"
