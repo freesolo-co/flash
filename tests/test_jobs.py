@@ -106,6 +106,185 @@ def test_job_handle_roundtrip_and_rejects_legacy_shapes():
         JobHandle.from_dict({**valid, "attempt": "2"})
 
 
+def test_strict_teardown_uses_valid_runpod_owner_without_inventory(monkeypatch):
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as runpod_api
+    from flash.runner.supervise import lifecycle
+
+    fingerprint = "rpk-" + "a" * 64
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep-direct",
+            "endpoint_name": "flash-direct",
+            "key_fingerprint": fingerprint,
+            "job_id": "job-direct",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", lambda value: "owner-key")
+    cancelled = []
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda endpoint_id, job_id, **_kwargs: (
+            cancelled.append((endpoint_id, job_id)) or {"id": job_id, "status": "CANCELLED"}
+        ),
+    )
+    deleted = []
+
+    def delete_endpoint(endpoint_id, owner):
+        deleted.append((endpoint_id, runpod_api._key_for_fingerprint(owner)))
+        return True
+
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
+    monkeypatch.setattr(
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: pytest.fail("valid owner must not inventory other accounts"),
+    )
+
+    assert lifecycle._strict_teardown_handle(handle, "run-direct") is True
+    assert cancelled == [("ep-direct", "job-direct")]
+    assert deleted == [("ep-direct", "owner-key")]
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    [
+        pytest.param("rpk-" + "a" * 12, id="legacy-16-character"),
+        pytest.param(None, id="missing"),
+        pytest.param("", id="empty"),
+        pytest.param("corrupt", id="corrupt"),
+    ],
+)
+def test_strict_teardown_discovers_runpod_owner_for_invalid_fingerprint(monkeypatch, fingerprint):
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as runpod_api
+    from flash.runner.supervise import lifecycle
+
+    owner_fingerprint = "rpk-" + "b" * 64
+    data = {
+        "provider": "runpod",
+        "endpoint_id": "ep-discovered",
+        "endpoint_name": "flash-discovered",
+        "job_id": "job-discovered",
+        "attempt": 0,
+        "started_ts": 1.0,
+    }
+    if fingerprint is not None:
+        data["key_fingerprint"] = fingerprint
+    handle = JobHandle.from_dict(data)
+
+    def resolve(value):
+        if value == owner_fingerprint:
+            return "discovered-owner-key"
+        raise runpod_api.RunpodApiError("unresolvable fingerprint")
+
+    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", resolve)
+    monkeypatch.setattr(
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: (
+            {owner_fingerprint: [{"id": "ep-discovered", "name": "flash-discovered"}]},
+            [],
+        ),
+    )
+    deleted = []
+
+    def delete_endpoint(endpoint_id, owner):
+        deleted.append((endpoint_id, runpod_api._key_for_fingerprint(owner)))
+        return True
+
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
+
+    assert lifecycle._strict_teardown_handle(handle, "run-discovered") is True
+    assert deleted == [("ep-discovered", "discovered-owner-key")]
+
+
+def test_strict_teardown_confirms_runpod_absent_only_from_complete_inventory(monkeypatch):
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as runpod_api
+    from flash.runner.supervise import lifecycle
+
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep-gone",
+            "endpoint_name": "flash-gone",
+            "key_fingerprint": "legacy-owner",
+            "job_id": "job-gone",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "_key_for_fingerprint",
+        lambda _value: (_ for _ in ()).throw(runpod_api.RunpodApiError("unresolvable")),
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: ({"rpk-" + "a" * 64: []}, []),
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *_args: pytest.fail("an absent endpoint must not be deleted blindly"),
+    )
+
+    assert lifecycle._strict_teardown_handle(handle, "run-gone") is True
+
+
+@pytest.mark.parametrize("mode", ["incomplete", "multiple-owners"])
+def test_strict_teardown_rejects_unconfirmed_runpod_owner_discovery(monkeypatch, mode):
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as runpod_api
+    from flash.runner.supervise import lifecycle
+
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep-ambiguous",
+            "endpoint_name": "flash-ambiguous",
+            "key_fingerprint": "legacy-owner",
+            "job_id": "job-ambiguous",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "_key_for_fingerprint",
+        lambda _value: (_ for _ in ()).throw(runpod_api.RunpodApiError("unresolvable")),
+    )
+    owner_a = "rpk-" + "a" * 64
+    owner_b = "rpk-" + "b" * 64
+    inventory = (
+        ({owner_a: []}, [owner_b])
+        if mode == "incomplete"
+        else (
+            {
+                owner_a: [{"id": "ep-ambiguous"}],
+                owner_b: [{"id": "ep-ambiguous"}],
+            },
+            [],
+        )
+    )
+    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", lambda **_kwargs: inventory)
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *_args: pytest.fail("ambiguous ownership must not delete"),
+    )
+
+    with pytest.raises(RuntimeError, match="endpoint deletion could not be confirmed") as exc_info:
+        lifecycle._strict_teardown_handle(handle, "run-ambiguous")
+    assert "cleanup unconfirmed" in str(exc_info.value.__cause__)
+
+
 def test_decode_output_success():
     from flash.providers.runpod.jobs import decode_output
 

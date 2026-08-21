@@ -178,6 +178,60 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
     return False
 
 
+def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
+    """Delete one exact RunPod endpoint without trusting legacy handle metadata."""
+    from flash.providers.runpod import api as runpod_api
+
+    endpoint_id = data.get("endpoint_id")
+    if not isinstance(endpoint_id, str) or not endpoint_id:
+        raise ValueError("persisted RunPod endpoint identity is invalid")
+
+    fingerprint = data.get("key_fingerprint")
+    if canonical is not None:
+        from flash.providers import get_provider
+
+        get_provider("runpod").destroy(canonical)
+        return
+
+    try:
+        runpod_api._key_for_fingerprint(fingerprint)
+    except runpod_api.RunpodApiError:
+        pass
+    else:
+        if runpod_api.delete_endpoint_for_fingerprint(endpoint_id, fingerprint):
+            return
+        if not runpod_api.endpoint_absent_for_fingerprint(endpoint_id, fingerprint):
+            raise runpod_api.RunpodApiError(f"runpod endpoint {endpoint_id} deletion unconfirmed")
+        return
+
+    by_fingerprint, failed = runpod_api.list_endpoints_by_key(
+        deadline_at=time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S
+    )
+    owners = [
+        owner_fingerprint
+        for owner_fingerprint, endpoints in by_fingerprint.items()
+        if any(
+            isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id
+            for endpoint in endpoints
+        )
+    ]
+    if len(owners) > 1:
+        raise runpod_api.RunpodApiError(
+            f"runpod endpoint {endpoint_id} appears in multiple accounts; cleanup unconfirmed"
+        )
+    if not owners:
+        if failed:
+            raise runpod_api.RunpodApiError(
+                f"runpod endpoint {endpoint_id} owner discovery was incomplete; cleanup unconfirmed"
+            )
+        return
+
+    if runpod_api.delete_endpoint_for_fingerprint(endpoint_id, owners[0]):
+        return
+    if not runpod_api.endpoint_absent_for_fingerprint(endpoint_id, owners[0]):
+        raise runpod_api.RunpodApiError(f"runpod endpoint {endpoint_id} deletion unconfirmed")
+
+
 def _strict_teardown_handle(handle, run_id: str) -> bool:
     """Request exact teardown, then prove the captured attempt's worker is gone.
 
@@ -187,22 +241,28 @@ def _strict_teardown_handle(handle, run_id: str) -> bool:
     """
     from flash.providers import INSTANCE_PROVIDERS, get_provider
 
-    handle = _canonical_provider_handle(handle)
-    provider = get_provider(handle.provider)
-    data = handle.to_dict()
-    if handle.provider == "runpod":
-        if data.get("job_id"):
+    raw = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
+    if raw.get("provider") == "runpod":
+        canonical = None
+        with contextlib.suppress(Exception):
+            canonical = _canonical_provider_handle(raw)
+        if canonical is not None and canonical.to_dict().get("job_id"):
             with contextlib.suppress(Exception):
-                provider.cancel(handle)
+                get_provider("runpod").cancel(canonical)
         try:
-            provider.destroy(handle)
+            _delete_runpod_endpoint(raw, canonical)
         except Exception as exc:
-            if _worker_provably_gone(run_id, handle):
+            # malformed legacy handles deliberately cannot use the job-status escape hatch: without
+            # a strict owner identity, only confirmed endpoint deletion may settle teardown.
+            if canonical is not None and _worker_provably_gone(run_id, canonical):
                 return False
             raise RuntimeError(
                 "runpod endpoint deletion could not be confirmed and its worker may still be live"
             ) from exc
         return True
+
+    handle = _canonical_provider_handle(raw)
+    provider = get_provider(handle.provider)
     if handle.provider in INSTANCE_PROVIDERS:
         destroy_error: Exception | None = None
         try:
