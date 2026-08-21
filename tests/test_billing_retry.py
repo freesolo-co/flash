@@ -362,8 +362,7 @@ def test_sweep_charges_run_with_stale_unparseable_spec(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
 
     # a finished, uncharged run whose persisted spec no longer round-trips through JobSpec.from_dict.
-    # A legacy payload carrying a local `environment.path` is rejected by from_dict (local env paths
-    # are no longer supported) -- the exact "stale persisted spec" finding (3) is about.
+    # a stale payload carrying `environment.path` is rejected as an unknown environment key.
     stale_spec = {**SPEC, "environment": {"path": "./local/environment.py"}}
     spec = _spec()
     created_at = 1_000_000.0
@@ -384,7 +383,7 @@ def test_sweep_charges_run_with_stale_unparseable_spec(monkeypatch, tmp_path):
     # belt-and-suspenders: prove this spec really would have aborted the old reparse path
     from flash.core.spec import JobSpec
 
-    with pytest.raises(ValueError, match="local environment paths"):
+    with pytest.raises(ValueError, match=r"environment has unknown key\(s\): path"):
         JobSpec.from_dict(stale_spec)
 
     calls = []

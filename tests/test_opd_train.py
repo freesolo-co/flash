@@ -7539,8 +7539,13 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
                 "run_id": "r-alloc",
                 "algorithm": "opd",
                 "model": "Qwen/Qwen3.5-4B",
-                "environment": {"repo": "x/y", "name": "e"},
-                "train": {"hf_repo": "a/b", "teacher_model": "", "max_examples": 1},
+                "environment": {"id": "org/env"},
+                "train": {
+                    "hf_repo": "a/b",
+                    "teacher_model": "",
+                    "max_examples": 1,
+                    "credit_assignment": "per_episode",
+                },
                 "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
             }
         )
@@ -7564,8 +7569,13 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             "run_id": "r-sft",
             "algorithm": "sft",
             "model": "Qwen/Qwen3.5-4B",
-            "environment": {"repo": "x/y", "name": "e"},
-            "train": {"hf_repo": "a/b", "teacher_model": "", "max_examples": 1},
+            "environment": {"id": "org/env"},
+            "train": {
+                "hf_repo": "a/b",
+                "teacher_model": "",
+                "max_examples": 1,
+                "credit_assignment": "per_episode",
+            },
             "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
         }
     )
