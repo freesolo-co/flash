@@ -71,6 +71,7 @@ def _export_checkpoint_adapter(
     model_id: str,
     model_revision: str,
     python_bin: str,
+    preprocessor=None,
 ) -> None:
     shutil.rmtree(adapter_dir, ignore_errors=True)
     export_peft_adapter(
@@ -80,6 +81,8 @@ def _export_checkpoint_adapter(
         python_bin=python_bin,
     )
     _copy_processing_sidecars(actor_dir, adapter_dir)
+    if preprocessor is not None:
+        preprocessor.save_pretrained(adapter_dir)
     stamp_adapter_dir_provenance(adapter_dir, model_id, model_revision)
     _w.write_base_model_provenance(adapter_dir, model_id, model_revision)
 
@@ -96,6 +99,7 @@ class _VerlCheckpointWatcher:
         model_id: str,
         model_revision: str,
         required_steps: tuple[int, ...],
+        preprocessor=None,
     ) -> None:
         self.local_dir = local_dir
         self.export_root = export_root
@@ -105,6 +109,7 @@ class _VerlCheckpointWatcher:
         self.python_bin = python_bin
         self.model_id = model_id
         self.model_revision = model_revision
+        self.preprocessor = preprocessor
         self.required_steps = frozenset(required_steps)
         self.lifecycle = CheckpointLedger()
         self._error: BaseException | None = None
@@ -234,13 +239,14 @@ class _VerlCheckpointWatcher:
         # the rl uploader republishes from its staged adapters on subsequent sweeps, and the opd
         # watcher hands `adapter_dir` to `_stage_retry_contract`. sft is done with it inside this call.
         try:
-            _sft_train()._export_checkpoint_adapter(
-                actor_dir,
-                adapter_dir,
-                model_id=self.model_id,
-                model_revision=self.model_revision,
-                python_bin=self.python_bin,
-            )
+            export_kwargs = {
+                "model_id": self.model_id,
+                "model_revision": self.model_revision,
+                "python_bin": self.python_bin,
+            }
+            if self.preprocessor is not None:
+                export_kwargs["preprocessor"] = self.preprocessor
+            _sft_train()._export_checkpoint_adapter(actor_dir, adapter_dir, **export_kwargs)
             self.lifecycle.mark_staged(step)
             uploaded = _w.upload_resume_checkpoint(
                 step,

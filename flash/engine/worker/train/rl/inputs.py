@@ -199,10 +199,10 @@ def _load_training_records(env, train_spec):
     return train, [env.prompt_messages(ex) for ex in train]
 
 
-def _grpo_is_multimodal(train, message_prompts):
+def _grpo_is_multimodal(env, train, message_prompts):
     from flash.content.multimodal import record_has_images
 
-    return any(
+    return bool(getattr(env, "image_observations", False)) or any(
         record_has_images(ex, messages) for ex, messages in zip(train, message_prompts, strict=True)
     )
 
@@ -269,12 +269,12 @@ def _build_grpo_prompts(
                 prompts.append(
                     {
                         "prompt": normalized.messages,
-                        # the pre-normalization messages, i.e. exactly what this example's
-                        # start_episode returned. see the text branch below for why the bridge
-                        # needs them.
-                        "env_prompt": messages,
+                        # use the same canonical message shape the processor and child authenticate.
+                        # this also carries top-level record images that were absent from `messages`.
+                        "env_prompt": normalized.messages,
                         "images": list(normalized.descriptors),
                         "rendered": rendered,
+                        "prompt_ids": list(expanded),
                         "example": ex,
                         "prompt_len": len(expanded),
                     }
@@ -284,7 +284,8 @@ def _build_grpo_prompts(
             rendered = tok.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
             )
-            prompt_len = len(tok(rendered, add_special_tokens=False).input_ids)
+            prompt_ids = list(tok(rendered, add_special_tokens=False).input_ids)
+            prompt_len = len(prompt_ids)
             if 0 < prompt_len <= prompt_budget:
                 prompts.append(
                     {
@@ -294,6 +295,7 @@ def _build_grpo_prompts(
                         # transcript.
                         "env_prompt": messages,
                         "rendered": rendered,
+                        "prompt_ids": prompt_ids,
                         "example": ex,
                         "prompt_len": prompt_len,
                     }
@@ -500,7 +502,7 @@ def _resolve_grpo_inputs():
         )
 
     train, message_prompts = _load_training_records(env, _t)
-    multimodal = _grpo_is_multimodal(train, message_prompts)
+    multimodal = _grpo_is_multimodal(env, train, message_prompts)
     package_root = getattr(env, "package_root", None)
     processor = None
     image_pad_token_id = None

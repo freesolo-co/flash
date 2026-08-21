@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+if __name__ == "flash_grpo_patches":
+    import flash_verl_runtime as runtime
+else:
+    from flash.engine.worker.train.core.child import runtime
+
 _ENTROPY_QUANTILE_MARKER = "[flash-verl] top-entropy token masking active"
 _STOP_SEQUENCES_MARKER = "[flash-verl] rollout stop strings active"
 _STRUCTURED_OUTPUTS_MARKER = "[flash-verl] rollout structured outputs active"
@@ -340,29 +345,6 @@ def install_per_turn_credit() -> None:
     ray_trainer.compute_advantage = compute_advantage
 
 
-def _install_vision_input_grads(module) -> None:
-    import torch
-
-    get_base = getattr(module, "get_base_model", None)
-    if callable(get_base):
-        base = get_base()
-    else:
-        peft_base = getattr(module, "base_model", None)
-        base = getattr(peft_base, "model", module)
-
-    def require_output_grad(_module, _inputs, output):
-        tensor = output[0] if isinstance(output, tuple) and output else output
-        if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
-            tensor.requires_grad_(True)
-
-    for path, submodule in base.named_modules():
-        if path.endswith("visual.patch_embed"):
-            submodule.register_forward_hook(require_output_grad)
-            print(f"[rl-verl] vision input gradients enabled at {path}", flush=True)
-            return
-    print("[rl-verl] no visual.patch_embed found; vision input gradients not installed", flush=True)
-
-
 def install_reentrant_checkpointing(*, multimodal: bool) -> None:
     from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
@@ -378,7 +360,7 @@ def install_reentrant_checkpointing(*, multimodal: bool) -> None:
                 gradient_checkpointing_kwargs={"use_reentrant": True}
             )
             if multimodal:
-                _install_vision_input_grads(module)
+                runtime.install_vision_input_grads(module)
             print("[rl-verl] reentrant gradient checkpointing is active", flush=True)
         return module
 

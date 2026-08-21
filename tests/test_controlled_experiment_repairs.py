@@ -141,6 +141,40 @@ def test_prepare_job_resolves_ref_to_sha_with_operator_token(monkeypatch):
     assert prepared.worker_spec.model_revision == sha
 
 
+def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monkeypatch):
+    import huggingface_hub
+
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+
+    exact = "d" * 40
+    moving_head = "e" * 40
+    _stub_prepare_dependencies(monkeypatch, _resolved_profile_spec(resolves_to=exact))
+    seen = []
+
+    class Api:
+        def __init__(self, *, token):
+            pass
+
+        def model_info(self, model, *, revision):
+            seen.append(revision)
+            return SimpleNamespace(sha=moving_head if revision is None else revision)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+    internal = _prepared_spec(revision=exact, resolves_to=exact).to_internal_dict()
+    internal.update(model_revision_auto=True, model_revision_force_pin=True)
+
+    prepared = runner.prepare_job(JobSpec.from_dict(internal))
+
+    assert seen == [exact]
+    for spec in (prepared.public_spec, prepared.worker_spec):
+        assert spec.model_revision == exact
+        assert spec.model_revision_auto is True
+        assert spec.model_revision_force_pin is False
+    assert "model_revision_force_pin" not in prepared.public_spec.to_dict()
+    assert prepared.worker_spec.to_internal_dict()["model_revision_force_pin"] is False
+
+
 def test_prepare_job_revision_failure_precedes_persistence_and_provider_submit(monkeypatch):
     import huggingface_hub
 

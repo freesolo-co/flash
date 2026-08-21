@@ -40,6 +40,7 @@ _REQUIRED_OVERRIDE_KEYS = (
     "local_dir",
     "save_freq",
     "n_gpus_per_node",
+    "gpu_mem_util",
     "ulysses_sequence_parallel_size",
     "seed",
     "project_name",
@@ -185,11 +186,16 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         # lands in the same vllm_async_server sleep(). the flagged model declares algos including
         # opd and the parse-time gate admits it, so without this an opd run on it wedges.
         *rollout_resident_overrides(bool(config.get("sleep_unsupported"))),
+        # size the colocated executor budget from this run's geometry, as the grpo path does.
+        # verl's default is 0.5, i.e. half the CARD, claimed on every wake no matter what the
+        # trainer already holds -- and `wake_up` re-acquires released physical pages, so an
+        # overcommit is a hard cumem_allocator OOM rather than a smaller pool.
+        f"actor_rollout_ref.rollout.gpu_memory_utilization={_hydra_val(config['gpu_mem_util'])}",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={_hydra_val(config['n_gpus_per_node'])}",
         f"actor_rollout_ref.rollout.n={_hydra_val(config['group_size'])}",
         # `++`, not a bare key: limit_images is a real RolloutConfig field but is absent from the
         # composed rollout node, so hydra rejects a bare assignment.
-        "++actor_rollout_ref.rollout.limit_images=8",
+        "++actor_rollout_ref.rollout.limit_images=4",
         f"actor_rollout_ref.rollout.max_model_len={_hydra_val(max_tokens)}",
         f"actor_rollout_ref.rollout.temperature={_hydra_val(config.get('temperature', 1.0))}",
         f"actor_rollout_ref.rollout.top_p={_hydra_val(config.get('top_p', 1.0))}",
@@ -205,7 +211,7 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         # whenever that product is not a multiple of 8. size the pool to the batch instead.
         (
             "actor_rollout_ref.rollout.agent.num_workers="
-            f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']))}"
+            f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']), cap=4 if config.get('multimodal') else 8)}"
         ),
     ]
 
@@ -376,6 +382,7 @@ def _build_opd_child_env(
     max_model_len: int = 32768,
     mutation_failure_path: str = "",
     score_delivery_failure_path: str = "",
+    rollout_failure_path: str = "",
     abandonment_failure_path: str = "",
     resample_failure_path: str = "",
     cycle_commit_failure_path: str = "",
@@ -396,6 +403,8 @@ def _build_opd_child_env(
         child["FLASH_OPD_MUTATION_FAILURE_PATH"] = mutation_failure_path
     if score_delivery_failure_path:
         child["FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH"] = score_delivery_failure_path
+    if rollout_failure_path:
+        child["FLASH_OPD_ROLLOUT_FAILURE_PATH"] = rollout_failure_path
     if abandonment_failure_path:
         child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] = abandonment_failure_path
     if resample_failure_path:

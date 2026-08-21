@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from typing import Protocol, TypeVar
+from typing import ClassVar, Protocol, TypeVar
 
 from flash._internal.channel import CLI_NAME
 
@@ -86,6 +86,7 @@ class RolloutReward:
 
 class Environment(Protocol):
     id: str
+    image_observations: bool
 
     def dataset(self) -> list[dict]:
         """Return the training rows (the only split used; eval is on the serving side)."""
@@ -109,6 +110,8 @@ class Environment(Protocol):
 @dataclass
 class BaseEnvironment:
     id: str
+
+    image_observations: ClassVar[bool] = False
 
     def dataset(self) -> list[dict]:
         raise NotImplementedError
