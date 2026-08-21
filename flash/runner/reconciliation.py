@@ -124,12 +124,11 @@ def _compare_and_fail_remote(
             return False
         if not runner._expected_remote_matches(status.remote, expected_remote):
             return False
-        previous_updated_at = status.updated_at
         status.state = "failed"
         status.error = error
         status.updated_at = time.time()
         if status.finished_at is None:
-            status.finished_at = status.updated_at or previous_updated_at
+            status.finished_at = status.updated_at
         runner._save_status_unlocked(status)
         report_status = status
     confirmed = runner.get_status(run_id)

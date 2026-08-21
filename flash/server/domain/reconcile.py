@@ -60,12 +60,10 @@ def _report(body: dict) -> bool:
 
 
 def _terminal_ts(status: runner.RunStatus) -> float:
-    """The run's training-teardown time, used for both billing and eligibility.
-
-    Prefer immutable `finished_at`; deploys and late updates move `updated_at` and distort settle
-    delay and window. Fall back for pre-feature runs, preserving `finished_at == 0.0`.
-    """
-    return float(status.finished_at if status.finished_at is not None else status.updated_at)
+    """Return the immutable training-teardown time used for billing and eligibility."""
+    if status.finished_at is None:
+        raise ValueError(f"run {status.run_id} is missing finished_at")
+    return float(status.finished_at)
 
 
 def _due(status: runner.RunStatus, now: float) -> bool:
@@ -74,7 +72,7 @@ def _due(status: runner.RunStatus, now: float) -> bool:
     past the settle delay, still within the window, and carrying a provider handle."""
     if status.state not in _RECONCILABLE_STATES:
         return False
-    if status.reconciled_at:
+    if status.reconciled_at or status.finished_at is None:
         return False
     age = now - _terminal_ts(
         status

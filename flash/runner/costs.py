@@ -344,13 +344,6 @@ def record_billing_state(run_id: str, **fields) -> None:
             and new_billing_state != "charged"
         ):
             return
-        # backfill finished_at before bumping updated_at so reconcile._terminal_ts is not skewed.
-        if (
-            status.state in runner._FINISHED_AT_PRESERVED_STATES
-            and status.finished_at is None
-            and not status.reconciled_at
-        ):
-            status.finished_at = status.updated_at
         for key, value in fields.items():
             setattr(status, key, value)
         status.updated_at = time.time()

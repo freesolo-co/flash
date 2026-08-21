@@ -412,12 +412,10 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         ):
             return False
         was_terminal = status.state in runner.TERMINAL_STATES
-        prev_updated_at = status.updated_at
         status.state = state
         status.updated_at = time.time()
-        if state in runner.TERMINAL_STATES and status.finished_at is None:
-            # legacy run already terminal: backfill from prior updated_at, not now.
-            status.finished_at = prev_updated_at if was_terminal else status.updated_at
+        if not was_terminal and state in runner.TERMINAL_STATES and status.finished_at is None:
+            status.finished_at = status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
         runner._save_status_unlocked(status)

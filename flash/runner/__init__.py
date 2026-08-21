@@ -440,8 +440,6 @@ class PreparedJob:
 
 
 _BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
-# deployed is non-terminal but reconciled; its finished_at must survive billing field-only writes.
-_FINISHED_AT_PRESERVED_STATES = TERMINAL_STATES | {"deployed"}
 
 
 def _send_status_report(status: RunStatus) -> bool:
