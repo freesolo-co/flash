@@ -835,6 +835,82 @@ def test_adoption_accepts_a_pinned_concurrent_finalized_successor(artifact_prese
     assert sdk.artifact == []
 
 
+def test_adoption_tolerates_the_artifact_flickering_back_in_a_cleaned_wait() -> None:
+    """a cleaned successor whose artifact reappears for one poll is still the success state.
+
+    The pinned-successor test clears the artifact atomically and permanently, so it never exercises
+    a reading where the artifact comes back. Modal's list calls are not a snapshot: a concurrent
+    finalize can be observed mid-flight, showing the artifact again after it looked gone. Waiting
+    without the `with_artifact` transient turned that single reading into a definite `conflict` for
+    an app that was deployed, healthy, and billing.
+    """
+
+    class _ColdProbe:
+        """rejects the first probe so the cleaned wait polls again and meets the flicker."""
+
+        def __init__(self, accept_on: int) -> None:
+            self.accept_on = accept_on
+            self.calls = 0
+
+        def __call__(
+            self,
+            _url: str,
+            _token: str,
+            _bundle: DeploymentBundle,
+            _timeout_seconds: float,
+        ) -> bool:
+            self.calls += 1
+            return self.calls >= self.accept_on
+
+    bundle = _bundle()
+    bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
+    finalized_plan = build_modal_create_plan(bundle, phase="finalized")
+    sdk = _FakeSdk(bootstrap_plan)
+    _seed_exact(sdk, artifact=True)
+    original_observe = sdk.observe
+    artifact_secret = list(sdk.artifact)
+    state = {"observations": 0, "flickered": False}
+
+    def flickering_observe(observed_plan, *, app_id_hint=None):
+        state["observations"] += 1
+        if state["observations"] == 2:
+            # the racer's finalize lands: tags flip and the artifact reads as reclaimed.
+            sdk.apps[0] = replace(sdk.apps[0], tags=finalized_plan.tags)
+            sdk.artifact.clear()
+        elif state["observations"] == 4:
+            # obs#4 is the cleaned wait's own poll -- obs#3 is the successor re-observe that picks
+            # the branch. the artifact must be visible on *this* reading, not an earlier one, or
+            # the wait proves on a clean view and the missing transient never matters.
+            state["flickered"] = True
+            sdk.artifact[:] = artifact_secret
+        elif state["observations"] > 4:
+            sdk.artifact.clear()
+        return original_observe(observed_plan, app_id_hint=app_id_hint)
+
+    sdk.observe = flickering_observe  # type: ignore[assignment]
+    # the first probe is refused so the wait polls a second time and settles on a clean reading,
+    # proving the flicker is tolerated rather than merely skipped.
+    probe = _ColdProbe(accept_on=2)
+    clock = _Clock()
+
+    result = provision_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
+        deadline_at=600.0,
+        sdk_factory=lambda _credentials, _plan: sdk,
+        probe=probe,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert state["flickered"], "the artifact never flickered back, so nothing was proven"
+    assert result.status == "ready", "a transient artifact reading was treated as a real conflict"
+    assert result.error_code is None
+    assert sdk.apps, "the app must still be deployed"
+    assert [value for name, value in sdk.calls if name == "deploy_app"] == []
+
+
 def test_adoption_rejects_identity_drift_during_a_concurrent_transition() -> None:
     bundle = _bundle()
     bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")

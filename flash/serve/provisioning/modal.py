@@ -431,7 +431,10 @@ def _adopt_bootstrap(
             inference_token,
             artifact_present=False,
             expected=expected,
-            transient_phases=(),
+            # the artifact can still flicker back into view between polls while the concurrent
+            # finalize settles. tolerate it exactly as the post-delete wait does, so a healthy
+            # billing app is never reported as a definite conflict over a transient reading.
+            transient_phases=(with_artifact,),
             deadline_at=deadline_at,
             probe=probe,
             clock=clock,
