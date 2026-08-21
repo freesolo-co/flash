@@ -61,21 +61,27 @@ _SMOKE_IMAGE_PROMPT = (
 _SMOKE_IMAGE_VARIANTS = (
     (
         "RED",
-        "data:image/png;base64,"
-        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7h"
-        "IASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC",
+        (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7h"
+            "IASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC"
+        ),
     ),
     (
         "BLUE",
-        "data:image/png;base64,"
-        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NsQkAAAjAsP7/tF7h"
-        "IASyp5pjAoFAIBAIBAKB4EmwOkv8Lom8x/sAAAAASUVORK5CYII=",
+        (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NsQkAAAjAsP7/tF7h"
+            "IASyp5pjAoFAIBAIBAKB4EmwOkv8Lom8x/sAAAAASUVORK5CYII="
+        ),
     ),
     (
         "GREEN",
-        "data:image/png;base64,"
-        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NsQkAAAjAsJ7u6V7h"
-        "IASyp6ZbAoFAIBAIBAKB4EuwwgAAH2BCGKwAAAAASUVORK5CYII=",
+        (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NsQkAAAjAsJ7u6V7h"
+            "IASyp6ZbAoFAIBAIBAKB4EuwwgAAH2BCGKwAAAAASUVORK5CYII="
+        ),
     ),
 )
 
@@ -100,6 +106,8 @@ def _smoke_image_challenge(run_id: str) -> tuple[str, list[dict]]:
         }
     ]
     return expected, messages
+
+
 # hard wall-clock budget for the trusted fixed-prompt generation and validation.
 # it remains below the deployment stale threshold.
 _SMOKE_BUDGET_SECONDS = 600.0

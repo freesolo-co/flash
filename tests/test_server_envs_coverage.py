@@ -872,7 +872,9 @@ def test_image_deployment_smoke_rejects_the_other_trusted_colours(monkeypatch):
 
     for wrong in others:
         response = _smoke_response(wrong)
-        monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+        # bind the response per iteration: a bare closure over the loop variable would read
+        # whatever the LAST iteration assigned, so every case would assert the same colour.
+        monkeypatch.setattr(serving._app, "serve_chat", lambda _r=response, **_kwargs: _r)
         with pytest.raises(ServingError, match="did not identify the trusted"):
             _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
 
