@@ -1118,6 +1118,10 @@ def _resume_accounting(step=2):
         "aligned_sequences": 5,
         "empty_alignments": 2,
         "coverage_sum": 3.5,
+        # `accounting_snapshot` emits the alignment pair unconditionally, so a state without it is
+        # corrupt rather than merely older -- the resume contract requires both.
+        "align_group_sum": 7.5,
+        "align_group_n": 5,
     }
 
 
@@ -1509,6 +1513,12 @@ def test_bridge_granularity_survives_resume_without_reading_the_coverage_counter
     assert snapshot["align_group_sum"] == 6.0
     assert snapshot["align_group_n"] == 3
 
+    # a state carrying no alignment accumulators is rejected by the resume validator, so the
+    # bridge's zero default is reachable only on a fresh start. it must still restart granularity at
+    # zero rather than borrow the coverage quantity under the granularity name.
+    without_granularity = dict(_resume_accounting())
+    del without_granularity["align_group_sum"]
+    del without_granularity["align_group_n"]
     coverage_only = _TeacherAlignmentBridge(
         prompts=list(resumed.prompts),
         tokenizer=_BridgeTokenizer(),
@@ -1517,7 +1527,7 @@ def test_bridge_granularity_survives_resume_without_reading_the_coverage_counter
         eos_token_ids=frozenset({99}),
         stop_sequences=(),
         mutation_callback=lambda: None,
-        initial_state=_resume_accounting(),
+        initial_state=without_granularity,
     )
     # coverage_sum is 3.5 and aligned_sequences is 5 in that state; neither may seed granularity.
     assert coverage_only.align_group_sum == 0.0

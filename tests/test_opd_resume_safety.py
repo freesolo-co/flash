@@ -74,6 +74,10 @@ def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
         "opd_phase_seconds": {},
         "opd_phase_counts": {},
         "train_wall_seconds": 0.0,
+        # `accounting_snapshot` emits both unconditionally, so every real version-4 state carries
+        # the pair and the contract requires it.
+        "align_group_sum": 0.0,
+        "align_group_n": 0,
     }
     state.update(overrides)
     return state
@@ -1264,9 +1268,13 @@ def test_resume_state_version_rejects_states_predating_alignment_granularity():
         validate_opd_resume_state_metadata(stale, expected_seed=42, checkpoint_step=2)
 
 
-def test_resume_validator_accepts_alignment_granularity_and_states_without_it():
-    # verl writes the pair; trl does not. both must validate, so the fields are checked when present
-    # rather than required -- otherwise adding them would reject every trl checkpoint.
+def test_resume_validator_requires_the_alignment_granularity_pair():
+    # `accounting_snapshot` is the ONLY producer of a version-4 state and always emits both fields,
+    # so an absent one means a corrupt record, not an older writer: the trl backend that wrote
+    # neither was deleted (8421a240, 2026-07-31) before this contract version existed (975ddbdc,
+    # 2026-08-05), so no version-4 state can lack them. required rather than optional because the
+    # reader defaults an absent field to 0, and the published mean_align_granularity would then
+    # divide a real sum by a zeroed count -- or report 0.0 for a run that measured every group.
     with_granularity = _valid_resume_state(2, align_group_sum=3.0, align_group_n=2)
     validated = validate_opd_resume_state_metadata(
         with_granularity, expected_seed=42, checkpoint_step=2
@@ -1274,26 +1282,22 @@ def test_resume_validator_accepts_alignment_granularity_and_states_without_it():
     assert validated["align_group_sum"] == 3.0
     assert validated["align_group_n"] == 2
 
-    without = _valid_resume_state(2)
-    assert "align_group_sum" not in without
-    validate_opd_resume_state_metadata(without, expected_seed=42, checkpoint_step=2)
-
 
 @pytest.mark.parametrize(
-    ("overrides", "missing"),
+    ("dropped", "missing"),
     [
-        ({"align_group_sum": 3.0}, "align_group_n"),
-        ({"align_group_n": 2}, "align_group_sum"),
+        (("align_group_n",), "align_group_n"),
+        (("align_group_sum",), "align_group_sum"),
+        (("align_group_sum", "align_group_n"), "align_group_"),
     ],
 )
-def test_resume_validator_rejects_a_half_present_alignment_pair(overrides, missing):
-    # Regression (opd_retry_contract.py): the two accumulators were checked INDEPENDENTLY, so a
-    # state carrying one of them passed. the reader then defaults the absent one to 0 (opd_train
-    # reads each with its own.get default), and the published mean_align_granularity divides a real
-    # sum by a zeroed count -- or reports 0.0 for a run that measured alignment on every group.
-    # absent-together stays valid (trl writes neither, which the test above pins); only the
-    # half-present state is a corrupt one.
-    state = _valid_resume_state(2, **overrides)
+def test_resume_validator_rejects_an_incomplete_alignment_pair(dropped, missing):
+    # both a half-present pair and an entirely absent one are corrupt: the reader defaults each
+    # missing field to 0 independently, so the published mean_align_granularity divides a real sum
+    # by a zeroed count, or reports 0.0 for a run that measured alignment on every group.
+    state = _valid_resume_state(2)
+    for field in dropped:
+        del state[field]
 
     with pytest.raises(ValueError, match=missing):
         validate_opd_resume_state_metadata(state, expected_seed=42, checkpoint_step=2)
@@ -1301,10 +1305,9 @@ def test_resume_validator_rejects_a_half_present_alignment_pair(overrides, missi
 
 def test_discarded_rollouts_is_not_part_of_the_resume_accounting_contract():
     required = set(retry_contract._OPD_RESUME_ACCOUNTING_SCHEMA)
-    optional = set(retry_contract._OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA)
 
     assert "truncated_rollouts" in required
-    assert "discarded_rollouts" not in required | optional
+    assert "discarded_rollouts" not in required
 
 
 def test_shared_resume_metadata_validator_returns_a_copy():

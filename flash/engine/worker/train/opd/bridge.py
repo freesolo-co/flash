@@ -147,7 +147,11 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
         self.coverage_sum = float(state.get("coverage_sum", 0.0))
         # alignment GRANULARITY (mean aligned-groups-per-sequence), distinct from coverage: a
         # collapsed alignment that maps every student token onto one group still scores coverage
-        # ~1.0, so coverage alone cannot flag that failure mode.
+        # ~1.0, so coverage alone cannot flag that failure mode. the zero default is reachable only
+        # on a FRESH start (no `initial_state`), where nothing has been measured yet and 0 is the
+        # true count; a resume state is required by `validate_opd_resume_state_metadata` to carry
+        # both, so an absent field there is rejected rather than silently defaulted -- otherwise the
+        # published `mean_align_granularity` would read 0.0 for a run that measured every group.
         self.align_group_sum = float(state.get("align_group_sum", 0.0))
         self.align_group_n = int(state.get("align_group_n", 0))
         # resume: baseline the per-step delta counters at the restored cumulative mass, so the
