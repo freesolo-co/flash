@@ -516,10 +516,6 @@ _NON_LANGUAGE_ADAPTER_SEGMENTS = frozenset(
 )
 
 
-
-
-
-
 def _pair_has_nonzero_delta(factor_a, factor_b, *, require_finite_scan: bool) -> bool:
     """return whether B @ A is nonzero, checking every block when overflow is possible."""
     import numpy as np

@@ -4210,13 +4210,12 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         # the hourly rate. The two agree only when the step is compute-bound. This spec retains one
         # prompt, so the step is latency-bound and a faster card can finish it for less despite a
         # higher hourly rate; asserting sorted hourly rates would pin the wrong invariant.
-        from flash.cost.facts import gpu_hourly_usd
-        from flash.providers.base import _run_cost_key
+        from flash.providers.base import GPU_INFO, _run_cost_key
 
         cost_key = _run_cost_key(
             "Qwen/Qwen3.5-0.8B", "grpo", train={"epochs": 1, "max_examples": 1}
         )
-        step_costs = [cost_key(g, gpu_hourly_usd(g)) for g in gpus_seen]
+        step_costs = [cost_key(gpu, GPU_INFO[gpu].hourly_usd) for gpu in gpus_seen]
         assert step_costs == sorted(step_costs)
         # and the first attempt is the cheapest per step among the classes that fit.
         assert step_costs[0] == min(step_costs)

@@ -264,8 +264,6 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     assert get_status(rid).to_dict()["adapter_ref"] == rid
 
 
-
-
 def test_done_status_with_removed_spec_key_serializes_without_adapter_ref(
     tmp_path, monkeypatch
 ) -> None:

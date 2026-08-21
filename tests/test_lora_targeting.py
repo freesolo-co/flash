@@ -187,9 +187,7 @@ def test_every_campaign_multimodal_trainer_keeps_the_existing_all_linear_surface
 def test_unmarked_warmstart_adapter_is_rejected_without_tensor_inference(monkeypatch, tmp_path):
     import flash.engine.worker.model.adapter as adapter_module
 
-    targeting = resolve_lora_targeting(
-        "Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=False
-    )
+    targeting = resolve_lora_targeting("Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=False)
 
     def unexpected_tensor_read(_path):
         raise AssertionError("unmarked adapters must be rejected before tensor inspection")

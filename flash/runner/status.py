@@ -116,8 +116,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     # the geometry cap still constrain.
     if (has_workload_profile or worker_spec.model_revision_auto) and (
         not isinstance(stored_digest, str)
-        or stored_digest
-        != runner._preparation_digest(public_spec, worker_spec, expected)
+        or stored_digest != runner._preparation_digest(public_spec, worker_spec, expected)
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:

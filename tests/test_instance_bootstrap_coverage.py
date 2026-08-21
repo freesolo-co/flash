@@ -267,8 +267,9 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
         attempts["n"] += 1
         raise _err(status=503, headers={"retry-after": "5"})
 
+    deadline_at = time.time() + 3600.0
     with pytest.raises(_HFError) as ei:
-        b._hf_call(always_503, "list")
+        b._hf_call(always_503, "list", deadline_at=deadline_at)
     assert "boom" in str(ei.value)
     assert attempts["n"] == len(b._HF_RETRY_DELAYS_S) + 1  # initial try + one per delay
     assert sleeps == [5.0] * len(b._HF_RETRY_DELAYS_S)  # Retry-After overrides the default schedule
@@ -282,7 +283,7 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
         raise _err(status=400)
 
     with pytest.raises(_HFError):
-        b._hf_call(bad_request, "list")
+        b._hf_call(bad_request, "list", deadline_at=deadline_at)
     assert calls["n"] == 1
     assert sleeps == []
 
@@ -296,7 +297,7 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
             raise nxt
         return nxt
 
-    assert b._hf_call(flaky, "download") == "ok-result"
+    assert b._hf_call(flaky, "download", deadline_at=deadline_at) == "ok-result"
     assert sleeps == [b._HF_RETRY_DELAYS_S[0]]  # one default-scheduled backoff before the retry
 
 
@@ -337,7 +338,15 @@ def test_hf_upload_targets_prefixed_path_and_swallows_errors(monkeypatch):
             recorded.update(kw)
 
     _install_fake_hf(monkeypatch, HfApi=_Api)
-    payload = {"hf_repo": "org/repo", "hf_prefix": "sft/run", "env": {"HF_TOKEN": "hf-tok"}}
+    created_at = time.time()
+    payload = {
+        "hf_repo": "org/repo",
+        "hf_prefix": "sft/run",
+        "env": {"HF_TOKEN": "hf-tok"},
+        "deadline_at": created_at + 60.0,
+        "run_created_at": created_at,
+        "run_max_wall_seconds": 60.0,
+    }
     # True only when the artifact landed: the error is swallowed, so a caller tracking what is
     # already stored would otherwise read a failed upload as success and skip its retry.
     assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is True
@@ -393,13 +402,49 @@ def test_hf_file_exists_delegates_to_api(monkeypatch):
             return kw["filename"].endswith("DONE")
 
     _install_fake_hf(monkeypatch, HfApi=_Api)
-    payload = {"hf_repo": "o/r", "hf_prefix": "p", "env": {"HF_TOKEN": "t"}}
+    created_at = time.time()
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "p",
+        "env": {"HF_TOKEN": "t"},
+        "deadline_at": created_at + 60.0,
+        "run_created_at": created_at,
+        "run_max_wall_seconds": 60.0,
+    }
     assert b.hf_file_exists(payload, "DONE") is True
     assert seen["filename"] == "p/DONE"
     assert seen["repo_id"] == "o/r"
     assert seen["repo_type"] == "dataset"
     assert seen["token"] == "t"
     assert b.hf_file_exists(payload, "metrics.json") is False
+
+
+def test_bootstrap_network_helpers_reject_payload_without_deadline(monkeypatch):
+    calls = []
+
+    class _Api:
+        def __init__(self, token=None):
+            calls.append(("init", token))
+
+    _install_fake_hf(monkeypatch, HfApi=_Api)
+    monkeypatch.setattr(
+        b.bootstrap_pip.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("pip must not start without a run deadline"),
+    )
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "p",
+        "env": {},
+        "extra_pip": ["private-package"],
+    }
+
+    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is False
+    with pytest.raises(RuntimeError, match="run wall deadline"):
+        b.hf_file_exists(payload, "DONE")
+    with pytest.raises(RuntimeError, match="run wall deadline"):
+        b.install_extra_pip(payload)
+    assert calls == []
 
 
 def test_hf_file_exists_starts_no_request_at_deadline(monkeypatch):
@@ -2494,7 +2539,15 @@ def test_hf_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
             raise error
         return "ok"
 
-    assert b._hf_call(call, "download spec", secrets=b._payload_secrets(payload)) == "ok"
+    assert (
+        b._hf_call(
+            call,
+            "download spec",
+            deadline_at=time.time() + 3600.0,
+            secrets=b._payload_secrets(payload),
+        )
+        == "ok"
+    )
     printed = capsys.readouterr().out
     assert secret not in printed
     assert "<redacted>" in printed

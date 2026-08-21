@@ -1617,8 +1617,6 @@ def test_model_revision_force_pin_rejects_invalid_internal_states(overrides) -> 
         _job_from_dict(overrides)
 
 
-
-
 def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
     from flash.runner.preparation import _preparation_digest
 
