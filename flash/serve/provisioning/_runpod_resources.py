@@ -106,6 +106,23 @@ def pod_identity_matches(
     # moment we could have confirmed the customer got what they asked for, and `exact_core_resources`
     # runs immediately before the readiness probe reports `ready`. treating absence as
     # non-conflicting there would let a pod be declared ready on unverified hardware.
+    #
+    # the attachments below follow the same rule for the same reason. runpod reports
+    # `networkVolumeId` and `templateId` only while the pod holds its machine: the create response
+    # carries neither, and a released pod stops carrying them even with `includeNetworkVolume=true`
+    # -- verified against the live api, where an `EXITED` pod still reports `machine.gpuTypeId` and
+    # `machine.dataCenterId` but neither attachment. Comparing an absent id against the real one
+    # read as "attached to something else", which rejected the pod the create call had just made
+    # and, in `exact_teardown_resources`, raised a conflict *before* any delete was issued -- so the
+    # pod, volume, template and secrets teardown exists to remove were left behind, still billing.
+    only_running_reports_attachments = readiness_state(pod.desired_status) != "running"
+    attachments_contradict = any(
+        observed != expected if observed is not None else not only_running_reports_attachments
+        for observed, expected in (
+            (pod.network_volume_id, volume_id),
+            (pod.template_id, template_id),
+        )
+    )
     placement_may_be_pending = readiness_state(pod.desired_status) == "pending"
     placement_contradicts = any(
         observed != planned if observed is not None else not placement_may_be_pending
@@ -120,8 +137,7 @@ def pod_identity_matches(
         and not placement_contradicts
         and pod.gpu_count == plan.placement.gpu_count
         and pod.container_disk_gb == plan.placement.container_disk_gb
-        and pod.network_volume_id == volume_id
-        and pod.template_id == template_id
+        and not attachments_contradict
         and pod.ports == (PROXY_PORT_SPEC,)
     )
 

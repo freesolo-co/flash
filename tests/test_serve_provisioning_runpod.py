@@ -1680,6 +1680,66 @@ def test_a_pod_awaiting_placement_is_still_recognized_as_ours() -> None:
     )
 
 
+def test_a_pod_that_has_released_its_machine_still_matches_for_teardown() -> None:
+    """A terminal pod stops reporting its attachments, and teardown must not read that as conflict.
+
+    Runpod reports `networkVolumeId` and `templateId` only while the pod holds its machine. The
+    create response carries neither, and a released pod stops carrying them even when the listing
+    asks for `includeNetworkVolume=true` -- confirmed against the live api, where an `EXITED` pod
+    still reported `machine.gpuTypeId` and `machine.dataCenterId` but neither attachment id.
+
+    Comparing an absent id against the handle's real one raised a conflict inside
+    `exact_teardown_resources`, which runs *before* the first delete -- so the pod, its volume, its
+    template and its secrets were all left behind, still billing, for exactly the terminal pods
+    teardown exists to remove.
+
+    The wrong-value cases are asserted alongside for the same reason as the placement test above:
+    "ignore it when absent" is one edit away from "ignore it always", which would let teardown
+    delete resources attached to something other than this deployment.
+    """
+
+    plan = build_runpod_create_plan(_bundle())
+    row = {
+        "id": "abc123def45682",
+        "name": plan.names.app_or_pod,
+        "imageName": plan.bundle.image.reference,
+        "gpuCount": plan.placement.gpu_count,
+        "containerDiskInGb": plan.placement.container_disk_gb,
+        "ports": ["8000/http"],
+        "machine": {
+            "gpuTypeId": plan.placement.gpu_type_id,
+            "dataCenterId": plan.placement.data_center_id,
+        },
+    }
+
+    def _matches(**overrides) -> bool:
+        pod = parse_pods([{**row, **overrides}])[0]
+        return pod_identity_matches(
+            plan,
+            pod,
+            template_id="tpl0000001",
+            volume_id="vol0000001",
+        )
+
+    attached = {"templateId": "tpl0000001", "networkVolume": {"id": "vol0000001"}}
+    for status in ("EXITED", "STOPPED", "TERMINATED", "DEAD", "FAILED"):
+        assert _matches(desiredStatus=status), (
+            f"a {status} pod was rejected over attachments it can no longer report, so teardown "
+            "would strand it and its volume, template and secrets while they keep billing"
+        )
+    assert _matches(desiredStatus="EXITED", **attached)
+
+    # a RUNNING pod holds its machine, so it does report both. absence there is a real mismatch,
+    # not a released resource, and must stay a conflict.
+    assert not _matches(desiredStatus="RUNNING")
+    # a value that *is* present must still match in every state: absence is the only tolerance.
+    assert not _matches(desiredStatus="EXITED", **{**attached, "templateId": "tpl0000002"})
+    assert not _matches(
+        desiredStatus="EXITED",
+        **{**attached, "networkVolume": {"id": "vol0000002"}},
+    )
+
+
 def _flip_to_running_after(transport: _FakeTransport, reads: int) -> dict[str, int]:
     """let the seeded pod finish provisioning after `reads` pod listings."""
 
