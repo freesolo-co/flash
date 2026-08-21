@@ -17,8 +17,7 @@ from collections.abc import Callable
 
 from flash.serve.control import DeploymentResult, RunPodProviderHandle
 
-from ._common import DeploymentBundle, failed_deployment_result
-from ._runpod_lifecycle import Clock, LifecycleFailure, Sleeper
+from ._common import Clock, DeploymentBundle, LifecycleFailure, Sleeper, failed_deployment_result
 from ._runpod_plan import RunPodCreatePlan
 from ._runpod_protocol import RunPodObservation, RunPodSecretObservation
 from ._runpod_resources import (

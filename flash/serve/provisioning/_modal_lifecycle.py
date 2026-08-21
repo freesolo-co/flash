@@ -1,11 +1,8 @@
-"""shared primitives for the modal serving deployment lifecycle.
+"""input validation, sdk construction, and the modal call wrapper.
 
-`modal.py` reached the 1000-line file limit. The group extracted here is the same one taken out of
-`runpod.py` into `_runpod_lifecycle`: input validation, sdk construction, and the call wrapper that
-decides whether a failed provider call is merely failed or leaves the outcome unknown. Keeping the
-two providers structured alike means a reader who has learned one can navigate the other.
-
-The split is one-way -- this module imports nothing from `modal.py` -- so there is no cycle.
+The mirror of `_runpod_lifecycle`: the wrapper decides whether a failed provider call is merely
+failed or leaves the outcome unknown. This module imports nothing from `modal.py`, so the
+dependency stays one-way.
 """
 
 from __future__ import annotations
@@ -15,30 +12,9 @@ from collections.abc import Callable
 
 from flash.serve.control import ModalCredentials
 
-# provider-neutral, so they live in `_common` rather than once per provider. re-exported here for
-# the same reason `_runpod_lifecycle` re-exports them: callers import lifecycle names from their
-# own provider's lifecycle module.
-from ._common import (
-    Clock,
-    LifecycleFailure,
-    ServingRuntimeSecrets,
-    Sleeper,
-    validate_deadline,
-)
+from ._common import Clock, ServingRuntimeSecrets, validate_deadline
 from ._modal_plan import ModalCreatePlan
 from ._modal_sdk import ModalObservation, ModalSdk, ModalSdkFactory, ModalSdkFailure
-
-__all__ = [
-    "Clock",
-    "LifecycleFailure",
-    "Sleeper",
-    "mutation",
-    "observe",
-    "open_sdk",
-    "validate_control_inputs",
-    "validate_deadline",
-    "validate_runtime_inputs",
-]
 
 
 def validate_runtime_inputs(

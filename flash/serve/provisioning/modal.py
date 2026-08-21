@@ -14,16 +14,38 @@ from flash.serve.control import (
 )
 from flash.serve.control.types import validate_modal_handle
 
-from . import _modal_lifecycle, _modal_readiness
 from ._common import (
+    Clock,
     DeploymentBundle,
     InterruptedProvisioning,
+    LifecycleFailure,
     ServingRuntimeSecrets,
+    Sleeper,
     failed_deployment_result,
 )
-from ._modal_lifecycle import Clock, LifecycleFailure, Sleeper
+from ._modal_lifecycle import (
+    mutation,
+    observe,
+    open_sdk,
+    validate_control_inputs,
+    validate_runtime_inputs,
+)
 from ._modal_plan import ModalCreatePlan, build_modal_create_plan
 from ._modal_probe import ModalEndpointProbe
+from ._modal_readiness import (
+    EndpointProbe,
+    ExpectedResources,
+    PhaseProof,
+    TransientPhase,
+    failure_result,
+    from_sdk_failure,
+    matches_transient,
+    phase_proof,
+    probe_with_deadline,
+    sleep_until_poll,
+    unknown_result,
+    wait_for_phase,
+)
 from ._modal_resources import (
     ModalResourceConflict,
     ensure_unique_resources,
@@ -38,29 +60,6 @@ from ._modal_sdk import (
     ModalSdkFailure,
     create_modal_sdk,
 )
-
-# readiness proofs and the endpoint probe moved to `_modal_readiness` when this file reached the
-# 1000-line limit, mirroring the `_runpod_readiness` split. bound to the private names the
-# lifecycle below already used, so the split stayed a move rather than a rename at every call site.
-_LifecycleFailure = LifecycleFailure
-_mutation = _modal_lifecycle.mutation
-_observe = _modal_lifecycle.observe
-_open_sdk = _modal_lifecycle.open_sdk
-_validate_control_inputs = _modal_lifecycle.validate_control_inputs
-_validate_runtime_inputs = _modal_lifecycle.validate_runtime_inputs
-
-EndpointProbe = _modal_readiness.EndpointProbe
-_ExpectedResources = _modal_readiness.ExpectedResources
-_PhaseProof = _modal_readiness.PhaseProof
-_TransientPhase = _modal_readiness.TransientPhase
-_failure_result = _modal_readiness.failure_result
-_from_sdk_failure = _modal_readiness.from_sdk_failure
-_matches_transient = _modal_readiness.matches_transient
-_phase_proof = _modal_readiness.phase_proof
-_probe_with_deadline = _modal_readiness.probe_with_deadline
-_sleep_until_poll = _modal_readiness.sleep_until_poll
-_unknown_result = _modal_readiness.unknown_result
-_wait_for_phase = _modal_readiness.wait_for_phase
 
 _DEFAULT_ENDPOINT_PROBE = ModalEndpointProbe()
 
@@ -105,23 +104,23 @@ def _create_resources(
     inference_token: str,
     artifact_token: str | None,
     created: _CreatedResources | None = None,
-) -> _ExpectedResources:
+) -> ExpectedResources:
     # each resource is marked before its create is issued, never after. an interrupt between two
     # creates has to tear down what may already have landed, and a resource Modal accepted whose
     # return value never arrived is exactly the one that leaks. see `_CreatedResources`.
     record = created if created is not None else _CreatedResources()
     record.inference = True
-    inference = _mutation(lambda: sdk.create_inference_secret(plan, inference_token))
+    inference = mutation(lambda: sdk.create_inference_secret(plan, inference_token))
     artifact = None
     if artifact_token is not None:
         record.artifact = True
-        artifact = _mutation(lambda: sdk.create_artifact_secret(plan, artifact_token))
+        artifact = mutation(lambda: sdk.create_artifact_secret(plan, artifact_token))
     record.volume = True
-    volume = _mutation(lambda: sdk.create_volume(plan))
+    volume = mutation(lambda: sdk.create_volume(plan))
     assert type(inference) is ModalNamedResource
     assert artifact is None or type(artifact) is ModalNamedResource
     assert type(volume) is ModalNamedResource
-    return _ExpectedResources(
+    return ExpectedResources(
         app_id=None,
         volume_id=volume.id,
         inference_secret_id=inference.id,
@@ -133,16 +132,16 @@ def _deploy_once_then_wait(
     plan: ModalCreatePlan,
     sdk: ModalSdk,
     inference_token: str,
-    expected: _ExpectedResources,
+    expected: ExpectedResources,
     *,
     artifact_present: bool,
-    transient_phases: tuple[_TransientPhase, ...],
+    transient_phases: tuple[TransientPhase, ...],
     deadline_at: float,
     probe: EndpointProbe,
     clock: Clock,
     sleep: Sleeper,
     created: _CreatedResources | None = None,
-) -> _PhaseProof | None:
+) -> PhaseProof | None:
     deployed_app_id: str | None = None
     try:
         # marked before the call, not after: an interrupt or an ambiguous failure can land with the
@@ -151,20 +150,20 @@ def _deploy_once_then_wait(
         # already suppresses, so over-recording is safe and under-recording leaks a live gpu.
         if created is not None:
             created.app_deployed = True
-        deployed = _mutation(lambda: sdk.deploy_app(plan))
+        deployed = mutation(lambda: sdk.deploy_app(plan))
         if type(deployed) is not str:
             raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True)
         deployed_app_id = deployed
     except ModalSdkFailure as exc:
         if not exc.outcome_unknown:
             raise
-    expected_after_deploy = _ExpectedResources(
+    expected_after_deploy = ExpectedResources(
         app_id=deployed_app_id or expected.app_id,
         volume_id=expected.volume_id,
         inference_secret_id=expected.inference_secret_id,
         artifact_secret_id=expected.artifact_secret_id,
     )
-    return _wait_for_phase(
+    return wait_for_phase(
         plan,
         sdk,
         inference_token,
@@ -181,7 +180,7 @@ def _deploy_once_then_wait(
 def _delete_artifact_and_confirm(
     finalized_plan: ModalCreatePlan,
     sdk: ModalSdk,
-    proof: _PhaseProof,
+    proof: PhaseProof,
     inference_token: str,
     *,
     deadline_at: float,
@@ -196,34 +195,34 @@ def _delete_artifact_and_confirm(
             status="ready",
             handle=proof.handle,
         )
-    expected = _ExpectedResources(
+    expected = ExpectedResources(
         app_id=proof.handle.app_id,
         volume_id=proof.handle.volume_id,
         inference_secret_id=proof.handle.inference_secret_id,
         artifact_secret_id=artifact.id,
     )
     try:
-        _mutation(lambda: sdk.delete_secret(finalized_plan, artifact.name))
+        mutation(lambda: sdk.delete_secret(finalized_plan, artifact.name))
     except ModalSdkFailure as exc:
         if not exc.outcome_unknown:
-            return _failure_result(finalized_plan, _from_sdk_failure(exc), handle=proof.handle)
+            return failure_result(finalized_plan, from_sdk_failure(exc), handle=proof.handle)
     try:
-        cleaned = _wait_for_phase(
+        cleaned = wait_for_phase(
             finalized_plan,
             sdk,
             inference_token,
             artifact_present=False,
             expected=expected,
-            transient_phases=(_TransientPhase(finalized_plan, True),),
+            transient_phases=(TransientPhase(finalized_plan, True),),
             deadline_at=deadline_at,
             probe=probe,
             clock=clock,
             sleep=sleep,
         )
     except (ModalResourceConflict, ModalSdkFailure):
-        return _unknown_result(finalized_plan, handle=proof.handle)
+        return unknown_result(finalized_plan, handle=proof.handle)
     if cleaned is None:
-        return _unknown_result(finalized_plan, handle=proof.handle)
+        return unknown_result(finalized_plan, handle=proof.handle)
     return DeploymentResult.from_spec(
         finalized_plan.bundle.spec,
         status="ready",
@@ -235,7 +234,7 @@ def _finalize_bootstrap(
     bootstrap_plan: ModalCreatePlan,
     finalized_plan: ModalCreatePlan,
     sdk: ModalSdk,
-    bootstrap: _PhaseProof,
+    bootstrap: PhaseProof,
     inference_token: str,
     *,
     deadline_at: float,
@@ -245,8 +244,8 @@ def _finalize_bootstrap(
 ) -> DeploymentResult:
     artifact = bootstrap.artifact
     if artifact is None:
-        return _unknown_result(finalized_plan, handle=bootstrap.handle)
-    expected = _ExpectedResources(
+        return unknown_result(finalized_plan, handle=bootstrap.handle)
+    expected = ExpectedResources(
         app_id=bootstrap.handle.app_id,
         volume_id=bootstrap.handle.volume_id,
         inference_secret_id=bootstrap.handle.inference_secret_id,
@@ -259,16 +258,16 @@ def _finalize_bootstrap(
             inference_token,
             expected,
             artifact_present=True,
-            transient_phases=(_TransientPhase(bootstrap_plan, True),),
+            transient_phases=(TransientPhase(bootstrap_plan, True),),
             deadline_at=deadline_at,
             probe=probe,
             clock=clock,
             sleep=sleep,
         )
     except (ModalResourceConflict, ModalSdkFailure):
-        return _unknown_result(finalized_plan, handle=bootstrap.handle)
+        return unknown_result(finalized_plan, handle=bootstrap.handle)
     if finalized is None:
-        return _unknown_result(finalized_plan, handle=bootstrap.handle)
+        return unknown_result(finalized_plan, handle=bootstrap.handle)
     return _delete_artifact_and_confirm(
         finalized_plan,
         sdk,
@@ -284,7 +283,7 @@ def _finalize_bootstrap(
 def _adopt_uncleaned(
     finalized_plan: ModalCreatePlan,
     sdk: ModalSdk,
-    finalized: _PhaseProof,
+    finalized: PhaseProof,
     inference_token: str,
     *,
     deadline_at: float,
@@ -301,7 +300,7 @@ def _adopt_uncleaned(
     """
 
     try:
-        proved = _wait_for_phase(
+        proved = wait_for_phase(
             finalized_plan,
             sdk,
             inference_token,
@@ -322,9 +321,9 @@ def _adopt_uncleaned(
         # only a vanished artifact is tolerable. re-read and prove that is what happened: identity
         # drift -- a *replacement* app under the same names -- must stay a definite conflict rather
         # than be mistaken for someone else's successful reclaim.
-        if not _matches_transient(
-            _observe(finalized_plan, sdk),
-            _TransientPhase(finalized_plan, False),
+        if not matches_transient(
+            observe(finalized_plan, sdk),
+            TransientPhase(finalized_plan, False),
             None,
         ):
             raise
@@ -346,7 +345,7 @@ def _adopt_uncleaned(
         # bootstrap credential and it is still here, so reclaiming it now would strip a container
         # that has not yet proven it finished hydrating -- and leave nothing for the rerun this
         # `outcome_unknown` invites. reclaim follows proof, never precedes it.
-        return _unknown_result(finalized_plan, handle=finalized.handle)
+        return unknown_result(finalized_plan, handle=finalized.handle)
     return _delete_artifact_and_confirm(
         finalized_plan,
         sdk,
@@ -371,9 +370,9 @@ def _adopt_existing(
     clock: Clock,
     sleep: Sleeper,
 ) -> DeploymentResult:
-    finalized: _PhaseProof | None = None
+    finalized: PhaseProof | None = None
     with contextlib.suppress(ModalResourceConflict):
-        finalized = _phase_proof(
+        finalized = phase_proof(
             finalized_plan,
             observation,
             artifact_present=False,
@@ -384,7 +383,7 @@ def _adopt_existing(
         # 30-second cap to load, and a single probe answered `outcome_unknown` with most of the
         # caller's deadline still unspent -- so a rerun meant to follow an existing deployment
         # could never reach it, while fresh creates and explicit reconciliation both wait here.
-        proved = _wait_for_phase(
+        proved = wait_for_phase(
             finalized_plan,
             sdk,
             inference_token,
@@ -402,9 +401,9 @@ def _adopt_existing(
                 status="ready",
                 handle=proved.handle,
             )
-        return _unknown_result(finalized_plan, handle=finalized.handle)
+        return unknown_result(finalized_plan, handle=finalized.handle)
     with contextlib.suppress(ModalResourceConflict):
-        finalized = _phase_proof(
+        finalized = phase_proof(
             finalized_plan,
             observation,
             artifact_present=True,
@@ -421,13 +420,13 @@ def _adopt_existing(
             clock=clock,
             sleep=sleep,
         )
-    bootstrap = _phase_proof(
+    bootstrap = phase_proof(
         bootstrap_plan,
         observation,
         artifact_present=True,
         expected=None,
     )
-    if not _probe_with_deadline(
+    if not probe_with_deadline(
         probe,
         bootstrap.handle,
         inference_token,
@@ -435,29 +434,29 @@ def _adopt_existing(
         deadline_at=deadline_at,
         clock=clock,
     ):
-        return _unknown_result(finalized_plan, handle=bootstrap.handle)
+        return unknown_result(finalized_plan, handle=bootstrap.handle)
     artifact = bootstrap.artifact
     assert artifact is not None
-    expected = _ExpectedResources(
+    expected = ExpectedResources(
         app_id=bootstrap.handle.app_id,
         volume_id=bootstrap.handle.volume_id,
         inference_secret_id=bootstrap.handle.inference_secret_id,
         artifact_secret_id=artifact.id,
     )
-    finalized = _wait_for_phase(
+    finalized = wait_for_phase(
         finalized_plan,
         sdk,
         inference_token,
         artifact_present=True,
         expected=expected,
-        transient_phases=(_TransientPhase(bootstrap_plan, True),),
+        transient_phases=(TransientPhase(bootstrap_plan, True),),
         deadline_at=deadline_at,
         probe=probe,
         clock=clock,
         sleep=sleep,
     )
     if finalized is None:
-        return _unknown_result(finalized_plan, handle=bootstrap.handle)
+        return unknown_result(finalized_plan, handle=bootstrap.handle)
     return _delete_artifact_and_confirm(
         finalized_plan,
         sdk,
@@ -483,15 +482,15 @@ def provision_modal_deployment(
 ) -> DeploymentResult:
     """create or prove one exact modal deployment without blind mutation retries."""
 
-    _validate_runtime_inputs(credentials, runtime_secrets, deadline_at, clock)
+    validate_runtime_inputs(credentials, runtime_secrets, deadline_at, clock)
     bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
     finalized_plan = build_modal_create_plan(bundle, phase="finalized")
     sdk: ModalSdk | None = None
     created = _CreatedResources()
     reached_ready = False
     try:
-        sdk = _open_sdk(sdk_factory, credentials, finalized_plan)
-        observation = _observe(finalized_plan, sdk)
+        sdk = open_sdk(sdk_factory, credentials, finalized_plan)
+        observation = observe(finalized_plan, sdk)
         ensure_unique_resources(observation)
         inference_token, artifact_token = runtime_secrets._reveal_for_launch()
         if observation.resource_count:
@@ -529,9 +528,9 @@ def provision_modal_deployment(
                 created=created,
             )
         except (ModalResourceConflict, ModalSdkFailure):
-            return _unknown_result(finalized_plan)
+            return unknown_result(finalized_plan)
         if phase is None:
-            return _unknown_result(finalized_plan)
+            return unknown_result(finalized_plan)
         # the app is deployed and has answered the readiness probe. from here the only remaining
         # work is swapping the bootstrap phase out for the finalized one, so an interrupt must
         # leave the deployment standing rather than delete what the user just waited for.
@@ -554,9 +553,9 @@ def provision_modal_deployment(
             sleep=sleep,
         )
     except ModalResourceConflict:
-        return _failure_result(finalized_plan, _LifecycleFailure("conflict"))
+        return failure_result(finalized_plan, LifecycleFailure("conflict"))
     except ModalSdkFailure as exc:
-        return _failure_result(finalized_plan, _from_sdk_failure(exc))
+        return failure_result(finalized_plan, from_sdk_failure(exc))
     except BaseException:
         # Ctrl-C derives from BaseException, so neither handler above sees it. Without this the
         # app, its volume, and its secrets stay live in the customer's Modal account and keep
@@ -593,26 +592,26 @@ def reconcile_modal_deployment(
 ) -> DeploymentResult:
     """read and prove one finalized modal deployment without provider mutation."""
 
-    _validate_runtime_inputs(credentials, runtime_secrets, deadline_at, clock)
+    validate_runtime_inputs(credentials, runtime_secrets, deadline_at, clock)
     bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
     finalized_plan = build_modal_create_plan(bundle, phase="finalized")
     sdk: ModalSdk | None = None
     try:
-        sdk = _open_sdk(sdk_factory, credentials, finalized_plan)
-        initial = _observe(finalized_plan, sdk)
+        sdk = open_sdk(sdk_factory, credentials, finalized_plan)
+        initial = observe(finalized_plan, sdk)
         ensure_unique_resources(initial)
         if initial.resource_count == 0:
             return DeploymentResult.from_spec(bundle.spec, status="absent")
         inference_token, _artifact_token = runtime_secrets._reveal_for_launch()
-        proof = _wait_for_phase(
+        proof = wait_for_phase(
             finalized_plan,
             sdk,
             inference_token,
             artifact_present=False,
             expected=None,
             transient_phases=(
-                _TransientPhase(bootstrap_plan, True),
-                _TransientPhase(finalized_plan, True),
+                TransientPhase(bootstrap_plan, True),
+                TransientPhase(finalized_plan, True),
             ),
             deadline_at=deadline_at,
             probe=probe,
@@ -620,12 +619,12 @@ def reconcile_modal_deployment(
             sleep=sleep,
         )
         if proof is None:
-            return _unknown_result(finalized_plan)
+            return unknown_result(finalized_plan)
         return DeploymentResult.from_spec(bundle.spec, status="ready", handle=proof.handle)
     except ModalResourceConflict:
-        return _failure_result(finalized_plan, _LifecycleFailure("conflict"))
+        return failure_result(finalized_plan, LifecycleFailure("conflict"))
     except ModalSdkFailure as exc:
-        return _failure_result(finalized_plan, _from_sdk_failure(exc))
+        return failure_result(finalized_plan, from_sdk_failure(exc))
     finally:
         if sdk is not None:
             sdk.close()
@@ -682,7 +681,7 @@ def _wait_for_terminal_app(
     sleep: Sleeper,
 ) -> ModalObservation | None:
     while True:
-        observation = _observe(plan, sdk, app_id_hint=handle.app_id)
+        observation = observe(plan, sdk, app_id_hint=handle.app_id)
         app, _volume, _inference, _artifact = exact_teardown_resources(
             plan,
             handle,
@@ -690,7 +689,7 @@ def _wait_for_terminal_app(
         )
         if app is not None and app.state in {"stopped", "failed"}:
             return observation if app.running_containers == 0 else None
-        if not _sleep_until_poll(deadline_at, clock, sleep):
+        if not sleep_until_poll(deadline_at, clock, sleep):
             return None
 
 
@@ -726,7 +725,7 @@ def _abort_created_resources(
         # and modal refuses to delete a volume an app still has attached, so stopping it first is
         # what makes the deletes below able to succeed at all. canonical teardown uses this order
         # for the same reason.
-        confirmed &= _suppressed(lambda: _mutation(lambda: sdk.stop_app(plan)))
+        confirmed &= _suppressed(lambda: mutation(lambda: sdk.stop_app(plan)))
     # the plan's names, not names read back off a create response: an attempted create whose
     # handle never arrived still has to be deletable, and `allow_missing=True` makes deleting one
     # that was never made a no-op.
@@ -736,10 +735,10 @@ def _abort_created_resources(
     ):
         if attempted:
             confirmed &= _suppressed(
-                lambda name=name: _mutation(lambda: sdk.delete_secret(plan, name))
+                lambda name=name: mutation(lambda: sdk.delete_secret(plan, name))
             )
     if created.volume:
-        confirmed &= _suppressed(lambda: _mutation(lambda: sdk.delete_volume(plan)))
+        confirmed &= _suppressed(lambda: mutation(lambda: sdk.delete_volume(plan)))
     return confirmed
 
 
@@ -751,11 +750,11 @@ def _delete_teardown_resources(
     artifact: ModalNamedResource | None,
 ) -> None:
     if artifact is not None:
-        _mutation(lambda: sdk.delete_secret(plan, artifact.name))
+        mutation(lambda: sdk.delete_secret(plan, artifact.name))
     if inference is not None:
-        _mutation(lambda: sdk.delete_secret(plan, inference.name))
+        mutation(lambda: sdk.delete_secret(plan, inference.name))
     if volume is not None:
-        _mutation(lambda: sdk.delete_volume(plan))
+        mutation(lambda: sdk.delete_volume(plan))
 
 
 def teardown_modal_deployment(
@@ -770,24 +769,24 @@ def teardown_modal_deployment(
 ) -> DeploymentResult:
     """stop one exact app, delete exact resources once, and prove terminal absence."""
 
-    _validate_control_inputs(credentials, deadline_at, clock)
+    validate_control_inputs(credentials, deadline_at, clock)
     plan = build_modal_create_plan(bundle, phase="finalized")
     _validate_handle(plan, handle)
     sdk: ModalSdk | None = None
     mutation_attempted = False
     try:
-        sdk = _open_sdk(sdk_factory, credentials, plan)
-        observation = _observe(plan, sdk, app_id_hint=handle.app_id)
+        sdk = open_sdk(sdk_factory, credentials, plan)
+        observation = observe(plan, sdk, app_id_hint=handle.app_id)
         app, _volume, _inference, _artifact = exact_teardown_resources(plan, handle, observation)
         if app is None:
-            return _unknown_result(plan, handle=handle)
+            return unknown_result(plan, handle=handle)
         if app.state == "deployed":
             mutation_attempted = True
             try:
-                _mutation(lambda: sdk.stop_app(plan))
+                mutation(lambda: sdk.stop_app(plan))
             except ModalSdkFailure as exc:
                 if not exc.outcome_unknown:
-                    return _failure_result(plan, _from_sdk_failure(exc), handle=handle)
+                    return failure_result(plan, from_sdk_failure(exc), handle=handle)
         terminal = _wait_for_terminal_app(
             plan,
             sdk,
@@ -797,24 +796,24 @@ def teardown_modal_deployment(
             sleep=sleep,
         )
         if terminal is None:
-            return _unknown_result(plan, handle=handle)
+            return unknown_result(plan, handle=handle)
         _app, volume, inference, artifact = exact_teardown_resources(plan, handle, terminal)
         if any(resource is not None for resource in (volume, inference, artifact)):
             mutation_attempted = True
         _delete_teardown_resources(plan, sdk, volume, inference, artifact)
-        final = _observe(plan, sdk, app_id_hint=handle.app_id)
+        final = observe(plan, sdk, app_id_hint=handle.app_id)
         exact_teardown_resources(plan, handle, final)
         if resources_are_absent(final, allow_terminal_app=True):
             return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
-        return _unknown_result(plan, handle=handle)
+        return unknown_result(plan, handle=handle)
     except ModalResourceConflict:
         if mutation_attempted:
-            return _unknown_result(plan, handle=handle)
-        return _failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
+            return unknown_result(plan, handle=handle)
+        return failure_result(plan, LifecycleFailure("conflict"), handle=handle)
     except ModalSdkFailure as exc:
         if mutation_attempted:
-            return _unknown_result(plan, handle=handle)
-        return _failure_result(plan, _from_sdk_failure(exc), handle=handle)
+            return unknown_result(plan, handle=handle)
+        return failure_result(plan, from_sdk_failure(exc), handle=handle)
     finally:
         if sdk is not None:
             sdk.close()
@@ -830,19 +829,19 @@ def confirm_modal_absence(
 ) -> DeploymentResult:
     """report absent only after authoritative workspace resource confirmation."""
 
-    _validate_control_inputs(credentials, deadline_at, clock)
+    validate_control_inputs(credentials, deadline_at, clock)
     plan = build_modal_create_plan(bundle, phase="finalized")
     sdk: ModalSdk | None = None
     try:
-        sdk = _open_sdk(sdk_factory, credentials, plan)
-        observation = _observe(plan, sdk)
+        sdk = open_sdk(sdk_factory, credentials, plan)
+        observation = observe(plan, sdk)
         if resources_are_absent(observation, allow_terminal_app=False):
             return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
-        return _failure_result(plan, _LifecycleFailure("conflict"))
+        return failure_result(plan, LifecycleFailure("conflict"))
     except (ModalResourceConflict, ModalSdkFailure) as exc:
         if isinstance(exc, ModalSdkFailure):
-            return _failure_result(plan, _from_sdk_failure(exc))
-        return _failure_result(plan, _LifecycleFailure("conflict"))
+            return failure_result(plan, from_sdk_failure(exc))
+        return failure_result(plan, LifecycleFailure("conflict"))
     finally:
         if sdk is not None:
             sdk.close()

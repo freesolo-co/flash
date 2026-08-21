@@ -11,13 +11,23 @@ from flash.serve.control import (
 )
 from flash.serve.control.types import validate_runpod_handle
 
-from . import _runpod_lifecycle
 from ._common import (
+    Clock,
     DeploymentBundle,
     InterruptedProvisioning,
+    LifecycleFailure,
     ServingRuntimeSecrets,
+    Sleeper,
 )
-from ._runpod_lifecycle import Clock, LifecycleFailure, Sleeper, TransportFactory
+from ._runpod_lifecycle import (
+    TransportFactory,
+    identity,
+    mutation_call,
+    open_transport,
+    read_call,
+    validate_control_inputs,
+    validate_runtime_inputs,
+)
 from ._runpod_mutations import MutationKind, MutationLedger
 from ._runpod_plan import RunPodCreatePlan, build_runpod_create_plan
 from ._runpod_probe import RunPodEndpointProbe
@@ -66,18 +76,6 @@ from ._runpod_transport import (
     StdlibRunPodTransport,
 )
 
-# the shared primitives moved to `_runpod_lifecycle` when this file reached the 1000-line limit.
-# bound to the private names the lifecycle below already used, so the split stayed a move rather
-# than a rename touching every call site.
-_LifecycleFailure = LifecycleFailure
-_identity = _runpod_lifecycle.identity
-_mutation_call = _runpod_lifecycle.mutation_call
-_read_call = _runpod_lifecycle.read_call
-_transport = _runpod_lifecycle.open_transport
-_validate_control_inputs = _runpod_lifecycle.validate_control_inputs
-_validate_runtime_inputs = _runpod_lifecycle.validate_runtime_inputs
-
-
 _DEFAULT_ENDPOINT_PROBE = RunPodEndpointProbe()
 
 # how much of the caller's deadline is held back for teardown. one observe, one pod delete, a
@@ -112,7 +110,7 @@ def _observe(
     *,
     deadline_at: float,
 ) -> RunPodObservation:
-    account_id, secrets = _read_call(
+    account_id, secrets = read_call(
         lambda: transport.graphql(
             LIST_ACCOUNT_SECRETS,
             {},
@@ -121,19 +119,19 @@ def _observe(
         ),
         parse_account_secrets,
     )
-    templates = _read_call(
+    templates = read_call(
         lambda: transport.rest("GET", "/templates", None, mutation=False, deadline_at=deadline_at),
         # only flash's own template is parsed strictly; foreign rows in the customer's account may
         # omit fields this parser requires and must not fail the whole observation.
         lambda raw: parse_templates(raw, keep_name=plan.names.template),
     )
-    volumes = _read_call(
+    volumes = read_call(
         lambda: transport.rest(
             "GET", "/networkvolumes", None, mutation=False, deadline_at=deadline_at
         ),
         parse_volumes,
     )
-    pods = _read_call(
+    pods = read_call(
         # runpod omits the machine and network-volume objects unless asked, and gpu type and data
         # center live only inside them. without these flags a pod's gpuTypeId is always absent, so
         # adoption could never confirm a pod matches the plan's placement.
@@ -166,8 +164,8 @@ def _observe(
     )
 
 
-def _from_transport_failure(exc: RunPodTransportFailure) -> _LifecycleFailure:
-    return _LifecycleFailure(exc.code, exc.outcome_unknown)
+def _from_transport_failure(exc: RunPodTransportFailure) -> LifecycleFailure:
+    return LifecycleFailure(exc.code, exc.outcome_unknown)
 
 
 def _bind_observe(transport: RunPodTransport, *, deadline_at: float) -> Observe:
@@ -193,11 +191,11 @@ def reconcile_runpod_deployment(
 ) -> DeploymentResult:
     """read and prove one deterministic deployment without mutating provider state."""
 
-    _validate_runtime_inputs(credentials, runtime_secrets, deadline_at, clock)
+    validate_runtime_inputs(credentials, runtime_secrets, deadline_at, clock)
     plan = build_runpod_create_plan(bundle)
     inference_token, _artifact_token = runtime_secrets._reveal_for_launch()
     try:
-        transport = _transport(transport_factory, credentials)
+        transport = open_transport(transport_factory, credentials)
         return read_only_reconcile(
             plan,
             _bind_observe(transport, deadline_at=deadline_at),
@@ -223,7 +221,7 @@ def _delete_secret_once(
     deadline_at: float,
 ) -> None:
     try:
-        _mutation_call(
+        mutation_call(
             lambda: transport.graphql(
                 DELETE_SECRET,
                 {"id": secret_id},
@@ -244,9 +242,9 @@ def _delete_rest_once(
     deadline_at: float,
 ) -> None:
     try:
-        _mutation_call(
+        mutation_call(
             lambda: transport.rest("DELETE", path, None, mutation=True, deadline_at=deadline_at),
-            _identity,
+            identity,
         )
     except RunPodTransportFailure as exc:
         if exc.code != "not_found":
@@ -263,7 +261,7 @@ def _create_secret(
     deadline_at: float,
 ) -> RunPodSecretObservation:
     ledger.begin(kind)
-    created = _mutation_call(
+    created = mutation_call(
         lambda: transport.graphql(
             CREATE_SECRET,
             {"name": name, "value": value},
@@ -313,7 +311,7 @@ def _create_resources(
             deadline_at=deadline_at,
         )
     ledger.begin("volume")
-    volume = _mutation_call(
+    volume = mutation_call(
         lambda: transport.rest(
             "POST",
             "/networkvolumes",
@@ -329,7 +327,7 @@ def _create_resources(
     ledger.confirm("volume", volume.id)
 
     ledger.begin("template")
-    template = _mutation_call(
+    template = mutation_call(
         lambda: transport.rest(
             "POST",
             "/templates",
@@ -345,7 +343,7 @@ def _create_resources(
     ledger.confirm("template", template.id)
 
     ledger.begin("pod")
-    pod = _mutation_call(
+    pod = mutation_call(
         lambda: transport.rest(
             "POST",
             "/pods",
@@ -490,7 +488,7 @@ def _failure_after_create_attempt(
     plan: RunPodCreatePlan,
     transport: RunPodTransport,
     ledger: MutationLedger,
-    failure: _LifecycleFailure,
+    failure: LifecycleFailure,
     *,
     handle: RunPodProviderHandle | None,
     unconfirmed_create_may_exist: bool = True,
@@ -527,7 +525,7 @@ def provision_runpod_deployment(
 ) -> DeploymentResult:
     """create one exact persistent pod generation with bounded abort cleanup."""
 
-    _validate_runtime_inputs(credentials, runtime_secrets, deadline_at, clock)
+    validate_runtime_inputs(credentials, runtime_secrets, deadline_at, clock)
     plan = build_runpod_create_plan(bundle)
     inference_token, artifact_token = runtime_secrets._reveal_for_launch()
     ledger = MutationLedger()
@@ -540,17 +538,17 @@ def provision_runpod_deployment(
         reached_ready = True
 
     try:
-        transport = _transport(transport_factory, credentials)
+        transport = open_transport(transport_factory, credentials)
         observation = _observe(plan, transport, deadline_at=deadline_at)
         try:
             ensure_unique_resources(observation)
         except RunPodResourceConflict:
-            return failure_result(plan, _LifecycleFailure("conflict"))
+            return failure_result(plan, LifecycleFailure("conflict"))
         if observation.resource_count:
             try:
                 exact_core_resources(plan, observation)
             except RunPodResourceConflict:
-                return failure_result(plan, _LifecycleFailure("conflict"))
+                return failure_result(plan, LifecycleFailure("conflict"))
             return await_ready_and_reclaim(
                 plan,
                 _bind_observe(transport, deadline_at=deadline_at),
@@ -597,7 +595,7 @@ def provision_runpod_deployment(
                 plan,
                 transport,
                 ledger,
-                _LifecycleFailure(ready.error_code or "readiness_failed"),
+                LifecycleFailure(ready.error_code or "readiness_failed"),
                 handle=handle,
                 deadline_at=deadline_at,
                 clock=clock,
@@ -638,7 +636,7 @@ def provision_runpod_deployment(
                 plan,
                 transport,
                 ledger,
-                _LifecycleFailure("readiness_failed"),
+                LifecycleFailure("readiness_failed"),
                 handle=handle,
                 deadline_at=deadline_at,
                 clock=clock,
@@ -685,26 +683,26 @@ def grow_runpod_volume(
 ) -> DeploymentResult:
     """grow the exact generation volume once and confirm its authoritative size."""
 
-    _validate_control_inputs(credentials, deadline_at, clock)
+    validate_control_inputs(credentials, deadline_at, clock)
     plan = build_runpod_create_plan(bundle)
     _validate_handle(plan, handle)
     if type(target_size_gb) is not int or target_size_gb < plan.placement.volume_size_gb:
         raise ValueError("target volume size cannot shrink the planned volume")
     mutation_attempted = False
     try:
-        transport = _transport(transport_factory, credentials)
+        transport = open_transport(transport_factory, credentials)
         observation = _observe(plan, transport, deadline_at=deadline_at)
         _secret, _template, volume, _pod = exact_core_resources(plan, observation)
         if volume.id != handle.network_volume_id:
-            return failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
+            return failure_result(plan, LifecycleFailure("conflict"), handle=handle)
         if target_size_gb < volume.size_gb:
-            return failure_result(plan, _LifecycleFailure("invalid_request"), handle=handle)
+            return failure_result(plan, LifecycleFailure("invalid_request"), handle=handle)
         if target_size_gb == volume.size_gb:
             return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
         # reads above are honest as `failed`; past the PATCH it is not. `failed` means "nothing
         # changed", so it hides the reconcile warning and invites a retry of an in-flight resize.
         mutation_attempted = True
-        resized = _mutation_call(
+        resized = mutation_call(
             lambda: transport.rest(
                 "PATCH",
                 f"/networkvolumes/{volume.id}",
@@ -730,13 +728,13 @@ def grow_runpod_volume(
             if current_volume.size_gb == target_size_gb:
                 return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
             if current_volume.size_gb > target_size_gb:
-                return failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
+                return failure_result(plan, LifecycleFailure("conflict"), handle=handle)
             if not sleep_until_poll(deadline_at, clock, sleep):
                 return unknown_result(plan, handle=handle)
     except RunPodResourceConflict:
         if mutation_attempted:
             return unknown_result(plan, handle=handle)
-        return failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
+        return failure_result(plan, LifecycleFailure("conflict"), handle=handle)
     except RunPodTransportFailure as exc:
         if mutation_attempted:
             return unknown_result(plan, handle=handle)
@@ -755,7 +753,7 @@ def teardown_runpod_deployment(
 ) -> DeploymentResult:
     """delete one exact generation once per resource and prove authoritative absence."""
 
-    _validate_control_inputs(credentials, deadline_at, clock)
+    validate_control_inputs(credentials, deadline_at, clock)
     plan = build_runpod_create_plan(bundle)
     _validate_handle(plan, handle)
     # once a delete has been issued, nothing after it can report a plain `failed`: the resource may
@@ -764,7 +762,7 @@ def teardown_runpod_deployment(
     # `mutation_attempted` in the modal teardown, which returns unknown for exactly these cases.
     mutation_attempted = False
     try:
-        transport = _transport(transport_factory, credentials)
+        transport = open_transport(transport_factory, credentials)
         observation = _observe(plan, transport, deadline_at=deadline_at)
         inference, artifact, template, volume, pod = exact_teardown_resources(
             plan, handle, observation
@@ -803,7 +801,7 @@ def teardown_runpod_deployment(
     except RunPodResourceConflict:
         if mutation_attempted:
             return unknown_result(plan, handle=handle)
-        return failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
+        return failure_result(plan, LifecycleFailure("conflict"), handle=handle)
     except RunPodTransportFailure as exc:
         if mutation_attempted:
             return unknown_result(plan, handle=handle)
@@ -820,13 +818,13 @@ def confirm_runpod_absence(
 ) -> DeploymentResult:
     """report absent only after authoritative account-scoped list confirmation."""
 
-    _validate_control_inputs(credentials, deadline_at, clock)
+    validate_control_inputs(credentials, deadline_at, clock)
     plan = build_runpod_create_plan(bundle)
     try:
-        transport = _transport(transport_factory, credentials)
+        transport = open_transport(transport_factory, credentials)
         observation = _observe(plan, transport, deadline_at=deadline_at)
         if observation.resource_count == 0:
             return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
-        return failure_result(plan, _LifecycleFailure("conflict"))
+        return failure_result(plan, LifecycleFailure("conflict"))
     except RunPodTransportFailure as exc:
         return failure_result(plan, _from_transport_failure(exc))

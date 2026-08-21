@@ -1,14 +1,8 @@
-"""shared primitives for the runpod provisioning lifecycle.
+"""input validation, transport construction, and the runpod call wrappers.
 
-`runpod.py` reached the 1000-line file limit, and the group that came out cleanest is the one
-nothing else in that module depends on structurally: input validation, transport construction, and
-the two call wrappers that decide whether a failed provider call is merely failed or leaves the
-outcome unknown. They are pure, provider-call-shaped, and referenced from every phase of the
-lifecycle, so they read better as a named foundation than as the first two hundred lines of the
-file that uses them.
-
-The split is deliberately one-way: this module imports nothing from `runpod.py`, so there is no
-cycle to reason about.
+The two call wrappers decide whether a failed provider call is merely failed or leaves the outcome
+unknown, which is the distinction every phase of the lifecycle branches on. This module imports
+nothing from `runpod.py`, so the dependency stays one-way.
 """
 
 from __future__ import annotations
@@ -17,31 +11,8 @@ from collections.abc import Callable
 
 from flash.serve.control import RunPodCredentials
 
-# `Clock`, `Sleeper`, `LifecycleFailure` and `validate_deadline` are provider-neutral and live in
-# `_common`. They are re-exported here so the lifecycle modules stay the single import site for
-# their own callers, which is what `_modal_lifecycle` does too.
-from ._common import (
-    Clock,
-    LifecycleFailure,
-    ServingRuntimeSecrets,
-    Sleeper,
-    validate_deadline,
-)
+from ._common import Clock, ServingRuntimeSecrets, validate_deadline
 from ._runpod_transport import RunPodTransport, RunPodTransportFailure
-
-__all__ = [
-    "Clock",
-    "LifecycleFailure",
-    "Sleeper",
-    "TransportFactory",
-    "identity",
-    "mutation_call",
-    "open_transport",
-    "read_call",
-    "validate_control_inputs",
-    "validate_deadline",
-    "validate_runtime_inputs",
-]
 
 TransportFactory = Callable[[str], RunPodTransport]
 

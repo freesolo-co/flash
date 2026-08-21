@@ -446,5 +446,3 @@ def _single_created(values: tuple[ResourceObservation, ...], name: str):
 
 def secret_reference(name: str) -> str:
     return f"{{{{ RUNPOD_SECRET_{name} }}}}"
-
-

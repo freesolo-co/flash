@@ -13,9 +13,15 @@ from typing import Protocol
 
 from flash.serve.control import DeploymentResult, ModalProviderHandle
 
-from . import _modal_lifecycle
-from ._common import DeploymentBundle, ServingRuntimeSecrets, failed_deployment_result
-from ._modal_lifecycle import Clock, LifecycleFailure, Sleeper
+from ._common import (
+    Clock,
+    DeploymentBundle,
+    LifecycleFailure,
+    ServingRuntimeSecrets,
+    Sleeper,
+    failed_deployment_result,
+)
+from ._modal_lifecycle import observe
 from ._modal_plan import ModalCreatePlan
 from ._modal_resources import ModalResourceConflict, build_handle, exact_core_resources
 from ._modal_sdk import ModalNamedResource, ModalObservation, ModalSdk, ModalSdkFailure
@@ -40,8 +46,6 @@ __all__ = [
 
 READINESS_POLL_SECONDS = 2.0
 MAX_PROBE_TIMEOUT_SECONDS = 30.0
-
-_observe = _modal_lifecycle.observe
 
 
 class EndpointProbe(Protocol):
@@ -197,7 +201,7 @@ def wait_for_phase(
 
     app_id_hint = None if expected is None else expected.app_id
     while True:
-        observation = _observe(plan, sdk, app_id_hint=app_id_hint)
+        observation = observe(plan, sdk, app_id_hint=app_id_hint)
         proof: PhaseProof | None = None
         if observation.resource_count:
             try:
