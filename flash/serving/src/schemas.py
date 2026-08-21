@@ -392,15 +392,15 @@ class GenerateRequest(BaseModel):
     # default), {} = explicitly unconstrained (overrides the adapter default), non-empty dict =
     # the constraint to apply.
     structured_outputs: dict[str, Any] | None = Field(default=None)
-    # Stop sequences for THIS call, forwarded to the engine. The serving contract documents `stop`
+    # stop sequences for THIS call, forwarded to the engine. the serving contract documents `stop`
     # as an accepted field, and pydantic drops undeclared keys silently, so an undeclared `stop`
-    # would be accepted and then ignored — the caller is billed for tokens it asked to stop before.
+    # would be accepted and then ignored -- billing the caller for tokens it asked to stop before.
     stop: str | list[str] | None = Field(default=None)
 
     @field_validator("stop", mode="before")
     @classmethod
     def normalize_stop(cls, value: Any) -> str | list[str] | None:
-        # An empty string never terminates generation and an empty list is not a constraint; both
+        # an empty string never terminates generation and an empty list is not a constraint; both
         # normalize to None so the engine sees "unspecified" rather than a no-op it must carry.
         if value is None:
             return None

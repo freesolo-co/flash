@@ -128,8 +128,8 @@ async def remove_adapter(
 
     base_record, run_id, matches = await resolve_undeploy_target(context.router, adapter_id)
     if base_record is not None:
-        # A base-model serve has no durable row: `_base_model_records()` seeds it in memory and
-        # every replica re-adds it on each reload. Removing it here would clear one replica's
+        # a base-model serve has no durable row: `_base_model_records()` seeds it in memory and
+        # every replica re-adds it on each reload. removing it here would clear one replica's
         # memory, report success, and be undone by the next reload -- while evicting the shared
         # engine's base weights out from under every other tenant on the way.
         raise HTTPException(

@@ -237,7 +237,7 @@ async def _prepare_generate_request(payload: Any, target: AdapterRecord) -> None
     messages = getattr(payload, "messages", None)
     if not isinstance(messages, list):
         return
-    # Validate EVERY message list, not only ones carrying list-form content. `GenerateRequest`
+    # validate EVERY message list, not only ones carrying list-form content. `GenerateRequest`
     # only checks that this is a list of dicts, and the engine hands it straight to the chat
     # template -- so a string-content request skipping this bypassed both halves of the shared
     # contract: a malformed `{"role": "user"}` rendered as an empty prompt and billed the
