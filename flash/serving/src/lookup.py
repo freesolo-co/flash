@@ -30,7 +30,13 @@ class AdapterLookup:
         self._router = router
         self._reload_records = reload_records
         self._reload_interval_seconds = reload_interval_seconds
-        self._last_reload: dict[str, Any] = {"at": float("-inf"), "task": None}
+        # `at` is when the last fetch COMPLETED and drives the ttl. `fetched_at` is when that
+        # fetch STARTED, which is what decides whether a waiting caller may reuse its result.
+        self._last_reload: dict[str, Any] = {
+            "at": float("-inf"),
+            "fetched_at": float("-inf"),
+            "task": None,
+        }
         self._reload_lock = asyncio.Lock()
 
     async def reload(self) -> None:
@@ -41,13 +47,16 @@ class AdapterLookup:
         # order -- the slower fetch's older records landing last and overwriting fresher state,
         # then stamping a newer timestamp over it. hydrate and timestamp move together under here.
         async with self._reload_lock:
-            if self._last_reload["at"] >= started:
-                # another reload finished while we waited. "reload once before 404-ing" is already
-                # satisfied by it, so return instead of stampeding the backend with a duplicate
-                # fetch per concurrent miss.
+            # coalesce onto the in-flight reload only if its fetch STARTED after we did. comparing
+            # against completion time instead let a reload that snapshotted storage before this
+            # caller existed, and merely finished late, satisfy it -- so an adapter committed
+            # before the request arrived stayed invisible and the caller got a 404.
+            if self._last_reload["fetched_at"] >= started:
                 return
+            fetch_started = time.monotonic()
             records = await asyncio.to_thread(self._reload_records)
             self._router.hydrate(records)
+            self._last_reload["fetched_at"] = fetch_started
             self._last_reload["at"] = time.monotonic()
 
     async def _reload_safe(self) -> None:

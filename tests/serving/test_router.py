@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import threading
 import time
 
 import pytest
@@ -1658,7 +1659,7 @@ def test_on_startup_failure_does_not_crash_the_router():
         assert client.get("/healthz").json()["ok"] is True
 
 
-def test_concurrent_misses_reload_once_and_hydrate_in_order():
+def test_concurrent_misses_hydrate_in_order_without_stampeding():
     """Two concurrent misses must not hydrate out of order or stampede shared storage.
 
     `reload()` suspends on `to_thread`, so without serialization a slow first fetch can land AFTER
@@ -1701,7 +1702,82 @@ def test_concurrent_misses_reload_once_and_hydrate_in_order():
 
     results = asyncio.run(_both())
 
-    assert calls["count"] == 1, "each concurrent miss fetched separately instead of coalescing"
-    assert hydrated == [0], f"hydrate ran {len(hydrated)}x; a stale fetch can overwrite a fresh one"
-    # both callers see the same outcome; neither observes a half-applied hydrate.
-    assert all(isinstance(r, HTTPException) for r in results)
+    # bounded, not necessarily 1. the second caller's miss began AFTER the first fetch had already
+    # snapshotted storage, so that snapshot cannot answer it -- an adapter committed in between
+    # would be invisible. what must not happen is a fetch per waiter: the count stays at one
+    # in-flight generation plus one follow-up no matter how many callers pile up.
+    assert calls["count"] <= 2, f"{calls['count']} fetches; misses stampeded shared storage"
+    # the empty fetch must not land after the fresh one. asserting the ORDER, not a fixed list:
+    # requiring `[0]` would mean the later miss reused the earlier snapshot, which is the defect.
+    assert hydrated == sorted(hydrated), f"a stale fetch hydrated after a fresher one: {hydrated}"
+    # no caller sees a half-applied hydrate: each either resolves the pair or gets a clean 404.
+    for result in results:
+        if isinstance(result, HTTPException):
+            continue
+        requested, target = result
+        assert requested.adapter_id == "late"
+        assert target.base_model == QWEN
+
+
+def test_reload_stampede_stays_bounded_as_callers_pile_up():
+    """The coalescing must bound fetches by generation, not by caller count."""
+    import asyncio
+
+    from flash.serving.src.lookup import AdapterLookup
+
+    calls = {"count": 0}
+
+    def _reload():
+        calls["count"] += 1
+        return []
+
+    lookup = AdapterLookup(AdapterRouter([]), _reload, reload_interval_seconds=30.0)
+
+    async def _many():
+        await asyncio.gather(*(lookup.reload() for _ in range(50)))
+
+    asyncio.run(_many())
+
+    assert calls["count"] <= 2, f"50 concurrent misses caused {calls['count']} fetches"
+
+
+def test_a_reload_that_snapshotted_first_cannot_answer_a_later_miss():
+    """Coalescing must compare against when the in-flight fetch STARTED, not when it finished.
+
+    A reload can snapshot storage, stall, and complete after a second request begins. Comparing
+    against its completion time let that stale snapshot satisfy the later request, so an adapter
+    committed before that request arrived stayed invisible and the caller got a 404.
+    """
+    import asyncio
+
+    from flash.serving.src.lookup import AdapterLookup
+
+    revision = _rec("committed-late", QWEN)
+    storage: list[AdapterRecord] = []
+    snapshotted = threading.Event()
+    release = threading.Event()
+    calls = {"count": 0}
+
+    def _reload():
+        calls["count"] += 1
+        snapshot = list(storage)
+        if calls["count"] == 1:
+            snapshotted.set()
+            release.wait(timeout=5)
+        return snapshot
+
+    lookup = AdapterLookup(AdapterRouter([]), _reload, reload_interval_seconds=30.0)
+
+    async def _sequence():
+        first = asyncio.create_task(lookup.reload())
+        await asyncio.to_thread(snapshotted.wait, 5)
+        # committed AFTER the first fetch snapshotted, BEFORE the second miss begins.
+        storage.extend([revision, _alias(revision)])
+        second = asyncio.create_task(lookup.reload())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(_sequence())
+
+    assert calls["count"] == 2, "the later miss reused a snapshot taken before it began"
