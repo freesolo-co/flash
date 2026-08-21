@@ -48,9 +48,6 @@ class ServingBootstrap:
     def models(self) -> Mapping[str, PublishedAdapter]:
         return self._models
 
-    def resolve(self, model: str) -> PublishedAdapter | None:
-        return self._models.get(model)
-
     async def close(self) -> None:
         self._ready = False
         self._models = MappingProxyType({})

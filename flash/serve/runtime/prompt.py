@@ -94,13 +94,6 @@ class PromptPreparer:
             return await self._prepare_multimodal(request, thinking)
         return PreparedPrompt(await self._prepare_text(request, thinking))
 
-    def chat_template_kwargs(
-        self,
-        request: GenerationRequest,
-        thinking: bool | None,
-    ) -> dict[str, Any]:
-        return effective_chat_template_kwargs(request, thinking)
-
     async def _prepare_text(
         self,
         request: GenerationRequest,

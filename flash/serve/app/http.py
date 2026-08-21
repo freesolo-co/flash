@@ -111,7 +111,7 @@ def create_app(
         model = payload.get("model")
         if type(model) is not str or not model:
             return _error(422, "invalid_request", "model is required")
-        resolved = state.bootstrap.resolve(model)
+        resolved = state.bootstrap.models.get(model)
         if resolved is None:
             return _error(404, "model_not_found", "requested model is not deployed")
         try:

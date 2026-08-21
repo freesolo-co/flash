@@ -20,7 +20,12 @@ from .errors import (
     RuntimeNotReadyError,
     ServingRuntimeError,
 )
-from .prompt import PreparedPrompt, PromptPreparer, resolve_thinking
+from .prompt import (
+    PreparedPrompt,
+    PromptPreparer,
+    effective_chat_template_kwargs,
+    resolve_thinking,
+)
 from .types import (
     AdapterSpec,
     EngineConfig,
@@ -506,9 +511,8 @@ class VllmLoraRuntime:
             raise PromptError(f"invalid structured outputs spec {spec!r}: {exc}") from exc
         parser_kwargs = None
         if self.config.reasoning_parser is not None:
-            assert self._prompts is not None
             parser_kwargs = {
-                "chat_template_kwargs": self._prompts.chat_template_kwargs(request, thinking)
+                "chat_template_kwargs": effective_chat_template_kwargs(request, thinking)
             }
         return _StructuredState(
             params=params,
