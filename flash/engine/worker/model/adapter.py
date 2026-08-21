@@ -6,12 +6,10 @@ import json
 import os
 import shutil
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 from flash.adapters.fused_experts import (
     has_complete_fused_expert_tensors,
-    is_non_language_lora_key,
     lora_target_parameters,
     validate_fused_expert_adapter_config,
 )
@@ -35,56 +33,6 @@ _ADAPTER_DOWNLOAD_RETRIES = 4
 _ADAPTER_DOWNLOAD_BACKOFF_S = 5.0
 
 
-def _legacy_adapter_is_multimodal(
-    adapter_dir: str, tensors: Mapping[str, tuple[int, ...]] | None
-) -> bool | None:
-    """classify legacy modality from live non-language LoRA values when readable."""
-    if not tensors:
-        return None
-    non_language_keys = {key for key in tensors if is_non_language_lora_key(key)}
-    if not non_language_keys:
-        return False
-
-    try:
-        from flash.adapters.artifacts import loadable_adapter_weight_files
-        from flash.serve.export import (
-            _load_bin_state,
-            _non_lm_liveness_from_key,
-            _non_lm_tensor_is_live,
-            _read_safetensors_header,
-        )
-
-        selected = loadable_adapter_weight_files(os.listdir(adapter_dir))
-        if not selected:
-            return None
-        unread = set(non_language_keys)
-        for name in selected:
-            path = Path(adapter_dir, name)
-            if name.endswith(".bin"):
-                state = _load_bin_state(path)
-                for key in unread & state.keys():
-                    decided = _non_lm_liveness_from_key(key)
-                    if decided is True or (decided is None and bool(state[key].any())):
-                        return True
-                    unread.remove(key)
-                continue
-            header, data_start, file_size = _read_safetensors_header(path)
-            with path.open("rb") as source:
-                for key in unread & header.keys():
-                    if _non_lm_tensor_is_live(
-                        source,
-                        key,
-                        header[key],
-                        data_start=data_start,
-                        file_size=file_size,
-                    ):
-                        return True
-                    unread.remove(key)
-        return False if not unread else None
-    except (OSError, ValueError):
-        return None
-
-
 def validate_warmstart_adapter(
     config: Mapping[str, Any],
     model_id: str,
@@ -92,19 +40,16 @@ def validate_warmstart_adapter(
     targeting: LoraTargeting | None = None,
 ) -> None:
     """Validate a downloaded warm-start adapter without changing its config or files."""
+    if "exclude_modules" not in config:
+        raise ValueError(
+            "warm-start adapter is missing the required exclude_modules modality marker; "
+            "unmarked artifacts are unsupported"
+        )
     tensors: Mapping[str, tuple[int, ...]] | None = None
-    source_is_multimodal: bool | None
-    if "exclude_modules" in config:
-        source_is_multimodal = config.get("exclude_modules") is None
-    else:
-        try:
-            tensors = _read_adapter_tensor_metadata(adapter_dir)
-        except (ImportError, OSError, ValueError):
-            tensors = None
-        source_is_multimodal = _legacy_adapter_is_multimodal(adapter_dir, tensors)
+    source_is_multimodal = config.get("exclude_modules") is None
     if targeting is not None:
         run_is_multimodal = targeting.exclude_modules is None
-        if source_is_multimodal is not None and source_is_multimodal != run_is_multimodal:
+        if source_is_multimodal != run_is_multimodal:
             source_modality = "multimodal (image-trained)" if source_is_multimodal else "text-only"
             run_modality = "multimodal" if run_is_multimodal else "text-only"
             raise ValueError(

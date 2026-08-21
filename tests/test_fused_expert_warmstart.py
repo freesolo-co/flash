@@ -156,21 +156,6 @@ def _text_adapter_tensors(mode, rank=1):
             **nonzero_pair,
             **_text_pair("visual.patch_embed.proj", nonzero_a, nonzero_b),
         }
-    if mode == "inert_vision":
-        # a zero B factor makes the visual pair contribute nothing: the grandfathered warm-start
-        # artifact, as opposed to the LIVE `vision` mode above.
-        return {
-            **nonzero_pair,
-            **_text_pair("visual.patch_embed.proj", nonzero_a, zero_b),
-        }
-    if mode == "orphan_vision_a":
-        # the merger dropped the visual B factor. the surviving A is settled not-live by NAME
-        # alone, so a per-key exemption would skip it before pair validation and publish an
-        # incomplete adapter.
-        return {
-            **nonzero_pair,
-            "base_model.model.visual.patch_embed.proj.lora_A.weight": nonzero_a,
-        }
     if mode == "vision_saved":
         return {
             **nonzero_pair,
@@ -242,10 +227,8 @@ def _write_expert_adapter(directory, *, config, tensor_mode="complete", text_ran
         "arbitrary_namespace",
         "all_zero",
         "bias_leaf",
-        "inert_vision",
         "legacy_default_leaf",
         "mixed",
-        "orphan_vision_a",
         "mtp_saved",
         "nonfinite",
         "orphan_a",
@@ -493,75 +476,6 @@ def test_fused_export_accepts_a_finite_nonzero_actual_payload(monkeypatch, tmp_p
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
     assert saved["target_parameters"] == _TARGETS
-
-
-def test_fused_export_admits_a_grandfathered_inert_vision_pair(monkeypatch, tmp_path):
-    """The inert-vision skip must not break the value validator that runs right after it.
-
-    `_validate_adapter_tensor_values` re-reads every tensor on disk and requires the key set to
-    equal the metadata it was handed exactly. Pruning the inert visual keys out of the map that
-    reaches it therefore fails as "tensor sources disagree with their metadata" -- on precisely the
-    grandfathered artifact the skip exists to admit, so a warm-started 35B-A3B run would train to
-    completion and then fail every periodic and final fused-expert publish.
-
-    The prune must apply only to the PAIR input. Uses the real pair function rather than a
-    monkeypatched stand-in, so the pruning path itself is under test.
-    """
-    import flash.engine.worker.verl.checkpoints as checkpoints
-
-    config = {
-        "peft_type": "LORA",
-        "r": 1,
-        "target_modules": ["q_proj", "v_proj"],
-        "target_parameters": None,
-    }
-    _write_expert_adapter(tmp_path, config=config, tensor_mode="inert_vision", text_rank=1)
-
-    def pair_keys(tensors, _config, _model_id):
-        # the assertion that matters: the inert visual keys never reach pair evidence.
-        assert not any("visual" in key for key in tensors)
-        groups = {}
-        for key in tensors:
-            module, factor = key.rsplit(".lora_", 1)
-            groups.setdefault(module, {})[factor[0]] = key
-        return {module: (factors["A"], factors["B"]) for module, factors in groups.items()}
-
-    monkeypatch.setattr(checkpoints, "fused_expert_lora_tensor_pairs", pair_keys)
-
-    checkpoints.stamp_adapter_dir_provenance(
-        str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
-    )
-
-    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
-    assert saved["target_modules"] == "all-linear"
-
-
-def test_fused_export_rejects_an_orphan_inert_vision_factor(monkeypatch, tmp_path):
-    """An exemption must require a COMPLETE pair, not a single not-live-looking key.
-
-    `_non_lm_liveness_from_key` settles a `lora_A` key not-live on its NAME alone, with no data
-    inspection. Both export callers skip exempted keys BEFORE pair-topology validation, so a
-    per-key exemption would let a merger that dropped the matching `lora_B` publish a structurally
-    incomplete adapter -- the surviving orphan gets exempted instead of rejected.
-
-    The grandfathered artifact always carries both factors, so pairing keeps the intended skip
-    working (`test_fused_export_admits_a_grandfathered_inert_vision_pair`) while a genuinely
-    broken export still fails.
-    """
-    import flash.engine.worker.verl.checkpoints as checkpoints
-
-    config = {
-        "peft_type": "LORA",
-        "r": 1,
-        "target_modules": ["q_proj", "v_proj"],
-        "target_parameters": None,
-    }
-    _write_expert_adapter(tmp_path, config=config, tensor_mode="orphan_vision_a", text_rank=1)
-
-    with pytest.raises(RuntimeError, match="non-language tensor"):
-        checkpoints.stamp_adapter_dir_provenance(
-            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
-        )
 
 
 def _merger_expert_tensors(*, include_ordinary=True, drop_last_layer_rung=False):
@@ -1671,14 +1585,7 @@ def test_tensor_analyzer_rejects_non_peft_fused_shapes(tensors, config):
 def test_stamped_modality_marker_survives_into_warmstart(
     monkeypatch, tmp_path, exclude_modules, stamped_multimodal
 ):
-    """The stamper's output must be readable as a modality marker by warm-start validation.
-
-    The two sides are written independently: `stamp_adapter_dir_provenance` decides what lands in
-    `adapter_config.json`, and `validate_warmstart_adapter` reads presence-vs-absence of that key
-    to classify modality. Every existing modality test hand-writes the config, so nothing pinned
-    that the stamper actually emits what the reader expects. It did not: popping the key for the
-    multimodal case stamped a fresh multimodal adapter as an unmarked legacy artifact.
-    """
+    """The stamper's explicit modality marker must drive warm-start validation."""
     import flash.engine.worker.model.adapter as adapter_module
 
     stamp_adapter_dir_provenance = _patch_export_metadata(monkeypatch)
@@ -1699,13 +1606,13 @@ def test_stamped_modality_marker_survives_into_warmstart(
     )
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
-    # present in BOTH directions: absence is reserved for genuinely unmarked legacy artifacts.
+    # present in both directions so every artifact states its modality.
     assert "exclude_modules" in saved
     assert (saved["exclude_modules"] is None) is stamped_multimodal
 
     # and the reader classifies it from the marker, never by inspecting tensor values.
     def unexpected_tensor_read(_path):
-        raise AssertionError("a stamped adapter must not fall back to the legacy classifier")
+        raise AssertionError("a stamped adapter must not infer modality from tensor values")
 
     monkeypatch.setattr(adapter_module, "_read_adapter_tensor_metadata", unexpected_tensor_read)
     _patch_worker_metadata(monkeypatch)

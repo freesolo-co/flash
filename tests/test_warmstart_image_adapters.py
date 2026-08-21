@@ -51,6 +51,7 @@ def _adapter_config(model: str = _IMAGE_MODEL) -> dict:
         "lora_alpha": 32,
         "task_type": "CAUSAL_LM",
         "base_model_name_or_path": model,
+        "exclude_modules": None,
     }
 
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib
 import json
 import re
-import struct
 import sys
 import types
 from concurrent.futures import ThreadPoolExecutor
@@ -185,182 +184,24 @@ def test_every_campaign_multimodal_trainer_keeps_the_existing_all_linear_surface
         assert targeting.target_parameters is None
 
 
-def _write_raw_legacy_adapter(
-    path: Path, *, vision_b_payload: bytes | None
-) -> tuple[dict[str, object], set[str]]:
-    language = "base_model.model.model.language_model.layers.0.self_attn.q_proj"
-    tensors = {
-        f"{language}.lora_A.weight": b"\x00\x3c",
-        f"{language}.lora_B.weight": b"\x00\x3c",
-    }
-    if vision_b_payload is not None:
-        vision = "base_model.model.model.visual.blocks.0.attn.proj"
-        tensors[f"{vision}.lora_A.weight"] = b"\x00\x3c"
-        tensors[f"{vision}.lora_B.weight"] = vision_b_payload
+def test_unmarked_warmstart_adapter_is_rejected_without_tensor_inference(monkeypatch, tmp_path):
+    import flash.engine.worker.model.adapter as adapter_module
 
-    header = {}
-    offset = 0
-    for key, payload in tensors.items():
-        header[key] = {
-            "dtype": "F16",
-            "shape": [1, 1],
-            "data_offsets": [offset, offset + len(payload)],
-        }
-        offset += len(payload)
-    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    header_bytes += b" " * (-len(header_bytes) % 8)
-
-    path.mkdir()
-    (path / "adapter_model.safetensors").write_bytes(
-        struct.pack("<Q", len(header_bytes)) + header_bytes + b"".join(tensors.values())
+    targeting = resolve_lora_targeting(
+        "Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=False
     )
-    config: dict[str, object] = {
-        "peft_type": "LORA",
-        "r": 1,
-        "lora_alpha": 2,
-        "target_modules": ["proj", "q_proj"],
-    }
-    (path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
-    return config, set(tensors)
 
+    def unexpected_tensor_read(_path):
+        raise AssertionError("unmarked adapters must be rejected before tensor inspection")
 
-def test_legacy_text_adapter_warmstarts_a_text_run_without_vision_tensors(tmp_path):
-    from flash.engine.worker.model.adapter import validate_warmstart_adapter
-
-    model_id = "Qwen/Qwen3.5-0.8B"
-    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
-    source_config, keys = _write_raw_legacy_adapter(tmp_path / "legacy-text", vision_b_payload=None)
-
-    assert "exclude_modules" not in source_config
-    assert all("visual" not in key for key in keys)
-    validate_warmstart_adapter(source_config, model_id, str(tmp_path / "legacy-text"), targeting)
-
-
-def test_legacy_inert_vision_factors_warmstart_a_text_run(tmp_path):
-    from flash.engine.worker.model.adapter import validate_warmstart_adapter
-
-    model_id = "Qwen/Qwen3.5-0.8B"
-    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
-    adapter = tmp_path / "legacy-inert-vision"
-    source_config, keys = _write_raw_legacy_adapter(adapter, vision_b_payload=b"\x00\x00")
-
-    assert any("visual" in key for key in keys)
-    validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
-
-
-def test_legacy_trained_vision_factors_cannot_warmstart_a_text_run(tmp_path):
-    from flash.engine.worker.model.adapter import validate_warmstart_adapter
-
-    model_id = "Qwen/Qwen3.5-0.8B"
-    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
-    adapter = tmp_path / "legacy-trained-vision"
-    source_config, keys = _write_raw_legacy_adapter(adapter, vision_b_payload=b"\x00\x3c")
-
-    assert any("visual" in key for key in keys)
-    with pytest.raises(
-        ValueError,
-        match=r"text-only run cannot continue a multimodal \(image-trained\) adapter",
-    ):
-        validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
-
-
-class _FakeBinTensor:
-    shape = (1, 1)
-
-    def __init__(self, live: bool):
-        self._live = live
-
-    def any(self):
-        return self._live
-
-
-def _write_legacy_bin_stub(path: Path) -> tuple[dict[str, object], dict[str, tuple[int, ...]]]:
-    language = "base_model.model.model.language_model.layers.0.self_attn.q_proj"
-    vision = "base_model.model.model.visual.blocks.0.attn.proj"
-    tensors = {
-        f"{language}.lora_A.weight": (1, 1),
-        f"{language}.lora_B.weight": (1, 1),
-        f"{vision}.lora_A.weight": (1, 1),
-        f"{vision}.lora_B.weight": (1, 1),
-    }
-    path.mkdir()
-    (path / "adapter_model.bin").write_bytes(b"stub")
-    config: dict[str, object] = {
-        "peft_type": "LORA",
-        "r": 1,
-        "lora_alpha": 2,
-        "target_modules": ["proj", "q_proj"],
-    }
-    (path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
-    return config, tensors
-
-
-def _install_fake_bin_payload(monkeypatch, tensors, *, vision_b_live: bool) -> None:
-    import flash.engine.worker.model.adapter as adapter_module
-    import flash.serve.export as export_module
-
-    vision_b_key = next(key for key in tensors if "visual" in key and ".lora_B." in key)
-    state = {
-        key: _FakeBinTensor(live=vision_b_live if key == vision_b_key else False) for key in tensors
-    }
-    monkeypatch.setattr(adapter_module, "_read_adapter_tensor_metadata", lambda _path: tensors)
-    monkeypatch.setattr(export_module, "_load_bin_state", lambda _path: state)
-
-
-def test_legacy_bin_trained_vision_factors_cannot_warmstart_a_text_run(monkeypatch, tmp_path):
-    from flash.engine.worker.model.adapter import validate_warmstart_adapter
-
-    model_id = "Qwen/Qwen3.5-0.8B"
-    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
-    adapter = tmp_path / "legacy-bin-trained-vision"
-    source_config, tensors = _write_legacy_bin_stub(adapter)
-    _install_fake_bin_payload(monkeypatch, tensors, vision_b_live=True)
-
-    with pytest.raises(
-        ValueError,
-        match=r"text-only run cannot continue a multimodal \(image-trained\) adapter",
-    ):
-        validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
-
-
-def test_legacy_bin_inert_vision_factors_warmstart_a_text_run(monkeypatch, tmp_path):
-    from flash.engine.worker.model.adapter import validate_warmstart_adapter
-
-    model_id = "Qwen/Qwen3.5-0.8B"
-    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
-    adapter = tmp_path / "legacy-bin-inert-vision"
-    source_config, tensors = _write_legacy_bin_stub(adapter)
-    _install_fake_bin_payload(monkeypatch, tensors, vision_b_live=False)
-
-    validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
-
-
-def test_legacy_modality_does_not_swallow_unexpected_classifier_errors(monkeypatch):
-    import flash.engine.worker.model.adapter as adapter_module
-
-    def unexpected_error(_path):
-        raise RuntimeError("classifier bug")
-
-    monkeypatch.setattr(adapter_module.os, "listdir", unexpected_error)
-    tensors = {"base_model.model.model.visual.proj.lora_B.weight": (1, 1)}
-
-    with pytest.raises(RuntimeError, match="classifier bug"):
-        adapter_module._legacy_adapter_is_multimodal("/adapter", tensors)
-
-
-@pytest.mark.parametrize("weights", [None, b"not-safetensors"])
-def test_legacy_absent_or_unreadable_tensor_values_leave_modality_unknown(tmp_path, weights):
-    from flash.engine.worker.model.adapter import validate_warmstart_adapter
-
-    model_id = "Qwen/Qwen3.5-0.8B"
-    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=True)
-    adapter = tmp_path / "legacy-unknown"
-    adapter.mkdir()
-    if weights is not None:
-        (adapter / "adapter_model.safetensors").write_bytes(weights)
-    source_config = {"peft_type": "LORA", "target_modules": "all-linear"}
-
-    validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
+    monkeypatch.setattr(adapter_module, "_read_adapter_tensor_metadata", unexpected_tensor_read)
+    with pytest.raises(ValueError, match="required exclude_modules modality marker"):
+        adapter_module.validate_warmstart_adapter(
+            {"target_modules": "all-linear"},
+            "Qwen/Qwen3.5-0.8B",
+            str(tmp_path),
+            targeting,
+        )
 
 
 @pytest.mark.parametrize(
@@ -398,21 +239,6 @@ def test_modern_multimodal_adapter_still_cannot_warmstart_a_text_run(tmp_path, m
         match=r"text-only run cannot continue a multimodal \(image-trained\) adapter",
     ):
         validate_warmstart_adapter(source_config, model_id, str(tmp_path), targeting)
-
-
-def test_legacy_text_adapter_cannot_warmstart_a_multimodal_run(tmp_path):
-    from flash.engine.worker.model.adapter import validate_warmstart_adapter
-
-    model_id = "Qwen/Qwen3.5-0.8B"
-    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=True)
-    adapter = tmp_path / "legacy-text"
-    source_config, keys = _write_raw_legacy_adapter(adapter, vision_b_payload=None)
-
-    assert "exclude_modules" not in source_config
-    assert all("visual" not in key for key in keys)
-    # a nonempty legacy payload with only language-stack weights is unambiguously text-only.
-    with pytest.raises(ValueError, match="multimodal run cannot continue a text-only adapter"):
-        validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
 
 
 @dataclass(frozen=True)
@@ -833,8 +659,7 @@ def test_multimodal_export_publishes_the_vision_tensors_it_was_told_to_train(tmp
 
     saved = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
-    # explicit null, not absent: presence is what marks this artifact multimodal for warm-start
-    # validation, and an absent key means "unmarked legacy artifact, guess from the tensors".
+    # explicit null, not absent: every warm-start artifact must state its modality.
     assert saved["exclude_modules"] is None
 
 
@@ -860,37 +685,3 @@ def test_multimodal_export_still_requires_a_trained_language_tensor(tmp_path):
 
     with pytest.raises(RuntimeError, match="no language-stack LoRA pair"):
         stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", exclude_modules=None)
-
-
-def test_grandfathered_inert_vision_adapter_survives_admission_and_export(tmp_path):
-    """The warm start this PR admits must also be publishable, not just startable.
-
-    `test_legacy_inert_vision_factors_warmstart_a_text_run` proves a pre-upgrade all-linear text
-    adapter carrying zero-delta visual factors is ADMITTED. But warm start hands the source
-    directory to Verl as `lora_adapter_path`, which bypasses Flash's language-only targeting and
-    lets PEFT rebuild the adapter from that source config, so those visual keys reappear in every
-    checkpoint the run exports. Rejecting them on presence alone meant such a run could train to
-    completion and then fail every periodic and final publish -- admitted but unpublishable.
-
-    So assert BOTH halves against one artifact: admission accepts it, and the real export
-    validator then accepts the same tensors. A LIVE vision tensor must still be rejected, which
-    `test_text_export_passes_only_when_training_targeting_omits_the_visual_tensor` covers.
-    """
-    from flash.engine.worker.model.adapter import validate_warmstart_adapter
-    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
-
-    model_id = "Qwen/Qwen3.5-0.8B"
-    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
-    adapter = tmp_path / "grandfathered-inert-vision"
-    source_config, keys = _write_raw_legacy_adapter(adapter, vision_b_payload=b"\x00\x00")
-    assert any("visual" in key for key in keys)
-
-    # half one: the run is allowed to start from it.
-    validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
-
-    # half two: the checkpoint it exports carries the same inert visual keys, and publishing it
-    # must not raise. this is the half that was missing.
-    stamp_adapter_dir_provenance(str(adapter), model_id, exclude_modules=targeting.exclude_modules)
-
-    saved = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
-    assert saved["exclude_modules"] == targeting.exclude_modules

@@ -320,28 +320,6 @@ def _declared_lora_rank_context(
     )
 
 
-def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
-    """read rank declarations tolerantly for non-authoritative inspection paths."""
-    if not isinstance(config, Mapping):
-        return DeclaredLoraRanks()
-    try:
-        default = _positive_int(config["r"], source="adapter_config.json", field="r")
-    except (KeyError, ValueError):
-        default = None
-
-    by_module: dict[str, int] = {}
-    pattern = config.get("rank_pattern")
-    if isinstance(pattern, Mapping):
-        for module, value in pattern.items():
-            try:
-                by_module[str(module)] = _positive_int(
-                    value, source="adapter_config.json", field="rank_pattern"
-                )
-            except ValueError:
-                continue
-    return _declared_lora_rank_context(config, default=default, by_module=by_module)
-
-
 def strict_declared_lora_ranks(
     config: Mapping[str, Any], *, source: str = "adapter_config.json"
 ) -> DeclaredLoraRanks:

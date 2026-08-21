@@ -372,12 +372,6 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
         while not self._session_reaper_stop.wait(self.session_reap_interval_s):
             self._reap_stale_sessions()
 
-    @property
-    def active_session_count(self) -> int:
-        with self._sessions_lock:
-            self._reap_stale_sessions_locked(time.monotonic())
-            return len(self._sessions)
-
     def _session(self, session_id: str) -> dict:
         session_id = self._validate_session_id(session_id)
         with self._sessions_lock:
