@@ -192,6 +192,28 @@ def _declared_provenance(config_path: str | None) -> tuple[int | None, str | Non
     if declared_base is None:
         raise ResolveError(f"{ADAPTER_CONFIG} declares no base_model_name_or_path")
 
+    # the same reasoning applied to the rest of what the container checks about these exact bytes.
+    # `_validate_adapter_config` rejects a non-LORA `peft_type`, an unsupported `task_type` and a
+    # nonempty `modules_to_save` deterministically -- the verdict depends only on the config, not on
+    # anything the gpu learns at runtime -- so leaving them out meant a config that could never
+    # serve still resolved, provisioned, and billed before failing for a reason readable here for
+    # free. a non-string `revision` is the same case: the container compares it for equality, so a
+    # non-string can never match, and `_text` would otherwise quietly map it to None.
+    peft_type = config.get("peft_type")
+    if peft_type != "LORA":
+        raise ResolveError(f"{ADAPTER_CONFIG} peft_type must be LORA, not {peft_type!r}")
+    task_type = config.get("task_type")
+    if task_type not in {None, "CAUSAL_LM"}:
+        raise ResolveError(
+            f"{ADAPTER_CONFIG} task_type must be absent or CAUSAL_LM, not {task_type!r}"
+        )
+    modules_to_save = config.get("modules_to_save")
+    if modules_to_save is not None and modules_to_save != []:
+        raise ResolveError(f"{ADAPTER_CONFIG} modules_to_save adapters are not supported")
+    revision = config.get("revision")
+    if revision is not None and not isinstance(revision, str):
+        raise ResolveError(f"{ADAPTER_CONFIG} revision must be a string when present")
+
     return rank, declared_base, _text("revision")
 
 

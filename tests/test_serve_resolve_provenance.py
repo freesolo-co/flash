@@ -122,6 +122,58 @@ def test_an_agreeing_config_resolves(monkeypatch, tmp_path) -> None:
     assert resolved.adapter.artifact_revision == ARTIFACT_REVISION
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({"peft_type": "IA3"}, "peft_type must be LORA"),
+        ({"peft_type": None}, "peft_type must be LORA"),
+        ({"task_type": "SEQ_CLS"}, "task_type must be absent or CAUSAL_LM"),
+        ({"modules_to_save": ["lm_head"]}, "modules_to_save"),
+        ({"revision": 7}, "revision must be a string"),
+    ),
+)
+def test_a_config_the_container_will_refuse_is_rejected_before_provisioning(
+    monkeypatch, tmp_path, overrides: dict, expected: str
+) -> None:
+    """Each of these is decided by the config alone, so paying a gpu to learn it is waste.
+
+    ``_validate_adapter_config`` rejects every one of these inside the serving container, and the
+    verdict never depends on anything the gpu observes at runtime. Resolving them anyway meant a
+    deployment that could not possibly serve still allocated provider resources and started billing
+    before failing for a reason that was readable here, for free, from bytes already on disk.
+    """
+    _install_hub(
+        monkeypatch,
+        tmp_path,
+        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": BASE, **overrides},
+    )
+
+    with pytest.raises(ResolveError, match=expected):
+        _resolve()
+
+
+def test_a_config_the_container_accepts_still_resolves(monkeypatch, tmp_path) -> None:
+    """The guard above must reject only what the container rejects, not narrow what deploys.
+
+    ``task_type`` and ``modules_to_save`` are legitimately absent on most adapters, and an empty
+    ``modules_to_save`` is what peft writes when nothing is saved -- so treating either as a
+    conflict would refuse ordinary adapters that serve correctly today.
+    """
+    _install_hub(
+        monkeypatch,
+        tmp_path,
+        {
+            "peft_type": "LORA",
+            "r": 32,
+            "base_model_name_or_path": BASE,
+            "task_type": "CAUSAL_LM",
+            "modules_to_save": [],
+        },
+    )
+
+    assert _resolve().adapter.lora_rank == 32
+
+
 def test_an_unreadable_config_is_a_resolve_error(monkeypatch, tmp_path) -> None:
     (tmp_path / ADAPTER_CONFIG).write_text("{not json", encoding="utf-8")
     (tmp_path / ADAPTER_WEIGHTS).write_bytes(b"weights-bytes")
