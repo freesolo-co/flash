@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from flash.serving.src.responses import _ReasoningStreamSplitter, _split_reasoning
 from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
+from tests.serving.conftest import attest
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 
@@ -73,12 +74,15 @@ class _Pool:
         self._deltas = deltas if deltas is not None else [text]
 
     async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        return {
-            "ok": True,
-            "text": self._text,
-            "finish_reason": "stop",
-            "thinking": self._thinking,
-        }
+        return attest(
+            record,
+            {
+                "ok": True,
+                "text": self._text,
+                "finish_reason": "stop",
+                "thinking": self._thinking,
+            },
+        )
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
         yield {"type": "ready", "checkpoint": "", "thinking": self._thinking}

@@ -15,10 +15,46 @@ _MAX_IMAGES = 4
 _MAX_COMPRESSED_BYTES = 8 * 1024 * 1024
 _MAX_TOTAL_COMPRESSED_BYTES = 16 * 1024 * 1024
 _MAX_DIMENSION = 8192
-_MAX_PIXELS = 16_777_216
-_MAX_TOTAL_PIXELS = 33_554_432
 _MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
 _MAX_SOURCE_CHARS = len("data:image/webp;base64,") + 4 * ((_MAX_COMPRESSED_BYTES + 2) // 3)
+
+# bytes per pixel of a decoded pillow image, by mode, used to bound decode memory.
+# covers the modes png/webp/jpeg decode to; unknown modes fall back to a conservative 4.
+_MODE_BYTES_PER_PIXEL = {
+    "1": 1,
+    "L": 1,
+    "P": 1,
+    "I;16": 2,
+    "I;16B": 2,
+    "I;16L": 2,
+    "LA": 2,
+    "La": 2,
+    "RGB": 3,
+    "YCbCr": 3,
+    "LAB": 3,
+    "HSV": 3,
+    "RGBA": 4,
+    "RGBa": 4,
+    "CMYK": 4,
+    "I": 4,
+    "F": 4,
+}
+# bytes per pixel that a decoded image occupies once it is the resident rgb copy we keep.
+_RGB_BYTES_PER_PIXEL = 3
+# decoding one image costs its own buffer plus a transient RGB conversion, so the worst mode
+# sets the bytes-per-pixel a pixel budget has to assume.
+_WORST_BYTES_PER_PIXEL = max(_MODE_BYTES_PER_PIXEL.values()) + 2 * _RGB_BYTES_PER_PIXEL
+
+# the per-image pixel cap is derived from the memory budget rather than chosen: a pixel count the
+# decoded-memory guard would always reject is not a limit, it is a promise the validator breaks.
+# training advertises the same pair and derives it the same way.
+#
+# there is deliberately no cumulative pixel cap. what a set of images costs is decoded memory, and
+# that depends on each image's decoded mode and on their order -- neither of which a sum of pixel
+# counts can see. so every mode-blind total is wrong in one direction: low enough to be safe for
+# four RGBA images and it rejects the same pixel count in cheaper modes, high enough to admit
+# those and it can never fire. the cumulative decoded-memory guard below bounds it exactly.
+_MAX_PIXELS = _MAX_TOTAL_DECODED_BYTES // _WORST_BYTES_PER_PIXEL
 _IMAGE_TYPES = frozenset({"image_url", "input_image", "image"})
 _TEXT_TYPES = frozenset({"text", "input_text"})
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
@@ -209,33 +245,6 @@ def _decode_data_uri(source: str, index: int) -> tuple[bytes, str]:
     return data, declared_format
 
 
-# bytes per pixel of a decoded pillow image, by mode, used to bound decode memory.
-# covers the modes png/webp/jpeg decode to; unknown modes fall back to a conservative 4.
-_MODE_BYTES_PER_PIXEL = {
-    "1": 1,
-    "L": 1,
-    "P": 1,
-    "I;16": 2,
-    "I;16B": 2,
-    "I;16L": 2,
-    "LA": 2,
-    "La": 2,
-    "RGB": 3,
-    "YCbCr": 3,
-    "LAB": 3,
-    "HSV": 3,
-    "RGBA": 4,
-    "RGBa": 4,
-    "CMYK": 4,
-    "I": 4,
-    "F": 4,
-}
-
-
-# bytes per pixel that a decoded image occupies once it is the resident rgb copy we keep.
-_RGB_BYTES_PER_PIXEL = 3
-
-
 def _decoded_bytes(mode: str, pixels: int) -> int:
     # bound the peak load+convert allocation for one image: at `return rgb.copy()` three buffers
     # are live at once before `loaded`/`rgb` are released - the original decoded image (mode
@@ -266,8 +275,6 @@ def _load_image(
                 width, height = probe.size
                 pixels = _validate_dimensions(width, height, index)
                 decoded_bytes = _decoded_bytes(probe.mode, pixels)
-                if prior_pixels + pixels > _MAX_TOTAL_PIXELS:
-                    raise MultimodalRequestError("images exceed the total pixel limit")
                 # earlier images are resident only as their rgb copies (3 bytes/pixel); this image
                 # adds its transient load+convert peak on top. bound that coexisting worst case.
                 if _RGB_BYTES_PER_PIXEL * prior_pixels + decoded_bytes > _MAX_TOTAL_DECODED_BYTES:

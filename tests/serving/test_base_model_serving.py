@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
+from tests.serving.conftest import attest
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 INTERNAL_KEY = "fs-internal"
@@ -73,13 +74,16 @@ def _base_rec(base_model: str = QWEN) -> AdapterRecord:
 
 class FakePool:
     async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        return {
-            "text": "hi",
-            "finish_reason": "stop",
-            "prompt_tokens": 3,
-            "completion_tokens": 2,
-            "checkpoint": "",
-        }
+        return attest(
+            record,
+            {
+                "text": "hi",
+                "finish_reason": "stop",
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "checkpoint": "",
+            },
+        )
 
     async def stream_generate(self, *a, **k):  # pragma: no cover
         yield {"type": "final", "finish_reason": "stop", "prompt_tokens": 3, "completion_tokens": 2}

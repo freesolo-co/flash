@@ -625,6 +625,22 @@ class _LoraEngineImpl:
             await self._add_lora_locked(record, path)
         return {"ok": True, "adapter_id": record.adapter_id, "base_model": self.base_model}
 
+    @staticmethod
+    def _lora_request_attestation(record: Any, lora_request: Any) -> str | None:
+        """Attest that the engine resolved the exact immutable adapter that was asked for.
+
+        A mutable alias may legitimately resolve to whatever it currently points at, so only a
+        revision is attested. Returning the resolved name lets the router prove the weights it
+        billed for came from the requested revision rather than trusting the id it sent.
+        """
+        if not record.is_revision:
+            return None
+        if lora_request is None:
+            raise RuntimeError("immutable adapter resolved without a LoRARequest")
+        if lora_request.lora_name != record.adapter_id:
+            raise RuntimeError("immutable adapter resolved to a mismatched LoRARequest")
+        return lora_request.lora_name
+
     def _active_checkpoint_ref(self, record: Any) -> str:
         return active_checkpoint_ref(record)
 
@@ -647,6 +663,7 @@ class _LoraEngineImpl:
         # record (revive=False, so it can't resurrect an id just undeployed here). Carry the resolved
         # record so the prompt's thinking default binds to the SAME record the weights came from.
         lora_request, record = await self._lora_request(payload.adapter_id, record_dict)
+        lora_request_attestation = self._lora_request_attestation(record, lora_request)
         active_checkpoint = self._enforce_expected_checkpoint(record, expected_checkpoint)
         thinking_default = self._thinking_default(record, payload)
         structured_outputs, reasoning_ended, reasoning_parser_kwargs = (
@@ -692,6 +709,11 @@ class _LoraEngineImpl:
         return {
             "ok": True,
             "adapter_id": payload.adapter_id,
+            **(
+                {"lora_request_adapter": lora_request_attestation}
+                if lora_request_attestation is not None
+                else {}
+            ),
             "text": output.text,
             "finish_reason": getattr(output, "finish_reason", None),
             "token_ids": completion_token_ids,
@@ -730,6 +752,10 @@ class _LoraEngineImpl:
 
         payload = GenerateRequest.model_validate(payload_dict)
         lora_request, record = await self._lora_request(payload.adapter_id, record_dict)
+        # streaming sends its headers before the first token, so there is no response field left to
+        # carry an attestation. the check still runs for its raise: a mismatched immutable adapter
+        # fails here, before any token is emitted, rather than streaming the wrong weights.
+        self._lora_request_attestation(record, lora_request)
         active_checkpoint = self._enforce_expected_checkpoint(record, expected_checkpoint)
         # resolve structured outputs and advance vllm before the ready event so validation failures
         # remain clean responses instead of surfacing after streaming has started.
