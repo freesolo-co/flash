@@ -138,6 +138,7 @@ def _prepared_status(public: JobSpec, worker: JobSpec, *, state: str = "provisio
         spec=public.to_dict(),
         effective_preparation={
             "worker_spec": worker.to_internal_dict(),
+            "version": 1,
             "preparation_digest": runner._preparation_digest(public, worker, None),
         },
     )
@@ -599,6 +600,7 @@ def test_a_stripped_package_restages_from_the_same_pin_instead_of_running_unstag
     worker = _spec(package=package)
     snapshot = {
         "worker_spec": worker.to_internal_dict(),
+        "version": 1,
         "preparation_digest": runner._preparation_digest(public, worker, None),
     }
     tampered = copy.deepcopy(snapshot)

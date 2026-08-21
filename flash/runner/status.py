@@ -19,6 +19,7 @@ import time
 
 import flash.runner as runner
 from flash.core.spec import JobSpec
+from flash.core.spec_persistence import validate_persisted_spec_envelope
 from flash.runner import RunStatus
 
 # every other collaborator is reached through `runner.` rather than bound here. `RUNS_DIR`,
@@ -86,11 +87,8 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     runner._validate_effective_spec(public_spec, worker_spec)
     expected = snapshot.get("adapter_identity")
     stored_digest = snapshot.get("preparation_digest")
-    # a pre-upgrade snapshot hashed a different serialization than this build produces -- dropped
-    # top-level keys, the old rollout-batch spelling, a public half without lora_alpha. reproducing
-    # its digest means replaying the bytes it actually stored, read once from both halves.
-    raw_public = status.spec if isinstance(status.spec, dict) else {}
-    persisted_envelope = runner.VersionedPersistedSpecEnvelope.read(snapshot, raw_public)
+    if stored_digest is not None:
+        validate_persisted_spec_envelope(snapshot)
     has_workload_profile = bool(
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
@@ -119,9 +117,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     if (has_workload_profile or worker_spec.model_revision_auto) and (
         not isinstance(stored_digest, str)
         or stored_digest
-        != runner._preparation_digest(
-            public_spec, worker_spec, expected, persisted=persisted_envelope
-        )
+        != runner._preparation_digest(public_spec, worker_spec, expected)
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
@@ -131,7 +127,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
                 "because its original artifact identity is unavailable"
             )
         if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
-            public_spec, worker_spec, expected, persisted=persisted_envelope
+            public_spec, worker_spec, expected
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:

@@ -3608,6 +3608,7 @@ def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypa
                 effective_preparation={
                     "worker_spec": worker_spec.to_internal_dict(),
                     "adapter_identity": identity.to_dict(),
+                    "version": 1,
                     "preparation_digest": orch._preparation_digest(
                         public_spec, worker_spec, identity.to_dict()
                     ),
@@ -3702,6 +3703,7 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
                 effective_preparation={
                     "worker_spec": worker_spec.to_internal_dict(),
                     "adapter_identity": identity.to_dict(),
+                    "version": 1,
                     "preparation_digest": orch._preparation_digest(
                         public_spec, worker_spec, identity.to_dict()
                     ),
@@ -3790,6 +3792,7 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
                 effective_preparation={
                     "worker_spec": worker_dict,
                     "adapter_identity": original_identity,
+                    "version": 1,
                     "preparation_digest": orch._preparation_digest(
                         public_spec, worker_spec, original_identity
                     ),
@@ -4737,6 +4740,7 @@ def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):
                 effective_preparation={
                     "worker_spec": worker_dict,
                     "adapter_identity": identity,
+                    "version": 1,
                     "preparation_digest": orch._preparation_digest(
                         public_spec, worker_spec, identity
                     ),

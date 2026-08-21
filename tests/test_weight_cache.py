@@ -778,6 +778,7 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
                 effective_preparation={
                     "worker_spec": public.to_internal_dict(),  # committed WITH the shared cache
                     "adapter_identity": None,
+                    "version": 1,
                     "preparation_digest": "seed",
                 },
             )
@@ -816,6 +817,7 @@ def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
                 effective_preparation={
                     "worker_spec": committed.to_internal_dict(),  # committed WITH the custom volume
                     "adapter_identity": None,
+                    "version": 1,
                     "preparation_digest": "seed",
                 },
             )

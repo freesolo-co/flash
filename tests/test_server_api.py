@@ -3411,6 +3411,7 @@ def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
     status.effective_preparation = {
         "worker_spec": worker_spec,
         "adapter_identity": identity,
+        "version": 1,
         "preparation_digest": runner._preparation_digest(
             runner.JobSpec.from_dict(public_spec),
             runner.JobSpec.from_dict(worker_spec),
@@ -8876,6 +8877,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
             effective_preparation={
                 "worker_spec": worker_spec,
                 "adapter_identity": identity.to_dict(),
+                "version": 1,
                 "preparation_digest": runner._preparation_digest(
                     public_job, worker_job, identity.to_dict()
                 ),
@@ -8957,6 +8959,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
             effective_preparation={
                 "worker_spec": worker_spec,
                 "adapter_identity": original_identity,
+                "version": 1,
                 "preparation_digest": runner._preparation_digest(
                     public_job, worker_job, original_identity
                 ),

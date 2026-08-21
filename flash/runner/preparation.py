@@ -18,7 +18,7 @@ import re
 from dataclasses import replace
 
 from flash.core.spec import JobSpec
-from flash.core.spec_persistence import VersionedPersistedSpecEnvelope
+from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 
 
 def _runner():
@@ -301,36 +301,11 @@ def _preparation_digest(
     public_spec: JobSpec,
     worker_spec: JobSpec,
     adapter_identity: dict | None,
-    *,
-    persisted: VersionedPersistedSpecEnvelope | None = None,
 ) -> str:
-    persisted = persisted or VersionedPersistedSpecEnvelope()
-    worker_payload = worker_spec.to_internal_dict()
-    public_payload = public_spec.to_dict()
-    # ``[environment] pip`` became user-authorable, so to_dict() now emits it where it used to be
-    # stripped, and a pre-upgrade snapshot hashed an environment with no pip key at all. dropping it
-    # when empty reproduces those bytes without needing to know when the run was prepared: absent
-    # and empty are the same install, so they must hash alike. an authored pip is non-empty and
-    # stays bound, so tampering with the persisted value is still caught. unlike the rewinds below
-    # this needs no stored reading, which is why it is not part of one.
-    if not public_payload["environment"].get("pip"):
-        public_payload["environment"].pop("pip", None)
-    # omit empty fields so existing version-1 snapshots keep their historical digest.
-    for key in (
-        "model_revision_auto",
-        "model_revision_force_pin",
-        "gpu_count_auto",
-        "workload_profile_input_digest",
-        "workload_profile_producer_version",
-        "workload_profile",
-    ):
-        if not worker_payload.get(key):
-            worker_payload.pop(key, None)
-    persisted.rewind(public_payload, worker_payload)
     payload = {
-        "version": persisted.version,
-        "public_spec": public_payload,
-        "worker_spec": worker_payload,
+        "version": PREPARATION_ENVELOPE_VERSION,
+        "public_spec": public_spec.to_dict(),
+        "worker_spec": worker_spec.to_internal_dict(),
         "adapter_identity": adapter_identity,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)

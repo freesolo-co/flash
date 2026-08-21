@@ -1617,56 +1617,6 @@ def test_model_revision_force_pin_rejects_invalid_internal_states(overrides) -> 
         _job_from_dict(overrides)
 
 
-def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() -> None:
-    """A snapshot prepared before this field existed must still rehash to its stored digest.
-
-    `_preparation_digest` has to reproduce the bytes that were hashed, not today's serialization,
-    or a still-valid warm-start or profile-bearing training run fails integrity validation on recovery.
-    """
-    from flash.runner.preparation import _preparation_digest
-
-    unmarked = JobSpec(model="Qwen/Qwen3.5-9B", algorithm="sft", model_revision="c" * 40)
-
-    # rebuild the pre-upgrade bytes: the same payload this build produces, minus the key that did
-    # not exist then. mirrors _preparation_digest's own omission list rather than re-deriving it,
-    # so the control cannot drift from the code under test.
-    worker_payload = unmarked.to_internal_dict()
-    for key in (
-        "workload_profile_input_digest",
-        "workload_profile_producer_version",
-        "workload_profile",
-    ):
-        if not worker_payload.get(key):
-            worker_payload.pop(key, None)
-    worker_payload.pop("model_revision_auto", None)
-    worker_payload.pop("model_revision_force_pin", None)
-    worker_payload.pop("gpu_count_auto", None)
-    worker_payload["gpu"].pop("type_fallbacks", None)
-    public_payload = unmarked.to_dict()  # to_dict() already strips the markers
-    # the old plane popped `[environment] pip` from every public payload, so its bytes carried no
-    # such key. mirrors _preparation_digest's drop-when-empty for the same reason as the list above.
-    if not public_payload["environment"].get("pip"):
-        public_payload["environment"].pop("pip", None)
-
-    payload = json.dumps(
-        {
-            "version": 1,
-            "public_spec": public_payload,
-            "worker_spec": worker_payload,
-            "adapter_identity": None,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    import hashlib
-
-    legacy = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    assert _preparation_digest(unmarked, unmarked, None) == legacy
-
-    # a marked run still binds the marker into its digest, so tampering remains detectable
-    marked = replace(unmarked, model_revision_auto=True)
-    assert _preparation_digest(marked, marked, None) != legacy
 
 
 def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:

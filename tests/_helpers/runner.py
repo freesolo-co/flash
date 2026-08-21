@@ -55,6 +55,7 @@ def provisioned_status(runner, spec, *, state="running", **kwargs):
         "effective_preparation",
         {
             "worker_spec": spec.to_internal_dict(),
+            "version": 1,
             "preparation_digest": runner._preparation_digest(
                 runner.JobSpec.from_dict(public), spec, None
             ),

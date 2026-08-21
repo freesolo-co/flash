@@ -33,7 +33,6 @@ from flash.core.spec import (  # noqa: F401
     GpuSpec,
     JobSpec,
 )
-from flash.core.spec_persistence import VersionedPersistedSpecEnvelope  # noqa: F401
 from flash.engine.plan.prompt_budget import PromptBudget
 from flash.providers._lifecycle.poll import _attempt_int as _attempt_int
 from flash.teacher.retry_contract import (
@@ -123,11 +122,6 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     """
     raw_worker = (status.effective_preparation or {}).get("worker_spec")
     if not raw_worker:
-        return None
-    # a workload-profile run recorded before #1095 removed the profile job has a managed hf_repo but
-    # never produced an adapter. its worker payload still carries the marker, which jobspec.from_dict
-    # now drops, so read it off the raw record rather than reviving the field.
-    if isinstance(raw_worker, dict) and raw_worker.get("workload_profile_kind"):
         return None
     try:
         spec = _internal_spec_from_status(status)

@@ -300,6 +300,7 @@ def test_warm_start_inherits_an_authored_source_revision(monkeypatch):
         spec=stored_public,
         effective_preparation={
             "worker_spec": source.to_internal_dict(),
+            "version": 1,
             "preparation_digest": R._preparation_digest(
                 JobSpec.from_dict(stored_public), source, None
             ),
@@ -725,6 +726,7 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
         effective_preparation={
             "worker_spec": worker.to_internal_dict(),
             "adapter_identity": identity,
+            "version": 1,
             "preparation_digest": R._preparation_digest(public, worker, identity),
         },
     )
@@ -882,6 +884,7 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
             effective_preparation={
                 "worker_spec": worker.to_internal_dict(),
                 "adapter_identity": identity,
+                "version": 1,
                 "preparation_digest": R._preparation_digest(public, worker, identity),
             },
         )
@@ -943,6 +946,7 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
         effective_preparation={
             "worker_spec": worker.to_internal_dict(),
             "adapter_identity": identity.to_dict(),
+            "version": 1,
             "preparation_digest": R._preparation_digest(public, worker, identity.to_dict()),
         },
     )
@@ -1008,6 +1012,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
     snapshot = {
         "worker_spec": copy.deepcopy(worker.to_internal_dict()),
         "adapter_identity": identity,
+        "version": 1,
         "preparation_digest": R._preparation_digest(public, worker, identity),
     }
     target = snapshot["worker_spec"]
