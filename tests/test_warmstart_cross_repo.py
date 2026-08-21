@@ -1359,6 +1359,68 @@ def test_recovery_reproduces_a_digest_taken_before_lora_alpha_was_public(monkeyp
     assert recovered.train.lora_rank == 32
 
 
+def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(monkeypatch, tmp_path):
+    """Rewriting the snapshot must replay the same `lora_alpha` omission recovery replays.
+
+    `_persist_effective_worker_spec` runs on the ATTACH and RESUBMIT paths (`supervise/attach.py`,
+    `supervise/seed_submission.py`), rebuilding `public_spec` from `status.spec` -- whose
+    `to_dict()` re-materializes an alpha the stored record never had -- and it never updates
+    `status.spec` to match. So a pre-1.1.35 run that recovers once is retired on its NEXT attach:
+    `server/platform/runtime.py` marks it `unrecoverable` when `reallocation_spec_from_status`
+    raises. The trigger gate is `workload_profile or model_revision_auto`, and auto-pinning is the
+    default, so this is the ordinary case rather than a corner.
+    """
+    from dataclasses import replace
+
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    public = replace(
+        JobSpec.from_dict(
+            {
+                "run_id": "pre-alpha-persist",
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "sft",
+                "gpu": {"type": "RTX 4090"},
+                "train": {"lora_rank": 32},
+            }
+        ),
+        model_revision="a" * 40,
+        model_revision_auto=True,
+    )
+    stored_public = public.to_dict()
+    stored_public["train"].pop("lora_alpha", None)
+    assert "lora_alpha" not in stored_public["train"]
+
+    R._save_status(
+        R.RunStatus(
+            run_id=public.run_id,
+            state="provisioning",
+            spec=stored_public,
+            effective_preparation={
+                "worker_spec": public.to_internal_dict(),
+                "adapter_identity": None,
+                "version": 1,
+                "workload_profile": None,
+                "preparation_digest": R._preparation_digest(
+                    public, public, None, stored_public=stored_public
+                ),
+            },
+        )
+    )
+    # the record recovers BEFORE the rewrite -- so a failure after it is caused by the rewrite
+    # itself, not by a fixture that was never valid.
+    assert R.reallocation_spec_from_status(R.get_status(public.run_id)).train.lora_rank == 32
+
+    assert R._persist_effective_worker_spec(public)
+
+    # the run survives its own attach: the rewritten digest is still reproducible from the stored
+    # public spec, which the rewrite left untouched.
+    recovered = R.reallocation_spec_from_status(R.get_status(public.run_id))
+    assert recovered.train.lora_rank == 32
+
+
 def test_a_snapshot_written_before_the_version_key_still_recovers(monkeypatch, tmp_path):
     """The `version` stamp landed in 1.2.59; runs prepared by an older build are still in flight.
 

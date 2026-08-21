@@ -200,15 +200,27 @@ def _effective_preparation_snapshot(
     public_spec: JobSpec,
     worker_spec: JobSpec,
     adapter_identity: dict | None,
+    *,
+    stored_public: object = None,
 ) -> dict:
-    """Build the current versioned snapshot shape."""
+    """Build the current versioned snapshot shape.
+
+    `stored_public` is the public spec as it is ALREADY persisted, and it belongs on every path
+    that REWRITES an existing record. The digest is recomputed here, and `_preparation_digest`
+    reproduces a pre-1.1.35 run only by replaying the `lora_alpha` omission it reads from the
+    stored spec -- but a rewrite reconstructs `public_spec` via `JobSpec.from_dict(status.spec)`,
+    whose `to_dict()` re-MATERIALIZES the key. Omitting the argument therefore stamps a digest
+    over bytes the stored spec still lacks, and since the rewrite never updates `status.spec`,
+    the two halves disagree from that moment on. The create path passes nothing because it
+    writes both halves from the same object, so it has no omission to replay.
+    """
     return {
         "version": PREPARATION_ENVELOPE_VERSION,
         "worker_spec": worker_spec.to_internal_dict(),
         "workload_profile": worker_spec.workload_profile or None,
         "adapter_identity": adapter_identity,
         "preparation_digest": _runner()._preparation_digest(
-            public_spec, worker_spec, adapter_identity
+            public_spec, worker_spec, adapter_identity, stored_public=stored_public
         ),
         "backend": _runner().TRAINER_BACKEND,
     }
@@ -233,7 +245,7 @@ def _persist_effective_worker_spec(
     _reject_managed_volume_removal(snapshot, worker_spec)
     _runner()._validate_effective_spec(public_spec, worker_spec)
     effective_preparation = _effective_preparation_snapshot(
-        public_spec, worker_spec, adapter_identity
+        public_spec, worker_spec, adapter_identity, stored_public=status.spec
     )
     fields = {"effective_preparation": effective_preparation}
     if estimated_cost_usd is not None:
