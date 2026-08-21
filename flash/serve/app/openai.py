@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from flash.serve.runtime import GenerationRequest, GenerationResult, StreamFinished
+from flash.serve.runtime.multimodal import validate_messages
 from flash.serve.runtime.structured_outputs import normalize_structured_outputs
 
 from .bootstrap import PublishedAdapter
@@ -66,6 +67,14 @@ def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAICha
         or any(type(item) is not dict for item in messages)
     ):
         raise OpenAIRequestError("messages must be a nonempty array of objects")
+    # being a dict is not being a *message*. the checks above accept `{}`, `{"role": "bogus"}`, and
+    # a `content` of any type, none of which generation can honor -- and the runtime only validates
+    # message shape on its multimodal branch, so a text-only request reached the chat template
+    # unchecked. that rendered a missing `content` as an empty prompt (200 on nonsense) and turned
+    # a bad `role` into a template failure answered 503, which reads as "retry later" for a request
+    # that can never succeed. this is the strict subset the docstring promises, so it belongs here,
+    # before the request is bound to an adapter and dispatched.
+    validate_messages(messages)
     stream = payload.get("stream", False)
     if type(stream) is not bool:
         raise OpenAIRequestError("stream must be a boolean")

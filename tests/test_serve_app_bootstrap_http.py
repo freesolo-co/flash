@@ -890,3 +890,111 @@ def test_the_packaged_app_exposes_exactly_its_documented_route_surface() -> None
         "the packaged app must not accept dynamic adapter registration; its adapters come from "
         "the immutable manifest at boot"
     )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("label", "messages"),
+    [
+        ("missing content", [{"role": "user"}]),
+        ("missing role", [{"content": "hello"}]),
+        ("unknown role", [{"role": "bogus", "content": "hello"}]),
+        ("non-sequence content", [{"role": "user", "content": {"text": "hello"}}]),
+        ("non-object block", [{"role": "user", "content": ["hello"]}]),
+        ("unknown block type", [{"role": "user", "content": [{"type": "audio"}]}]),
+        ("non-string text", [{"role": "user", "content": [{"type": "text", "text": 7}]}]),
+    ],
+)
+def test_a_malformed_message_is_rejected_before_the_runtime_is_reached(
+    label: str, messages: list[dict], stream: bool
+) -> None:
+    """`type(item) is dict` is not a message check, and the runtime never made up the difference.
+
+    `PromptPreparer.prepare` dispatches on `has_image_blocks`, so message shape was validated only
+    for image-bearing requests. Text-only requests went straight to `apply_chat_template`, a jinja
+    renderer that validates nothing: a missing `content` rendered empty and returned 200 having
+    generated from an empty prompt, while a bad `role` or non-string `content` raised a
+    `TemplateError` from outside `_rejection_as_prompt_error` and was answered 503 -- advertising a
+    healthy service as down and inviting a retry that must fail identically.
+
+    Asserted on the wire for both streaming and non-streaming, because the two take different
+    branches through `http.py`, and asserted together with an untouched runtime: the point is not
+    merely a better status code but that a request that can never succeed is refused before it is
+    dispatched to the gpu.
+    """
+    owner, runtime = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(messages=messages, stream=stream),
+        )
+    )
+
+    assert response.status_code == 422, (
+        f"{label} (stream={stream}) was answered {response.status_code}; a message the runtime "
+        "cannot honor must be refused as an invalid request"
+    )
+    assert response.headers["content-type"].startswith("application/json")
+    assert runtime.generation_requests == [], (
+        f"{label} (stream={stream}) reached the runtime; malformed messages must be rejected "
+        "before dispatch"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "messages"),
+    [
+        ("plain string", [{"role": "user", "content": "hello"}]),
+        ("text blocks", [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]),
+        ("openai input_text", [{"role": "user", "content": [{"type": "input_text", "text": "x"}]}]),
+        (
+            "system then user",
+            [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+        ),
+        ("developer alias", [{"role": "developer", "content": "s"}]),
+        ("empty block list", [{"role": "user", "content": []}]),
+        (
+            "assistant tool calls",
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
+                {"role": "tool", "content": "result"},
+            ],
+        ),
+    ],
+)
+def test_valid_message_shapes_still_reach_the_runtime(label: str, messages: list[dict]) -> None:
+    """the guard must not narrow what the app accepts.
+
+    Every shape here is one the sdk and the openai clients genuinely send -- including the
+    `developer` alias, an assistant turn carrying `tool_calls` instead of content, and a deliberately
+    empty user turn. A validator that rejected any of these would trade a 503 for a 422 and break
+    working callers, so they are pinned as reaching the runtime rather than merely returning 200.
+    """
+    owner, runtime = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(messages=messages),
+        )
+    )
+
+    assert response.status_code == 200, f"{label} was rejected: {response.text}"
+    assert len(runtime.generation_requests) == 1, f"{label} did not reach the runtime"
+    # the guard validates a *copy* and discards it, so the runtime must still receive the caller's
+    # own messages -- a normalizer that rewrote `developer` to `system` here would silently change
+    # what the model is asked, which is the parser's job to avoid.
+    forwarded = runtime.generation_requests[0].messages
+    assert list(forwarded) == messages, (
+        f"{label} was mutated on the way to the runtime: {forwarded}"
+    )

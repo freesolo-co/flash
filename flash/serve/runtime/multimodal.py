@@ -61,6 +61,25 @@ def has_image_blocks(messages: Any) -> bool:
     return False
 
 
+def validate_messages(messages: Any) -> None:
+    """raise unless every message satisfies the rules generation will later assume.
+
+    `PromptPreparer.prepare` dispatches on `has_image_blocks`, so until now only image-bearing
+    requests were ever checked. A text-only request went straight to `apply_chat_template`, which
+    is a jinja renderer, not a validator: a missing `content` rendered as the empty string and
+    generated from an empty prompt (200 with garbage), while a non-string `content` or an unknown
+    `role` raised a `TemplateError` from outside `_rejection_as_prompt_error` and was answered 503
+    -- telling the caller the service is down and inviting a retry that must fail identically.
+
+    Reusing `_normalize_messages` rather than restating its rules is deliberate: a second copy of
+    the role and block vocabulary is exactly how the two paths would drift apart again. It only
+    walks the list and discards the result -- image *payloads* are decoded in `_decode_images`,
+    which this does not call, so validating costs no base64 work and touches no pillow.
+    """
+
+    _normalize_messages(messages)
+
+
 def prepare_multimodal_request(
     messages: Any,
     *,

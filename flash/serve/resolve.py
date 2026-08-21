@@ -135,6 +135,21 @@ def _artifact_files(repo_id: str, repo_type: str, revision: str, subfolder: str)
     return tuple(files), config_path
 
 
+class _DuplicateConfigKey(ValueError):
+    """raised through `json.load`, so it stays a ValueError for any caller that expects one."""
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """mirror of the materializer's rule, so both boundaries read the same bytes the same way."""
+
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateConfigKey(f"{ADAPTER_CONFIG} contains a duplicate key")
+        result[key] = value
+    return result
+
+
 def _declared_provenance(config_path: str | None) -> tuple[int | None, str | None, str | None]:
     """read the rank and base-model provenance the adapter stamps into its own config.
 
@@ -148,7 +163,13 @@ def _declared_provenance(config_path: str | None) -> tuple[int | None, str | Non
         return None, None, None
     try:
         with open(config_path, "rb") as handle:
-            config = json.load(handle)
+            # the same duplicate-key rule the gpu-side materializer applies to these exact bytes.
+            # plain `json.load` takes the last value, so a config declaring `r` twice resolves
+            # against one rank here and is then rejected outright inside the container -- after
+            # the provider resources this function exists to avoid paying for already exist.
+            config = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
+    except _DuplicateConfigKey as exc:
+        raise ResolveError(str(exc)) from exc
     except (OSError, ValueError) as exc:
         raise ResolveError(f"{ADAPTER_CONFIG} is not readable json") from exc
     if not isinstance(config, dict):

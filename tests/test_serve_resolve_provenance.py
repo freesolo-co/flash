@@ -127,6 +127,39 @@ def test_an_unreadable_config_is_a_resolve_error(monkeypatch, tmp_path) -> None:
         _resolve()
 
 
+def test_a_duplicate_key_is_rejected_before_provider_resources_exist(monkeypatch, tmp_path) -> None:
+    """the control plane must read this file exactly as the gpu container will.
+
+    `json.load` keeps the last value, so a config declaring `r` twice resolves cleanly here against
+    one rank while the materializer's `_reject_duplicate_keys` refuses the identical bytes. that
+    split means the artifact is only rejected after the modal app or runpod pod exists -- billing
+    the user for a deployment that could never have started. this function exists specifically to
+    catch provenance problems before provisioning, so the rule has to match on both sides.
+    """
+
+    (tmp_path / ADAPTER_CONFIG).write_text(
+        f'{{"peft_type":"LORA","r":16,"r":32,"base_model_name_or_path":"{BASE}"}}',
+        encoding="utf-8",
+    )
+    (tmp_path / ADAPTER_WEIGHTS).write_bytes(b"weights-bytes")
+
+    class _Info:
+        sha = ARTIFACT_REVISION
+
+    class _Api:
+        def repo_info(self, **_kwargs):
+            return _Info()
+
+    monkeypatch.setattr(resolve_module, "_hub_api", lambda: _Api())
+    monkeypatch.setattr(
+        "huggingface_hub.hf_hub_download",
+        lambda *, filename, **_kwargs: str(tmp_path / Path(filename).name),
+    )
+
+    with pytest.raises(ResolveError, match="duplicate key"):
+        _resolve()
+
+
 @pytest.mark.parametrize("unset", ["", "   ", None])
 def test_absent_hub_token_is_none_rather_than_an_empty_bearer(monkeypatch, unset) -> None:
     """No token must mean *no credential*, not an empty one.
