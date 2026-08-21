@@ -88,10 +88,9 @@ def _export_checkpoint_adapter(
     _copy_processing_sidecars(actor_dir, adapter_dir)
     if preprocessor is not None:
         preprocessor.save_pretrained(adapter_dir)
-    provenance_kwargs = {}
-    if exclude_modules is not None:
-        provenance_kwargs["exclude_modules"] = exclude_modules
-    stamp_adapter_dir_provenance(adapter_dir, model_id, model_revision, **provenance_kwargs)
+    stamp_adapter_dir_provenance(
+        adapter_dir, model_id, model_revision, exclude_modules=exclude_modules
+    )
     _w.write_base_model_provenance(adapter_dir, model_id, model_revision)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import inspect
 import os
 import subprocess
 import sys
@@ -33,7 +34,7 @@ def test_checkpoint_export_saves_complete_processor_sidecars(monkeypatch, tmp_pa
             )
 
     monkeypatch.setattr(checkpoints, "export_peft_adapter", export)
-    monkeypatch.setattr(checkpoints, "stamp_adapter_dir_provenance", lambda *args: None)
+    monkeypatch.setattr(checkpoints, "stamp_adapter_dir_provenance", lambda *args, **kwargs: None)
     monkeypatch.setattr(checkpoints._w, "write_base_model_provenance", lambda *args: None)
 
     checkpoints._export_checkpoint_adapter(
@@ -53,6 +54,41 @@ def test_checkpoint_export_saves_complete_processor_sidecars(monkeypatch, tmp_pa
     )
 
 
+def test_multimodal_checkpoint_export_passes_explicit_modality_marker(monkeypatch, tmp_path):
+    from flash.engine.worker.train.sft import checkpoints
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    actor_dir = tmp_path / "actor"
+    actor_dir.mkdir()
+    adapter_dir = tmp_path / "adapter"
+
+    def export(_actor, target, **_kwargs):
+        os.makedirs(target)
+        (adapter_dir / "adapter_config.json").write_text("{}")
+
+    captured = {}
+
+    def stamp(*args, **kwargs):
+        inspect.signature(stamp_adapter_dir_provenance).bind(*args, **kwargs)
+        captured.update(kwargs)
+
+    monkeypatch.setattr(checkpoints, "export_peft_adapter", export)
+    monkeypatch.setattr(checkpoints, "stamp_adapter_dir_provenance", stamp)
+    monkeypatch.setattr(checkpoints._w, "write_base_model_provenance", lambda *args: None)
+
+    checkpoints._export_checkpoint_adapter(
+        str(actor_dir),
+        str(adapter_dir),
+        model_id="org/model",
+        model_revision="commit",
+        python_bin="/verl/python",
+        exclude_modules=None,
+    )
+
+    assert "exclude_modules" in captured
+    assert captured["exclude_modules"] is None
+
+
 def test_text_checkpoint_export_does_not_invent_processor_sidecars(monkeypatch, tmp_path):
     from flash.engine.worker.train.sft import checkpoints
 
@@ -65,7 +101,7 @@ def test_text_checkpoint_export_does_not_invent_processor_sidecars(monkeypatch, 
         (adapter_dir / "adapter_config.json").write_text("{}")
 
     monkeypatch.setattr(checkpoints, "export_peft_adapter", export)
-    monkeypatch.setattr(checkpoints, "stamp_adapter_dir_provenance", lambda *args: None)
+    monkeypatch.setattr(checkpoints, "stamp_adapter_dir_provenance", lambda *args, **kwargs: None)
     monkeypatch.setattr(checkpoints._w, "write_base_model_provenance", lambda *args: None)
 
     checkpoints._export_checkpoint_adapter(
