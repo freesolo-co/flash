@@ -18,6 +18,8 @@ from flash.serve.profiles import (
 )
 from flash.serve.provisioning import ServingImage
 from flash.serve.runtime.multimodal import _MAX_IMAGES
+from flash.serving.src.model_config import reasoning_parser_for
+from flash.serving.src.settings import KV_CACHE_DTYPE
 
 MODEL = "Qwen/Qwen3.5-9B"
 DIGEST = "sha256:" + "a" * 64
@@ -89,6 +91,38 @@ def test_no_profile_forces_a_quantization_the_checkpoint_would_reject() -> None:
         assert profile.quantization is None, (
             f"{model_id} forces quantization={profile.quantization!r}; the checkpoint declares its "
             "own method and vllm rejects an argument that disagrees"
+        )
+
+
+def test_profiles_carry_the_reasoning_parser_hosted_serving_configures() -> None:
+    # `_structured_state` raises `PromptError` -- a 400 -- when a request asks for structured
+    # outputs while thinking is on and no reasoning parser is configured. these adapters carry a
+    # `thinking_default` and the public endpoint accepts per-request `structured_outputs` /
+    # `response_format`, so an unset parser made that supported combination fail every time on a
+    # perfectly healthy engine.
+    #
+    # read from the hosted config rather than hardcoded: these are the same base models on the
+    # same checkpoints, so the two must not drift apart in either direction.
+    for model_id in supported_models():
+        expected = reasoning_parser_for(model_id)
+        assert expected is not None, f"hosted serving configures no parser for {model_id}"
+        assert get_profile(model_id).reasoning_parser == expected, (
+            f"{model_id} diverges from the parser hosted serving runs for the same checkpoint; "
+            "thinking plus structured outputs would 400"
+        )
+
+
+def test_profiles_keep_the_validated_fp8_kv_cache() -> None:
+    # unlike `quantization` above, the KV cache dtype is the engine's own and no checkpoint
+    # rejects it. hosted serving runs fp8 for every base because it halves KV bytes, and the
+    # 32k context / rank-128 / 16-hot-lora shape below was validated on that footprint.
+    #
+    # `None` is not a harmless "use the default": `engine_config_from_manifest` omits the key
+    # entirely, so vllm falls back to auto and the same card holds half the cache blocks -- fewer
+    # concurrent requests and preemption under load at the context the profile advertises.
+    for model_id in supported_models():
+        assert get_profile(model_id).kv_cache_dtype == KV_CACHE_DTYPE, (
+            f"{model_id} would serve a different KV footprint than the validated shape"
         )
 
 

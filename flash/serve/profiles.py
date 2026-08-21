@@ -209,7 +209,13 @@ _PROFILES: dict[str, ServingProfile] = {
         # the checkpoint rather than treating it as a hint. the checkpoint is the authority,
         # so nothing is forced here.
         quantization=None,
-        kv_cache_dtype=None,
+        # fp8, matching hosted serving's KV_CACHE_DTYPE for every base. unlike `quantization` above
+        # this is the engine's own cache, not a property of the checkpoint, so nothing rejects it.
+        # it halves KV bytes and is part of the shape the 32k/rank-128/16-hot-lora numbers below
+        # were validated against: leaving it unset lets vllm default to auto, so the same card
+        # holds half the cache blocks and preempts under load at the context this profile
+        # advertises. the customer's gpu is the same one the sweep measured.
+        kv_cache_dtype="fp8",
         max_model_len=32768,
         max_num_seqs=8,
         max_num_batched_tokens=None,
@@ -234,7 +240,11 @@ _PROFILES: dict[str, ServingProfile] = {
         # and from_local_checkpoint RAISES on them ("expected target modules in ... but received").
         # a customer who trained on images would get a deployment that refuses to load the adapter.
         enable_tower_connector_lora=True,
-        reasoning_parser=None,
+        # qwen3, as hosted serving configures for every Qwen3.5 base. these adapters carry a
+        # `thinking_default`, and the endpoint accepts per-request structured outputs; with no
+        # parser `_structured_state` raises on that exact combination, so a customer deploying a
+        # thinking adapter got a 400 on every structured-output request from a healthy engine.
+        reasoning_parser="qwen3",
         engine_args={},
         tokenizer_kwargs={},
         processor_kwargs={},
@@ -252,7 +262,8 @@ _PROFILES: dict[str, ServingProfile] = {
         # the checkpoint rather than treating it as a hint. the checkpoint is the authority,
         # so nothing is forced here.
         quantization=None,
-        kv_cache_dtype=None,
+        # fp8 for the same reason as the 9B above.
+        kv_cache_dtype="fp8",
         max_model_len=32768,
         max_num_seqs=8,
         max_loras=16,
@@ -268,7 +279,8 @@ _PROFILES: dict[str, ServingProfile] = {
         mm_processor_cache_gb=0.0,
         # true for the same reason as the 9B above.
         enable_tower_connector_lora=True,
-        reasoning_parser=None,
+        # qwen3 for the same reason as the 9B above.
+        reasoning_parser="qwen3",
         engine_args={},
         tokenizer_kwargs={},
         processor_kwargs={},
