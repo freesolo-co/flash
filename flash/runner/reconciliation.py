@@ -257,7 +257,31 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
         return False
     with runner._status_guard(run_id):
         raw = runner._load_status_json(run_id)
-        records = runner._cleanup_remotes_from_raw(raw)
+        try:
+            records = runner._cleanup_remotes_from_raw(raw)
+        except Exception:
+            # the strict reader raises on the FIRST record it cannot canonicalize, and the drain
+            # suppresses that -- so one bad sibling made every CONFIRMED-DELETED record undeletable,
+            # and each sweep retried a resource that is already gone, forever. removing one record
+            # does not require understanding the others: keep the ones that cannot be parsed exactly
+            # as they are on disk, drop only the record whose teardown was confirmed. nothing is
+            # silently discarded, and the strict reader still guards every other write path.
+            value = raw.get(runner._CLEANUP_REMOTES_KEY, [])
+            if not isinstance(value, list):
+                return False
+            remaining = [
+                item
+                for item in value
+                if runner._cleanup_remote_key(runner._canonical_cleanup_remote(item))
+                != expected_key
+            ]
+            if len(remaining) == len(value):
+                return False
+            runner._save_status_unlocked(
+                runner._runstatus_from_json(raw),
+                _cleanup_remotes=remaining or None,
+            )
+            return True
         remaining = [
             record for record in records if runner._cleanup_remote_key(record) != expected_key
         ]

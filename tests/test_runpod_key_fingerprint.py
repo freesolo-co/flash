@@ -573,6 +573,15 @@ def test_unverifiable_cleanup_record_does_not_block_draining_its_siblings(tmp_pa
     # the resolvable resource was actually torn down rather than stranded behind the raise.
     assert "ep-drainable" in torn_down
 
+    # and its record was durably REMOVED. removal reparses the whole list strictly, so the
+    # unverifiable sibling used to make that raise -- suppressed by the drain -- leaving a
+    # confirmed-gone resource on disk for every later sweep to retry forever. the sibling itself
+    # must survive untouched: it is unverifiable, not proven absent.
+    with open(runner.runs_file_path("drain-partial", ".json"), encoding="utf-8") as handle:
+        stored = json.load(handle)
+    endpoints = [record.get("endpoint_id") for record in stored.get("cleanup_remotes") or []]
+    assert endpoints == ["ep-unverifiable"]
+
 
 def test_list_endpoints_by_key_returns_fingerprints_not_raw_keys(monkeypatch):
     from flash.providers.runpod import api
