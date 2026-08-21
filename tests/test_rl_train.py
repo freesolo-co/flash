@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import hashlib
 import importlib
 import inspect
 import io
@@ -4666,6 +4667,26 @@ def _notes_common():
     return {"steps_run": 3, "retained_prompts": 8, "reward_history": [0.5], "loss_curve": [0.1]}
 
 
+def _identity_summary(identities):
+    digest = hashlib.sha256()
+    for identity in sorted(
+        identities,
+        key=lambda value: (
+            value["optimizer_step"],
+            value["sample_index"],
+            value["rollout_ordinal"],
+            value["validate"],
+        ),
+    ):
+        digest.update(
+            (
+                f"{identity['optimizer_step']}:{identity['sample_index']}:"
+                f"{identity['rollout_ordinal']}:{int(identity['validate'])}\n"
+            ).encode("ascii")
+        )
+    return {"count": len(identities), "sha256": digest.hexdigest()}
+
+
 def test_successful_child_validation_publishes_exact_rollout_identity_evidence_in_notes():
     from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
 
@@ -4707,7 +4728,7 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
             {
                 "optimizer_step": 1,
                 "registered": expected,
-                "observed": expected,
+                "observed": _identity_summary(expected),
             }
         ],
         "validation": [],

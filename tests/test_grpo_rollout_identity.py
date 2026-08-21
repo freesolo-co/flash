@@ -13,7 +13,11 @@ import cloudpickle
 import pytest
 
 from flash.engine.worker.train.rl.child import patches
-from flash.engine.worker.train.rl.identity import RolloutIdentityLedger, parse_rollout_identity
+from flash.engine.worker.train.rl.identity import (
+    RolloutIdentity,
+    RolloutIdentityLedger,
+    parse_rollout_identity,
+)
 from flash.engine.worker.train.rl.reward_module import render_reward_module
 
 
@@ -28,6 +32,26 @@ def _identity(step: int, index: int, ordinal: int, *, validate: bool = False) ->
 
 def _expected(step: int, indexes: tuple[int, ...], group_size: int) -> list[dict]:
     return [_identity(step, index, ordinal) for index in indexes for ordinal in range(group_size)]
+
+
+def _identity_sha256(identities: list[dict]) -> str:
+    digest = hashlib.sha256()
+    for identity in sorted(
+        identities,
+        key=lambda value: (
+            value["optimizer_step"],
+            value["sample_index"],
+            value["rollout_ordinal"],
+            value["validate"],
+        ),
+    ):
+        digest.update(
+            (
+                f"{identity['optimizer_step']}:{identity['sample_index']}:"
+                f"{identity['rollout_ordinal']}:{int(identity['validate'])}\n"
+            ).encode("ascii")
+        )
+    return digest.hexdigest()
 
 
 async def get_trajectory_info(*_args):
@@ -61,37 +85,48 @@ def test_identity_ledger_retains_exact_p64_g2_terminal_evidence_and_returns_deep
             {
                 "optimizer_step": step,
                 "registered": exact_by_step[step],
-                "observed": exact_by_step[step],
+                "observed": {
+                    "count": len(exact_by_step[step]),
+                    "sha256": _identity_sha256(exact_by_step[step]),
+                },
             }
             for step in (1, 2)
         ],
         "validation": [],
     }
     for step in evidence["steps"]:
-        assert len(step["registered"]) == 128
-        assert len(step["observed"]) == 128
-        assert len({tuple(identity.items()) for identity in step["registered"]}) == 128
-        assert step["registered"] == step["observed"]
-        assert all(identity["validate"] is False for identity in step["registered"])
-        assert all(
-            identity["optimizer_step"] == step["optimizer_step"] for identity in step["registered"]
-        )
+        registered = step["registered"]
+        observed = step["observed"]
+        assert len(registered) == 128
+        assert len({tuple(identity.items()) for identity in registered}) == 128
+        assert observed["count"] == len(registered)
+        assert observed["sha256"] == _identity_sha256(registered)
+        assert all(identity["validate"] is False for identity in registered)
+        assert all(identity["optimizer_step"] == step["optimizer_step"] for identity in registered)
 
     evidence["steps"][0]["registered"][0]["sample_index"] = 999
-    evidence["steps"].append({"optimizer_step": 999, "registered": [], "observed": []})
+    evidence["steps"][0]["observed"]["count"] = 0
+    evidence["steps"].append({"optimizer_step": 999, "registered": [], "observed": {}})
     fresh = ledger.evidence()
     assert [step["optimizer_step"] for step in fresh["steps"]] == [1, 2]
     assert fresh["steps"][0]["registered"][0]["sample_index"] == 0
+    assert fresh["steps"][0]["observed"]["count"] == 128
 
 
-def test_sealed_evidence_retains_one_identity_tuple_per_step():
-    """the ledger must not keep a second copy of a set it has already proven equal.
+def test_identity_evidence_observed_summary_matches_registered_detail():
+    ledger = RolloutIdentityLedger(2, 2)
+    expected = _expected(7, (4, 9), 2)
+    ledger.register(reversed(expected))
+    for identity in expected:
+        ledger.record(identity, identity["sample_index"])
+    ledger.seal(7)
 
-    `seal` raises unless registered == observed, so retaining both makes parent memory scale
-    with steps x completions_per_step for no added evidence, and `train.max_steps` has no
-    ceiling. this pins the retention itself, since the published payload still emits both keys
-    and therefore cannot distinguish one stored tuple from two.
-    """
+    step = ledger.finalize({7})["steps"][0]
+    assert step["observed"]["count"] == len(step["registered"])
+    assert step["observed"]["sha256"] == _identity_sha256(step["registered"])
+
+
+def test_finalize_materializes_each_identity_dict_once(monkeypatch):
     ledger = RolloutIdentityLedger(64, 2)
     for step in (1, 2):
         expected = _expected(step, tuple(range(64)), 2)
@@ -100,19 +135,21 @@ def test_sealed_evidence_retains_one_identity_tuple_per_step():
             ledger.record(identity, identity["sample_index"])
         ledger.seal(step)
 
-    retained = ledger._sealed_evidence
-    assert set(retained) == {1, 2}
-    for sealed in retained.values():
-        # a bare tuple of identities, not a (registered, observed) pair of tuples
-        assert isinstance(sealed, tuple)
-        assert len(sealed) == 128
-        assert not any(isinstance(entry, tuple) for entry in sealed)
+    calls = 0
+    original_to_dict = RolloutIdentity.to_dict
 
-    # the published contract is unchanged: both keys are still emitted, still equal
+    def counted_to_dict(identity):
+        nonlocal calls
+        calls += 1
+        return original_to_dict(identity)
+
+    monkeypatch.setattr(RolloutIdentity, "to_dict", counted_to_dict)
     evidence = ledger.finalize({1, 2})
-    for step in evidence["steps"]:
-        assert step["registered"] == step["observed"]
-        assert len(step["registered"]) == 128
+
+    expected_identities = 2 * 64 * 2
+    assert calls == expected_identities
+    assert sum(len(step["registered"]) for step in evidence["steps"]) == expected_identities
+    assert all(not isinstance(step["observed"], list) for step in evidence["steps"])
 
 
 def test_failed_identity_seal_does_not_publish_terminal_evidence():
