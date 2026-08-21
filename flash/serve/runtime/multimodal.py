@@ -15,8 +15,6 @@ _MAX_IMAGES = 4
 _MAX_COMPRESSED_BYTES = 8 * 1024 * 1024
 _MAX_TOTAL_COMPRESSED_BYTES = 16 * 1024 * 1024
 _MAX_DIMENSION = 8192
-_MAX_PIXELS = 16_777_216
-_MAX_TOTAL_PIXELS = 33_554_432
 _MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
 _MAX_SOURCE_CHARS = len("data:image/webp;base64,") + 4 * ((_MAX_COMPRESSED_BYTES + 2) // 3)
 _IMAGE_TYPES = frozenset({"image_url", "input_image", "image"})
@@ -44,6 +42,20 @@ _MODE_BYTES_PER_PIXEL = {
     "F": 4,
 }
 _RGB_BYTES_PER_PIXEL = 3
+# decoding one image costs its own buffer plus a transient RGB conversion, so the worst mode
+# sets the bytes-per-pixel a pixel budget has to assume.
+_WORST_BYTES_PER_PIXEL = max(_MODE_BYTES_PER_PIXEL.values()) + 2 * _RGB_BYTES_PER_PIXEL
+
+# derived, not chosen: a pixel count the decoded-memory guard would always reject is not a limit,
+# it is a promise the validator breaks. training (`train/core/child/glue.py`) and the hosted
+# serving validator advertise the same pair and derive it the same way -- a hardcoded cap here
+# accepted images both of those reject, so one deployable image contract had two answers.
+#
+# there is deliberately no cumulative pixel cap. what a set of images costs is decoded memory,
+# which depends on each image's mode and on their order -- neither of which a sum of pixel counts
+# can see. with this per-image cap, `_MAX_IMAGES` of them cannot reach the old 33_554_432 total
+# anyway, so that guard could never fire. the cumulative decoded-memory guard bounds it exactly.
+_MAX_PIXELS = _MAX_TOTAL_DECODED_BYTES // _WORST_BYTES_PER_PIXEL
 
 
 def has_image_blocks(messages: Any) -> bool:
@@ -324,8 +336,6 @@ def _validate_image_metadata(
     if getattr(image, "n_frames", 1) != 1:
         raise MultimodalRequestError(f"image {index} must be a static single-frame image")
     pixels = _validate_dimensions(*image.size, index)
-    if prior_pixels + pixels > _MAX_TOTAL_PIXELS:
-        raise MultimodalRequestError("images exceed the total pixel limit")
     peak_bytes = _RGB_BYTES_PER_PIXEL * prior_pixels + _decoded_bytes(image.mode, pixels)
     if peak_bytes > _MAX_TOTAL_DECODED_BYTES:
         raise MultimodalRequestError("images exceed the total decoded-memory limit")

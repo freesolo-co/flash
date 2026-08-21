@@ -400,6 +400,26 @@ def test_no_cumulative_pixel_cap_exists() -> None:
     assert not hasattr(multimodal, "_MAX_TOTAL_PIXELS")
 
 
+def test_hosted_and_runtime_advertise_one_image_contract() -> None:
+    """The two validators bound the same deployable image contract, so they cannot disagree.
+
+    They are separate modules only because one runs in the hosted app and one in the engine
+    runtime. A caller cannot tell which validated its request, so a limit that differs between
+    them means the same image is accepted on one path and rejected on the other. The runtime
+    hardcoded 16_777_216 while this module and training both derived 6_710_886, so a 7Mpx image
+    passed the runtime and was refused here.
+    """
+    from flash.serve.runtime import multimodal as runtime
+
+    for name in ("_MAX_PIXELS", "_MAX_IMAGES", "_MAX_DIMENSION", "_MAX_TOTAL_DECODED_BYTES"):
+        assert getattr(multimodal, name) == getattr(runtime, name), name
+    # derived on both sides, not two copies of the same literal that can drift apart again.
+    assert runtime._MAX_PIXELS == (
+        runtime._MAX_TOTAL_DECODED_BYTES // runtime._WORST_BYTES_PER_PIXEL
+    )
+    assert not hasattr(runtime, "_MAX_TOTAL_PIXELS")
+
+
 def test_total_decoded_memory_limit(monkeypatch) -> None:
     monkeypatch.setattr(multimodal, "_MAX_TOTAL_DECODED_BYTES", 11)
     with pytest.raises(MultimodalRequestError, match="decoded-memory"):
