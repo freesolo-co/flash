@@ -88,12 +88,17 @@ def normalize_chat_messages(
     *,
     supports_images: bool,
     image_limit: int | None,
-) -> list[dict[str, Any]]:
-    """Validate chat messages, decode images inside the safety boundary, and return the
-    template-ready list.
+) -> list[dict[str, Any]] | None:
+    """Validate chat messages and return a template-ready list, or None to keep the original.
 
-    Returns the normalized messages rather than discarding them: role rewrites (`developer` ->
-    `system`) only take effect if the caller templates what was validated.
+    Text-only lists come back normalized, because role rewrites (`developer` -> `system`) only
+    take effect if the caller templates what was validated.
+
+    Image-bearing lists come back as None. `_normalize_messages` strips each image block down to
+    a bare `{"type": "image"}` and lifts the data uri into a separate `sources` channel, so that
+    list is only meaningful alongside the decoded images. Handing it back would discard the
+    sources while still looking like an image request to `has_image_blocks`, and the engine --
+    which re-normalizes from the original itself -- would then fail on a block with no source.
     """
     template_messages, sources = _normalize_messages(messages)
     if not sources:
@@ -105,7 +110,8 @@ def normalize_chat_messages(
     images = _decode_images(sources, image_limit=image_limit)
     for image in images:
         image.close()
-    return template_messages
+    # validated only. the engine re-normalizes the original list together with its sources.
+    return None
 
 
 def prepare_multimodal_request(

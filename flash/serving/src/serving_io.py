@@ -251,9 +251,11 @@ async def _prepare_generate_request(payload: Any, target: AdapterRecord) -> None
         )
     except MultimodalRequestError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-    # write the normalized list back so the engine templates what was validated, not the original
-    # spelling -- validation alone would still send `developer` through to the tokenizer.
-    payload.messages = normalized
+    # write back only for text-only lists, where the normalized form is self-contained and the
+    # role rewrite would otherwise be lost. image lists return None: their normalized form has
+    # the sources stripped out, so the engine must re-normalize the original.
+    if normalized is not None:
+        payload.messages = normalized
 
 
 def _sse(data: dict[str, Any] | str) -> bytes:

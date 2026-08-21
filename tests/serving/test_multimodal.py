@@ -1127,3 +1127,25 @@ def test_developer_role_is_rewritten_to_system_for_text_only_requests() -> None:
     assert [m["role"] for m in sent] == ["system", "user"], (
         "the engine must template the normalized roles, not the original spelling"
     )
+
+
+def test_image_request_reaches_the_engine_with_its_sources_intact() -> None:
+    """The text-only write-back must not strip image sources on the way to the engine.
+
+    `_normalize_messages` lifts each data uri into a separate `sources` channel and leaves a bare
+    `{"type": "image"}` behind. That stripped block still satisfies `has_image_blocks`, so writing
+    it back would route to the image path and then fail there with "must contain exactly one image
+    source" -- after the request had already been accepted.
+    """
+    client, pool = _client(QWEN_2B)
+    response = client.post("/v1/chat/completions", json={"model": RUN_ID, "messages": _messages()})
+    assert response.status_code == 200
+    assert pool.calls == [(QWEN_2B, REVISION_ID, REVISION_ID)]
+    sent = pool.payloads[-1].messages
+    blocks = sent[0]["content"]
+    image_blocks = [b for b in blocks if b.get("type") in {"image_url", "input_image", "image"}]
+    assert image_blocks, "the engine must still receive an image block"
+    # the engine re-normalizes from the original, so the source must survive the boundary
+    assert prepare_multimodal_request(sent, image_limit=4)[1], (
+        "the engine must be able to decode the images it was handed"
+    )
