@@ -3264,6 +3264,31 @@ def test_deploy_rejects_a_forged_auto_pin_marker(api):
     assert "integrity validation" in response.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+        ("deploy", {"dry_run": True}),
+        ("export", {"repository": "owner/adapter", "hf_token": "hf-test"}),
+        ("chat", {"messages": [{"role": "user", "content": "hello"}]}),
+    ],
+)
+def test_serving_routes_map_leaked_revision_decode_failures_to_conflict(api, route, payload):
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.spec["model_revision"] = "abc123"
+    runner._save_status(status)
+
+    response = api.post(f"/v1/runs/{run_id}/{route}", json=payload, headers=_bearer(key))
+
+    assert response.status_code == 409, response.text
+    assert "platform-managed model revision key" in response.json()["detail"]
+
+
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
