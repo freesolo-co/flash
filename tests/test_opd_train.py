@@ -2722,7 +2722,10 @@ class _RecordingEnv:
         self.recorded: list[str] = []
 
     def new_rollout_state(self, _example):
-        return {"messages": [{"role": "user", "content": "q"}], "prompt": None}
+        # both keys, as the real adapter emits them: `prompt` is the frozen initial prefix and
+        # `messages` starts as a copy of it that each turn appends to.
+        prompt = [{"role": "user", "content": "q"}]
+        return {"messages": [dict(message) for message in prompt], "prompt": prompt}
 
     def record_model_turn(self, state, content):
         if not content.strip():
@@ -8815,7 +8818,12 @@ class _StructuredImageEnv(_RecordingEnv):
         self.reply_contexts = []
 
     def new_rollout_state(self, _example):
-        return {"messages": self.initial_messages, "prompt": None}
+        # `prompt` carries the frozen initial prefix and `messages` its mutable copy, matching what
+        # the real adapter builds; the media checks read the prefix, not the growing transcript.
+        return {
+            "messages": [dict(message) for message in self.initial_messages],
+            "prompt": self.initial_messages,
+        }
 
     def env_reply(self, messages, _state):
         self.reply_contexts.append(messages)
@@ -9128,6 +9136,32 @@ def test_step_media_identity_requires_the_child_to_attest_its_media():
 
     with pytest.raises(ValueError, match="list of strings"):
         step_media_identity({"image_count": 1, "image_digests": [b"not-a-str"]})
+
+
+def test_normalize_initial_prompt_rejects_a_state_with_no_prompt():
+    """`prompt` and `messages` are not two spellings of one field.
+
+    `new_rollout_state` seeds `messages` with a COPY of `prompt` and appends each turn onto it, so
+    falling back to `messages` when `prompt` is absent normalizes the transcript-so-far against the
+    frozen prompt's media -- on any state past turn zero that carries model turns the prompt never
+    had. every producer sets `prompt`, so its absence is a corrupt state and must be named as one.
+    """
+    from flash.engine.worker.train.opd.multiturn_media import normalize_initial_prompt
+
+    class _Prompt:
+        image_descriptors = ()
+        image_digests = ()
+        example = {}  # noqa: RUF012
+        package_root = None
+
+    state = {
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ]
+    }
+    with pytest.raises(ValueError, match="environment initial prompt"):
+        normalize_initial_prompt(_Prompt(), state, None)
 
 
 def test_build_opd_overrides_sizes_the_rollout_memory_budget():
