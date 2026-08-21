@@ -1289,3 +1289,93 @@ def test_force_pin_still_pins_a_fresh_sft_run_to_the_hub_tip(monkeypatch):
 
     assert resolved.model_revision == tip
     assert resolved.model_revision_auto is True
+
+
+def test_recovery_reproduces_a_digest_taken_before_lora_alpha_was_public(monkeypatch, tmp_path):
+    """A run prepared before 1.1.35 stored no public `lora_alpha`; its digest must still verify.
+
+    `to_dict()` now MATERIALIZES alpha (defaulting to 2 * lora_rank), so rehashing such a run with
+    today's serialization hashes bytes it never had. `workload_profile` predates the change
+    (1.1.32), so the digest branch is genuinely reachable for runs in that window -- and
+    `reallocation_spec_from_status` is what the retry path calls, so a mismatch marks a live run
+    `unrecoverable` rather than retrying it.
+    """
+    import hashlib
+
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+    from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
+
+    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    public = JobSpec.from_dict(
+        {
+            "run_id": "pre-alpha-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "gpu": {"type": "RTX 4090"},
+            "train": {"lora_rank": 32},
+        }
+    )
+    # the stored public spec as an older build wrote it: no `lora_alpha` key at all.
+    stored_public = public.to_dict()
+    stored_public["train"].pop("lora_alpha", None)
+    assert "lora_alpha" not in stored_public["train"]
+
+    worker_dict = public.to_internal_dict()
+    worker_dict["workload_profile"] = {"tokens": 128}
+    worker = JobSpec.from_dict(worker_dict)
+    # the digest the ORIGINAL build computed, hashed HERE rather than through the function under
+    # test: deriving it from `_preparation_digest` would move with the code and pass either way.
+    original_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "version": PREPARATION_ENVELOPE_VERSION,
+                "public_spec": stored_public,
+                "worker_spec": worker.to_internal_dict(),
+                "adapter_identity": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    R._save_status(
+        R.RunStatus(
+            run_id=public.run_id,
+            state="provisioning",
+            spec=stored_public,
+            effective_preparation={
+                "worker_spec": worker.to_internal_dict(),
+                "adapter_identity": None,
+                "version": 1,
+                "workload_profile": worker.workload_profile or None,
+                "preparation_digest": original_digest,
+            },
+        )
+    )
+
+    recovered = R.effective_spec_from_status(R.get_status(public.run_id))
+    assert recovered.train.lora_rank == 32
+
+
+def test_a_snapshot_written_before_the_version_key_still_recovers(monkeypatch, tmp_path):
+    """The `version` stamp landed in 1.2.59; runs prepared by an older build are still in flight.
+
+    Rejecting an ABSENT version makes `reallocation_spec_from_status` raise on the retry path,
+    which marks a live run `unrecoverable` instead of retrying it. A malformed value is still
+    rejected -- absence is a known shape, a bad type is not.
+    """
+    from flash.core.spec_persistence import (
+        PREPARATION_ENVELOPE_VERSION,
+        validate_persisted_spec_envelope,
+    )
+
+    assert (
+        validate_persisted_spec_envelope({"worker_spec": {}, "preparation_digest": "d"})
+        == PREPARATION_ENVELOPE_VERSION
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        validate_persisted_spec_envelope({"version": "1"})
+    with pytest.raises(ValueError, match="unsupported persisted preparation envelope version"):
+        validate_persisted_spec_envelope({"version": PREPARATION_ENVELOPE_VERSION + 1})

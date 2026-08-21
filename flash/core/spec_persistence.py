@@ -12,7 +12,13 @@ def validate_persisted_spec_envelope(snapshot: object) -> int:
     """Validate and return the current persisted preparation version."""
     if not isinstance(snapshot, Mapping):
         raise ValueError("persisted effective preparation is malformed")
-    version = snapshot.get("version")
+    # an ABSENT version is the pre-envelope shape and reads as version 1; only a PRESENT one is
+    # type-checked. the writer that stamps this key landed in 1.2.59 (five days before this branch),
+    # so runs prepared by an older build are still in flight, and `reallocation_spec_from_status`
+    # is what the retry path calls -- rejecting them there marks a live run `unrecoverable` instead
+    # of retrying it. a malformed value is still rejected: absence is a known shape, a bad type
+    # is not.
+    version = snapshot.get("version", PREPARATION_ENVELOPE_VERSION)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise ValueError("persisted preparation envelope version must be a positive integer")
     if version != PREPARATION_ENVELOPE_VERSION:

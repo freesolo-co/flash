@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import replace
 
 from flash.core.spec import JobSpec
@@ -294,10 +295,32 @@ def _preparation_digest(
     public_spec: JobSpec,
     worker_spec: JobSpec,
     adapter_identity: dict | None,
+    *,
+    stored_public: object = None,
 ) -> str:
+    public_payload = public_spec.to_dict()
+    # `lora_alpha` became user-authorable in 1.1.35, so `to_dict()` now MATERIALIZES it (defaulting
+    # to 2 * lora_rank) where a spec prepared before that stored no key at all. rehashing such a
+    # run with today's serialization hashes bytes it never had, so its digest can only be
+    # reproduced by replaying the omission. `workload_profile` predates the change (1.1.32), so the
+    # digest branch is genuinely reachable for runs in that window.
+    #
+    # this cannot forge a value: the omission is read from the STORED public spec, and the digest
+    # it is compared against was computed over the original. a warm start is excluded because
+    # `to_dict()` strips rank and alpha for those in EVERY version, so absence there dates nothing
+    # and dropping the binding would lose real cover -- `_validate_effective_spec` excludes alpha
+    # from its structural comparison, leaving the digest as the only thing tying the two halves.
+    if isinstance(stored_public, Mapping):
+        stored_train = stored_public.get("train")
+        if (
+            isinstance(stored_train, Mapping)
+            and "lora_alpha" not in stored_train
+            and not stored_train.get("init_from_adapter")
+        ):
+            public_payload["train"].pop("lora_alpha", None)
     payload = {
         "version": PREPARATION_ENVELOPE_VERSION,
-        "public_spec": public_spec.to_dict(),
+        "public_spec": public_payload,
         "worker_spec": worker_spec.to_internal_dict(),
         "adapter_identity": adapter_identity,
     }
