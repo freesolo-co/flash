@@ -998,15 +998,36 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
     assert spec.environment.secrets == ()
 
 
-def test_jobspec_from_dict_rejects_path() -> None:
-    # Defense-in-depth: a stale worker payload carrying a local path must be rejected.
+@pytest.mark.parametrize("unknown_key", ["path", "pth", "totally_made_up"])
+def test_jobspec_from_dict_rejects_unknown_environment_keys(unknown_key) -> None:
     data = {
         "project": "11111111-1111-4111-8111-111111111111",
         "model": "Qwen/Qwen3-0.6B",
-        "environment": {"id": "gsm8k", "path": "./environment.py"},
+        "environment": {"id": "gsm8k", unknown_key: "./environment.py"},
     }
-    with pytest.raises(ValueError, match="local environment paths are no longer supported"):
+    with pytest.raises(ValueError, match=rf"environment has unknown key\(s\): {unknown_key}"):
         _job_from_dict(data)
+
+
+def test_jobspec_from_dict_keeps_valid_environment_package() -> None:
+    data = {
+        "project": "11111111-1111-4111-8111-111111111111",
+        "model": "Qwen/Qwen3-0.6B",
+        "environment": {
+            "id": "owner/project/gsm8k",
+            "resolved_sha": "d" * 40,
+            "package": {
+                "artifact_revision": "a" * 40,
+                "archive_sha256": "b" * 64,
+                "manifest_sha256": "c" * 64,
+            },
+        },
+    }
+
+    spec = _job_from_dict(data)
+
+    assert spec.environment.package is not None
+    assert spec.environment.package.artifact_revision == "a" * 40
 
 
 # ---------------------------------------------------------------------------

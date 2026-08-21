@@ -729,9 +729,9 @@ class JobSpec:
         unknown_top_level = sorted(set(data) - allowed_top_level)
         if unknown_top_level:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
-        env = data.get("environment") or {}
-        if not isinstance(env, dict):
-            raise TypeError("environment must be an object")
+        env = validated_section(
+            data, "environment", {item.name for item in fields(EnvironmentSpec)}
+        )
         raw_package = env.get("package")
         if raw_package is not None and not isinstance(raw_package, dict):
             raise TypeError("environment.package must be an object")
@@ -751,12 +751,6 @@ class JobSpec:
             if raw_package is not None
             else None
         )
-        # reject stale payloads carrying a local `path`; worker only runs published env ids.
-        if env.get("path"):
-            raise ValueError(
-                "local environment paths are no longer supported; the worker only runs "
-                "published Freesolo environment ids"
-            )
         train = validated_section(data, "train", {item.name for item in fields(TrainSpec)})
         gpu = validated_section(data, "gpu", {item.name for item in fields(GpuSpec)})
         gpu_type, gpu_type_fallbacks = _parse_persisted_gpu_types(gpu)
