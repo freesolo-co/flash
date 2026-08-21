@@ -519,6 +519,51 @@ def test_multimodal_prompt_failure_closes_decoded_images(monkeypatch) -> None:
 
     import asyncio
 
+    # this test is about releasing decoded images, and the raise is only the trigger. the render
+    # failure is now classified as a `PromptError` (a `RuntimeError` subclass) that quotes the
+    # original text, so match on the underlying cause rather than the wrapper's type alone.
     with pytest.raises(RuntimeError, match="render failed"):
         asyncio.run(preparer.prepare(request, False))
     assert closed == [True]
+
+
+def test_a_multimodal_template_rejection_is_a_client_error_not_an_unavailable_engine(
+    monkeypatch,
+) -> None:
+    """the image branch renders through the processor, so it needed the same translation.
+
+    Its only wrapper was the handler that closes decoded images and re-raises, which is about
+    freeing memory rather than classifying failures. So an unrenderable multimodal request escaped
+    unclassified and answered 503 exactly as the text path did before it was fixed.
+    """
+
+    class _Image:
+        def close(self) -> None:
+            return None
+
+    class _Processor:
+        tokenizer = SimpleNamespace()
+
+        def apply_chat_template(self, *_args, **_kwargs):
+            raise TypeError('can only concatenate str (not "dict") to str')
+
+    monkeypatch.setattr(
+        "flash.serve.runtime.prompt.prepare_multimodal_request",
+        lambda *_args, **_kwargs: ([{"role": "user", "content": [{"type": "image"}]}], [_Image()]),
+    )
+    preparer = PromptPreparer(
+        EngineConfig(model="model", image_limit=1),
+        SimpleNamespace(),
+        _Processor(),
+    )
+    request = GenerationRequest(
+        messages=[{"role": "user", "content": [{"type": "image", "image": _data_uri()}]}]
+    )
+
+    import asyncio
+
+    with pytest.raises(PromptError) as raised:
+        asyncio.run(preparer.prepare(request, False))
+
+    assert isinstance(raised.value, ValueError)
+    assert "chat template rejected" in str(raised.value)

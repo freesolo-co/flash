@@ -211,13 +211,22 @@ class PromptPreparer:
         )
         try:
             kwargs = effective_chat_template_kwargs(request, thinking)
-            rendered = await asyncio.to_thread(
-                self._processor.apply_chat_template,
-                template_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                **kwargs,
-            )
+            try:
+                # the same request-caused rejection the text branch translates. the handler below
+                # is about releasing decoded images, not classifying failures, so without this an
+                # unrenderable multimodal request escapes unclassified and answers 503 exactly as
+                # the text path used to.
+                rendered = await asyncio.to_thread(
+                    self._processor.apply_chat_template,
+                    template_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    **kwargs,
+                )
+            except ServingRuntimeError:
+                raise
+            except Exception as exc:
+                raise PromptError(f"chat template rejected the request messages: {exc}") from exc
             if not isinstance(rendered, str):
                 raise MultimodalRequestError("processor chat template did not return text")
             image_data: Any = images[0] if len(images) == 1 else images
