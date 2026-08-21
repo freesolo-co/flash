@@ -34,6 +34,7 @@ from flash.engine.worker import backend_common, rl_train, sft_train
 from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.train.core.child import runtime as child_runtime
+from flash.engine.worker.train.core.child import runtime as verl_child_runtime
 from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 from flash.engine.worker.train.rl.child import patches as verl_patches
 from flash.engine.worker.train.rl.child import plugin as grpo_plugin
@@ -1240,6 +1241,11 @@ def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
     assert not any("drop_last" in override for override in o)
 
 
+def test_build_verl_overrides_limits_grpo_rollouts_to_four_images():
+    overrides = rl_train.build_verl_overrides(_overrides_cfg())
+    assert "++actor_rollout_ref.rollout.limit_images=4" in overrides
+
+
 def test_build_verl_overrides_sizes_agent_loop_workers_to_the_rollout_batch():
     # verl chunks prompts_per_step * group_size across agent.num_workers and asserts exact
     # divisibility; its default of 8 aborts before the first step on e.g. 2 x 2 = 4.
@@ -1248,6 +1254,24 @@ def test_build_verl_overrides_sizes_agent_loop_workers_to_the_rollout_batch():
     # the common case still gets the full worker pool.
     big = rl_train.build_verl_overrides(_overrides_cfg(prompts_per_step=64, group_size=8))
     assert "actor_rollout_ref.rollout.agent.num_workers=8" in big
+
+
+def test_build_verl_overrides_halves_agent_loop_workers_for_multimodal_runs():
+    # every agent worker is a ray actor with its own processor copy. on an image run that is a
+    # full image processor, and eight of them beside the vllm engine exhausted the worker
+    # container: `libgomp: Thread creation failed`. the actor died mid-grading, so the rollouts
+    # generated (reward_completions=8) but none were graded (reward_grading_depth=0) and the run
+    # hung until the 1200s child-silence watchdog killed it.
+    batch = {"prompts_per_step": 2, "group_size": 4}
+    text = rl_train.build_verl_overrides(_overrides_cfg(**batch))
+    assert "actor_rollout_ref.rollout.agent.num_workers=8" in text
+    image = rl_train.build_verl_overrides(_overrides_cfg(**batch, multimodal=True))
+    assert "actor_rollout_ref.rollout.agent.num_workers=4" in image
+    # the authored knobs are untouched: only scheduling parallelism narrows.
+    assert "actor_rollout_ref.rollout.n=4" in image
+    # and the cap still yields an exact divisor of the rollout batch, which verl asserts on.
+    workers = int(next(o for o in image if "agent.num_workers=" in o).rsplit("=", 1)[1])
+    assert (batch["prompts_per_step"] * batch["group_size"]) % workers == 0
 
 
 @pytest.mark.parametrize(("count", "expected"), [(None, 1), (1, 1), (2, 2), (8, 8)])
@@ -2944,7 +2968,7 @@ def test_an_unrepresentable_env_reply_is_rejected_rather_than_reported_as_a_faul
     """
     bridge = rl_train.MultiTurnBridge(
         _BridgeEnv(
-            replies=[{"role": "user", "content": [{"type": "image_url", "image_url": "x"}]}],
+            replies=[{"role": "user", "content": [{"type": "audio", "audio": "x"}]}],
             done_after=99,
         ),
         examples=[{"q": "a"}],
@@ -2964,13 +2988,34 @@ def test_an_unrepresentable_env_reply_is_rejected_rather_than_reported_as_a_faul
         return urllib.request.urlopen(request, timeout=10)
 
     try:
-        _post("/multiturn/start", {"index": 0, "session_id": "a"}).close()
+        _post(
+            "/multiturn/start",
+            {
+                "index": 0,
+                "session_id": "a",
+                "raw_prompt": [{"role": "user", "content": "a"}],
+                "prompt_ids": [],
+                "image_count": 0,
+                "image_digests": [],
+            },
+        ).close()
         with pytest.raises(urllib.error.HTTPError) as exc_info:
-            _post("/multiturn/step", {"session_id": "a", "completion_text": "answer"})
+            _post(
+                "/multiturn/step",
+                {
+                    "session_id": "a",
+                    "turn_ordinal": 0,
+                    "accepted_prefix": [],
+                    "response_ids": [],
+                    "completion_text": "answer",
+                    "image_count": 0,
+                    "image_digests": [],
+                },
+            )
         assert exc_info.value.code == 400, (
             "an env reply this transcript cannot carry is permanent, not a capacity fault"
         )
-        assert "image block" in exc_info.value.read().decode()
+        assert "unsupported content block" in exc_info.value.read().decode()
     finally:
         server.shutdown()
         bridge.shutdown()
@@ -3125,7 +3170,7 @@ def _vision_hook_installer(torch_module):
     saved = sys.modules.get("torch")
     sys.modules["torch"] = torch_module
     try:
-        yield verl_patches._install_vision_input_grads
+        yield verl_child_runtime.install_vision_input_grads
     finally:
         if saved is None:
             sys.modules.pop("torch", None)
@@ -4593,20 +4638,21 @@ def _capability_resolve(
     gpu_count=1,
 ):
     """run the resolver against one env, with everything else on the supported path."""
-    import transformers
-
     from flash.core.spec import JobSpec
     from flash.engine.worker.runtime.pkg_proxy import W as _PkgW
 
     _Tokenizer = _CapabilityTokenizer
 
-    # patch AutoProcessor on the live module because the resolver imports it inside the function.
-    # skipping the patch before transformers is imported reaches the real loader.
-    monkeypatch.setattr(
-        transformers,
-        "AutoProcessor",
-        SimpleNamespace(from_pretrained=lambda *a, **k: processor or _CapabilityProcessor()),
-        raising=False,
+    # replace the lazy transformers module at the import boundary the resolver uses. assigning an
+    # attribute on transformers' lazy module can be ignored by its custom from-import path.
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoProcessor=SimpleNamespace(
+                from_pretrained=lambda *a, **k: processor or _CapabilityProcessor()
+            )
+        ),
     )
 
     spec = JobSpec.from_dict(
@@ -4733,6 +4779,23 @@ def test_multimodal_prompts_carry_descriptors_and_rendered_text(monkeypatch):
     # descriptor list, which is what _materialize_verl_images later writes to disk.
     blocks = first["prompt"][0]["content"]
     assert {"type": "image"} in blocks
+
+
+def test_top_level_record_image_reaches_actor_and_environment_prompts():
+    from flash.engine.worker.train.rl import inputs as rl_inputs
+
+    prompts = rl_inputs._build_grpo_prompts(
+        [{"image": _capability_image_uri()}],
+        [[{"role": "user", "content": "question"}]],
+        True,
+        _CapabilityProcessor(),
+        _CapabilityTokenizer(),
+        None,
+        32,
+    )
+
+    assert any(block == {"type": "image"} for block in prompts[0]["prompt"][0]["content"])
+    assert any(block == {"type": "image"} for block in prompts[0]["env_prompt"][0]["content"])
 
 
 def test_multimodal_budget_filter_measures_the_expanded_prompt(monkeypatch):
@@ -5083,6 +5146,55 @@ class _BridgeEnv:
         return [RolloutReward(episode=self.episode, turns=None) for _ in items]
 
 
+def _bridge_image(color="red"):
+    from PIL import Image
+
+    from flash.content.multimodal import normalize_image_source
+
+    image = Image.new("RGB", (8, 8), color)
+    encoded = io.BytesIO()
+    image.save(encoded, format="PNG")
+    return image, normalize_image_source(encoded.getvalue(), None)
+
+
+class _BridgeGlueTokenizer:
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [ord(character) for character in text]}
+
+    def apply_chat_template(self, messages, **kwargs):
+        rendered = []
+        for message in messages:
+            content = message["content"]
+            if isinstance(content, str):
+                rendered.append(content)
+                continue
+            rendered.extend(
+                "<image>" if block["type"] == "image" else block["text"] for block in content
+            )
+        return "".join(rendered)
+
+
+class _BridgeGlueProcessor:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.image_counts = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        return self.tokenizer.apply_chat_template(messages, **kwargs)
+
+    def image_processor(self, *, images, return_tensors):
+        assert return_tensors == "np"
+        image = np.asarray(images[0].convert("RGB"), dtype=np.uint8)
+        return {
+            "pixel_values": image,
+            "image_grid_thw": np.asarray([[1, image.shape[0], image.shape[1]]], dtype=np.int64),
+        }
+
+    def __call__(self, *, text, images, videos, return_tensors, **kwargs):
+        self.image_counts.append(len(images))
+        return {"input_ids": [[ord(character) for character in text[0]]]}
+
+
 def _bridge(env, *, max_turns=4, examples=None, env_prompts=None, **kwargs):
     examples = examples if examples is not None else [{"index": 0}, {"index": 1}]
     if env_prompts is None:
@@ -5150,29 +5262,414 @@ def test_bridge_start_passes_the_index_aligned_prepared_prompt_into_state_creati
     assert state["messages"] == prepared_prompt
 
 
+def test_bridge_accepts_child_string_for_frozen_singleton_text_block_without_replacing_it():
+    class _RecordingEnv(_BridgeEnv):
+        def __init__(self):
+            super().__init__()
+            self.starts = []
+
+        def new_rollout_state(self, example, prepared_prompt):
+            self.starts.append((example, prepared_prompt))
+            return super().new_rollout_state(example, prepared_prompt)
+
+    env = _RecordingEnv()
+    frozen_prompt = [{"role": "user", "content": [{"type": "text", "text": "prepared"}]}]
+    bridge = _bridge(env, examples=[{"index": 0}], env_prompts=[frozen_prompt])
+
+    bridge.start(
+        {
+            "index": 0,
+            "session_id": "a",
+            "raw_prompt": [{"role": "user", "content": "prepared"}],
+            "image_count": 0,
+            "image_digests": [],
+        }
+    )
+
+    expected_prompt = bridge._env_prompts[0]
+    assert env.starts[0][1] is expected_prompt, "the child string replaced the frozen env prompt"
+    assert expected_prompt[0]["content"] == [{"type": "text", "text": "prepared"}]
+    assert bridge._sessions["a"]["state"]["prompt"] == expected_prompt
+    assert bridge._sessions["a"]["messages"] == expected_prompt
+
+
 @pytest.mark.parametrize(
-    "content",
+    ("text_blocks", "child_text"),
     [
-        [{"type": "image", "image_url": "x"}],
-        [{"type": "image_url", "image_url": "x"}],
-        [{"type": "input_image", "image_url": "x"}],
-        [
-            {"type": "text", "text": "what changed?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ],
+        ([{"type": "text", "text": "first"}, {"type": "text", "text": " second"}], "first second"),
+        ([{"type": "text", "text": ""}], ""),
     ],
-    ids=["image", "image-url", "input-image", "mixed-text-image"],
 )
-def test_bridge_refuses_every_image_reply_shape(content):
-    # every image spelling and a mixed text/image reply must fail rather than reach the child as text.
+def test_bridge_authentication_joins_consecutive_text_blocks_like_the_chat_template(
+    text_blocks, child_text
+):
+    frozen_prompt = [{"role": "user", "content": text_blocks}]
+    child_prompt = [{"role": "user", "content": child_text}]
+    tokenizer = _BridgeGlueTokenizer()
+    assert tokenizer.apply_chat_template(frozen_prompt) == tokenizer.apply_chat_template(
+        child_prompt
+    )
+
+    bridge = _bridge(
+        _BridgeEnv(), examples=[{"index": 0}], env_prompts=[frozen_prompt], tokenizer=tokenizer
+    )
+    bridge.start(
+        {
+            "index": 0,
+            "session_id": "a",
+            "raw_prompt": child_prompt,
+            "image_count": 0,
+            "image_digests": [],
+        }
+    )
+    assert bridge.open_sessions() == 1
+
+
+def test_bridge_authentication_rejects_changed_text_after_text_block_concatenation():
+    from flash.engine.worker.train.rl.multi_turn import _BadRequest
+
+    bridge = _bridge(
+        _BridgeEnv(),
+        examples=[{"index": 0}],
+        env_prompts=[
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first"},
+                        {"type": "text", "text": " second"},
+                    ],
+                }
+            ]
+        ],
+    )
+    with pytest.raises(_BadRequest, match="does not match the frozen environment prompt"):
+        bridge.start(
+            {
+                "index": 0,
+                "session_id": "a",
+                "raw_prompt": [{"role": "user", "content": "first  second"}],
+                "image_count": 0,
+                "image_digests": [],
+            }
+        )
+    assert bridge.open_sessions() == 0
+
+
+def test_bridge_authentication_rejects_image_placement_and_media_digest_sabotage():
+    from flash.engine.worker.train.rl.multi_turn import (
+        _authentication_prompts_equal,
+        _BadRequest,
+    )
+
+    exact_blocks = [
+        {
+            "role": "user",
+            "metadata": {"source": "parent"},
+            "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image", "image": "image-a"},
+                {"type": "video", "video": "video-a"},
+            ],
+        }
+    ]
+    for sabotage in (
+        [{**exact_blocks[0], "role": "assistant"}],
+        [{**exact_blocks[0], "metadata": {"source": "child"}}],
+        [
+            {
+                **exact_blocks[0],
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image", "image": "image-b"},
+                    {"type": "video", "video": "video-a"},
+                ],
+            }
+        ],
+        [
+            {
+                **exact_blocks[0],
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image", "image": "image-a"},
+                    {"type": "video", "video": "video-b"},
+                ],
+            }
+        ],
+    ):
+        assert not _authentication_prompts_equal(exact_blocks, sabotage)
+
+    image, descriptor = _bridge_image()
+    tokenizer = _BridgeGlueTokenizer()
+    processor = _BridgeGlueProcessor(tokenizer)
+    frozen_prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image"},
+                {"type": "text", "text": "after"},
+            ],
+        }
+    ]
+    child_prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image", "image": "/tmp/image.png"},
+                {"type": "text", "text": "after"},
+            ],
+        }
+    ]
+    bridge = _bridge(
+        _BridgeEnv(),
+        examples=[{"index": 0}],
+        env_prompts=[frozen_prompt],
+        prompt_descriptors=[[descriptor]],
+        processor=processor,
+        tokenizer=tokenizer,
+    )
+    correct_digests = list(bridge._prompt_digests[0])
+    sabotages = [
+        {
+            "raw_prompt": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": "/tmp/image.png"},
+                        {"type": "text", "text": "beforeafter"},
+                    ],
+                }
+            ],
+            "image_count": 1,
+            "image_digests": correct_digests,
+        },
+        {
+            "raw_prompt": [{"role": "user", "content": "beforeafter"}],
+            "image_count": 1,
+            "image_digests": correct_digests,
+        },
+        {
+            "raw_prompt": child_prompt,
+            "image_count": 1,
+            "image_digests": ["changed-image-content"],
+        },
+    ]
+    try:
+        for index, sabotage in enumerate(sabotages):
+            with pytest.raises(_BadRequest):
+                bridge.start({"index": 0, "session_id": f"s{index}", **sabotage})
+        assert bridge.open_sessions() == 0
+    finally:
+        image.close()
+
+
+def test_image_observation_prompt_without_initial_images_authenticates_through_verl_row():
+    from flash.engine.worker.train.rl import inputs as rl_inputs
+
+    class _ImageObservationEnv(_BridgeEnv):
+        image_observations = True
+
+    env = _ImageObservationEnv()
+    example = {"index": 0}
+    source_prompt = [{"role": "user", "content": "question"}]
+    processor = _CapabilityProcessor()
+    prompts = rl_inputs._build_grpo_prompts(
+        [example], [source_prompt], True, processor, processor.tokenizer, None, 32
+    )
+    prepared = prompts[0]
+    rows = rl_train.build_verl_dataset_rows(
+        [prepared["prompt"]], [0], [""], image_uris=[prepared["images"]]
+    )
+
+    assert prepared["env_prompt"][0]["content"] == [{"type": "text", "text": "question"}]
+    assert rows[0]["prompt"] == [{"role": "user", "content": "question"}]
+    assert rows[0]["images"] == []
+
+    bridge = _bridge(
+        env,
+        examples=[example],
+        env_prompts=[prepared["env_prompt"]],
+        prompt_ids=[prepared["prompt_ids"]],
+        prompt_descriptors=[prepared["images"]],
+        processor=processor,
+        tokenizer=processor.tokenizer,
+    )
+    bridge.start(
+        {
+            "index": 0,
+            "session_id": "a",
+            "raw_prompt": rows[0]["prompt"],
+            "prompt_ids": prepared["prompt_ids"],
+            "image_count": 0,
+            "image_digests": [],
+        }
+    )
+    assert bridge._sessions["a"]["state"]["prompt"] == prepared["env_prompt"]
+
+
+@pytest.mark.parametrize("shape", ["image", "image_url", "input_image", "mixed"])
+def test_bridge_normalizes_and_authenticates_every_supported_image_reply_shape(shape):
+    from flash.content.multimodal import image_descriptors_to_data_uris
+
+    image, descriptor = _bridge_image()
+    data_uri = image_descriptors_to_data_uris([descriptor], None)[0]
+    blocks = {
+        "image": [{"type": "image", "image": data_uri}],
+        "image_url": [{"type": "image_url", "image_url": {"url": data_uri}}],
+        "input_image": [{"type": "input_image", "input_image": data_uri}],
+        "mixed": [
+            {"type": "text", "text": "what changed?"},
+            {"type": "image_url", "image_url": {"url": data_uri}},
+        ],
+    }[shape]
     env = _BridgeEnv(
-        replies=[{"role": "user", "content": content}],
+        replies=[{"role": "user", "content": blocks}],
         done_after=99,
     )
-    bridge = _bridge(env)
-    bridge.start({"index": 0, "session_id": "a"})
-    with pytest.raises(ValueError, match="image block"):
-        bridge.step({"session_id": "a", "completion_text": "answer"})
+    tokenizer = _BridgeGlueTokenizer()
+    processor = _BridgeGlueProcessor(tokenizer)
+    bridge = _bridge(
+        env,
+        examples=[{"index": 0}],
+        env_prompts=[[{"role": "user", "content": "go"}]],
+        prompt_ids=[[1]],
+        processor=processor,
+        tokenizer=tokenizer,
+    )
+    routes = bridge.routes()
+    assert routes["/multiturn/start"](
+        {
+            "index": 0,
+            "session_id": "a",
+            "raw_prompt": [{"role": "user", "content": "go"}],
+            "prompt_ids": [1],
+            "image_count": 0,
+            "image_digests": [],
+        }
+    ) == {"max_turns": 4}
+    out = routes["/multiturn/step"](
+        {
+            "session_id": "a",
+            "turn_ordinal": 0,
+            "accepted_prefix": [1],
+            "response_ids": [2],
+            "completion_text": "answer",
+            "image_count": 0,
+            "image_digests": [],
+        }
+    )
+
+    assert out["messages"][0]["content"][-1] == {"type": "image"}
+    assert out["image_data_uris"] == [data_uri]
+    assert out["image_count"] == 1
+    assert out["image_digests"] == bridge._sessions["a"]["image_digests"]
+    assert processor.image_counts == [1]
+    image.close()
+
+
+def test_bridge_rejects_a_fifth_image_before_processor_glue_or_another_generation():
+    from flash.content.multimodal import image_descriptors_to_data_uris
+    from flash.engine.worker.train.core.child.glue import parent_image_digests
+
+    source_images_and_descriptors = [
+        _bridge_image(color) for color in ("red", "green", "blue", "yellow", "black")
+    ]
+    source_images = [item[0] for item in source_images_and_descriptors]
+    descriptors = [item[1] for item in source_images_and_descriptors]
+    data_uris = [
+        image_descriptors_to_data_uris([descriptor], None)[0] for descriptor in descriptors
+    ]
+    prompt = [
+        {
+            "role": "user",
+            "content": [{"type": "image", "image": uri} for uri in data_uris[:4]],
+        }
+    ]
+    env = _BridgeEnv(
+        replies=[{"role": "user", "content": [{"type": "image", "image": data_uris[4]}]}],
+        done_after=99,
+    )
+    tokenizer = _BridgeGlueTokenizer()
+    processor = _BridgeGlueProcessor(tokenizer)
+    bridge = _bridge(
+        env,
+        examples=[{"index": 0}],
+        env_prompts=[prompt],
+        prompt_ids=[[1]],
+        prompt_descriptors=[descriptors[:4]],
+        processor=processor,
+        tokenizer=tokenizer,
+    )
+    routes = bridge.routes()
+    digests = parent_image_digests(processor, descriptors[:4], None)
+    routes["/multiturn/start"](
+        {
+            "index": 0,
+            "session_id": "a",
+            "raw_prompt": prompt,
+            "prompt_ids": [1],
+            "image_count": 4,
+            "image_digests": digests,
+        }
+    )
+    with pytest.raises(ValueError, match="4-image limit"):
+        routes["/multiturn/step"](
+            {
+                "session_id": "a",
+                "turn_ordinal": 0,
+                "accepted_prefix": [1],
+                "response_ids": [2],
+                "completion_text": "answer",
+                "image_count": 4,
+                "image_digests": digests,
+            }
+        )
+    assert processor.image_counts == []
+    for image in source_images:
+        image.close()
+
+
+def test_bridge_rejects_prefix_and_media_sabotage_before_recording_the_turn():
+    from flash.engine.worker.train.rl.multi_turn import _BadRequest
+
+    env = _BridgeEnv(done_after=99)
+    tokenizer = _BridgeGlueTokenizer()
+    bridge = _bridge(
+        env,
+        examples=[{"index": 0}],
+        env_prompts=[[{"role": "user", "content": "go"}]],
+        prompt_ids=[[1]],
+        tokenizer=tokenizer,
+    )
+    routes = bridge.routes()
+    routes["/multiturn/start"](
+        {
+            "index": 0,
+            "session_id": "a",
+            "raw_prompt": [{"role": "user", "content": "go"}],
+            "prompt_ids": [1],
+            "image_count": 0,
+            "image_digests": [],
+        }
+    )
+    base = {
+        "session_id": "a",
+        "turn_ordinal": 0,
+        "accepted_prefix": [1],
+        "response_ids": [2],
+        "completion_text": "answer",
+        "image_count": 0,
+        "image_digests": [],
+    }
+    for changed, message in (
+        ({"accepted_prefix": [9]}, "authenticated environment context"),
+        ({"image_count": 1, "image_digests": ["wrong"]}, "authenticated context"),
+    ):
+        with pytest.raises(_BadRequest, match=message):
+            routes["/multiturn/step"]({**base, **changed})
+    assert env.recorded == []
 
 
 @pytest.mark.parametrize("block_type", ["video", "audio", "tool_use", "input_file"])
@@ -5191,7 +5688,7 @@ def test_bridge_refuses_a_non_text_reply_block_instead_of_dropping_it(block_type
     )
     bridge = _bridge(env)
     bridge.start({"index": 0, "session_id": "a"})
-    with pytest.raises(ValueError, match="unsupported type"):
+    with pytest.raises(ValueError, match="unsupported content block type"):
         bridge.step({"session_id": "a", "completion_text": "answer"})
 
 
@@ -5203,7 +5700,7 @@ def test_bridge_refuses_a_malformed_text_block_rather_than_flattening_it_to_noth
     )
     bridge = _bridge(env)
     bridge.start({"index": 0, "session_id": "a"})
-    with pytest.raises(ValueError, match="missing its text"):
+    with pytest.raises(ValueError, match="missing text"):
         bridge.step({"session_id": "a", "completion_text": "answer"})
 
 
@@ -5211,7 +5708,7 @@ def test_bridge_refuses_a_non_object_reply_block():
     env = _BridgeEnv(replies=[{"role": "user", "content": ["plain string"]}], done_after=99)
     bridge = _bridge(env)
     bridge.start({"index": 0, "session_id": "a"})
-    with pytest.raises(ValueError, match="must be an object"):
+    with pytest.raises(ValueError, match="expected an object"):
         bridge.step({"session_id": "a", "completion_text": "answer"})
 
 
@@ -5349,16 +5846,22 @@ def test_bridge_step_does_not_validate_a_terminal_reply_the_child_never_reads():
     assert env.replies[0] in env.last_state["messages"]
 
 
-def test_bridge_step_still_refuses_a_non_terminal_image_reply():
-    # the terminal exemption above must not weaken the live path: a mid-episode image still cannot
-    # reach the engine, so it stays a loud failure rather than a silently dropped turn.
+def test_bridge_step_still_refuses_a_remote_non_terminal_image_reply():
+    # dynamic image support must not weaken the package-local source boundary.
     env = _BridgeEnv(
         done_after=9,
-        replies=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}],
+        replies=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.invalid/x.png"}}
+                ],
+            }
+        ],
     )
     bridge = _bridge(env)
     bridge.start({"index": 0, "session_id": "a"})
-    with pytest.raises(ValueError, match="image block"):
+    with pytest.raises(ValueError, match="remote image URLs are not supported"):
         bridge.step({"session_id": "a", "completion_text": "first"})
 
 
@@ -5852,7 +6355,7 @@ def test_bridge_routes_are_served_alongside_single_turn_scoring():
     # it. mounting the bridge on its own server would leave the child's reward path pointing at a
     # port that only answers episodes.
     env = _BridgeEnv()
-    bridge = _bridge(env)
+    bridge = _bridge(env, tokenizer=_BridgeGlueTokenizer())
     server, url = rl_train.start_reward_server(
         lambda index, text: 1.0, example_count=2, multi_turn_bridge=bridge
     )
@@ -5868,8 +6371,29 @@ def test_bridge_routes_are_served_alongside_single_turn_scoring():
                 return json.loads(response.read().decode())
 
         assert _post("/score", {"index": 0, "solution_str": "x"}) == {"score": 1.0}
-        assert _post("/multiturn/start", {"index": 0, "session_id": "a"}) == {"max_turns": 4}
-        _post("/multiturn/step", {"session_id": "a", "completion_text": "answer"})
+        assert _post(
+            "/multiturn/start",
+            {
+                "index": 0,
+                "session_id": "a",
+                "raw_prompt": [],
+                "prompt_ids": [],
+                "image_count": 0,
+                "image_digests": [],
+            },
+        ) == {"max_turns": 4}
+        _post(
+            "/multiturn/step",
+            {
+                "session_id": "a",
+                "turn_ordinal": 0,
+                "accepted_prefix": [],
+                "response_ids": [1],
+                "completion_text": "answer",
+                "image_count": 0,
+                "image_digests": [],
+            },
+        )
         assert _post("/multiturn/score", {"session_id": "a", "turn_count": 1}) == {"score": 1.0}
         assert _post("/multiturn/close", {"session_id": "a"}) == {"closed": True}
     finally:
@@ -5883,14 +6407,16 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
     # guard around it, not how the formatter wrapped the call.
     src = " ".join(inspect.getsource(rl_train._start_reward_runtime).split())
     assert src.count("MultiTurnBridge(") == 1
-    assert (
-        "MultiTurnBridge( env, rollout_examples, "
-        "# index-aligned with rollout_examples: build_grpo_prompt_dataset preserves order. "
-        'env_prompts=[p["env_prompt"] for p in prompts], max_turns=int(inp["max_turns"]), '
-        'per_turn_credit=bool(inp["per_turn_credit"]), '
-        "on_episode_scored=observability.record, "
-        "parent_work=observability.parent_work, )" in src
-    )
+    for fragment in (
+        'env_prompts=[p["env_prompt"] for p in prompts]',
+        'prompt_ids=[p["prompt_ids"] for p in prompts]',
+        'prompt_descriptors=[p.get("images", ()) for p in prompts]',
+        'processor=inp["processor"]',
+        "tokenizer=tok",
+        'per_turn_credit=bool(inp["per_turn_credit"])',
+        "on_episode_scored=observability.record",
+    ):
+        assert fragment in src
     assert 'if inp["multi_turn"] else None' in src
 
 
@@ -6967,6 +7493,7 @@ def _drive_multi_turn_episode(
     multi_modal_data=None,
     return_instance=False,
     raw_prompt=None,
+    prompt_descriptors=None,
 ):
     """run the real child loop end to end against a real bridge, returning its agent loop output.
 
@@ -6983,13 +7510,9 @@ def _drive_multi_turn_episode(
     # span accounting, and a cap that clipped a turn would change what they are measuring.
     monkeypatch.setenv("FLASH_VERL_MAX_COMPLETION_TOKENS", "4096")
 
-    bridge = _bridge(
-        env, examples=[{"question": "q"}], max_turns=max_turns, per_turn_credit=per_turn_credit
+    prepared_raw_prompt = (
+        raw_prompt if raw_prompt is not None else [{"role": "user", "content": "go"}]
     )
-    routes = bridge.routes()
-
-    def bridge_post(url, path, payload):
-        return routes[path](payload)
 
     class _Tokenizer:
         """one codepoint per token, so spans are readable straight off response_ids."""
@@ -7004,13 +7527,42 @@ def _drive_multi_turn_episode(
             return [ord(c) for c in text]
 
         def apply_chat_template(self, messages, **kwargs):
-            return "".join(str(m.get("content") or "") for m in messages)
+            rendered = []
+            for message in messages:
+                content = message.get("content")
+                if isinstance(content, str):
+                    rendered.append(content)
+                    continue
+                rendered.extend(
+                    "<image>" if block["type"] == "image" else block["text"]
+                    for block in content or ()
+                )
+            return "".join(rendered)
+
+    tokenizer = _Tokenizer()
+    processor = _BridgeGlueProcessor(tokenizer)
+    bridge = _bridge(
+        env,
+        examples=[{"question": "q"}],
+        env_prompts=[prepared_raw_prompt],
+        max_turns=max_turns,
+        prompt_ids=[[1, 2, 3]],
+        prompt_descriptors=[list(prompt_descriptors or ())],
+        processor=processor,
+        tokenizer=tokenizer,
+        per_turn_credit=per_turn_credit,
+    )
+    routes = bridge.routes()
+
+    def bridge_post(url, path, payload):
+        return routes[path](payload)
 
     class _Base:
         """mirrors the parts of verl's AgentLoopBase the loop actually calls."""
 
         def __init__(self):
-            self.tokenizer = _Tokenizer()
+            self.tokenizer = tokenizer
+            self.processor = processor
             self.rollout_config = SimpleNamespace(response_length=256)
             self.server_manager = self
             self._sent = list(stop_reasons)
@@ -7026,6 +7578,23 @@ def _drive_multi_turn_episode(
             # a loop that flattened the prompt to text before extracting would arrive here with
             # nothing left to find, and the images would be silently gone.
             self.mm_info_contents = [message.get("content") for message in messages]
+            data_uris = [
+                block["image"]
+                for message in messages
+                if isinstance(message.get("content"), list)
+                for block in message["content"]
+                if block.get("type") == "image"
+                and isinstance(block.get("image"), str)
+                and block["image"].startswith("data:image/")
+            ]
+            if data_uris:
+                from flash.content.multimodal import (
+                    decode_image_descriptors,
+                    normalize_image_source,
+                )
+
+                descriptors = [normalize_image_source(uri, None) for uri in data_uris]
+                return {"images": decode_image_descriptors(descriptors, None)}
             return dict(multi_modal_data or {})
 
         async def apply_chat_template(self, messages, **kwargs):
@@ -7118,12 +7687,14 @@ def test_an_image_prompt_reaches_media_extraction_and_the_rollout(monkeypatch):
     # those blocks before the model-facing transcript is flattened, and the decoded pixels must stay
     # attached to the emitted episode for training.
     env = _SpanEnv()
+    image, descriptor = _bridge_image()
     out, instance = _drive_multi_turn_episode(
         stop_reasons=[("ab", "completed")],
         env=env,
         monkeypatch=monkeypatch,
         max_turns=1,
-        multi_modal_data={"images": ["PIXELS"]},
+        multi_modal_data={"images": [image]},
+        prompt_descriptors=[descriptor],
         return_instance=True,
         raw_prompt=[
             {
@@ -7136,13 +7707,14 @@ def test_an_image_prompt_reaches_media_extraction_and_the_rollout(monkeypatch):
         ],
     )
 
-    assert out["multi_modal_data"] == {"images": ["PIXELS"]}
+    assert out["multi_modal_data"] == {"images": [image]}
     assert env.recorded == ["ab"]
     contents = instance.mm_info_contents
     assert isinstance(contents[0], list), (
         "media extraction was handed flattened text; the images are already gone by this point"
     )
     assert {"type": "image", "image": "/tmp/x.png"} in contents[0]
+    image.close()
 
 
 def test_a_truncated_final_turn_still_earns_per_turn_credit_for_the_turns_before_it(monkeypatch):
@@ -7192,12 +7764,24 @@ def test_multi_turn_rollout_carries_the_prompts_images_into_every_turn(monkeypat
     # the training pass re-tokenizes the episode through the processor, so the output has to carry
     # the media too.
     env = _SpanEnv()
-    sentinel = ["<pil-image>"]
+    image, descriptor = _bridge_image()
+    sentinel = [image]
+    raw_prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "/tmp/x.png"},
+                {"type": "text", "text": "describe it"},
+            ],
+        }
+    ]
     out, instance = _drive_multi_turn_episode(
         stop_reasons=[("ab", "completed")] * 4,
         env=env,
         monkeypatch=monkeypatch,
         multi_modal_data={"images": sentinel},
+        raw_prompt=raw_prompt,
+        prompt_descriptors=[descriptor],
         return_instance=True,
     )
     assert instance.generate_media == [sentinel] * 4, (
@@ -7206,6 +7790,77 @@ def test_multi_turn_rollout_carries_the_prompts_images_into_every_turn(monkeypat
     assert out["multi_modal_data"] == {"images": sentinel}, (
         "the episode was emitted without the media the training pass re-tokenizes against"
     )
+    image.close()
+
+
+def test_dynamic_images_are_cumulative_ordered_masked_and_snapshotted(monkeypatch):
+    from flash.content.multimodal import image_descriptors_to_data_uris
+    from flash.engine.worker.train.core.child.glue import (
+        parent_image_digests,
+        processor_image_digests,
+    )
+
+    source_images_and_descriptors = [_bridge_image(color) for color in ("red", "green", "blue")]
+    source_images = [item[0] for item in source_images_and_descriptors]
+    descriptors = [item[1] for item in source_images_and_descriptors]
+    data_uris = image_descriptors_to_data_uris(descriptors, None)
+
+    class _DynamicImageEnv(_SpanEnv):
+        def env_reply(self, messages, state):
+            reply_index = len(self.recorded) - 1
+            reply = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"observation {reply_index}"},
+                        {"type": "image", "image": data_uris[reply_index]},
+                    ],
+                }
+            ]
+            state["messages"].extend(reply)
+            return reply
+
+        def rollout_done(self, state, max_turns=None):
+            return len(self.recorded) >= 4
+
+    env = _DynamicImageEnv()
+    out, instance = _drive_multi_turn_episode(
+        stop_reasons=[("ab", "completed")] * 4,
+        env=env,
+        monkeypatch=monkeypatch,
+        return_instance=True,
+    )
+
+    assert [None if images is None else len(images) for images in instance.generate_media] == [
+        None,
+        1,
+        2,
+        3,
+    ]
+    output_images = out["multi_modal_data"]["images"]
+    assert processor_image_digests(instance.processor, output_images) == parent_image_digests(
+        instance.processor, descriptors, None
+    )
+    generated_text = "".join(
+        chr(token_id)
+        for token_id, included in zip(out["response_ids"], out["response_mask"], strict=True)
+        if included
+    )
+    environment_text = "".join(
+        chr(token_id)
+        for token_id, included in zip(out["response_ids"], out["response_mask"], strict=True)
+        if not included
+    )
+    assert generated_text == "abababab"
+    assert environment_text.count("<image>") == 3
+    assert all(
+        len(snapshot) == index for index, snapshot in enumerate(instance.generate_media[1:], 1)
+    )
+
+    for image in output_images:
+        image.close()
+    for image in source_images:
+        image.close()
 
 
 def test_a_text_only_multi_turn_rollout_sends_no_media(monkeypatch):

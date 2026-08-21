@@ -10,6 +10,7 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -19,9 +20,15 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler
 
-from flash.content.multimodal import content_has_images, message_content_text
+from flash.content.multimodal import normalize_environment_reply
 from flash.engine.worker.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.score_batcher import ScoreBatcher
+from flash.engine.worker.train.core.child.glue import (
+    dedup_seam_terminator,
+    parent_environment_glue,
+    parent_image_digests,
+    validate_structured_messages,
+)
 from flash.engine.worker.train.rl.scoring import RolloutScoreRequest, score_rollouts
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
@@ -109,71 +116,48 @@ def request_session_id(payload: dict) -> str:
     return str(_request_field(payload, "session_id"))
 
 
+def _authentication_prompts_equal(expected: list[dict], actual: list[dict]) -> bool:
+    """compare prompts after only the text concatenation performed by chat templates."""
+
+    def content_parts(content) -> list[tuple[str, object]]:
+        if isinstance(content, str):
+            return [("text", content)] if content else []
+        parts: list[tuple[str, object]] = []
+        text_parts: list[str] = []
+        for block in content:
+            if block.get("type") == "text":
+                text_parts.append(block["text"])
+                continue
+            text = "".join(text_parts)
+            if text:
+                parts.append(("text", text))
+            text_parts = []
+            parts.append(("block", block))
+        text = "".join(text_parts)
+        if text:
+            parts.append(("text", text))
+        return parts
+
+    if len(expected) != len(actual):
+        return False
+    for expected_message, actual_message in zip(expected, actual, strict=True):
+        expected_metadata = {
+            key: value for key, value in expected_message.items() if key != "content"
+        }
+        actual_metadata = {key: value for key, value in actual_message.items() if key != "content"}
+        if expected_metadata != actual_metadata:
+            return False
+        if content_parts(expected_message["content"]) != content_parts(actual_message["content"]):
+            return False
+    return True
+
+
 # ONLY the bridge's own deliberate rejections are client errors. classifying by exception TYPE
 # instead cannot work: a user env raising IndexError/KeyError deep inside its own scoring would be
 # reported as a malformed request -- the same "blame the caller for this side's failure" bug this
 # module's 503 split exists to fix, one layer down. so the rejecting code raises _BadRequest itself
 # and anything else reaching the handler is this side failing to serve a well-formed request.
 _BAD_REQUEST_ERRORS = (_BadRequest,)
-
-
-def _reject_unrepresentable_reply_blocks(content: list) -> None:
-    """Refuse every reply block this transcript cannot carry, not just the image ones.
-
-    ``message_content_text`` keeps ``type == "text"`` blocks and joins them, which means any OTHER
-    block -- video, audio, a tool-use payload, a type this code has never heard of -- contributes
-    nothing and vanishes without a trace. that is the same silent corruption as the stringified
-    image: the environment intended the model to see something, the model never saw it, and every
-    metric still reports a healthy run. so the flattening below is only allowed to run once the
-    content is known to be text and nothing but text.
-    """
-    for position, block in enumerate(content):
-        if not isinstance(block, dict):
-            raise _BadEnvReply(
-                f"environment reply content block {position} must be an object, not "
-                f"{type(block).__name__}"
-            )
-        block_type = block.get("type")
-        if block_type != "text":
-            raise _BadEnvReply(
-                f"environment reply content block {position} has unsupported type {block_type!r}; "
-                "a multi-turn GRPO environment reply can carry text blocks only"
-            )
-        if not isinstance(block.get("text"), str):
-            raise _BadEnvReply(f"environment reply text block {position} is missing its text")
-
-
-def _env_reply_message(message: dict) -> dict:
-    """one environment reply message, as the role/content text the child transcript can carry.
-
-    the adapter lets an environment return arbitrary message dicts from ``step_episode``, so a reply
-    may carry openai-style content BLOCKS rather than a string. ``str()`` on a block list does not
-    fail -- it produces the python repr, and the model then reads a literal
-    ``[{'type': 'image_url', ...}]`` as its prompt text while every metric reports a healthy run.
-
-    a block the transcript cannot represent is refused outright instead. the media a rollout
-    conditions on is fixed from the initial prompt (see ``_EpisodePrompt``), so a mid-episode image
-    cannot reach the engine no matter what this returns; stringifying it would train on the repr of
-    a dropped image, and dropping it would train on a turn the environment never wrote. refusing is
-    the interim contract until per-turn media is threaded into the rollout, and it is LOUD -- the
-    bridge turns a raise into a 400 that fails the episode -- because silence is the actual defect.
-    """
-    content = message.get("content")
-    if isinstance(content, list):
-        # images get their own message ahead of the generic guard: it is the one unsupported block
-        # with an action attached, so saying which one it is beats naming the type alone.
-        if content_has_images(content):
-            raise _BadEnvReply(
-                "environment reply carries an image block; multi-turn GRPO conditions every turn on "
-                "the media from the INITIAL prompt, so an image returned by step_episode cannot "
-                "reach the model. return text, or put the image in the initial prompt"
-            )
-        _reject_unrepresentable_reply_blocks(content)
-        # text-only blocks are a shape this transcript CAN represent exactly, so flatten them
-        # through the same definition of "the text of a message" the graders and reward path use.
-        return {"role": str(message.get("role", "")), "content": message_content_text(content)}
-    # unchanged for every non-block reply, which is what every existing multi-turn env returns.
-    return {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
 
 
 # size the listen backlog for the full prompts_per_step * group_size connection burst.
@@ -202,6 +186,12 @@ class MultiTurnBridge:
         *,
         env_prompts: list[list[dict]],
         max_turns: int,
+        prompt_ids: list[list[int]] | None = None,
+        prompt_descriptors: list[list[str] | tuple[str, ...]] | None = None,
+        package_root: str | None = None,
+        processor=None,
+        tokenizer=None,
+        thinking: bool = False,
         per_turn_credit: bool = False,
         on_episode_scored: Callable[[object, object, float], None] | None = None,
         parent_work: ParentWorkGauge | None = None,
@@ -211,9 +201,31 @@ class MultiTurnBridge:
     ) -> None:
         if len(env_prompts) != len(examples):
             raise ValueError("multi-turn env prompts must align one-to-one with examples")
+        if prompt_ids is not None and len(prompt_ids) != len(examples):
+            raise ValueError("multi-turn prompt ids must align one-to-one with examples")
+        prompt_descriptors = prompt_descriptors or [()] * len(examples)
+        if len(prompt_descriptors) != len(examples):
+            raise ValueError("multi-turn image descriptors must align one-to-one with examples")
         self._env = env
         self._examples = examples
-        self._env_prompts = env_prompts
+        self._env_prompts = [
+            validate_structured_messages(messages, source="frozen environment prompt")
+            for messages in env_prompts
+        ]
+        self._prompt_ids = (
+            None
+            if prompt_ids is None
+            else [tuple(int(token_id) for token_id in ids) for ids in prompt_ids]
+        )
+        self._prompt_descriptors = [tuple(values) for values in prompt_descriptors]
+        self._processor = processor
+        self._prompt_digests = [
+            tuple(parent_image_digests(processor, values, package_root))
+            for values in self._prompt_descriptors
+        ]
+        self._package_root = package_root
+        self._tokenizer = tokenizer
+        self._thinking = bool(thinking)
         self._max_turns = int(max_turns)
         self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
@@ -239,9 +251,25 @@ class MultiTurnBridge:
         )
 
     def routes(self) -> dict:
+        def start(payload: dict) -> dict:
+            for key in ("raw_prompt", "prompt_ids", "image_count", "image_digests"):
+                _request_field(payload, key)
+            return self.start(payload)
+
+        def step(payload: dict) -> dict:
+            for key in (
+                "turn_ordinal",
+                "accepted_prefix",
+                "response_ids",
+                "image_count",
+                "image_digests",
+            ):
+                _request_field(payload, key)
+            return self.step(payload)
+
         return {
-            "/multiturn/start": self.start,
-            "/multiturn/step": self.step,
+            "/multiturn/start": start,
+            "/multiturn/step": step,
             "/multiturn/score": self.score,
             "/multiturn/close": self.close,
         }
@@ -279,6 +307,18 @@ class MultiTurnBridge:
         with self._parent_work.busy():
             return getattr(self._env, method)(*args)
 
+    @staticmethod
+    def _payload_media_identity(payload: dict, *, required: bool) -> tuple[int, tuple[str, ...]]:
+        if not required and "image_count" not in payload and "image_digests" not in payload:
+            return 0, ()
+        image_count = request_int(payload, "image_count")
+        digests = _request_field(payload, "image_digests")
+        if not isinstance(digests, list) or any(not isinstance(value, str) for value in digests):
+            raise _BadRequest("field 'image_digests' must be a list of strings")
+        if image_count != len(digests):
+            raise _BadRequest("image count does not match ordered media digests")
+        return image_count, tuple(digests)
+
     def start(self, payload: dict) -> dict:
         index = request_int(payload, "index")
         if index < 0 or index >= len(self._examples):
@@ -287,6 +327,26 @@ class MultiTurnBridge:
             )
         session_id = request_session_id(payload)
         example = self._examples[index]
+        expected_prompt = self._env_prompts[index]
+        expected_digests = self._prompt_digests[index]
+        if "raw_prompt" in payload:
+            raw_prompt = validate_structured_messages(
+                payload["raw_prompt"], source="child initial prompt"
+            )
+            if not _authentication_prompts_equal(expected_prompt, raw_prompt):
+                raise _BadRequest(
+                    "multi-turn child prompt does not match the frozen environment prompt"
+                )
+        image_count, image_digests = self._payload_media_identity(
+            payload, required="raw_prompt" in payload
+        )
+        if image_count != len(expected_digests) or image_digests != expected_digests:
+            raise _BadRequest("multi-turn child media does not match the frozen environment prompt")
+        prompt_ids = [int(token_id) for token_id in payload.get("prompt_ids", [])]
+        if self._prompt_ids is not None and tuple(prompt_ids) != self._prompt_ids[index]:
+            raise _BadRequest(
+                "multi-turn child prompt ids do not match the frozen processor prompt"
+            )
         with self._lock:
             # swept here rather than on a timer thread: a session is only ever abandoned by an
             # actor that stopped calling, and the actors that replace it announce themselves
@@ -294,10 +354,16 @@ class MultiTurnBridge:
             reaped = self._reap_abandoned_sessions()
             if session_id in self._sessions:
                 raise _BadSession(f"duplicate multi-turn session {session_id}")
-            state = self._env_call("new_rollout_state", example, self._env_prompts[index])
+            state = self._env_call("new_rollout_state", example, expected_prompt)
             self._sessions[session_id] = {
                 "example": example,
                 "state": state,
+                "messages": copy.deepcopy(expected_prompt),
+                "descriptors": list(self._prompt_descriptors[index]),
+                "image_digests": list(expected_digests),
+                "required_prefix": prompt_ids,
+                "next_turn": 0,
+                "turns": [],
                 "touched_at": time.monotonic(),
             }
         if reaped:
@@ -313,40 +379,130 @@ class MultiTurnBridge:
         turns = self._max_turns if episode_turns is None else int(episode_turns)
         return {"max_turns": max(1, min(self._max_turns, turns))}
 
+    @staticmethod
+    def _step_response(
+        session: dict,
+        *,
+        terminal: bool,
+        messages: list[dict],
+        image_data_uris: tuple[str, ...] = (),
+        authenticated: bool,
+    ) -> dict:
+        response = {"terminal": terminal, "messages": messages}
+        if authenticated:
+            response.update(
+                {
+                    "image_data_uris": list(image_data_uris),
+                    "image_count": len(session["image_digests"]),
+                    "image_digests": list(session["image_digests"]),
+                }
+            )
+        return response
+
     def step(self, payload: dict) -> dict:
         with self._lock:
             session = self._session(payload)
             state = session["state"]
-            # an unusable turn is terminal and must NOT be shown to the env: recording it would
-            # append a truncated or empty assistant message to the transcript that gets scored.
-            # the child stops on the same condition, so this only decides what the env sees.
+            turn_ordinal = int(payload.get("turn_ordinal", session["next_turn"]))
+            if turn_ordinal != session["next_turn"]:
+                raise _BadRequest(
+                    f"multi-turn rollout expected turn {session['next_turn']}, got {turn_ordinal}"
+                )
+            authenticated = "accepted_prefix" in payload
+            accepted_prefix = [
+                int(token_id)
+                for token_id in payload.get("accepted_prefix", session["required_prefix"])
+            ]
+            if accepted_prefix != session["required_prefix"]:
+                raise _BadRequest(
+                    "multi-turn rollout prompt does not exactly match the authenticated environment context"
+                )
+            image_count, image_digests = self._payload_media_identity(
+                payload, required=authenticated
+            )
+            if authenticated and (
+                image_count != len(session["image_digests"])
+                or image_digests != tuple(session["image_digests"])
+            ):
+                raise _BadRequest(
+                    "multi-turn rollout media does not match the authenticated context"
+                )
+            response_ids = [int(token_id) for token_id in payload.get("response_ids", [])]
+            completion_text = str(payload.get("completion_text") or "")
+            session["next_turn"] += 1
+            # an unusable turn is terminal and must not be shown to the env or teacher.
             if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
-                # it is still the turn the model generated and the child trained on, so it is kept
-                # for the DIAGNOSTIC transcript. dropping it entirely would publish an empty
-                # completion for a first-turn truncation -- the one sample worth reading, since it
-                # is the failure being diagnosed.
                 session["aborted_turn"] = {
                     "role": "assistant",
-                    "content": str(payload.get("completion_text") or ""),
+                    "content": completion_text,
                 }
-                return {"terminal": True, "messages": []}
-            self._env_call("record_model_turn", state, str(payload.get("completion_text") or ""))
+                return self._step_response(
+                    session,
+                    terminal=True,
+                    messages=[],
+                    authenticated=authenticated,
+                )
+            self._env_call("record_model_turn", state, completion_text)
+            session["messages"].append({"role": "assistant", "content": completion_text})
+            next_prefix = [*accepted_prefix, *response_ids]
             if self._env_call("rollout_done", state, self._max_turns):
-                return {"terminal": True, "messages": []}
+                session["required_prefix"] = next_prefix
+                return self._step_response(
+                    session,
+                    terminal=True,
+                    messages=[],
+                    authenticated=authenticated,
+                )
             replies = self._env_call("env_reply", list(state.get("messages") or ()), state)
             terminal = bool(self._env_call("rollout_done", state, self._max_turns))
-        if terminal:
-            # nothing here is ever shown to the model: the child breaks on `terminal` BEFORE it
-            # reads `messages`. env_reply has already recorded these replies into the state that
-            # score_episodes reads, so the episode is scored on them either way. validating them
-            # for transcript representability would turn a completed episode whose env signed off
-            # with an image or a tool payload into a 400 with no reward -- refusing a turn the
-            # model was never going to see.
-            return {"terminal": True, "messages": []}
-        return {
-            "terminal": False,
-            "messages": [_env_reply_message(message) for message in replies],
-        }
+            if terminal:
+                # terminal replies remain available to environment scoring but are never actor or
+                # teacher context, so their media is deliberately neither normalized nor transported.
+                session["required_prefix"] = next_prefix
+                return self._step_response(
+                    session,
+                    terminal=True,
+                    messages=[],
+                    authenticated=authenticated,
+                )
+            try:
+                normalized = normalize_environment_reply(
+                    replies,
+                    self._package_root,
+                    session["descriptors"],
+                )
+                if authenticated or normalized.descriptors:
+                    glue_ids, new_digests = parent_environment_glue(
+                        self._processor,
+                        self._tokenizer,
+                        normalized.messages,
+                        normalized.descriptors,
+                        self._package_root,
+                        thinking=self._thinking,
+                    )
+                else:
+                    glue_ids, new_digests = [], []
+            except ValueError as error:
+                raise _BadEnvReply(str(error)) from error
+            glue_ids = dedup_seam_terminator(response_ids, glue_ids)
+            session["messages"].extend(normalized.messages)
+            session["descriptors"].extend(normalized.descriptors)
+            session["image_digests"].extend(new_digests)
+            session["required_prefix"] = [*next_prefix, *glue_ids]
+            session["turns"].append(
+                {
+                    "messages": copy.deepcopy(session["messages"]),
+                    "descriptors": tuple(session["descriptors"]),
+                    "image_digests": tuple(session["image_digests"]),
+                }
+            )
+            return self._step_response(
+                session,
+                terminal=False,
+                messages=normalized.messages,
+                image_data_uris=normalized.data_uris,
+                authenticated=authenticated,
+            )
 
     def _score_batch(self, requests: list) -> list:
         """score a whole batch of terminal episodes in ONE env call. runs on the batcher thread.

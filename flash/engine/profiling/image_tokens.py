@@ -14,13 +14,14 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from flash.content.image_descriptors import RGB_BYTES_PER_PIXEL
 from flash.content.multimodal import (
     MAX_IMAGES_PER_EXAMPLE,
     MAX_TOTAL_DECODED_BYTES,
     MAX_TOTAL_IMAGE_SOURCE_BYTES,
     decode_descriptor_pixels,
-    inspect_image_bytes,
     read_descriptor_source,
+    validate_image_descriptor_data,
 )
 
 # qwen VL publishes its pixel budget under `size`, older revisions under min_pixels/max_pixels.
@@ -36,9 +37,13 @@ MAX_PROFILE_DECODED_WORK_BYTES = MAX_TOTAL_DECODED_BYTES * MAX_IMAGES_PER_EXAMPL
 @dataclass(frozen=True)
 class ImageDescriptorMetadata:
     source_bytes: int
-    decoded_rgb_bytes: int
+    decoded_peak_bytes: int
     width: int
     height: int
+
+    @property
+    def pixels(self) -> int:
+        return self.width * self.height
 
 
 @dataclass
@@ -68,7 +73,7 @@ def image_descriptor_metadata(
     pending: dict[str, tuple[bytes, ImageDescriptorMetadata]] = {}
     metadata = []
     source_bytes = 0
-    decoded_bytes = 0
+    prior_pixels = 0
     new_decoded_work = 0
     for descriptor in descriptors:
         item = validation_state.descriptor_metadata.get(descriptor)
@@ -76,15 +81,15 @@ def image_descriptor_metadata(
             prepared = pending.get(descriptor)
             if prepared is None:
                 data = read_descriptor_source(descriptor, package_root)
-                decoded_rgb_bytes, width, height = inspect_image_bytes(data)
+                validated = validate_image_descriptor_data(descriptor, data, decode_pixels=False)
                 item = ImageDescriptorMetadata(
-                    source_bytes=len(data),
-                    decoded_rgb_bytes=decoded_rgb_bytes,
-                    width=width,
-                    height=height,
+                    source_bytes=validated.source_bytes,
+                    decoded_peak_bytes=validated.decoded_peak_bytes,
+                    width=validated.width,
+                    height=validated.height,
                 )
                 pending[descriptor] = data, item
-                new_decoded_work += item.decoded_rgb_bytes
+                new_decoded_work += item.decoded_peak_bytes
             else:
                 item = prepared[1]
         metadata.append(item)
@@ -93,11 +98,12 @@ def image_descriptor_metadata(
             raise ValueError(
                 f"example image sources exceed the {MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit"
             )
-        decoded_bytes += item.decoded_rgb_bytes
+        decoded_bytes = RGB_BYTES_PER_PIXEL * prior_pixels + item.decoded_peak_bytes
         if decoded_bytes > MAX_TOTAL_DECODED_BYTES:
             raise ValueError(
                 f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
             )
+        prior_pixels += item.pixels
 
     prospective_decoded_work = validation_state.decoded_work_bytes + new_decoded_work
     if prospective_decoded_work > profile_decoded_work_limit:

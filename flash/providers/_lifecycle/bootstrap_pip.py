@@ -75,6 +75,7 @@ def _is_terminal(output: str) -> bool:
 def _extra_pip_env(payload: dict) -> tuple[dict[str, str], str | None]:
     env = dict(os.environ)
     env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
+    env.pop("GIT_ASKPASS", None)
     env["GIT_TERMINAL_PROMPT"] = "0"
     askpass = None
     if env.get("GITHUB_TOKEN"):

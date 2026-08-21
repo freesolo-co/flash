@@ -1506,6 +1506,117 @@ def test_model_revision_auto_is_platform_managed_and_stripped_from_the_public_sp
     assert replace(auto, model_revision="").model_revision_auto is False
 
 
+def test_model_revision_force_pin_is_internal_only_and_round_trips() -> None:
+    revision = "d" * 40
+    forced = replace(
+        spec_from_dict(_raw()),
+        model_revision=revision,
+        model_revision_auto=True,
+        model_revision_force_pin=True,
+    )
+
+    public = forced.to_dict()
+    internal = forced.to_internal_dict()
+
+    assert "model_revision_force_pin" not in public
+    assert internal["model_revision_force_pin"] is True
+    assert JobSpec.from_dict(internal) == forced
+    assert JobSpec.from_json(forced.to_json()) == forced
+    with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revision_force_pin"):
+        spec_from_dict(_raw(model_revision_force_pin=True))
+
+
+@pytest.mark.parametrize("field_name", ["model_revision_auto", "model_revision_force_pin"])
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, 1.0, (), []])
+def test_model_revision_markers_require_bool_for_direct_construction_and_replace(
+    field_name, value
+) -> None:
+    revision = "a" * 40
+    constructor_kwargs = {"model_revision": revision}
+    if field_name == "model_revision_force_pin":
+        constructor_kwargs["model_revision_auto"] = True
+    constructor_kwargs[field_name] = value
+
+    with pytest.raises(TypeError, match=rf"{field_name} must be a boolean"):
+        JobSpec(**constructor_kwargs)
+
+    valid = JobSpec(model_revision=revision, model_revision_auto=True)
+    with pytest.raises(TypeError, match=rf"{field_name} must be a boolean"):
+        replace(valid, **{field_name: value})
+
+
+@pytest.mark.parametrize(
+    ("model_revision_auto", "model_revision_force_pin"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_model_revision_markers_accept_valid_bool_states(
+    model_revision_auto, model_revision_force_pin
+) -> None:
+    spec = JobSpec(
+        model_revision="a" * 40,
+        model_revision_auto=model_revision_auto,
+        model_revision_force_pin=model_revision_force_pin,
+    )
+
+    assert spec.model_revision_auto is model_revision_auto
+    assert spec.model_revision_force_pin is model_revision_force_pin
+    assert replace(spec) == spec
+
+
+@pytest.mark.parametrize(
+    ("auto_raw", "force_raw", "expected"),
+    [
+        ("true", "false", (True, False)),
+        (1, 0, (True, False)),
+        (0, 0, (False, False)),
+        ("true", "true", (True, True)),
+    ],
+)
+def test_model_revision_marker_from_dict_coercion_and_roundtrip_are_unchanged(
+    auto_raw, force_raw, expected
+) -> None:
+    payload = JobSpec(model_revision="a" * 40).to_internal_dict()
+    payload.update(model_revision_auto=auto_raw, model_revision_force_pin=force_raw)
+
+    restored = JobSpec.from_dict(payload)
+
+    assert (restored.model_revision_auto, restored.model_revision_force_pin) == expected
+    assert JobSpec.from_dict(restored.to_internal_dict()) == restored
+
+
+def test_historical_internal_model_revision_marker_roundtrip_without_force_pin() -> None:
+    payload = JobSpec(model_revision="a" * 40, model_revision_auto=True).to_internal_dict()
+    payload.pop("model_revision_force_pin")
+
+    restored = JobSpec.from_dict(payload)
+
+    assert restored.model_revision_auto is True
+    assert restored.model_revision_force_pin is False
+    assert JobSpec.from_dict(restored.to_internal_dict()) == restored
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model_revision_force_pin": True},
+        {"model_revision": "a" * 40, "model_revision_force_pin": True},
+        {
+            "model_revision": "main",
+            "model_revision_auto": True,
+            "model_revision_force_pin": True,
+        },
+        {
+            "model_revision": "A" * 40,
+            "model_revision_auto": True,
+            "model_revision_force_pin": True,
+        },
+    ],
+)
+def test_model_revision_force_pin_rejects_invalid_internal_states(overrides) -> None:
+    with pytest.raises(ValueError, match="model_revision_force_pin requires"):
+        _job_from_dict(overrides)
+
+
 def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() -> None:
     """A snapshot prepared before this field existed must still rehash to its stored digest.
 
@@ -1528,6 +1639,7 @@ def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() 
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
     worker_payload.pop("model_revision_auto", None)
+    worker_payload.pop("model_revision_force_pin", None)
     worker_payload.pop("gpu_count_auto", None)
     worker_payload["gpu"].pop("type_fallbacks", None)
     public_payload = unmarked.to_dict()  # to_dict() already strips the markers
@@ -1603,6 +1715,126 @@ def test_resubmitting_a_public_spec_gets_a_fresh_runner_pin(monkeypatch) -> None
     assert _Api.asked_for is None
     assert rerun.model_revision == resolved_sha
     assert rerun.model_revision_auto is True
+
+
+def test_forced_sft_model_revision_verifies_and_retains_the_exact_pin(monkeypatch) -> None:
+    from flash.runner.preparation import _resolve_model_revision
+
+    exact = "a" * 40
+    moving_head = "b" * 40
+    asked_for = []
+
+    class _Api:
+        def __init__(self, *a, **k) -> None: ...
+
+        def model_info(self, model, revision=None):
+            asked_for.append(revision)
+            return type("_Info", (), {"sha": moving_head if revision is None else revision})
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    forced = _job_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": "sft",
+            "model_revision": exact,
+            "model_revision_auto": True,
+            "model_revision_force_pin": True,
+        }
+    )
+
+    resolved = _resolve_model_revision(forced, required=True)
+
+    assert asked_for == [exact]
+    assert resolved.model_revision == exact
+    assert resolved.model_revision_auto is True
+    assert resolved.model_revision_force_pin is False
+    assert resolved.to_internal_dict()["model_revision_force_pin"] is False
+
+
+@pytest.mark.parametrize("reported", ["b" * 40, "A" * 40])
+def test_forced_model_revision_rejects_a_mismatched_hub_resolution(monkeypatch, reported) -> None:
+    from flash.runner.preparation import _resolve_model_revision
+
+    class _Api:
+        def __init__(self, *a, **k) -> None: ...
+
+        def model_info(self, model, revision=None):
+            return type("_Info", (), {"sha": reported})
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    forced = _job_from_dict(
+        {
+            "model_revision": "a" * 40,
+            "model_revision_auto": True,
+            "model_revision_force_pin": True,
+        }
+    )
+
+    with pytest.raises(ValueError, match="could not resolve model_revision"):
+        _resolve_model_revision(forced, required=True)
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algorithm) -> None:
+    from flash.runner.preparation import _resolve_model_revision
+
+    exact = "c" * 40
+    asked_for = []
+
+    class _Api:
+        def __init__(self, *a, **k) -> None: ...
+
+        def model_info(self, model, revision=None):
+            asked_for.append(revision)
+            return type("_Info", (), {"sha": exact})
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    forced = _job_from_dict(
+        {
+            "algorithm": algorithm,
+            "model_revision": exact,
+            "model_revision_auto": True,
+            "model_revision_force_pin": True,
+        }
+    )
+
+    resolved = _resolve_model_revision(forced, required=False)
+
+    assert asked_for == [exact]
+    assert resolved.model_revision == exact
+    assert resolved.model_revision_auto is True
+    assert resolved.model_revision_force_pin is False
+
+
+def test_authored_and_ordinary_auto_model_revision_resolution_is_unchanged(monkeypatch) -> None:
+    from flash.runner.preparation import _resolve_model_revision
+
+    resolved_sha = "e" * 40
+    calls = []
+
+    class _Api:
+        def __init__(self, *a, **k) -> None: ...
+
+        def model_info(self, model, revision=None):
+            calls.append(revision)
+            return type("_Info", (), {"sha": resolved_sha})
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    authored = _job_from_dict({"model_revision": "release-tag"})
+    ordinary_auto = _job_from_dict({"model_revision": "d" * 40, "model_revision_auto": True})
+
+    authored_resolved = _resolve_model_revision(authored, required=False)
+    rollout_unchanged = _resolve_model_revision(ordinary_auto, required=False)
+    sft_unchanged = _resolve_model_revision(ordinary_auto, required=True)
+
+    # only the authored pin reaches the hub. an already-resolved auto sha is returned untouched in
+    # BOTH directions: re-resolving it would look up the current tip and overwrite a pin a previous
+    # run chose, which is what breaks a warm start the moment the base model moves.
+    assert calls == ["release-tag"]
+    assert authored_resolved.model_revision == resolved_sha
+    assert authored_resolved.model_revision_auto is False
+    assert rollout_unchanged == ordinary_auto
+    assert sft_unchanged == ordinary_auto
 
 
 def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() -> None:

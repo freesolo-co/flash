@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import contextlib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from flash.core.spec import JobSpec
+from flash.envs.staged import StagedEnvironmentTransientError
 from flash.providers._lifecycle.poll import _attempt_int
 
 # imported by value rather than through `_deploy()`: the set and its lock are mutated in place and
@@ -61,6 +62,8 @@ def _resume_after_confirmed_teardown(
     from flash.runner import (
         _compare_and_clear_remote,
         _compare_and_fail_remote,
+        _load_run_deadline_at,
+        _persist_effective_worker_spec,
         _record_cleanup_remote,
         _run_training,
         _RunCancelled,
@@ -70,6 +73,7 @@ def _resume_after_confirmed_teardown(
         get_status,
         reallocation_spec_from_status,
         source_snapshot_from_status,
+        stage_environment_package,
     )
 
     if int(worker_spec.gpu.max_retries) == 0:
@@ -103,6 +107,12 @@ def _resume_after_confirmed_teardown(
         print(f"attach: {run_id} {exc}", file=log)
         return get_status(run_id)
     worker_spec = reallocation_spec_from_status(get_status(run_id), verify_source=True)
+    if worker_spec.run_id != run_id:
+        worker_spec = replace(worker_spec, run_id=run_id)
+    deadline_at = _load_run_deadline_at(run_id)
+    worker_spec = stage_environment_package(worker_spec, deadline_at=deadline_at)
+    if not _persist_effective_worker_spec(worker_spec):
+        raise _RunCancelled(f"run {run_id} went terminal before environment staging")
     if not _compare_and_clear_remote(run_id, persisted_remote):
         print(
             f"attach: {run_id} persisted remote changed before clear; not resuming",
@@ -848,6 +858,22 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     except _RunCancelled:
         with contextlib.suppress(Exception):
             cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
+    except StagedEnvironmentTransientError as exc:
+        _deploy()._schedule_attach_reconciliation(
+            run_id,
+            persisted_remote,
+            worker_spec,
+            next_attempt,
+            source_snapshot,
+            log,
+            str(exc),
+        )
+        print(
+            f"attach: {run_id} staged environment verification is temporarily unavailable; "
+            "deferring replacement",
+            file=log,
+        )
+        return status_for_return()
     except Exception as exc:
         try:
             _record_cleanup_remote(run_id, persisted_remote)
