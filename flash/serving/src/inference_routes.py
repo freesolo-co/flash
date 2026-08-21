@@ -136,12 +136,9 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         expected_checkpoint=_expected_checkpoint(request),
         caller_org=caller_org,
     )
+    # already attested in `generate_once`, before usage was metered; this only strips the field
+    # off the body so it does not leak into the OpenAI-shaped response.
     lora_request_adapter = generation.pop("lora_request_adapter", None)
-    if target.is_revision and lora_request_adapter != target.adapter_id:
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            "The serving engine did not attest the resolved immutable adapter.",
-        )
     active_checkpoint = generation.get("checkpoint")
     provenance = _revision_provenance(target, active_checkpoint)
     response = openai_chat_completion(

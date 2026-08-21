@@ -184,7 +184,15 @@ def _declared_provenance(config_path: str | None) -> tuple[int | None, str | Non
         value = config.get(key)
         return value.strip() or None if isinstance(value, str) else None
 
-    return rank, _text("base_model_name_or_path"), _text("revision")
+    # the container compares `base_model_name_or_path` for equality, so an absent, empty, or
+    # non-string one can never match and the deployment is already doomed. returning None here
+    # skipped the check instead, which deferred a certain failure until after the provider had
+    # allocated and started billing -- the exact outcome this function exists to prevent.
+    declared_base = _text("base_model_name_or_path")
+    if declared_base is None:
+        raise ResolveError(f"{ADAPTER_CONFIG} declares no base_model_name_or_path")
+
+    return rank, declared_base, _text("revision")
 
 
 def resolve_adapter(

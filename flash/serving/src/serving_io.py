@@ -62,6 +62,21 @@ def _active_checkpoint_ref(record: AdapterRecord) -> str:
     return record.adapter_id
 
 
+def require_attested_revision(result: dict[str, Any], target: AdapterRecord) -> None:
+    """Refuse a generation the engine did not attest to the resolved immutable adapter.
+
+    Reads without consuming, so the caller still owns when to strip the field off the response
+    body. The check lives here rather than in each route because it has to run before usage is
+    metered: billing a caller for a generation we then reject with a 502 charges them for nothing.
+    """
+
+    if target.is_revision and result.get("lora_request_adapter") != target.adapter_id:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "The serving engine did not attest the resolved immutable adapter.",
+        )
+
+
 def _revision_provenance(target: AdapterRecord, active_checkpoint: Any) -> dict[str, str] | None:
     # immutable-revision provenance the deploy handshake verifies and external clients read to
     # confirm which revision answered. only concrete revisions carry it; base-model serving and

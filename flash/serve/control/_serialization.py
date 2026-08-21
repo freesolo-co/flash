@@ -19,10 +19,8 @@ from .types import (
     validate_deployment_spec,
     validate_engine_identity,
     validate_modal_handle,
-    validate_modal_placement,
     validate_resolved_adapter,
     validate_runpod_handle,
-    validate_runpod_placement,
 )
 
 
@@ -95,12 +93,6 @@ def _adapter_payload(value: ResolvedAdapter) -> dict[str, object]:
     }
 
 
-def serialize_adapter(value: ResolvedAdapter) -> dict[str, object]:
-    _require_exact(value, ResolvedAdapter, "adapter")
-    validate_resolved_adapter(value)
-    return _adapter_payload(value)
-
-
 def canonical_adapter_sort_key(value: ResolvedAdapter) -> str:
     """return the one canonical ordering key for deployment adapters."""
 
@@ -132,16 +124,6 @@ def _placement_payload(value: ModalPlacement | RunPodPlacement) -> dict[str, obj
         "volume_size_gb": value.volume_size_gb,
         "provider": value.provider,
     }
-
-
-def serialize_placement(value: object) -> dict[str, object]:
-    if type(value) is ModalPlacement:
-        validate_modal_placement(value)
-        return _placement_payload(value)
-    if type(value) is RunPodPlacement:
-        validate_runpod_placement(value)
-        return _placement_payload(value)
-    raise TypeError("placement must be an exact ModalPlacement or RunPodPlacement")
 
 
 def _spec_payload(value: DeploymentSpec) -> dict[str, object]:

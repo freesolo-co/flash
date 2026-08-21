@@ -17,6 +17,7 @@ from flash.serving.src.serving_io import (
     _provenance_headers,
     _revision_provenance,
     _sse,
+    require_attested_revision,
 )
 
 
@@ -204,6 +205,11 @@ async def generate_once(
         )
     except Exception as exc:
         raise_if_engine_error(router, requested.adapter_id, exc)
+    # attest before metering, not after: `schedule_usage` is what bills the caller, so a
+    # generation the engine never attested to the resolved immutable adapter must not reach it.
+    # this also covers every non-streaming route at once -- the plain `/generate` paths would
+    # otherwise serve an unattested adapter with no check at all.
+    require_attested_revision(result, target)
     if "adapter_id" in result:
         result = {**result, "adapter_id": requested.adapter_id}
     schedule_usage(requested, result, caller_org)

@@ -261,6 +261,8 @@ def test_shutdown_cancels_timed_out_usage_report_before_closing_client(monkeypat
                 "finish_reason": "stop",
                 "prompt_tokens": 2,
                 "completion_tokens": 1,
+                # a revision request is refused unless the engine attests what it served
+                "lora_request_adapter": record.adapter_id,
             }
 
     reporter = Reporter()

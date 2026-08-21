@@ -1287,6 +1287,8 @@ def test_generate_forwards_record_for_lazy_engine_load(app_setup):
             "finish_reason": "stop",
             "token_ids": [],
             "inference_time_seconds": 0.0,
+            # a revision request is refused unless the engine attests what it served
+            "lora_request_adapter": record.adapter_id,
         }
 
     pool.generate = _capture

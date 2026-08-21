@@ -873,9 +873,16 @@ def _validate_lora_pairs(tensors: Mapping[str, tuple[int, ...]]) -> None:
             )
         a_shape = pair["A"]
         b_shape = pair["B"]
+        # peft writes a convolution LoRA as `A (r, in_ch, *kernel)` / `B (out_ch, r, 1, 1, 1)`,
+        # so factors are not always 2-D. flash's own `all-linear` training produces exactly one
+        # such pair on image models -- `visual.patch_embed.proj` is a Conv3d -- and demanding
+        # rank-2 rejected the whole adapter over it, making every image adapter undeployable.
+        # vllm loads the pair, warns that it cannot wrap a convolution, and leaves it unapplied,
+        # so refusing to serve the other 346 pairs is strictly worse than what the engine does.
+        # the rank agreement below holds for both shapes: rank is `A[0]` and `B[1]` either way.
         if (
-            len(a_shape) != 2
-            or len(b_shape) != 2
+            len(a_shape) < 2
+            or len(b_shape) < 2
             or any(dimension <= 0 for dimension in (*a_shape, *b_shape))
             or a_shape[0] != b_shape[1]
         ):

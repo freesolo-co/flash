@@ -187,17 +187,19 @@ def cmd_serve_deploy(args) -> int:
     except (ValueError, TypeError) as exc:
         return _err(str(exc))
 
+    try:
+        # build the provider plan too, not just the bundle. the generic placement types accept
+        # any nonempty string, while the provider-specific `_validate_placement` is what
+        # enforces the hostname charset -- so an uppercase workspace or an underscored region
+        # passed the dry run and then raised an uncaught ValueError during a real deployment,
+        # after hub resolution. "validated every input" has to mean the ones the provider
+        # applies. this runs on both paths: gating it on `--dry-run` meant the real deployment
+        # -- the one that allocates and bills -- was the only path that surfaced a raw traceback.
+        _build_provider_plan(provider, bundle)
+    except (ValueError, TypeError) as exc:
+        return _err(str(exc))
+
     if getattr(args, "dry_run", False):
-        try:
-            # build the provider plan too, not just the bundle. the generic placement types accept
-            # any nonempty string, while the provider-specific `_validate_placement` is what
-            # enforces the hostname charset -- so an uppercase workspace or an underscored region
-            # passed the dry run and then raised an uncaught ValueError during a real deployment,
-            # after hub resolution. "validated every input" has to mean the ones the provider
-            # applies.
-            _build_provider_plan(provider, bundle)
-        except (ValueError, TypeError) as exc:
-            return _err(str(exc))
         for key, value in dry_run_deployment(bundle).items():
             print(f"{key:18} {value}")
         print("\ndry run: no provider was contacted and nothing was provisioned.")

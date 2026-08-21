@@ -967,6 +967,68 @@ def test_missing_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None
     assert "attest" in response.json()["detail"]
 
 
+def _unattesting_pool(monkeypatch) -> None:
+    """make the engine answer without attesting the adapter it served."""
+
+    original = _Pool.generate
+
+    async def unattested(self, base_model, payload, record, *, expected_checkpoint=None):
+        result = await original(
+            self, base_model, payload, record, expected_checkpoint=expected_checkpoint
+        )
+        result.pop("lora_request_adapter", None)
+        return result
+
+    monkeypatch.setattr(_Pool, "generate", unattested)
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/generate", {"adapter_id": REVISION_ID, "prompt": "hi"}),
+        (f"/adapters/{REVISION_ID}/generate", {"prompt": "hi"}),
+    ],
+)
+def test_unattested_revision_is_refused_on_the_plain_generate_routes(
+    monkeypatch, path: str, body: dict[str, Any]
+) -> None:
+    # the attestation check originally lived only in the OpenAI handler, so these two routes
+    # served an unattested adapter with no check at all -- the same request 502s as
+    # /v1/chat/completions but succeeded here.
+    _unattesting_pool(monkeypatch)
+    client, _pool = _client(QWEN)
+
+    response = client.post(path, json=body)
+
+    assert response.status_code == 502
+    assert "attest" in response.json()["detail"]
+
+
+def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
+    # usage is scheduled inside generate_once, so attesting after it returned meant the caller had
+    # already been billed for a generation we then rejected with a 502. the check has to run
+    # before metering, not after it.
+    _unattesting_pool(monkeypatch)
+    reported: list[dict[str, Any]] = []
+
+    async def record_usage(payload: dict[str, Any]) -> None:
+        reported.append(payload)
+
+    revision = _revision(QWEN)
+    app = build_serving_app(
+        _Pool(),
+        AdapterRouter([revision, _alias(revision)]),
+        chat_authorizer=_allow,
+        usage_reporter=record_usage,
+    )
+    client = TestClient(app, headers={"Authorization": "Bearer test"})
+
+    response = client.post("/generate", json={"adapter_id": REVISION_ID, "prompt": "hi"})
+
+    assert response.status_code == 502
+    assert reported == []
+
+
 def test_mismatched_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None:
     # sabotage: attesting a DIFFERENT adapter is the failure the header exists to catch - the
     # engine served weights that are not the ones the caller pinned.

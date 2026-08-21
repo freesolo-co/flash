@@ -582,6 +582,91 @@ def test_adapter_without_a_peft_adapter_name_segment_validates(tmp_path: Path) -
     validate_manifest_cache(manifest, cache)
 
 
+def test_convolution_lora_factors_validate(tmp_path: Path) -> None:
+    # flash trains with peft `all-linear`, which on an image model wraps `visual.patch_embed.proj`
+    # -- a Conv3d. peft writes that pair as A (r, in_ch, *kernel) / B (out_ch, r, 1, 1, 1), so the
+    # factors are 5-D. requiring rank 2 rejected the ENTIRE adapter over that single pair, which
+    # made every image adapter undeployable: observed live as a crash loop on both a Modal app and
+    # a $0.49/hr RunPod L4, after the provider had already allocated and started billing.
+    # vllm loads the pair, warns it cannot wrap a convolution, and leaves it unapplied, so
+    # refusing the other 346 pairs is strictly worse than what the engine itself does.
+    source = tmp_path / "source"
+    source.mkdir()
+    config = {
+        "peft_type": "LORA",
+        "task_type": "CAUSAL_LM",
+        "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+        "revision": BASE_REVISION,
+        "r": 16,
+        "lora_alpha": 32,
+        "target_modules": ["q_proj", "proj"],
+    }
+    config_bytes = json.dumps(config, sort_keys=True).encode()
+    (source / "adapter_config.json").write_bytes(config_bytes)
+    linear = "base_model.model.layers.0.self_attn.q_proj"
+    conv = "base_model.model.model.visual.patch_embed.proj"
+    weights_path = source / "adapter_model.safetensors"
+    save_file(
+        {
+            f"{linear}.lora_A.weight": np.zeros((16, 2), dtype=np.float32),
+            f"{linear}.lora_B.weight": np.zeros((2, 16), dtype=np.float32),
+            f"{conv}.lora_A.weight": np.zeros((16, 3, 2, 4, 4), dtype=np.float32),
+            f"{conv}.lora_B.weight": np.zeros((8, 16, 1, 1, 1), dtype=np.float32),
+        },
+        weights_path,
+    )
+    weights_bytes = weights_path.read_bytes()
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+
+    hydrate_manifest(
+        manifest,
+        cache,
+        token_fd=_token_fd(),
+        snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+    )
+
+    validate_manifest_cache(manifest, cache)
+
+
+def test_convolution_lora_factors_with_mismatched_rank_are_refused(tmp_path: Path) -> None:
+    # accepting >2-D factors must not stop enforcing rank agreement: rank is A[0] and B[1] for
+    # both the 2-D and the convolution shape, so a disagreeing pair is still a broken adapter.
+    source = tmp_path / "source"
+    source.mkdir()
+    config = {
+        "peft_type": "LORA",
+        "task_type": "CAUSAL_LM",
+        "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+        "revision": BASE_REVISION,
+        "r": 16,
+        "lora_alpha": 32,
+        "target_modules": ["proj"],
+    }
+    config_bytes = json.dumps(config, sort_keys=True).encode()
+    (source / "adapter_config.json").write_bytes(config_bytes)
+    conv = "base_model.model.model.visual.patch_embed.proj"
+    weights_path = source / "adapter_model.safetensors"
+    save_file(
+        {
+            f"{conv}.lora_A.weight": np.zeros((16, 3, 2, 4, 4), dtype=np.float32),
+            f"{conv}.lora_B.weight": np.zeros((8, 15, 1, 1, 1), dtype=np.float32),
+        },
+        weights_path,
+    )
+    weights_bytes = weights_path.read_bytes()
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+
+    with pytest.raises(MaterializationError, match="incompatible LoRA factor shapes"):
+        hydrate_manifest(
+            manifest,
+            cache,
+            token_fd=_token_fd(),
+            snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+        )
+
+
 def test_lora_tensor_key_with_extra_leaf_segments_is_still_refused(tmp_path: Path) -> None:
     # relaxing the leaf count must not turn into accepting anything: a key carrying more than an
     # optional adapter name before "weight" is not a shape peft or verl produces, and pairing on
