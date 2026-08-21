@@ -503,39 +503,46 @@ def _adopt_existing(
             expected=None,
         )
     if finalized is not None:
-        # same bounded wait as the branch above, but this phase still owns an artifact, and waiting
-        # re-observes it on every poll. a concurrent `serve deploy` -- or the run that created this
-        # app finishing its own reclaim -- can delete that secret while this wait is still warming a
-        # cold container. the deployment is then finalized-and-cleaned -- the success state -- yet
-        # `_phase_proof` sees a phase mismatch and raises, and the caller maps that to a definite
-        # `conflict` for an app that may be healthy and billing.
+        # same bounded wait as the branch above, but this phase still owns its artifact, so the
+        # target is the phase this observation already showed: artifact present. Waiting on the
+        # *cleaned* phase instead would never build a proof while the secret is still there, so
+        # nothing would ever be probed -- the solo case, where no one else is reclaiming, would
+        # burn the entire deadline and then hand an exhausted one to the cleanup below.
         #
-        # so wait for the *cleaned* phase and tolerate the still-has-artifact phase as transient,
-        # which is exactly how `reconcile_modal_deployment` waits out this same pair. either the
-        # racer reclaims the artifact or this run does it below; both converge on the same phase.
-        proved = _wait_for_phase(
-            finalized_plan,
-            sdk,
-            inference_token,
-            artifact_present=False,
-            expected=None,
-            transient_phases=(_TransientPhase(finalized_plan, True),),
-            deadline_at=deadline_at,
-            probe=probe,
-            clock=clock,
-            sleep=sleep,
-        )
-        if proved is not None:
-            # a racer reclaimed it first, so there is nothing left to delete.
-            return DeploymentResult.from_spec(
-                finalized_plan.bundle.spec,
-                status="ready",
-                handle=proved.handle,
+        # the artifact can still vanish underneath this wait: a concurrent `serve deploy`, or the
+        # run that created this app finishing its own reclaim. that leaves the deployment
+        # finalized-and-cleaned -- the success state -- yet a phase mismatch to `_phase_proof`,
+        # which would otherwise surface as a definite `conflict` for a healthy, billing app. so
+        # stop waiting and let the cleanup below settle it: its own wait targets the cleaned phase,
+        # the delete is name-addressed and `allow_missing`, and the deadline is still unspent.
+        proved: _PhaseProof | None = None
+        try:
+            proved = _wait_for_phase(
+                finalized_plan,
+                sdk,
+                inference_token,
+                artifact_present=True,
+                expected=None,
+                transient_phases=(),
+                deadline_at=deadline_at,
+                probe=probe,
+                clock=clock,
+                sleep=sleep,
             )
+        except ModalResourceConflict:
+            # only a vanished artifact is tolerable here. re-read and prove that is what happened:
+            # identity drift -- a *replacement* app under the same names -- must stay a definite
+            # conflict rather than be mistaken for someone else's successful reclaim.
+            if not _matches_transient(
+                _observe(finalized_plan, sdk),
+                _TransientPhase(finalized_plan, False),
+                None,
+            ):
+                raise
         return _delete_artifact_and_confirm(
             finalized_plan,
             sdk,
-            finalized,
+            proved if proved is not None else finalized,
             inference_token,
             deadline_at=deadline_at,
             probe=probe,

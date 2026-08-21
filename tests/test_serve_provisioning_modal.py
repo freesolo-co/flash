@@ -550,6 +550,41 @@ def test_adoption_waits_out_a_cold_container_instead_of_probing_once() -> None:
     assert all(not name.startswith("create_") for name, _value in sdk.calls)
 
 
+def test_adoption_of_an_uncleaned_deployment_probes_instead_of_burning_the_deadline() -> None:
+    """the solo case: nobody else is reclaiming, so the artifact stays put until this run acts.
+
+    Waiting on the *cleaned* phase here could never build a proof while the secret was still
+    there, so the endpoint was never probed at all -- the wait spun to the deadline and handed an
+    exhausted one to the cleanup, turning a healthy app that needed nothing but artifact reclaim
+    into `outcome_unknown`. The target has to be the phase the observation actually showed.
+    """
+
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    _seed_exact(sdk, artifact=True)
+    probe = _Probe()
+    clock = _Clock()
+    started_at = clock()
+
+    result = provision_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan: sdk,
+        probe=probe,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "ready"
+    assert probe.calls, "the endpoint was never probed, so the wait could not prove readiness"
+    # the real symptom: spinning to the deadline before the artifact is ever reclaimed.
+    assert clock() - started_at < 90.0, "the wait burned the deadline instead of probing"
+    assert sdk.artifact == [], "the artifact was left behind for the next run to trip over"
+
+
 def test_adoption_tolerates_a_concurrent_artifact_reclaim_while_waiting() -> None:
     """a racer finishing the reclaim mid-wait is the success state, not a conflict.
 
