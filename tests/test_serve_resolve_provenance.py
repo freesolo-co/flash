@@ -55,10 +55,26 @@ def _resolve(**overrides):
 
 
 def test_a_rank_that_disagrees_with_the_config_is_rejected(monkeypatch, tmp_path) -> None:
-    _install_hub(monkeypatch, tmp_path, {"peft_type": "LORA", "r": 16})
+    # declares an AGREEING base model so the rank is what this case turns on: a config missing
+    # `base_model_name_or_path` is refused earlier, and would pass this test for the wrong reason.
+    _install_hub(
+        monkeypatch, tmp_path, {"peft_type": "LORA", "r": 16, "base_model_name_or_path": BASE}
+    )
 
     with pytest.raises(ResolveError, match="disagrees"):
         _resolve(lora_rank=32)
+
+
+def test_a_config_without_a_declared_base_model_is_rejected(monkeypatch, tmp_path) -> None:
+    """The container compares this field for equality, so an absent one can never match.
+
+    Resolving it to ``None`` skipped the check rather than failing it, which deferred a certain
+    rejection until after the provider had allocated and started billing.
+    """
+    _install_hub(monkeypatch, tmp_path, {"peft_type": "LORA", "r": 32})
+
+    with pytest.raises(ResolveError, match="declares no base_model_name_or_path"):
+        _resolve()
 
 
 def test_a_base_model_that_disagrees_with_the_config_is_rejected(monkeypatch, tmp_path) -> None:
