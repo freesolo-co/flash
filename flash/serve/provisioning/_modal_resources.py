@@ -67,7 +67,6 @@ def terminal_app_matches(
         and app.app_name == plan.names.app_or_pod
         and app.state in {"stopped", "failed"}
         and app.running_containers == 0
-        and not app.tags
         and app.function_id is None
         and app.function_name is None
         and app.public_url is None
@@ -85,7 +84,6 @@ def lifecycle_pending_app_matches(
         and app.app_name == plan.names.app_or_pod
         and app.state == "lifecycle_pending"
         and app.running_containers is None
-        and not app.tags
         and app.function_id is None
         and app.function_name is None
         and app.public_url is None
@@ -200,9 +198,4 @@ def resources_are_absent(observation: ModalObservation, *, allow_terminal_app: b
     if not observation.apps:
         return True
     app = observation.apps[0]
-    return (
-        allow_terminal_app
-        and app.state in {"stopped", "failed"}
-        and app.running_containers == 0
-        and not app.tags
-    )
+    return allow_terminal_app and app.state in {"stopped", "failed"} and app.running_containers == 0

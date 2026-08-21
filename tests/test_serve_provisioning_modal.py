@@ -11,6 +11,7 @@ import sys
 import urllib.response
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +40,7 @@ from flash.serve.provisioning._modal_sdk import (
     ModalNamedResource,
     ModalObservation,
     ModalSdkFailure,
+    PinnedModalSdk,
 )
 from flash.serve.provisioning.modal import (
     confirm_modal_absence,
@@ -1119,6 +1121,70 @@ def test_teardown_stops_before_secret_and_volume_deletion_then_confirms_absence(
     assert all(name == "observe" for name, _value in sdk.calls)
 
 
+def test_teardown_deletes_resources_after_lifecycle_only_stopped_app_observation() -> None:
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+
+    class LifecycleOnlyStoppedSdk(_FakeSdk):
+        def __init__(self, received_plan) -> None:
+            super().__init__(received_plan)
+            self._client = object()
+            self._modal = SimpleNamespace(
+                App=SimpleNamespace(lookup=self._lookup_stopped_app),
+                experimental=SimpleNamespace(get_app_lifecycle=self._get_app_lifecycle),
+            )
+
+        def _lookup_stopped_app(self, name: str, **_kwargs: object) -> object:
+            self.calls.append(("lookup", name))
+            raise RuntimeError("stopped app not found")
+
+        def _get_app_lifecycle(self, app_id: str, *, client: object) -> object:
+            self.calls.append(("get_app_lifecycle", app_id))
+            assert app_id == APP_ID
+            assert client is self._client
+            return SimpleNamespace(stopped_at=object())
+
+        def stop_app(self, received_plan) -> None:
+            self.calls.append(("stop_app", None))
+            self._fail("stop_app")
+            self.apps.clear()
+
+        def observe(self, received_plan, *, app_id_hint=None) -> ModalObservation:
+            if self.apps or app_id_hint is None:
+                return super().observe(received_plan, app_id_hint=app_id_hint)
+            self.calls.append(("observe", app_id_hint))
+            app = PinnedModalSdk._lifecycle_app(self, received_plan, app_id_hint)
+            return ModalObservation(
+                workspace_name=self.workspace_name,
+                environment_name=self.environment_name,
+                apps=(app,),
+                volumes=tuple(self.volumes),
+                inference_secrets=tuple(self.inference),
+                artifact_secrets=tuple(self.artifact),
+            )
+
+    sdk = LifecycleOnlyStoppedSdk(plan)
+    handle = _seed_exact(sdk)
+    clock = _Clock()
+
+    result = teardown_modal_deployment(
+        bundle,
+        handle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan: sdk,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "absent"
+    assert sdk.apps == []
+    assert ("delete_inference", None) in sdk.calls
+    assert ("delete_volume", None) in sdk.calls
+    assert [value for name, value in sdk.calls if name == "lookup"] == []
+    assert [value for name, value in sdk.calls if name == "get_app_lifecycle"] == [APP_ID, APP_ID]
+
+
 def test_teardown_post_stop_observation_failure_is_outcome_unknown() -> None:
     bundle = _bundle()
     plan = build_modal_create_plan(bundle)
@@ -1197,7 +1263,7 @@ def test_teardown_never_deletes_resources_without_explicit_terminal_app_proof() 
     assert [name for name, _value in sdk.calls if name.startswith("delete_")] == []
 
 
-def test_teardown_refuses_terminal_app_with_retained_finalized_tags() -> None:
+def test_teardown_accepts_terminal_app_with_retained_finalized_tags() -> None:
     bundle = _bundle()
     plan = build_modal_create_plan(bundle)
 
@@ -1228,13 +1294,16 @@ def test_teardown_refuses_terminal_app_with_retained_finalized_tags() -> None:
         sleep=lambda _seconds: None,
     )
 
-    assert result.status == "outcome_unknown"
-    assert result.status != "absent"
-    assert [name for name, _value in sdk.calls if name.startswith("delete_")] == []
+    assert result.status == "absent"
+    assert [name for name, _value in sdk.calls if name.startswith("delete_")] == [
+        "delete_artifact",
+        "delete_inference",
+        "delete_volume",
+    ]
     assert sdk.apps[0].tags == plan.tags
-    assert sdk.volumes
-    assert sdk.inference
-    assert sdk.artifact
+    assert sdk.volumes == []
+    assert sdk.inference == []
+    assert sdk.artifact == []
 
 
 @pytest.mark.parametrize("state", ["stopped", "failed"])

@@ -310,21 +310,6 @@ class PinnedModalSdk:
 
     def _lifecycle_app(self, plan: ModalCreatePlan, app_id: str) -> ModalAppObservation:
         validated_app_id = _provider_id(app_id, "app")
-        app = _call_read(
-            lambda: self._modal.App.lookup(
-                plan.names.app_or_pod,
-                client=self._client,
-                environment_name=plan.placement.environment,
-                create_if_missing=False,
-            )
-        )
-        if _provider_id(getattr(app, "app_id", None), "app") != validated_app_id:
-            raise ModalSdkFailure("transport_failed")
-        tags = _call_read(lambda: app.get_tags(client=self._client))
-        if type(tags) is not dict or any(
-            type(key) is not str or type(item) is not str for key, item in tags.items()
-        ):
-            raise ModalSdkFailure("transport_failed")
         lifecycle = _call_read(
             lambda: self._modal.experimental.get_app_lifecycle(
                 validated_app_id,
@@ -337,7 +322,7 @@ class PinnedModalSdk:
             app_name=plan.names.app_or_pod,
             state="stopped" if stopped else "lifecycle_pending",
             running_containers=0 if stopped else None,
-            tags=tuple(sorted(tags.items())),
+            tags=(),
             function_id=None,
             function_name=None,
             public_url=None,
