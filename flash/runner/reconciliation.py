@@ -323,21 +323,8 @@ def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
 
 def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     """Teardown every tracked resource independently, removing only confirmed exact records."""
-    from flash.providers.runpod.jobs import migrate_persisted_legacy_key_fingerprints
-
-    # best-effort: the upgrade is what lets a legacy record tear down instead of silently
-    # no-opping, but a record nobody can verify must not abort the drain for its siblings.
-    # the resolvable upgrades are durably written before the raise, so catching it here still
-    # tears down everything that became resolvable. the error is not lost by being caught:
-    # every caller of this function already suppresses exceptions (`_drain_confirmed_cleanup`
-    # returns an empty set, `_drain_cleanup_remotes_bg` uses contextlib.suppress), so letting
-    # it propagate reports the failure to nobody and only skips teardown -- and cancellation
-    # re-raises the same error itself, after teardown, from `_prepare_cancellation`.
-    with contextlib.suppress(Exception):
-        migrate_persisted_legacy_key_fingerprints(run_id)
     # the strict snapshot raises on the FIRST record it cannot canonicalize, which strands every
-    # other tracked resource behind it -- the same all-or-nothing shape as the migration above,
-    # and it would defeat that fix on its own. teardown is per-resource, so read the records
+    # other tracked resource behind it. teardown is per-resource, so read the records
     # leniently here and simply skip the ones that cannot produce a handle; a record that cannot
     # be canonicalized has no endpoint to tear down anyway. the strict reader stays in place for
     # the write paths, where a malformed record must not be silently dropped from the file.

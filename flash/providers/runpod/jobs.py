@@ -142,99 +142,6 @@ def apply_disk_gb(config, disk_gb: int | None) -> None:
     template.containerDiskInGb = max(int(disk_gb), int(template.containerDiskInGb or 0))
 
 
-def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, str], str]:
-    """Rewrite endpoint-confirmed legacy owner prefixes in one durable run record.
-
-    A run with no durable record has no persisted fingerprint to rewrite, so an unknown run is
-    nothing to migrate rather than an error. Callers run this before resolving the run itself --
-    cancellation fences authority before it waits on any lock -- and raising here would replace
-    the caller's own unknown-run failure with a migration one.
-    """
-    import flash.runner as runner
-
-    def legacy_target(remote: object) -> tuple[str, str] | None:
-        if not isinstance(remote, dict) or remote.get("provider") != "runpod":
-            return None
-        fingerprint = remote.get("key_fingerprint")
-        if not runpod_api._is_legacy_key_fingerprint(fingerprint):
-            return None
-        endpoint_id = remote.get("endpoint_id")
-        if not isinstance(endpoint_id, str) or not endpoint_id:
-            raise ValueError("persisted RunPod endpoint identity is invalid")
-        return endpoint_id, fingerprint
-
-    def legacy_targets(raw: dict) -> set[tuple[str, str]]:
-        cleanup_remotes = raw.get(runner._CLEANUP_REMOTES_KEY)
-        cleanup_records = cleanup_remotes if isinstance(cleanup_remotes, list) else []
-        return {
-            target
-            for remote in [raw.get("remote"), *cleanup_records]
-            if (target := legacy_target(remote)) is not None
-        }
-
-    upgrades: dict[tuple[str, str], str] = {}
-    blocked: set[tuple[str, str]] = set()
-
-    def upgrade(remote: object) -> object:
-        target = legacy_target(remote)
-        if target is None or target not in upgrades:
-            return remote
-        return {**remote, "key_fingerprint": upgrades[target]}
-
-    # a record whose credential left the pool, or whose ownership lookup is merely unreachable
-    # right now, is unverifiable rather than wrong. it must not abort the migration of the records
-    # that DO resolve: cancellation calls this before it reads the current remote, so one stale
-    # entry would otherwise leave the active worker and every sibling cleanup resource billing.
-    # the failure is raised only after the resolvable upgrades have been written.
-    unresolvable: Exception | None = None
-    while True:
-        try:
-            raw = runner._load_status_json(run_id)
-        except FileNotFoundError:
-            return {}
-        unresolved = legacy_targets(raw) - upgrades.keys() - blocked
-        if not unresolved:
-            break
-        for endpoint_id, fingerprint in unresolved:
-            try:
-                upgrades[(endpoint_id, fingerprint)] = runpod_api.resolve_legacy_key_fingerprint(
-                    endpoint_id, fingerprint
-                )
-            except runpod_api.RunpodApiError:
-                blocked.add((endpoint_id, fingerprint))
-                unresolvable = ValueError("persisted RunPod key fingerprint is invalid")
-    if not upgrades:
-        if unresolvable is not None:
-            raise unresolvable
-        return upgrades
-
-    with runner._status_guard(run_id):
-        current = runner._load_status_json(run_id)
-        current_cleanup_remotes = current.get(runner._CLEANUP_REMOTES_KEY)
-        if current_cleanup_remotes is not None and not isinstance(current_cleanup_remotes, list):
-            raise RuntimeError("stored cleanup remotes are invalid")
-        remaining = legacy_targets(current) - upgrades.keys() - blocked
-        if remaining:
-            raise RuntimeError("persisted RunPod owner changed during fingerprint migration")
-        status = runner._runstatus_from_json(current)
-        upgraded_remote = upgrade(status.remote)
-        upgraded_cleanup_remotes = (
-            [upgrade(remote) for remote in current_cleanup_remotes]
-            if current_cleanup_remotes is not None
-            else None
-        )
-        if not (
-            upgraded_remote == status.remote and upgraded_cleanup_remotes == current_cleanup_remotes
-        ):
-            status.remote = upgraded_remote
-            runner._save_status_unlocked(status, _cleanup_remotes=upgraded_cleanup_remotes)
-    if unresolvable is not None:
-        # raised only after the resolvable records are durably upgraded, so an unverifiable one is
-        # still reported rather than silently skipped.
-        raise unresolvable
-    return upgrades
-
-
 @dataclass
 class JobHandle:
     endpoint_id: str
@@ -277,11 +184,6 @@ class JobHandle:
         if not isinstance(endpoint_name, str) or not endpoint_name:
             raise ValueError("persisted RunPod endpoint name is invalid")
         fingerprint = d.get("key_fingerprint")
-        if runpod_api._is_legacy_key_fingerprint(fingerprint):
-            try:
-                fingerprint = runpod_api.resolve_legacy_key_fingerprint(endpoint_id, fingerprint)
-            except runpod_api.RunpodApiError:
-                raise ValueError("persisted RunPod key fingerprint is invalid") from None
         if not runpod_api._is_valid_key_fingerprint(fingerprint):
             raise ValueError("persisted RunPod key fingerprint is invalid")
         job_id = d.get("job_id")

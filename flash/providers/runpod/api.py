@@ -32,15 +32,6 @@ def _is_valid_key_fingerprint(fingerprint: object) -> bool:
     )
 
 
-def _is_legacy_key_fingerprint(fingerprint: object) -> bool:
-    return (
-        isinstance(fingerprint, str)
-        and len(fingerprint) == 16
-        and fingerprint.startswith("rpk-")
-        and all(char in "0123456789abcdef" for char in fingerprint[4:])
-    )
-
-
 def _unique_matching_key(matches: list[str], message: str) -> str:
     """The sole distinct credential among fingerprint matches.
 
@@ -137,63 +128,6 @@ def _list_endpoints_for_key(
             f"unexpected /endpoints response for a pool key (got {type(out).__name__}, want list)"
         )
     return out
-
-
-def resolve_legacy_key_fingerprint(endpoint_id: str, fingerprint: str) -> str:
-    """Upgrade a historical prefix only after its sole matching key proves endpoint ownership."""
-    if not _is_legacy_key_fingerprint(fingerprint):
-        raise RunpodApiError("persisted legacy RunPod key fingerprint is invalid")
-    configured_keys = _keys.keys()
-    matches = [
-        (key, full_fingerprint)
-        for key in configured_keys
-        if (full_fingerprint := key_fingerprint(key)).startswith(fingerprint)
-    ]
-    key = _unique_matching_key(
-        [match_key for match_key, _ in matches],
-        "expected exactly one RunPod pool key matching the persisted legacy fingerprint",
-    )
-    full_fingerprint = key_fingerprint(key)
-    try:
-        endpoints = _list_endpoints_for_key(key)
-    except Exception:
-        raise RunpodApiError(
-            f"runpod endpoint ownership lookup failed for {endpoint_id}; owner unconfirmed"
-        ) from None
-    if not any(
-        isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id for endpoint in endpoints
-    ):
-        # absence from this key's listing is not proof of foreign ownership: a process that died
-        # between deleting the endpoint and clearing its cleanup record leaves exactly this state,
-        # and refusing the upgrade would strand that record forever. but it is not proof of
-        # deletion either, and neither available signal settles it alone -- a 404 under the matching
-        # key means "invisible to this credential", which RunPod also answers for an endpoint alive
-        # under another account, while the pool listing cannot see an owner outside the pool at all.
-        # so require BOTH to agree it is gone: binding a record to the wrong credential is worse
-        # than stranding it, because teardown would then read 404, report success, and leave the
-        # real endpoint billing.
-        _confirm_deleted(endpoint_id, full_fingerprint)
-    return full_fingerprint
-
-
-def _confirm_deleted(endpoint_id: str, fingerprint: str) -> None:
-    """Raise unless both the pool-wide listing and the owner's own lookup agree it is gone."""
-    try:
-        fleet = list_endpoints()
-    except Exception:
-        raise RunpodApiError(
-            f"runpod endpoint ownership lookup failed for {endpoint_id}; owner unconfirmed"
-        ) from None
-    foreign = f"runpod endpoint {endpoint_id} is not owned by the legacy fingerprint match"
-    if any(isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id for endpoint in fleet):
-        raise RunpodApiError(foreign)
-    try:
-        # raises unless the lookup 404s, so a still-live endpoint can never read as deleted here.
-        absent = endpoint_absent_for_fingerprint(endpoint_id, fingerprint)
-    except RunpodApiError:
-        raise RunpodApiError(foreign) from None
-    if not absent:
-        raise RunpodApiError(foreign)
 
 
 def list_endpoints_by_key(

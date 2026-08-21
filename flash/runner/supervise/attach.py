@@ -773,7 +773,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     """Re-attach to a run's remote job from any process (after a client crash/restart)."""
     import sys
 
-    from flash.providers.runpod.jobs import migrate_persisted_legacy_key_fingerprints
     from flash.runner import (
         TERMINAL_STATES,
         _compare_and_fail_remote,
@@ -787,17 +786,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     )
     from flash.runner.supervise.lifecycle import _CompletedAttemptPending
 
-    # best-effort, for the same reason the poll, cancel, and drain sites are: the migration raises
-    # on the FIRST record it cannot resolve, and this call sits ABOVE the try below, so an
-    # unrelated historical record's departed credential would escape every handler here.
-    # `attach_run` is dispatched as a bare daemon thread by the restart sweep, so that escape
-    # silently kills recovery and leaves the run nonterminal while its remote keeps billing.
-    # the resolvable upgrades are durably written before that raise, so suppressing it still picks
-    # them up, and this run's own handle fingerprint is re-resolved independently by
-    # `JobHandle.from_dict` in `_build_attach_context` -- an unresolvable fingerprint on the handle
-    # actually being attached still fails, exactly as before.
-    with contextlib.suppress(Exception):
-        migrate_persisted_legacy_key_fingerprints(run_id)
     cleanup_terminal = False
 
     def status_for_return() -> RunStatus:
