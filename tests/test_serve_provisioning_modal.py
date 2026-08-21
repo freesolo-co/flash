@@ -585,6 +585,41 @@ def test_adoption_of_an_uncleaned_deployment_probes_instead_of_burning_the_deadl
     assert sdk.artifact == [], "the artifact was left behind for the next run to trip over"
 
 
+def test_adoption_keeps_the_artifact_when_readiness_is_never_proven() -> None:
+    """reclaim follows proof of readiness, never precedes it.
+
+    A cold container that never answers the probe leaves the wait returning nothing. Deleting the
+    artifact anyway strips the bootstrap credential from an app that has not proven it finished
+    hydrating, and leaves nothing for the rerun that `outcome_unknown` invites -- a destructive
+    mutation performed on the strength of a timeout.
+
+    The verdict is `outcome_unknown` either way, so the deletion bought nothing: it was pure loss.
+    """
+
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    _seed_exact(sdk, artifact=True)
+    clock = _Clock()
+
+    result = provision_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan: sdk,
+        probe=_Probe(False),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert sdk.artifact, "the bootstrap credential was reclaimed without ever proving readiness"
+    assert [name for name, _value in sdk.calls if name.startswith("delete_")] == [], (
+        "a readiness timeout must not mutate provider state"
+    )
+
+
 def test_adoption_tolerates_a_concurrent_artifact_reclaim_while_waiting() -> None:
     """a racer finishing the reclaim mid-wait is the success state, not a conflict.
 

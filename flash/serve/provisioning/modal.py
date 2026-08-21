@@ -6,7 +6,6 @@ import contextlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
 
 from flash.serve.control import (
     DeploymentResult,
@@ -15,7 +14,7 @@ from flash.serve.control import (
 )
 from flash.serve.control.types import validate_modal_handle
 
-from . import _modal_lifecycle
+from . import _modal_lifecycle, _modal_readiness
 from ._common import (
     DeploymentBundle,
     InterruptedProvisioning,
@@ -27,9 +26,7 @@ from ._modal_plan import ModalCreatePlan, build_modal_create_plan
 from ._modal_probe import ModalEndpointProbe
 from ._modal_resources import (
     ModalResourceConflict,
-    build_handle,
     ensure_unique_resources,
-    exact_core_resources,
     exact_teardown_resources,
     resources_are_absent,
 )
@@ -42,12 +39,9 @@ from ._modal_sdk import (
     create_modal_sdk,
 )
 
-_READINESS_POLL_SECONDS = 2.0
-_MAX_PROBE_TIMEOUT_SECONDS = 30.0
-
-# the shared primitives moved to `_modal_lifecycle` when this file reached the 1000-line limit.
-# bound to the private names the lifecycle below already used, so the split stayed a move rather
-# than a rename touching every call site.
+# readiness proofs and the endpoint probe moved to `_modal_readiness` when this file reached the
+# 1000-line limit, mirroring the `_runpod_readiness` split. bound to the private names the
+# lifecycle below already used, so the split stayed a move rather than a rename at every call site.
 _LifecycleFailure = LifecycleFailure
 _mutation = _modal_lifecycle.mutation
 _observe = _modal_lifecycle.observe
@@ -55,26 +49,20 @@ _open_sdk = _modal_lifecycle.open_sdk
 _validate_control_inputs = _modal_lifecycle.validate_control_inputs
 _validate_runtime_inputs = _modal_lifecycle.validate_runtime_inputs
 
-
-class EndpointProbe(Protocol):
-    def __call__(
-        self,
-        public_url: str,
-        inference_token: str,
-        bundle: DeploymentBundle,
-        timeout_seconds: float,
-    ) -> bool: ...
-
+EndpointProbe = _modal_readiness.EndpointProbe
+_ExpectedResources = _modal_readiness.ExpectedResources
+_PhaseProof = _modal_readiness.PhaseProof
+_TransientPhase = _modal_readiness.TransientPhase
+_failure_result = _modal_readiness.failure_result
+_from_sdk_failure = _modal_readiness.from_sdk_failure
+_matches_transient = _modal_readiness.matches_transient
+_phase_proof = _modal_readiness.phase_proof
+_probe_with_deadline = _modal_readiness.probe_with_deadline
+_sleep_until_poll = _modal_readiness.sleep_until_poll
+_unknown_result = _modal_readiness.unknown_result
+_wait_for_phase = _modal_readiness.wait_for_phase
 
 _DEFAULT_ENDPOINT_PROBE = ModalEndpointProbe()
-
-
-@dataclass(frozen=True, slots=True)
-class _ExpectedResources:
-    app_id: str | None
-    volume_id: str
-    inference_secret_id: str
-    artifact_secret_id: str | None
 
 
 @dataclass(slots=True)
@@ -109,164 +97,6 @@ class _CreatedResources:
     @property
     def any_created(self) -> bool:
         return self.inference or self.artifact or self.volume or self.app_deployed
-
-
-@dataclass(frozen=True, slots=True)
-class _PhaseProof:
-    handle: ModalProviderHandle
-    artifact: ModalNamedResource | None
-
-
-@dataclass(frozen=True, slots=True)
-class _TransientPhase:
-    plan: ModalCreatePlan
-    artifact_present: bool
-
-
-def _failure_result(
-    plan: ModalCreatePlan,
-    failure: _LifecycleFailure,
-    *,
-    handle: ModalProviderHandle | None = None,
-) -> DeploymentResult:
-    return failed_deployment_result(
-        plan.bundle.spec,
-        failure.code,
-        outcome_unknown=failure.outcome_unknown,
-        handle=handle,
-    )
-
-
-def _unknown_result(
-    plan: ModalCreatePlan,
-    *,
-    handle: ModalProviderHandle | None = None,
-) -> DeploymentResult:
-    return _failure_result(
-        plan,
-        _LifecycleFailure("resource_ambiguous", outcome_unknown=True),
-        handle=handle,
-    )
-
-
-def _from_sdk_failure(exc: ModalSdkFailure) -> _LifecycleFailure:
-    return _LifecycleFailure(exc.code, exc.outcome_unknown)
-
-
-def _sleep_until_poll(deadline_at: float, clock: Clock, sleep: Sleeper) -> bool:
-    remaining = deadline_at - clock()
-    if remaining <= 0:
-        return False
-    sleep(min(_READINESS_POLL_SECONDS, remaining))
-    return clock() < deadline_at
-
-
-def _probe_with_deadline(
-    probe: EndpointProbe,
-    handle: ModalProviderHandle,
-    inference_token: str,
-    plan: ModalCreatePlan,
-    *,
-    deadline_at: float,
-    clock: Clock,
-) -> bool:
-    remaining = deadline_at - clock()
-    if remaining <= 0:
-        return False
-    try:
-        accepted = probe(
-            handle.public_url,
-            inference_token,
-            plan.bundle,
-            min(_MAX_PROBE_TIMEOUT_SECONDS, remaining),
-        )
-    except Exception:
-        return False
-    return accepted is True and clock() < deadline_at
-
-
-def _phase_proof(
-    plan: ModalCreatePlan,
-    observation: ModalObservation,
-    *,
-    artifact_present: bool,
-    expected: _ExpectedResources | None,
-) -> _PhaseProof:
-    app, volume, inference = exact_core_resources(plan, observation)
-    artifacts = observation.artifact_secrets
-    if len(artifacts) != int(artifact_present):
-        raise ModalResourceConflict("modal artifact phase does not match the exact deployment")
-    artifact = artifacts[0] if artifacts else None
-    handle = build_handle(plan, app, volume, inference)
-    if expected is not None and (
-        (expected.app_id is not None and handle.app_id != expected.app_id)
-        or handle.volume_id != expected.volume_id
-        or handle.inference_secret_id != expected.inference_secret_id
-        or (artifact_present and (artifact is None or artifact.id != expected.artifact_secret_id))
-    ):
-        raise ModalResourceConflict("modal provider ids drifted across deployment phases")
-    return _PhaseProof(handle, artifact)
-
-
-def _matches_transient(
-    observation: ModalObservation,
-    transient: _TransientPhase,
-    expected: _ExpectedResources | None,
-) -> bool:
-    try:
-        _phase_proof(
-            transient.plan,
-            observation,
-            artifact_present=transient.artifact_present,
-            expected=expected,
-        )
-    except ModalResourceConflict:
-        return False
-    return True
-
-
-def _wait_for_phase(
-    plan: ModalCreatePlan,
-    sdk: ModalSdk,
-    inference_token: str,
-    *,
-    artifact_present: bool,
-    expected: _ExpectedResources | None,
-    transient_phases: tuple[_TransientPhase, ...],
-    deadline_at: float,
-    probe: EndpointProbe,
-    clock: Clock,
-    sleep: Sleeper,
-) -> _PhaseProof | None:
-    app_id_hint = None if expected is None else expected.app_id
-    while True:
-        observation = _observe(plan, sdk, app_id_hint=app_id_hint)
-        proof: _PhaseProof | None = None
-        if observation.resource_count:
-            try:
-                proof = _phase_proof(
-                    plan,
-                    observation,
-                    artifact_present=artifact_present,
-                    expected=expected,
-                )
-            except ModalResourceConflict:
-                if not any(
-                    _matches_transient(observation, transient, expected)
-                    for transient in transient_phases
-                ):
-                    raise
-        if proof is not None and _probe_with_deadline(
-            probe,
-            proof.handle,
-            inference_token,
-            plan,
-            deadline_at=deadline_at,
-            clock=clock,
-        ):
-            return proof
-        if not _sleep_until_poll(deadline_at, clock, sleep):
-            return None
 
 
 def _create_resources(
@@ -451,6 +281,84 @@ def _finalize_bootstrap(
     )
 
 
+def _adopt_uncleaned(
+    finalized_plan: ModalCreatePlan,
+    sdk: ModalSdk,
+    finalized: _PhaseProof,
+    inference_token: str,
+    *,
+    deadline_at: float,
+    probe: EndpointProbe,
+    clock: Clock,
+    sleep: Sleeper,
+) -> DeploymentResult:
+    """adopt a finalized app whose artifact secret was never reclaimed, then reclaim it.
+
+    The bounded wait targets the phase this observation already showed -- artifact present.
+    Targeting the *cleaned* phase could never build a proof while the secret is still there, so
+    nothing would ever be probed: the solo case, where no one else is reclaiming, would burn the
+    entire deadline and then hand an exhausted one to the reclaim.
+    """
+
+    try:
+        proved = _wait_for_phase(
+            finalized_plan,
+            sdk,
+            inference_token,
+            artifact_present=True,
+            expected=None,
+            transient_phases=(),
+            deadline_at=deadline_at,
+            probe=probe,
+            clock=clock,
+            sleep=sleep,
+        )
+    except ModalResourceConflict:
+        # the artifact can vanish underneath the wait: a concurrent `serve deploy`, or the run that
+        # created this app finishing its own reclaim. that leaves the deployment
+        # finalized-and-cleaned -- the success state -- yet a phase mismatch here, which would
+        # otherwise surface as a definite `conflict` for a healthy, billing app.
+        #
+        # only a vanished artifact is tolerable. re-read and prove that is what happened: identity
+        # drift -- a *replacement* app under the same names -- must stay a definite conflict rather
+        # than be mistaken for someone else's successful reclaim.
+        if not _matches_transient(
+            _observe(finalized_plan, sdk),
+            _TransientPhase(finalized_plan, False),
+            None,
+        ):
+            raise
+        # hand it to the reclaim: the delete is name-addressed and `allow_missing`, so it is a
+        # no-op against a secret already gone, and its own wait -- which targets the cleaned phase
+        # this observation just showed -- is what decides ready versus unknown.
+        return _delete_artifact_and_confirm(
+            finalized_plan,
+            sdk,
+            finalized,
+            inference_token,
+            deadline_at=deadline_at,
+            probe=probe,
+            clock=clock,
+            sleep=sleep,
+        )
+    if proved is None:
+        # the deadline ran out with the endpoint never answering. the artifact is this app's
+        # bootstrap credential and it is still here, so reclaiming it now would strip a container
+        # that has not yet proven it finished hydrating -- and leave nothing for the rerun this
+        # `outcome_unknown` invites. reclaim follows proof, never precedes it.
+        return _unknown_result(finalized_plan, handle=finalized.handle)
+    return _delete_artifact_and_confirm(
+        finalized_plan,
+        sdk,
+        proved,
+        inference_token,
+        deadline_at=deadline_at,
+        probe=probe,
+        clock=clock,
+        sleep=sleep,
+    )
+
+
 def _adopt_existing(
     bootstrap_plan: ModalCreatePlan,
     finalized_plan: ModalCreatePlan,
@@ -503,46 +411,10 @@ def _adopt_existing(
             expected=None,
         )
     if finalized is not None:
-        # same bounded wait as the branch above, but this phase still owns its artifact, so the
-        # target is the phase this observation already showed: artifact present. Waiting on the
-        # *cleaned* phase instead would never build a proof while the secret is still there, so
-        # nothing would ever be probed -- the solo case, where no one else is reclaiming, would
-        # burn the entire deadline and then hand an exhausted one to the cleanup below.
-        #
-        # the artifact can still vanish underneath this wait: a concurrent `serve deploy`, or the
-        # run that created this app finishing its own reclaim. that leaves the deployment
-        # finalized-and-cleaned -- the success state -- yet a phase mismatch to `_phase_proof`,
-        # which would otherwise surface as a definite `conflict` for a healthy, billing app. so
-        # stop waiting and let the cleanup below settle it: its own wait targets the cleaned phase,
-        # the delete is name-addressed and `allow_missing`, and the deadline is still unspent.
-        proved: _PhaseProof | None = None
-        try:
-            proved = _wait_for_phase(
-                finalized_plan,
-                sdk,
-                inference_token,
-                artifact_present=True,
-                expected=None,
-                transient_phases=(),
-                deadline_at=deadline_at,
-                probe=probe,
-                clock=clock,
-                sleep=sleep,
-            )
-        except ModalResourceConflict:
-            # only a vanished artifact is tolerable here. re-read and prove that is what happened:
-            # identity drift -- a *replacement* app under the same names -- must stay a definite
-            # conflict rather than be mistaken for someone else's successful reclaim.
-            if not _matches_transient(
-                _observe(finalized_plan, sdk),
-                _TransientPhase(finalized_plan, False),
-                None,
-            ):
-                raise
-        return _delete_artifact_and_confirm(
+        return _adopt_uncleaned(
             finalized_plan,
             sdk,
-            proved if proved is not None else finalized,
+            finalized,
             inference_token,
             deadline_at=deadline_at,
             probe=probe,
