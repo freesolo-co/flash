@@ -1710,6 +1710,12 @@ def test_concurrent_misses_hydrate_in_order_without_stampeding():
     # the empty fetch must not land after the fresh one. asserting the ORDER, not a fixed list:
     # requiring `[0]` would mean the later miss reused the earlier snapshot, which is the defect.
     assert hydrated == sorted(hydrated), f"a stale fetch hydrated after a fresher one: {hydrated}"
+    # the caller whose miss forced the follow-up fetch must SEE it. bounding the fetch count alone
+    # let an implementation read storage and drop the records on the floor: the counts and the
+    # ordering both still held while the committed adapter stayed invisible and every caller 404'd.
+    assert any(not isinstance(result, HTTPException) for result in results), (
+        "the follow-up fetch ran but no caller could resolve the adapter it read"
+    )
     # no caller sees a half-applied hydrate: each either resolves the pair or gets a clean 404.
     for result in results:
         if isinstance(result, HTTPException):
@@ -1766,7 +1772,8 @@ def test_a_reload_that_snapshotted_first_cannot_answer_a_later_miss():
             release.wait(timeout=5)
         return snapshot
 
-    lookup = AdapterLookup(AdapterRouter([]), _reload, reload_interval_seconds=30.0)
+    router = AdapterRouter([])
+    lookup = AdapterLookup(router, _reload, reload_interval_seconds=30.0)
 
     async def _sequence():
         first = asyncio.create_task(lookup.reload())
@@ -1781,3 +1788,9 @@ def test_a_reload_that_snapshotted_first_cannot_answer_a_later_miss():
     asyncio.run(_sequence())
 
     assert calls["count"] == 2, "the later miss reused a snapshot taken before it began"
+    # and the second fetch's records must actually land. the fetch count only proves storage was
+    # re-read; the point of re-reading it is that the adapter committed in between becomes
+    # resolvable, which is exactly what the caller's 404 depended on.
+    assert router.resolve("committed-late") is not None, (
+        "storage was re-read but the adapter committed before that miss stayed invisible"
+    )
