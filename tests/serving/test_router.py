@@ -1527,14 +1527,24 @@ def test_stale_ready_record_refreshes_in_background():
     from httpx import ASGITransport, AsyncClient
 
     revision = _rec("qa", QWEN)
-    # A row this router does not start with. Its arrival is the only signal that a reload
-    # HYDRATED, as opposed to merely having been entered: the reload callback runs in a worker
+    # a row this router does not start with. its arrival is the only signal that a reload
+    # hydrated, rather than merely having been entered: the reload callback runs in a worker
     # thread and counts itself on entry, while hydrate happens later, back on the event loop.
-    # Waiting on the counter would let the undeploy below land inside that gap and coalesce onto
-    # the in-flight fetch, which already snapshotted non-empty rows -- failing against correct code.
+    # waiting on the counter lets the undeploy below land inside that gap and coalesce onto the
+    # in-flight fetch, which already snapshotted non-empty rows -- failing against correct code.
     canary = _rec("canary", QWEN)
     shared = {"rows": [revision, _alias(revision), canary, _alias(canary)]}
     reloads = {"count": 0}
+    # plain scalars, read before production is handed the records. the router stores the instances
+    # it is given, so anything derived from those objects would move with a corruption instead of
+    # catching it.
+    material = (
+        revision.repo_id,
+        revision.base_model,
+        revision.checkpoint,
+        revision.org_id,
+        revision.metadata["hf_revision"],
+    )
 
     def _reload():
         reloads["count"] += 1
@@ -1545,6 +1555,15 @@ def test_stale_ready_record_refreshes_in_background():
     app = build_serving_app(
         pool, router, reload_records=_reload, reload_interval_seconds=0.0, chat_authorizer=_allow
     )
+
+    def _served_material(record):
+        return (
+            record.repo_id,
+            record.base_model,
+            record.checkpoint,
+            record.org_id,
+            record.metadata["hf_revision"],
+        )
 
     async def _scenario():
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as ac:
@@ -1557,28 +1576,45 @@ def test_stale_ready_record_refreshes_in_background():
                 )
                 return response.status_code
 
-            # Serve on BOTH ids while deployed. Priming the immutable id matters: a cache keyed on
+            async def _until(predicate, message: str) -> None:
+                # a generous deadline rather than a fixed poll count: the success path still exits
+                # on the first 10ms tick, but a loaded machine cannot fail a correct refresh.
+                deadline = asyncio.get_running_loop().time() + 5.0
+                while not predicate():
+                    if asyncio.get_running_loop().time() >= deadline:
+                        pytest.fail(message)
+                    await asyncio.sleep(0.01)
+
+            # serve on both ids while deployed. priming the immutable id matters: a cache keyed on
             # "immutable revisions never change" is only reachable once the revision has resolved.
             assert await _generate("qa") == 200
             assert await _generate(_revision_id("qa")) == 200
-            for _ in range(100):
-                if router.has("canary"):
-                    break
-                await asyncio.sleep(0.01)
-            assert router.has("canary"), "the first background refresh never hydrated"
+            await _until(
+                lambda: router.has("canary"), "the first background refresh never hydrated"
+            )
             settled = reloads["count"]
-            # Another container undeploys qa: it drops out of the status=ready reload.
+            # a refresh must re-serve the same adapter, not merely an adapter under the same id.
+            # existence survives a reload that rebuilds records from the wrong material, so status
+            # codes alone would keep passing while every request is served from the wrong weights.
+            refreshed = router.get(_revision_id("qa"))
+            assert refreshed is not None, "the refresh dropped the revision it re-fetched"
+            assert _served_material(refreshed) == material, (
+                f"the refresh replaced the revision's material: {refreshed}"
+            )
+            assert [_served_material(record) for record in pool.generated_records] == [
+                material
+            ] * 2, (
+                f"the engine was handed material other than the record storage returned: "
+                f"{pool.generated_records}"
+            )
+            # another container undeploys qa: it drops out of the status=ready reload.
             shared["rows"] = []
-            # This hit is stale, but still cached: serve it and schedule the refresh.
+            # this hit is stale, but still cached: serve it and schedule the refresh.
             assert await _generate("qa") == 200
-            for _ in range(50):
-                if not router.has("qa"):
-                    break
-                await asyncio.sleep(0.01)
-            assert not router.has("qa")
-            # a genuinely LATER refresh did the work, not the one that had already settled.
+            await _until(lambda: not router.has("qa"), "the undeploy never landed")
+            # a genuinely later refresh did the work, not the one that had already settled.
             assert reloads["count"] > settled, "the ttl window stopped refreshing after the first"
-            # After the background refresh, NEITHER id is routed here. The immutable id is the one
+            # after the background refresh, neither id is routed here. the immutable id is the one
             # that matters: `resolve` answers a ready revision directly, so anything that holds one
             # past its undeploy keeps serving an adapter that no longer exists -- invisible to the
             # alias, and invisible to the registry if the staleness lives downstream of it.
