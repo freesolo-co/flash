@@ -193,11 +193,21 @@ def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
         get_provider("runpod").destroy(canonical)
         return
 
+    owner_resolved = False
     try:
         runpod_api._key_for_fingerprint(fingerprint)
     except runpod_api.RunpodApiError:
-        pass
+        if runpod_api._is_legacy_key_fingerprint(fingerprint):
+            try:
+                fingerprint = runpod_api.resolve_legacy_key_fingerprint(endpoint_id, fingerprint)
+            except runpod_api.RunpodApiError:
+                pass
+            else:
+                owner_resolved = True
     else:
+        owner_resolved = True
+
+    if owner_resolved:
         if runpod_api.delete_endpoint_for_fingerprint(endpoint_id, fingerprint):
             return
         if not runpod_api.endpoint_absent_for_fingerprint(endpoint_id, fingerprint):

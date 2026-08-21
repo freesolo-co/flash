@@ -13,6 +13,8 @@ import urllib.error
 
 import pytest
 
+from flash.providers.runpod.api import list_endpoints as _real_list_endpoints
+
 
 def _reset_pool(monkeypatch, value):
     monkeypatch.setenv("RUNPOD_API_KEY", value)
@@ -72,6 +74,100 @@ def test_repeated_identical_pool_key_still_resolves_its_fingerprint(monkeypatch)
 
     assert api._key_for_fingerprint(api.key_fingerprint("secretA")) == "secretA"
     assert api._key_for_fingerprint(api.key_fingerprint("secretB")) == "secretB"
+
+
+def test_legacy_fingerprint_owner_listing_deletes_through_authenticated_path(monkeypatch):
+    from flash.providers.runpod import api
+    from flash.runner.supervise.recovery import _delete_runpod_endpoint
+
+    key = "legacy-owner"
+    full_fingerprint = api.key_fingerprint(key)
+    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+    monkeypatch.setattr(
+        api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: pytest.fail("legacy prefix must resolve before inventory fallback"),
+    )
+    calls = []
+
+    def request(request_key, url, **kwargs):
+        calls.append((request_key, url, kwargs.get("method", "GET")))
+        if url.endswith("/endpoints"):
+            return [{"id": "ep-legacy"}]
+        return {}
+
+    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", request)
+
+    _delete_runpod_endpoint({"endpoint_id": "ep-legacy", "key_fingerprint": full_fingerprint[:16]})
+
+    assert calls == [
+        (key, f"{api.REST_BASE}/endpoints", "GET"),
+        (key, f"{api.REST_BASE}/endpoints/ep-legacy", "DELETE"),
+    ]
+
+
+def test_legacy_fingerprint_already_gone_retires_cleanup_record(monkeypatch):
+    from flash.providers.runpod import api
+    from flash.runner.supervise.recovery import _delete_runpod_endpoint
+
+    key = "legacy-owner"
+    other_key = "other-account"
+    full_fingerprint = api.key_fingerprint(key)
+    monkeypatch.setattr(api._keys, "keys", lambda: [key, other_key])
+    monkeypatch.setattr(api, "list_endpoints", _real_list_endpoints)
+
+    def gone_everywhere(_request_key, url, **_kwargs):
+        if url.endswith("/endpoints"):
+            return []
+        raise api.RunpodApiError("not found") from urllib.error.HTTPError(
+            url, 404, "not found", {}, io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", gone_everywhere)
+
+    _delete_runpod_endpoint({"endpoint_id": "ep-legacy", "key_fingerprint": full_fingerprint[:16]})
+
+
+def test_legacy_fingerprint_rejects_ambiguous_prefix_owners(monkeypatch):
+    from flash.providers.runpod import api
+
+    keys = ["owner-a", "owner-b"]
+    fingerprints = {
+        "owner-a": "rpk-" + "a" * 12 + "1" * 52,
+        "owner-b": "rpk-" + "a" * 12 + "2" * 52,
+    }
+    monkeypatch.setattr(api._keys, "keys", lambda: keys)
+    monkeypatch.setattr(api, "key_fingerprint", fingerprints.__getitem__)
+    monkeypatch.setattr(
+        api._CLIENT,
+        "request_with_retries_for_key",
+        lambda *_args, **_kwargs: pytest.fail("ambiguous ownership must not query an account"),
+    )
+
+    with pytest.raises(api.RunpodApiError, match="expected exactly one"):
+        api.resolve_legacy_key_fingerprint("ep-legacy", "rpk-" + "a" * 12)
+
+
+def test_legacy_fingerprint_rejects_endpoint_live_under_other_account(monkeypatch):
+    from flash.providers.runpod import api
+
+    key = "legacy-owner"
+    other_key = "other-account"
+    full_fingerprint = api.key_fingerprint(key)
+    monkeypatch.setattr(api._keys, "keys", lambda: [key, other_key])
+    monkeypatch.setattr(api, "list_endpoints", _real_list_endpoints)
+
+    def alive_under_other_account(request_key, url, **_kwargs):
+        if url.endswith("/endpoints"):
+            return [] if request_key == key else [{"id": "ep-legacy"}]
+        raise api.RunpodApiError("not found") from urllib.error.HTTPError(
+            url, 404, "not found", {}, io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", alive_under_other_account)
+
+    with pytest.raises(api.RunpodApiError, match="not owned by the legacy fingerprint match"):
+        api.resolve_legacy_key_fingerprint("ep-legacy", full_fingerprint[:16])
 
 
 def test_rotated_sole_replacement_with_same_48_bit_prefix_cannot_confirm_absence(monkeypatch):
