@@ -400,12 +400,18 @@ class GenerateRequest(BaseModel):
     @field_validator("stop", mode="before")
     @classmethod
     def normalize_stop(cls, value: Any) -> str | list[str] | None:
-        # an empty string never terminates generation and an empty list is not a constraint; both
-        # normalize to None so the engine sees "unspecified" rather than a no-op it must carry.
+        # `None` is the one spelling of "no stop constraint". an empty LIST means the caller
+        # supplied no sequences, so it normalizes to that. an empty STRING is different: it is a
+        # sequence the caller authored that can never terminate generation, and accepting it would
+        # dispatch an unconstrained run under a constraint the caller believes they set. it is
+        # already refused inside a list, and the flash-owned runtime validator refuses it too, so
+        # accepting the bare form was the odd one out rather than a deliberate allowance.
         if value is None:
             return None
         if isinstance(value, str):
-            return value or None
+            if not value:
+                raise ValueError("stop must not be an empty string")
+            return value
         if isinstance(value, list):
             if not all(isinstance(item, str) and item for item in value):
                 raise ValueError("stop entries must be non-empty strings")

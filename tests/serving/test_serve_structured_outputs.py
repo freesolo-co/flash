@@ -502,12 +502,23 @@ def test_invalid_stored_spec_raises_value_error_before_ready(modal_app_module):
         ("STOP", "STOP"),
         (["</s>", "\n\n"], ["</s>", "\n\n"]),
         (None, None),
-        ("", None),  # never terminates anything
-        ([], None),  # not a constraint
+        ([], None),  # no sequences supplied, so no constraint
     ],
 )
 def test_stop_reaches_sampling_params(modal_app_module, value, expected):
     assert _generate(_engine(modal_app_module), stop=value).stop == expected
+
+
+def test_an_empty_stop_string_is_rejected_rather_than_silently_dropped(modal_app_module):
+    """An authored sequence that can never terminate generation must not become "unconstrained".
+
+    Accepting `""` dispatched a run with no stop constraint while the caller believed they had set
+    one. The same value is already refused inside a list, and the flash-owned runtime validator
+    refuses it too, so the bare form was the inconsistent case. `None` remains the one spelling of
+    "no constraint".
+    """
+    with pytest.raises(ValidationError, match="must not be an empty string"):
+        _generate(_engine(modal_app_module), stop="")
 
 
 def test_stop_reaches_sampling_params_when_streaming(modal_app_module):
