@@ -14,7 +14,7 @@ import re
 
 from fastapi import HTTPException
 
-from flash.content.multimodal import normalize_prompt_images
+from flash.content.multimodal import messages_with_image_data_uris, normalize_prompt_images
 from flash.core.spec import JobSpec
 from flash.runner import adapter_prefix, read_verified_adapter_revisions
 from flash.runner.results.checkpoints import checkpoint_adapter_prefix
@@ -214,13 +214,18 @@ def _spec_is_unservable(status) -> bool:
 
 
 def _chat_messages_from_payload(payload: dict) -> list[dict]:
-    """Validate a chat payload's messages against the training image contract.
+    """Normalize a chat payload's messages against the training image contract.
 
-    serving admits the same images training does. the request is validated with the canonical
-    normalizer so the count, user-only role, mime, byte, pixel, and decoded-memory limits cannot
-    drift from the ones training enforces, but the caller's own messages are what gets forwarded:
-    normalization rewrites scalar ``content`` into block form, and sending that rewritten shape
-    upstream would change the wire format of every existing text-only request.
+    serving admits the same images training does, so the request goes through the canonical
+    normalizer and the count, user-only role, mime, byte, pixel, and decoded-memory limits cannot
+    drift from the ones training enforces.
+
+    what gets forwarded is the shape that was validated. a text-only request is returned
+    untouched, because normalization rewrites scalar ``content`` into block form and sending that
+    rewritten shape upstream would change the wire format of every existing text-only request. an
+    image request is forwarded in canonical openai ``image_url`` form: the normalizer accepts the
+    sdk spellings (``input_text``, ``input_image``, ``image``) that the upstream engine does not,
+    so returning the caller's own blocks would admit a request the engine then rejects.
     """
     raw = payload.get("messages")
     if raw is None:
@@ -234,10 +239,12 @@ def _chat_messages_from_payload(payload: dict) -> list[dict]:
                 detail=f"messages[{index}] must be a chat message object",
             )
     try:
-        normalize_prompt_images({}, raw, None)
+        normalized = normalize_prompt_images({}, raw, None)
+        if not normalized.descriptors:
+            return raw
+        return messages_with_image_data_uris(normalized.messages, normalized.descriptors, None)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"invalid image request: {exc}") from exc
-    return raw
 
 
 def _parse_checkpoint_step(raw_step) -> int:

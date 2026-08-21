@@ -10,6 +10,7 @@ offline conftest.
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import json
 import multiprocessing
@@ -316,11 +317,11 @@ def test_chat_messages_from_payload_validation():
     assert "messages[1]" in bad_item.value.detail
 
 
-def _png_data_uri(image_format: str = "PNG") -> str:
+def _png_data_uri(image_format: str = "PNG", color: str = "red") -> str:
     from PIL import Image
 
     buffer = io.BytesIO()
-    Image.new("RGB", (8, 8), "red").save(buffer, format=image_format)
+    Image.new("RGB", (8, 8), color).save(buffer, format=image_format)
     mime = {"PNG": "image/png", "GIF": "image/gif"}[image_format]
     return f"data:{mime};base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
@@ -366,18 +367,51 @@ def test_chat_payload_rejects_images_training_would_refuse(messages, expected_de
     assert expected_detail in rejected.value.detail
 
 
-def test_chat_payload_forwards_admitted_messages_unchanged():
-    """the caller's own messages go upstream verbatim, including a legal four-image request.
+def test_chat_payload_forwards_text_only_requests_byte_for_byte():
+    """a text-only request goes upstream exactly as the caller wrote it.
 
     the normalizer rewrites scalar ``content`` into block form; forwarding that rewritten shape
-    would change the wire format of every existing text-only request, so it is used to validate
-    and its output is deliberately discarded.
+    would change the wire format of every existing text-only request. asserted on a deep copy
+    rather than on list identity, since identity also holds if the messages were mutated in place.
     """
-    text_only = [{"role": "user", "content": "hi"}]
-    assert serving._chat_messages_from_payload({"messages": text_only}) is text_only
+    text_only = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+    before = copy.deepcopy(text_only)
+    forwarded = serving._chat_messages_from_payload({"messages": text_only})
+    assert forwarded == before
+    assert text_only == before
 
-    four_images = [{"role": "user", "content": [_image_block(_png_data_uri()) for _ in range(4)]}]
-    assert serving._chat_messages_from_payload({"messages": four_images}) is four_images
+
+def test_chat_payload_forwards_images_in_the_shape_it_validated():
+    """an admitted image request reaches the engine as canonical openai ``image_url`` blocks.
+
+    the normalizer accepts sdk spellings the upstream openai-compatible endpoint does not, so
+    forwarding the caller's own blocks would admit a request the engine then rejects with a 502.
+    validating one representation and forwarding another is the bug this pins.
+    """
+    uri = _png_data_uri()
+    aliased = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "describe"},
+                {"type": "input_image", "input_image": uri},
+            ],
+        }
+    ]
+    before = copy.deepcopy(aliased)
+    forwarded = serving._chat_messages_from_payload({"messages": aliased})
+    assert [block["type"] for block in forwarded[0]["content"]] == ["text", "image_url"]
+    assert forwarded[0]["content"][1]["image_url"]["url"] == uri
+    # the caller's own object is never rewritten in place.
+    assert aliased == before
+
+
+def test_chat_payload_preserves_image_order_when_canonicalizing():
+    """four images arrive upstream in the order the caller sent them, with their exact bytes."""
+    uris = [_png_data_uri(color=color) for color in ("red", "green", "blue", "yellow")]
+    messages = [{"role": "user", "content": [_image_block(uri) for uri in uris]}]
+    forwarded = serving._chat_messages_from_payload({"messages": messages})
+    assert [block["image_url"]["url"] for block in forwarded[0]["content"]] == uris
 
 
 def test_validate_hf_repo_id_accepts_valid_and_rejects_malformed():
