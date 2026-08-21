@@ -171,6 +171,7 @@ def _resolve_ref_sha(
     *,
     timeout: float = 60.0,
     max_rate_limit_retries: int = 5,
+    deadline_at: float | None = None,
 ) -> str:
     # Control plane pins sha once; workers skip GitHub entirely on a fan-out.
     if pinned_sha and is_commit_sha(pinned_sha):
@@ -181,7 +182,13 @@ def _resolve_ref_sha(
     headers = _github_headers("application/vnd.github+json")
     commit_url = f"https://api.github.com/repos/{parsed.repo_full_name}/commits/{urllib.parse.quote(parsed.ref, safe='')}"
     req = urllib.request.Request(commit_url, headers=headers)
-    data = _urlopen(req, timeout=timeout, max_rate_limit_retries=max_rate_limit_retries)
+    request_options = {
+        "timeout": timeout,
+        "max_rate_limit_retries": max_rate_limit_retries,
+    }
+    if deadline_at is not None:
+        request_options["deadline_at"] = deadline_at
+    data = _urlopen(req, **request_options)
     try:
         payload = json.loads(data)
     except json.JSONDecodeError as exc:
@@ -219,6 +226,7 @@ def _urlopen(
     max_rate_limit_retries: int = 5,
     max_bytes: int | None = None,
     out: BinaryIO | None = None,
+    deadline_at: float | None = None,
 ) -> bytes:
     """Fetch bytes for a GitHub request with jittered retry on rate limits.
 
@@ -255,13 +263,35 @@ def _urlopen(
     # every attempt writes the whole body from this offset, so the sink holds one attempt's bytes.
     sink_start = out.tell() if out is not None else 0
 
+    def remaining_timeout() -> float:
+        if deadline_at is None:
+            return timeout
+        remaining = float(deadline_at) - time.time()
+        if remaining <= 0:
+            raise GitHubUnavailableError(
+                "GitHub environment request exceeded the authoritative run deadline"
+            )
+        return min(timeout, remaining)
+
+    def sleep_before_retry(delay: float) -> None:
+        if deadline_at is None:
+            time.sleep(delay)
+            return
+        remaining = float(deadline_at) - time.time()
+        if remaining <= 0:
+            raise GitHubUnavailableError(
+                "GitHub environment request exceeded the authoritative run deadline"
+            )
+        time.sleep(min(delay, remaining))
+
     attempt = 0
     while True:
         try:
+            request_timeout = remaining_timeout()
             if out is not None:
                 out.seek(sink_start)
                 out.truncate()
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=request_timeout) as resp:
                 return drain(resp)
         except urllib.error.HTTPError as exc:
             # urllib can raise an HTTPError with fp=None; exc.read() is an AttributeError there.
@@ -272,7 +302,7 @@ def _urlopen(
             )
             is_transient = is_rate_limit or exc.code >= 500
             if is_transient and attempt < max_rate_limit_retries:
-                time.sleep(backoff_delay(attempt))
+                sleep_before_retry(backoff_delay(attempt))
                 attempt += 1
                 continue
             if is_rate_limit:
@@ -300,7 +330,7 @@ def _urlopen(
             ) from exc
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             if attempt < max_rate_limit_retries:
-                time.sleep(backoff_delay(attempt))
+                sleep_before_retry(backoff_delay(attempt))
                 attempt += 1
                 continue
             reason = getattr(exc, "reason", exc)
@@ -309,7 +339,11 @@ def _urlopen(
             ) from exc
 
 
-def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
+def _download_github_tarball(
+    ref: GitHubEnvironmentRef,
+    *,
+    deadline_at: float | None = None,
+) -> Path:
     url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
     headers = _github_headers("application/vnd.github+json")
     tar_path: Path | None = None
@@ -318,11 +352,16 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
             prefix="flash-env-tar-", suffix=".tar.gz", delete=False
         ) as spill:
             tar_path = Path(spill.name)
+            request_options = {
+                "timeout": 120.0,
+                "max_bytes": _MAX_TARBALL_BYTES,
+                "out": spill,
+            }
+            if deadline_at is not None:
+                request_options["deadline_at"] = deadline_at
             _urlopen(
                 urllib.request.Request(url, headers=headers),
-                timeout=120.0,
-                max_bytes=_MAX_TARBALL_BYTES,
-                out=spill,
+                **request_options,
             )
     except BaseException:
         if tar_path is not None:
@@ -404,8 +443,11 @@ def _download_github_json(
     *,
     timeout: float = 120.0,
     max_rate_limit_retries: int = 5,
+    deadline_at: float | None = None,
 ) -> object:
     request_options = {"timeout": timeout, "max_bytes": _MAX_CONTENTS_JSON_BYTES}
+    if deadline_at is not None:
+        request_options["deadline_at"] = deadline_at
     if max_rate_limit_retries != 5:
         request_options["max_rate_limit_retries"] = max_rate_limit_retries
     data = _urlopen(
@@ -437,13 +479,19 @@ def _github_tree_entries(
     recursive: bool = False,
     timeout: float = 120.0,
     max_rate_limit_retries: int = 5,
+    deadline_at: float | None = None,
 ) -> list[dict]:
+    request_options = {
+        "timeout": timeout,
+        "max_rate_limit_retries": max_rate_limit_retries,
+    }
+    if deadline_at is not None:
+        request_options["deadline_at"] = deadline_at
     payload = _download_github_json(
         ref,
         _github_tree_url(ref, treeish, recursive=recursive),
         context,
-        timeout=timeout,
-        max_rate_limit_retries=max_rate_limit_retries,
+        **request_options,
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
         raise RuntimeError(
@@ -460,11 +508,22 @@ def _github_tree_entries(
     return entries
 
 
-def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str) -> str:
+def _resolve_github_directory_tree_sha(
+    ref: GitHubEnvironmentRef,
+    repo_dir: str,
+    *,
+    deadline_at: float | None = None,
+) -> str:
     treeish = ref.ref
     current = ""
     for part in [part for part in repo_dir.split("/") if part]:
-        entries = _github_tree_entries(ref, treeish, current or ref.ref)
+        request_options = {"deadline_at": deadline_at} if deadline_at is not None else {}
+        entries = _github_tree_entries(
+            ref,
+            treeish,
+            current or ref.ref,
+            **request_options,
+        )
         match = next(
             (
                 entry
@@ -482,7 +541,13 @@ def _resolve_github_directory_tree_sha(ref: GitHubEnvironmentRef, repo_dir: str)
     return treeish
 
 
-def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: Path) -> Path:
+def _download_github_directory(
+    ref: GitHubEnvironmentRef,
+    repo_dir: str,
+    dest: Path,
+    *,
+    deadline_at: float | None = None,
+) -> Path:
     """Download one GitHub directory into a repo-shaped tree under ``dest``."""
     repo_root = dest / "repo"
     root_parts = [part for part in repo_dir.split("/") if part]
@@ -512,14 +577,19 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
         target = repo_root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("wb") as out:
+            request_options = {
+                "timeout": 120.0,
+                "max_bytes": remaining,
+                "out": out,
+            }
+            if deadline_at is not None:
+                request_options["deadline_at"] = deadline_at
             _urlopen(
                 urllib.request.Request(
                     _github_contents_url(ref, path),
                     headers=_github_headers("application/vnd.github.raw"),
                 ),
-                timeout=120.0,
-                max_bytes=remaining,
-                out=out,
+                **request_options,
             )
         state["bytes"] += target.stat().st_size
         if state["bytes"] > _MAX_ARCHIVE_BYTES:
@@ -536,11 +606,17 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
         (repo_root / path).mkdir(parents=True, exist_ok=True)
 
     create_dir(repo_dir)
-    package_tree_sha = _resolve_github_directory_tree_sha(ref, repo_dir)
+    request_options = {"deadline_at": deadline_at} if deadline_at is not None else {}
+    package_tree_sha = _resolve_github_directory_tree_sha(
+        ref,
+        repo_dir,
+        **request_options,
+    )
     payload = _download_github_json(
         ref,
         _github_tree_url(ref, package_tree_sha, recursive=True),
         repo_dir,
+        **request_options,
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
         raise RuntimeError(
@@ -568,8 +644,14 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
     return repo_root
 
 
-def _extract_github_tarball(ref: GitHubEnvironmentRef, dest: Path) -> Path:
-    tarball = _download_github_tarball(ref)
+def _extract_github_tarball(
+    ref: GitHubEnvironmentRef,
+    dest: Path,
+    *,
+    deadline_at: float | None = None,
+) -> Path:
+    request_options = {"deadline_at": deadline_at} if deadline_at is not None else {}
+    tarball = _download_github_tarball(ref, **request_options)
     try:
         return _safe_extract_archive(tarball, dest)
     finally:
@@ -841,16 +923,19 @@ def _import_freesolo_environment_tools():
         ) from exc
 
 
-def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **kwargs):
-    # pinned_sha is positional-only so user [environment.params] named "pinned_sha" goes to **kwargs, not here.
+def _load_resolved_freesolo_environment(
+    env_id: str,
+    reference: str,
+    params: dict,
+):
+    """Load one already-resolved local entrypoint while retaining its canonical id."""
     from flash.envs.adapter import FreesoloEnvironment
 
     tools = _import_freesolo_environment_tools()
-    reference = _resolve_environment_reference(env_id, pinned_sha)
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 
-    params = dict(kwargs)
+    params = dict(params)
     source = params.pop("records", None)
     selection = select_dataset_source(params, base_dir, source, _resolve_path_arg)
     source = selection.source
@@ -887,6 +972,12 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         contract_text=contract_text,
         package_root=base_dir,
     )
+
+
+def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **kwargs):
+    # pinned_sha is positional-only so a user param named pinned_sha cannot shadow it.
+    reference = _resolve_environment_reference(env_id, pinned_sha)
+    return _load_resolved_freesolo_environment(env_id, reference, kwargs)
 
 
 from flash.envs.namespace_listing import (  # noqa: E402

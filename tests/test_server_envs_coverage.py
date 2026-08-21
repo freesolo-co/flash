@@ -9,6 +9,8 @@ offline conftest.
 
 from __future__ import annotations
 
+import base64
+import copy
 import io
 import json
 import multiprocessing
@@ -27,6 +29,8 @@ from fastapi import HTTPException
 
 import flash.server.routes.serving as serving
 import flash.server.routes.serving_completion as serving_completion
+import flash.server.routes.serving_smoke as serving_smoke
+from flash.content import multimodal
 from flash.engine.plan.recipe import RECIPE
 from flash.serve.deploy import AliasThinkingSilent, ServingError
 
@@ -314,6 +318,172 @@ def test_chat_messages_from_payload_validation():
     assert "messages[1]" in bad_item.value.detail
 
 
+def _png_data_uri(image_format: str = "PNG", color: str = "red") -> str:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), color).save(buffer, format=image_format)
+    mime = {"PNG": "image/png", "GIF": "image/gif"}[image_format]
+    return f"data:{mime};base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _image_block(url: str) -> dict:
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _sized_png_data_uri(width: int, height: int) -> str:
+    """A real PNG of exact dimensions, for the pixel and decoded-memory limits."""
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), "red").save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _oversized_source_data_uri(payload_bytes: int) -> str:
+    """A data URI whose source exceeds a byte limit before any decode is attempted.
+
+    The bytes are not a decodable image on purpose: the byte limits must reject on size
+    alone, so a test that fed a real image here would not distinguish the byte guard from
+    the decoder refusing the result.
+    """
+    blob = b"\x89PNG\r\n\x1a\n" + b"\x00" * payload_bytes
+    return "data:image/png;base64," + base64.b64encode(blob).decode("ascii")
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_detail"),
+    [
+        pytest.param(
+            [{"role": "user", "content": [_image_block(_png_data_uri()) for _ in range(5)]}],
+            "exceeding the 4-image limit",
+            id="fifth_image",
+        ),
+        pytest.param(
+            [{"role": "assistant", "content": [_image_block(_png_data_uri())]}],
+            "allowed only in user messages",
+            id="assistant_image",
+        ),
+        pytest.param(
+            [{"role": "user", "content": [_image_block(_png_data_uri("GIF"))]}],
+            "unsupported MIME type",
+            id="unsupported_mime",
+        ),
+        pytest.param(
+            [{"role": "user", "content": [_image_block("https://example.com/a.png")]}],
+            "remote image URLs are not supported",
+            id="remote_url",
+        ),
+        pytest.param(
+            [{"role": "user", "content": [_image_block(_sized_png_data_uri(8192, 8192))]}],
+            f"exceeding the {multimodal.MAX_IMAGE_PIXELS}-pixel limit",
+            id="per_image_pixels",
+        ),
+        pytest.param(
+            [{"role": "user", "content": [_image_block(_sized_png_data_uri(9000, 8))]}],
+            "image dimensions 9000x8 exceed the 8192x8192 limit",
+            id="dimensions",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        _image_block(
+                            _oversized_source_data_uri(multimodal.MAX_IMAGE_SOURCE_BYTES + 1)
+                        )
+                    ],
+                }
+            ],
+            f"image source exceeds the {multimodal.MAX_IMAGE_SOURCE_BYTES}-byte limit",
+            id="per_image_source_bytes",
+        ),
+        pytest.param(
+            # three 6 MiB sources: each is under the per-image cap, their total is not.
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        _image_block(_oversized_source_data_uri(6 * 1024 * 1024)) for _ in range(3)
+                    ],
+                }
+            ],
+            f"exceeding the {multimodal.MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit",
+            id="aggregate_source_bytes",
+        ),
+        pytest.param(
+            # four 2400x2400 images: each is under the per-image pixel cap, but decoding
+            # them cumulatively as RGB needs ~69 MB against a 64 MiB budget.
+            [
+                {
+                    "role": "user",
+                    "content": [_image_block(_sized_png_data_uri(2400, 2400)) for _ in range(4)],
+                }
+            ],
+            f"example decoded images exceed the {multimodal.MAX_TOTAL_DECODED_BYTES}-byte limit",
+            id="aggregate_decoded_bytes",
+        ),
+    ],
+)
+def test_chat_payload_rejects_images_training_would_refuse(messages, expected_detail):
+    """serving admits exactly the images training does, so a request cannot bypass the contract.
+
+    without this the chat route forwarded any caller content straight upstream: training enforced
+    the count, role, mime, byte, and decoded-memory limits while serving enforced none of them.
+    """
+    with pytest.raises(HTTPException) as rejected:
+        serving._chat_messages_from_payload({"messages": messages})
+    assert rejected.value.status_code == 400
+    assert expected_detail in rejected.value.detail
+
+
+def test_chat_payload_forwards_text_only_requests_byte_for_byte():
+    """a text-only request goes upstream exactly as the caller wrote it.
+
+    the normalizer rewrites scalar ``content`` into block form; forwarding that rewritten shape
+    would change the wire format of every existing text-only request. asserted on a deep copy
+    rather than on list identity, since identity also holds if the messages were mutated in place.
+    """
+    text_only = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+    before = copy.deepcopy(text_only)
+    forwarded = serving._chat_messages_from_payload({"messages": text_only})
+    assert forwarded == before
+    assert text_only == before
+
+
+def test_chat_payload_forwards_images_in_the_shape_it_validated():
+    """an admitted image request reaches the engine as canonical openai ``image_url`` blocks.
+
+    the normalizer accepts sdk spellings the upstream openai-compatible endpoint does not, so
+    forwarding the caller's own blocks would admit a request the engine then rejects with a 502.
+    validating one representation and forwarding another is the bug this pins.
+    """
+    uri = _png_data_uri()
+    aliased = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "describe"},
+                {"type": "input_image", "input_image": uri},
+            ],
+        }
+    ]
+    before = copy.deepcopy(aliased)
+    forwarded = serving._chat_messages_from_payload({"messages": aliased})
+    assert [block["type"] for block in forwarded[0]["content"]] == ["text", "image_url"]
+    assert forwarded[0]["content"][1]["image_url"]["url"] == uri
+    # the caller's own object is never rewritten in place.
+    assert aliased == before
+
+
+def test_chat_payload_preserves_image_order_when_canonicalizing():
+    """four images arrive upstream in the order the caller sent them, with their exact bytes."""
+    uris = [_png_data_uri(color=color) for color in ("red", "green", "blue", "yellow")]
+    messages = [{"role": "user", "content": [_image_block(uri) for uri in uris]}]
+    forwarded = serving._chat_messages_from_payload({"messages": messages})
+    assert [block["image_url"]["url"] for block in forwarded[0]["content"]] == uris
+
+
 def test_validate_hf_repo_id_accepts_valid_and_rejects_malformed():
     # A well-formed id passes silently.
     serving._validate_hf_repo_id("owner/name")
@@ -555,9 +725,10 @@ def _smoke_spec(
     max_context_tokens: int | None = None,
     algorithm: str = "grpo",
     stop_sequences: tuple[str, ...] = (),
+    model: str = "some-org/text-only-model",
 ):
     return types.SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
+        model=model,
         algorithm=algorithm,
         thinking=thinking,
         train=types.SimpleNamespace(
@@ -578,11 +749,12 @@ def _smoke_response(
     finish_reason: str = "stop",
     *,
     reasoning_content: object = _MISSING_REASONING,
+    request_adapter: str | None = _SMOKE_REVISION,
 ) -> dict:
     message = {"content": content}
     if reasoning_content is not _MISSING_REASONING:
         message["reasoning_content"] = reasoning_content
-    return {
+    response = {
         "choices": [{"message": message, "finish_reason": finish_reason}],
         "freesolo": {
             "adapter_revision": _SMOKE_REVISION,
@@ -595,6 +767,19 @@ def _smoke_response(
             "hf_revision": "a" * 40,
         },
     }
+    if request_adapter is not None:
+        response["_freesolo_lora_request_adapter"] = request_adapter
+    return response
+
+
+def _smoke_expected_colour(run_id: str = "run-1") -> str:
+    """The colour this run_id must answer, derived the same way production derives it.
+
+    hardcoding a colour here would silently re-introduce the guessable smoke: the point of the
+    per-run choice is that no single colour is always right, so the test must not know one either.
+    """
+    expected, _messages = serving_smoke._smoke_image_challenge(run_id)
+    return expected
 
 
 def _run_smoke(spec, *, budget_s: float = 600.0):
@@ -637,6 +822,214 @@ def test_run_deployment_smoke_uses_only_trusted_fixed_prompt(monkeypatch):
     assert calls[0]["expected_checkpoint"] == "run-1"
     assert calls[0]["timeout_s"] <= 10.0
     assert calls[0]["retry_unavailable"] is True
+
+
+def test_image_deployment_smoke_uses_valid_trusted_image_without_persisting_it(monkeypatch):
+    import base64
+    import io
+
+    from PIL import Image
+
+    expected_colour, expected_messages = serving_smoke._smoke_image_challenge("run-1")
+    # EVERY variant must be a true solid square, not just the one this run_id happens to draw.
+    # checking only the drawn variant leaves the others free to rot, and a variant whose pixels
+    # did not match its announced colour would fail a correctly-seeing model.
+    rgb_for = {"RED": (255, 0, 0), "BLUE": (0, 0, 255), "GREEN": (0, 128, 0)}
+    for colour, data_uri in serving_smoke._SMOKE_IMAGE_VARIANTS:
+        image = Image.open(io.BytesIO(base64.b64decode(data_uri.split(",", 1)[1], validate=True)))
+        image.load()
+        assert image.size == (32, 32)
+        pixels = image.convert("RGB").tobytes()
+        distinct = {pixels[i : i + 3] for i in range(0, len(pixels), 3)}
+        assert distinct == {bytes(rgb_for[colour])}, f"{colour} variant is not a solid square"
+        image.close()
+    # the prompt must not name any candidate colour, or the answer could be read off the question.
+    for colour, _uri in serving_smoke._SMOKE_IMAGE_VARIANTS:
+        assert colour.lower() not in serving_smoke._SMOKE_IMAGE_PROMPT.lower()
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response(expected_colour)
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+    assert out["verify_kind"] == "fixed_image"
+    assert out["verify_turns"] == 1
+    assert out["verify_lora_request_adapter"] == _SMOKE_REVISION
+    assert calls[0]["messages"] == expected_messages
+    assert calls[0]["expected_checkpoint"] == "run-1"
+    assert calls[0]["expected_adapter_revision"] == _SMOKE_REVISION
+    for _colour, data_uri in serving_smoke._SMOKE_IMAGE_VARIANTS:
+        assert data_uri not in json.dumps(out)
+
+
+def test_image_deployment_smoke_rejects_missing_lora_request_attestation(monkeypatch):
+    response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+
+    with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+
+def test_image_deployment_smoke_rejects_mismatched_lora_request_adapter(monkeypatch):
+    response = _smoke_response(_smoke_expected_colour(), request_adapter="run-1@final." + "b" * 40)
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+
+    with pytest.raises(ServingError, match="wrong LoRA request adapter"):
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+
+def test_image_deployment_smoke_still_rejects_wrong_provenance(monkeypatch):
+    response = _smoke_response(_smoke_expected_colour())
+    response["freesolo"]["checkpoint"] = "wrong"
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+
+    with pytest.raises(ServingError, match="wrong checkpoint"):
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["a red-and-blue checkerboard", "I cannot see an image.", "purple"],
+)
+def test_image_deployment_smoke_rejects_an_answer_that_is_not_the_shown_square(monkeypatch, answer):
+    """The colour assertion is what makes this smoke image-dependent, so pin it.
+
+    a deployment whose vision path is broken -- wrong processor, dropped media, placeholders that
+    never expanded -- still answers *something*, and without this the suite would accept it as
+    verified. the sibling test proves the prompt names no candidate colour, so the only way to
+    answer is to decode the image.
+    """
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: _smoke_response(answer))
+
+    with pytest.raises(ServingError, match="did not identify the trusted"):
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+
+def test_image_smoke_colour_actually_varies_across_deployments():
+    """The challenge must not collapse to one colour, or it is guessable again.
+
+    every other test here derives the expected colour from production, so they all stay
+    self-consistent if the selection is hardcoded to a single variant -- the exact bug this gate
+    exists to prevent would pass unnoticed. this asserts the property directly: over many run ids
+    at least two distinct colours must appear, and each must be a genuine solid square.
+    """
+    seen = {serving_smoke._smoke_image_challenge(f"run-{i}")[0] for i in range(60)}
+    assert len(seen) >= 2, f"smoke colour never varies (always {seen}) - it is guessable"
+    assert seen <= {c for c, _uri in serving_smoke._SMOKE_IMAGE_VARIANTS}
+
+    # and the message must always carry the variant matching the announced colour, so a mismatched
+    # pairing cannot make a correct model look wrong.
+    by_colour = dict(serving_smoke._SMOKE_IMAGE_VARIANTS)
+    for i in range(60):
+        colour, messages = serving_smoke._smoke_image_challenge(f"run-{i}")
+        assert messages[0]["content"][1]["image_url"]["url"] == by_colour[colour]
+
+
+def test_image_deployment_smoke_rejects_the_other_trusted_colours(monkeypatch):
+    """Answering a colour that is real, but not the one THIS run was shown, must fail.
+
+    this is the check a single fixed colour could never make: it proves the smoke reads the
+    deployment's own challenge rather than accepting any plausible colour word. a model guessing
+    "red" because that is the obvious answer to "what colour is the square" is wrong here whenever
+    the run drew blue or green.
+    """
+    expected = _smoke_expected_colour()
+    others = [c for c, _uri in serving_smoke._SMOKE_IMAGE_VARIANTS if c != expected]
+    assert others, "the challenge needs more than one colour or it is guessable"
+
+    for wrong in others:
+        response = _smoke_response(wrong)
+        # bind the response per iteration: a bare closure over the loop variable would read
+        # whatever the LAST iteration assigned, so every case would assert the same colour.
+        monkeypatch.setattr(serving._app, "serve_chat", lambda _r=response, **_kwargs: _r)
+        with pytest.raises(ServingError, match="did not identify the trusted"):
+            _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+
+def test_text_only_model_smoke_does_not_require_the_colour_answer(monkeypatch):
+    """The control: the colour gate must apply to image-capable models only.
+
+    a text-only deployment never receives the image, so requiring a colour word from it would fail
+    every text model. this is what proves the gate above keys on capability rather than being
+    global.
+    """
+    monkeypatch.setattr(
+        serving._app, "serve_chat", lambda **_kwargs: _smoke_response("The answer is 4")
+    )
+
+    out = _run_smoke(_smoke_spec(thinking=False))
+
+    assert out["verify_kind"] == "fixed_prompt"
+
+
+def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(monkeypatch):
+    calls = []
+    validated = []
+    validate_structured_smoke = serving_smoke._validate_structured_smoke
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            assert kwargs["structured_outputs"] == {}
+            return _smoke_response(_smoke_expected_colour())
+        assert "structured_outputs" not in kwargs
+        return _smoke_response('{"answer":"4"}')
+
+    def capture_validation(answer, constraint, **kwargs):
+        validated.append((answer, constraint))
+        return validate_structured_smoke(answer, constraint, **kwargs)
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_smoke, "_validate_structured_smoke", capture_validation)
+    out = _run_smoke(
+        _smoke_spec(
+            thinking=False,
+            model="Qwen/Qwen3.5-4B",
+            constraint={"json_object": True},
+        )
+    )
+
+    assert out["verify_kind"] == "fixed_image"
+    assert out["verify_turns"] == 2
+    assert calls[0]["messages"] == serving_smoke._smoke_image_challenge("run-1")[1]
+    assert calls[1]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
+    assert validated == [('{"answer":"4"}', {"json_object": True})]
+
+
+@pytest.mark.parametrize(
+    ("request_adapter", "error"),
+    [
+        (None, "omitted LoRA request adapter attestation"),
+        ("run-1@final." + "b" * 40, "wrong LoRA request adapter"),
+    ],
+)
+def test_image_structured_smoke_requires_attestation_on_second_request(
+    monkeypatch, request_adapter, error
+):
+    calls = 0
+
+    def fake_serve_chat(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _smoke_response(_smoke_expected_colour())
+        return _smoke_response('{"answer":"4"}', request_adapter=request_adapter)
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+
+    with pytest.raises(ServingError, match=error):
+        _run_smoke(
+            _smoke_spec(
+                thinking=False,
+                model="Qwen/Qwen3.5-4B",
+                constraint={"json_object": True},
+            )
+        )
+
+    assert calls == 2
 
 
 def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
@@ -877,6 +1270,50 @@ def test_chat_body_carries_stop_sequences(monkeypatch):
     sent.clear()
     _deploy.chat("run-1", [{"role": "user", "content": "hi"}])
     assert "stop" not in sent
+
+
+def test_chat_captures_lora_request_adapter_attestation_for_smoke(monkeypatch):
+    from flash.serve import deploy as _deploy
+
+    class _Resp:
+        status_code = 200
+        headers: ClassVar[dict[str, str]] = {
+            "X-Freesolo-Adapter-Revision": _SMOKE_REVISION,
+            "X-Freesolo-Checkpoint": "run-1",
+            "X-Freesolo-HF-Revision": "a" * 40,
+            "X-Freesolo-LoRA-Request-Adapter": _SMOKE_REVISION,
+        }
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {"content": _smoke_expected_colour()},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+    class _Client:
+        def post(self, url, json=None, headers=None, timeout=None):
+            return _Resp()
+
+    monkeypatch.setattr(_deploy, "serving_openai_base_url", lambda: "https://serving.example/v1")
+    monkeypatch.setattr(_deploy, "_internal_key_header", dict)
+    monkeypatch.setattr(_deploy, "_chat_http_client", _Client)
+
+    out = _deploy.chat(
+        _SMOKE_REVISION,
+        [{"role": "user", "content": "hi"}],
+        expected_checkpoint="run-1",
+        expected_adapter_revision=_SMOKE_REVISION,
+    )
+
+    assert out["choices"][0]["message"]["content"] == _smoke_expected_colour()
+    assert out["_freesolo_lora_request_adapter"] == _SMOKE_REVISION
 
 
 def test_zero_completion_budget_resolves_to_thinking_recipe_default():
@@ -1122,7 +1559,7 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
         lambda **_k: _smoke_response("<think>still reasoning"),
     )
     with pytest.raises(ServingError, match="never closed its reasoning"):
-        _run_smoke(_smoke_spec(thinking=True))
+        _run_smoke(_smoke_spec(thinking=True, model="Qwen/Qwen3.5-4B"))
 
     monkeypatch.setattr(
         serving._app,
@@ -1196,7 +1633,7 @@ def test_thinking_smoke_accepts_a_tagless_answer_only_for_an_uncataloged_model(m
     """
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("4"))
 
-    strict = _smoke_spec(thinking=True)
+    strict = _smoke_spec(thinking=True, model="Qwen/Qwen3.5-4B")
     with pytest.raises(ServingError, match="never closed its reasoning"):
         _run_smoke(strict)
 
@@ -1516,13 +1953,21 @@ def test_structured_json_rejects_nonfinite_constants(monkeypatch, constant, cons
 def test_thinking_structured_smoke_rejects_invalid_output(
     monkeypatch, constraint, content, finish_reason, match
 ):
-    monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
-        lambda **_k: _smoke_response(content, finish_reason),
+    responses = iter(
+        [
+            _smoke_response(f"<think>vision</think>{_smoke_expected_colour()}"),
+            _smoke_response(content, finish_reason),
+        ]
     )
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: next(responses))
     with pytest.raises(ServingError, match=match):
-        _run_smoke(_smoke_spec(thinking=True, constraint=constraint))
+        _run_smoke(
+            _smoke_spec(
+                thinking=True,
+                constraint=constraint,
+                model="Qwen/Qwen3.5-4B",
+            )
+        )
 
 
 def test_nonthinking_structured_smoke_validates_whole_stripped_content(monkeypatch):
@@ -1582,21 +2027,34 @@ def test_alias_thinking_verification_matches_the_smoke_request_shape(monkeypatch
         constraint={"json_object": True},
         max_completion_tokens=40000,
         stop_sequences=("</answer>",),
+        model="Qwen/Qwen3.5-4B",
     )
     calls = []
+    responses = iter(
+        [
+            _smoke_response(
+                f"<think>vision</think>{_smoke_expected_colour()}", reasoning_content="vision"
+            ),
+            _smoke_response(
+                '<think>2+2 is 4</think>{"answer":"4"}',
+                reasoning_content="2+2 is 4",
+            ),
+            _smoke_response(
+                '<think>2+2 is 4</think>{"answer":"4"}',
+                reasoning_content="2+2 is 4",
+            ),
+        ]
+    )
 
     def fake_serve_chat(**kwargs):
         calls.append(kwargs)
-        return _smoke_response(
-            '<think>2+2 is 4</think>{"answer":"4"}',
-            reasoning_content="2+2 is 4",
-        )
+        return next(responses)
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
     _run_smoke(spec)
     serving._verify_alias_thinking("run-1", spec, _SMOKE_REVISION, "run-1")
 
-    smoke_call, alias_call = calls
+    _image_call, smoke_call, alias_call = calls
     assert alias_call["stop"] == smoke_call["stop"] == ["</answer>"]
     assert alias_call["max_tokens"] == smoke_call["max_tokens"] == 32512
     assert alias_call["messages"] == smoke_call["messages"]

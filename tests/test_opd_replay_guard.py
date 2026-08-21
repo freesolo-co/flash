@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.train.opd.child import replay_guard
+from flash.engine.worker.train.opd.child import bridge, replay_guard
 
 
 class _Buffer:
@@ -69,6 +69,29 @@ def test_failed_prompt_beats_still_running_siblings_and_upstream_result():
     with pytest.raises(RuntimeError, match=r"failed prompt.*failed"):
         buffer.sample(partition_id="train", global_steps=7)
     assert upstream.calls == 1
+
+
+def test_recorded_rollout_cause_beats_generic_failed_prompt(monkeypatch, tmp_path):
+    rollout_path = tmp_path / "rollout-failure"
+    monkeypatch.setenv("FLASH_OPD_ROLLOUT_FAILURE_PATH", str(rollout_path))
+    try:
+        raise LookupError("replay-original-sentinel")
+    except LookupError as error:
+        bridge._write_rollout_failure_fallback(error, "permanent")
+
+    upstream = _Upstream()
+    buffer = _Buffer(upstream)
+    buffer.partitions["train"]["failed"] = {"global_steps": 7, "status": "failure"}
+    replay_guard.install_bounded_replay_buffer_sample(_trainer(buffer))
+    upstream.release.set()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        buffer.sample(partition_id="train", global_steps=7)
+    detail = str(excinfo.value)
+    assert "multi-turn OPD rollout failed" in detail
+    assert "LookupError" in detail
+    assert "replay-original-sentinel" in detail
+    assert "opd replay observed failed prompt" not in detail
 
 
 def test_initially_empty_step_stays_guarded_until_target_step_is_observed():

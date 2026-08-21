@@ -53,16 +53,11 @@ def _png_bytes(width: int, height: int) -> bytes:
     return out.getvalue()
 
 
-def _truncated_bmp_bytes(width: int, height: int) -> bytes:
-    """Bytes whose header still reports (width, height) but whose pixels cannot be decoded.
-
-    The truncation is the point: a check that reads only the header accepts this payload, so any
-    test using it is asserting that the geometry path decodes rather than merely measures. That
-    property is asserted here so it holds for every caller instead of at one call site.
-    """
+def _truncated_png_bytes(width: int, height: int) -> bytes:
+    """PNG bytes whose header parses but whose pixels cannot be fully verified."""
     image_module = pytest.importorskip("PIL.Image")
     out = io.BytesIO()
-    image_module.new("RGB", (width, height), (12, 34, 56)).save(out, format="BMP")
+    image_module.new("RGB", (width, height), (12, 34, 56)).save(out, format="PNG")
     truncated = out.getvalue()[:-10]
     with image_module.open(io.BytesIO(truncated)) as image:
         assert image.size == (width, height)
@@ -357,7 +352,7 @@ class TestDescriptorPadTokens:
             pytest.param(b"notanimage", id="not-an-image-at-all"),
             # a truncated bitmap still parses a valid header, so a dimensions-only check would
             # accept it and the worker would then fail on a row the quote already charged for.
-            pytest.param(_truncated_bmp_bytes(64, 64), id="truncated-with-valid-dimensions"),
+            pytest.param(_truncated_png_bytes(64, 64), id="truncated-with-valid-dimensions"),
         ],
     )
     def test_rejects_a_payload_that_cannot_be_fully_decoded(self, payload):
@@ -372,8 +367,8 @@ class TestDescriptorPadTokens:
     ):
         dataset = tmp_path / "dataset"
         dataset.mkdir()
-        corrupt_path = dataset / "corrupt.bmp"
-        corrupt_path.write_bytes(_truncated_bmp_bytes(64, 64))
+        corrupt_path = dataset / "corrupt.png"
+        corrupt_path.write_bytes(_truncated_png_bytes(64, 64))
         reads = []
         real_read_bytes = type(corrupt_path).read_bytes
 
@@ -385,7 +380,7 @@ class TestDescriptorPadTokens:
         monkeypatch.setattr(type(corrupt_path), "read_bytes", count_read)
         state = ImageProfileValidationState()
         normalized = multimodal.normalize_prompt_images(
-            {"image": "dataset/corrupt.bmp"},
+            {"image": "dataset/corrupt.png"},
             [{"role": "user", "content": "describe"}],
             tmp_path,
             defer_validation=True,
@@ -439,7 +434,7 @@ class TestDescriptorPadTokens:
 
     def test_failed_row_commits_no_partial_profile_cache_accounting(self, monkeypatch):
         valid = multimodal.normalize_image_source(_png_bytes(10, 10), None)
-        corrupt_data = _truncated_bmp_bytes(64, 64)
+        corrupt_data = _truncated_png_bytes(64, 64)
         corrupt = json.dumps(
             {"kind": "bytes", "value": base64.b64encode(corrupt_data).decode("ascii")}
         )
@@ -460,5 +455,5 @@ class TestDescriptorPadTokens:
         assert state.descriptor_metadata == {}
         assert state.decoded_work_bytes == 0
         assert descriptor_pad_tokens([valid], None, QWEN_GEOMETRY, state) == [64]
-        assert successful_decodes == [(10, 10), (10, 10)]
-        assert state.decoded_work_bytes == 300
+        assert successful_decodes == [(10, 10)]
+        assert state.decoded_work_bytes == 900

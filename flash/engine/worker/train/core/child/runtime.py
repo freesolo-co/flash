@@ -385,6 +385,40 @@ def install_deferred_flash_qla(model_type: str, marker_file: str) -> None:
     )
 
 
+def install_vision_input_grads(module) -> None:
+    """force the vision tower's first activation to require grad under reentrant checkpointing.
+
+    a reentrant checkpointed block produces no gradient at all unless at least one of its inputs
+    requires grad. ``enable_input_require_grads()`` only covers the text embedding, so pixel values
+    stay grad-free and every ``visual.blocks.*`` submodule receives exactly zero. the LM half still
+    trains and ``visual.merger`` still moves (it is downstream of the grad-carrying text hidden
+    states), so the total adapter delta looks healthy and inference still answers image questions --
+    the frozen tower is only visible per lora pair.
+    """
+    import torch
+
+    get_base = getattr(module, "get_base_model", None)
+    if callable(get_base):
+        base = get_base()
+    else:
+        peft_base = getattr(module, "base_model", None)
+        base = getattr(peft_base, "model", module)
+
+    def require_output_grad(_module, _inputs, output):
+        tensor = output[0] if isinstance(output, tuple) and output else output
+        if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+            tensor.requires_grad_(True)
+
+    for path, submodule in base.named_modules():
+        if path.endswith("visual.patch_embed"):
+            submodule.register_forward_hook(require_output_grad)
+            print(f"[flash-verl] vision input gradients enabled at {path}", flush=True)
+            return
+    print(
+        "[flash-verl] no visual.patch_embed found; vision input gradients not installed", flush=True
+    )
+
+
 def _guard_lora_engine(engine, adapter_id) -> None:
     inner = engine.generate
 

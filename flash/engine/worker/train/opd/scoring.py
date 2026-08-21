@@ -12,26 +12,28 @@ if TYPE_CHECKING:  # annotation-only: the prompt record lives in the orchestrato
 
 def build_multimodal_score_items(
     prompt: _BridgePrompt,
-    history_and_completions: list[tuple[list[dict] | None, str]],
+    history_completions_and_descriptors: list[tuple[list[dict] | None, str, tuple[str, ...]]],
     *,
     thinking_prefill: str,
 ) -> list[tuple[list[dict], str, list[str], bool]]:
-    """build ordered teacher items while decoding the frozen images exactly once."""
+    """build ordered teacher items from each turn's immutable cumulative media snapshot."""
     from flash.content.multimodal import (
         image_descriptors_to_data_uris,
         image_teacher_prompt_messages,
     )
 
-    teacher_images = image_descriptors_to_data_uris(
-        prompt.image_descriptors,
-        prompt.package_root,
-    )
+    image_cache: dict[tuple[str, ...], list[str]] = {}
     items = []
-    for history, completion_text in history_and_completions:
+    for history, completion_text, descriptors in history_completions_and_descriptors:
+        descriptors = tuple(descriptors)
+        teacher_images = image_cache.get(descriptors)
+        if teacher_images is None:
+            teacher_images = image_descriptors_to_data_uris(descriptors, prompt.package_root)
+            image_cache[descriptors] = teacher_images
         teacher_messages = (
             list(prompt.teacher_messages)
             if history is None
-            else image_teacher_prompt_messages(history, len(prompt.image_descriptors))
+            else image_teacher_prompt_messages(history, len(descriptors))
         )
         if thinking_prefill:
             teacher_messages.append({"role": "assistant", "content": thinking_prefill})
@@ -76,7 +78,7 @@ def score_rollout(
     if prompt.image_descriptors:
         items = build_multimodal_score_items(
             prompt,
-            [(None, completion_text)],
+            [(None, completion_text, prompt.image_descriptors)],
             thinking_prefill=thinking_prefill,
         )
         return score_multimodal_items(teacher, items, on_scored=on_scored)[0]

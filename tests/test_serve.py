@@ -1648,6 +1648,40 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
 
+def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkeypatch):
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+    requests = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class Client:
+        def post(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return Response()
+
+    monkeypatch.setattr(d, "_chat_http_client", Client)
+
+    messages = [{"role": "user", "content": "hello"}]
+    d.chat("run-1", messages, structured_outputs={})
+    d.chat("run-1", messages)
+
+    first_url, first = requests[0]
+    second_url, second = requests[1]
+    assert first_url == second_url == "https://serve.example/v1/chat/completions"
+    assert first["json"]["structured_outputs"] == {}
+    assert "structured_outputs" not in second["json"]
+    assert first["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
+    assert second["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
+
+
 def test_chat_stream_yields_openai_sse_content(monkeypatch):
     """A terminal /v1 override produces one OpenAI path for streaming chat."""
     import flash.serve.deploy as d

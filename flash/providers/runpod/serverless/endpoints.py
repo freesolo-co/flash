@@ -295,6 +295,7 @@ def _train_body(input_data: dict) -> dict:
         def _extra_pip_env() -> tuple[dict[str, str], str | None]:
             env = dict(os.environ)
             env.update(overrides)
+            env.pop("GIT_ASKPASS", None)
             env["GIT_TERMINAL_PROMPT"] = "0"
             askpass = None
             if env.get("GITHUB_TOKEN"):
@@ -551,6 +552,8 @@ def _train_body(input_data: dict) -> dict:
 
         env = dict(os.environ)
         env.update(overrides)
+        env.pop("GITHUB_TOKEN", None)
+        env.pop("GIT_ASKPASS", None)
         # inlined: handler is baked standalone (flash not importable); mirrors the worker cache cleanup.
         if not os.path.isdir("/runpod-volume"):
             for _k in [k for k, v in env.items() if str(v).startswith("/runpod-volume")]:
