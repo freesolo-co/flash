@@ -39,6 +39,16 @@ class MutationLedger:
     def has_attempted_creations(self) -> bool:
         return bool(self._attempted)
 
+    def attempted(self, kind: MutationKind) -> bool:
+        """report whether this attempt issued a create for `kind`.
+
+        distinct from `confirmed_id`: a create that failed after reaching the provider is attempted
+        but unconfirmed, and the resource may exist. cleanup must still delete that one, while a
+        kind this attempt never touched belongs to somebody else.
+        """
+
+        return kind in self._attempted
+
     def confirmed_id(self, kind: MutationKind) -> str | None:
         for entry in self._confirmed:
             if entry.kind == kind:

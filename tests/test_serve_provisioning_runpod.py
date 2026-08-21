@@ -7,6 +7,7 @@ import io
 import json
 import urllib.error
 import urllib.response
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
@@ -204,6 +205,7 @@ class _FakeTransport:
         self.fail_mutation_at: int | None = None
         self.failure_mode = "ambiguous_before"
         self.malformed_pod_id = False
+        self.on_first_mutation: Callable[[], None] | None = None
 
     def graphql(
         self,
@@ -306,6 +308,10 @@ class _FakeTransport:
 
     def _begin_mutation(self) -> None:
         self.mutation_count += 1
+        if self.mutation_count == 1 and self.on_first_mutation is not None:
+            # lets a test model a concurrent racer whose resources appear after this run's initial
+            # observation but before its first create returns.
+            self.on_first_mutation()
         if self.mutation_count != self.fail_mutation_at:
             return
         if self.failure_mode == "definite_before":
@@ -753,6 +759,51 @@ def test_malformed_success_id_binds_no_invalid_proxy_url() -> None:
     assert transport.templates == []
     assert transport.volumes == []
     assert transport.pods == []
+
+
+def test_losing_racer_never_deletes_the_winners_resources() -> None:
+    """a second `serve deploy` for one generation must not tear down the first one's deployment.
+
+    both runs build byte-identical names and identities, so the loser's plan matches the winner's
+    live resources exactly. the loser conflicts on its very first secret create, which leaves that
+    kind attempted but unconfirmed -- and cleanup keyed only on plan identity would then delete the
+    winner's secret, pod, template, and volume, destroying a running deployment the user is paying
+    for. cleanup must refuse and report the outcome as unknown instead.
+    """
+
+    bundle = _bundle()
+    transport = _FakeTransport()
+    # build the winner's resources, then hide them: both racers observe an empty account first, so
+    # the loser proceeds to create rather than adopting. the winner lands in between.
+    handle = _seed_exact(transport, bundle)
+    winner_secrets = [dict(item) for item in transport.secrets]
+    winner_volumes = [dict(item) for item in transport.volumes]
+    winner_templates = [dict(item) for item in transport.templates]
+    winner_pods = [dict(item) for item in transport.pods]
+    transport.secrets, transport.volumes, transport.templates, transport.pods = [], [], [], []
+
+    def _winner_lands() -> None:
+        transport.secrets = [dict(item) for item in winner_secrets]
+        transport.volumes = [dict(item) for item in winner_volumes]
+        transport.templates = [dict(item) for item in winner_templates]
+        transport.pods = [dict(item) for item in winner_pods]
+
+    transport.on_first_mutation = _winner_lands
+    # the loser's first mutation -- creating the inference secret -- then collides with it.
+    transport.fail_mutation_at = 1
+    transport.failure_mode = "definite_before"
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "outcome_unknown"
+    assert transport.secrets == winner_secrets
+    assert transport.volumes == winner_volumes
+    assert transport.templates == winner_templates
+    assert transport.pods == winner_pods
+    assert handle.pod_id == winner_pods[0]["id"]
+    # and it must not have issued a single delete against them.
+    assert [call for call in _mutation_calls(transport) if "DELETE" in call[1]] == []
+    assert [call for call in _mutation_calls(transport) if call[1] == "secretDelete"] == []
 
 
 def test_reconcile_is_read_only_and_reports_ready_or_absent() -> None:

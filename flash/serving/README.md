@@ -107,7 +107,7 @@ uv run modal deploy --env dev flash/serving/modal_app.py
 Explicitly warm one development model without changing the zero floor:
 
 ```bash
-uv run modal run --env dev modal_app.py --base-model Qwen/Qwen3.5-0.8B
+uv run modal run --env dev flash/serving/modal_app.py --base-model Qwen/Qwen3.5-0.8B
 ```
 
 ### No autoscaling or vLLM perf knobs

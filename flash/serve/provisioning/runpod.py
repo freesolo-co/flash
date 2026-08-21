@@ -557,8 +557,19 @@ def _abort_observation_matches(
         ("pod", observation.pods),
     )
     for kind, values in resources:
+        if not values:
+            continue
         confirmed_id = ledger.confirmed_id(kind)
-        if values and confirmed_id is not None and values[0].id != confirmed_id:
+        if confirmed_id is not None:
+            # confirmed: ours only if the id matches the one the provider returned to us.
+            if values[0].id != confirmed_id:
+                return False
+        elif not ledger.attempted(kind):
+            # never attempted by this run, so it cannot be ours no matter how well it matches the
+            # plan. two `serve deploy` runs for one deployment generation build byte-identical
+            # names and identities, so the loser's plan matches the winner's resources exactly.
+            # without this, a conflict on the loser's first secret create -- which leaves nothing
+            # confirmed -- let cleanup delete the winner's secret, pod, template, and volume.
             return False
     template = observation.templates[0] if observation.templates else None
     volume = observation.volumes[0] if observation.volumes else None
