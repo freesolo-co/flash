@@ -397,6 +397,64 @@ def test_legacy_fingerprint_is_persisted_for_active_and_cleanup_handles(tmp_path
     assert listings == ["listed"]
 
 
+def test_unresolvable_cleanup_record_still_migrates_the_resolvable_ones(tmp_path, monkeypatch):
+    """One unverifiable historical record must not strand the rest of the teardown.
+
+    Cancellation migrates fingerprints BEFORE it reads the current remote, so an all-or-nothing
+    migration meant a single stale cleanup entry -- a credential that left the pool, or an
+    ownership lookup that is merely unreachable -- aborted the whole cancellation and left the
+    active worker and every sibling resource billing. The resolvable records must still be
+    upgraded, and the unverifiable one must still be reported rather than silently skipped.
+    """
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+    from flash.providers.runpod import api, jobs
+
+    key = "legacy-owner"
+    full_fingerprint = api.key_fingerprint(key)
+
+    def record(endpoint_id, fingerprint):
+        return {
+            "provider": "runpod",
+            "endpoint_id": endpoint_id,
+            "endpoint_name": f"flash-{endpoint_id}",
+            "key_fingerprint": fingerprint,
+            "job_id": None,
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+
+    # the active remote resolves; the stale cleanup record's credential is no longer in the pool.
+    stranger_fingerprint = "rpk-" + "b" * 12
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path))
+    runner._save_status(
+        runner.RunStatus(
+            run_id="partial-migration",
+            state="running",
+            spec=JobSpec(
+                run_id="partial-migration",
+                model="Qwen/Qwen3.5-4B",
+                algorithm="sft",
+            ).to_dict(),
+            remote=record("ep-live", full_fingerprint[:16]),
+        ),
+        _cleanup_remotes=[record("ep-stale", stranger_fingerprint)],
+    )
+    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+    monkeypatch.setattr(
+        api._CLIENT, "request_with_retries_for_key", lambda *_a, **_k: [{"id": "ep-live"}]
+    )
+
+    with pytest.raises(ValueError, match="persisted RunPod key fingerprint is invalid"):
+        jobs.migrate_persisted_legacy_key_fingerprints("partial-migration")
+
+    with open(runner.runs_file_path("partial-migration", ".json"), encoding="utf-8") as handle:
+        stored = json.load(handle)
+    # the resolvable record was upgraded despite the unresolvable sibling raising afterwards.
+    assert stored["remote"]["key_fingerprint"] == full_fingerprint
+    assert stored["cleanup_remotes"][0]["key_fingerprint"] == stranger_fingerprint
+
+
 def test_confirmed_legacy_handle_cancel_reaches_teardown(tmp_path, monkeypatch):
     import flash.runner as runner
     from flash.core.spec import JobSpec

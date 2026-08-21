@@ -173,6 +173,7 @@ def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, st
         }
 
     upgrades: dict[tuple[str, str], str] = {}
+    blocked: set[tuple[str, str]] = set()
 
     def upgrade(remote: object) -> object:
         target = legacy_target(remote)
@@ -180,12 +181,18 @@ def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, st
             return remote
         return {**remote, "key_fingerprint": upgrades[target]}
 
+    # a record whose credential left the pool, or whose ownership lookup is merely unreachable
+    # right now, is unverifiable rather than wrong. it must not abort the migration of the records
+    # that DO resolve: cancellation calls this before it reads the current remote, so one stale
+    # entry would otherwise leave the active worker and every sibling cleanup resource billing.
+    # the failure is raised only after the resolvable upgrades have been written.
+    unresolvable: Exception | None = None
     while True:
         try:
             raw = runner._load_status_json(run_id)
         except FileNotFoundError:
             return {}
-        unresolved = legacy_targets(raw) - upgrades.keys()
+        unresolved = legacy_targets(raw) - upgrades.keys() - blocked
         if not unresolved:
             break
         for endpoint_id, fingerprint in unresolved:
@@ -194,8 +201,11 @@ def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, st
                     endpoint_id, fingerprint
                 )
             except runpod_api.RunpodApiError:
-                raise ValueError("persisted RunPod key fingerprint is invalid") from None
+                blocked.add((endpoint_id, fingerprint))
+                unresolvable = ValueError("persisted RunPod key fingerprint is invalid")
     if not upgrades:
+        if unresolvable is not None:
+            raise unresolvable
         return upgrades
 
     with runner._status_guard(run_id):
@@ -203,7 +213,7 @@ def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, st
         current_cleanup_remotes = current.get(runner._CLEANUP_REMOTES_KEY)
         if current_cleanup_remotes is not None and not isinstance(current_cleanup_remotes, list):
             raise RuntimeError("stored cleanup remotes are invalid")
-        remaining = legacy_targets(current) - upgrades.keys()
+        remaining = legacy_targets(current) - upgrades.keys() - blocked
         if remaining:
             raise RuntimeError("persisted RunPod owner changed during fingerprint migration")
         status = runner._runstatus_from_json(current)
@@ -213,10 +223,15 @@ def migrate_persisted_legacy_key_fingerprints(run_id: str) -> dict[tuple[str, st
             if current_cleanup_remotes is not None
             else None
         )
-        if upgraded_remote == status.remote and upgraded_cleanup_remotes == current_cleanup_remotes:
-            return upgrades
-        status.remote = upgraded_remote
-        runner._save_status_unlocked(status, _cleanup_remotes=upgraded_cleanup_remotes)
+        if not (
+            upgraded_remote == status.remote and upgraded_cleanup_remotes == current_cleanup_remotes
+        ):
+            status.remote = upgraded_remote
+            runner._save_status_unlocked(status, _cleanup_remotes=upgraded_cleanup_remotes)
+    if unresolvable is not None:
+        # raised only after the resolvable records are durably upgraded, so an unverifiable one is
+        # still reported rather than silently skipped.
+        raise unresolvable
     return upgrades
 
 

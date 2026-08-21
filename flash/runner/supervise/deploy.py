@@ -692,6 +692,13 @@ def _prepare_cancellation(run_id: str) -> list[Exception]:
     fence revokes authority the run could still spend, and a persisted legacy fingerprint has to
     become resolvable or every later lifecycle path silently no-ops on it. Returns the fencing
     errors to re-raise once teardown has run, so a fencing failure never skips teardown.
+
+    The migration is deferred on the same terms. One historical cleanup record whose credential
+    left the pool -- or whose ownership lookup is merely unreachable right now -- must not abort
+    the cancellation before it reads the current remote: the active worker and every other
+    independently tracked resource would keep billing because of one stale record nothing can
+    verify. The records that ARE resolvable still migrate, and the failure is re-raised after
+    teardown so it is reported rather than swallowed.
     """
     from flash.providers.runpod.jobs import migrate_persisted_legacy_key_fingerprints
     from flash.server.platform import db as server_db
@@ -701,7 +708,10 @@ def _prepare_cancellation(run_id: str) -> list[Exception]:
         server_db.revoke_teacher_capabilities_for_run(run_id)
     except Exception as exc:
         deferred_fencing_errors.append(exc)
-    migrate_persisted_legacy_key_fingerprints(run_id)
+    try:
+        migrate_persisted_legacy_key_fingerprints(run_id)
+    except Exception as exc:
+        deferred_fencing_errors.append(exc)
     return deferred_fencing_errors
 
 
