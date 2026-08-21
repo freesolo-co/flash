@@ -125,18 +125,6 @@ def _database_file_identity(path: str) -> tuple[int, int] | None:
     return stat.st_dev, stat.st_ino
 
 
-def _migrate_schema(conn: sqlite3.Connection) -> None:
-    columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(teacher_score_requests)").fetchall()
-    }
-    if "response_body" not in columns:
-        try:
-            conn.execute("ALTER TABLE teacher_score_requests ADD COLUMN response_body BLOB")
-        except sqlite3.OperationalError as exc:
-            if "duplicate column" not in str(exc).lower():
-                raise
-
-
 def _initialize_database(path: str) -> None:
     database = (os.getpid(), path)
     identity = _database_file_identity(path)
@@ -159,7 +147,6 @@ def _initialize_database(path: str) -> None:
                 conn = sqlite3.connect(path, timeout=remaining)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript(_SCHEMA)
-                _migrate_schema(conn)
                 conn.commit()
                 # Record the identity of the file the schema actually ran on while
                 # the connection is still open, so a file replaced at the same path

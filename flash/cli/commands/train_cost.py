@@ -8,12 +8,11 @@ split out of `flash.cli.commands` to keep that module under the file-size limit.
 
 from __future__ import annotations
 
-import re
 import sys
 
 from flash import __version__
 from flash.cli.ui import render
-from flash.client import ApiError, ClientError
+from flash.client import ClientError
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
@@ -37,15 +36,6 @@ def _commands():
     from flash.cli import commands
 
     return commands
-
-
-# moved here with its only reader: the plane rejects a pre-schema `[train]` table with this exact
-# message, and the rejection detail below turns it into a per-key explanation.
-_LEGACY_TRAIN_UNKNOWN_KEYS_RE = re.compile(
-    r"\A\[train\] unknown key\(s\): "
-    r"(?P<keys>[A-Za-z_][A-Za-z0-9_]*(?:, [A-Za-z_][A-Za-z0-9_]*)*) "
-    r"\(allowed: [A-Za-z_][A-Za-z0-9_]*(?:, [A-Za-z_][A-Za-z0-9_]*)*\)\Z"
-)
 
 
 def _cmd_train_cost(args) -> int:
@@ -106,21 +96,13 @@ def _cmd_train_cost_sft(args, spec, authored_train_keys: frozenset[str]) -> int:
     if message:
         print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
     client = _commands().client_from_config()
-    try:
-        status = client.create_run(
-            spec_payload(spec, authored_train_keys=authored_train_keys),
-            runtime_secrets=runtime_secrets_from_local_env(
-                args.config, keys=spec.environment.secrets
-            )
-            or None,
-            dry_run=True,
-            client_train_schema=_client_train_schema(authored_train_keys),
-        )
-    except ApiError as exc:
-        detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
-        if detail is None:
-            raise
-        raise ApiError(exc.status, detail, detail=detail) from exc
+    status = client.create_run(
+        spec_payload(spec, authored_train_keys=authored_train_keys),
+        runtime_secrets=runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets)
+        or None,
+        dry_run=True,
+        client_train_schema=_client_train_schema(authored_train_keys),
+    )
     _print_sft_cost(status, spec)
     return 0
 
@@ -207,24 +189,17 @@ def _print_reasoning_loss_warning(status: object) -> None:
     profile = status.get("workload_profile") if isinstance(status, dict) else None
     if not isinstance(profile, dict):
         return
-    authored = profile.get("authored_reasoning_turns")
-    rendered = profile.get("rendered_reasoning_spans")
-    if isinstance(authored, bool) or not isinstance(authored, int):
-        return
-    if isinstance(rendered, bool) or not isinstance(rendered, int):
-        return
-    truncated = profile.get("truncated_reasoning_spans")
+
+    def required_count(key: str) -> int:
+        value = profile[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"workload profile {key} must be an integer")
+        return value
+
     message = rendered_reasoning_loss_warning(
-        authored_turns=authored,
-        rendered_spans=rendered,
-        # absent on a profile from an older producer, where the two causes were not yet separated.
-        # zero reads as "none were truncated", which is the pre-split behaviour.
-        truncated_spans=truncated
-        if isinstance(truncated, int) and not isinstance(truncated, bool)
-        else 0,
-        # the counts above cover the rows the update horizon reaches, so the denominator has to
-        # cover the same rows. `retained_examples` is the whole retained dataset -- it sizes the
-        # allocation -- and pairing it with bounded counts would understate the survival rate.
+        authored_turns=required_count("authored_reasoning_turns"),
+        rendered_spans=required_count("rendered_reasoning_spans"),
+        truncated_spans=required_count("truncated_reasoning_spans"),
         rows=reasoning_warning_rows(profile),
     )
     if not message:
@@ -258,27 +233,6 @@ def _print_sft_cost(status: dict, spec) -> None:
     )
     _print_unpacked_batch_warning(status, spec)
     _print_reasoning_loss_warning(status)
-
-
-def _legacy_train_key_rejection_detail(
-    exc: ApiError, authored_train_keys: frozenset[str]
-) -> str | None:
-    if exc.status != 400:
-        return None
-    match = _LEGACY_TRAIN_UNKNOWN_KEYS_RE.fullmatch(str(exc))
-    if match is None:
-        return None
-    metadata = train_schema_metadata()
-    unsupported = sorted(set(match.group("keys").split(", ")) & authored_train_keys & set(metadata))
-    if not unsupported:
-        return None
-    declared = ", ".join(
-        f"{key} (minimum released Flash version {metadata[key]})" for key in unsupported
-    )
-    return (
-        f"{exc}. Unsupported authored [train] key(s): {declared}; "
-        "client/server [train] schemas disagree"
-    )
 
 
 def _print_train_schema_compatibility(result: object) -> None:

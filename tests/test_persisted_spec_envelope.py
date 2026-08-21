@@ -59,7 +59,16 @@ def test_current_envelope_digest_round_trips_and_detects_tampering() -> None:
         runner.effective_spec_from_status(status)
 
 
-def test_current_envelope_version_is_required_and_validated() -> None:
+def test_current_envelope_version_is_validated_but_absence_still_recovers() -> None:
+    """An ABSENT version is the pre-stamp shape and reads as version 1; a bad one still raises.
+
+    the stamp landed in 1.2.59 (b144ed68, 2026-08-16), so runs prepared by an older build are
+    still in flight. `reallocation_spec_from_status` is what the retry path calls, and
+    `server/platform/runtime.py` marks the run `unrecoverable` when it raises -- so rejecting an
+    unversioned snapshot retires a live run instead of retrying it. dev draws the line the same
+    way (`snapshot.get("version", CURRENT_VERSION)`), and its own regression pins a bool rather
+    than an absent key.
+    """
     from flash.runner.submit import _effective_preparation_snapshot
 
     spec = _current_spec()
@@ -72,6 +81,10 @@ def test_current_envelope_version_is_required_and_validated() -> None:
         spec=spec.to_dict(),
         effective_preparation={key: value for key, value in snapshot.items() if key != "version"},
     )
+    assert runner.effective_spec_from_status(status) == spec
+
+    # a PRESENT but malformed value is still rejected: absence is a known shape, a bool is not.
+    status.effective_preparation = {**snapshot, "version": True}
     with pytest.raises(ValueError, match="version must be a positive integer"):
         runner.effective_spec_from_status(status)
 

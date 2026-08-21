@@ -57,21 +57,6 @@ def broker_db(monkeypatch, tmp_path):
     return path
 
 
-def test_existing_teacher_request_table_gains_replay_column(tmp_path):
-    path = tmp_path / "legacy.db"
-    connection = sqlite3.connect(path)
-    connection.execute(
-        "CREATE TABLE teacher_score_requests (id INTEGER PRIMARY KEY, state TEXT NOT NULL)"
-    )
-    db._migrate_schema(connection)
-    columns = {
-        row[1] for row in connection.execute("PRAGMA table_info(teacher_score_requests)").fetchall()
-    }
-    connection.close()
-
-    assert "response_body" in columns
-
-
 def _issue(*, now=None, expires_at=None, limits=None):
     current = time.time() if now is None else float(now)
     return db.issue_teacher_capability(

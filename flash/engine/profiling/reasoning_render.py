@@ -243,16 +243,10 @@ def reasoning_warning_rows(profile: object) -> int:
     is indistinguishable from a whole-dataset one by inspection -- both carry ``examples_per_update``
     and ``authoritative_steps`` -- so deriving it would pair a binding horizon with unbounded counts.
     """
-
-    def _int(key: str) -> int | None:
-        value = profile.get(key) if isinstance(profile, dict) else getattr(profile, key, None)
-        return None if isinstance(value, bool) or not isinstance(value, int) else value
-
-    rows = _int("reasoning_rows")
-    if rows is not None:
-        return rows
-    retained = _int("retained_examples")
-    return 0 if retained is None else retained
+    value = profile["reasoning_rows"] if isinstance(profile, dict) else profile.reasoning_rows
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("workload profile reasoning_rows must be an integer")
+    return value
 
 
 def rendered_reasoning_loss_warning(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -15,12 +16,12 @@ from flash.cli.ui import render
 from flash.cli.ui.tty import TtyStatusLine
 from flash.client import (
     ApiClient,
-    ApiError,
     ClientError,
     client_from_config,
     save_credentials,
     verify_freesolo_key,
 )
+from flash.client import ApiError as ApiError
 
 # `shadowed_login_warning` has no call site left here since the cost quote moved to
 # `.train_cost`, but the estimate tests patch it on THIS module and that quote reads it back
@@ -380,18 +381,12 @@ def cmd_train(args) -> int:
         # dry-run runs submit-time server preflights without allocating a training gpu or charging
         # for training. a rejection surfaces as the server's error with exit status 1. for sft the
         # server reads the packaged dataset file and builds the quote without executing environment.py.
-        try:
-            status = client.create_run(
-                payload,
-                runtime_secrets=runtime_secrets,
-                dry_run=True,
-                client_train_schema=client_train_schema,
-            )
-        except ApiError as exc:
-            detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
-            if detail is None:
-                raise
-            raise ApiError(exc.status, detail, detail=detail) from exc
+        status = client.create_run(
+            payload,
+            runtime_secrets=runtime_secrets,
+            dry_run=True,
+            client_train_schema=client_train_schema,
+        )
         compatibility = status.pop("train_schema_compatibility", None)
         _print_train_schema_compatibility(compatibility)
         # the server fails open on a billing-infra problem, so "cost" is only in the validated list
@@ -442,7 +437,12 @@ def cmd_train(args) -> int:
     )
     run_id = status["run_id"]
     _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
-    _print_reasoning_loss_warning(status)  # and trains on whatever reasoning the template kept
+    # the run is already created and billing by this line, so a malformed profile must not take the
+    # process down before the run id is reported -- losing it would leave a paid run the user cannot
+    # name to cancel. the dry-run and --cost paths above call this UNGUARDED, which is where a bad
+    # profile still fails loudly and nothing has been allocated yet.
+    with contextlib.suppress(KeyError, TypeError):
+        _print_reasoning_loss_warning(status)  # and trains on whatever reasoning the template kept
     print_warmstart_context_supplement(local_budget, status)
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",
@@ -979,7 +979,6 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _cmd_train_cost,
     _cmd_train_cost_offline,
     _cmd_train_cost_sft,
-    _legacy_train_key_rejection_detail,
     _print_reasoning_loss_warning,
     _print_sft_cost,
     _print_train_schema_compatibility,

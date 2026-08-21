@@ -381,6 +381,10 @@ EXACT_PROFILE = {
     "authoritative_supervised_tokens": 2048,
     "packing_mode": "packed",
     "architecture_mode": "pure-attention",
+    "authored_reasoning_turns": 0,
+    "rendered_reasoning_spans": 0,
+    "truncated_reasoning_spans": 0,
+    "reasoning_rows": 8,
     "content_digest": "b" * 64,
 }
 
@@ -646,74 +650,45 @@ def test_the_client_warning_counts_rows_over_the_same_horizon_as_the_counts(
     assert "across 8 SFT rows" not in err
 
 
-def test_the_client_warning_falls_back_to_retained_rows_without_horizon_fields(
-    tmp_path, monkeypatch, capsys
-):
-    """A profile from a producer that predates the horizon fields is still reported correctly.
-
-    Those counts were measured over every retained row, so the matching denominator is the retained
-    count. Defaulting the missing horizon to zero instead would divide by zero rows and report a
-    loss against a population the profile never described.
-    """
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "authored_reasoning_turns",
+        "rendered_reasoning_spans",
+        "truncated_reasoning_spans",
+        "reasoning_rows",
+    ],
+)
+def test_sft_cost_rejects_profiles_missing_reasoning_counts(tmp_path, monkeypatch, missing):
+    profile = dict(EXACT_PROFILE)
+    profile.pop(missing)
     _use_client(
         monkeypatch,
-        _QuotingClient(
-            {
-                "estimated_cost_usd": 1.25,
-                "workload_profile": {
-                    # EXACT_PROFILE carries no examples_per_update, which is the old-producer shape
-                    **EXACT_PROFILE,
-                    "authored_reasoning_turns": 4,
-                    "rendered_reasoning_spans": 1,
-                },
-            }
-        ),
+        _QuotingClient({"estimated_cost_usd": 1.25, "workload_profile": profile}),
     )
 
-    rc = cmd_train(_sft_args(tmp_path))
-    err = capsys.readouterr().err
-
-    assert rc == 0
-    assert "dropped 3 of 4 authored reasoning blocks" in err
-    assert "across 8 SFT rows" in err
+    with pytest.raises(KeyError, match=missing):
+        cmd_train(_sft_args(tmp_path))
 
 
-def test_unbounded_counts_are_not_divided_by_a_horizon_they_never_used(
-    tmp_path, monkeypatch, capsys
-):
-    """A profile can carry a binding horizon AND counts that predate the bounding.
-
-    The horizon inputs are present on both shapes, so deriving the denominator from them cannot
-    tell the two apart: it would divide whole-dataset counts by the 2 rows the horizon reaches and
-    claim 4 authored blocks across 2 rows -- more blocks than those rows can hold, since the counts
-    are per turn within a row. The denominator travels with the counts instead, and its absence
-    means unbounded.
-    """
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "authored_reasoning_turns",
+        "rendered_reasoning_spans",
+        "truncated_reasoning_spans",
+        "reasoning_rows",
+    ],
+)
+def test_sft_cost_rejects_malformed_reasoning_counts(tmp_path, monkeypatch, malformed):
+    profile = {**EXACT_PROFILE, malformed: None}
     _use_client(
         monkeypatch,
-        _QuotingClient(
-            {
-                "estimated_cost_usd": 1.25,
-                "workload_profile": {
-                    **EXACT_PROFILE,
-                    # a horizon that reaches 2 of the 8 retained rows...
-                    "authoritative_steps": 1,
-                    "examples_per_update": 2,
-                    # ...but counts measured over every retained row, and no `reasoning_rows`
-                    "authored_reasoning_turns": 4,
-                    "rendered_reasoning_spans": 1,
-                },
-            }
-        ),
+        _QuotingClient({"estimated_cost_usd": 1.25, "workload_profile": profile}),
     )
 
-    rc = cmd_train(_sft_args(tmp_path))
-    err = capsys.readouterr().err
-
-    assert rc == 0
-    assert "dropped 3 of 4 authored reasoning blocks" in err
-    assert "across 8 SFT rows" in err
-    assert "across 2 SFT rows" not in err
+    with pytest.raises(TypeError, match=rf"workload profile {malformed} must be an integer"):
+        cmd_train(_sft_args(tmp_path))
 
 
 def test_a_real_sft_submit_warns_about_dropped_reasoning_before_the_run_starts(
@@ -745,6 +720,40 @@ def test_a_real_sft_submit_warns_about_dropped_reasoning_before_the_run_starts(
     assert "dropped 3 of 4 authored reasoning blocks" in err
 
 
+def test_a_real_submit_reports_its_run_id_even_when_the_profile_is_malformed(
+    tmp_path, monkeypatch, capsys
+):
+    """The run is already created and billing here, so a bad profile must not take the id with it.
+
+    the quote and dry-run paths reject a malformed profile loudly, which is where nothing has been
+    allocated yet. past this line the money is spent, and a user who never sees the run id cannot
+    name it to cancel.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "run_id": "run-malformed-profile",
+                "workload_profile": {
+                    **{k: v for k, v in EXACT_PROFILE.items() if k != "reasoning_rows"},
+                    "authored_reasoning_turns": 4,
+                    "rendered_reasoning_spans": 1,
+                },
+            }
+        ),
+    )
+
+    args = _sft_args(tmp_path)
+    args.cost = False
+    args.background = True
+
+    rc = cmd_train(args)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "run-malformed-profile" in out
+
+
 def test_sft_cost_stays_quiet_when_every_authored_block_survives(tmp_path, monkeypatch, capsys):
     """A dataset the template renders whole must not be told to restructure itself."""
     _use_client(
@@ -772,7 +781,18 @@ def test_sft_cost_omits_aggregates_the_profile_did_not_report(tmp_path, monkeypa
     """A partial profile drops rows rather than defaulting them to zero."""
     _use_client(
         monkeypatch,
-        _QuotingClient({"estimated_cost_usd": 0.5, "workload_profile": {"authoritative_steps": 3}}),
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 0.5,
+                "workload_profile": {
+                    "authoritative_steps": 3,
+                    "authored_reasoning_turns": 0,
+                    "rendered_reasoning_spans": 0,
+                    "truncated_reasoning_spans": 0,
+                    "reasoning_rows": 0,
+                },
+            }
+        ),
     )
 
     rc = cmd_train(_sft_args(tmp_path))
