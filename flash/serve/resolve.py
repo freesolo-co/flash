@@ -163,14 +163,19 @@ def _declared_provenance(config_path: str | None) -> tuple[int | None, str | Non
         return None, None, None
     try:
         with open(config_path, "rb") as handle:
-            # the same duplicate-key rule the gpu-side materializer applies to these exact bytes.
-            # plain `json.load` takes the last value, so a config declaring `r` twice resolves
-            # against one rank here and is then rejected outright inside the container -- after
-            # the provider resources this function exists to avoid paying for already exist.
-            config = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
+            raw = handle.read()
+        # decode as strict utf-8 first, exactly as `_load_strict_config` does on the gpu side.
+        # handing the bytes straight to `json.load` instead lets it auto-detect utf-16 and accept
+        # a bom (rfc 4627), so a config the container refuses outright resolved cleanly here --
+        # and the deployment failed only after the provider resources had been allocated.
+        #
+        # the duplicate-key rule is shared for the same reason: plain `json.load` takes the last
+        # value, so a config declaring `r` twice would resolve against one rank and then be
+        # rejected inside the container this function exists to avoid paying for.
+        config = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except _DuplicateConfigKey as exc:
         raise ResolveError(str(exc)) from exc
-    except (OSError, ValueError) as exc:
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise ResolveError(f"{ADAPTER_CONFIG} is not readable json") from exc
     if not isinstance(config, dict):
         raise ResolveError(f"{ADAPTER_CONFIG} must be a json object")

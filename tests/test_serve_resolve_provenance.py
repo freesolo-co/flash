@@ -303,3 +303,42 @@ def test_a_real_hub_token_is_still_forwarded(monkeypatch) -> None:
     resolve_module._hub_api()
 
     assert seen == ["hf_realtoken"], seen
+
+
+@pytest.mark.parametrize(
+    ("label", "prefix", "encoding"),
+    [
+        pytest.param("utf-8 bom", b"\xef\xbb\xbf", "utf-8", id="utf-8-bom"),
+        pytest.param("utf-16-le", b"\xff\xfe", "utf-16-le", id="utf-16-le"),
+        pytest.param("utf-16-be", b"\xfe\xff", "utf-16-be", id="utf-16-be"),
+    ],
+)
+def test_a_config_the_container_cannot_decode_is_rejected_here(
+    monkeypatch, tmp_path, label: str, prefix: bytes, encoding: str
+) -> None:
+    """The control plane must decode these bytes exactly as the gpu container will.
+
+    `_load_strict_config` decodes strict utf-8 and refuses a BOM. Passing the raw handle to
+    `json.load` instead lets it auto-detect utf-16 and skip a BOM (RFC 4627), so a config the
+    container rejects outright resolved cleanly, provisioned, and started billing before failing
+    -- the same split this function already closes for duplicate keys.
+    """
+    body = json.dumps({"peft_type": "LORA", "r": 32, "base_model_name_or_path": BASE})
+    (tmp_path / ADAPTER_CONFIG).write_bytes(prefix + body.encode(encoding))
+    (tmp_path / ADAPTER_WEIGHTS).write_bytes(b"weights-bytes")
+
+    class _Info:
+        sha = ARTIFACT_REVISION
+
+    class _Api:
+        def repo_info(self, **_kwargs):
+            return _Info()
+
+    monkeypatch.setattr(resolve_module, "_hub_api", lambda: _Api())
+    monkeypatch.setattr(
+        "huggingface_hub.hf_hub_download",
+        lambda *, filename, **_kwargs: str(tmp_path / Path(filename).name),
+    )
+
+    with pytest.raises(ResolveError, match="not readable json"):
+        _resolve()
