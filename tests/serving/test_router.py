@@ -1710,19 +1710,21 @@ def test_concurrent_misses_hydrate_in_order_without_stampeding():
     # the empty fetch must not land after the fresh one. asserting the ORDER, not a fixed list:
     # requiring `[0]` would mean the later miss reused the earlier snapshot, which is the defect.
     assert hydrated == sorted(hydrated), f"a stale fetch hydrated after a fresher one: {hydrated}"
-    # the caller whose miss forced the follow-up fetch must SEE it. bounding the fetch count alone
-    # let an implementation read storage and drop the records on the floor: the counts and the
-    # ordering both still held while the committed adapter stayed invisible and every caller 404'd.
-    assert any(not isinstance(result, HTTPException) for result in results), (
-        "the follow-up fetch ran but no caller could resolve the adapter it read"
+    # the caller whose miss forced the follow-up fetch must SEE it, and see exactly what storage
+    # returned. bounding the fetch count alone let an implementation read storage and drop the
+    # records on the floor -- counts and ordering both held while every caller 404'd. checking only
+    # `adapter_id`/`base_model` was the next hole: those survive a hydrate of the wrong records, so
+    # a pair resolving from `wrong/repository` still passed. compare the records themselves.
+    #
+    # `any`, not `all`: the first caller legitimately gets the empty snapshot and 404s, because its
+    # own fetch began before the adapter was committed. requiring both would encode a false
+    # contract; requiring one exact match is the real invariant.
+    resolved = [result for result in results if not isinstance(result, HTTPException)]
+    assert resolved, "the follow-up fetch ran but no caller could resolve the adapter it read"
+    # no caller sees a half-applied hydrate: each either resolves the committed pair or 404s.
+    assert all(result == (_alias(revision), revision) for result in resolved), (
+        f"a caller resolved records that are not the ones storage returned: {resolved}"
     )
-    # no caller sees a half-applied hydrate: each either resolves the pair or gets a clean 404.
-    for result in results:
-        if isinstance(result, HTTPException):
-            continue
-        requested, target = result
-        assert requested.adapter_id == "late"
-        assert target.base_model == QWEN
 
 
 def test_reload_stampede_stays_bounded_as_callers_pile_up():
@@ -1788,9 +1790,10 @@ def test_a_reload_that_snapshotted_first_cannot_answer_a_later_miss():
     asyncio.run(_sequence())
 
     assert calls["count"] == 2, "the later miss reused a snapshot taken before it began"
-    # and the second fetch's records must actually land. the fetch count only proves storage was
-    # re-read; the point of re-reading it is that the adapter committed in between becomes
-    # resolvable, which is exactly what the caller's 404 depended on.
-    assert router.resolve("committed-late") is not None, (
+    # and the second fetch's records must actually land, as themselves. the fetch count only proves
+    # storage was re-read; the point of re-reading it is that the adapter committed in between
+    # becomes resolvable. asserting merely `is not None` would accept a hydrate of different
+    # records that happen to share the routable id, so compare the exact committed pair.
+    assert router.resolve("committed-late") == (_alias(revision), revision), (
         "storage was re-read but the adapter committed before that miss stayed invisible"
     )
