@@ -4727,7 +4727,7 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
         "steps": [
             {
                 "optimizer_step": 1,
-                "registered": expected,
+                "registered": _identity_summary(expected),
                 "observed": _identity_summary(expected),
             }
         ],

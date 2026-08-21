@@ -14,7 +14,6 @@ import pytest
 
 from flash.engine.worker.train.rl.child import patches
 from flash.engine.worker.train.rl.identity import (
-    RolloutIdentity,
     RolloutIdentityLedger,
     parse_rollout_identity,
 )
@@ -68,7 +67,7 @@ def test_identity_ledger_accepts_resumed_step_and_exact_out_of_order_set():
     ledger.finalize({17})
 
 
-def test_identity_ledger_retains_exact_p64_g2_terminal_evidence_and_returns_deep_copies():
+def test_identity_ledger_summarizes_p64_g2_terminal_evidence_and_returns_deep_copies():
     ledger = RolloutIdentityLedger(64, 2)
     exact_by_step = {}
     for step in (1, 2):
@@ -80,11 +79,17 @@ def test_identity_ledger_retains_exact_p64_g2_terminal_evidence_and_returns_deep
         ledger.seal(step)
 
     evidence = ledger.finalize({1, 2})
+    # both sides are digested, and each digest is checked against the identities the test built
+    # itself rather than against the other side of the payload. a payload that simply copied one
+    # digest into the other field would satisfy an internal comparison while proving nothing.
     assert evidence == {
         "steps": [
             {
                 "optimizer_step": step,
-                "registered": exact_by_step[step],
+                "registered": {
+                    "count": len(exact_by_step[step]),
+                    "sha256": _identity_sha256(exact_by_step[step]),
+                },
                 "observed": {
                     "count": len(exact_by_step[step]),
                     "sha256": _identity_sha256(exact_by_step[step]),
@@ -95,25 +100,21 @@ def test_identity_ledger_retains_exact_p64_g2_terminal_evidence_and_returns_deep
         "validation": [],
     }
     for step in evidence["steps"]:
-        registered = step["registered"]
-        observed = step["observed"]
-        assert len(registered) == 128
-        assert len({tuple(identity.items()) for identity in registered}) == 128
-        assert observed["count"] == len(registered)
-        assert observed["sha256"] == _identity_sha256(registered)
-        assert all(identity["validate"] is False for identity in registered)
-        assert all(identity["optimizer_step"] == step["optimizer_step"] for identity in registered)
+        assert step["registered"]["count"] == 128
+        assert step["observed"]["count"] == 128
+        assert step["registered"]["sha256"] == step["observed"]["sha256"]
 
-    evidence["steps"][0]["registered"][0]["sample_index"] = 999
+    # the returned payload must be a copy: mutating it cannot reach into the ledger.
+    evidence["steps"][0]["registered"]["count"] = 999
     evidence["steps"][0]["observed"]["count"] = 0
-    evidence["steps"].append({"optimizer_step": 999, "registered": [], "observed": {}})
+    evidence["steps"].append({"optimizer_step": 999, "registered": {}, "observed": {}})
     fresh = ledger.evidence()
     assert [step["optimizer_step"] for step in fresh["steps"]] == [1, 2]
-    assert fresh["steps"][0]["registered"][0]["sample_index"] == 0
+    assert fresh["steps"][0]["registered"]["count"] == 128
     assert fresh["steps"][0]["observed"]["count"] == 128
 
 
-def test_identity_evidence_observed_summary_matches_registered_detail():
+def test_identity_evidence_summaries_agree_across_both_sides():
     ledger = RolloutIdentityLedger(2, 2)
     expected = _expected(7, (4, 9), 2)
     ledger.register(reversed(expected))
@@ -122,34 +123,48 @@ def test_identity_evidence_observed_summary_matches_registered_detail():
     ledger.seal(7)
 
     step = ledger.finalize({7})["steps"][0]
-    assert step["observed"]["count"] == len(step["registered"])
-    assert step["observed"]["sha256"] == _identity_sha256(step["registered"])
+    assert step["registered"]["count"] == len(expected)
+    assert step["observed"]["count"] == len(expected)
+    assert step["registered"]["sha256"] == _identity_sha256(expected)
+    assert step["observed"]["sha256"] == _identity_sha256(expected)
 
 
-def test_finalize_materializes_each_identity_dict_once(monkeypatch):
-    ledger = RolloutIdentityLedger(64, 2)
-    for step in (1, 2):
-        expected = _expected(step, tuple(range(64)), 2)
-        ledger.register(expected)
-        for identity in expected:
-            ledger.record(identity, identity["sample_index"])
-        ledger.seal(step)
+def test_finalize_evidence_is_constant_size_per_step():
+    """Evidence must not grow with the completions it summarizes.
 
-    calls = 0
-    original_to_dict = RolloutIdentity.to_dict
+    Asserted as a size relation between two ledgers whose per-step work differs by 8x, rather than
+    against a hardcoded byte count: a fixed number would pass for any payload that happens to be
+    small today, including one that still embeds every identity at a small group size.
 
-    def counted_to_dict(identity):
-        nonlocal calls
-        calls += 1
-        return original_to_dict(identity)
+    The unbounded form measured 43 KB of json per step at the documented 512-completions-per-step
+    envelope, so a 10,000-step run wrote ~434 MB into `train_meta.json` -- doubled to ~867 MB by
+    the deepcopy in verl_config -- during `finalize()`, after paid training had already succeeded.
+    """
+    import json
 
-    monkeypatch.setattr(RolloutIdentity, "to_dict", counted_to_dict)
-    evidence = ledger.finalize({1, 2})
+    def evidence_for(prompts_per_step, group_size, steps):
+        ledger = RolloutIdentityLedger(prompts_per_step, group_size)
+        for step in range(1, steps + 1):
+            expected = _expected(step, tuple(range(prompts_per_step)), group_size)
+            ledger.register(expected)
+            for identity in expected:
+                ledger.record(identity, identity["sample_index"])
+            ledger.seal(step)
+        return ledger.finalize(set(range(1, steps + 1)))
 
-    expected_identities = 2 * 64 * 2
-    assert calls == expected_identities
-    assert sum(len(step["registered"]) for step in evidence["steps"]) == expected_identities
-    assert all(not isinstance(step["observed"], list) for step in evidence["steps"])
+    small = json.dumps(evidence_for(8, 2, 2))  # 16 completions per step
+    large = json.dumps(evidence_for(64, 8, 2))  # 512 completions per step, 32x the work
+    # not asserted equal: the counts themselves are rendered into the json, so "512" is three bytes
+    # wider than "16". a handful of bytes for 32x the completions is the property under test; the
+    # unbounded form differed by ~86 KB at these sizes.
+    assert abs(len(large) - len(small)) < 32, (
+        f"evidence size tracks completion count: {len(small)} vs {len(large)} bytes for the same "
+        "step count with 16 vs 512 completions per step"
+    )
+
+    # and it grows only with the number of steps, linearly and by a small constant.
+    four_steps = json.dumps(evidence_for(64, 8, 4))
+    assert len(four_steps) < 2 * len(large) + 64
 
 
 def test_failed_identity_seal_does_not_publish_terminal_evidence():

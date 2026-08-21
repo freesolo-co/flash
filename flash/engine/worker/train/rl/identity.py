@@ -41,7 +41,26 @@ class RolloutIdentity:
 
 @dataclass(frozen=True)
 class _SealedEvidence:
-    registered: tuple[RolloutIdentity, ...]
+    """A sealed step's identity evidence, summarized rather than enumerated.
+
+    Both sides are held as a count and a digest instead of the identities themselves. The exact
+    tuple is what `seal` compares -- equality of the registered and observed SETS is checked there,
+    while both are still in memory -- so keeping the members afterwards would preserve the detail of
+    a comparison that has already succeeded, and nothing downstream reads an individual identity.
+
+    That detail is not free: one dict per completion per step, at the documented envelope of 512
+    completions per optimizer step, measures 43 KB of json per step. A 10,000-step run therefore
+    writes ~434 MB into `train_meta.json`, and `verl_config.py` deepcopies the payload before
+    serializing it, so the peak is ~867 MB -- reached during `finalize()`, after paid training has
+    already succeeded. Summarizing bounds the evidence at a constant size per step.
+
+    `registered_sha256` and `observed_sha256` are computed independently over the two sets rather
+    than one being copied from the other, so they still corroborate each other: a digest that
+    matched only because it was assigned from its counterpart would prove nothing.
+    """
+
+    registered_count: int
+    registered_sha256: str
     observed_count: int
     observed_sha256: str
 
@@ -106,7 +125,10 @@ class RolloutIdentityLedger:
             "steps": [
                 {
                     "optimizer_step": step,
-                    "registered": [identity.to_dict() for identity in sealed.registered],
+                    "registered": {
+                        "count": sealed.registered_count,
+                        "sha256": sealed.registered_sha256,
+                    },
                     "observed": {
                         "count": sealed.observed_count,
                         "sha256": sealed.observed_sha256,
@@ -242,8 +264,12 @@ class RolloutIdentityLedger:
                     f"GRPO step {step} observed identity set does not equal registration: "
                     f"missing={missing}, unexpected={unexpected}"
                 )
+            # digested from `expected` and `observed` separately. the two sets were just proven
+            # equal above, so the digests necessarily agree -- but they agree because each was
+            # computed from its own side, which is what makes their agreement evidence.
             self._sealed_evidence[step] = _SealedEvidence(
-                registered=tuple(sorted(expected)),
+                registered_count=len(expected),
+                registered_sha256=_identity_digest(expected),
                 observed_count=len(observed),
                 observed_sha256=_identity_digest(observed),
             )
