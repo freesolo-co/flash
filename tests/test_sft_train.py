@@ -4641,6 +4641,37 @@ def test_required_saves_are_never_skipped_even_when_the_publisher_lags(monkeypat
     assert published == [350, 450], f"a required save was dropped as superseded: {published}"
 
 
+def test_a_required_backlog_still_drops_its_superseded_optional_saves(monkeypatch, tmp_path):
+    """The coalescing must survive `save_at_steps`, which is when the disk is tightest.
+
+    Each export writes a full model copy to the container disk while training writes the next
+    checkpoint to the same disk, which is the whole reason superseded periodic saves are skipped.
+    Gating that on `required_steps` being EMPTY disabled it for every run that authored
+    `save_at_steps` -- so the runs most likely to lag were the ones that kept every copy.
+    """
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=(350,)
+    )
+
+    selected = [step for step, _ in watcher._publishable(watcher._pending())]
+    # 400 is superseded by the newer 450 and is dropped before any export runs. it is the export,
+    # not the sweep, that writes a full model copy beside the checkpoint training is still saving.
+    assert selected == [350, 450], f"a superseded optional save survived selection: {selected}"
+    assert watcher.lifecycle.facts(400).discovered, "the skipped step was not claimed"
+    assert not watcher.lifecycle.facts(400).deployable_published, (
+        "a skipped step must gain no durability fact"
+    )
+
+    for step, checkpoint_dir in watcher._publishable(watcher._pending()):
+        watcher._publish(step, checkpoint_dir)
+
+    # `_should_publish` still governs what is actually exported: with required steps authored, only
+    # those get an artifact. selection bounds the disk; publication honours the authored contract.
+    assert published == [350], (
+        f"an optional save was exported alongside a required one: {published}"
+    )
+
+
 def test_the_opd_watcher_publishes_every_step_despite_the_sft_bound(monkeypatch, tmp_path):
     """opd keeps all pending retry states."""
     from flash.engine.worker.train.opd import failures as opd_failures

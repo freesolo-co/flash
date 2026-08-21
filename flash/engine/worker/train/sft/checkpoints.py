@@ -159,21 +159,43 @@ class _VerlCheckpointWatcher:
         return not self.required_steps or step in self.required_steps
 
     def _publishable(self, pending: list[tuple[int, str]]) -> list[tuple[int, str]]:
-        """coalesce only an optional multi-checkpoint backlog to its newest save."""
-        if self.required_steps or len(pending) <= 1:
+        """coalesce a superseded OPTIONAL backlog to its newest save, required steps kept.
+
+        the coalescing exists because each export writes a full model copy to the container disk,
+        and the publisher runs on its own thread while training writes the next checkpoint. gating
+        the whole thing on `self.required_steps` being empty disabled it for exactly the runs that
+        need it most: `save_at_steps` makes every step required, so a backlog kept every optional
+        step too and the disk held several full copies at once.
+
+        a required step is still never dropped -- it is owed a durable artifact. only steps that
+        `_should_publish` would skip anyway are coalesced away, so this changes no authored
+        contract; it just stops claiming them one sweep later than it has to.
+        """
+        if len(pending) <= 1:
             return pending
-        superseded = pending[:-1]
+        # a required step is owed a durable artifact and is never coalesced away. an optional step is
+        # only worth publishing when it is the newest save in the backlog; anything older than that
+        # is superseded by weights this same sweep is about to publish.
+        keep = [
+            entry
+            for index, entry in enumerate(pending)
+            if entry[0] in self.required_steps or index == len(pending) - 1
+        ]
+        superseded = [entry for entry in pending if entry not in keep]
+        if not superseded:
+            return pending
         # discovered only: these are claimed so the next sweep skips them, and deliberately gain no
         # durability fact. nothing was published for them, and the ledger has to say so.
         for step, _ in superseded:
             self.lifecycle.mark_discovered(step)
         print(
-            f"[ckpt] publishing step {pending[-1][0]} and skipping superseded periodic "
-            f"checkpoint(s) {', '.join(str(step) for step, _ in superseded)}: the publisher is "
-            "behind training, and each export writes a full model copy to the same disk",
+            f"[ckpt] publishing step(s) {', '.join(str(step) for step, _ in keep)} and skipping "
+            f"superseded periodic checkpoint(s) {', '.join(str(step) for step, _ in superseded)}: "
+            "the publisher is behind training, and each export writes a full model copy to the "
+            "same disk",
             flush=True,
         )
-        return pending[-1:]
+        return keep
 
     def _staged_source(self, step: int, checkpoint_dir: str) -> str:
         """hardlink a completed checkpoint before verl retention can prune it.

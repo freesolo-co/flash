@@ -634,7 +634,23 @@ def resolve_vocab_size(model_id: str, revision: str = "") -> int:
 
 
 def _with_merge_disk_floor(info: ModelInfo) -> ModelInfo:
-    return replace(info, min_disk_gb=max(info.min_disk_gb, ceil(info.params_b * 2) + 64))
+    """Floor the container disk at what publishing a checkpoint actually holds at once.
+
+    `min_disk_gb` sizes the RunPod container disk (`template.containerDiskInGb`), which is where the
+    verl workdir and every export live. Publishing is concurrent with training, so at the moment the
+    merger runs that one filesystem holds THREE full bf16 model copies, not one:
+
+    * the checkpoint being published. verl saves `self.model.state_dict()`, the whole model rather
+      than the lora delta, and the publisher hardlinks it into `_staging`, so verl's own
+      `max_ckpt_to_keep=1` prune frees nothing while the merge still references it.
+    * the next checkpoint, which training writes on its own thread while that merge runs.
+    * the merger's output, a full model materialized beside its input.
+
+    At `2 * params + 64` a 35B model was granted 200 GB and died with 24.98 GB free after both of
+    its steps had trained -- the failure lands at publish, so it reads like a training fault and is
+    not one. The base weight cache is NOT in this budget: it lives on the shared weight-cache volume.
+    """
+    return replace(info, min_disk_gb=max(info.min_disk_gb, ceil(info.params_b * 2) * 3 + 64))
 
 
 def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> ModelInfo:
