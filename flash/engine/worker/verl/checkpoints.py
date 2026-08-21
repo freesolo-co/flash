@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Mapping
+from pathlib import Path
 
 from flash.adapters.fused_experts import (
     fused_expert_lora_tensor_pairs,
@@ -516,6 +517,60 @@ _NON_LANGUAGE_ADAPTER_SEGMENTS = frozenset(
 )
 
 
+def _inert_non_language_keys(adapter_dir: str, keys: set[str]) -> set[str]:
+    """The subset of ``keys`` whose LoRA-B factors are provably all zero, i.e. contribute nothing.
+
+    A text-only run never TARGETS a non-language module, so such a tensor is normally proof the
+    merger wrote something the run never trained. But warm start admits a pre-upgrade all-linear
+    text adapter carrying inert visual/projector pairs -- `_legacy_adapter_is_multimodal` classifies
+    it text-only exactly because every non-language LoRA-B is zero -- and PEFT then rebuilds the
+    adapter from that SOURCE config, so those keys reappear in every checkpoint the run exports.
+    Rejecting them on presence alone would let such a run train to completion and then fail every
+    periodic and final publish, which is strictly worse than never admitting it.
+
+    So apply the same rule the admission used: tolerate a non-language key only when it is provably
+    inert. A live one is still contamination and still rejected. Unreadable weights decide nothing,
+    so they are reported as not-inert and the caller rejects -- the safe direction.
+    """
+    from flash.adapters.artifacts import loadable_adapter_weight_files
+    from flash.serve.export import (
+        _load_bin_state,
+        _non_lm_liveness_from_key,
+        _non_lm_tensor_is_live,
+        _read_safetensors_header,
+    )
+
+    inert: set[str] = set()
+    try:
+        selected = loadable_adapter_weight_files(os.listdir(adapter_dir))
+        if not selected:
+            return set()
+        unread = set(keys)
+        for name in selected:
+            path = os.path.join(adapter_dir, name)
+            if name.endswith(".bin"):
+                state = _load_bin_state(Path(path))
+                for key in unread & state.keys():
+                    decided = _non_lm_liveness_from_key(key)
+                    if decided is False or (decided is None and not bool(state[key].any())):
+                        inert.add(key)
+                continue
+            header, data_start, file_size = _read_safetensors_header(Path(path))
+            with open(path, "rb") as source:
+                for key in unread & header.keys():
+                    if not _non_lm_tensor_is_live(
+                        source,
+                        key,
+                        header[key],
+                        data_start=data_start,
+                        file_size=file_size,
+                    ):
+                        inert.add(key)
+    except (OSError, ValueError, ImportError):
+        return set()
+    return inert
+
+
 def _pair_has_nonzero_delta(factor_a, factor_b, *, require_finite_scan: bool) -> bool:
     """return whether B @ A is nonzero, checking every block when overflow is possible."""
     import numpy as np
@@ -635,11 +690,23 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
     pairs: dict[str, dict[str, str]] = {}
     language_pairs: dict[str, dict[str, str]] = {}
     target_evidence: set[str] = set()
+    inert_non_language: set[str] = set()
+    if not multimodal:
+        carried = {
+            key for key in metadata if set(key.lower().split(".")) & _NON_LANGUAGE_ADAPTER_SEGMENTS
+        }
+        if carried:
+            inert_non_language = _inert_non_language_keys(adapter_dir, carried)
     for key, shape in metadata.items():
         segments = set(key.lower().split("."))
         non_language = bool(segments & _NON_LANGUAGE_ADAPTER_SEGMENTS)
         if non_language and not multimodal:
-            raise RuntimeError(f"{label} contains non-language tensor {key!r}")
+            # inert pairs are the grandfathered warm-start case, not contamination: they compose to
+            # a zero delta, so publishing them changes no output. a LIVE one still means the run
+            # trained something it never targeted, and is still rejected.
+            if key not in inert_non_language:
+                raise RuntimeError(f"{label} contains non-language tensor {key!r}")
+            continue
         match = _TEXT_LORA_KEY_RE.fullmatch(key)
         if match is None:
             raise RuntimeError(f"{label} contains a non-canonical tensor key {key!r}")
@@ -684,7 +751,19 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
     _validate_adapter_tensor_values(adapter_dir, metadata, pair_keys, label=label)
     # the concrete list is peft's attached surface, including vision modules for multimodal runs;
     # fused-expert targets use their separate topology validator instead of this path.
-    missing_targets = sorted(set(targets) - target_evidence)
+    #
+    # a target reachable ONLY through skipped inert non-language keys is excused: the legacy config
+    # declares it (`proj` on a grandfathered all-linear adapter), but every tensor proving it was
+    # skipped above, so demanding evidence would reject exactly the artifact the skip exists to
+    # allow. only those targets are excused -- a language target with no tensors still fails.
+    excused = {
+        target
+        for key in inert_non_language
+        if (match := _TEXT_LORA_KEY_RE.fullmatch(key)) is not None
+        for target in targets
+        if (module := match.group("module")) == target or module.endswith(f".{target}")
+    }
+    missing_targets = sorted(set(targets) - target_evidence - excused)
     if missing_targets:
         raise RuntimeError(
             f"{label} has no tensors for declared target_modules {missing_targets[:4]}"
@@ -742,16 +821,21 @@ def stamp_adapter_dir_provenance(
             tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
         except ValueError as exc:
             raise RuntimeError("exported fused-expert adapter tensor artifact is invalid") from exc
-        # a text-only run never targets non-language modules, so their presence is an invalid
-        # export; a multimodal run trains them under `all-linear` on purpose. this rejection is
-        # what enforces that, and it must run BEFORE `fused_expert_lora_tensor_pairs`, which
-        # returns non-language pairs as ordinary evidence rather than skipping them.
+        # a text-only run never targets non-language modules, so a LIVE one is an invalid export;
+        # a multimodal run trains them under `all-linear` on purpose. this rejection is what
+        # enforces that, and it must run BEFORE `fused_expert_lora_tensor_pairs`, which returns
+        # non-language pairs as ordinary evidence rather than skipping them. inert pairs are
+        # exempt for the same reason as the non-moe path: warm start admits a legacy adapter
+        # carrying zero-delta visual factors, peft rebuilds them from that source config, and
+        # rejecting them on presence would make the run unpublishable after it already trained.
         if not multimodal:
-            for key in tensors:
-                if is_non_language_lora_key(key):
-                    raise RuntimeError(
-                        f"exported text adapter contains non-language tensor {key!r}"
-                    )
+            carried = {key for key in tensors if is_non_language_lora_key(key)}
+            live = carried - _inert_non_language_keys(adapter_dir, carried)
+            if live:
+                raise RuntimeError(
+                    f"exported text adapter contains non-language tensor {sorted(live)[0]!r}"
+                )
+            tensors = {key: shape for key, shape in tensors.items() if key not in carried}
         pairs = fused_expert_lora_tensor_pairs(tensors, cfg, model_id)
         if pairs is None:
             raise RuntimeError(

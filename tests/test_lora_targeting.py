@@ -860,3 +860,37 @@ def test_multimodal_export_still_requires_a_trained_language_tensor(tmp_path):
 
     with pytest.raises(RuntimeError, match="no language-stack LoRA pair"):
         stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", exclude_modules=None)
+
+
+def test_grandfathered_inert_vision_adapter_survives_admission_and_export(tmp_path):
+    """The warm start this PR admits must also be publishable, not just startable.
+
+    `test_legacy_inert_vision_factors_warmstart_a_text_run` proves a pre-upgrade all-linear text
+    adapter carrying zero-delta visual factors is ADMITTED. But warm start hands the source
+    directory to Verl as `lora_adapter_path`, which bypasses Flash's language-only targeting and
+    lets PEFT rebuild the adapter from that source config, so those visual keys reappear in every
+    checkpoint the run exports. Rejecting them on presence alone meant such a run could train to
+    completion and then fail every periodic and final publish -- admitted but unpublishable.
+
+    So assert BOTH halves against one artifact: admission accepts it, and the real export
+    validator then accepts the same tensors. A LIVE vision tensor must still be rejected, which
+    `test_text_export_passes_only_when_training_targeting_omits_the_visual_tensor` covers.
+    """
+    from flash.engine.worker.model.adapter import validate_warmstart_adapter
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
+    adapter = tmp_path / "grandfathered-inert-vision"
+    source_config, keys = _write_raw_legacy_adapter(adapter, vision_b_payload=b"\x00\x00")
+    assert any("visual" in key for key in keys)
+
+    # half one: the run is allowed to start from it.
+    validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
+
+    # half two: the checkpoint it exports carries the same inert visual keys, and publishing it
+    # must not raise. this is the half that was missing.
+    stamp_adapter_dir_provenance(str(adapter), model_id, exclude_modules=targeting.exclude_modules)
+
+    saved = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["exclude_modules"] == targeting.exclude_modules
