@@ -278,7 +278,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
     if not os.path.exists(runner.runs_file_path(run_id, ".json")):
         return
     hb = runner._sanitize_status_value(heartbeat)
-    gpu = (hb.get("gpu") or hb.get("diag")) if isinstance(hb, dict) else None
+    gpu = hb.get("gpu") if isinstance(hb, dict) else None
     with runner._status_guard(run_id):
         try:
             status = runner.get_status(run_id)
