@@ -1543,9 +1543,13 @@ server = [
     { name = "uvicorn" },
 ]
 serving = [
+    { name = "fastapi", version = "0.136.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-freesolo-flash-serve-runtime'" },
+    { name = "fastapi", version = "0.141.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-freesolo-flash-gpu' or extra != 'extra-14-freesolo-flash-serve-runtime'" },
     { name = "httpx" },
     { name = "modal" },
     { name = "orjson" },
+    { name = "pillow" },
+    { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
 ]
@@ -1574,6 +1578,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'dev'" },
     { name = "fastapi", marker = "extra == 'serve-runtime'" },
     { name = "fastapi", marker = "extra == 'server'" },
+    { name = "fastapi", marker = "extra == 'serving'" },
     { name = "freesolo", marker = "extra == 'dev'", specifier = ">=0.4.1" },
     { name = "freesolo", marker = "extra == 'gpu'", specifier = ">=0.4.1" },
     { name = "freesolo", marker = "extra == 'server'", specifier = ">=0.4.1" },
@@ -1594,6 +1599,8 @@ requires-dist = [
     { name = "pillow", marker = "extra == 'dev'", specifier = ">=11" },
     { name = "pillow", marker = "extra == 'serve-runtime'", specifier = ">=11.0.0" },
     { name = "pillow", marker = "extra == 'server'", specifier = ">=11" },
+    { name = "pillow", marker = "extra == 'serving'", specifier = ">=11" },
+    { name = "pydantic", marker = "extra == 'serving'", specifier = ">=2.7.0" },
     { name = "pydantic-settings", marker = "extra == 'serving'", specifier = ">=2.6.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
     { name = "python-dotenv", marker = "extra == 'serving'", specifier = ">=1.0.0" },

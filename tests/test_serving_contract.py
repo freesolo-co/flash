@@ -925,3 +925,53 @@ def test_new_deployment_does_not_duplicate_existing_v1_suffix(monkeypatch):
     assert data["endpoint_name"] == "https://serve.example"
     assert data["openai_base_url"] == "https://serve.example/v1"
     assert "url" not in data
+
+
+def test_the_serving_extra_declares_every_module_scope_import_of_the_serving_app():
+    """The `serving` extra must be able to import the app it exists to run.
+
+    `flash/serving/` is installed into the GPU container by that extra alone. A module-scope import
+    it does not cover makes the container fail on startup, which is the most expensive place to
+    discover a missing bound. CI cannot catch it by running the tests: it installs `server` too,
+    and `server` happens to carry fastapi -- so the app imported fine while the extra was
+    incomplete. fastapi and Pillow were both missing exactly this way.
+
+    Checked statically against the source rather than by installing, so it costs nothing and runs
+    in the offline suite.
+    """
+    import ast
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = {
+        # `pydantic-settings` -> `pydantic_settings`, and a bound like `pillow>=11` -> `pillow`.
+        __import__("re").split(r"[<>=!\[; ]", name, 1)[0].strip().lower().replace("-", "_")
+        for name in pyproject["project"]["optional-dependencies"]["serving"]
+    }
+    # distribution name != import name for these three; nothing else in the extra differs.
+    declared |= {"pil"} if "pillow" in declared else set()
+    declared |= {"dotenv"} if "python_dotenv" in declared else set()
+
+    stdlib = set(__import__("sys").stdlib_module_names)
+    missing: dict[str, set[str]] = {}
+    for path in sorted((root / "flash" / "serving").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            # module scope only: a function-level import is deliberately deferred and may name a
+            # package the extra is not required to carry (vllm, torch).
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.col_offset == 0:
+                top = (node.module or "").split(".")[0]
+            elif isinstance(node, ast.Import) and node.col_offset == 0:
+                top = node.names[0].name.split(".")[0]
+            else:
+                continue
+            key = top.lower()
+            if not top or top == "flash" or key in stdlib or key in declared:
+                continue
+            missing.setdefault(top, set()).add(str(path.relative_to(root)))
+
+    assert not missing, (
+        "these packages are imported at module scope by flash/serving but are not declared by the "
+        f"`serving` extra: { {k: sorted(v)[:2] for k, v in missing.items()} }"
+    )

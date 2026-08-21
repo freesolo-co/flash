@@ -85,8 +85,21 @@ serving = [
     # billing) over httpx, at module scope in src/persistence.py and src/supabase_rest.py. it is
     # NOT transitively guaranteed by the other bounds, so the image must state it.
     "httpx>=0.27.0",
+    # the app IS a fastapi app: `src/router.py` and nine sibling modules import it at module scope.
+    # nothing else here guarantees it -- modal does not depend on fastapi -- so installing this
+    # extra alone could not import the app it exists to run. CI only passed because it also
+    # installs `server`, which happens to carry fastapi.
+    "fastapi",
     "modal>=1.0.0",
     "orjson>=3.10.0",
+    # `src/multimodal.py` decodes and normalizes inbound images at module scope. the `gpu` extra
+    # gets Pillow transitively via vllm, but this extra deliberately excludes vllm, so it has to
+    # state Pillow itself.
+    "pillow>=11",
+    # imported directly by `src/schemas.py`, `src/serving_io.py` and `src/settings.py`. it does
+    # arrive under `pydantic-settings`, but a direct module-scope import should not rely on
+    # another package's dependency to keep supplying it.
+    "pydantic>=2.7.0",
     "pydantic-settings>=2.6.0",
     "python-dotenv>=1.0.0",
 ]
