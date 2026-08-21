@@ -1825,6 +1825,49 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
     )
 
 
+def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
+    # the OTHER attach exit: a provider poll that returns ok. the wall-deadline route above carries
+    # all three fields through `_carry_allocation_stamp`, but this one restored only gpu and count
+    # from the context -- so a vast or lambda run that simply finished its poll was priced by
+    # `_gpu_rate`'s fallback (normally RunPod) and its notes named a provider that never ran it.
+    import io
+    from types import SimpleNamespace
+
+    import flash.runner.supervise.attach as attach
+    from flash.providers.base import JobHandle
+
+    remote = _vast_remote(allocated_gpu="RTX 4090", allocated_gpu_count=4)
+    context = attach._AttachContext(
+        worker_spec=None,
+        persisted_remote=remote,
+        handle=JobHandle.from_dict({"provider": "vast", "instance_id": 7}),
+        seed=0,
+        recovered_attempt=0,
+        next_attempt=1,
+        source_snapshot=None,
+    )
+    result = SimpleNamespace(ok=True, metrics={"wall_seconds": 3600.0})
+    adopted = {}
+    # `_adopt_attached_poll_result` imports the adopter from its owning module at call time, so the
+    # patch has to land there rather than on a name bound into `attach`.
+    import flash.runner.supervise.lifecycle as lifecycle_mod
+
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "_adopt_completed_attempt",
+        lambda *_a, **_k: adopted.update(result.metrics) or True,
+    )
+
+    attach._adopt_attached_poll_result("attach-poll-multicard", context, result, io.StringIO())
+
+    assert adopted["allocated_gpu"] == "RTX 4090"
+    assert adopted["allocated_gpu_count"] == 4
+    assert adopted["allocated_provider"] == "vast", (
+        "a polled vast run reached persistence with no provider, so its wall is priced at "
+        "whichever provider offers the class rather than the one that billed it"
+    )
+
+
 def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, tmp_path):
     import io
 
