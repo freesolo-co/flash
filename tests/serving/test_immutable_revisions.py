@@ -16,6 +16,7 @@ from flash.serving.src.schemas import (
     PersistedAdapterRecord,
     internal_adapter_payload,
 )
+from tests.serving.conftest import attest
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 QWEN_2B = "Qwen/Qwen3.5-2B"
@@ -173,14 +174,17 @@ class FakePool:
     ) -> dict[str, Any]:
         del expected_checkpoint
         self.generated.append((base_model, payload.adapter_id, record.adapter_id))
-        return {
-            "ok": True,
-            "adapter_id": payload.adapter_id,
-            "text": record.adapter_id,
-            "prompt_tokens": 1,
-            "completion_tokens": 1,
-            "checkpoint": record.checkpoint,
-        }
+        return attest(
+            record,
+            {
+                "ok": True,
+                "adapter_id": payload.adapter_id,
+                "text": record.adapter_id,
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "checkpoint": record.checkpoint,
+            },
+        )
 
     async def stream_generate(
         self,

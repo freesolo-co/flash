@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from flash.serving.src.adapter_routes import remove_adapter
 from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
+from tests.serving.conftest import attest
 
 
 async def _allow(_token: str, _adapter_id: str) -> None:
@@ -156,16 +157,19 @@ class FakePool:
         self.template_kwargs.append(getattr(payload, "chat_template_kwargs", None))
         self.messages.append(getattr(payload, "messages", None))
         self.structured.append(getattr(payload, "structured_outputs", None))
-        return {
-            # Snake_case, matching the real engine RPC contract (modal_app.py::_generate).
-            "ok": True,
-            "adapter_id": payload.adapter_id,
-            "text": f"[{base_model}] reply",
-            "finish_reason": "stop",
-            "token_ids": [1, 2, 3],
-            "inference_time_seconds": 0.01,
-            "checkpoint": checkpoint,
-        }
+        return attest(
+            record,
+            {
+                # Snake_case, matching the real engine RPC contract (modal_app.py::_generate).
+                "ok": True,
+                "adapter_id": payload.adapter_id,
+                "text": f"[{base_model}] reply",
+                "finish_reason": "stop",
+                "token_ids": [1, 2, 3],
+                "inference_time_seconds": 0.01,
+                "checkpoint": checkpoint,
+            },
+        )
 
     async def stream_generate(
         self,
@@ -940,17 +944,20 @@ class _MeteringPool(FakePool):
         record = self._resolved_record(record)
         checkpoint = self._check_expected(record, expected_checkpoint)
         self.generated.append((base_model, payload.adapter_id))
-        return {
-            "ok": True,
-            "adapter_id": payload.adapter_id,
-            "text": f"[{base_model}] reply",
-            "prompt_tokens": 7,
-            "completion_tokens": 3,
-            "cached_tokens_reported": False,
-            "inference_time_seconds": 0.25,
-            "engine_replica_id": "replica-7",
-            "checkpoint": checkpoint,
-        }
+        return attest(
+            record,
+            {
+                "ok": True,
+                "adapter_id": payload.adapter_id,
+                "text": f"[{base_model}] reply",
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+                "cached_tokens_reported": False,
+                "inference_time_seconds": 0.25,
+                "engine_replica_id": "replica-7",
+                "checkpoint": checkpoint,
+            },
+        )
 
 
 def test_openai_chat_completions_includes_usage_when_engine_reports_counts():
@@ -1144,18 +1151,21 @@ class _CachedMeteringPool(FakePool):
         record = self._resolved_record(record)
         checkpoint = self._check_expected(record, expected_checkpoint)
         self.generated.append((base_model, payload.adapter_id))
-        return {
-            "ok": True,
-            "adapter_id": payload.adapter_id,
-            "text": f"[{base_model}] reply",
-            "prompt_tokens": 10,
-            "completion_tokens": 3,
-            "cached_tokens": 6,  # 6 of the 10 prompt tokens were served from the prefix cache
-            "cached_tokens_reported": True,
-            "inference_time_seconds": 0.25,
-            "engine_replica_id": "replica-cached",
-            "checkpoint": checkpoint,
-        }
+        return attest(
+            record,
+            {
+                "ok": True,
+                "adapter_id": payload.adapter_id,
+                "text": f"[{base_model}] reply",
+                "prompt_tokens": 10,
+                "completion_tokens": 3,
+                "cached_tokens": 6,  # 6 of the 10 prompt tokens were served from the prefix cache
+                "cached_tokens_reported": True,
+                "inference_time_seconds": 0.25,
+                "engine_replica_id": "replica-cached",
+                "checkpoint": checkpoint,
+            },
+        )
 
     async def stream_generate(
         self,

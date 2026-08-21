@@ -382,19 +382,22 @@ def test_per_image_pixel_limit(monkeypatch) -> None:
         _validate(_messages())
 
 
-def test_total_pixel_limit(monkeypatch) -> None:
-    monkeypatch.setattr(multimodal, "_MAX_TOTAL_PIXELS", 7)
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": _data_uri()},
-                {"type": "image", "image": _data_uri()},
-            ],
-        }
-    ]
-    with pytest.raises(MultimodalRequestError, match="total pixel"):
-        _validate(messages)
+def test_per_image_pixel_limit_is_derived_from_the_memory_budget() -> None:
+    # the pixel cap is not a chosen number: it is the largest image the decoded-memory guard
+    # could ever admit. a hardcoded cap above this would be a limit that never fires, and one
+    # below it would reject images the memory guard would have allowed.
+    assert multimodal._MAX_PIXELS == (
+        multimodal._MAX_TOTAL_DECODED_BYTES // multimodal._WORST_BYTES_PER_PIXEL
+    )
+    assert (
+        max(multimodal._MODE_BYTES_PER_PIXEL.values()) + 2 * multimodal._RGB_BYTES_PER_PIXEL
+    ) == multimodal._WORST_BYTES_PER_PIXEL
+
+
+def test_no_cumulative_pixel_cap_exists() -> None:
+    # a mode-blind sum of pixel counts cannot see decoded mode or ordering, so any cumulative
+    # pixel total is wrong in one direction. the cumulative decoded-memory guard bounds it exactly.
+    assert not hasattr(multimodal, "_MAX_TOTAL_PIXELS")
 
 
 def test_total_decoded_memory_limit(monkeypatch) -> None:
@@ -728,6 +731,9 @@ class _Pool:
         self.calls.append((base_model, payload.adapter_id, record.adapter_id))
         return {
             "adapter_id": payload.adapter_id,
+            # a real engine attests the adapter it actually resolved, which for a revision is the
+            # resolved record rather than whatever id the caller asked with.
+            **({"lora_request_adapter": record.adapter_id} if record.is_revision else {}),
             "text": "ok",
             "finish_reason": "stop",
             "prompt_tokens": 7,
@@ -936,3 +942,72 @@ def test_legacy_checkpoint_style_model_identifier_stays_rejected() -> None:
     assert response.status_code == 400
     assert "checkpoint identifier" in response.json()["detail"]
     assert pool.calls == []
+
+
+def test_missing_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None:
+    # sabotage: an engine that serves a revision without naming the adapter it resolved cannot
+    # prove the weights came from the requested revision, so the router must refuse the response
+    # rather than bill for provenance it never established.
+    original = _Pool.generate
+
+    async def unattested(self, base_model, payload, record, *, expected_checkpoint=None):
+        result = await original(
+            self, base_model, payload, record, expected_checkpoint=expected_checkpoint
+        )
+        result.pop("lora_request_adapter", None)
+        return result
+
+    monkeypatch.setattr(_Pool, "generate", unattested)
+    client, _pool = _client(QWEN)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": REVISION_ID, "messages": _messages()},
+    )
+    assert response.status_code == 502
+    assert "attest" in response.json()["detail"]
+
+
+def test_mismatched_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None:
+    # sabotage: attesting a DIFFERENT adapter is the failure the header exists to catch - the
+    # engine served weights that are not the ones the caller pinned.
+    original = _Pool.generate
+
+    async def wrong_adapter(self, base_model, payload, record, *, expected_checkpoint=None):
+        result = await original(
+            self, base_model, payload, record, expected_checkpoint=expected_checkpoint
+        )
+        result["lora_request_adapter"] = "flash-9999999999-99999999@step-1.%s" % ("b" * 40)
+        return result
+
+    monkeypatch.setattr(_Pool, "generate", wrong_adapter)
+    client, _pool = _client(QWEN)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": REVISION_ID, "messages": _messages()},
+    )
+    assert response.status_code == 502
+
+
+def test_revision_response_carries_the_attestation_header_and_hides_the_field() -> None:
+    client, _pool = _client(QWEN)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": REVISION_ID, "messages": _messages()},
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Freesolo-LoRA-Request-Adapter"] == REVISION_ID
+    # the attestation is engine-internal plumbing; it must not leak into the caller-facing body.
+    assert "lora_request_adapter" not in response.text
+
+
+def test_alias_request_attests_the_revision_it_resolved_to() -> None:
+    # asking by run alias still resolves to a concrete revision, and that resolved revision is
+    # what got served - so it is attested. the header names the revision, not the alias the
+    # caller typed, which is the whole point: it says what ran, not what was asked for.
+    client, _pool = _client(QWEN)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": RUN_ID, "messages": _messages()},
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Freesolo-LoRA-Request-Adapter"] == REVISION_ID

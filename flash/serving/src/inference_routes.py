@@ -136,6 +136,12 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         expected_checkpoint=_expected_checkpoint(request),
         caller_org=caller_org,
     )
+    lora_request_adapter = generation.pop("lora_request_adapter", None)
+    if target.is_revision and lora_request_adapter != target.adapter_id:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "The serving engine did not attest the resolved immutable adapter.",
+        )
     active_checkpoint = generation.get("checkpoint")
     provenance = _revision_provenance(target, active_checkpoint)
     response = openai_chat_completion(
@@ -145,7 +151,10 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         generation=generation,
         provenance=provenance,
     )
-    return JSONResponse(response, headers=_provenance_headers(provenance, active_checkpoint))
+    response_headers = _provenance_headers(provenance, active_checkpoint)
+    if target.is_revision:
+        response_headers["X-Freesolo-LoRA-Request-Adapter"] = lora_request_adapter
+    return JSONResponse(response, headers=response_headers)
 
 
 async def _stream_chat_completion(

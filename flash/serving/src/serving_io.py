@@ -98,7 +98,11 @@ def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> J
     # attach revision provenance while keeping engine-process attribution internal to metering.
     active_checkpoint = result.get("checkpoint")
     provenance = _revision_provenance(target, active_checkpoint)
-    internal_fields = {"cached_tokens_reported", "engine_replica_id"}
+    internal_fields = {
+        "cached_tokens_reported",
+        "engine_replica_id",
+        "lora_request_adapter",
+    }
     public_result = {key: value for key, value in result.items() if key not in internal_fields}
     body = {**public_result, "freesolo": provenance} if provenance is not None else public_result
     return JSONResponse(body, headers=_provenance_headers(provenance, active_checkpoint))

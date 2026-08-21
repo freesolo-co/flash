@@ -180,3 +180,17 @@ def _install_vllm_stub() -> None:
 
 
 _install_vllm_stub()
+
+
+def attest(record: Any, result: dict[str, Any]) -> dict[str, Any]:
+    """Add the engine-side adapter attestation a real engine would return.
+
+    The router is a CPU front door and each engine is a separate GPU container, so the router
+    cannot see which adapter the engine actually loaded - it only knows what it asked for. A real
+    engine names the adapter it resolved, and the router refuses to bill a revision it cannot
+    confirm. A fake pool that skips this is not modelling the engine contract, so every fake in
+    the suite routes through here rather than hand-rolling the field.
+    """
+    if getattr(record, "is_revision", False):
+        result["lora_request_adapter"] = record.adapter_id
+    return result
