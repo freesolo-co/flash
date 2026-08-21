@@ -634,30 +634,18 @@ def _resolve_local_env_entrypoint(path: str | Path) -> tuple[Path, Path, Path, b
     include_full_tree = src.is_dir()
     if include_full_tree:
         canonical_entrypoint = src / _ENV_ENTRYPOINT
-        if canonical_entrypoint.is_file():
-            entrypoint = canonical_entrypoint
-            env_root = src
-        elif (src / "pyproject.toml").is_file():
-            raise ValueError(f"{src} has a pyproject.toml but no environment.py entrypoint")
-        else:
-            # evaluations.py is a known sidecar, never an entrypoint. counting it here would
-            # make adding one break a legacy single-module package that resolved fine before:
-            # the directory would suddenly hold "multiple top-level .py modules" and be rejected
-            # before either file is read.
-            modules = [
-                p
-                for p in sorted(src.glob("*.py"))
-                if not p.name.startswith("__") and p.name != _ENV_EVALUATIONS_SIDECAR
-            ]
-            if len(modules) != 1:
-                raise ValueError(
-                    f"{src} has no environment.py and "
-                    f"{'no' if not modules else 'multiple'} top-level .py module(s); "
-                    "add an environment.py entrypoint or pass the exact .py file "
-                    "for a single-file smoke test."
-                )
-            env_root = src
-            entrypoint = modules[0]
+        if not canonical_entrypoint.is_file():
+            # a directory package names its entrypoint `environment.py`. that is what `flash env
+            # setup` scaffolds and the only layout the docs describe, so a directory without one is
+            # rejected rather than guessed at: inferring the entrypoint from "the sole top-level
+            # module" made the resolution depend on which OTHER files happened to be present, so
+            # adding a second module turned a working push into a rejection.
+            raise ValueError(
+                f"{src} has no {_ENV_ENTRYPOINT} entrypoint; add one, "
+                "or pass the exact .py file for a single-file smoke test."
+            )
+        entrypoint = canonical_entrypoint
+        env_root = src
     elif src.is_file() and src.suffix == ".py":
         env_root = src.parent
         entrypoint = src
