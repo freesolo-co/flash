@@ -513,19 +513,6 @@ def test_sigint_during_bootstrap_closes_inference_descriptor(
     assert list((tmp_path / "cache").glob(".serving-manifest-*.tmp")) == []
 
 
-def test_launcher_main_preserves_signal_exit_status(monkeypatch) -> None:
-    monkeypatch.setattr(
-        launch,
-        "run_launcher",
-        lambda: (_ for _ in ()).throw(launch.StartupTerminated(143)),
-    )
-
-    with pytest.raises(SystemExit) as exc_info:
-        launch.main()
-
-    assert exc_info.value.code == 143
-
-
 def test_sigterm_during_hydration_aborts_in_subprocess(tmp_path: Path) -> None:
     cache_root = tmp_path / "subprocess-cache"
     probe = f"""

@@ -9,7 +9,6 @@ _EXPORTS = {
     "MANIFEST_VERSION": (".manifest", "MANIFEST_VERSION"),
     "AdapterExecutionInput": (".manifest", "AdapterExecutionInput"),
     "ArtifactFile": (".manifest", "ArtifactFile"),
-    "BootstrapError": (".bootstrap", "BootstrapError"),
     "ExecutionInputs": (".manifest", "ExecutionInputs"),
     "ManifestAdapter": (".manifest", "ManifestAdapter"),
     "ManifestError": (".manifest", "ManifestError"),

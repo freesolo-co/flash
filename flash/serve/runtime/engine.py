@@ -246,28 +246,6 @@ class VllmLoraRuntime:
         assert self._adapters is not None
         return await self._adapters.register(spec)
 
-    async def evict_adapter(
-        self,
-        adapter_id: str,
-        *,
-        expected_incarnation: str,
-    ) -> bool:
-        """drop vllm lora state but retain the registration for lazy reload."""
-        await self._ensure_started()
-        assert self._adapters is not None
-        return await self._adapters.evict(adapter_id, expected_incarnation)
-
-    async def unload_adapter(
-        self,
-        adapter_id: str,
-        *,
-        expected_incarnation: str,
-    ) -> bool:
-        """remove a registration if its opaque incarnation still matches."""
-        await self._ensure_started()
-        assert self._adapters is not None
-        return await self._adapters.unload(adapter_id, expected_incarnation)
-
     async def generate(self, request: GenerationRequest) -> GenerationResult:
         """run one non-streaming generation with final-only vllm output."""
         await self._ensure_started()

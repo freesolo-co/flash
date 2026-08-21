@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import hashlib
 import os
 import signal
@@ -14,32 +13,13 @@ from pathlib import Path
 from .bootstrap import bootstrap_serving
 from .http import create_app
 from .manifest import ServingManifest, load_serving_manifest
-from .materialize import hydrate_manifest, read_artifact_token_fd
+from .materialize import read_artifact_token_fd
 
 _MANIFEST_ENV = "FLASH_SERVING_MANIFEST"
 _MANIFEST_ID_ENV = "FLASH_SERVING_MANIFEST_ID"
 _IMAGE_DIGEST_ENV = "FLASH_SERVING_IMAGE_DIGEST"
 _CACHE_ROOT_ENV = "FLASH_SERVING_CACHE_ROOT"
 _INFERENCE_TOKEN_FD_ENV = "FLASH_INFERENCE_TOKEN_FD"
-
-
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m flash.serve.app")
-    subparsers = parser.add_subparsers(dest="mode", required=True)
-    for mode in ("hydrate", "serve"):
-        command = subparsers.add_parser(mode)
-        command.add_argument(
-            "--manifest",
-            default=os.environ.get(_MANIFEST_ENV, "/etc/flash/serving-manifest.json"),
-        )
-        command.add_argument(
-            "--cache-root",
-            default=os.environ.get(_CACHE_ROOT_ENV, "/var/lib/flash-serving"),
-        )
-    serve = subparsers.choices["serve"]
-    serve.add_argument("--host", default="0.0.0.0")
-    serve.add_argument("--port", type=int, default=8000)
-    return parser
 
 
 def _bound_manifest(path: str) -> ServingManifest:
@@ -134,16 +114,3 @@ async def _serve(
         await server.serve()
     finally:
         await owner.close()
-
-
-def main() -> None:
-    args = _parser().parse_args()
-    manifest = _bound_manifest(args.manifest)
-    if args.mode == "hydrate":
-        hydrate_manifest(manifest, args.cache_root)
-        return
-    asyncio.run(_serve(args, manifest))
-
-
-if __name__ == "__main__":
-    main()

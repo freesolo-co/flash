@@ -14,10 +14,6 @@ from .manifest import ManifestAdapter, ServingManifest
 from .materialize import locked_manifest_cache
 
 
-class BootstrapError(RuntimeError):
-    """the immutable serving runtime could not be started completely."""
-
-
 @dataclass(frozen=True, slots=True)
 class PublishedAdapter:
     """one public model id bound to an exact registered adapter incarnation."""

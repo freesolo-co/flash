@@ -630,14 +630,3 @@ def start_launcher_process(
     finally:
         _close_descriptors(read_fds)
         _close_descriptors(write_fds)
-
-
-def main() -> None:
-    try:
-        run_launcher()
-    except StartupTerminated as exc:
-        raise SystemExit(exc.exit_code) from None
-
-
-if __name__ == "__main__":
-    main()
