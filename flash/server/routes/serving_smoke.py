@@ -11,6 +11,7 @@ Split out of `flash.server.routes.serving` to keep that module under the file-si
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import time
@@ -52,20 +53,53 @@ _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+
 _SMOKE_IMAGE_PROMPT = (
     "Look at the square in the attached image. What color is it? Reply with one color word."
 )
-_SMOKE_IMAGE_DATA_URI = (
-    "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+"
-    "nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg=="
+# three trusted 32x32 solid-colour squares, every pixel the stated colour. the smoke picks one
+# per deployment, so a model that answers from a language prior rather than from the pixels is
+# wrong two times in three. a single fixed colour would be guessable: "red" is the obvious answer
+# to "what colour is the square", and a broken vision path -- wrong processor, dropped media,
+# placeholders that never expanded -- would still emit it and pass.
+_SMOKE_IMAGE_VARIANTS = (
+    (
+        "RED",
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7h"
+        "IASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC",
+    ),
+    (
+        "BLUE",
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NsQkAAAjAsP7/tF7h"
+        "IASyp5pjAoFAIBAIBAKB4EmwOkv8Lom8x/sAAAAASUVORK5CYII=",
+    ),
+    (
+        "GREEN",
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NsQkAAAjAsJ7u6V7h"
+        "IASyp6ZbAoFAIBAIBAKB4EuwwgAAH2BCGKwAAAAASUVORK5CYII=",
+    ),
 )
-_SMOKE_IMAGE_MESSAGES = [
-    {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": _SMOKE_IMAGE_PROMPT},
-            {"type": "image_url", "image_url": {"url": _SMOKE_IMAGE_DATA_URI}},
-        ],
-    }
-]
+
+
+def _smoke_image_challenge(run_id: str) -> tuple[str, list[dict]]:
+    """Pick this deployment's colour challenge and build its message.
+
+    keyed on run_id so one deployment always gets the same colour: the smoke may be retried and a
+    per-call random choice would make a flaky vision path look intermittently healthy. the answer
+    still cannot be memorised across runs, which is what makes the check image-dependent.
+    """
+    expected, data_uri = _SMOKE_IMAGE_VARIANTS[
+        int(hashlib.sha256(run_id.encode()).hexdigest(), 16) % len(_SMOKE_IMAGE_VARIANTS)
+    ]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _SMOKE_IMAGE_PROMPT},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        }
+    ]
+    return expected, messages
 # hard wall-clock budget for the trusted fixed-prompt generation and validation.
 # it remains below the deployment stale threshold.
 _SMOKE_BUDGET_SECONDS = 600.0
@@ -453,12 +487,13 @@ def _run_deployment_smoke(
     from flash.core.catalog import supports_image_training
 
     image_capable = supports_image_training(spec.model)
+    expected_colour, image_messages = _smoke_image_challenge(run_id)
     result = _bounded_smoke_chat(
         serving_model=serving_model,
         thinking=spec.thinking,
         expected_checkpoint=expected_checkpoint,
         expected_adapter_revision=serving_model,
-        messages=_SMOKE_IMAGE_MESSAGES if image_capable else None,
+        messages=image_messages if image_capable else None,
         structured_outputs={} if image_capable and constraint is not None else None,
         max_tokens=max_tokens,
         stop_sequences=stop_sequences,
@@ -475,8 +510,11 @@ def _run_deployment_smoke(
     attested_adapter_revision: str | None = None
     if image_capable:
         attested_adapter_revision = _smoke_lora_request_adapter(result, serving_model)
-        if answer.strip().upper() != "RED":
-            raise ServingError("image deployment smoke did not identify the trusted red square")
+        if answer.strip().upper() != expected_colour:
+            raise ServingError(
+                "image deployment smoke did not identify the trusted "
+                f"{expected_colour.lower()} square"
+            )
         if constraint:
             structured_result = _bounded_smoke_chat(
                 serving_model=serving_model,

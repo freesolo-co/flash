@@ -702,6 +702,16 @@ def _smoke_response(
     return response
 
 
+def _smoke_expected_colour(run_id: str = "run-1") -> str:
+    """The colour this run_id must answer, derived the same way production derives it.
+
+    hardcoding a colour here would silently re-introduce the guessable smoke: the point of the
+    per-run choice is that no single colour is always right, so the test must not know one either.
+    """
+    expected, _messages = serving_smoke._smoke_image_challenge(run_id)
+    return expected
+
+
 def _run_smoke(spec, *, budget_s: float = 600.0):
     return serving._run_deployment_smoke(
         "run-1",
@@ -750,18 +760,27 @@ def test_image_deployment_smoke_uses_valid_trusted_image_without_persisting_it(m
 
     from PIL import Image
 
-    encoded = serving_smoke._SMOKE_IMAGE_DATA_URI.split(",", 1)[1]
-    image = Image.open(io.BytesIO(base64.b64decode(encoded, validate=True)))
-    image.load()
-    assert image.size == (32, 32)
-    assert image.convert("RGB").getpixel((0, 0)) == (255, 0, 0)
-    image.close()
-    assert "red" not in serving_smoke._SMOKE_IMAGE_PROMPT.lower()
+    expected_colour, expected_messages = serving_smoke._smoke_image_challenge("run-1")
+    # EVERY variant must be a true solid square, not just the one this run_id happens to draw.
+    # checking only the drawn variant leaves the others free to rot, and a variant whose pixels
+    # did not match its announced colour would fail a correctly-seeing model.
+    rgb_for = {"RED": (255, 0, 0), "BLUE": (0, 0, 255), "GREEN": (0, 128, 0)}
+    for colour, data_uri in serving_smoke._SMOKE_IMAGE_VARIANTS:
+        image = Image.open(io.BytesIO(base64.b64decode(data_uri.split(",", 1)[1], validate=True)))
+        image.load()
+        assert image.size == (32, 32)
+        pixels = image.convert("RGB").tobytes()
+        distinct = {pixels[i : i + 3] for i in range(0, len(pixels), 3)}
+        assert distinct == {bytes(rgb_for[colour])}, f"{colour} variant is not a solid square"
+        image.close()
+    # the prompt must not name any candidate colour, or the answer could be read off the question.
+    for colour, _uri in serving_smoke._SMOKE_IMAGE_VARIANTS:
+        assert colour.lower() not in serving_smoke._SMOKE_IMAGE_PROMPT.lower()
     calls = []
 
     def fake_serve_chat(**kwargs):
         calls.append(kwargs)
-        return _smoke_response("RED")
+        return _smoke_response(expected_colour)
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
     out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
@@ -769,14 +788,15 @@ def test_image_deployment_smoke_uses_valid_trusted_image_without_persisting_it(m
     assert out["verify_kind"] == "fixed_image"
     assert out["verify_turns"] == 1
     assert out["verify_lora_request_adapter"] == _SMOKE_REVISION
-    assert calls[0]["messages"] == serving_smoke._SMOKE_IMAGE_MESSAGES
+    assert calls[0]["messages"] == expected_messages
     assert calls[0]["expected_checkpoint"] == "run-1"
     assert calls[0]["expected_adapter_revision"] == _SMOKE_REVISION
-    assert serving_smoke._SMOKE_IMAGE_DATA_URI not in json.dumps(out)
+    for _colour, data_uri in serving_smoke._SMOKE_IMAGE_VARIANTS:
+        assert data_uri not in json.dumps(out)
 
 
 def test_image_deployment_smoke_rejects_missing_lora_request_attestation(monkeypatch):
-    response = _smoke_response("RED", request_adapter=None)
+    response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
 
     with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
@@ -784,7 +804,7 @@ def test_image_deployment_smoke_rejects_missing_lora_request_attestation(monkeyp
 
 
 def test_image_deployment_smoke_rejects_mismatched_lora_request_adapter(monkeypatch):
-    response = _smoke_response("RED", request_adapter="run-1@final." + "b" * 40)
+    response = _smoke_response(_smoke_expected_colour(), request_adapter="run-1@final." + "b" * 40)
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
 
     with pytest.raises(ServingError, match="wrong LoRA request adapter"):
@@ -792,7 +812,7 @@ def test_image_deployment_smoke_rejects_mismatched_lora_request_adapter(monkeypa
 
 
 def test_image_deployment_smoke_still_rejects_wrong_provenance(monkeypatch):
-    response = _smoke_response("RED")
+    response = _smoke_response(_smoke_expected_colour())
     response["freesolo"]["checkpoint"] = "wrong"
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
 
@@ -802,28 +822,67 @@ def test_image_deployment_smoke_still_rejects_wrong_provenance(monkeypatch):
 
 @pytest.mark.parametrize(
     "answer",
-    ["BLUE", "green", "a red-and-blue checkerboard", "I cannot see an image."],
+    ["a red-and-blue checkerboard", "I cannot see an image.", "purple"],
 )
-def test_image_deployment_smoke_rejects_an_answer_that_is_not_the_red_square(monkeypatch, answer):
+def test_image_deployment_smoke_rejects_an_answer_that_is_not_the_shown_square(monkeypatch, answer):
     """The colour assertion is what makes this smoke image-dependent, so pin it.
 
-    every other image-smoke test hands back "RED", which means they all pass whether or not the
-    model actually looked at the pixels. a deployment whose vision path is broken -- wrong
-    processor, dropped media, placeholders that never expanded -- still answers *something*, and
-    without this the suite would accept it as verified. the sibling test already proves the prompt
-    never says "red", so the only way to answer it is to decode the image.
+    a deployment whose vision path is broken -- wrong processor, dropped media, placeholders that
+    never expanded -- still answers *something*, and without this the suite would accept it as
+    verified. the sibling test proves the prompt names no candidate colour, so the only way to
+    answer is to decode the image.
     """
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: _smoke_response(answer))
 
-    with pytest.raises(ServingError, match="did not identify the trusted red square"):
+    with pytest.raises(ServingError, match="did not identify the trusted"):
         _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
 
 
-def test_text_only_model_smoke_does_not_require_the_red_answer(monkeypatch):
+def test_image_smoke_colour_actually_varies_across_deployments():
+    """The challenge must not collapse to one colour, or it is guessable again.
+
+    every other test here derives the expected colour from production, so they all stay
+    self-consistent if the selection is hardcoded to a single variant -- the exact bug this gate
+    exists to prevent would pass unnoticed. this asserts the property directly: over many run ids
+    at least two distinct colours must appear, and each must be a genuine solid square.
+    """
+    seen = {serving_smoke._smoke_image_challenge(f"run-{i}")[0] for i in range(60)}
+    assert len(seen) >= 2, f"smoke colour never varies (always {seen}) - it is guessable"
+    assert seen <= {c for c, _uri in serving_smoke._SMOKE_IMAGE_VARIANTS}
+
+    # and the message must always carry the variant matching the announced colour, so a mismatched
+    # pairing cannot make a correct model look wrong.
+    by_colour = dict(serving_smoke._SMOKE_IMAGE_VARIANTS)
+    for i in range(60):
+        colour, messages = serving_smoke._smoke_image_challenge(f"run-{i}")
+        assert messages[0]["content"][1]["image_url"]["url"] == by_colour[colour]
+
+
+def test_image_deployment_smoke_rejects_the_other_trusted_colours(monkeypatch):
+    """Answering a colour that is real, but not the one THIS run was shown, must fail.
+
+    this is the check a single fixed colour could never make: it proves the smoke reads the
+    deployment's own challenge rather than accepting any plausible colour word. a model guessing
+    "red" because that is the obvious answer to "what colour is the square" is wrong here whenever
+    the run drew blue or green.
+    """
+    expected = _smoke_expected_colour()
+    others = [c for c, _uri in serving_smoke._SMOKE_IMAGE_VARIANTS if c != expected]
+    assert others, "the challenge needs more than one colour or it is guessable"
+
+    for wrong in others:
+        response = _smoke_response(wrong)
+        monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+        with pytest.raises(ServingError, match="did not identify the trusted"):
+            _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+
+def test_text_only_model_smoke_does_not_require_the_colour_answer(monkeypatch):
     """The control: the colour gate must apply to image-capable models only.
 
-    a text-only deployment never receives the image, so requiring "RED" from it would fail every
-    text model. this is what proves the gate above keys on capability rather than being global.
+    a text-only deployment never receives the image, so requiring a colour word from it would fail
+    every text model. this is what proves the gate above keys on capability rather than being
+    global.
     """
     monkeypatch.setattr(
         serving._app, "serve_chat", lambda **_kwargs: _smoke_response("The answer is 4")
@@ -843,7 +902,7 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
         calls.append(kwargs)
         if len(calls) == 1:
             assert kwargs["structured_outputs"] == {}
-            return _smoke_response("RED")
+            return _smoke_response(_smoke_expected_colour())
         assert "structured_outputs" not in kwargs
         return _smoke_response('{"answer":"4"}')
 
@@ -863,7 +922,7 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
 
     assert out["verify_kind"] == "fixed_image"
     assert out["verify_turns"] == 2
-    assert calls[0]["messages"] == serving_smoke._SMOKE_IMAGE_MESSAGES
+    assert calls[0]["messages"] == serving_smoke._smoke_image_challenge("run-1")[1]
     assert calls[1]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
     assert validated == [('{"answer":"4"}', {"json_object": True})]
 
@@ -884,7 +943,7 @@ def test_image_structured_smoke_requires_attestation_on_second_request(
         nonlocal calls
         calls += 1
         if calls == 1:
-            return _smoke_response("RED")
+            return _smoke_response(_smoke_expected_colour())
         return _smoke_response('{"answer":"4"}', request_adapter=request_adapter)
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
@@ -1157,7 +1216,14 @@ def test_chat_captures_lora_request_adapter_attestation_for_smoke(monkeypatch):
             return None
 
         def json(self):
-            return {"choices": [{"message": {"content": "RED"}, "finish_reason": "stop"}]}
+            return {
+                "choices": [
+                    {
+                        "message": {"content": _smoke_expected_colour()},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
 
     class _Client:
         def post(self, url, json=None, headers=None, timeout=None):
@@ -1174,7 +1240,7 @@ def test_chat_captures_lora_request_adapter_attestation_for_smoke(monkeypatch):
         expected_adapter_revision=_SMOKE_REVISION,
     )
 
-    assert out["choices"][0]["message"]["content"] == "RED"
+    assert out["choices"][0]["message"]["content"] == _smoke_expected_colour()
     assert out["_freesolo_lora_request_adapter"] == _SMOKE_REVISION
 
 
@@ -1817,7 +1883,7 @@ def test_thinking_structured_smoke_rejects_invalid_output(
 ):
     responses = iter(
         [
-            _smoke_response("<think>vision</think>RED"),
+            _smoke_response(f"<think>vision</think>{_smoke_expected_colour()}"),
             _smoke_response(content, finish_reason),
         ]
     )
@@ -1894,7 +1960,9 @@ def test_alias_thinking_verification_matches_the_smoke_request_shape(monkeypatch
     calls = []
     responses = iter(
         [
-            _smoke_response("<think>vision</think>RED", reasoning_content="vision"),
+            _smoke_response(
+                f"<think>vision</think>{_smoke_expected_colour()}", reasoning_content="vision"
+            ),
             _smoke_response(
                 '<think>2+2 is 4</think>{"answer":"4"}',
                 reasoning_content="2+2 is 4",

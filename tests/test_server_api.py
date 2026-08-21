@@ -5561,7 +5561,7 @@ def test_deploy_fails_when_the_activated_alias_serves_no_reasoning(api, monkeypa
             return _smoke_chat_result(
                 revision,
                 run_id,
-                "<think>2+2 is 4</think>RED",
+                f"<think>2+2 is 4</think>{_expected_smoke_colour(run_id)}",
                 reasoning_content="2+2 is 4",
             )
         return _smoke_chat_result(revision, run_id, "4")
@@ -5628,7 +5628,7 @@ def test_deploy_persists_ordinary_post_activation_probe_failures(api, monkeypatc
         lambda **_kwargs: _smoke_chat_result(
             revision,
             run_id,
-            "<think>2+2 is 4</think>RED",
+            f"<think>2+2 is 4</think>{_expected_smoke_colour(run_id)}",
             reasoning_content="2+2 is 4",
         ),
     )
@@ -5711,7 +5711,7 @@ def test_deploy_records_alias_thinking_on_a_healthy_thinking_deployment(api, mon
         lambda **kwargs: _smoke_chat_result(
             revision,
             run_id,
-            "<think>2+2 is 4</think>RED",
+            f"<think>2+2 is 4</think>{_expected_smoke_colour(run_id)}",
             reasoning_content="2+2 is 4",
         ),
     )
@@ -9921,15 +9921,31 @@ _FAKE_CKPTS = [
 _MISSING_SMOKE_REASONING = object()
 
 
+def _expected_smoke_colour(run_id: str) -> str:
+    """The colour this run_id's deployment smoke must answer.
+
+    derived from production rather than hardcoded: the smoke picks one of several trusted colours
+    per run, so a fixed literal here would break whenever the hash landed elsewhere.
+    """
+    from flash.server.routes import serving_smoke
+
+    expected, _messages = serving_smoke._smoke_image_challenge(run_id)
+    return expected
+
+
 def _smoke_chat_result(
     revision: str,
     checkpoint: str,
-    content: str = "RED",
+    content: str | None = None,
     *,
     reasoning_content: object = _MISSING_SMOKE_REASONING,
 ) -> dict:
     # a serve_chat response that passes _smoke_provenance for the given immutable revision
     hf_revision = revision.rsplit(".", 1)[-1]
+    if content is None:
+        # answer this run's own colour challenge. a fixed literal would pass only when the hash
+        # happened to land on it, so the default is derived from the revision's run id.
+        content = _expected_smoke_colour(revision.split("@", 1)[0])
     message = {"content": content}
     if reasoning_content is not _MISSING_SMOKE_REASONING:
         message["reasoning_content"] = reasoning_content
