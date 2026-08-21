@@ -858,6 +858,7 @@ def grow_runpod_volume(
     _validate_handle(plan, handle)
     if type(target_size_gb) is not int or target_size_gb < plan.placement.volume_size_gb:
         raise ValueError("target volume size cannot shrink the planned volume")
+    mutation_attempted = False
     try:
         transport = _transport(transport_factory, credentials)
         observation = _observe(plan, transport, deadline_at=deadline_at)
@@ -868,6 +869,9 @@ def grow_runpod_volume(
             return _failure_result(plan, _LifecycleFailure("invalid_request"), handle=handle)
         if target_size_gb == volume.size_gb:
             return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
+        # reads above are honest as `failed`; past the PATCH it is not. `failed` means "nothing
+        # changed", so it hides the reconcile warning and invites a retry of an in-flight resize.
+        mutation_attempted = True
         resized = _mutation_call(
             lambda: transport.rest(
                 "PATCH",
@@ -898,8 +902,12 @@ def grow_runpod_volume(
             if not _sleep_until_poll(deadline_at, clock, sleep):
                 return _unknown_result(plan, handle=handle)
     except RunPodResourceConflict:
+        if mutation_attempted:
+            return _unknown_result(plan, handle=handle)
         return _failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
     except RunPodTransportFailure as exc:
+        if mutation_attempted:
+            return _unknown_result(plan, handle=handle)
         return _failure_result(plan, _from_transport_failure(exc), handle=handle)
 
 
