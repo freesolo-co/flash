@@ -16,7 +16,6 @@ from flash.serving.src.persistence import (
     insert_adapter,
     load_adapters,
     replace_adapter_cas,
-    update_adapter_status_cas,
 )
 from flash.serving.src.schemas import AdapterRecord, PersistedAdapterRecord
 from flash.serving.src.settings import Settings
@@ -218,22 +217,6 @@ def test_replace_adapter_uses_updated_at_cas() -> None:
         "adapter_id": f"eq.{REVISION_ID}",
         "updated_at": "eq.2026-07-14T00:00:01+00:00",
     }
-    assert committed is not None
-    assert committed.status == "ready"
-
-
-def test_status_cas_patches_only_status_and_updated_at() -> None:
-    FakeClient.patch_rows = [_row(status="ready", updated_at="2026-07-14T00:00:02+00:00")]
-    committed = update_adapter_status_cas(
-        REVISION_ID,
-        "ready",
-        expected_updated_at="2026-07-14T00:00:01+00:00",
-        settings=_settings(),
-    )
-    request = FakeClient.requests[0]
-    assert request["params"]["select"] == _PERSISTED_COLUMNS
-    assert set(request["json"]) == {"status", "updated_at"}
-    assert request["json"]["status"] == "ready"
     assert committed is not None
     assert committed.status == "ready"
 

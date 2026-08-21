@@ -96,10 +96,6 @@ class AdapterRouter:
             return None
         return requested, target
 
-    def base_model_for(self, adapter_id: str) -> str | None:
-        resolved = self.resolve(adapter_id)
-        return resolved[1].base_model if resolved is not None else None
-
     def base_models(self) -> list[str]:
         return sorted({target.base_model for _, target in self._resolved_ready()})
 

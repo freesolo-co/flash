@@ -1066,7 +1066,7 @@ def test_adapters_fail_closed_when_no_internal_key_configured():
     assert with_key.status_code == 503
     teardown = client.delete("/adapters/qa")
     assert teardown.status_code == 503
-    assert router.base_model_for("qa") == QWEN  # nothing was mutated
+    assert router.resolve("qa")[1].base_model == QWEN  # nothing was mutated
 
 
 def test_base_model_delete_is_rejected_rather_than_faked() -> None:
@@ -1451,7 +1451,7 @@ def test_openai_usage_omits_prompt_details_when_no_cache_hit():
 
 def test_disabled_adapter_is_not_routable():
     router = _router_for("off", QWEN, status="disabled")
-    assert router.base_model_for("off") is None
+    assert router.resolve("off") is None
     assert router.base_models() == []  # no ready adapters -> no GPU
 
 

@@ -7,7 +7,6 @@ README to deploy.
 import asyncio
 import inspect
 import os
-from collections import OrderedDict  # noqa: F401
 from pathlib import Path
 from typing import Any
 
@@ -281,21 +280,6 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 # so it registers nothing, and inside the ``flash`` package so the image's
 # ``add_local_python_source("flash")`` ships it to the remote container under the same import path
 # it has here), re-exported so ``_build_engine`` can subclass it.
-# Its stateless helpers live in ``flash.serving.src.engine_support``; re-exported so modal_app's
-# historical ``from modal_app import _*`` surface is unchanged.
-from flash.serving.src.engine_support import (  # noqa: E402
-    _RESERVED_CHAT_TEMPLATE_KWARGS,  # noqa: F401
-    _adapter_cache_ready,  # noqa: F401
-    _adapter_source_cache_dir,  # noqa: F401
-    _adapter_source_ident,  # noqa: F401
-    _cached_tokens_reported,  # noqa: F401
-    _engine_is_dead,  # noqa: F401
-    _is_adapter_tensor_file,  # noqa: F401
-    _load_adapters_for_base,  # noqa: F401
-    _num_cached_tokens,  # noqa: F401
-    _safe_chat_template_kwargs,  # noqa: F401
-    _stream_text_delta,  # noqa: F401
-)
 from flash.serving.src.lora_engine import _LoraEngineImpl  # noqa: E402
 
 # ---- One Modal LoraEngine class per GPU tier -----------------------------------------------------

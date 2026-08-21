@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 
@@ -174,34 +174,6 @@ def replace_adapter_cas(
     records = _records_from_response(response, "conditionally replace hosted LoRA adapter")
     if len(records) > 1:
         raise RuntimeError("conditional adapter replacement returned more than one row")
-    return records[0] if records else None
-
-
-def update_adapter_status_cas(
-    adapter_id: str,
-    status: Literal["ready", "disabled"],
-    *,
-    expected_updated_at: str,
-    settings: Settings,
-) -> AdapterRecord | None:
-    now = utc_now_iso()
-    if not settings.has_supabase:
-        return None
-    with httpx.Client(timeout=30.0) as client:
-        response = client.patch(
-            supabase_table_url(settings, ADAPTER_TABLE),
-            params={
-                "select": _PERSISTED_COLUMNS,
-                "adapter_id": f"eq.{adapter_id}",
-                "updated_at": f"eq.{expected_updated_at}",
-            },
-            headers={**supabase_headers(settings, "flash"), "Prefer": "return=representation"},
-            json={"status": status, "updated_at": now},
-        )
-    raise_for_supabase(response, "conditionally update hosted LoRA adapter status")
-    records = _records_from_response(response, "conditionally update hosted LoRA adapter status")
-    if len(records) > 1:
-        raise RuntimeError("conditional adapter status update returned more than one row")
     return records[0] if records else None
 
 

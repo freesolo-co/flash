@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import MagicMock
 
 import pytest
 
+from flash.serving.src import engine_support
 from flash.serving.src.settings import Settings
 
 
@@ -81,7 +83,7 @@ def test_stream_text_delta_keeps_native_delta_chunks(modal_app_module):
     deltas = []
 
     for text in ("Hel", "lo", " hello"):
-        delta, previous = modal_app_module._stream_text_delta(
+        delta, previous = engine_support._stream_text_delta(
             text, previous, cumulative_output=False
         )
         deltas.append(delta)
@@ -95,7 +97,7 @@ def test_stream_text_delta_diffs_cumulative_chunks_without_token_ids(modal_app_m
     deltas = []
 
     for text in ("Hel", "Hello", "Hello", "Hello!"):
-        delta, previous = modal_app_module._stream_text_delta(
+        delta, previous = engine_support._stream_text_delta(
             text, previous, cumulative_output=None
         )
         deltas.append(delta)
@@ -105,7 +107,7 @@ def test_stream_text_delta_diffs_cumulative_chunks_without_token_ids(modal_app_m
 
 
 def test_stream_text_delta_keeps_text_when_cumulative_hint_is_not_a_prefix(modal_app_module):
-    delta, previous = modal_app_module._stream_text_delta("world", "hello ", cumulative_output=True)
+    delta, previous = engine_support._stream_text_delta("world", "hello ", cumulative_output=True)
 
     assert delta == "world"
     assert previous == "hello world"
@@ -191,14 +193,14 @@ def test_cached_token_telemetry_distinguishes_zero_from_absent(modal_app_module)
     class _Negative:
         num_cached_tokens = -1
 
-    assert modal_app_module._num_cached_tokens(_Absent()) == 0
-    assert modal_app_module._cached_tokens_reported(_Absent()) is False
-    assert modal_app_module._num_cached_tokens(_Zero()) == 0
-    assert modal_app_module._cached_tokens_reported(_Zero()) is True
-    assert modal_app_module._num_cached_tokens(_Invalid()) == 0
-    assert modal_app_module._cached_tokens_reported(_Invalid()) is False
-    assert modal_app_module._num_cached_tokens(_Negative()) == 0
-    assert modal_app_module._cached_tokens_reported(_Negative()) is False
+    assert engine_support._num_cached_tokens(_Absent()) == 0
+    assert engine_support._cached_tokens_reported(_Absent()) is False
+    assert engine_support._num_cached_tokens(_Zero()) == 0
+    assert engine_support._cached_tokens_reported(_Zero()) is True
+    assert engine_support._num_cached_tokens(_Invalid()) == 0
+    assert engine_support._cached_tokens_reported(_Invalid()) is False
+    assert engine_support._num_cached_tokens(_Negative()) == 0
+    assert engine_support._cached_tokens_reported(_Negative()) is False
 
 
 def test_lora_engine_builds_tokenized_chat_prompt(modal_app_module):
@@ -249,7 +251,7 @@ def test_lora_engine_builds_tokenized_raw_prompt(modal_app_module):
 def test_lora_engine_caches_exact_prompt_tokens(modal_app_module):
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine._prompt_cache_size = 2  # prompt-cache size is an instance attr (constant at load)
-    engine._prompt_token_cache = modal_app_module.OrderedDict()
+    engine._prompt_token_cache = OrderedDict()
     calls: list[str] = []
 
     class _Tokenizer:
@@ -316,7 +318,7 @@ def test_lora_engine_cache_key_uses_adapter_thinking_default(modal_app_module):
     # render different prompts.
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine._prompt_cache_size = 4
-    engine._prompt_token_cache = modal_app_module.OrderedDict()
+    engine._prompt_token_cache = OrderedDict()
     calls: list = []
 
     class _Tokenizer:
@@ -347,7 +349,7 @@ def test_lora_engine_cache_key_uses_adapter_thinking_default(modal_app_module):
 def test_lora_engine_requires_trained_thinking_default(modal_app_module):
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine._prompt_cache_size = 4
-    engine._prompt_token_cache = modal_app_module.OrderedDict()
+    engine._prompt_token_cache = OrderedDict()
 
     class _Tokenizer:
         def apply_chat_template(self, messages, **kwargs):
@@ -428,7 +430,7 @@ def test_lora_engine_cache_key_ignores_reserved_chat_template_kwargs(modal_app_m
     # ignored key (which doesn't change the rendered prompt) must NOT cause a cache miss.
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine._prompt_cache_size = 4
-    engine._prompt_token_cache = modal_app_module.OrderedDict()
+    engine._prompt_token_cache = OrderedDict()
     calls: list = []
 
     class _Tokenizer:
@@ -479,7 +481,7 @@ def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_modu
         cuda = _Cuda()
 
     engine.registry = _Registry()
-    engine._prompt_token_cache = modal_app_module.OrderedDict([(("prompt", "cached"), (1, 2, 3))])
+    engine._prompt_token_cache = OrderedDict([(("prompt", "cached"), (1, 2, 3))])
     monkeypatch.setitem(sys.modules, "torch", _Torch())
 
     # Health reports the served PRE-QUANTIZED checkpoint (owned FP8 for 2B) + baked-in config.
@@ -720,7 +722,7 @@ def test_load_adapters_for_base_filters_records(modal_app_module, monkeypatch):
     records = [_Record("Qwen/Qwen3.5-4B"), _Record("Qwen/Qwen3.5-0.8B")]
     monkeypatch.setattr("flash.serving.src.persistence.load_adapters", lambda settings: records)
 
-    assert modal_app_module._load_adapters_for_base(object(), "Qwen/Qwen3.5-0.8B") == [records[1]]
+    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-0.8B") == [records[1]]
 
 
 def test_load_adapters_for_base_skips_hydration_failures(modal_app_module, monkeypatch, capsys):
@@ -729,7 +731,7 @@ def test_load_adapters_for_base_skips_hydration_failures(modal_app_module, monke
 
     monkeypatch.setattr("flash.serving.src.persistence.load_adapters", _boom)
 
-    assert modal_app_module._load_adapters_for_base(object(), "Qwen/Qwen3.5-0.8B") == []
+    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-0.8B") == []
     assert "adapter hydration skipped" in capsys.readouterr().out
 
 
@@ -750,11 +752,11 @@ def test_adapter_source_cache_dir_ignores_adapter_id(modal_app_module):
     changed = first.model_copy(update={"subfolder": "sft/other/seed0/adapter"})
 
     root = Path("/cache/adapters")
-    assert modal_app_module._adapter_source_cache_dir(root, first) == (
-        modal_app_module._adapter_source_cache_dir(root, second)
+    assert engine_support._adapter_source_cache_dir(root, first) == (
+        engine_support._adapter_source_cache_dir(root, second)
     )
-    assert modal_app_module._adapter_source_cache_dir(root, first) != (
-        modal_app_module._adapter_source_cache_dir(root, changed)
+    assert engine_support._adapter_source_cache_dir(root, first) != (
+        engine_support._adapter_source_cache_dir(root, changed)
     )
 
 
@@ -857,7 +859,7 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
             "thinking": True,
         }
     )
-    cached_path = modal_app_module._adapter_source_cache_dir(tmp_path / "adapters", record)
+    cached_path = engine_support._adapter_source_cache_dir(tmp_path / "adapters", record)
     cached_path = cached_path / "sft/run/seed0/adapter"
     cached_path.mkdir(parents=True)
     (cached_path / "adapter_config.json").write_text("{}", encoding="utf-8")
@@ -906,7 +908,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
             "thinking": True,
         }
     )
-    partial_path = modal_app_module._adapter_source_cache_dir(tmp_path / "adapters", record)
+    partial_path = engine_support._adapter_source_cache_dir(tmp_path / "adapters", record)
     partial_adapter_path = partial_path / "sft/run/seed0/adapter"
     partial_adapter_path.mkdir(parents=True)
     (partial_adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
@@ -958,7 +960,7 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
         }
     )
     missing = cached.model_copy(update={"adapter_id": "missing", "repo_id": "org/missing"})
-    cache_path = modal_app_module._adapter_source_cache_dir(tmp_path / "adapters", cached)
+    cache_path = engine_support._adapter_source_cache_dir(tmp_path / "adapters", cached)
     cache_path = cache_path / "sft/cached/seed0/adapter"
     cache_path.mkdir(parents=True)
     (cache_path / "adapter_config.json").write_text("{}", encoding="utf-8")
