@@ -3,7 +3,8 @@
 The authorizer POSTs to the backend's /api/serving/authorize and must translate the backend's
 HTTP status into the right serving-side HTTPException:
 
-  - 200                       -> allow (no raise)
+  - 200 + nonempty orgId      -> allow and return the billing org
+  - malformed 200             -> 503 (fail closed; never authorize without a billing org)
   - 401 + code invalid_api_key-> 401 (the user's key is bad)
   - 401 without that code     -> 503 (our machine bearer was rejected: a serving misconfig, NOT the
                                  caller's key — must not be reported as an invalid user key)
@@ -28,6 +29,11 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi.testclient import TestClient
+
+from flash.serving.src.router import AdapterRouter, build_serving_app
+from flash.serving.src.schemas import AdapterRecord
+from tests.serving.conftest import attest
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -117,11 +123,6 @@ def test_authorizer_none_when_unconfigured(modal_app_module):
     no_key = SimpleNamespace(backend_url="https://b", internal_key="")
     assert modal_app_module._build_chat_authorizer(no_url) is None
     assert modal_app_module._build_chat_authorizer(no_key) is None
-
-
-def test_200_allows(modal_app_module, monkeypatch):
-    authorize = _authorizer(modal_app_module, monkeypatch, _FakeResp(200, {"ok": True}))
-    _run(authorize)  # must not raise
 
 
 def test_401_invalid_user_key_maps_to_401(modal_app_module, monkeypatch):
@@ -224,6 +225,126 @@ def _new_authorizer(modal_app_module):
     return modal_app_module._build_chat_authorizer(
         SimpleNamespace(backend_url="https://backend.example.com", internal_key="machine-key")
     )
+
+
+_QWEN = "Qwen/Qwen3.5-0.8B"
+_INTERNAL_KEY = "fs-internal"
+
+
+class _CountingPool:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, _base_model, _payload, record, *, expected_checkpoint=None):
+        self.generate_calls += 1
+        return attest(
+            record,
+            {
+                "text": "hi",
+                "finish_reason": "stop",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "checkpoint": "",
+            },
+        )
+
+    async def stream_generate(self, *_a, **_k):  # pragma: no cover - unused here
+        yield {"type": "final", "finish_reason": "stop", "prompt_tokens": 1, "completion_tokens": 1}
+
+    async def register(self, _base_model, _record) -> None:  # pragma: no cover - unused here
+        return None
+
+    async def unregister(
+        self, _base_model, _adapter_id, expected_generation=None
+    ) -> None:  # pragma: no cover - unused here
+        return None
+
+
+def _base_model_client(authorize, pool, *, usage_reporter=None) -> TestClient:
+    record = AdapterRecord(
+        adapter_id=_QWEN,
+        repo_id=_QWEN,
+        base_model=_QWEN,
+        serve_base_model=True,
+        thinking=True,
+        org_id=None,
+        status="ready",
+    )
+    return TestClient(
+        build_serving_app(
+            pool,
+            AdapterRouter([record]),
+            internal_key=_INTERNAL_KEY,
+            chat_authorizer=authorize,
+            usage_reporter=usage_reporter,
+        )
+    )
+
+
+def _chat(client: TestClient, **headers: str):
+    return client.post(
+        "/v1/chat/completions",
+        json={"model": _QWEN, "messages": [{"role": "user", "content": "hi"}]},
+        headers=headers,
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        pytest.param({}, id="missing-org-id"),
+        pytest.param({"orgId": None}, id="null-org-id"),
+        pytest.param({"orgId": ""}, id="empty-org-id"),
+        pytest.param({"orgId": 123}, id="non-string-org-id"),
+        pytest.param(ValueError("invalid json"), id="invalid-json"),
+    ],
+)
+def test_malformed_200_fails_closed_without_dispatch_or_cache(
+    modal_app_module, monkeypatch, malformed
+):
+    calls = _counting_client(
+        monkeypatch,
+        lambda n: _FakeResp(200, malformed if n == 1 else {"orgId": "org-1"}),
+    )
+    authorize = _new_authorizer(modal_app_module)
+    pool = _CountingPool()
+    reports: list[dict[str, Any]] = []
+
+    async def capture(usage: dict[str, Any]) -> None:
+        reports.append(usage)
+
+    with _base_model_client(authorize, pool, usage_reporter=capture) as client:
+        denied = _chat(client, Authorization="Bearer fs-user-key")
+        assert denied.status_code == 503
+        assert pool.generate_calls == 0
+
+        allowed = _chat(client, Authorization="Bearer fs-user-key")
+        internal = _chat(client, **{"X-Freesolo-Internal-Key": _INTERNAL_KEY})
+
+    assert allowed.status_code == 200
+    assert internal.status_code == 200
+    assert pool.generate_calls == 2
+    assert calls["n"] == 2
+    assert len(reports) == 1
+    assert reports[0]["orgId"] == "org-1"
+
+
+def test_cancelled_waiter_does_not_cancel_shared_authorization(modal_app_module, monkeypatch):
+    import asyncio
+
+    calls = _counting_client(monkeypatch, lambda _n: _FakeResp(200, {"orgId": "org-1"}), delay=0.05)
+    authorize = _new_authorizer(modal_app_module)
+
+    async def run():
+        waiters = [asyncio.create_task(authorize("key", "ad")) for _ in range(10)]
+        await asyncio.sleep(0)
+        waiters[0].cancel()
+        return await asyncio.gather(*waiters, return_exceptions=True)
+
+    results = asyncio.run(run())
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert results[1:] == ["org-1"] * 9
+    assert calls["n"] == 1
 
 
 def test_successful_authorization_is_cached_within_ttl(modal_app_module, monkeypatch):

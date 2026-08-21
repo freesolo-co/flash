@@ -694,13 +694,21 @@ def _build_chat_authorizer(settings: Any) -> Any:
             ) from exc
         if resp.status_code == 200:
             # Return the authorized billing org so the router can meter a base-model serve to the
-            # caller (a base model has no adapter owner). A malformed/absent body is non-fatal — a
-            # LoRA serve bills by adapterId regardless, so fall back to None.
+            # caller (a base model has no adapter owner). A malformed response cannot authorize an
+            # external request because that would let base-model usage escape billing.
             try:
                 org_id = resp.json().get("orgId")
-            except Exception:  # a non-JSON 200 still authorizes; just no org echoed
-                org_id = None
-            return org_id if isinstance(org_id, str) and org_id else None
+            except Exception as exc:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "serving auth backend returned malformed response",
+                ) from exc
+            if not isinstance(org_id, str) or not org_id:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "serving auth backend returned malformed response",
+                )
+            return org_id
         if resp.status_code == 401:
             # The backend returns 401 for BOTH an invalid *user* key (our authorize route, body
             # code "invalid_api_key") AND a rejected serving *machine* bearer (require_internal_token,
@@ -775,7 +783,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
             # disconnect), so an orphaned single-flight failure doesn't warn "exception never retrieved".
             task.add_done_callback(lambda t: t.cancelled() or t.exception())
             _inflight[ck] = task
-        return await task
+        return await asyncio.shield(task)
 
     authorize.aclose = _client.aclose
     return authorize
