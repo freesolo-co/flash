@@ -550,6 +550,67 @@ def test_adoption_waits_out_a_cold_container_instead_of_probing_once() -> None:
     assert all(not name.startswith("create_") for name, _value in sdk.calls)
 
 
+def test_adoption_tolerates_a_concurrent_artifact_reclaim_while_waiting() -> None:
+    """a racer finishing the reclaim mid-wait is the success state, not a conflict.
+
+    Waiting re-observes the phase on every poll, so a concurrent `serve deploy` -- or the run that
+    created this app completing its own reclaim -- can delete the artifact secret while this wait
+    is still warming a cold container. Demanding the artifact still be present turned that into a
+    definite `failed`/`conflict` for an app that was healthy, deployed, and billing.
+    """
+
+    class _ColdProbe:
+        def __init__(self, accept_on: int) -> None:
+            self.accept_on = accept_on
+            self.calls = 0
+
+        def __call__(
+            self,
+            _url: str,
+            _token: str,
+            _bundle: DeploymentBundle,
+            _timeout_seconds: float,
+        ) -> bool:
+            self.calls += 1
+            return self.calls >= self.accept_on
+
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    _seed_exact(sdk, artifact=True)
+    original_observe = sdk.observe
+    observations = {"count": 0}
+
+    def racing_observe(observed_plan, *, app_id_hint=None):
+        # the reclaim lands after the adoption branch has already been chosen, which is the only
+        # ordering that reaches the wait with the artifact disappearing underneath it.
+        observations["count"] += 1
+        result = original_observe(observed_plan, app_id_hint=app_id_hint)
+        if observations["count"] >= 2:
+            sdk.artifact.clear()
+        return result
+
+    sdk.observe = racing_observe  # type: ignore[assignment]
+    probe = _ColdProbe(accept_on=3)
+    clock = _Clock()
+
+    result = provision_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=600.0,
+        sdk_factory=lambda _credentials, _plan: sdk,
+        probe=probe,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "ready", "a healthy app was rejected because a racer reclaimed first"
+    assert result.error_code is None
+    assert sdk.apps, "the app must still be deployed"
+    assert not sdk.artifact, "the artifact is reclaimed either way"
+
+
 def test_exact_adoption_requires_authenticated_endpoint_provenance() -> None:
     bundle = _bundle()
     factory = _Factory()
@@ -1486,6 +1547,51 @@ def test_a_failed_abort_delete_reports_that_cleanup_was_not_confirmed() -> None:
     assert raised.value.provider == "modal"
     # still an interrupt, so the existing cli handler keeps exiting 130 rather than tracebacking.
     assert isinstance(raised.value, KeyboardInterrupt)
+
+
+@pytest.mark.parametrize("interrupted_call", ["create_volume", "create_inference_secret"])
+def test_a_create_interrupted_after_the_provider_accepted_it_is_still_torn_down(
+    interrupted_call: str,
+) -> None:
+    """the window between Modal accepting a create and the caller seeing its handle.
+
+    Ctrl-C landing there used to leave nothing recorded, because the record was written from the
+    return value -- so abort skipped exactly the resource that exists, reported full success, and
+    the cli printed a plain "aborted" over a volume the customer keeps paying for. Marking the
+    attempt before the call is what makes an unseen handle still deletable, since every name comes
+    from the plan.
+    """
+
+    factory = _Factory()
+    sdk_holder: list[_FakeSdk] = []
+
+    class _InterruptAfterAcceptSdk(_FakeSdk):
+        def __init__(self, plan) -> None:
+            super().__init__(plan)
+            sdk_holder.append(self)
+
+    def _interrupt_after(name: str) -> None:
+        original = getattr(_InterruptAfterAcceptSdk, name)
+
+        def wrapper(self, *args, **kwargs):
+            original(self, *args, **kwargs)  # the resource now exists in the provider
+            raise KeyboardInterrupt  # ...before its handle reaches the caller
+
+        setattr(_InterruptAfterAcceptSdk, name, wrapper)
+
+    _interrupt_after(interrupted_call)
+    factory.sdk_class = _InterruptAfterAcceptSdk
+
+    with pytest.raises(KeyboardInterrupt):
+        _provision(_bundle(), factory)
+
+    # the interrupted resource is the one that used to leak, but nothing else may be left behind
+    # either, and the abort must have confirmed every step -- an unconfirmed one would have
+    # surfaced as `InterruptedProvisioning` rather than the bare interrupt asserted above.
+    sdk = sdk_holder[0]
+    assert sdk.volumes == []
+    assert sdk.inference == []
+    assert sdk.artifact == []
 
 
 def test_a_fully_confirmed_abort_leaves_the_interrupt_unchanged() -> None:

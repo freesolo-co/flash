@@ -79,10 +79,21 @@ class _ExpectedResources:
 
 @dataclass(slots=True)
 class _CreatedResources:
-    """what this invocation actually created, recorded as each create returns.
+    """what this invocation may have created, each flag set *before* its create is issued.
 
     Mutable and written in place so an interrupt handler can read it: the create sequence may be
-    abandoned between any two steps, and only the resources already made need tearing down.
+    abandoned between any two steps, and only the resources already attempted need tearing down.
+
+    Attempted, not confirmed. A create that Modal accepted but whose return value never reached us
+    -- Ctrl-C landing between the accept and the assignment -- leaves the resource live and
+    billing. Recording after the call meant cleanup walked past exactly that resource and still
+    reported success, so the CLI printed a plain abort over a volume the customer keeps paying for.
+    Marking first inverts the error: the worst case is deleting a resource that was never made,
+    and every delete here is name-addressed with `allow_missing=True`, so that case is a no-op.
+
+    Flags rather than handles because nothing needs the ids. Deletes address secrets and the volume
+    by their plan-derived names, which are known before any call is issued -- which is also what
+    makes marking-before-the-call able to clean up a resource whose handle was never seen.
 
     `app_deployed` is the expensive one. The secrets and the volume are cheap storage; the app is
     the live GPU deployment, and it starts billing the moment `deploy_app` returns, which is well
@@ -90,14 +101,14 @@ class _CreatedResources:
     resources is what lets abort stop compute first, the same order canonical teardown uses.
     """
 
-    inference: ModalNamedResource | None = None
-    artifact: ModalNamedResource | None = None
-    volume: ModalNamedResource | None = None
+    inference: bool = False
+    artifact: bool = False
+    volume: bool = False
     app_deployed: bool = False
 
     @property
     def any_created(self) -> bool:
-        return any((self.inference, self.artifact, self.volume)) or self.app_deployed
+        return self.inference or self.artifact or self.volume or self.app_deployed
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,18 +276,18 @@ def _create_resources(
     artifact_token: str | None,
     created: _CreatedResources | None = None,
 ) -> _ExpectedResources:
-    # each resource is recorded the instant it exists, before the next create runs. an interrupt
-    # between two creates has to tear down what already landed, so "what did we build" cannot be
-    # assembled only at the end of a function that may not reach its end.
+    # each resource is marked before its create is issued, never after. an interrupt between two
+    # creates has to tear down what may already have landed, and a resource Modal accepted whose
+    # return value never arrived is exactly the one that leaks. see `_CreatedResources`.
     record = created if created is not None else _CreatedResources()
+    record.inference = True
     inference = _mutation(lambda: sdk.create_inference_secret(plan, inference_token))
-    record.inference = inference
     artifact = None
     if artifact_token is not None:
+        record.artifact = True
         artifact = _mutation(lambda: sdk.create_artifact_secret(plan, artifact_token))
-        record.artifact = artifact
+    record.volume = True
     volume = _mutation(lambda: sdk.create_volume(plan))
-    record.volume = volume
     assert type(inference) is ModalNamedResource
     assert artifact is None or type(artifact) is ModalNamedResource
     assert type(volume) is ModalNamedResource
@@ -492,25 +503,39 @@ def _adopt_existing(
             expected=None,
         )
     if finalized is not None:
-        # same bounded wait as the branch above; this one still has its artifact to reclaim after.
+        # same bounded wait as the branch above, but this phase still owns an artifact, and waiting
+        # re-observes it on every poll. a concurrent `serve deploy` -- or the run that created this
+        # app finishing its own reclaim -- can delete that secret while this wait is still warming a
+        # cold container. the deployment is then finalized-and-cleaned -- the success state -- yet
+        # `_phase_proof` sees a phase mismatch and raises, and the caller maps that to a definite
+        # `conflict` for an app that may be healthy and billing.
+        #
+        # so wait for the *cleaned* phase and tolerate the still-has-artifact phase as transient,
+        # which is exactly how `reconcile_modal_deployment` waits out this same pair. either the
+        # racer reclaims the artifact or this run does it below; both converge on the same phase.
         proved = _wait_for_phase(
             finalized_plan,
             sdk,
             inference_token,
-            artifact_present=True,
+            artifact_present=False,
             expected=None,
-            transient_phases=(),
+            transient_phases=(_TransientPhase(finalized_plan, True),),
             deadline_at=deadline_at,
             probe=probe,
             clock=clock,
             sleep=sleep,
         )
-        if proved is None:
-            return _unknown_result(finalized_plan, handle=finalized.handle)
+        if proved is not None:
+            # a racer reclaimed it first, so there is nothing left to delete.
+            return DeploymentResult.from_spec(
+                finalized_plan.bundle.spec,
+                status="ready",
+                handle=proved.handle,
+            )
         return _delete_artifact_and_confirm(
             finalized_plan,
             sdk,
-            proved,
+            finalized,
             inference_token,
             deadline_at=deadline_at,
             probe=probe,
@@ -823,12 +848,18 @@ def _abort_created_resources(
         # what makes the deletes below able to succeed at all. canonical teardown uses this order
         # for the same reason.
         confirmed &= _suppressed(lambda: _mutation(lambda: sdk.stop_app(plan)))
-    for secret in (created.artifact, created.inference):
-        if secret is not None:
+    # the plan's names, not names read back off a create response: an attempted create whose
+    # handle never arrived still has to be deletable, and `allow_missing=True` makes deleting one
+    # that was never made a no-op.
+    for attempted, name in (
+        (created.artifact, plan.names.artifact_secret),
+        (created.inference, plan.names.inference_secret),
+    ):
+        if attempted:
             confirmed &= _suppressed(
-                lambda name=secret.name: _mutation(lambda: sdk.delete_secret(plan, name))
+                lambda name=name: _mutation(lambda: sdk.delete_secret(plan, name))
             )
-    if created.volume is not None:
+    if created.volume:
         confirmed &= _suppressed(lambda: _mutation(lambda: sdk.delete_volume(plan)))
     return confirmed
 
