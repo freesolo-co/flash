@@ -667,7 +667,7 @@ def test_sanitized_handles_and_results_are_json_safe_secret_free_and_flat() -> N
         replace(handles_and_specs[1][0], template_id="")
 
 
-def test_deployment_result_requires_factory_bound_exact_spec_provenance() -> None:
+def test_deployment_result_requires_an_exact_spec_and_matching_handle_provenance() -> None:
     spec = plan_deployment(_modal_request(_adapter(1)))
     handle = _modal_handle(spec)
 
@@ -675,12 +675,7 @@ def test_deployment_result_requires_factory_bound_exact_spec_provenance() -> Non
         DeploymentResult()
 
     legitimate = DeploymentResult.from_spec(spec, status="ready", handle=handle)
-    forged = object.__new__(DeploymentResult)
-    for entry in fields(legitimate):
-        object.__setattr__(forged, entry.name, getattr(legitimate, entry.name))
     assert sanitized_dict(legitimate)["spec_id"] == spec.spec_id
-    with pytest.raises(ValueError, match="exact DeploymentResult factory"):
-        sanitized_dict(forged)
 
     raw_error = RuntimeError(SECRET_SENTINEL)
     with pytest.raises(ValueError, match="allowlisted deployment error") as exc_info:

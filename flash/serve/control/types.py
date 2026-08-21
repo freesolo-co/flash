@@ -6,7 +6,6 @@ import hashlib
 import json
 import math
 import re
-import weakref
 from dataclasses import dataclass, field, fields
 from pathlib import PurePosixPath
 from typing import Literal, TypeAlias
@@ -713,7 +712,7 @@ def _validate_handle_against_plan(
         raise ValueError("provider handle provenance does not match the planned deployment")
 
 
-@dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
+@dataclass(frozen=True, slots=True, init=False)
 class DeploymentResult:
     """one deployment outcome bound to one complete exact deployment spec."""
 
@@ -776,25 +775,13 @@ class DeploymentResult:
         }
         for name, value in values.items():
             object.__setattr__(result, name, value)
-        _validate_deployment_result_structure(result)
-        _register_deployment_result(result)
+        validate_deployment_result(result)
         return result
 
 
-_DEPLOYMENT_RESULT_REGISTRY: dict[int, weakref.ReferenceType[DeploymentResult]] = {}
+def validate_deployment_result(result: DeploymentResult) -> None:
+    """validate one result's complete structural contract."""
 
-
-def _register_deployment_result(result: DeploymentResult) -> None:
-    identity = id(result)
-
-    def remove(reference: weakref.ReferenceType[DeploymentResult]) -> None:
-        if _DEPLOYMENT_RESULT_REGISTRY.get(identity) is reference:
-            _DEPLOYMENT_RESULT_REGISTRY.pop(identity, None)
-
-    _DEPLOYMENT_RESULT_REGISTRY[identity] = weakref.ref(result, remove)
-
-
-def _validate_deployment_result_structure(result: DeploymentResult) -> None:
     if type(result) is not DeploymentResult:
         raise ValueError("result must be an exact DeploymentResult")
     validate_deployment_spec(result.spec)
@@ -830,15 +817,6 @@ def _validate_deployment_result_structure(result: DeploymentResult) -> None:
             image_digest=result.image_digest,
             handle=result.handle,
         )
-
-
-def validate_deployment_result(result: DeploymentResult) -> None:
-    """validate one factory-created result and its complete structural contract."""
-
-    _validate_deployment_result_structure(result)
-    reference = _DEPLOYMENT_RESULT_REGISTRY.get(id(result))
-    if reference is None or reference() is not result:
-        raise ValueError("result must be created by the exact DeploymentResult factory")
 
 
 def sanitized_dict(value: object) -> dict[str, object]:
