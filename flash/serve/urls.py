@@ -68,26 +68,6 @@ def displayable_url(url: str) -> str:
     return f"{scheme}://{host}" if scheme else host
 
 
-def url_origin(url: str) -> tuple[str, str, int | None]:
-    """The (scheme, host, port) triple that decides whether two URLs share an origin.
-
-    Stdlib-only, so the dependency-free CLI path can scope a credential to one origin the same way
-    ``flash.serve.deploy``'s httpx hook does. Case-folded and default-ports-normalized, because
-    ``HTTPS://Host`` and ``https://host:443`` are the same origin and a mismatch here reads as a
-    cross-origin hop that must drop the key. A url too malformed to parse gets a triple that
-    matches nothing, which fails closed.
-    """
-    default_ports = {"http": 80, "https": 443}
-    try:
-        parsed = urlsplit(url)
-        scheme = (parsed.scheme or "").lower()
-        host = (parsed.hostname or "").rstrip(".").lower()
-        port = parsed.port
-    except ValueError:  # malformed authority: a bad ipv6 literal, or a non-numeric port
-        return ("", "", None)
-    return (scheme, host, port if port is not None else default_ports.get(scheme))
-
-
 def serving_control_url(value: str) -> str:
     """Return the serving control root without a terminal OpenAI ``/v1`` path."""
     url = str(value or "").rstrip("/")
