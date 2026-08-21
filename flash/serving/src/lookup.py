@@ -31,13 +31,24 @@ class AdapterLookup:
         self._reload_records = reload_records
         self._reload_interval_seconds = reload_interval_seconds
         self._last_reload: dict[str, Any] = {"at": float("-inf"), "task": None}
+        self._reload_lock = asyncio.Lock()
 
     async def reload(self) -> None:
         # to_thread: reload_records is a sync Supabase call; don't block the event loop.
         assert self._reload_records is not None
-        records = await asyncio.to_thread(self._reload_records)
-        self._router.hydrate(records)
-        self._last_reload["at"] = time.monotonic()
+        started = time.monotonic()
+        # Serialized: the fetch suspends, so two concurrent misses could otherwise hydrate out of
+        # order -- the slower fetch's older records landing last and overwriting fresher state,
+        # then stamping a newer timestamp over it. Hydrate and timestamp move together under here.
+        async with self._reload_lock:
+            if self._last_reload["at"] >= started:
+                # Another reload finished while we waited. "Reload once before 404-ing" is already
+                # satisfied by it, so return instead of stampeding the backend with a duplicate
+                # fetch per concurrent miss.
+                return
+            records = await asyncio.to_thread(self._reload_records)
+            self._router.hydrate(records)
+            self._last_reload["at"] = time.monotonic()
 
     async def _reload_safe(self) -> None:
         try:

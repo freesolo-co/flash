@@ -128,16 +128,14 @@ async def remove_adapter(
 
     base_record, run_id, matches = await resolve_undeploy_target(context.router, adapter_id)
     if base_record is not None:
-        base_model = base_record.base_model
-        context.router.remove(adapter_id)
-        # return after durable routing cleanup; gpu eviction continues after the response.
-        background_tasks.add_task(
-            context.unregister_safe,
-            base_model,
-            adapter_id,
-            base_record.deployment_generation,
+        # A base-model serve has no durable row: `_base_model_records()` seeds it in memory and
+        # every replica re-adds it on each reload. Removing it here would clear one replica's
+        # memory, report success, and be undone by the next reload -- while evicting the shared
+        # engine's base weights out from under every other tenant on the way.
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"{adapter_id} is a base model, not a deployed adapter",
         )
-        return undeploy_body(adapter_id, adapter_id, base_model, [], [])
 
     # phase 1: compare-and-swap every matched row to "disabled" in persistence first, collecting
     # the rows that durably converged.

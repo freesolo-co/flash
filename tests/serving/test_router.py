@@ -9,9 +9,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import time
 
 import pytest
-from fastapi import BackgroundTasks, Request
+from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.testclient import TestClient
 from starlette.responses import StreamingResponse
 
@@ -1068,7 +1069,14 @@ def test_adapters_fail_closed_when_no_internal_key_configured():
     assert router.base_model_for("qa") == QWEN  # nothing was mutated
 
 
-def test_base_model_delete_defers_gpu_cleanup_until_after_response() -> None:
+def test_base_model_delete_is_rejected_rather_than_faked() -> None:
+    """A base model is not a deployed adapter, so DELETE must 404 instead of reporting success.
+
+    `_base_model_records()` seeds these rows in memory and every replica re-adds them on each
+    reload, so there is no durable row to remove. Removing it from one replica's memory and
+    returning ok=True told the caller a teardown happened that the next reload silently undid --
+    and evicted the shared engine's base weights out from under every other tenant on the way.
+    """
     record = AdapterRecord(
         adapter_id=QWEN,
         repo_id=QWEN,
@@ -1095,21 +1103,21 @@ def test_base_model_delete_defers_gpu_cleanup_until_after_response() -> None:
     )
     background_tasks = BackgroundTasks()
 
-    result = asyncio.run(
-        remove_adapter(
-            adapter_id=QWEN,
-            request=request,
-            background_tasks=background_tasks,
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(
+            remove_adapter(
+                adapter_id=QWEN,
+                request=request,
+                background_tasks=background_tasks,
+            )
         )
-    )
 
-    assert result["ok"] is True
+    assert excinfo.value.status_code == 404
+    # nothing was mutated and no gpu eviction was scheduled: a rejected teardown must not evict
+    # the base weights every other tenant on this engine is serving from.
     assert pool.unregistered == []
-    assert len(background_tasks.tasks) == 1
-
-    asyncio.run(background_tasks())
-
-    assert pool.unregistered == [(QWEN, QWEN)]
+    assert background_tasks.tasks == []
+    assert router.get(QWEN) is record
 
 
 class _MeteringPool(FakePool):
@@ -1639,3 +1647,52 @@ def test_on_startup_failure_does_not_crash_the_router():
         assert ran.wait(timeout=5)
         # the router is unaffected by the startup failure; health and routing still work.
         assert client.get("/healthz").json()["ok"] is True
+
+
+def test_concurrent_misses_reload_once_and_hydrate_in_order():
+    """Two concurrent misses must not hydrate out of order or stampede shared storage.
+
+    `reload()` suspends on `to_thread`, so without serialization a slow first fetch can land AFTER
+    a fast second one and overwrite fresher records with staler ones -- then stamp a newer
+    timestamp over the result, hiding the regression until the next TTL.
+    """
+    import asyncio
+
+    from flash.serving.src.lookup import AdapterLookup
+
+    revision = _rec("late", QWEN)
+    fresh = [revision, _alias(revision)]
+    calls = {"count": 0}
+    hydrated: list[int] = []
+
+    def _reload():
+        calls["count"] += 1
+        # the FIRST caller is the slow one; a lock-free reload lets it hydrate last.
+        if calls["count"] == 1:
+            time.sleep(0.05)
+            return []
+        return fresh
+
+    router = AdapterRouter([])
+    original_hydrate = router.hydrate
+
+    def _tracking_hydrate(records):
+        hydrated.append(len(records))
+        return original_hydrate(records)
+
+    router.hydrate = _tracking_hydrate  # type: ignore[method-assign]
+    lookup = AdapterLookup(router, _reload, reload_interval_seconds=30.0)
+
+    async def _both():
+        return await asyncio.gather(
+            lookup.resolve("late", require_supported_base_model=False),
+            lookup.resolve("late", require_supported_base_model=False),
+            return_exceptions=True,
+        )
+
+    results = asyncio.run(_both())
+
+    assert calls["count"] == 1, "each concurrent miss fetched separately instead of coalescing"
+    assert hydrated == [0], f"hydrate ran {len(hydrated)}x; a stale fetch can overwrite a fresh one"
+    # both callers see the same outcome; neither observes a half-applied hydrate.
+    assert all(isinstance(r, HTTPException) for r in results)
