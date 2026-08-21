@@ -5,6 +5,8 @@ are passed in rather than captured, so the stream can be rendered against a fake
 building the app.
 """
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -21,6 +23,128 @@ from flash.serving.src.serving_io import (
 )
 
 
+async def _produce_openai_chat_stream(
+    router: AdapterRouter,
+    schedule_usage: Callable[[AdapterRecord, dict[str, Any], str | None], None],
+    output: asyncio.Queue[tuple[bytes | None, Exception | None]],
+    disconnected: asyncio.Event,
+    *,
+    record: AdapterRecord,
+    events: AsyncIterator[dict[str, Any]],
+    adapter_id: str,
+    completion_id: str,
+    created: int,
+    include_usage: bool,
+    caller_org: str | None,
+    thinking: bool,
+) -> None:
+    async def emit(chunk: bytes | None = None, error: Exception | None = None) -> None:
+        if not disconnected.is_set():
+            await output.put((chunk, error))
+
+    try:
+        await emit(
+            _sse(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": adapter_id,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant"},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+        )
+
+        def _delta_chunk(delta: dict[str, Any]) -> bytes:
+            return _sse(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": adapter_id,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                }
+            )
+
+        splitter = _ReasoningStreamSplitter(thinking)
+        final: dict[str, Any] = {}
+        async for event in terminating_on_engine_error(router, events, adapter_id):
+            kind = event.get("type")
+            if kind == "delta":
+                text = event.get("text") or ""
+                if not text:
+                    continue
+                reasoning_delta, content_delta = splitter.feed(text)
+                if reasoning_delta:
+                    await emit(_delta_chunk({"reasoning_content": reasoning_delta}))
+                if content_delta:
+                    await emit(_delta_chunk({"content": content_delta}))
+            elif kind == "final":
+                final = event
+            elif kind == "error":
+                # the 200 and its headers went out with the first chunk, so the status can no
+                # longer carry the failure. without this the failure would propagate and starlette
+                # would drop the connection: the caller receives a well-formed but silently
+                # truncated stream with no error and no [done], indistinguishable from a short
+                # completion. emit the error into the stream and then close the protocol normally
+                # so the failure is detectable by an unmodified openai client.
+                await emit(
+                    _sse(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": adapter_id,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                            "error": {
+                                "message": event["message"],
+                                "type": "engine_error",
+                                "code": event["code"],
+                            },
+                        }
+                    )
+                )
+                await emit(_sse("[DONE]"))
+                return
+        trailing = splitter.flush()
+        if trailing:
+            await emit(_delta_chunk({"reasoning_content": trailing}))
+
+        schedule_usage(record, final, caller_org)
+        done_chunk: dict[str, Any] = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": adapter_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": final.get("finish_reason"),
+                }
+            ],
+        }
+        if include_usage:
+            prompt_tokens = final.get("prompt_tokens")
+            completion_tokens = final.get("completion_tokens")
+            if prompt_tokens is not None and completion_tokens is not None:
+                done_chunk["usage"] = _usage_block(
+                    int(prompt_tokens), int(completion_tokens), final.get("cached_tokens")
+                )
+        await emit(_sse(done_chunk))
+        await emit(_sse("[DONE]"))
+    except Exception as exc:
+        await emit(error=exc)
+    finally:
+        await emit()
+
+
 async def openai_chat_stream(
     router: AdapterRouter,
     schedule_usage: Callable[[AdapterRecord, dict[str, Any], str | None], None],
@@ -34,99 +158,40 @@ async def openai_chat_stream(
     caller_org: str | None,
     thinking: bool = False,
 ) -> AsyncIterator[bytes]:
-    yield _sse(
-        {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": adapter_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant"},
-                    "finish_reason": None,
-                }
-            ],
-        }
-    )
-
-    def _delta_chunk(delta: dict[str, Any]) -> bytes:
-        return _sse(
-            {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": adapter_id,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-            }
+    output: asyncio.Queue[tuple[bytes | None, Exception | None]] = asyncio.Queue(maxsize=1)
+    disconnected = asyncio.Event()
+    producer = asyncio.create_task(
+        _produce_openai_chat_stream(
+            router,
+            schedule_usage,
+            output,
+            disconnected,
+            record=record,
+            events=events,
+            adapter_id=adapter_id,
+            completion_id=completion_id,
+            created=created,
+            include_usage=include_usage,
+            caller_org=caller_org,
+            thinking=thinking,
         )
-
-    splitter = _ReasoningStreamSplitter(thinking)
-    final: dict[str, Any] = {}
-    async for event in terminating_on_engine_error(router, events, adapter_id):
-        kind = event.get("type")
-        if kind == "delta":
-            text = event.get("text") or ""
-            if not text:
-                continue
-            reasoning_delta, content_delta = splitter.feed(text)
-            if reasoning_delta:
-                yield _delta_chunk({"reasoning_content": reasoning_delta})
-            if content_delta:
-                yield _delta_chunk({"content": content_delta})
-        elif kind == "final":
-            final = event
-        elif kind == "error":
-            # The 200 and its headers went out with the first chunk, so the status can no
-            # longer carry the failure. Without this the failure would propagate and Starlette
-            # would drop the connection: the caller receives a well-formed but SILENTLY
-            # TRUNCATED stream with no error and no [DONE], indistinguishable from a short
-            # completion. Emit the error into the stream and then close the protocol normally
-            # -- the same shape vLLM's own OpenAI server uses -- so the failure is detectable
-            # by an unmodified OpenAI client.
-            yield _sse(
-                {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": adapter_id,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
-                    "error": {
-                        "message": event["message"],
-                        "type": "engine_error",
-                        "code": event["code"],
-                    },
-                }
-            )
-            yield _sse("[DONE]")
-            return
-    trailing = splitter.flush()
-    if trailing:
-        yield _delta_chunk({"reasoning_content": trailing})
-
-    schedule_usage(record, final, caller_org)
-    done_chunk: dict[str, Any] = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": adapter_id,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {},
-                "finish_reason": final.get("finish_reason"),
-            }
-        ],
-    }
-    if include_usage:
-        prompt_tokens = final.get("prompt_tokens")
-        completion_tokens = final.get("completion_tokens")
-        if prompt_tokens is not None and completion_tokens is not None:
-            done_chunk["usage"] = _usage_block(
-                int(prompt_tokens), int(completion_tokens), final.get("cached_tokens")
-            )
-    yield _sse(done_chunk)
-    yield _sse("[DONE]")
+    )
+    try:
+        while True:
+            chunk, error = await output.get()
+            if error is not None:
+                raise error
+            if chunk is None:
+                return
+            yield chunk
+    finally:
+        disconnected.set()
+        with contextlib.suppress(asyncio.QueueEmpty):
+            output.get_nowait()
+        # keep the terminal engine event and billing schedule inside the request's shutdown order.
+        # shielded: starlette cancels this iterator on disconnect, and an unshielded await would
+        # carry that cancellation into the producer and lose the usage the disconnect must still bill.
+        await asyncio.shield(producer)
 
 
 async def prepare_stream(

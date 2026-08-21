@@ -13,10 +13,13 @@ import re
 import pytest
 from fastapi import BackgroundTasks, Request
 from fastapi.testclient import TestClient
+from starlette.responses import StreamingResponse
 
 from flash.serving.src.adapter_routes import remove_adapter
 from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.serving_io import _sse
+from flash.serving.src.streaming import openai_chat_stream
 from tests.serving.conftest import attest
 
 
@@ -729,6 +732,185 @@ def test_streaming_usage_reporter_fires_and_is_not_gc_dropped(app_setup):
     assert reports[0]["promptTokens"] == 2
     assert reports[0]["completionTokens"] == 2
     assert reports[0]["requestId"] == "req-stream"
+
+
+def _metered_chat_stream(events, reports):
+    record = _rec("metered", QWEN)
+    router = AdapterRouter([record])
+
+    def schedule_usage(_record, final, _caller_org):
+        reports.append(final.copy())
+
+    return openai_chat_stream(
+        router,
+        schedule_usage,
+        record=record,
+        events=events,
+        adapter_id=record.adapter_id,
+        completion_id="chatcmpl-metered",
+        created=123,
+        include_usage=True,
+        caller_org=None,
+    )
+
+
+def test_stream_disconnect_still_schedules_terminal_usage_once():
+    async def scenario():
+        release_final = asyncio.Event()
+        sent_partial = asyncio.Event()
+        disconnect_sent = asyncio.Event()
+        reports = []
+
+        async def events():
+            yield {"type": "delta", "text": "partial"}
+            await release_final.wait()
+            yield {
+                "type": "final",
+                "finish_reason": "stop",
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "request_id": "req-disconnected",
+            }
+
+        response = StreamingResponse(_metered_chat_stream(events(), reports))
+
+        async def receive():
+            await sent_partial.wait()
+            disconnect_sent.set()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if (
+                message["type"] == "http.response.body"
+                and b'"content":"partial"' in message["body"]
+            ):
+                sent_partial.set()
+
+        response_task = asyncio.create_task(
+            response(
+                {"type": "http", "asgi": {"spec_version": "2.3"}},
+                receive,
+                send,
+            )
+        )
+        await disconnect_sent.wait()
+        release_final.set()
+        await response_task
+        return reports
+
+    reports = asyncio.run(scenario())
+    assert reports == [
+        {
+            "type": "final",
+            "finish_reason": "stop",
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "request_id": "req-disconnected",
+        }
+    ]
+
+
+def test_stream_normal_completion_schedules_usage_once_without_changing_bytes():
+    async def scenario():
+        reports = []
+        source_tasks = []
+        response_task = asyncio.current_task()
+
+        async def events():
+            source_tasks.append(asyncio.current_task())
+            yield {"type": "delta", "text": "answer"}
+            yield {
+                "type": "final",
+                "finish_reason": "stop",
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "request_id": "req-complete",
+            }
+
+        chunks = [chunk async for chunk in _metered_chat_stream(events(), reports)]
+        assert len(source_tasks) == 1
+        assert source_tasks[0] is not response_task
+        return chunks, reports
+
+    chunks, reports = asyncio.run(scenario())
+    assert chunks == [
+        _sse(
+            {
+                "id": "chatcmpl-metered",
+                "object": "chat.completion.chunk",
+                "created": 123,
+                "model": _revision_id("metered"),
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }
+        ),
+        _sse(
+            {
+                "id": "chatcmpl-metered",
+                "object": "chat.completion.chunk",
+                "created": 123,
+                "model": _revision_id("metered"),
+                "choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": None}],
+            }
+        ),
+        _sse(
+            {
+                "id": "chatcmpl-metered",
+                "object": "chat.completion.chunk",
+                "created": 123,
+                "model": _revision_id("metered"),
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            }
+        ),
+        _sse("[DONE]"),
+    ]
+    assert reports == [
+        {
+            "type": "final",
+            "finish_reason": "stop",
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "request_id": "req-complete",
+        }
+    ]
+
+
+def test_stream_engine_error_reaches_connected_client_without_usage():
+    async def scenario():
+        reports = []
+        source_tasks = []
+        response_task = asyncio.current_task()
+
+        async def events():
+            source_tasks.append(asyncio.current_task())
+            yield {"type": "delta", "text": "partial"}
+            raise ValueError("engine stream failed")
+
+        chunks = [chunk async for chunk in _metered_chat_stream(events(), reports)]
+        assert len(source_tasks) == 1
+        assert source_tasks[0] is not response_task
+        return chunks, reports
+
+    chunks, reports = asyncio.run(scenario())
+    assert b'"content":"partial"' in chunks[-3]
+    assert chunks[-2:] == [
+        _sse(
+            {
+                "id": "chatcmpl-metered",
+                "object": "chat.completion.chunk",
+                "created": 123,
+                "model": _revision_id("metered"),
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                "error": {
+                    "message": "engine stream failed",
+                    "type": "engine_error",
+                    "code": 400,
+                },
+            }
+        ),
+        _sse("[DONE]"),
+    ]
+    assert reports == []
 
 
 def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
