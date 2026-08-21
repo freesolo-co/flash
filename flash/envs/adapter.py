@@ -133,6 +133,9 @@ class FreesoloEnvironment(BaseEnvironment):
         self._EnvironmentEpisode = tools["EnvironmentEpisode"]
         self._EnvironmentTurn = tools["EnvironmentTurn"]
         self.multi_turn = isinstance(sdk_env, tools["EnvironmentMultiTurn"])
+        # only an explicit class capability opts in. instance data and environment params cannot
+        # turn dynamic image observations on accidentally.
+        self.image_observations = getattr(type(sdk_env), "image_observations", False) is True
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None

@@ -74,6 +74,7 @@ class _SftOptions:
 class _SftData:
     rows: list[dict]
     multimodal: bool
+    processor: object | None
     profile: object
     max_length: int
     realized_max_length: int
@@ -318,6 +319,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     return _SftData(
         rows=rows,
         multimodal=prepared_workload.multimodal,
+        processor=prepared_workload.processor,
         profile=profile,
         max_length=max_length,
         realized_max_length=realized_max_length,
@@ -351,7 +353,11 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
         if isinstance(target_modules, set | frozenset):
             target_modules = sorted(target_modules)
         warmstart_adapter = _sft_train._warmstart_adapter_path(
-            options.model_id, options.model_revision, lora_rank, targeting
+            options.model_id,
+            options.model_revision,
+            lora_rank,
+            int(lora_config.lora_alpha),
+            targeting,
         )
         vocab_size = _sft_train._resolve_sft_vocab_size(options.model_id, options.model_revision)
         # hoisted into the span: on a PINNED revision this falls through to a live AutoConfig read
@@ -549,6 +555,7 @@ def _write_sft_child_shims(
     seed: int,
     loggers: list[str],
     gdn_reset_arch: str | None,
+    multimodal: bool = False,
 ) -> tuple[str, tuple[str, ...], str]:
     """write the SFT plugin bundle, startup bootstrap, and non-secret plugin config."""
     parent_dir = os.path.dirname(_sft_train.__file__)
@@ -577,6 +584,7 @@ def _write_sft_child_shims(
             "lora_language_prefix": (
                 get_model(options.model_id).lora_language_prefix if text_only else ""
             ),
+            "multimodal": bool(multimodal),
             "gdn_model_type": gdn_reset_arch,
             "wandb": "wandb" in loggers,
         },
@@ -667,6 +675,7 @@ def _prepare_sft_child(
         seed=config["seed"],
         loggers=loggers,
         gdn_reset_arch=gdn_reset_arch,
+        multimodal=data.multimodal,
     )
 
     # the RESOLVED width, not the allocated card count: it is what becomes --nproc-per-node below,
@@ -683,6 +692,7 @@ def _prepare_sft_child(
         model_revision=options.model_revision,
         exclude_modules=model.exclude_modules,
         required_steps=options.save_at_steps,
+        preprocessor=data.processor,
     )
     # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded
     # watcher re-merges it and re-uploads full state hf already has, holding the resume-upload

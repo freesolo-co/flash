@@ -169,11 +169,11 @@ def _reject_image_completion(
     """
     from flash.content.multimodal import (
         IMAGE_PAD_TOKEN,
+        completion_has_images,
         message_content_text,
-        record_has_images,
     )
 
-    if record_has_images({}, completion):
+    if completion_has_images(completion):
         raise ValueError("image-bearing SFT completions are not supported")
     if not image_bearing:
         return

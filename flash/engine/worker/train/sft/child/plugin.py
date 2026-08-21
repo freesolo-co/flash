@@ -81,7 +81,7 @@ def _install_linear_scheduler() -> None:
     FSDPEngine._build_lr_scheduler = build_lr_scheduler
 
 
-def _install_reentrant_checkpointing() -> None:
+def _install_reentrant_checkpointing(*, multimodal: bool) -> None:
     from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
     original = FSDPEngine._build_module
@@ -92,6 +92,8 @@ def _install_reentrant_checkpointing() -> None:
         module = original(self)
         module.enable_input_require_grads()
         module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+        if multimodal:
+            runtime.install_vision_input_grads(module)
         return module
 
     build_reentrant_module._flash_reentrant_sft = True
@@ -147,7 +149,7 @@ def _install_core(config: dict) -> None:
     if save_at_steps:
         runtime.install_checkpoint_handler_filter(save_at_steps, int(config["total_steps"]))
     if config.get("reentrant_gradient_checkpointing"):
-        _install_reentrant_checkpointing()
+        _install_reentrant_checkpointing(multimodal=bool(config.get("multimodal")))
     _install_loraplus(
         float(config.get("loraplus_ratio", 1.0)),
         str(config["loraplus_ready_marker"]),

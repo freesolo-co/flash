@@ -76,12 +76,14 @@ def _processor_expanded_prompt(
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
     )
-    model_inputs = processor(
-        text=[raw_prompt],
-        images=images,
-        videos=None,
-        return_tensors="pt",
-    )
+    processor_kwargs = {
+        "text": [raw_prompt],
+        "videos": None,
+        "return_tensors": "pt",
+    }
+    if images:
+        processor_kwargs["images"] = images
+    model_inputs = processor(**processor_kwargs)
     return _normalize_prompt_ids(model_inputs), raw_prompt
 
 

@@ -118,13 +118,14 @@ def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
         assert key not in env
 
 
-def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
-    """The worker receives the control-plane token used for managed Freesolo environments."""
+def test_build_worker_env_forwards_github_only_for_private_vcs_pip(monkeypatch):
     from flash.providers.runpod.serverless import build_worker_env
 
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
-    assert build_worker_env(_spec(), 0).get("GITHUB_TOKEN") == "ghp-secret"
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
+    env = build_worker_env(_spec(), 0)
+    assert env["GITHUB_TOKEN"] == "ghp-secret"
+    assert "GIT_ASKPASS" not in env
 
 
 def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monkeypatch):
@@ -974,6 +975,8 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
         calls.append({"cmd": cmd, "env": env})
         return _FakePipProc()
 
+    monkeypatch.setenv("GITHUB_TOKEN", "operator-secret")
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
     monkeypatch.setattr("subprocess.Popen", fake_popen)
 
     with pytest.raises(RuntimeError, match="could not load downloaded module"):
@@ -984,7 +987,7 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     assert env["GITHUB_TOKEN"] == "ghp-secret"
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert askpass_paths
-    assert all(not p.exists() for p in askpass_paths)
+    assert all(not path.exists() for path in askpass_paths)
 
 
 def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
@@ -1248,6 +1251,8 @@ def test_train_body_uploads_console_on_missing_metrics(
 
     from flash.providers.runpod.serverless import endpoints
 
+    monkeypatch.setenv("GITHUB_TOKEN", "operator-secret")
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
     run_code = tmp_path / "runcode"
     late_marker = tmp_path / "late-live-attempted"
     real_join = os.path.join
@@ -1313,6 +1318,8 @@ def test_train_body_uploads_console_on_missing_metrics(
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
             assert k["cwd"] == str(run_code / "flash-test-run-attempt-7")
+            assert "GITHUB_TOKEN" not in k["env"]
+            assert "GIT_ASKPASS" not in k["env"]
             self.stdout = iter(console_lines)
             self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
 
@@ -1327,7 +1334,13 @@ def test_train_body_uploads_console_on_missing_metrics(
         "seed": 0,
         "hf_repo": "owner/runs",
         "job_spec_json": job_spec,
-        "env": {"HF_TOKEN": "tok", "PYTHONPATH": "", "ATTEMPT": "999"},
+        "env": {
+            "HF_TOKEN": "tok",
+            "GITHUB_TOKEN": "payload-secret",
+            "GIT_ASKPASS": "/tmp/payload-askpass",
+            "PYTHONPATH": "",
+            "ATTEMPT": "999",
+        },
         "source_snapshot": SOURCE_SNAPSHOT,
         "run_id": "flash-test-run",
         "attempt": 7,

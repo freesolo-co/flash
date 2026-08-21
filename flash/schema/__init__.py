@@ -256,9 +256,9 @@ _GPU_KEYS = (
     - MANAGED_GPU_KEYS
     - {"type_fallbacks"}
 )
-# [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
-# is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha) and
-# named once in the managed environment registry rather than restated here.
+# [environment] user-authorable keys, derived from environmentspec (mirrors _gpu_keys) so a new field
+# is accepted automatically; resolved_sha and package are controller-managed by staging and named once
+# in the managed environment registry rather than restated here.
 # pip is authorable: worker_pip_for_env returns only Flash's own worker requirement, so a scorer that
 # imports a third-party dependency has no other way to get it onto the worker, and the missing import
 # surfaces as a zero reward at training time. The submit paths append these to worker_pip_for_env

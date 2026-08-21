@@ -2271,7 +2271,7 @@ def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
         }
     )
     monkeypatch.setattr(worker, "JOB_SPEC", spec)
-    monkeypatch.setattr(worker, "load_environment", lambda *a, **k: _Env())
+    monkeypatch.setattr(worker, "load_staged_freesolo_environment", lambda *a, **k: (_Env(), None))
 
     assert worker._load_active_env().thinking is True
 

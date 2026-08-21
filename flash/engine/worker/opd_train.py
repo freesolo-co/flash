@@ -100,6 +100,7 @@ class _BridgePrompt:
     image_descriptors: tuple[str, ...]
     package_root: str | None
     example: dict | None = None
+    image_digests: tuple[str, ...] = ()
 
 
 class _OpdProgressState:
@@ -116,6 +117,7 @@ class _OpdProgressState:
         self._prev_no_signal_skipped_steps = int(state.get("no_signal_skipped_steps", 0))
         self._train_started_at: float | None = None
         self._step_states: dict[int, dict] = {}
+        self._terminal_error: str = ""
         if resume_state is not None:
             self._step_states[int(state["opt_steps"])] = dict(state)
 
@@ -210,10 +212,31 @@ class _OpdProgressState:
                 max_completion=max_completion,
             )
 
+    def fail(self, reason: str) -> None:
+        """Record that the verl child died, and wake anything waiting on its accounting.
+
+        Without this a crash is indistinguishable from slowness: `checkpoint_state` blocks on a
+        condition only `record_step` notifies, so a child that exits before printing the step's
+        metrics leaves the waiter to burn its full timeout and then blame accounting for a failure
+        that happened elsewhere. Observed on a 27B image OPD run whose real cause was a vLLM
+        `wake_up` CUDA OOM two frames deeper.
+        """
+        with self._condition:
+            # keep the FIRST reason: it is the cause, and later ones are usually its fallout.
+            self._terminal_error = self._terminal_error or str(reason).strip()
+            self._condition.notify_all()
+
     def checkpoint_state(self, step: int, *, timeout_s: float = 300.0) -> dict:
         deadline = time.monotonic() + timeout_s
         with self._condition:
             while step not in self._step_states:
+                # a dead child will never record this step, so report why it died rather than
+                # waiting out a timeout and attributing the failure to accounting.
+                if self._terminal_error:
+                    raise RuntimeError(
+                        f"OPD child exited before accounting for checkpoint step {step}: "
+                        f"{self._terminal_error}"
+                    )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError(
@@ -237,10 +260,7 @@ class _OpdProgressState:
 def _validate_multimodal_opd(request, spec, model_id: str) -> None:
     """Re-check an image-bearing OPD job now that the env class is loaded.
 
-    The submit-time preflight in multimodal.py reads `multi_turn` out of the dataset params, so a
-    multi-turn env that declares itself by CLASS reaches the worker unflagged; `request.multi_turn`
-    here comes from that class and is authoritative. Runs before the GPU probe and weight download
-    so a rejected job costs no paid setup.
+    Runs before the GPU probe and weight download so capability failures cost no paid setup.
     """
     from flash.content.multimodal import validate_multimodal_training
 
@@ -249,8 +269,6 @@ def _validate_multimodal_opd(request, spec, model_id: str) -> None:
         "opd",
         getattr(spec.train, "teacher_model", None),
     )
-    if request.multi_turn:
-        raise ValueError("multi-turn image-bearing opd is not supported")
 
 
 def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[float, list]:
@@ -352,6 +370,12 @@ def run_opd_train(spec=None) -> None:
                 "attention_backend": attention_backend,
                 "mm_encoder_attn_backend": mm_encoder_attn_backend,
                 "sleep_unsupported": rollout_sleep_unsupported(model_id),
+                # caps the agent-worker fan-out: each is a ray actor with its own processor copy,
+                # and on an image run that fan-out exhausted the grpo worker container's threads.
+                "multimodal": bool(multimodal),
+                "gpu_mem_util": _resolve_opd_gpu_mem_util(
+                    request, prompt_state, runtime, model_id, fp8_kv
+                ),
                 "loggers": runtime.loggers,
                 # resolved from the out-of-process capability probe, never by opening cuda in this parent -- see fused_ce_backend.
                 "fused_ce_backend": fused_ce_backend(caps),
@@ -437,6 +461,7 @@ from flash.engine.worker.opd_train_runner import (  # noqa: E402
     _prepare_workload,
     _render_prompt_rows,
     _report_training_complete,
+    _resolve_opd_gpu_mem_util,
     _run_child,
     _validate_aligned_sequences,
     _validate_teacher_transport,
@@ -460,6 +485,9 @@ from flash.engine.worker.train.opd.batching import (  # noqa: E402,F401
     _validate_text_teacher_batch,
 )
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge  # noqa: E402
+from flash.engine.worker.train.opd.child.bridge import (  # noqa: E402,F401
+    _read_rollout_failure_fallback,
+)
 
 # failure accounting and resume staging, implemented in `.train.opd.failures`. imported at the
 # BOTTOM because that module reads this one's teacher exit codes, so a top-level import would be

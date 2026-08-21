@@ -225,11 +225,6 @@ def test_48_hour_opd_wall_is_rejected_before_allocation(monkeypatch):
 
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
-    monkeypatch.setattr(
-        lifecycle,
-        "_pin_environment_for_run",
-        lambda spec, _log, *, attempt_started: spec,
-    )
 
     def unexpected_allocation(*_args, **_kwargs):
         raise AssertionError("allocation must not run for an opd wall over 24 hours")
@@ -1972,11 +1967,6 @@ def test_missing_broker_configuration_fails_before_allocation(monkeypatch, missi
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     monkeypatch.delenv(missing, raising=False)
-    monkeypatch.setattr(
-        lifecycle,
-        "_pin_environment_for_run",
-        lambda spec, _log, *, attempt_started: spec,
-    )
 
     def unexpected_allocation(*_args, **_kwargs):
         raise AssertionError("allocation must not run without broker configuration")

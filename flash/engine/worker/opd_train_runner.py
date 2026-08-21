@@ -105,7 +105,9 @@ def _render_prompt_rows(request: _OpdRequest) -> tuple[list[tuple[Any, Any]], bo
         for example in train:
             prompt_rows.append((example, request.env.prompt_messages(example)))
             scanned[0] += 1
-    multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
+    multimodal = bool(getattr(request.env, "image_observations", False)) or any(
+        record_has_images(example, messages) for example, messages in prompt_rows
+    )
     # shuffle cached rendered rows, not examples: prompt_messages may be stateful and a second
     # render could change multimodal classification. the same seeded permutation preserves resume order.
     random.Random(_opd_train._w.SEED).shuffle(prompt_rows)
@@ -161,6 +163,7 @@ def _prepare_prompts(
 ) -> _PromptState:
     from flash.content.multimodal import image_teacher_prompt_messages
     from flash.engine.worker.teacher.client import TeacherClient
+    from flash.engine.worker.train.core.child.glue import parent_image_digests
 
     teacher = TeacherClient(capability, control_panel_url, request.knobs.teacher_model)
     processor = None
@@ -282,6 +285,9 @@ def _prepare_prompts(
                     image_descriptors=image_descriptors,
                     package_root=package_root,
                     example=example if request.multi_turn else None,
+                    image_digests=tuple(
+                        parent_image_digests(processor, image_descriptors, package_root)
+                    ),
                 )
             )
     return _PromptState(
@@ -292,7 +298,15 @@ def _prepare_prompts(
         prompt_budget,
         prompts,
         dropped_long,
+        processor,
     )
+
+
+def _reset_workdir(workdir: str) -> None:
+    shutil.rmtree(workdir, ignore_errors=True)
+    if os.path.lexists(workdir):
+        raise RuntimeError(f"could not clear stale OPD attempt workdir {workdir!r}")
+    os.makedirs(workdir)
 
 
 def _prepare_workload(
@@ -314,7 +328,7 @@ def _prepare_workload(
     workdir = os.path.join(
         "/tmp", "flash-opd-verl", _opd_train._w.RUN_ID, f"seed-{_opd_train._w.SEED}"
     )
-    shutil.rmtree(workdir, ignore_errors=True)
+    _reset_workdir(workdir)
     data_dir = os.path.join(workdir, "data")
     image_dir = os.path.join(workdir, "images")
     shim_dir = os.path.join(workdir, "shim")
@@ -322,6 +336,7 @@ def _prepare_workload(
     export_root = os.path.join(workdir, "checkpoint-adapters")
     mutation_failure_path = os.path.join(workdir, "mutation-failure")
     score_delivery_failure_path = os.path.join(workdir, "score-delivery-failure")
+    rollout_failure_path = os.path.join(workdir, "rollout-failure")
     abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
     resample_failure_path = os.path.join(workdir, "resample-failure")
     cycle_commit_failure_path = os.path.join(workdir, "cycle-commit-failure")
@@ -380,6 +395,7 @@ def _prepare_workload(
         export_root,
         mutation_failure_path,
         score_delivery_failure_path,
+        rollout_failure_path,
         abandonment_failure_path,
         resample_failure_path,
         cycle_commit_failure_path,
@@ -390,7 +406,11 @@ def _prepare_workload(
         target_modules,
         targeting.exclude_modules,
         _opd_train._warmstart_adapter_path(
-            request.model_id, request.model_revision, lora_rank, targeting
+            request.model_id,
+            request.model_revision,
+            lora_rank,
+            int(lora_config.lora_alpha),
+            targeting,
         ),
     )
 
@@ -437,6 +457,7 @@ def _materialize_child_files(
     )
     bridge = _opd_train._TeacherAlignmentBridge(
         prompts=prompt_state.prompts,
+        processor=prompt_state.processor,
         tokenizer=prompt_state.tokenizer,
         teacher=prompt_state.teacher,
         thinking_prefill=prompt_state.thinking_prefill,
@@ -509,6 +530,42 @@ def _spec_gpu_type(spec: Any) -> str:
     may not have.
     """
     return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
+
+
+def _resolve_opd_gpu_mem_util(
+    request: _OpdRequest,
+    prompt_state: _PromptState,
+    runtime: _RuntimeState,
+    model_id: str,
+    fp8_kv: bool,
+) -> float:
+    """Size vLLM's colocated executor budget from this run's geometry, as the GRPO path does.
+
+    Left unset, verl substitutes its own default of 0.5 and the engine claims half the CARD on
+    every wake regardless of what the trainer already holds. That is not a spare-capacity request:
+    `wake_up` re-acquires the physical pages it released to sleep, so an overcommit is a hard
+    `CUDA Error: out of memory` in cumem_allocator rather than a smaller pool. Observed on a 27B
+    image OPD run on one H200 -- the trainer reserved 83.35 GB, the default handed vLLM 70.5 GB of
+    a 141 GB card, and the weight-sync wake after step 2 died 12.85 GB short.
+
+    Shares GRPO's resolver rather than restating it: both run the same colocated sleep/wake path,
+    so a second equation here could only drift from the one preflight admits against.
+    """
+    from flash.engine.worker.backend_common import rollout_sleep_unsupported
+    from flash.engine.worker.train.rl.verl_config import resolve_gpu_mem_util
+
+    return resolve_gpu_mem_util(
+        {
+            "model_id": model_id,
+            "model_revision": str(getattr(request, "model_revision", "") or ""),
+            "engine_len": int(prompt_state.max_model_len),
+            "group_size": int(request.knobs.group_size),
+        },
+        gpu_type=_spec_gpu_type(getattr(request, "spec", None)),
+        n_gpus=int(runtime.gpu_count),
+        fp8_kv=bool(fp8_kv),
+        sleep_unsupported=rollout_sleep_unsupported(model_id),
+    )
 
 
 def _build_base_config(
@@ -728,6 +785,16 @@ def _run_child(
                 )
                 training_completed = return_code == 0
     finally:
+        # the watcher stamps checkpoints, and stamping BLOCKS on this run's accounting. a child
+        # that died before printing its last step will never record it, so tell the gate the run
+        # is over first -- otherwise `watcher.stop` waits out the accounting timeout and reports a
+        # bookkeeping stall in place of the exit that actually ended the run.
+        if not training_completed:
+            progress_state.fail(
+                f"verl child exited with code {return_code}"
+                if return_code
+                else "verl child ended without completing training"
+            )
         try:
             watcher.stop(require_complete=training_completed)
         finally:
@@ -776,6 +843,7 @@ def _build_checkpoint_watcher(
         model_revision=request.model_revision,
         required_steps=request.knobs.save_at_steps,
         exclude_modules=workload.exclude_modules,
+        preprocessor=runtime.bridge.processor,
         seed=int(_opd_train._w.SEED),
         prompt_pool_fingerprint=workload.prompt_pool_fingerprint,
         prompts_per_step=workload.prompts_per_step,
@@ -810,6 +878,7 @@ def _build_child_env(
         max_model_len=prompt_state.max_model_len,
         mutation_failure_path=workload.mutation_failure_path,
         score_delivery_failure_path=workload.score_delivery_failure_path,
+        rollout_failure_path=workload.rollout_failure_path,
         abandonment_failure_path=workload.abandonment_failure_path,
         resample_failure_path=workload.resample_failure_path,
         cycle_commit_failure_path=workload.cycle_commit_failure_path,
@@ -852,6 +921,7 @@ def _reconcile_child_failures(
     cycle_commit_failure = _opd_train._read_classified_failure_fallback(
         workload.cycle_commit_failure_path
     )
+    rollout_failure = _opd_train._read_rollout_failure_fallback(workload.rollout_failure_path)
     _opd_train._raise_verl_failure(
         return_code,
         bridge.teacher_failure,
@@ -859,6 +929,7 @@ def _reconcile_child_failures(
         cycle_commit_failure,
         no_signal_failure,
         score_delivery_failure,
+        rollout_failure=rollout_failure,
         truncation_window=truncation_window,
     )
 
@@ -910,6 +981,7 @@ def _export_and_upload_adapter(
         model_revision=request.model_revision,
         exclude_modules=workload.exclude_modules,
         python_bin=runtime.python_bin,
+        preprocessor=runtime.bridge.processor,
     )
     _opd_train._w.hf_upload_folder(adapter_dir, "adapter", required=True)
     return adapter_dir

@@ -395,16 +395,11 @@ _WEIGHT_CACHE_PEAK_FACTOR = 2.0
 def _run_job_background(
     spec: JobSpec,
     runtime_secrets: dict[str, str] | None = None,
-    *,
-    resolve_env_sha: bool = False,
 ) -> None:
     """Daemon-thread entrypoint: swallows exceptions to suppress noisy thread tracebacks."""
     import logging
 
     try:
-        if resolve_env_sha:
-            with contextlib.suppress(Exception):
-                spec = _assign_resolved_env_sha(spec)
         if runtime_secrets:
             _run_job(spec, runtime_secrets=runtime_secrets)
         else:
@@ -788,6 +783,7 @@ from flash.runner.artifacts import (  # noqa: E402,F401
     artifact_namespace,
     managed_hf_repo_for_environment,
     preflight_validate_environment_ref,
+    stage_environment_package,
 )
 from flash.runner.attempts import (  # noqa: E402,F401
     _heartbeat_attempt_is_current,

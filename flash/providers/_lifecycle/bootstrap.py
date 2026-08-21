@@ -518,6 +518,8 @@ def fetch_spec_from_hf(payload: dict) -> str:
 def build_worker_env(payload: dict) -> dict:
     env = dict(os.environ)
     env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
+    env.pop("GITHUB_TOKEN", None)
+    env.pop("GIT_ASKPASS", None)
     spec_json = payload.get("job_spec_json")
     if not spec_json and payload.get("job_spec_in_hf"):
         # Pre-worker fetch; failure is infra-shaped → raise RetriableBootstrapError so poller retries.

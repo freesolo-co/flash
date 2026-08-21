@@ -2891,6 +2891,7 @@ def _fresh_orchestrator(tmp, monkeypatch):
             weight_identity="weight-v1:123",
         ),
     )
+    monkeypatch.setattr(runner, "stage_environment_package", lambda spec, **_kwargs: spec)
     return runner
 
 

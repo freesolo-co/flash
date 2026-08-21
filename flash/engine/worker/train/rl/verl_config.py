@@ -308,10 +308,19 @@ def _rollout_overrides(cfg: dict) -> list[str]:
     return [
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
+        # hydra's composed rollout node omits this real rollout config field.
+        "++actor_rollout_ref.rollout.limit_images=4",
         # verl 0.8.0 chunks the rollout batch across agent workers with exact divisibility
         # (agent_loop.py:1111 -> protocol.py:874). choose the largest divisor of
-        # prompts_per_step * group_size up to 8, so small or final short batches cannot abort.
-        f"actor_rollout_ref.rollout.agent.num_workers={agent_loop_workers(int(cfg['prompts_per_step']) * int(cfg['group_size']))}",
+        # prompts_per_step * group_size up to the cap, so small or final short batches cannot abort.
+        # a multimodal run halves the cap: every agent worker is a ray actor holding its own
+        # processor copy, and on an image run that processor is a full image processor living
+        # beside the vllm engine, enginecore, load balancer and http server in one container. at
+        # eight workers one actor dies with `libgomp: Thread creation failed`, and because it dies
+        # mid-grading the rollouts generate but never get graded, so the run hangs until the
+        # child-silence watchdog kills it 1200s later. capping the pool leaves group_size and
+        # prompts_per_step exactly as authored -- only scheduling parallelism narrows.
+        f"actor_rollout_ref.rollout.agent.num_workers={agent_loop_workers(int(cfg['prompts_per_step']) * int(cfg['group_size']), cap=4 if cfg.get('multimodal') else 8)}",
         # multi-turn runs flash's own agent loop, registered in the child by flash_grpo_plugin. the
         # stock single_turn_agent generates once and returns; it has no notion of an environment
         # reply, so a multi-turn env on the default loop would train on first turns only.

@@ -89,7 +89,7 @@ def validate_warmstart_adapter(
     config: Mapping[str, Any],
     model_id: str,
     adapter_dir: str,
-    targeting: LoraTargeting,
+    targeting: LoraTargeting | None = None,
 ) -> None:
     """Validate a downloaded warm-start adapter without changing its config or files."""
     tensors: Mapping[str, tuple[int, ...]] | None = None
@@ -102,14 +102,15 @@ def validate_warmstart_adapter(
         except (ImportError, OSError, ValueError):
             tensors = None
         source_is_multimodal = _legacy_adapter_is_multimodal(adapter_dir, tensors)
-    run_is_multimodal = targeting.exclude_modules is None
-    if source_is_multimodal is not None and source_is_multimodal != run_is_multimodal:
-        source_modality = "multimodal (image-trained)" if source_is_multimodal else "text-only"
-        run_modality = "multimodal" if run_is_multimodal else "text-only"
-        raise ValueError(
-            f"warm-start modality mismatch: a {run_modality} run cannot continue a "
-            f"{source_modality} adapter; start a fresh run or use a matching-modality source adapter"
-        )
+    if targeting is not None:
+        run_is_multimodal = targeting.exclude_modules is None
+        if source_is_multimodal is not None and source_is_multimodal != run_is_multimodal:
+            source_modality = "multimodal (image-trained)" if source_is_multimodal else "text-only"
+            run_modality = "multimodal" if run_is_multimodal else "text-only"
+            raise ValueError(
+                f"warm-start modality mismatch: a {run_modality} run cannot continue a "
+                f"{source_modality} adapter; start a fresh run or use a matching-modality source adapter"
+            )
     validate_fused_expert_adapter_config(config, model_id)
     if not lora_target_parameters(model_id):
         return

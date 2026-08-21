@@ -257,6 +257,8 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
     {
         "RUN_ID",
         "HF_REPO",
+        "GITHUB_TOKEN",
+        "GIT_ASKPASS",
         "FLASH_ARM",
         "SEED",
         OPD_RESUME_REVISION_ENV,
@@ -315,17 +317,54 @@ def parse_positive_int_tuple(value: Any, *, name: str) -> tuple[int, ...]:
 
 
 @dataclass(frozen=True)
+class EnvironmentPackageSpec:
+    artifact_revision: str
+    archive_sha256: str
+    manifest_sha256: str
+
+    def __post_init__(self) -> None:
+        from flash.envs.identity import is_commit_sha
+
+        if (
+            not is_commit_sha(self.artifact_revision)
+            or self.artifact_revision.lower() != self.artifact_revision
+        ):
+            raise ValueError(
+                "staged environment artifact revision must be lowercase immutable commit hex"
+            )
+        for name, digest in (
+            ("archive", self.archive_sha256),
+            ("manifest", self.manifest_sha256),
+        ):
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError(f"staged environment {name} digest must be lowercase sha256 hex")
+
+
+@dataclass(frozen=True)
 class EnvironmentSpec:
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
-    # Third-party requirements this environment's scorer imports, appended to Flash's own worker
-    # requirement at submit (worker_pip_with_extras). Empty means the scorer needs nothing beyond
+    # third-party requirements this environment's scorer imports, appended to flash's own worker
+    # requirement at submit (worker_pip_with_extras). empty means the scorer needs nothing beyond
     # the worker's baseline; entries here never displace it.
     pip: tuple[str, ...] = ()
-    # Names only — values sent out-of-band via runtime_secrets, never stored in spec.
+    # names only, with values sent out-of-band through runtime_secrets and never stored in spec.
     secrets: tuple[str, ...] = ()
-    # Resolved once in control plane to avoid GitHub rate-limits on cold spawn waves.
+    # resolved once in the control plane to avoid github rate limits on cold spawn waves.
     resolved_sha: str = ""
+    # controller-staged immutable package transport. absent only before run preparation completes.
+    package: EnvironmentPackageSpec | None = None
+
+    def __post_init__(self) -> None:
+        if self.package is None:
+            return
+        from flash.envs.identity import canonical_environment_id, is_commit_sha
+
+        canonical_environment_id(self.id)
+        if not is_commit_sha(self.resolved_sha) or self.resolved_sha.lower() != self.resolved_sha:
+            raise ValueError(
+                "staged environment resolved sha must be lowercase immutable commit hex"
+            )
 
 
 @dataclass(frozen=True)
@@ -482,6 +521,7 @@ MANAGED_TOP_LEVEL_KEYS = frozenset(
         # exact persisted bytes.
         "model_revision",
         "model_revision_auto",
+        "model_revision_force_pin",
         # the provenance marker only. gpu.count=1 stays in the public [gpu] object for digest
         # stability; internal round trips carry the marker verbatim.
         "gpu_count_auto",
@@ -498,7 +538,7 @@ MANAGED_TRAIN_KEYS = frozenset({"hf_repo", "init_from_adapter_revision"})
 # platform-managed [environment] field: the env ref is resolved once and pinned by the control plane.
 # `pip` deliberately stays public -- it is the author's own scorer dependencies, which only they can
 # declare.
-MANAGED_ENVIRONMENT_KEYS = frozenset({"resolved_sha"})
+MANAGED_ENVIRONMENT_KEYS = frozenset({"resolved_sha", "package"})
 
 # every managed section, so the public/worker boundary can be walked rather than restated. the two
 # things not here are the ones that are not removals: `train.lora_rank`/`lora_alpha` are stripped
@@ -542,6 +582,10 @@ class JobSpec:
     # from the internal worker spec under `effective_preparation` instead (see
     # `_internal_spec_from_status`), which carries it verbatim.
     model_revision_auto: bool = False
+    # transient internal request for the runner to verify an exact auto-managed immutable pin instead
+    # of resolving the model's current default head. preparation clears it after successful
+    # verification, so persisted worker specs carry false rather than a reusable verification request.
+    model_revision_force_pin: bool = False
     # platform-managed marker: true when the author omitted both gpu.type and gpu.count and the stored
     # integer 1 is only the digest-stable public placeholder. allocation reads this marker as
     # "auto-size"; a type pin or authored count=1 leaves it false and remains a hard ceiling.
@@ -562,6 +606,17 @@ class JobSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
+        for field_name in ("model_revision_auto", "model_revision_force_pin"):
+            if not isinstance(getattr(self, field_name), bool):
+                raise TypeError(f"{field_name} must be a boolean")
+        if self.model_revision_force_pin:
+            revision = self.model_revision
+            if not self.model_revision_auto:
+                raise ValueError("model_revision_force_pin requires model_revision_auto=True")
+            if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+                raise ValueError(
+                    "model_revision_force_pin requires a full lowercase immutable model_revision"
+                )
         # the marker qualifies a pin; it cannot outlive one. a spec carrying it with no revision
         # would let a later edit that clears model_revision leave a True marker behind, and the
         # deploy guard reads the pair.
@@ -671,6 +726,9 @@ class JobSpec:
         # omit an empty field to preserve existing preparation digests.
         if not data["gpu"].get("type_fallbacks"):
             data["gpu"].pop("type_fallbacks", None)
+        # omit an unstaged package so historical worker payloads and preparation digests stay stable.
+        if not data["environment"].get("package"):
+            data["environment"].pop("package", None)
         return data
 
     def to_json(self) -> str:
@@ -695,8 +753,29 @@ class JobSpec:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
         announce_dropped_keys(data)
         env = data.get("environment") or {}
-        # Reject stale payloads carrying a local `path`; worker only runs published env ids.
-        if isinstance(env, dict) and env.get("path"):
+        if not isinstance(env, dict):
+            raise TypeError("environment must be an object")
+        raw_package = env.get("package")
+        if raw_package is not None and not isinstance(raw_package, dict):
+            raise TypeError("environment.package must be an object")
+        if isinstance(raw_package, dict):
+            package_keys = {item.name for item in fields(EnvironmentPackageSpec)}
+            unknown_package = sorted(set(raw_package) - package_keys)
+            if unknown_package:
+                raise ValueError(
+                    "environment.package has unknown key(s): " + ", ".join(unknown_package)
+                )
+        package = (
+            EnvironmentPackageSpec(
+                artifact_revision=str(raw_package.get("artifact_revision") or ""),
+                archive_sha256=str(raw_package.get("archive_sha256") or ""),
+                manifest_sha256=str(raw_package.get("manifest_sha256") or ""),
+            )
+            if raw_package is not None
+            else None
+        )
+        # reject stale payloads carrying a local `path`; worker only runs published env ids.
+        if env.get("path"):
             raise ValueError(
                 "local environment paths are no longer supported; the worker only runs "
                 "published Freesolo environment ids"
@@ -743,6 +822,7 @@ class JobSpec:
                 pip=tuple(str(p) for p in env.get("pip") or ()),
                 secrets=str_tuple(env.get("secrets")),
                 resolved_sha=str(env.get("resolved_sha") or ""),
+                package=package,
             ),
             train=TrainSpec(
                 epochs=opt_int(train.get("epochs")),
@@ -796,6 +876,7 @@ class JobSpec:
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
             model_revision_auto=coerce_bool(data.get("model_revision_auto", False)),
+            model_revision_force_pin=coerce_bool(data.get("model_revision_force_pin", False)),
             gpu_count_auto=coerce_bool(data.get("gpu_count_auto", False)),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
             workload_profile_producer_version=str(

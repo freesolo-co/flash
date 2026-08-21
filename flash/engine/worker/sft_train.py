@@ -15,7 +15,7 @@ import threading
 import time
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
-from flash.adapters.lora_rank import rank_from_adapter_config
+from flash.adapters.lora_rank import alpha_from_adapter_config, rank_from_adapter_config
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -54,7 +54,11 @@ def _cached_model_path(model_id: str, model_revision: str) -> str:
 
 
 def _warmstart_adapter_path(
-    model_id: str, model_revision: str, expected_rank: int, targeting
+    model_id: str,
+    model_revision: str,
+    expected_rank: int,
+    expected_alpha: int,
+    targeting=None,
 ) -> str | None:
     """Stage and verify this run's warm-start source adapter; None when it is not a warm start.
 
@@ -69,15 +73,29 @@ def _warmstart_adapter_path(
     adapter_dir = _w._download_adapter(source)
     if not adapter_dir:
         raise RuntimeError("the prepared warm-start adapter could not be downloaded")
-    with open(os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8") as file:
+    config_path = os.path.join(adapter_dir, "adapter_config.json")
+    with open(config_path, encoding="utf-8") as file:
         config = json.load(file)
-    rank = rank_from_adapter_config(config, source=os.path.join(adapter_dir, "adapter_config.json"))
+    rank = rank_from_adapter_config(config, source=config_path)
     if rank != expected_rank:
         raise ValueError(
             f"warm-start adapter rank {rank} does not match the prepared train.lora_rank "
             f"{expected_rank}; rank changes are not supported"
         )
-    _w.validate_warmstart_adapter(config, model_id, adapter_dir, targeting)
+    # alpha is checked alongside rank because the pair sets the adapter's scaling: continuing a
+    # LoRA at the source rank but a different alpha silently rescales every trained delta. grpo
+    # already rereads both from the source (see rl/inputs.py::_resolve_warmstart_config); without
+    # this, sft and opd failed closed on rank and open on alpha.
+    alpha = alpha_from_adapter_config(config, source=config_path)
+    if alpha != expected_alpha:
+        raise ValueError(
+            f"warm-start adapter alpha {alpha} does not match the prepared train.lora_alpha "
+            f"{expected_alpha}; alpha changes are not supported"
+        )
+    if targeting is None:
+        _w.validate_warmstart_adapter(config, model_id, adapter_dir)
+    else:
+        _w.validate_warmstart_adapter(config, model_id, adapter_dir, targeting)
     base = str(config.get("base_model_name_or_path") or "").strip()
     if base and base != model_id:
         raise ValueError("warm-start adapter base model does not match the target model")
@@ -634,6 +652,7 @@ def run_sft_train(spec=None) -> None:
             model_revision=options.model_revision,
             exclude_modules=model.exclude_modules,
             python_bin=child.python_bin,
+            preprocessor=data.processor,
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
         # only a durably published adapter may suppress the final publish. the seeded resume step no

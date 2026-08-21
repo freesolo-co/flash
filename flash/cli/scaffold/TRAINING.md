@@ -140,6 +140,11 @@ def load_environment(**kwargs) -> MyEnv:
 For tool use, dialogue, or games, subclass `EnvironmentMultiTurn` instead and drive the
 conversation across turns. The reward is the same `RewardResult` contract either way.
 
+If the environment class can return image-bearing user observations from `step_episode`, declare
+`image_observations = True` on that class. This is a class capability, not a TOML setting: Flash uses
+it to reject a text-only model or OPD teacher before model work. Set it only for environments that
+can actually emit images. The capability does not by itself enable per-turn image rollout wiring.
+
 ### 2. Publish the environment
 
 A managed run references a **published** environment by id — so push your folder first:

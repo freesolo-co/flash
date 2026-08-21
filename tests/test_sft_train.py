@@ -1856,6 +1856,7 @@ def test_sft_plugin_config_carries_the_canonical_loraplus_marker(tmp_path):
         seed=42,
         loggers=[],
         gdn_reset_arch=None,
+        multimodal=False,
     )
 
     assert json.loads(raw_config)["loraplus_ready_marker"] == _LORAPLUS_READY_MARKER
@@ -2003,7 +2004,7 @@ def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointi
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    sft_plugin._install_reentrant_checkpointing()
+    sft_plugin._install_reentrant_checkpointing(multimodal=False)
     FakeEngine()._build_module()
 
     assert calls[0] == "require_grads"
@@ -2011,6 +2012,60 @@ def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointi
         "gc_enable",
         {"gradient_checkpointing_kwargs": {"use_reentrant": True}},
     )
+
+
+@pytest.mark.parametrize("multimodal", [True, False])
+def test_reentrant_checkpointing_installs_vision_grads_only_when_multimodal(
+    monkeypatch, multimodal
+):
+    """a reentrant-checkpointed vision tower gets ZERO gradient without this hook.
+
+    ``enable_input_require_grads()`` only reaches the text embedding, so pixel values stay
+    grad-free and every ``visual.blocks.*`` lora pair stays exactly at its init value while the
+    language model trains normally. that leaves the aggregate adapter delta large and the deployed
+    red/blue probe passing, so this seam is the only place the regression is observable.
+    """
+    installed = []
+
+    class FakeModule:
+        def enable_input_require_grads(self):
+            pass
+
+        def gradient_checkpointing_enable(self, **kwargs):
+            pass
+
+    class FakeEngine:
+        def _build_module(self):
+            return FakeModule()
+
+    transformer_impl = _module("verl.workers.engine.fsdp.transformer_impl", FSDPEngine=FakeEngine)
+    for name, module in {
+        "verl": _module("verl"),
+        "verl.workers": _module("verl.workers"),
+        "verl.workers.engine": _module("verl.workers.engine"),
+        "verl.workers.engine.fsdp": _module("verl.workers.engine.fsdp"),
+        "verl.workers.engine.fsdp.transformer_impl": transformer_impl,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(
+        sft_plugin.runtime, "install_vision_input_grads", lambda module: installed.append(module)
+    )
+
+    sft_plugin._install_reentrant_checkpointing(multimodal=multimodal)
+    FakeEngine()._build_module()
+
+    assert len(installed) == (1 if multimodal else 0)
+
+
+def test_sft_plugin_config_carries_multimodal_for_the_vision_hook():
+    """the child cannot see the workload, so the parent must ship the multimodal flag."""
+    import inspect
+
+    from flash.engine.worker import sft_train_runner
+
+    writer = inspect.getsource(sft_train_runner._write_sft_child_shims)
+    assert '"multimodal": bool(multimodal),' in writer
+    assert "multimodal=data.multimodal," in inspect.getsource(sft_train_runner._prepare_sft_child)
 
 
 class _TolerantWatcher:
@@ -2997,6 +3052,7 @@ def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monke
             self.model_id = kwargs["model_id"]
             self.model_revision = kwargs["model_revision"]
             self.exclude_modules = kwargs["exclude_modules"]
+            self.preprocessor = kwargs["preprocessor"]
             self.required_steps = frozenset(kwargs["required_steps"])
             self.lifecycle = CheckpointLedger()
 
@@ -3013,6 +3069,7 @@ def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monke
                     model_revision=self.model_revision,
                     exclude_modules=self.exclude_modules,
                     python_bin=self.python_bin,
+                    preprocessor=self.preprocessor,
                 )
                 self.lifecycle.mark_deployable_published(step)
 
@@ -3034,6 +3091,7 @@ def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monke
         model_revision,
         exclude_modules,
         python_bin,
+        preprocessor,
     ):
         exports.append(
             {
@@ -3043,6 +3101,7 @@ def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monke
                 "model_revision": model_revision,
                 "exclude_modules": exclude_modules,
                 "python_bin": python_bin,
+                "preprocessor": preprocessor,
             }
         )
         os.makedirs(adapter_dir, exist_ok=True)
@@ -3080,6 +3139,55 @@ def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monke
     assert {export["model_id"] for export in exports} == {spec.model}
     assert {export["model_revision"] for export in exports} == {spec.model_revision}
     assert {export["python_bin"] for export in exports} == {"/venv/bin/python"}
+    assert {export["preprocessor"] for export in exports} == {None}
+
+
+@pytest.mark.parametrize("multimodal", [True, False])
+def test_sft_runner_carries_the_prepared_processor_to_every_export(monkeypatch, multimodal):
+    from flash.engine.worker import sft_train
+
+    captured = {}
+
+    class Watcher:
+        def __init__(self, **kwargs):
+            captured["watcher_preprocessor"] = kwargs["preprocessor"]
+            self.required_steps = frozenset(kwargs["required_steps"])
+            self.lifecycle = CheckpointLedger()
+
+        def start(self):
+            return None
+
+        def stop(self, *, require_complete):
+            assert require_complete is True
+
+        def raise_if_failed(self):
+            return None
+
+    spec, _run_capture = _stub_sft_run(monkeypatch, watcher_cls=Watcher)
+    processor = object() if multimodal else None
+    prepare_workload = sft_train.prepare_sft_workload
+
+    def prepare_with_processor(*args, **kwargs):
+        prepared = prepare_workload(*args, **kwargs)
+        return replace(prepared, multimodal=multimodal, processor=processor)
+
+    def fake_export(_actor_dir, _adapter_dir, **kwargs):
+        captured["final_preprocessor"] = kwargs["preprocessor"]
+
+    def fake_training(_command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        return 0
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", prepare_with_processor)
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+
+    assert captured["watcher_preprocessor"] is processor
+    assert captured["final_preprocessor"] is processor
 
 
 def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypatch):
@@ -3172,6 +3280,7 @@ def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
     data = sft_train_runner._SftData(
         rows=[{}] * 800,
         multimodal=False,
+        processor=None,
         profile=SimpleNamespace(examples_per_update=64, authoritative_steps=horizon),
         max_length=1024,
         realized_max_length=128,

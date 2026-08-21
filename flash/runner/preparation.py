@@ -318,6 +318,7 @@ def _preparation_digest(
     # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
         "model_revision_auto",
+        "model_revision_force_pin",
         "gpu_count_auto",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
@@ -385,6 +386,21 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     effective["train"] = effective_train
     public_environment = dict(public["environment"])
     effective_environment = dict(effective["environment"])
+    # the staged package is controller-managed: staging writes it onto the worker half only, so the
+    # public half never carries one and comparing the two directly would fail every staged run.
+    # this exclusion cannot be tightened into a tamper check here. `to_internal_dict` OMITS the key
+    # when unset, so a stripped package is byte-identical to a run that simply has not staged yet --
+    # which is the state of every run between submit and allocation, and of every finished run in
+    # the hosted tests. rejecting that shape fails 96 legitimate runs
+    # (tests/test_server_api.py, tests/test_client_server_integration.py), and widening the digest
+    # trigger instead fails ordinary runs whose gpu.type the allocator rewrote at provisioning
+    # (tests/test_server_api.py::test_deploy_ignores_stored_training_gpu).
+    # stripping it is contained at the consumer rather than here: `stage_environment_package` sees
+    # no package and re-stages from the SAME digest-bound `resolved_sha`, and the worker's loader
+    # raises "worker job spec has no staged environment package" rather than importing anything.
+    # a substituted package is the case that must fail closed, and does: it is bound to the pin by
+    # `verify_staged_environment`, which re-derives both digests before any environment code loads.
+    effective_environment.pop("package", None)
     public_sha = public_environment.get("resolved_sha")
     effective_sha = effective_environment.get("resolved_sha")
     if not public_sha and isinstance(effective_sha, str):
@@ -462,10 +478,16 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
 
 
 def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec:
-    # a pin already marked runner-assigned (inherited from a warm-start source) is not authored,
-    # even though it is present. reading presence alone would relabel it as the author's and hand
-    # deploy a pin it refuses -- the exact failure the marker exists to prevent.
-    authored = "" if spec.model_revision_auto else spec.model_revision
+    # a forced pin is runner-managed even though it is present. otherwise a pin already marked
+    # runner-assigned (inherited from a warm-start source) is not authored either: reading presence
+    # alone would relabel it as the author's and hand deploy a pin it refuses.
+    authored = (
+        spec.model_revision
+        if spec.model_revision_force_pin
+        else ""
+        if spec.model_revision_auto
+        else spec.model_revision
+    )
     if not authored and not required:
         return spec
     # an inherited warm-start pin is already an immutable sha chosen by a previous run, so there is
@@ -474,7 +496,16 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
     # sha with it. the warm start would then be rejected for a revision mismatch the moment the base
     # model moved -- and ``_adopted_warmstart_revision`` cannot undo it, because it refuses to
     # replace a pin that is already set.
-    if spec.model_revision_auto and re.fullmatch(r"[0-9a-f]{40}", spec.model_revision or ""):
+    # a FORCED pin is excluded, and the exclusion is load-bearing rather than defensive: the
+    # ``model_revision_force_pin`` contract requires auto=True and a 40-hex sha, so a forced pin
+    # matches this condition every single time. without the exclusion this return would swallow
+    # every forced pin, skipping both the hub verification the marker exists to demand and the
+    # clearing below that keeps the one-shot request out of any persisted spec.
+    if (
+        spec.model_revision_auto
+        and not spec.model_revision_force_pin
+        and re.fullmatch(r"[0-9a-f]{40}", spec.model_revision or "")
+    ):
         return spec
     try:
         from huggingface_hub import HfApi
@@ -483,19 +514,27 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
             spec.model,
             revision=authored or None,
         )
-        resolved = str(getattr(info, "sha", "") or "").strip().lower()
+        reported = str(getattr(info, "sha", "") or "").strip()
+        resolved = reported.lower()
         if re.fullmatch(r"[0-9a-f]{40}", resolved) is None:
             raise ValueError("resolved revision is not an immutable commit")
+        if spec.model_revision_force_pin and reported != spec.model_revision:
+            raise ValueError("resolved revision does not match the forced immutable pin")
     except Exception as exc:
         raise ValueError(
             f"could not resolve model_revision for model {spec.model!r}; "
             "verify that the revision exists and the operator token can access it"
         ) from exc
-    # record WHO chose the pin, not just its value. `authored` is empty exactly when the caller
-    # asked for a pin the user never wrote (SFT, required=True), and that is the only case deploy
-    # may relax: serving resolves the base by name, so an auto pin asks nothing of it, while an
-    # authored one is a request serving cannot honour and must still be refused.
-    return replace(spec, model_revision=resolved, model_revision_auto=not authored)
+    # record who chose the pin, not just its value. a forced pin is supplied by the internal runner,
+    # so it retains auto provenance while the one-shot verification request is cleared before any
+    # prepared public or worker spec is persisted. an authored pin remains authored.
+    auto_assigned = True if spec.model_revision_force_pin else not authored
+    return replace(
+        spec,
+        model_revision=resolved,
+        model_revision_auto=auto_assigned,
+        model_revision_force_pin=False,
+    )
 
 
 def _profile_producer_version() -> str:

@@ -5,6 +5,11 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
+import tempfile
+from dataclasses import replace
+from io import BytesIO
+from pathlib import Path
 
 import flash.runner as runner
 from flash.core.spec import JobSpec
@@ -56,6 +61,110 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return runner.JobSpec.from_dict(d)
 
 
+def stage_environment_package(
+    spec: JobSpec,
+    *,
+    deadline_at: float | None = None,
+) -> JobSpec:
+    """Stage or verify one exact environment package before provider allocation."""
+    if not spec.environment.id:
+        return spec
+    if not spec.train.hf_repo:
+        raise RuntimeError("hf_repo must be assigned before staging the environment package")
+    token = (os.environ.get("HF_TOKEN") or "").strip()
+    if not token:
+        raise RuntimeError("staging the environment package requires HF_TOKEN")
+
+    from flash.envs.staged import (
+        StagedEnvironmentTransientError,
+        archive_path_for_digest,
+        encode_manifest,
+        is_staged_environment_transient_error,
+        manifest_path_for_digest,
+        manifest_payload,
+        resolve_environment_source,
+        verify_staged_environment,
+        write_environment_archive,
+    )
+
+    if spec.environment.package is not None:
+        verify_staged_environment(
+            spec.environment,
+            hf_repo=spec.train.hf_repo,
+            token=token,
+        )
+        return spec
+
+    from huggingface_hub import HfApi
+
+    from flash.core.spec import EnvironmentPackageSpec
+    from flash.providers._lifecycle.worker import _ensure_private_artifact_repo, _hf_call
+
+    source = resolve_environment_source(
+        spec.environment.id,
+        spec.environment.resolved_sha,
+        deadline_at=deadline_at,
+    )
+    try:
+        api = HfApi(token=token)
+        _ensure_private_artifact_repo(api, spec.train.hf_repo, deadline_at=deadline_at)
+        with tempfile.TemporaryDirectory(prefix="flash-stage-env-") as tmp:
+            archive_file = Path(tmp) / "package.tar.gz"
+            archive_sha256 = write_environment_archive(source, archive_file)
+            archive_path = archive_path_for_digest(archive_sha256)
+            manifest_bytes = encode_manifest(manifest_payload(source, archive_sha256, archive_path))
+            manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+            manifest_path = manifest_path_for_digest(manifest_sha256)
+            _hf_call(
+                lambda: api.upload_file(
+                    path_or_fileobj=str(archive_file),
+                    path_in_repo=archive_path,
+                    repo_id=spec.train.hf_repo,
+                    repo_type="dataset",
+                ),
+                f"upload environment package {spec.train.hf_repo}:{archive_path}",
+                deadline_at=deadline_at,
+            )
+            commit = _hf_call(
+                lambda: api.upload_file(
+                    path_or_fileobj=BytesIO(manifest_bytes),
+                    path_in_repo=manifest_path,
+                    repo_id=spec.train.hf_repo,
+                    repo_type="dataset",
+                ),
+                f"complete environment package {spec.train.hf_repo}:{manifest_path}",
+                deadline_at=deadline_at,
+            )
+        package = EnvironmentPackageSpec(
+            artifact_revision=str(getattr(commit, "oid", "") or "").lower(),
+            archive_sha256=archive_sha256,
+            manifest_sha256=manifest_sha256,
+        )
+        staged_spec = replace(
+            spec,
+            environment=replace(
+                spec.environment,
+                resolved_sha=source.resolved_sha,
+                package=package,
+            ),
+        )
+        verify_staged_environment(
+            staged_spec.environment,
+            hf_repo=staged_spec.train.hf_repo,
+            token=token,
+        )
+        return staged_spec
+    except Exception as exc:
+        if is_staged_environment_transient_error(exc):
+            raise StagedEnvironmentTransientError(
+                "environment package staging is temporarily unavailable"
+            ) from exc
+        raise
+    finally:
+        if source.staging_root is not None:
+            shutil.rmtree(source.staging_root, ignore_errors=True)
+
+
 def _github_environment_ref(spec: JobSpec) -> GitHubEnvironmentRef | None:
     """parse the spec's resolvable github environment ref without making a request."""
     env_id = spec.environment.id
@@ -104,7 +213,7 @@ def _pin_env_sha_with_reason(spec: JobSpec) -> tuple[JobSpec, str]:
     if error is None:
         return pinned, ""
     logging.getLogger(runner.__name__).warning(
-        "resolve-once: could not pin env ref->sha for %r (%s); worker will resolve",
+        "resolve-once: could not pin env ref->sha for %r (%s); controller staging will retry",
         spec.environment.id,
         error,
     )
@@ -112,16 +221,16 @@ def _pin_env_sha_with_reason(spec: JobSpec) -> tuple[JobSpec, str]:
 
 
 def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
-    """Pin env ref->SHA once so N workers don't fan-out N GitHub API calls (secondary rate-limit). Best-effort."""
+    """Best-effort preflight pin for diagnostics before authoritative controller staging."""
     return _pin_env_sha_with_reason(spec)[0]
 
 
 def preflight_validate_environment_ref(spec: JobSpec) -> tuple[JobSpec, bool]:
     """reject permanent refs and report whether github-dependent work must defer.
 
-    transient and unclassified failures keep the existing worker deferral. tokenless planes skip
-    the request because github also returns 404 for private repositories an anonymous caller cannot
-    read. a successful resolve is retained on the returned worker spec.
+    transient and unclassified failures defer to controller staging before provider allocation.
+    tokenless planes skip the request because github also returns 404 for private repositories an
+    anonymous caller cannot read. a successful resolve is retained on the returned worker spec.
     """
     from flash.envs.identity import GitHubPermanentError
     from flash.envs.loader import _github_token

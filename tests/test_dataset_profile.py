@@ -791,7 +791,7 @@ def test_profile_rejects_cumulative_unique_decoded_work_before_crossing_decode(
     image_module.new("RGB", (300, 200), (10, 200, 10)).save(
         entrypoint.parent / "dataset" / "b.png", format="PNG"
     )
-    monkeypatch.setattr(image_tokens, "MAX_PROFILE_DECODED_WORK_BYTES", 56 * 56 * 3)
+    monkeypatch.setattr(image_tokens, "MAX_PROFILE_DECODED_WORK_BYTES", 56 * 56 * 9)
     successful_decodes = _spy_on_pixel_decodes(monkeypatch)
 
     with pytest.raises(ValueError, match="profile decoded image work"):

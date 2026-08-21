@@ -861,6 +861,7 @@ def chat(
     timeout_s: float | None = None,
     retry_unavailable: bool = False,
     stop: list[str] | None = None,
+    structured_outputs: dict | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
@@ -879,6 +880,8 @@ def chat(
     }
     if stop:
         body["stop"] = [str(value) for value in stop]
+    if structured_outputs is not None:
+        body["structured_outputs"] = structured_outputs
     # follow_redirects: modal 303-redirects slow cold-start requests across many poll cycles
     # before the result is ready (bounded by _MAX_REDIRECTS, all on the serving origin).
     headers = _internal_key_header()
@@ -907,6 +910,9 @@ def chat(
                 "checkpoint": resp.headers.get("X-Freesolo-Checkpoint"),
                 "hf_revision": resp.headers.get("X-Freesolo-HF-Revision"),
             }
+            payload["_freesolo_lora_request_adapter"] = resp.headers.get(
+                "X-Freesolo-LoRA-Request-Adapter"
+            )
         return payload
 
 

@@ -25,6 +25,7 @@ from flash.engine.worker.sft_train import (
     _VerlCheckpointWatcher,
 )
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge
+from flash.engine.worker.train.opd.child.bridge import _render_rollout_failure
 from flash.engine.worker.verl.checkpoints import (
     checkpoint_world_size,
     resume_checkpoint_is_loadable,
@@ -168,6 +169,7 @@ def _raise_verl_failure(
     no_signal_failure: tuple[str, str] | None = None,
     score_delivery_failure: tuple[str, str] | None = None,
     *,
+    rollout_failure: dict[str, str] | None = None,
     truncation_window: _TruncationWindow | None = None,
 ) -> None:
     if return_code == 0:
@@ -199,6 +201,11 @@ def _raise_verl_failure(
                 f"transient teacher failure after bounded retries: {message}"
             )
         raise RuntimeError(f"permanent teacher failure: {message}")
+    if rollout_failure is not None:
+        detail = _render_rollout_failure(rollout_failure)
+        if rollout_failure["classification"] == "transient":
+            raise _w.RetriableInfraError(f"transient multi-turn OPD rollout failure: {detail}")
+        raise RuntimeError(f"permanent multi-turn OPD rollout failure: {detail}")
     if return_code == _TRANSIENT_TEACHER_EXIT:
         raise _w.RetriableInfraError("transient teacher bridge failure")
     if return_code == _PERMANENT_TEACHER_EXIT:
@@ -310,6 +317,7 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
             model_revision=self.model_revision,
             exclude_modules=self.exclude_modules,
             python_bin=self.python_bin,
+            preprocessor=self.preprocessor,
         )
         _stage_retry_contract(
             checkpoint_dir,
