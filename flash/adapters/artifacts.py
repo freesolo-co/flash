@@ -5,14 +5,13 @@ by it, and the two never share a call stack to check. Spelling one on each side 
 coincidence, so they are defined once, here.
 """
 
-# The PEFT adapter weights file a deployable adapter must carry. Modern saves use safetensors,
-# but older PEFT/default settings may emit adapter_model.bin.
-ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
+# the peft adapter weights file a deployable adapter must carry.
+ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors",)
 
-# A PEFT save past its shard size splits the weights across `adapter_model-0000N-of-0000M.<ext>`
+# a peft save past its shard size splits the weights across `adapter_model-0000N-of-0000M.<ext>`
 # beside an `adapter_model.<ext>.index.json` mapping every tensor key to the shard holding it.
 ADAPTER_SHARD_PREFIX = "adapter_model-"
-ADAPTER_WEIGHT_SUFFIXES = (".safetensors", ".bin")
+ADAPTER_WEIGHT_SUFFIXES = (".safetensors",)
 ADAPTER_WEIGHT_INDEX_FILES = tuple(f"{name}.index.json" for name in ADAPTER_WEIGHT_FILES)
 
 

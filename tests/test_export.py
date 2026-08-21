@@ -433,190 +433,29 @@ def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatc
     assert uploaded["weights"] == source_bytes
 
 
-class _FakeTensor:
-    def __init__(self, values):
-        self.values = list(values)
-
-    def any(self):
-        return any(self.values)
-
-
-def _install_fake_torch(monkeypatch):
-    """Inject a minimal ``torch``: load/save/Tensor, the whole surface the .bin path touches.
-
-    torch is a ``gpu`` extra and is not installed alongside the control plane, so faking it is the
-    only way this path runs in CI at all. The byte scan that decides whether to import torch still
-    reads the real file, so the round trip below is a real one.
-    """
-    fake = types.ModuleType("torch")
-    fake.Tensor = _FakeTensor
-
-    def load(path, map_location=None, weights_only=False):
-        assert weights_only is True, "adapter state dicts must be loaded weights-only"
-        return {
-            key: _FakeTensor(values) for key, values in json.loads(Path(path).read_bytes()).items()
-        }
-
-    def save(state, destination):
-        destination.write(
-            json.dumps({key: tensor.values for key, tensor in state.items()}).encode("utf-8")
-        )
-
-    fake.load = load
-    fake.save = save
-    monkeypatch.setitem(sys.modules, "torch", fake)
-
-
-def _write_fake_bin(path: Path, state: dict) -> None:
-    path.write_bytes(json.dumps(state).encode("utf-8"))
-
-
-def test_export_adapter_normalizes_bin_keys_for_vanilla_peft(tmp_path, monkeypatch):
-    """`adapter_model.bin` is a shape the rest of the pipeline accepts, so it gets normalized too.
-
-    Skipping it exports a VL adapter whose keys peft binds to nothing."""
+def test_export_adapter_normalizes_only_the_representation_peft_loads(tmp_path):
+    """the single safetensors file wins over stale same-suffix shards from an earlier save."""
     from flash.serve import export
 
     infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
-    plain = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight"
-    _install_fake_torch(monkeypatch)
-    _write_fake_bin(tmp_path / "adapter_model.bin", {infixed: [1.0], plain: [2.0]})
-
-    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
-
-    stripped = infixed.replace(".language_model.", ".", 1)
-    state = json.loads((tmp_path / "adapter_model.bin").read_bytes())
-    assert set(state) == {stripped, plain}
-    assert state[stripped] == [1.0]
-    assert state[plain] == [2.0]
-
-
-def test_export_adapter_bin_with_live_vision_weights_keeps_multimodal_namespace(
-    tmp_path, monkeypatch
-):
-    from flash.serve import export
-
-    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
-    vision_b = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
-    _install_fake_torch(monkeypatch)
-    path = tmp_path / "adapter_model.bin"
-    _write_fake_bin(path, {infixed: [1.0], vision_b: [0.5]})
-    before = path.read_bytes()
-
-    assert export._normalize_export_adapter_keys(tmp_path) == "multimodal"
-    assert path.read_bytes() == before
-
-
-def test_export_adapter_bin_needing_normalization_without_torch_is_refused(tmp_path, monkeypatch):
-    """Normalization is needed here and cannot be applied, which fails invisibly if allowed.
-
-    peft would warn and apply nothing, so the user benchmarks the base model believing it is their
-    adapter. Refuse the export instead of logging a warning nobody sees."""
-    from flash.serve import export
-    from flash.serve.errors import ServingError
-
-    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
-    path = tmp_path / "adapter_model.bin"
-    _write_fake_bin(path, {infixed: [1.0]})
-    before = path.read_bytes()
-    monkeypatch.setitem(sys.modules, "torch", None)
-
-    with pytest.raises(ServingError, match="torch is not installed"):
-        export._normalize_export_adapter_keys(tmp_path)
-    assert path.read_bytes() == before
-
-
-def test_export_adapter_bin_without_the_infix_never_imports_torch(tmp_path, monkeypatch):
-    """The control plane installs no torch (it is a `gpu` extra), so a `.bin` that cannot need a
-    rename must not reach for it. Importing torch here would fail every legacy `.bin` export."""
-    from flash.serve import export
-
-    plain = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight"
-    _write_fake_bin(tmp_path / "adapter_model.bin", {plain: [1.0]})
-    monkeypatch.setattr(
-        export, "_torch_for", lambda path: pytest.fail(f"torch imported for {path.name}")
-    )
-
-    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
-
-
-def test_export_adapter_bin_shard_without_the_infix_still_pins_the_namespace(tmp_path, monkeypatch):
-    """A shard that never mentions the infix still carries keys the global plan has to see.
-
-    Sharding splits ONE key namespace across files, so liveness is a property of their union: a live
-    vision LoRA-B in the second shard means the first shard's language-model keys must stay put.
-    Reading only the shard that mentions the infix strips them anyway and ships a mixed namespace
-    peft binds to nothing."""
-    from flash.serve import export
-
-    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
-    vision_b = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
-    _install_fake_torch(monkeypatch)
-    first = tmp_path / "adapter_model-00001-of-00002.bin"
-    second = tmp_path / "adapter_model-00002-of-00002.bin"
-    _write_fake_bin(first, {infixed: [1.0]})
-    _write_fake_bin(second, {vision_b: [0.5]})
-    # peft writes the index whenever it shards, and it is what makes the shards a representation
-    # peft can discover at all -- without it there is nothing to export.
-    (tmp_path / "adapter_model.bin.index.json").write_text(
-        json.dumps({"weight_map": {infixed: first.name, vision_b: second.name}})
-    )
-    before = (first.read_bytes(), second.read_bytes())
-
-    assert export._normalize_export_adapter_keys(tmp_path) == "multimodal"
-    assert (first.read_bytes(), second.read_bytes()) == before
-
-
-def test_export_adapter_bin_shard_collision_across_shards_is_refused(tmp_path, monkeypatch):
-    """The rename is planned over the union of the shards, so the collision is only visible there.
-
-    Missing it rewrites the infixed key onto a name the other shard already uses, and the index then
-    maps one key to two shards -- entries silently collapse instead of the export failing."""
-    from flash.serve import export
-    from flash.serve.errors import ServingError
-
-    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
-    plain = infixed.replace(".language_model.", ".", 1)
-    _install_fake_torch(monkeypatch)
-    first = tmp_path / "adapter_model-00001-of-00002.bin"
-    second = tmp_path / "adapter_model-00002-of-00002.bin"
-    _write_fake_bin(first, {infixed: [1.0]})
-    _write_fake_bin(second, {plain: [2.0]})
-    (tmp_path / "adapter_model.bin.index.json").write_text(
-        json.dumps({"weight_map": {infixed: first.name, plain: second.name}})
-    )
-    before = (first.read_bytes(), second.read_bytes())
-
-    with pytest.raises(ServingError, match="collides"):
-        export._normalize_export_adapter_keys(tmp_path)
-    assert (first.read_bytes(), second.read_bytes()) == before
-
-
-def test_export_adapter_normalizes_only_the_representation_peft_loads(tmp_path, monkeypatch):
-    """A retry's adapter lands on the previous attempt's path without deleting what it did not
-    write, so a stale `.bin` can outlive the safetensors peft actually binds.
-
-    Scanning both reads one namespace out of two: every shared key collides with itself and a valid
-    export fails. peft takes safetensors over `.bin`, so the exporter normalizes exactly that."""
-    from flash.serve import export
-
-    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    stale_visual = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
     (tmp_path / "adapter_config.json").write_text(_PLAIN_CONFIG)
-    stale = tmp_path / "adapter_model.bin"
-    _write_fake_bin(stale, {infixed: [9.0]})
-    before = stale.read_bytes()
     path = tmp_path / "adapter_model.safetensors"
     path.write_bytes(
         _safetensors_bytes(
             {infixed: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}, b"\x01\x02"
         )
     )
-    monkeypatch.setattr(
-        export, "_torch_for", lambda p: pytest.fail(f"read the stale representation {p.name}")
+    stale = tmp_path / "adapter_model-00001-of-00001.safetensors"
+    stale.write_bytes(
+        _safetensors_bytes(
+            {stale_visual: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}},
+            b"\x09\x09",
+        )
     )
+    before = stale.read_bytes()
 
     assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
-
     assert set(_parse_safetensors_bytes(path.read_bytes())[0]) == {
         infixed.replace(".language_model.", ".", 1)
     }
@@ -719,15 +558,20 @@ def test_stale_shards_left_by_a_shorter_retry_are_not_scanned(tmp_path):
     """
     from flash.serve import export
 
-    live_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    live_a = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    live_b = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_B.default.weight"
     stale_visual = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
     (tmp_path / "adapter_config.json").write_text(_PLAIN_CONFIG)
-    live_names = ("adapter_model-00001-of-00002.safetensors",)
-    (tmp_path / live_names[0]).write_bytes(
-        _safetensors_bytes(
-            {live_key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}, b"\x01\x02"
-        )
+    live_names = (
+        "adapter_model-00001-of-00002.safetensors",
+        "adapter_model-00002-of-00002.safetensors",
     )
+    for name, key in zip(live_names, (live_a, live_b), strict=True):
+        (tmp_path / name).write_bytes(
+            _safetensors_bytes(
+                {key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}, b"\x01\x02"
+            )
+        )
     # the orphan from the previous, longer attempt: still on disk, absent from the current index.
     (tmp_path / "adapter_model-00003-of-00003.safetensors").write_bytes(
         _safetensors_bytes(
@@ -735,46 +579,12 @@ def test_stale_shards_left_by_a_shorter_retry_are_not_scanned(tmp_path):
         )
     )
     (tmp_path / "adapter_model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {live_key: live_names[0]}})
+        json.dumps({"weight_map": {live_a: live_names[0], live_b: live_names[1]}})
     )
 
     assert [p.name for p in export._adapter_weight_paths(tmp_path)] == list(live_names)
     # the stale visual tensor must not pin the live text-only weights to the multimodal namespace
     assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
-
-
-def test_index_rewrite_leaves_the_unselected_representation_alone(tmp_path):
-    """Only the selected representation's shards are rewritten, so only its index may be remapped.
-
-    Remapping the other suffix's index would leave it naming keys its own untouched shards do not
-    contain -- the index/payload disagreement the rewrite exists to prevent.
-    """
-    from flash.serve import export
-
-    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
-    (tmp_path / "adapter_config.json").write_text(_PLAIN_CONFIG)
-    shard = "adapter_model-00001-of-00001.safetensors"
-    (tmp_path / shard).write_bytes(
-        _safetensors_bytes(
-            {infixed: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}, b"\x01\x02"
-        )
-    )
-    (tmp_path / "adapter_model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {infixed: shard}})
-    )
-    # a .bin index for shards that were NOT selected and therefore never rewritten
-    bin_index = tmp_path / "adapter_model.bin.index.json"
-    bin_index.write_text(json.dumps({"weight_map": {infixed: "adapter_model-00001-of-00001.bin"}}))
-
-    assert export._normalize_export_adapter_keys(tmp_path) == "text_only"
-
-    expected = infixed.replace(".language_model.", ".", 1)
-    safetensors_map = json.loads((tmp_path / "adapter_model.safetensors.index.json").read_text())[
-        "weight_map"
-    ]
-    assert set(safetensors_map) == {expected}  # the selected index tracks its rewritten shard
-    # the untouched representation's index still names the keys ITS shards actually contain
-    assert set(json.loads(bin_index.read_text())["weight_map"]) == {infixed}
 
 
 def test_export_adapter_with_out_of_bounds_non_lm_offsets_is_refused(tmp_path):
@@ -820,52 +630,6 @@ def test_export_adapter_with_unrecognized_non_lm_tensor_is_unchanged(tmp_path):
 
     assert export._normalize_export_adapter_keys(tmp_path) == "multimodal"
     assert path.read_bytes() == source_bytes
-
-
-def test_export_adapter_without_safetensors_still_exports(monkeypatch):
-    uploaded: dict = {}
-    bin_weights = b"legacy-adapter-weights"
-
-    def fake_snapshot_download(*, local_dir, **kw):
-        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
-        adapter.mkdir(parents=True, exist_ok=True)
-        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
-        (adapter / "adapter_model.bin").write_bytes(bin_weights)
-        return str(local_dir)
-
-    class FakeHfApi:
-        def __init__(self, token=None):
-            pass
-
-        def create_repo(self, **kw):
-            pass
-
-        def update_repo_settings(self, **kw):
-            pass
-
-        def repo_info(self, **kw):
-            return types.SimpleNamespace(sha="parent-sha")
-
-        def upload_folder(self, *, folder_path, **kw):
-            folder = Path(folder_path)
-            uploaded["files"] = sorted(path.name for path in folder.iterdir())
-            uploaded["weights"] = (folder / "adapter_model.bin").read_bytes()
-
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
-
-    url = export_adapter(
-        source_repo="org/test-runs",
-        source_subfolder="rl/run-x/seed0/adapter",
-        dest_repo="me/adapters",
-        dest_token="hf_user",
-        base_model=BASE_MODEL,
-        source_token="hf_operator",
-    )
-
-    assert url == "https://huggingface.co/me/adapters"
-    assert uploaded["files"] == ["adapter_config.json", "adapter_model.bin"]
-    assert uploaded["weights"] == bin_weights
 
 
 def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
@@ -984,11 +748,11 @@ def test_export_readme_base_model_replacement_is_literal(tmp_path):
 
 
 def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeypatch):
-    """A re-export into a repo holding a previous, differently-serialized adapter must clear the stale
-    adapter weights (so a leftover ``.bin`` can't be loaded next to the new ``.safetensors``) WITHOUT
-    deleting the user's unrelated files. The deletion is by STATIC adapter-scoped patterns, not a
-    ``existing - uploaded`` mirror, and needs no ``list_repo_files`` call (so a listing failure can't
-    silently skip cleanup either)."""
+    """a re-export clears unsupported stale adapter files without deleting unrelated user files.
+
+    the deletion uses static adapter-scoped patterns rather than an ``existing - uploaded`` mirror,
+    and needs no ``list_repo_files`` call, so a listing failure cannot silently skip cleanup.
+    """
     calls: dict = {}
     listed = {"called": False}
 

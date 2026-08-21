@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 import struct
-import sys
-import types
 
 import numpy as np
 import pytest
@@ -18,11 +16,6 @@ VL_KEYS = [
     "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.default.weight",
     "base_model.model.model.language_model.layers.31.mlp.gate_proj.lora_B.default.weight",
 ]
-
-
-def _write_torch_bin(path: str, names: list[str]) -> None:
-    torch = pytest.importorskip("torch")
-    torch.save({name: torch.zeros(2, 3) for name in names}, path)
 
 
 def _raw_safetensors(header, payload=b"") -> bytes:
@@ -172,42 +165,16 @@ def test_read_adapter_metadata_rejects_invalid_safetensors_structure(tmp_path, h
         lora._read_adapter_tensor_metadata(str(adir))
 
 
-def test_read_adapter_metadata_reads_bin_shapes_without_gpu_dependencies(monkeypatch, tmp_path):
-    import flash.engine.worker.model.lora as lora
-
-    class FakeTensor:
-        shape = (2, 3)
-
-    fake_torch = types.ModuleType("torch")
-    fake_torch.Tensor = FakeTensor
-    fake_torch.load = lambda *_args, **_kwargs: {VL_KEYS[0]: FakeTensor()}
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    adir = tmp_path / "adapter"
-    adir.mkdir()
-    (adir / "adapter_model.bin").write_bytes(b"stub")
-
-    assert lora._read_adapter_tensor_metadata(str(adir)) == {VL_KEYS[0]: (2, 3)}
-    assert lora._read_adapter_tensor_keys(str(adir)) == [VL_KEYS[0]]
-
-
-def test_read_adapter_keys_reads_bin_state_dict(tmp_path):
-    import flash.engine.worker.model.lora as lora
+def test_bin_only_adapter_has_no_selected_representation_and_is_not_loadable(tmp_path):
+    from flash.adapters.artifacts import loadable_adapter_weight_files
+    from flash.engine.worker.model.adapter import _warmstart_adapter_is_loadable
+    from flash.engine.worker.model.lora import _read_adapter_tensor_metadata
 
     adir = tmp_path / "adapter"
     adir.mkdir()
-    _write_torch_bin(str(adir / "adapter_model.bin"), VL_KEYS)
+    (adir / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA"}))
+    (adir / "adapter_model.bin").write_bytes(b"unsupported")
 
-    assert lora._read_adapter_tensor_keys(str(adir)) == VL_KEYS
-    assert lora._read_adapter_tensor_metadata(str(adir)) == dict.fromkeys(VL_KEYS, (2, 3))
-
-
-def test_read_adapter_keys_rejects_malformed_bin_state_dict(tmp_path):
-    torch = pytest.importorskip("torch")
-    import flash.engine.worker.model.lora as lora
-
-    adir = tmp_path / "adapter"
-    adir.mkdir()
-    torch.save({"metadata": "not a tensor"}, adir / "adapter_model.bin")
-
-    with pytest.raises(ValueError, match="non-tensor entries"):
-        lora._read_adapter_tensor_keys(str(adir))
+    assert loadable_adapter_weight_files(path.name for path in adir.iterdir()) == []
+    assert _read_adapter_tensor_metadata(str(adir)) is None
+    assert not _warmstart_adapter_is_loadable(str(adir))

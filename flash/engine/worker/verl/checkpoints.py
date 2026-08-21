@@ -556,22 +556,15 @@ def _validate_adapter_tensor_values(
         sources = {}
         for name in selected:
             path = os.path.join(adapter_dir, name)
-            if name.endswith(".safetensors"):
-                handle = stack.enter_context(_open_safetensors_numpy(path))
-                tensor_keys = handle.keys()
-                sources.update({key: (handle, key) for key in tensor_keys})
-            else:
-                import torch
-
-                sources.update(torch.load(path, map_location="cpu", weights_only=True))
+            handle = stack.enter_context(_open_safetensors_numpy(path))
+            tensor_keys = handle.keys()
+            sources.update({key: (handle, key) for key in tensor_keys})
         if sources.keys() != metadata.keys():
             raise RuntimeError(f"{label} tensor sources disagree with their metadata")
 
         def tensor(key: str):
             source = sources[key]
-            if isinstance(source, tuple):
-                return source[0].get_tensor(source[1])
-            return source.detach().cpu().numpy()
+            return source[0].get_tensor(source[1])
 
         for key in metadata:
             if not np.isfinite(tensor(key)).all():
