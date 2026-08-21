@@ -678,6 +678,7 @@ class _LoraEngineImpl:
             top_p=payload.top_p,
             output_kind=RequestOutputKind.FINAL_ONLY,
             structured_outputs=structured_outputs,
+            stop=payload.stop,
         )
         request_id = str(uuid.uuid4())
         start = time.time()
@@ -769,6 +770,7 @@ class _LoraEngineImpl:
             top_p=payload.top_p,
             output_kind=RequestOutputKind.DELTA,
             structured_outputs=structured_outputs,
+            stop=payload.stop,
         )
         request_id = str(uuid.uuid4())
         start = time.time()

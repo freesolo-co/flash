@@ -217,6 +217,9 @@ def openai_generate_fields(payload: dict[str, Any], adapter_id: str) -> dict[str
         # adapter's trained default, so callers cannot change thinking mode for adapters
         # that have a persisted trained value.
         "chat_template_kwargs": payload.get("chat_template_kwargs"),
+        # Forwarded raw so GenerateRequest's validator normalizes and rejects it consistently with
+        # the /generate route (one 422 shape for both entry points).
+        "stop": payload.get("stop"),
         # Structured outputs: our structured_outputs extension, or the OpenAI-standard
         # response_format (translated to canonical at this endpoint only). Forwarded raw so
         # GenerateRequest's validator normalizes it (consistent 422s).

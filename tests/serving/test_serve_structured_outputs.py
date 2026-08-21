@@ -21,11 +21,13 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from flash.serving.src.engine_support import _require_reasoning_api_compatibility
 from flash.serving.src.model_config import reasoning_parser_for
 from flash.serving.src.registry import AdapterRegistry
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.responses import openai_generate_fields
+from flash.serving.src.schemas import AdapterRecord, GenerateRequest
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
@@ -486,3 +488,50 @@ def test_invalid_stored_spec_raises_value_error_before_ready(modal_app_module):
     with pytest.raises(ValueError, match="invalid structured outputs spec"):
         asyncio.run(_first(eng._stream_generate({"adapter_id": "r1", "prompt": "hi"})))
     assert eng.engine.sampling_params == []  # never reached vLLM
+
+
+# --- stop sequences ---------------------------------------------------------------------------
+# `docs/serving-contract.md` documents `stop` as an accepted field and requires stop handling to be
+# preserved. Pydantic drops keys a model does not declare, so an undeclared `stop` was accepted with
+# a 200 and then ignored: generation ran past the caller's stop string and billed the extra tokens.
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("STOP", "STOP"),
+        (["</s>", "\n\n"], ["</s>", "\n\n"]),
+        (None, None),
+        ("", None),  # never terminates anything
+        ([], None),  # not a constraint
+    ],
+)
+def test_stop_reaches_sampling_params(modal_app_module, value, expected):
+    assert _generate(_engine(modal_app_module), stop=value).stop == expected
+
+
+def test_stop_reaches_sampling_params_when_streaming(modal_app_module):
+    """The streaming path builds its own SamplingParams and must carry stop too."""
+    eng = _engine(modal_app_module)
+
+    async def _drain(agen):
+        return [event async for event in agen]
+
+    events = asyncio.run(
+        _drain(eng._stream_generate({"adapter_id": "r1", "prompt": "hi", "stop": ["</s>"]}))
+    )
+    assert [event["type"] for event in events] == ["ready", "delta", "final"]
+    assert eng.engine.sampling_params[-1].stop == ["</s>"]
+
+
+def test_openai_body_forwards_stop():
+    """The OpenAI chat-completions translation must not drop the standard `stop` field."""
+    assert openai_generate_fields({"messages": [], "stop": ["</s>"]}, "r1")["stop"] == ["</s>"]
+    assert openai_generate_fields({"messages": []}, "r1")["stop"] is None
+
+
+@pytest.mark.parametrize("bad", [123, {"a": 1}, ["ok", ""], ["ok", 5]])
+def test_malformed_stop_is_rejected_rather_than_ignored(bad):
+    """A bad `stop` is a 422, not a silently discarded field."""
+    with pytest.raises(ValidationError):
+        GenerateRequest(adapter_id="r1", prompt="hi", stop=bad)
