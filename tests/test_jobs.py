@@ -203,7 +203,15 @@ def test_strict_teardown_discovers_runpod_owner_for_invalid_fingerprint(monkeypa
     assert deleted == [("ep-discovered", "discovered-owner-key")]
 
 
-def test_strict_teardown_confirms_runpod_absent_only_from_complete_inventory(monkeypatch):
+def test_strict_teardown_keeps_runpod_record_when_no_configured_account_owns_it(monkeypatch):
+    """An inventory over the CONFIGURED keys cannot prove an endpoint is gone.
+
+    this path runs only when the persisted fingerprint did not resolve, so the owning credential
+    may simply have been removed from `RUNPOD_API_KEY`. "none of my accounts list it" is then
+    indistinguishable from "it was deleted", and reporting deletion would let the caller drop the
+    cleanup record while an unreachable endpoint keeps billing. refuse instead, so the record
+    survives for a drain that may have the owning key configured again.
+    """
     from flash.providers.base import JobHandle
     from flash.providers.runpod import api as runpod_api
     from flash.runner.supervise import lifecycle
@@ -235,7 +243,9 @@ def test_strict_teardown_confirms_runpod_absent_only_from_complete_inventory(mon
         lambda *_args: pytest.fail("an absent endpoint must not be deleted blindly"),
     )
 
-    assert lifecycle._strict_teardown_handle(handle, "run-gone") is True
+    with pytest.raises(RuntimeError, match="endpoint deletion could not be confirmed") as exc_info:
+        lifecycle._strict_teardown_handle(handle, "run-gone")
+    assert "no reachable owner account" in str(exc_info.value.__cause__)
 
 
 @pytest.mark.parametrize("mode", ["incomplete", "multiple-owners"])

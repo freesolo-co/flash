@@ -220,11 +220,19 @@ def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
             f"runpod endpoint {endpoint_id} appears in multiple accounts; cleanup unconfirmed"
         )
     if not owners:
+        # an inventory over the CONFIGURED keys cannot prove absence. this branch is reached only
+        # when the persisted fingerprint did not resolve, so the owning credential may simply no
+        # longer be in RUNPOD_API_KEY -- "none of my accounts list it" and "it was deleted" are
+        # indistinguishable from here. reporting deletion would let the caller drop the cleanup
+        # record while the unreachable endpoint stays live and billing, so refuse instead and let
+        # the record survive for a later drain that may have the owning key configured again.
         if failed:
             raise runpod_api.RunpodApiError(
                 f"runpod endpoint {endpoint_id} owner discovery was incomplete; cleanup unconfirmed"
             )
-        return
+        raise runpod_api.RunpodApiError(
+            f"runpod endpoint {endpoint_id} has no reachable owner account; cleanup unconfirmed"
+        )
 
     if runpod_api.delete_endpoint_for_fingerprint(endpoint_id, owners[0]):
         return
