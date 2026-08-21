@@ -690,24 +690,22 @@ def test_observe_lifecycle_stop_and_deletes_use_exact_pinned_signatures() -> Non
         modal.client,
     )
 
+    # a lifecycle-only app is resolved by id: modal cannot look one up by name once it leaves the
+    # deployed listing, and exposes no tag surface for it, so tags stay empty whatever the app kept.
     modal.deployed_apps.clear()
     pending = sdk.observe(plan, app_id_hint=APP_ID)
     assert pending.apps[0].state == "lifecycle_pending"
     assert pending.apps[0].running_containers is None
-    assert pending.apps[0].tags == plan.tags
+    assert pending.apps[0].tags == ()
     assert modal.calls["get_app_lifecycle"] == (APP_ID, modal.client)
 
     sdk.stop_app(plan)
     modal.lifecycle_stopped_at = object()
-    stopped_with_tags = sdk.observe(plan, app_id_hint=APP_ID)
-    assert stopped_with_tags.apps[0].state == "stopped"
-    assert stopped_with_tags.apps[0].running_containers == 0
-    assert stopped_with_tags.apps[0].tags == plan.tags
-    modal.deployed_tags.clear()
     stopped = sdk.observe(plan, app_id_hint=APP_ID)
     assert stopped.apps[0].state == "stopped"
     assert stopped.apps[0].running_containers == 0
     assert stopped.apps[0].tags == ()
+    assert modal.deployed_tags == dict(plan.tags)
     sdk.delete_secret(plan, plan.names.artifact_secret)
     sdk.delete_secret(plan, plan.names.inference_secret)
     sdk.delete_volume(plan)
