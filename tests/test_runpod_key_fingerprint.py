@@ -14,6 +14,8 @@ import urllib.error
 
 import pytest
 
+from flash.providers.runpod.api import list_endpoints as _real_list_endpoints
+
 
 def _reset_pool(monkeypatch, value):
     monkeypatch.setenv("RUNPOD_API_KEY", value)
@@ -245,73 +247,85 @@ def test_legacy_fingerprint_upgrades_an_already_deleted_endpoint(monkeypatch):
     """A cleanup record whose endpoint is already gone must still migrate.
 
     A process that dies between deleting the endpoint and clearing its durable cleanup record
-    leaves the endpoint absent from the owner's listing. Refusing the upgrade there stranded the
-    record forever, because `_drain_cleanup_remotes` never reached the authenticated absence
-    check. Absence is adjudicated by the owner's own 404, not by list membership.
+    leaves the endpoint absent from every account's listing. Refusing the upgrade there stranded
+    the record forever, because `_drain_cleanup_remotes` never reached the authenticated absence
+    check.
     """
-    import io
-    import urllib.error
-
     from flash.providers.runpod import api
 
     key = "legacy-owner"
     full_fingerprint = api.key_fingerprint(key)
-    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+    monkeypatch.setattr(api._keys, "keys", lambda: [key, "other-account"])
 
-    def owner_sees_no_such_endpoint(_key, url, **_kwargs):
+    def gone_everywhere(_key, url, **_kwargs):
         if url.endswith("/endpoints"):
             return []
         raise api.RunpodApiError("not found") from urllib.error.HTTPError(
             url, 404, "not found", {}, io.BytesIO(b"")
         )
 
-    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", owner_sees_no_such_endpoint)
+    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", gone_everywhere)
+    monkeypatch.setattr(api, "list_endpoints", _real_list_endpoints)
 
     assert (
         api.resolve_legacy_key_fingerprint("ep-legacy", full_fingerprint[:16]) == full_fingerprint
     )
 
 
-def test_legacy_fingerprint_still_refuses_an_endpoint_that_exists_elsewhere(monkeypatch):
-    """Absent from the listing but alive on lookup means another account owns it."""
+def test_legacy_fingerprint_refuses_an_endpoint_alive_under_another_pool_account(monkeypatch):
+    """A 404 under the matching key is invisibility, not deletion.
+
+    RunPod answers 404 both for an endpoint that no longer exists and for one that exists under a
+    different account, so the matching key's own lookup cannot separate them. Upgrading here would
+    bind the record to the wrong credential, and teardown under it would read 404, report success,
+    and leave the real endpoint billing. Only the pool-wide view settles this.
+    """
     from flash.providers.runpod import api
 
     key = "legacy-owner"
     full_fingerprint = api.key_fingerprint(key)
-    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+    monkeypatch.setattr(api._keys, "keys", lambda: [key, "other-account"])
 
-    def listing_empty_but_endpoint_alive(_key, url, **_kwargs):
-        return [] if url.endswith("/endpoints") else {"id": "ep-legacy"}
+    def alive_only_under_the_other_account(request_key, url, **_kwargs):
+        if url.endswith("/endpoints"):
+            return [] if request_key == key else [{"id": "ep-legacy"}]
+        # the matching key's own detail lookup 404s, because the endpoint really is invisible to
+        # THIS credential. that 404 alone would read as "deleted", so only the pool-wide listing
+        # can reject here -- which is exactly the signal under test.
+        raise api.RunpodApiError("not found") from urllib.error.HTTPError(
+            url, 404, "not found", {}, io.BytesIO(b"")
+        )
 
     monkeypatch.setattr(
-        api._CLIENT, "request_with_retries_for_key", listing_empty_but_endpoint_alive
+        api._CLIENT, "request_with_retries_for_key", alive_only_under_the_other_account
     )
+    # the `_offline` fixture stubs `list_endpoints` to an empty fleet so no test reaches the real
+    # API; restore the genuine aggregator here, since the pool-wide view is the behaviour under test.
+    monkeypatch.setattr(api, "list_endpoints", _real_list_endpoints)
 
     with pytest.raises(api.RunpodApiError, match="not owned"):
         api.resolve_legacy_key_fingerprint("ep-legacy", full_fingerprint[:16])
 
 
 def test_legacy_fingerprint_refuses_when_absence_cannot_be_confirmed(monkeypatch):
-    """A failed ownership lookup is not proof of deletion, so the upgrade must still refuse."""
-    import io
-    import urllib.error
-
+    """A partial fleet view is not proof of deletion, so the upgrade must still refuse."""
     from flash.providers.runpod import api
 
     key = "legacy-owner"
     full_fingerprint = api.key_fingerprint(key)
-    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+    monkeypatch.setattr(api._keys, "keys", lambda: [key, "other-account"])
 
-    def lookup_fails(_key, url, **_kwargs):
-        if url.endswith("/endpoints"):
+    def the_other_account_is_unreachable(request_key, _url, **_kwargs):
+        if request_key == key:
             return []
-        raise api.RunpodApiError("boom") from urllib.error.HTTPError(
-            url, 500, "server error", {}, io.BytesIO(b"")
-        )
+        raise api.RunpodApiError("boom")
 
-    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", lookup_fails)
+    monkeypatch.setattr(
+        api._CLIENT, "request_with_retries_for_key", the_other_account_is_unreachable
+    )
+    monkeypatch.setattr(api, "list_endpoints", _real_list_endpoints)
 
-    with pytest.raises(api.RunpodApiError, match="not owned"):
+    with pytest.raises(api.RunpodApiError, match="owner unconfirmed"):
         api.resolve_legacy_key_fingerprint("ep-legacy", full_fingerprint[:16])
 
 
@@ -327,6 +341,7 @@ def test_rotated_sole_legacy_prefix_match_cannot_claim_endpoint(monkeypatch):
         "request_with_retries_for_key",
         lambda *_args, **_kwargs: [{"id": "ep-rotated-owner"}],
     )
+    monkeypatch.setattr(api, "list_endpoints", _real_list_endpoints)
 
     with pytest.raises(api.RunpodApiError, match="not owned"):
         api.resolve_legacy_key_fingerprint("ep-original-owner", "rpk-" + "a" * 12)

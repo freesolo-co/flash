@@ -163,27 +163,37 @@ def resolve_legacy_key_fingerprint(endpoint_id: str, fingerprint: str) -> str:
     if not any(
         isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id for endpoint in endpoints
     ):
-        # absence from the listing is not proof of foreign ownership: a process that died between
-        # deleting the endpoint and clearing its cleanup record leaves exactly this state, and
-        # refusing the upgrade would strand that record forever. the owner-authenticated 404 in
-        # endpoint_absent_for_fingerprint is the stronger adjudicator, so hand the decision there
-        # rather than rejecting a fingerprint whose sole matching credential is already unique.
-        _confirm_absent_or_foreign(endpoint_id, full_fingerprint)
+        # absence from this key's listing is not proof of foreign ownership: a process that died
+        # between deleting the endpoint and clearing its cleanup record leaves exactly this state,
+        # and refusing the upgrade would strand that record forever. but it is not proof of
+        # deletion either, and neither available signal settles it alone -- a 404 under the matching
+        # key means "invisible to this credential", which RunPod also answers for an endpoint alive
+        # under another account, while the pool listing cannot see an owner outside the pool at all.
+        # so require BOTH to agree it is gone: binding a record to the wrong credential is worse
+        # than stranding it, because teardown would then read 404, report success, and leave the
+        # real endpoint billing.
+        _confirm_deleted(endpoint_id, full_fingerprint)
     return full_fingerprint
 
 
-def _confirm_absent_or_foreign(endpoint_id: str, fingerprint: str) -> None:
-    """Raise unless the owner's own authenticated lookup proves the endpoint is already gone."""
+def _confirm_deleted(endpoint_id: str, fingerprint: str) -> None:
+    """Raise unless both the pool-wide listing and the owner's own lookup agree it is gone."""
     try:
+        fleet = list_endpoints()
+    except Exception:
+        raise RunpodApiError(
+            f"runpod endpoint ownership lookup failed for {endpoint_id}; owner unconfirmed"
+        ) from None
+    foreign = f"runpod endpoint {endpoint_id} is not owned by the legacy fingerprint match"
+    if any(isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id for endpoint in fleet):
+        raise RunpodApiError(foreign)
+    try:
+        # raises unless the lookup 404s, so a still-live endpoint can never read as deleted here.
         absent = endpoint_absent_for_fingerprint(endpoint_id, fingerprint)
     except RunpodApiError:
-        raise RunpodApiError(
-            f"runpod endpoint {endpoint_id} is not owned by the legacy fingerprint match"
-        ) from None
+        raise RunpodApiError(foreign) from None
     if not absent:
-        raise RunpodApiError(
-            f"runpod endpoint {endpoint_id} is not owned by the legacy fingerprint match"
-        )
+        raise RunpodApiError(foreign)
 
 
 def list_endpoints_by_key(
