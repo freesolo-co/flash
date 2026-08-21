@@ -160,6 +160,14 @@ def _text_adapter_tensors(mode, rank=1):
             **nonzero_pair,
             **_text_pair("visual.patch_embed.proj", nonzero_a, zero_b),
         }
+    if mode == "orphan_vision_a":
+        # the merger dropped the visual B factor. the surviving A is settled not-live by NAME
+        # alone, so a per-key exemption would skip it before pair validation and publish an
+        # incomplete adapter.
+        return {
+            **nonzero_pair,
+            "base_model.model.visual.patch_embed.proj.lora_A.weight": nonzero_a,
+        }
     if mode == "vision_saved":
         return {
             **nonzero_pair,
@@ -234,6 +242,7 @@ def _write_expert_adapter(directory, *, config, tensor_mode="complete", text_ran
         "inert_vision",
         "legacy_default_leaf",
         "mixed",
+        "orphan_vision_a",
         "mtp_saved",
         "nonfinite",
         "orphan_a",
@@ -526,6 +535,34 @@ def test_fused_export_admits_a_grandfathered_inert_vision_pair(monkeypatch, tmp_
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
+
+
+def test_fused_export_rejects_an_orphan_inert_vision_factor(monkeypatch, tmp_path):
+    """An exemption must require a COMPLETE pair, not a single not-live-looking key.
+
+    `_non_lm_liveness_from_key` settles a `lora_A` key not-live on its NAME alone, with no data
+    inspection. Both export callers skip exempted keys BEFORE pair-topology validation, so a
+    per-key exemption would let a merger that dropped the matching `lora_B` publish a structurally
+    incomplete adapter -- the surviving orphan gets exempted instead of rejected.
+
+    The grandfathered artifact always carries both factors, so pairing keeps the intended skip
+    working (`test_fused_export_admits_a_grandfathered_inert_vision_pair`) while a genuinely
+    broken export still fails.
+    """
+    import flash.engine.worker.verl.checkpoints as checkpoints
+
+    config = {
+        "peft_type": "LORA",
+        "r": 1,
+        "target_modules": ["q_proj", "v_proj"],
+        "target_parameters": None,
+    }
+    _write_expert_adapter(tmp_path, config=config, tensor_mode="orphan_vision_a", text_rank=1)
+
+    with pytest.raises(RuntimeError, match="non-language tensor"):
+        checkpoints.stamp_adapter_dir_provenance(
+            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
 
 def _merger_expert_tensors(*, include_ordinary=True, drop_last_layer_rung=False):

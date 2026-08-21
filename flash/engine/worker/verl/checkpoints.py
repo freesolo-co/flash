@@ -531,6 +531,13 @@ def _inert_non_language_keys(adapter_dir: str, keys: set[str]) -> set[str]:
     So apply the same rule the admission used: tolerate a non-language key only when it is provably
     inert. A live one is still contamination and still rejected. Unreadable weights decide nothing,
     so they are reported as not-inert and the caller rejects -- the safe direction.
+
+    Exemption requires a COMPLETE A/B pair whose B is provably zero. `_non_lm_liveness_from_key`
+    settles a `lora_A` key not-live on its NAME alone, so exempting per-key would admit an orphan
+    A whose B the merger dropped: both callers skip exempted keys before pair-topology validation
+    runs, so that orphan would never be rejected and a structurally incomplete adapter could
+    publish. Pairing here keeps the skip narrow to the grandfathered artifact -- which always
+    carries both factors -- and lets a genuinely broken export still fail.
     """
     from flash.adapters.artifacts import loadable_adapter_weight_files
     from flash.serve.export import (
@@ -568,7 +575,19 @@ def _inert_non_language_keys(adapter_dir: str, keys: set[str]) -> set[str]:
                         inert.add(key)
     except (OSError, ValueError, ImportError):
         return set()
-    return inert
+    return _paired_inert_keys(inert)
+
+
+def _paired_inert_keys(inert: set[str]) -> set[str]:
+    """Drop exemptions that do not form a complete A/B pair within the inert set."""
+    factors: dict[str, dict[str, str]] = {}
+    for key in inert:
+        for factor in ("A", "B"):
+            token = f".lora_{factor}."
+            if token in key:
+                factors.setdefault(key.replace(token, ".lora_*."), {})[factor] = key
+                break
+    return {key for pair in factors.values() if set(pair) == {"A", "B"} for key in pair.values()}
 
 
 def _pair_has_nonzero_delta(factor_a, factor_b, *, require_finite_scan: bool) -> bool:
