@@ -507,7 +507,7 @@ def test_adoption_waits_out_a_cold_container_instead_of_probing_once() -> None:
 
     A cold gpu container can need longer than the probe's 30-second cap to load. Probing once
     answered `outcome_unknown` with nearly the whole deadline unspent, so rerunning `serve deploy`
-    against an app that was still warming could never reach it -- while `_wait_for_phase` already
+    against an app that was still warming could never reach it -- while `wait_for_phase` already
     knew how to wait for exactly this on the create and reconcile paths.
     """
 
