@@ -95,12 +95,25 @@ def pod_identity_matches(
     template_id: str,
     volume_id: str,
 ) -> bool:
+    # placement is assigned by runpod, not by us, and is absent until it happens: a `CREATED` or
+    # `PENDING` pod (including the one the create call just returned) reports no machine even with
+    # `includeMachine=true`. comparing `None` for equality read that as "a different gpu than we
+    # asked for" -- a permanent conflict for a pod that is merely still being placed, which failed
+    # every fresh creation that had not been scheduled yet and every rerun that tried to adopt one.
+    # absent means not yet known, so it cannot contradict the plan; a *present* value still must
+    # match exactly, which is what keeps this from adopting someone else's pod.
+    placement_contradicts = any(
+        observed is not None and observed != planned
+        for observed, planned in (
+            (pod.gpu_type_id, plan.placement.gpu_type_id),
+            (pod.data_center_id, plan.placement.data_center_id),
+        )
+    )
     return (
         pod.name == plan.names.app_or_pod
         and pod.image_name == plan.bundle.image.reference
-        and pod.gpu_type_id == plan.placement.gpu_type_id
+        and not placement_contradicts
         and pod.gpu_count == plan.placement.gpu_count
-        and pod.data_center_id == plan.placement.data_center_id
         and pod.container_disk_gb == plan.placement.container_disk_gb
         and pod.network_volume_id == volume_id
         and pod.template_id == template_id

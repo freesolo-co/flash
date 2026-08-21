@@ -1599,6 +1599,58 @@ def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> No
     assert bare[0].template_id is None
 
 
+def test_a_pod_awaiting_placement_is_still_recognized_as_ours() -> None:
+    """absent placement means "not assigned yet", which cannot contradict the plan.
+
+    RunPod omits `machine` until it schedules the pod -- including in the response to the create
+    call itself, and in every listing while the pod is CREATED or PENDING, even with
+    `includeMachine=true`. Comparing those fields for equality turned `None != "NVIDIA B200"` into
+    a mismatch, and `exact_core_resources` runs *before* `readiness_state`, so the pod was rejected
+    as a permanent conflict instead of being waited on: a fresh creation that had not been
+    scheduled yet failed, and a rerun could not adopt one either.
+
+    The wrong-value cases are asserted alongside because "ignore it when absent" is one edit away
+    from "ignore it always", which would let this adopt a pod running on hardware nobody asked for.
+    """
+
+    plan = build_runpod_create_plan(_bundle())
+    row = {
+        "id": "abc123def45682",
+        "name": plan.names.app_or_pod,
+        "imageName": plan.bundle.image.reference,
+        "gpuCount": plan.placement.gpu_count,
+        "containerDiskInGb": plan.placement.container_disk_gb,
+        "ports": ["8000/http"],
+        "templateId": "tpl0000001",
+        "networkVolume": {"id": "vol0000001"},
+    }
+
+    def _matches(**overrides) -> bool:
+        pod = parse_pods([{**row, **overrides}])[0]
+        return pod_identity_matches(
+            plan,
+            pod,
+            template_id="tpl0000001",
+            volume_id="vol0000001",
+        )
+
+    placed = {
+        "gpuTypeId": plan.placement.gpu_type_id,
+        "dataCenterId": plan.placement.data_center_id,
+    }
+    for status in ("CREATED", "PENDING"):
+        assert _matches(desiredStatus=status), f"our own {status} pod was rejected as a conflict"
+    assert _matches(desiredStatus="RUNNING", machine=placed)
+    assert not _matches(
+        desiredStatus="RUNNING",
+        machine={**placed, "gpuTypeId": "NVIDIA L4"},
+    )
+    assert not _matches(
+        desiredStatus="RUNNING",
+        machine={**placed, "dataCenterId": "CA-MTL-3"},
+    )
+
+
 def test_observation_survives_a_pod_waiting_for_its_machine() -> None:
     # runpod omits `machine` entirely while a pod is CREATED or PENDING: placement is not decided
     # yet, so there is no gpu type or data center to report. demanding them collapsed the whole
@@ -1622,8 +1674,9 @@ def test_observation_survives_a_pod_waiting_for_its_machine() -> None:
         assert pending[0].gpu_type_id is None
         assert pending[0].data_center_id is None
 
-    # an unplaced pod must never match the plan: `pod_identity_matches` compares both fields
-    # against nonempty plan values, so None simply never matches and cannot be adopted as ready.
+    # a *foreign* queued pod still must not match: this one differs in name and image, which is
+    # what rejects it. placement is deliberately not what does the rejecting -- see
+    # `test_a_pod_awaiting_placement_is_still_recognized_as_ours` for our own unplaced pod.
     plan = build_runpod_create_plan(_bundle())
     assert not pod_identity_matches(
         plan,
