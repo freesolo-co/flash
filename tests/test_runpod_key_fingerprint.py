@@ -729,3 +729,74 @@ def test_submit_status_cancel_and_delete_keep_owning_key_after_rotation(monkeypa
     assert api.delete_endpoint_for_fingerprint("ep-1", owner) is True
 
     assert [key for key, _url, _method in calls] == ["secretA"] * 4
+
+
+def test_poll_survives_an_unrelated_unverifiable_cleanup_record(tmp_path, monkeypatch):
+    """A healthy poll must not die because some OTHER historical record cannot be verified.
+
+    The fingerprint migration raises on the first record it cannot resolve. `poll` runs inside
+    the attach try whose `except Exception` marks the run FAILED, so an all-or-nothing migration
+    here would tear down healthy paid training over a stale cleanup entry whose credential simply
+    left the pool. The polled handle's own fingerprint is still verified independently by
+    `JobHandle.from_dict`, so suppressing the migration error loses no safety.
+    """
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+    from flash.providers.base import JobHandle, PollResult
+    from flash.providers.runpod import RunpodProvider, api
+    from flash.providers.runpod import jobs as runpod_jobs
+
+    key = "still-in-the-pool"
+    live_fingerprint = api.key_fingerprint(key)
+
+    def record(endpoint_id, fingerprint, job_id=None):
+        return {
+            "provider": "runpod",
+            "endpoint_id": endpoint_id,
+            "endpoint_name": f"flash-{endpoint_id}",
+            "key_fingerprint": fingerprint,
+            "job_id": job_id,
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+
+    # the polled remote is a legacy prefix owned by a key that IS still in the pool; the stale
+    # cleanup record's owner departed, so its legacy prefix can never resolve.
+    departed = api.key_fingerprint("departed-owner")[:16]
+    spec = JobSpec(run_id="poll-unrelated-stale", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path))
+    runner._save_status(
+        runner.RunStatus(
+            run_id="poll-unrelated-stale",
+            state="running",
+            spec=spec.to_dict(),
+            remote=record("ep-live", live_fingerprint[:16], job_id="job-1"),
+        ),
+        _cleanup_remotes=[record("ep-departed", departed)],
+    )
+    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+    monkeypatch.setattr(
+        api._CLIENT,
+        "request_with_retries_for_key",
+        lambda *_a, **_k: [{"id": "ep-live"}],
+    )
+
+    polled = {}
+
+    def fake_poll_job(handle, **kwargs):
+        polled["fingerprint"] = handle.key_fingerprint
+        polled["job_id"] = handle.job_id
+        return PollResult(ok=True, metrics={"step": 1})
+
+    monkeypatch.setattr(runpod_jobs, "poll_job", fake_poll_job)
+
+    result = RunpodProvider().poll(
+        JobHandle("runpod", record("ep-live", live_fingerprint[:16], job_id="job-1")),
+        spec,
+        spec.seed,
+    )
+
+    # the unrelated unverifiable record did not fail the run, and the polled handle still got its
+    # own legacy prefix upgraded to the full fingerprint before the call.
+    assert result.ok is True
+    assert polled == {"fingerprint": live_fingerprint, "job_id": "job-1"}

@@ -124,7 +124,15 @@ class RunpodProvider:
         prefix = f"{spec.phase}/{spec.run_id}"
         hd = handle.to_dict()
         upgrades = {}
-        with contextlib.suppress(FileNotFoundError):
+        # best-effort, for the same reason the teardown drain is: the migration raises on the FIRST
+        # record it cannot resolve, and a poll must not die because some UNRELATED historical
+        # cleanup record's credential left the pool. this call runs inside the attach try whose
+        # `except Exception` marks the run failed, so letting an unrelated record's error escape
+        # here would tear down healthy paid training. the resolvable upgrades are durably written
+        # before that raise, so suppressing it still picks them up, and this handle's own
+        # fingerprint is re-resolved independently by `JobHandle.from_dict` below -- an
+        # unresolvable fingerprint on the polled handle still fails, exactly as before.
+        with contextlib.suppress(Exception):
             upgrades = migrate_persisted_legacy_key_fingerprints(spec.run_id)
         fingerprint = hd.get("key_fingerprint")
         endpoint_id = hd.get("endpoint_id")
