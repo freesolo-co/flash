@@ -80,6 +80,31 @@ _validate_runtime_inputs = _runpod_lifecycle.validate_runtime_inputs
 
 _DEFAULT_ENDPOINT_PROBE = RunPodEndpointProbe()
 
+# how much of the caller's deadline is held back for teardown. one observe, one pod delete, a
+# short absence wait, then four deletes and a confirming observe.
+_CLEANUP_RESERVE_SECONDS = 30.0
+
+
+def _work_deadline(deadline_at: float, clock: Clock) -> float:
+    """the deadline for every phase of a create that can leave a resource behind.
+
+    Held back from the caller's deadline so the teardown that follows still has a live one. Every
+    transport call takes a deadline and rejects outright once it has passed, so cleanup handed an
+    exhausted deadline issues no deletes at all: the pod, its template, volume, and both secrets
+    stay live and billing while the result claims the creation ledger was aborted. Readiness is
+    what usually reaches the deadline -- a pod that runs but never answers the probe polls until
+    there is nothing left -- but a create slow enough to expire mid-sequence lands in the same
+    place, so the reserve covers the whole ledger-bearing stretch rather than the wait alone.
+
+    Half the remaining budget when that is smaller than the reserve, so a caller whose deadline is
+    shorter than the reserve gets both phases instead of a readiness wait that starts expired.
+
+    Adoption does not use this: it has no ledger, so it never reaches teardown and spending its
+    whole deadline proving an existing pod healthy is exactly what it should do.
+    """
+
+    return deadline_at - min(_CLEANUP_RESERVE_SECONDS, (deadline_at - clock()) / 2.0)
+
 
 def _observe(
     plan: RunPodCreatePlan,
@@ -540,24 +565,27 @@ def provision_runpod_deployment(
                 clock=clock,
                 sleep=sleep,
             )
+        # from here on this call owns resources, so every phase stops short of the caller's
+        # deadline to leave the teardown below a live one.
+        work_deadline_at = _work_deadline(deadline_at, clock)
         secret, artifact, template, volume, pod = _create_resources(
             plan,
             transport,
             ledger,
             inference_token,
             artifact_token,
-            deadline_at=deadline_at,
+            deadline_at=work_deadline_at,
         )
         handle = build_handle(plan, secret, template, volume, pod)
         ready = await_ready_and_reclaim(
             plan,
-            _bind_observe(transport, deadline_at=deadline_at),
-            _bind_delete_secret(transport, deadline_at=deadline_at),
+            _bind_observe(transport, deadline_at=work_deadline_at),
+            _bind_delete_secret(transport, deadline_at=work_deadline_at),
             inference_token,
             artifact,
             unproven_is_failure=True,
             on_ready=_mark_ready,
-            deadline_at=deadline_at,
+            deadline_at=work_deadline_at,
             probe=probe,
             clock=clock,
             sleep=sleep,

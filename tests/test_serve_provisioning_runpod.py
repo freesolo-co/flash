@@ -197,7 +197,15 @@ class _Factory:
 
 
 class _FakeTransport:
+    """provider double that enforces the deadline, and owns the clock that measures it.
+
+    The clock lives here rather than beside each caller so the transport and the lifecycle under
+    test cannot be handed different ones: tests pass `transport.clock` to `provision_...`, and a
+    deadline the lifecycle believes is live is one this double agrees is live.
+    """
+
     def __init__(self, account_id: str = "account-01") -> None:
+        self.clock = _Clock()
         self.account_id = account_id
         self.secrets: list[dict[str, object]] = []
         self.templates: list[dict[str, object]] = []
@@ -211,6 +219,15 @@ class _FakeTransport:
         self.malformed_pod_id = False
         self.on_first_mutation: Callable[[], None] | None = None
 
+    def _honour_deadline(self, deadline_at: float) -> None:
+        # the real transport refuses a call once the deadline has passed, and that refusal is what
+        # decides whether teardown gets to issue its deletes. a double that accepted an expired
+        # deadline let the whole suite pass over a create path that, in production, spent the
+        # deadline on readiness and then leaked the pod, volume, template, and both secrets --
+        # every cleanup call rejected before it was sent. see `_RunPodTransport._timeout`.
+        if deadline_at - self.clock() <= 0:
+            raise RunPodTransportFailure("transport_failed")
+
     def graphql(
         self,
         document: str,
@@ -219,6 +236,7 @@ class _FakeTransport:
         mutation: bool,
         deadline_at: float,
     ) -> object:
+        self._honour_deadline(deadline_at)
         # match runpod's real mutation names. keying off the old ones made this double answer a
         # document runpod itself rejects, so the whole suite passed against a schema that does
         # not exist -- the create branch is selected by name, so a renamed field would silently
@@ -266,6 +284,7 @@ class _FakeTransport:
         deadline_at: float,
         query: dict[str, str] | None = None,
     ) -> object:
+        self._honour_deadline(deadline_at)
         # the real transport takes query parameters as a mapping, and runpod gates whole response
         # objects behind them (includeMachine). a double without this parameter raises TypeError
         # on every call, which the lifecycle then classifies as transport_failed -- so each such
@@ -457,7 +476,7 @@ def _provision(
     artifact_token: str | None = ARTIFACT_SECRET,
     probe: _Probe | None = None,
 ):
-    clock = _Clock()
+    clock = transport.clock
     selected_probe = probe or _Probe()
     factory = _Factory(transport)
     result = provision_runpod_deployment(
@@ -477,7 +496,7 @@ def test_invalid_inputs_fail_before_client_construction() -> None:
     bundle = _bundle()
     transport = _FakeTransport()
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
 
     with pytest.raises(ValueError, match="credential type"):
         provision_runpod_deployment(
@@ -509,7 +528,7 @@ def test_oversized_manifest_fails_before_secret_reveal_or_provider_construction(
     bundle = _oversized_bundle()
     transport = _FakeTransport()
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
     revealed = False
 
     def reveal(_self):
@@ -813,7 +832,7 @@ def test_reconcile_is_read_only_and_reports_ready_or_absent() -> None:
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle)
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
 
     ready = reconcile_runpod_deployment(
         bundle,
@@ -853,7 +872,7 @@ def test_read_only_reconcile_never_reports_ready_with_transient_artifact_secret(
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle, artifact_secret=True)
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
 
     result = reconcile_runpod_deployment(
         bundle,
@@ -896,7 +915,7 @@ def test_production_probe_overrun_never_accepts_readiness_or_cleans_artifact() -
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle, artifact_secret=True)
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
     observed: list[dict[str, object]] = []
 
     class Response:
@@ -1001,7 +1020,7 @@ def test_volume_resize_only_grows_and_mutates_once() -> None:
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle)
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
     transport.calls.clear()
 
     grown = grow_runpod_volume(
@@ -1055,7 +1074,7 @@ def test_teardown_deletes_pod_before_attached_volume_and_confirms_absence() -> N
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle)
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
     transport.calls.clear()
 
     result = teardown_runpod_deployment(
@@ -1114,7 +1133,7 @@ def test_teardown_that_cannot_prove_the_pod_is_gone_is_unknown_not_failed() -> N
     transport = _PodOutlivesDeleteTransport()
     handle = _seed_exact(transport, bundle)
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
     transport.calls.clear()
 
     result = teardown_runpod_deployment(
@@ -1139,7 +1158,7 @@ def test_teardown_accepts_exact_pods_in_nonready_statuses(status: str) -> None:
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle, status=status)
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
     transport.calls.clear()
 
     result = teardown_runpod_deployment(
@@ -1161,7 +1180,7 @@ def test_teardown_rejects_wrong_generation_handle_before_client() -> None:
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle)
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
 
     with pytest.raises(ValueError, match="exact deployment generation"):
         teardown_runpod_deployment(
@@ -1229,7 +1248,7 @@ def test_teardown_refuses_mismatched_exact_resource_before_deletion() -> None:
     handle = _seed_exact(transport, bundle)
     transport.templates[0]["dockerStartCmd"] = "python -c bad"
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
     transport.calls.clear()
 
     result = teardown_runpod_deployment(
@@ -1695,7 +1714,7 @@ def test_rerunning_deploy_follows_its_own_pending_pod_to_ready() -> None:
     # the adoption branch reads pods once itself before delegating, so the pod must stay pending
     # past that first read -- otherwise a single-check implementation would pass this test too.
     reads = _flip_to_running_after(transport, 2)
-    clock = _Clock()
+    clock = transport.clock
     probe = _Probe(True)
 
     result = provision_runpod_deployment(
@@ -1726,7 +1745,7 @@ def test_adoption_reports_unproven_rather_than_failed_when_the_deadline_expires(
     bundle = _bundle()
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle, status="RUNNING")
-    clock = _Clock()
+    clock = transport.clock
 
     result = provision_runpod_deployment(
         bundle,
@@ -1745,6 +1764,75 @@ def test_adoption_reports_unproven_rather_than_failed_when_the_deadline_expires(
     assert _mutation_calls(transport) == [], "adoption must never tear down a pod it did not create"
 
 
+def test_a_create_whose_pod_never_proves_readiness_is_still_torn_down() -> None:
+    """readiness must not spend the deadline that teardown needs.
+
+    A pod that runs but never answers the probe polls until the deadline is gone. Cleanup then
+    inherits an expired deadline, and every transport call refuses before it is sent -- so no
+    delete is issued and the pod, its template, volume, and both secrets stay live and billing,
+    while the result claims this path aborted its own creation ledger.
+
+    The probe here never accepts, which is the whole failure mode: the create succeeds, readiness
+    cannot be proven, and what matters is that the provider is empty afterwards.
+    """
+
+    bundle = _bundle()
+    transport = _FakeTransport()
+    clock = transport.clock
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(False),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert transport.pods == [], "the pod outlived the create that could not prove it"
+    assert transport.templates == []
+    assert transport.volumes == []
+    assert transport.secrets == [], "both secrets outlived the create"
+    assert result.status == "failed", (
+        f"cleanup emptied the provider, so the outcome is known: got {result.status}"
+    )
+    deleted = [call[1] for call in _mutation_calls(transport) if "DELETE" in call[1]]
+    assert f"DELETE /pods/{POD_ID}" in deleted, "teardown never reached the pod delete"
+
+
+def test_a_create_deadline_shorter_than_the_cleanup_reserve_still_creates_and_cleans_up() -> None:
+    """the reserve is a share of the budget, not a fixed subtraction from it.
+
+    Holding back a flat 30s from a deadline shorter than that would leave readiness starting
+    already expired -- the create would fail its first call and no pod would ever exist. Halving
+    the remaining budget instead gives both phases room at any deadline.
+    """
+
+    bundle = _bundle()
+    transport = _FakeTransport()
+    clock = transport.clock
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
+        deadline_at=10.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(False),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    created = [call[1] for call in _mutation_calls(transport) if "POST" in call[1]]
+    assert "POST /pods" in created, "the create never ran: the reserve consumed the whole budget"
+    assert transport.pods == [], "the pod outlived a create with a deadline under the reserve"
+    assert transport.volumes == []
+    assert transport.secrets == []
+    assert result.status == "failed"
+
+
 def test_read_only_reconcile_reports_unproven_rather_than_failed_for_a_live_pod() -> None:
     """`reconcile` mutates nothing, so it can never be the caller that undoes what it doubts.
 
@@ -1756,7 +1844,7 @@ def test_read_only_reconcile_reports_unproven_rather_than_failed_for_a_live_pod(
     bundle = _bundle()
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle, status="RUNNING")
-    clock = _Clock()
+    clock = transport.clock
 
     result = reconcile_runpod_deployment(
         bundle,
@@ -1798,7 +1886,7 @@ def test_a_deployment_that_vanishes_during_artifact_cleanup_is_not_reported_read
         return response
 
     transport.graphql = wipe_after_delete  # type: ignore[assignment]
-    clock = _Clock()
+    clock = transport.clock
 
     result = provision_runpod_deployment(
         bundle,
@@ -2033,7 +2121,7 @@ def test_observation_survives_a_foreign_template_in_the_customers_account() -> N
             "env": None,
         }
     )
-    clock = _Clock()
+    clock = transport.clock
 
     confirmed = confirm_runpod_absence(
         bundle,
@@ -2330,7 +2418,7 @@ def test_a_resize_that_fails_after_the_patch_is_unknown_not_failed() -> None:
     transport = _VolumeVanishesAfterPatchTransport()
     handle = _seed_exact(transport, bundle)
     factory = _Factory(transport)
-    clock = _Clock()
+    clock = transport.clock
     transport.calls.clear()
 
     result = grow_runpod_volume(
