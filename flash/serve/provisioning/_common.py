@@ -393,7 +393,14 @@ def serving_resource_names(
 
 
 class ServingRuntimeSecrets:
-    """redacted request boundary for runtime secret values."""
+    """redacted request boundary for runtime secret values.
+
+    `artifact_token` is optional because teardown, resize, and read-only reconcile never hydrate and
+    so have no artifact to fetch. A *fresh create* is the opposite: the volume starts empty, the
+    container hydrates before the engine starts, and that path is token-only end to end, so
+    provisioning without one would create billable resources for a container that cannot reach
+    readiness. `serve_deploy` rejects that combination before contacting the provider.
+    """
 
     __slots__ = ("__artifact_token", "__inference_token")
 
