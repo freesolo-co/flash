@@ -65,6 +65,11 @@ def _read_task_children(pid: int, task_id: int) -> set[int] | None:
     return {int(value) for value in values if value.isdigit()}
 
 
+def _task_present(pid: int, task_id: int) -> bool:
+    """Whether one thread of a process still exists."""
+    return os.path.exists(f"/proc/{pid}/task/{task_id}")
+
+
 def _liveness(identity: _ProcessIdentity) -> str:
     """Classify a pid as still alive, exited, or replaced by an unrelated process."""
     start_time = _read_start_time(identity.pid)
@@ -85,7 +90,12 @@ def _stable_children(identity: _ProcessIdentity) -> set[int] | _VanishedProcess 
     for task_id in task_ids:
         task_children = _read_task_children(identity.pid, task_id)
         if task_children is None:
-            # a thread of a live process must be readable; only a whole-process exit is benign
+            # a rollout tree churns threads, so one task listed by `_list_task_ids` can exit
+            # before its `children` file is read while the process itself stays alive. that
+            # thread's descendants left with it, so skipping it is exact rather than lossy.
+            # only a thread that is STILL PRESENT and unreadable makes the walk unusable.
+            if not _task_present(identity.pid, task_id):
+                continue
             return _VANISHED if _liveness(identity) == _GONE else None
         children.update(task_children)
     state = _liveness(identity)

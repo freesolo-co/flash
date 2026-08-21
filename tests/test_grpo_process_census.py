@@ -69,6 +69,48 @@ def test_snapshot_partial_child_task_read_failure_on_a_live_process_is_unavailab
     assert _census()._snapshot().available == 0
 
 
+def test_snapshot_thread_that_exits_mid_walk_is_skipped_not_invalidating(monkeypatch):
+    """A rollout tree churns threads; one exiting mid-walk must not discard the whole sample.
+
+    `_list_task_ids` snapshots the task list, so a thread can exit before its `children` file is
+    read while the PROCESS stays alive. that thread's descendants left with it, so skipping it is
+    exact. treating it as unusable would make one benign race drop the step's census evidence.
+    """
+    _complete_proc_view(monkeypatch, with_child=True)
+    original = census_module._read_task_children
+    # thread 3 of pid 2 exits mid-walk: its `children` read fails AND it is no longer present.
+    monkeypatch.setattr(
+        census_module,
+        "_read_task_children",
+        lambda pid, task_id: None if (pid, task_id) == (2, 3) else original(pid, task_id),
+    )
+    monkeypatch.setattr(
+        census_module,
+        "_task_present",
+        lambda pid, task_id: (pid, task_id) != (2, 3),
+    )
+    snapshot = _census()._snapshot()
+    assert snapshot.available == 1
+    assert snapshot.descendant_processes == 1
+
+
+def test_snapshot_present_but_unreadable_thread_is_still_unavailable(monkeypatch):
+    """The skip above must require the thread to be GONE, not merely unreadable.
+
+    a thread that is still present but whose `children` file cannot be read is a real unusable
+    read: its descendants are unknown rather than known-departed.
+    """
+    _complete_proc_view(monkeypatch, with_child=True)
+    original = census_module._read_task_children
+    monkeypatch.setattr(
+        census_module,
+        "_read_task_children",
+        lambda pid, task_id: None if (pid, task_id) == (2, 3) else original(pid, task_id),
+    )
+    monkeypatch.setattr(census_module, "_task_present", lambda _pid, _task_id: True)
+    assert _census()._snapshot().available == 0
+
+
 def test_snapshot_child_task_read_failure_after_exit_is_tolerated(monkeypatch):
     """The same failed read is benign once the child has actually exited."""
     _stable_auxiliary_metrics(monkeypatch)
