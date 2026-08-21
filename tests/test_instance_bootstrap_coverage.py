@@ -30,6 +30,20 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
+@pytest.mark.parametrize("arm", ["lambda", "vast"])
+def test_arm_accepts_current_provider_identity(arm):
+    assert b._arm({"flash_arm": arm}) == arm
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [pytest.param({}, id="missing"), {"flash_arm": None}, {"flash_arm": ""}],
+)
+def test_arm_rejects_missing_provider_identity(payload):
+    with pytest.raises(ValueError, match="missing flash_arm"):
+        b._arm(payload)
+
+
 def _sleeping_upload_child():
     time.sleep(60.0)
 

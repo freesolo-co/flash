@@ -138,7 +138,10 @@ def load_payload() -> dict:
 
 
 def _arm(payload: dict) -> str:
-    return str(payload.get("flash_arm") or "instance")
+    arm = payload.get("flash_arm")
+    if not isinstance(arm, str) or not arm:
+        raise ValueError("bootstrap payload is missing flash_arm")
+    return arm
 
 
 def _source_descriptor(payload: dict):
