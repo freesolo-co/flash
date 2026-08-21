@@ -7,8 +7,10 @@ import binascii
 import hashlib
 import ipaddress
 import json
+import math
 import re
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -23,6 +25,35 @@ from flash.serve.control.types import validate_deployment_spec
 
 MAX_CANONICAL_MANIFEST_BYTES = 48 * 1024
 MAX_ENCODED_MANIFEST_BYTES = 64 * 1024
+
+Clock = Callable[[], float]
+Sleeper = Callable[[float], None]
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleFailure:
+    """one provider-neutral lifecycle failure.
+
+    Defined here rather than once per provider because both lifecycles produce it and six modules
+    across the two consume it: two identical definitions are two things to keep in step, and a
+    reader comparing the paths cannot tell at a glance that they are the same type.
+    """
+
+    code: DeploymentErrorCode
+    outcome_unknown: bool = False
+
+
+def validate_deadline(deadline_at: float, clock: Clock) -> None:
+    """reject a deadline that cannot describe a future instant.
+
+    Neither the rule nor the clock is provider-specific, so the modal and runpod copies of this
+    were character-for-character identical.
+    """
+
+    if type(deadline_at) not in {int, float} or not math.isfinite(float(deadline_at)):
+        raise ValueError("deadline_at must be finite")
+    if float(deadline_at) <= clock():
+        raise ValueError("deadline_at must be in the future")
 
 
 def _launcher_abi_id() -> str:

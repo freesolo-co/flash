@@ -11,31 +11,34 @@ The split is one-way -- this module imports nothing from `modal.py` -- so there 
 from __future__ import annotations
 
 import contextlib
-import math
 from collections.abc import Callable
-from dataclasses import dataclass
 
-from flash.serve.control import DeploymentErrorCode, ModalCredentials
+from flash.serve.control import ModalCredentials
 
-from ._common import ServingRuntimeSecrets
+# provider-neutral, so they live in `_common` rather than once per provider. re-exported here for
+# the same reason `_runpod_lifecycle` re-exports them: callers import lifecycle names from their
+# own provider's lifecycle module.
+from ._common import (
+    Clock,
+    LifecycleFailure,
+    ServingRuntimeSecrets,
+    Sleeper,
+    validate_deadline,
+)
 from ._modal_plan import ModalCreatePlan
 from ._modal_sdk import ModalObservation, ModalSdk, ModalSdkFactory, ModalSdkFailure
 
-Clock = Callable[[], float]
-Sleeper = Callable[[float], None]
-
-
-@dataclass(frozen=True, slots=True)
-class LifecycleFailure:
-    code: DeploymentErrorCode
-    outcome_unknown: bool = False
-
-
-def validate_deadline(deadline_at: float, clock: Clock) -> None:
-    if type(deadline_at) not in {int, float} or not math.isfinite(float(deadline_at)):
-        raise ValueError("deadline_at must be finite")
-    if float(deadline_at) <= clock():
-        raise ValueError("deadline_at must be in the future")
+__all__ = [
+    "Clock",
+    "LifecycleFailure",
+    "Sleeper",
+    "mutation",
+    "observe",
+    "open_sdk",
+    "validate_control_inputs",
+    "validate_deadline",
+    "validate_runtime_inputs",
+]
 
 
 def validate_runtime_inputs(

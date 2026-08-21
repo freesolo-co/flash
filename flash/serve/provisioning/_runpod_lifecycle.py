@@ -13,31 +13,37 @@ cycle to reason about.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable
-from dataclasses import dataclass
 
-from flash.serve.control import DeploymentErrorCode, RunPodCredentials
+from flash.serve.control import RunPodCredentials
 
-from ._common import ServingRuntimeSecrets
+# `Clock`, `Sleeper`, `LifecycleFailure` and `validate_deadline` are provider-neutral and live in
+# `_common`. They are re-exported here so the lifecycle modules stay the single import site for
+# their own callers, which is what `_modal_lifecycle` does too.
+from ._common import (
+    Clock,
+    LifecycleFailure,
+    ServingRuntimeSecrets,
+    Sleeper,
+    validate_deadline,
+)
 from ._runpod_transport import RunPodTransport, RunPodTransportFailure
 
+__all__ = [
+    "Clock",
+    "LifecycleFailure",
+    "Sleeper",
+    "TransportFactory",
+    "identity",
+    "mutation_call",
+    "open_transport",
+    "read_call",
+    "validate_control_inputs",
+    "validate_deadline",
+    "validate_runtime_inputs",
+]
+
 TransportFactory = Callable[[str], RunPodTransport]
-Clock = Callable[[], float]
-Sleeper = Callable[[float], None]
-
-
-@dataclass(frozen=True, slots=True)
-class LifecycleFailure:
-    code: DeploymentErrorCode
-    outcome_unknown: bool = False
-
-
-def validate_deadline(deadline_at: float, clock: Clock) -> None:
-    if type(deadline_at) not in {int, float} or not math.isfinite(float(deadline_at)):
-        raise ValueError("deadline_at must be finite")
-    if float(deadline_at) <= clock():
-        raise ValueError("deadline_at must be in the future")
 
 
 def validate_runtime_inputs(
@@ -97,4 +103,11 @@ def mutation_call(operation: Callable[[], object], parser: Callable[[object], ob
 
 
 def identity(value: object) -> object:
+    """the parser for a mutation whose response has nothing to parse.
+
+    `mutation_call` always parses, so a delete -- which returns no body worth reading -- still has
+    to hand it something. Passing this keeps the "every mutation goes through one wrapper" rule
+    intact instead of adding a second, parserless call path for one case.
+    """
+
     return value
