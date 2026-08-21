@@ -281,6 +281,8 @@ def rank_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
 
 _LORA_A_INFIX = ".lora_A."
 _LORA_B_INFIX = ".lora_B."
+# PEFT appends this rung for every parameter wrapper nested inside another one.
+_NESTED_WRAPPER_RUNG = ".base_layer"
 
 
 @dataclass(frozen=True)
@@ -390,9 +392,27 @@ def _rank_for_module(module_path: str, declared: DeclaredLoraRanks) -> int | Non
 
 
 def _module_uses_target_parameters(module_path: str, declared: DeclaredLoraRanks) -> bool:
-    """Whether this serialized module came from one of PEFT's targeted parameters."""
+    """Whether this serialized module came from one of PEFT's targeted parameters.
+
+    PEFT wraps the module that *owns* a targeted parameter, keeping the parameter name off the
+    serialized path. When several targeted parameters share one owner, the wrappers nest and every
+    wrapper after the first appends a ``base_layer`` rung, so a single owner produces keys like::
+
+        mlp.experts                          (the outermost wrapper)
+        mlp.experts.base_layer               (the one nested inside it)
+
+    Those inner rungs carry the same stacked axis as the outer one, so peeling the ``base_layer``
+    rungs off before matching is what keeps a valid adapter from being measured against the scalar
+    rank.
+    """
+    candidates = [module_path]
+    trimmed = module_path
+    while trimmed.endswith(_NESTED_WRAPPER_RUNG):
+        trimmed = trimmed[: -len(_NESTED_WRAPPER_RUNG)]
+        candidates.append(trimmed)
     return any(
-        module_path == module or module_path.endswith(f".{module}")
+        candidate == module or candidate.endswith(f".{module}")
+        for candidate in candidates
         for module in declared.stacked_rank_modules
     )
 
