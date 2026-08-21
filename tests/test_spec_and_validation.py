@@ -2178,6 +2178,20 @@ def test_gpu_count_of_reads_spec_and_defaults() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_persisted_rl_batch_size_is_rejected_and_names_the_right_key(algorithm) -> None:
+    record = JobSpec(algorithm=algorithm).to_internal_dict()
+    record["train"]["batch_size"] = 16
+    record["train"].pop("prompts_per_step", None)
+
+    with pytest.raises(ValueError, match=r"batch_size.*prompts_per_step") as excinfo:
+        JobSpec.from_dict(record)
+
+    message = str(excinfo.value)
+    assert f"batch_size does not apply to {algorithm}" in message
+    assert "prompts_per_step" in message
+
+
 def test_sft_batch_size_is_rejected_on_rl_and_names_the_right_key() -> None:
     """The trap this split exists to close.
 

@@ -770,6 +770,10 @@ class JobSpec:
         if model_revision and not model_revision_auto:
             raise ValueError("model_revision requires model_revision_auto=True")
         algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
+        if algorithm in {"grpo", "opd"} and train.get("batch_size") is not None:
+            raise ValueError(
+                f"train.batch_size does not apply to {algorithm}; use train.prompts_per_step"
+            )
         if algorithm == "grpo":
             for name, value in (
                 ("prompts_per_step", train.get("prompts_per_step")),
