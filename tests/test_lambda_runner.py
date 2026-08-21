@@ -63,7 +63,11 @@ def _spec(gpu_type="A10", **gpu_kw) -> JobSpec:
             "algorithm": "sft",
             "run_id": "flash-1700000000-abcd1234",
             "seed": 0,
-            "train": {"epochs": 1, "hf_repo": "org/repo"},
+            "train": {
+                "epochs": 1,
+                "hf_repo": "org/repo",
+                "credit_assignment": "per_episode",
+            },
             "gpu": gpu,
         }
     )

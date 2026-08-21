@@ -2272,7 +2272,11 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "train": {"prompts_per_step": 16, "epochs": 2},
+            "train": {
+                "prompts_per_step": 16,
+                "epochs": 2,
+                "credit_assignment": "per_episode",
+            },
         }
     )
     monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
@@ -5028,7 +5032,12 @@ def _capability_resolve(
         {
             "model": model,
             "algorithm": "grpo",
-            "train": {"prompts_per_step": 4, "epochs": 1, **(train or {})},
+            "train": {
+                "prompts_per_step": 4,
+                "epochs": 1,
+                "credit_assignment": "per_episode",
+                **(train or {}),
+            },
             "gpu": {"count": gpu_count},
         }
     )

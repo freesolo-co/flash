@@ -708,7 +708,11 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "sft",
                 "environment": {"id": "github:o/r@main:env/environment.py"},
-                "train": {"epochs": 1, "max_examples": 8},
+                "train": {
+                    "epochs": 1,
+                    "max_examples": 8,
+                    "credit_assignment": "per_episode",
+                },
                 "run_id": "flash-wc-1",
             }
         )
@@ -1594,7 +1598,12 @@ def _preload_spec():
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": "flash-1700000000-abcd1234",
-            "train": {"epochs": 1, "max_examples": 8, "hf_repo": "org/repo"},
+            "train": {
+                "epochs": 1,
+                "max_examples": 8,
+                "hf_repo": "org/repo",
+                "credit_assignment": "per_episode",
+            },
             "gpu": {
                 "type": "A10",
                 "max_wall_seconds": 3600,

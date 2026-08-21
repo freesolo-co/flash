@@ -3103,6 +3103,7 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
                     "epochs": 1,
                     "max_examples": 1,
                     "hf_repo": "Freesolo-Co/flashrun-source-env",
+                    "credit_assignment": "per_episode",
                 },
             }
         )
@@ -3184,7 +3185,12 @@ def test_submit_rejects_cross_org_init_ref(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {
+                    "epochs": 1,
+                    "max_examples": 1,
+                    "hf_repo": "Freesolo-Co/source",
+                    "credit_assignment": "per_episode",
+                },
             }
         )
         orch._save_status(
@@ -3225,7 +3231,12 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {
+                    "epochs": 1,
+                    "max_examples": 1,
+                    "hf_repo": "Freesolo-Co/source",
+                    "credit_assignment": "per_episode",
+                },
             }
         )
         orch._save_status(
@@ -3284,7 +3295,12 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {
+                    "epochs": 1,
+                    "max_examples": 1,
+                    "hf_repo": "Freesolo-Co/source",
+                    "credit_assignment": "per_episode",
+                },
             }
         )
         orch._save_status(
@@ -3352,7 +3368,12 @@ def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {
+                    "epochs": 1,
+                    "max_examples": 1,
+                    "hf_repo": "Freesolo-Co/source",
+                    "credit_assignment": "per_episode",
+                },
             }
         )
         orch._save_status(
@@ -3388,7 +3409,12 @@ def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {
+                    "epochs": 1,
+                    "max_examples": 1,
+                    "hf_repo": "Freesolo-Co/source",
+                    "credit_assignment": "per_episode",
+                },
             }
         )
         orch._save_status(
@@ -3429,7 +3455,12 @@ def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {
+                    "epochs": 1,
+                    "max_examples": 1,
+                    "hf_repo": "Freesolo-Co/source",
+                    "credit_assignment": "per_episode",
+                },
             }
         )
         orch._save_status(
@@ -3472,7 +3503,12 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {
+                    "epochs": 1,
+                    "max_examples": 1,
+                    "hf_repo": "Freesolo-Co/source",
+                    "credit_assignment": "per_episode",
+                },
             }
         )
         orch._save_status(
@@ -3520,7 +3556,12 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
                 "run_id": "source-run",
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
+                "train": {
+                    "epochs": 1,
+                    "max_examples": 1,
+                    "hf_repo": "Freesolo-Co/source",
+                    "credit_assignment": "per_episode",
+                },
             }
         )
         orch._save_status(

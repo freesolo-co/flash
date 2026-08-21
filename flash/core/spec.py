@@ -743,7 +743,13 @@ class JobSpec:
             if raw_package is not None
             else None
         )
+        raw_train = data.get("train")
         train = validated_section(data, "train", {item.name for item in fields(TrainSpec)})
+        credit_assignment = (
+            _coerce_credit_assignment(train.get("credit_assignment"))
+            if raw_train is not None
+            else DEFAULT_CREDIT_ASSIGNMENT
+        )
         gpu = validated_section(data, "gpu", {item.name for item in fields(GpuSpec)})
         gpu_type, gpu_type_fallbacks = _parse_persisted_gpu_types(gpu)
         provider, providers = validated_persisted_providers(gpu, gpu_type, gpu_type_fallbacks)
@@ -809,7 +815,7 @@ class JobSpec:
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
-                credit_assignment=_coerce_credit_assignment(train.get("credit_assignment")),
+                credit_assignment=credit_assignment,
             ),
             gpu=GpuSpec(
                 type=gpu_type,

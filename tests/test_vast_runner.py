@@ -33,7 +33,11 @@ def _spec(gpu_type="RTX 4090", **gpu_kw) -> JobSpec:
             # authoritative seed 0 matches the literal seed threaded into every provider call below.
             "seed": 0,
             "run_id": "flash-1700000000-abcd1234",
-            "train": {"epochs": 1, "hf_repo": "org/repo"},
+            "train": {
+                "epochs": 1,
+                "hf_repo": "org/repo",
+                "credit_assignment": "per_episode",
+            },
             "gpu": gpu,
         }
     )
