@@ -585,6 +585,57 @@ def test_adoption_of_an_uncleaned_deployment_probes_instead_of_burning_the_deadl
     assert sdk.artifact == [], "the artifact was left behind for the next run to trip over"
 
 
+def test_adoption_of_a_cold_bootstrap_app_waits_instead_of_probing_once() -> None:
+    """the bootstrap half of the cold-container fix above.
+
+    A prior invocation can leave its app in the *bootstrap* phase -- artifact secret present,
+    hydrating, not yet finalized. Probing that once capped the attempt at the probe's 30-second
+    ceiling and returned `outcome_unknown` with nearly the whole deadline unspent, so a rerun could
+    never follow an in-progress invocation through bootstrap readiness into its finalized
+    transition. The finalized branch already waited; this one did not.
+    """
+
+    class _ColdProbe:
+        def __init__(self, accept_on: int) -> None:
+            self.accept_on = accept_on
+            self.calls = 0
+
+        def __call__(
+            self,
+            _url: str,
+            _token: str,
+            _bundle: DeploymentBundle,
+            _timeout_seconds: float,
+        ) -> bool:
+            self.calls += 1
+            return self.calls >= self.accept_on
+
+    bundle = _bundle()
+    bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
+    sdk = _FakeSdk(bootstrap_plan)
+    _seed_exact(sdk, artifact=True)
+    # more probes than a single attempt can make: one probe call is the whole pre-fix budget.
+    probe = _ColdProbe(accept_on=3)
+    clock = _Clock()
+
+    result = provision_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
+        deadline_at=600.0,
+        sdk_factory=lambda _credentials, _plan: sdk,
+        probe=probe,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    # the fix is that the bootstrap phase is *waited on* rather than probed once. what happens after
+    # it warms up -- the finalized redeploy -- is a separate step this fake never performs, so the
+    # run still ends unproven; the regression is the probe count, which was capped at 1 before.
+    assert probe.calls >= 3, "the cold bootstrap app was probed once, so no waiting happened"
+    assert result.status != "ready", "the fake never finalizes, so readiness cannot be claimed"
+
+
 def test_adoption_keeps_the_artifact_when_readiness_is_never_proven() -> None:
     """reclaim follows proof of readiness, never precedes it.
 

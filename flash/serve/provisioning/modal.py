@@ -41,7 +41,6 @@ from ._modal_readiness import (
     from_sdk_failure,
     matches_transient,
     phase_proof,
-    probe_with_deadline,
     sleep_until_poll,
     unknown_result,
     wait_for_phase,
@@ -426,15 +425,26 @@ def _adopt_existing(
         artifact_present=True,
         expected=None,
     )
-    if not probe_with_deadline(
-        probe,
-        bootstrap.handle,
-        inference_token,
+    # a single probe is capped at MAX_PROBE_TIMEOUT_SECONDS, so an adopted bootstrap app that is
+    # still cold answers nothing within that cap and used to end the whole rerun as
+    # `outcome_unknown` -- with most of the deadline unspent. wait for the phase instead, the same
+    # way `_adopt_uncleaned` waits on the finalized one, so a rerun can follow an in-progress
+    # invocation through bootstrap readiness and on into its finalized transition.
+    proved = wait_for_phase(
         bootstrap_plan,
+        sdk,
+        inference_token,
+        artifact_present=True,
+        expected=None,
+        transient_phases=(),
         deadline_at=deadline_at,
+        probe=probe,
         clock=clock,
-    ):
+        sleep=sleep,
+    )
+    if proved is None:
         return unknown_result(finalized_plan, handle=bootstrap.handle)
+    bootstrap = proved
     artifact = bootstrap.artifact
     assert artifact is not None
     expected = ExpectedResources(
