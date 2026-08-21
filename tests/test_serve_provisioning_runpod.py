@@ -1745,6 +1745,77 @@ def test_adoption_reports_unproven_rather_than_failed_when_the_deadline_expires(
     assert _mutation_calls(transport) == [], "adoption must never tear down a pod it did not create"
 
 
+def test_read_only_reconcile_reports_unproven_rather_than_failed_for_a_live_pod() -> None:
+    """`reconcile` mutates nothing, so it can never be the caller that undoes what it doubts.
+
+    A definite `failed` is reserved for the create path, which aborts its own ledger in the same
+    breath. Reporting it from a read-only reconcile tells the supervisor to discard the deployment
+    record while the pod is still there and still billing.
+    """
+
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, status="RUNNING")
+    clock = _Clock()
+
+    result = reconcile_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=6.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(False),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "resource_ambiguous"
+    assert result.handle == handle
+    assert transport.pods, "the pod is still live, so the verdict must not read as discardable"
+    assert _mutation_calls(transport) == [], "a read-only reconcile must not mutate provider state"
+
+
+def test_a_deployment_that_vanishes_during_artifact_cleanup_is_not_reported_ready() -> None:
+    """artifact absence alone cannot distinguish "token cleaned up" from "everything is gone".
+
+    An empty observation has no artifact secret either, so a pod deleted between the readiness
+    probe and this confirmation used to return `ready` with a handle whose url resolves to nothing.
+    """
+
+    bundle = _bundle()
+    transport = _FakeTransport()
+    _seed_exact(transport, bundle, artifact_secret=True, status="RUNNING")
+    original = transport.graphql
+
+    def wipe_after_delete(document: str, variables, *, mutation: bool, deadline_at: float):
+        response = original(document, variables, mutation=mutation, deadline_at=deadline_at)
+        if mutation and "secretDelete" in document:
+            transport.pods.clear()
+            transport.templates.clear()
+            transport.volumes.clear()
+            transport.secrets.clear()
+        return response
+
+    transport.graphql = wipe_after_delete  # type: ignore[assignment]
+    clock = _Clock()
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=600.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(True),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status != "ready", "a deployment that no longer exists was reported ready"
+    assert result.status == "outcome_unknown"
+    assert not transport.pods
+
+
 def test_observation_survives_a_pod_waiting_for_its_machine() -> None:
     # runpod omits `machine` entirely while a pod is CREATED or PENDING: placement is not decided
     # yet, so there is no gpu type or data center to report. demanding them collapsed the whole

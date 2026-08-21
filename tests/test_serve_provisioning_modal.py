@@ -502,6 +502,54 @@ def test_request_secrets_are_confined_to_one_shot_sinks_and_sanitized_results() 
     assert "FREESOLO_INTERNAL_KEY" not in rendered
 
 
+def test_adoption_waits_out_a_cold_container_instead_of_probing_once() -> None:
+    """a rerun must follow an existing deployment to readiness, like a fresh create does.
+
+    A cold gpu container can need longer than the probe's 30-second cap to load. Probing once
+    answered `outcome_unknown` with nearly the whole deadline unspent, so rerunning `serve deploy`
+    against an app that was still warming could never reach it -- while `_wait_for_phase` already
+    knew how to wait for exactly this on the create and reconcile paths.
+    """
+
+    class _ColdProbe:
+        def __init__(self, accept_on: int) -> None:
+            self.accept_on = accept_on
+            self.calls = 0
+
+        def __call__(
+            self,
+            _url: str,
+            _token: str,
+            _bundle: DeploymentBundle,
+            _timeout_seconds: float,
+        ) -> bool:
+            self.calls += 1
+            return self.calls >= self.accept_on
+
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    handle = _seed_exact(sdk)
+    probe = _ColdProbe(accept_on=3)
+    clock = _Clock()
+
+    result = provision_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=600.0,
+        sdk_factory=lambda _credentials, _plan: sdk,
+        probe=probe,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "ready", "adoption gave up on a container that warmed up in time"
+    assert result.handle == handle
+    assert probe.calls == 3, "the endpoint was probed once, so no waiting happened"
+    assert all(not name.startswith("create_") for name, _value in sdk.calls)
+
+
 def test_exact_adoption_requires_authenticated_endpoint_provenance() -> None:
     bundle = _bundle()
     factory = _Factory()

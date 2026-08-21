@@ -185,10 +185,21 @@ def confirm_artifact_absence(
     clock: Clock,
     sleep: Sleeper,
 ) -> bool:
+    """confirm the artifact is gone *and* the deployment it belonged to is still there.
+
+    Checking only the artifact made a vanished deployment indistinguishable from a cleaned-up one:
+    an empty observation has no artifact secret either, so a pod deleted between the readiness
+    probe and this confirmation still returned `ready` -- with a handle whose url resolves to
+    nothing. Re-proving the exact core resources is what separates "the token is gone" from
+    "everything is gone", and it re-runs the same identity match the probe relied on, so drift as
+    well as disappearance is caught.
+    """
+
     while True:
         observation = observe(plan)
         try:
             ensure_unique_resources(observation)
+            exact_core_resources(plan, observation)
         except RunPodResourceConflict:
             return False
         if not observation.artifact_secrets:

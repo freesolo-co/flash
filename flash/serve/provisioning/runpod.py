@@ -181,6 +181,11 @@ def reconcile_runpod_deployment(
             probe=probe,
             clock=clock,
             sleep=sleep,
+            # this function mutates nothing by contract, so it can never be the caller that undoes
+            # a pod it could not prove. `failed` is reserved for the create path, which aborts its
+            # own ledger in the same breath; reporting it from here would tell the supervisor to
+            # discard the deployment record while the pod stays live and billing.
+            unproven_is_failure=False,
         )
     except RunPodTransportFailure as exc:
         return failure_result(plan, _from_transport_failure(exc))

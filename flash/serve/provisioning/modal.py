@@ -461,18 +461,27 @@ def _adopt_existing(
             expected=None,
         )
     if finalized is not None:
-        if _probe_with_deadline(
-            probe,
-            finalized.handle,
-            inference_token,
+        # poll rather than probe once. a cold gpu container can need longer than the probe's
+        # 30-second cap to load, and a single probe answered `outcome_unknown` with most of the
+        # caller's deadline still unspent -- so a rerun meant to follow an existing deployment
+        # could never reach it, while fresh creates and explicit reconciliation both wait here.
+        proved = _wait_for_phase(
             finalized_plan,
+            sdk,
+            inference_token,
+            artifact_present=False,
+            expected=None,
+            transient_phases=(),
             deadline_at=deadline_at,
+            probe=probe,
             clock=clock,
-        ):
+            sleep=sleep,
+        )
+        if proved is not None:
             return DeploymentResult.from_spec(
                 finalized_plan.bundle.spec,
                 status="ready",
-                handle=finalized.handle,
+                handle=proved.handle,
             )
         return _unknown_result(finalized_plan, handle=finalized.handle)
     with contextlib.suppress(ModalResourceConflict):
@@ -483,19 +492,25 @@ def _adopt_existing(
             expected=None,
         )
     if finalized is not None:
-        if not _probe_with_deadline(
-            probe,
-            finalized.handle,
-            inference_token,
+        # same bounded wait as the branch above; this one still has its artifact to reclaim after.
+        proved = _wait_for_phase(
             finalized_plan,
+            sdk,
+            inference_token,
+            artifact_present=True,
+            expected=None,
+            transient_phases=(),
             deadline_at=deadline_at,
+            probe=probe,
             clock=clock,
-        ):
+            sleep=sleep,
+        )
+        if proved is None:
             return _unknown_result(finalized_plan, handle=finalized.handle)
         return _delete_artifact_and_confirm(
             finalized_plan,
             sdk,
-            finalized,
+            proved,
             inference_token,
             deadline_at=deadline_at,
             probe=probe,
