@@ -544,6 +544,8 @@ def _abort_observation_matches(
     plan: RunPodCreatePlan,
     ledger: MutationLedger,
     observation: RunPodObservation,
+    *,
+    unconfirmed_create_may_exist: bool,
 ) -> bool:
     try:
         ensure_unique_resources(observation)
@@ -564,12 +566,17 @@ def _abort_observation_matches(
             # confirmed: ours only if the id matches the one the provider returned to us.
             if values[0].id != confirmed_id:
                 return False
-        elif not ledger.attempted(kind):
-            # never attempted by this run, so it cannot be ours no matter how well it matches the
-            # plan. two `serve deploy` runs for one deployment generation build byte-identical
-            # names and identities, so the loser's plan matches the winner's resources exactly.
-            # without this, a conflict on the loser's first secret create -- which leaves nothing
-            # confirmed -- let cleanup delete the winner's secret, pod, template, and volume.
+        elif not (ledger.attempted(kind) and unconfirmed_create_may_exist):
+            # unconfirmed, so plan identity is the only evidence -- and it proves nothing. two
+            # `serve deploy` runs for one deployment generation build byte-identical names and
+            # identities, so the loser's plan matches the winner's live resources exactly.
+            # deleting on that basis tears down a running deployment the user is paying for.
+            #
+            # a kind this attempt never began cannot be ours at all. a kind it began but could
+            # not confirm is ours only when the create may still have landed: after a definite
+            # rejection the create provably never took effect, so anything bearing the name is
+            # somebody else's. that rejection is exactly how the loser of a race finds out it
+            # lost, which is why cleanup must not read it as ownership.
             return False
     template = observation.templates[0] if observation.templates else None
     volume = observation.volumes[0] if observation.volumes else None
@@ -611,13 +618,19 @@ def _abort_created_resources(
     transport: RunPodTransport,
     ledger: MutationLedger,
     *,
+    unconfirmed_create_may_exist: bool,
     deadline_at: float,
     clock: Clock,
     sleep: Sleeper,
 ) -> bool:
     try:
         observation = _observe(plan, transport, deadline_at=deadline_at)
-        if not _abort_observation_matches(plan, ledger, observation):
+        if not _abort_observation_matches(
+            plan,
+            ledger,
+            observation,
+            unconfirmed_create_may_exist=unconfirmed_create_may_exist,
+        ):
             return False
         pod = observation.pods[0] if observation.pods else None
         template = observation.templates[0] if observation.templates else None
@@ -658,6 +671,7 @@ def _failure_after_create_attempt(
     failure: _LifecycleFailure,
     *,
     handle: RunPodProviderHandle | None,
+    unconfirmed_create_may_exist: bool = True,
     deadline_at: float,
     clock: Clock,
     sleep: Sleeper,
@@ -668,6 +682,7 @@ def _failure_after_create_attempt(
         plan,
         transport,
         ledger,
+        unconfirmed_create_may_exist=unconfirmed_create_may_exist,
         deadline_at=deadline_at,
         clock=clock,
         sleep=sleep,
@@ -767,6 +782,10 @@ def provision_runpod_deployment(
             ledger,
             failure,
             handle=handle,
+            # a definite rejection proves the create that raised never took effect, so an
+            # unconfirmed kind cannot have produced a resource and any matching one is another
+            # run's. only an ambiguous failure leaves that in doubt.
+            unconfirmed_create_may_exist=failure.outcome_unknown,
             deadline_at=deadline_at,
             clock=clock,
             sleep=sleep,

@@ -783,10 +783,11 @@ def test_losing_racer_never_deletes_the_winners_resources() -> None:
     transport.secrets, transport.volumes, transport.templates, transport.pods = [], [], [], []
 
     def _winner_lands() -> None:
+        # only the secret: the winner is mid-provision, exactly one create ahead of the loser.
+        # this is the case plan identity alone cannot survive -- with the later kinds absent,
+        # nothing the loser never attempted is present to betray the resources as another run's,
+        # so the secret must be spared on the strength of the rejection itself.
         transport.secrets = [dict(item) for item in winner_secrets]
-        transport.volumes = [dict(item) for item in winner_volumes]
-        transport.templates = [dict(item) for item in winner_templates]
-        transport.pods = [dict(item) for item in winner_pods]
 
     transport.on_first_mutation = _winner_lands
     # the loser's first mutation -- creating the inference secret -- then collides with it.
@@ -797,9 +798,6 @@ def test_losing_racer_never_deletes_the_winners_resources() -> None:
 
     assert result.status == "outcome_unknown"
     assert transport.secrets == winner_secrets
-    assert transport.volumes == winner_volumes
-    assert transport.templates == winner_templates
-    assert transport.pods == winner_pods
     assert handle.pod_id == winner_pods[0]["id"]
     # and it must not have issued a single delete against them.
     assert [call for call in _mutation_calls(transport) if "DELETE" in call[1]] == []
