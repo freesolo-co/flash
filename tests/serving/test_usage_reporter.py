@@ -83,9 +83,7 @@ def test_stream_text_delta_keeps_native_delta_chunks(modal_app_module):
     deltas = []
 
     for text in ("Hel", "lo", " hello"):
-        delta, previous = engine_support._stream_text_delta(
-            text, previous, cumulative_output=False
-        )
+        delta, previous = engine_support._stream_text_delta(text, previous, cumulative_output=False)
         deltas.append(delta)
 
     assert deltas == ["Hel", "lo", " hello"]
@@ -97,9 +95,7 @@ def test_stream_text_delta_diffs_cumulative_chunks_without_token_ids(modal_app_m
     deltas = []
 
     for text in ("Hel", "Hello", "Hello", "Hello!"):
-        delta, previous = engine_support._stream_text_delta(
-            text, previous, cumulative_output=None
-        )
+        delta, previous = engine_support._stream_text_delta(text, previous, cumulative_output=None)
         deltas.append(delta)
 
     assert deltas == ["Hel", "lo", "", "!"]
