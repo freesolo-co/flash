@@ -1594,8 +1594,16 @@ def test_stale_ready_record_refreshes_in_background():
             )
             # another container undeploys qa: it drops out of the status=ready reload.
             shared["rows"] = []
-            # this hit is stale, but still cached: serve it and schedule the refresh.
+            # this hit is stale, but still cached: serve it and schedule the refresh. it is the
+            # request this whole test characterizes, so what the engine is handed for it matters
+            # more than the status code -- serving the cached row is only correct if the row
+            # served is the one storage returned.
+            served = len(pool.generated_records)
             assert await _generate("qa") == 200
+            assert pool.generated_records[served:] == [material], (
+                f"the stale cached hit was served from other material: "
+                f"{pool.generated_records[served:]}"
+            )
             await _until(lambda: not router.has("qa"), "the undeploy never landed")
             # a genuinely later refresh did the work, not the one that had already settled.
             assert reloads["count"] > settled, "the ttl window stopped refreshing after the first"
