@@ -528,7 +528,7 @@ def provision_runpod_deployment(
                 inference_token,
                 observation.artifact_secrets[0] if observation.artifact_secrets else None,
                 # adoption owns resources it did not create and has no ledger to undo, so an
-                # unproven pod is reported unknown rather than failed. see `_read_only_reconcile`.
+                # unproven pod is reported unknown rather than failed. see `read_only_reconcile`.
                 unproven_is_failure=False,
                 deadline_at=deadline_at,
                 probe=probe,
