@@ -84,11 +84,7 @@ SPEC = {
     # A hub slug, because this fixture drives the HOSTED api: the managed plane accepts
     # `namespace/project/name` only, and a `github:` ref is refused at submit.
     "environment": {"id": "acme/checkout-bot/gsm8k"},
-    "train": {
-        "epochs": 1,
-        "max_examples": 1,
-        "credit_assignment": "per_episode",
-    },
+    "train": {"epochs": 1, "max_examples": 1},
     "gpu": {},
 }
 
@@ -1293,11 +1289,7 @@ def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(ap
         {
             "project": "11111111-1111-4111-8111-111111111111",
             **SPEC,
-            "train": {
-                **SPEC["train"],
-                "init_from_adapter": "source-run",
-                "credit_assignment": "per_episode",
-            },
+            "train": {**SPEC["train"], "init_from_adapter": "source-run"},
         }
     ).to_dict()
     # a warm start cannot author alpha, so a normalized warm-start spec omits it.
@@ -1372,11 +1364,7 @@ def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch)
             "model": "Qwen/Qwen3.5-4B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "sft",
-            "train": {
-                "epochs": 1,
-                "hf_repo": "Freesolo-Co/source",
-                "credit_assignment": "per_episode",
-            },
+            "train": {"epochs": 1, "hf_repo": "Freesolo-Co/source"},
         }
     )
     runner._save_status(runner.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
@@ -1428,11 +1416,7 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
             "model": "Qwen/Qwen3.5-4B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "sft",
-            "train": {
-                "epochs": 1,
-                "hf_repo": "Freesolo-Co/source",
-                "credit_assignment": "per_episode",
-            },
+            "train": {"epochs": 1, "hf_repo": "Freesolo-Co/source"},
         }
     )
     runner._save_status(runner.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
@@ -8136,11 +8120,7 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "train": {
-            "epochs": 1,
-            "max_examples": 1,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
         "run_id": "nohandle-1",
     }
@@ -8303,11 +8283,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "train": {
-            "epochs": 1,
-            "max_examples": 1,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
         "run_id": "phantom-1",
     }
@@ -8368,11 +8344,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "train": {
-            "epochs": 1,
-            "max_examples": 1,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
         "run_id": "unconf-1",
     }
@@ -8429,11 +8401,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "train": {
-            "epochs": 1,
-            "max_examples": 1,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
         "run_id": "queued-1",
     }
@@ -8502,11 +8470,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "train": {
-            "epochs": 1,
-            "max_examples": 1,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
         "run_id": "novast-1",
     }
@@ -8558,11 +8522,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "train": {
-            "epochs": 1,
-            "max_examples": 1,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
         "run_id": "newvast-1",
     }
@@ -8625,11 +8585,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "train": {
-            "epochs": 1,
-            "max_examples": 1,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
         "run_id": "retry-1",
     }
@@ -8696,11 +8652,7 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "train": {
-            "epochs": 1,
-            "max_examples": 1,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
         "run_id": "clear-1",
     }
@@ -8772,7 +8724,6 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
             "max_examples": 1,
             "init_from_adapter": "source-run",
             "lora_rank": 8,
-            "credit_assignment": "per_episode",
         },
         "gpu": {},
         "run_id": "nohandle-warm",
@@ -8855,11 +8806,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "train": {
-            "init_from_adapter": "source-run",
-            "lora_rank": 8,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"init_from_adapter": "source-run", "lora_rank": 8},
         "run_id": "drifted-warm",
     }
     worker_spec = {
@@ -8959,11 +8906,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "environment": {"path": "/legacy/local/env"},
-        "train": {
-            "epochs": 1,
-            "max_examples": 1,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {"type": "RTX 5090"},
         "run_id": "bad-1",
     }
@@ -8972,11 +8915,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "model": "Qwen/Qwen3.5-4B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
-        "train": {
-            "epochs": 1,
-            "max_examples": 1,
-            "credit_assignment": "per_episode",
-        },
+        "train": {"epochs": 1, "max_examples": 1},
         "gpu": {},
         "run_id": "good-2",
     }

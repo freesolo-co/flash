@@ -743,11 +743,10 @@ class JobSpec:
             if raw_package is not None
             else None
         )
-        raw_train = data.get("train")
         train = validated_section(data, "train", {item.name for item in fields(TrainSpec)})
         credit_assignment = (
-            _coerce_credit_assignment(train.get("credit_assignment"))
-            if raw_train is not None
+            _coerce_credit_assignment(train["credit_assignment"])
+            if "credit_assignment" in train
             else DEFAULT_CREDIT_ASSIGNMENT
         )
         gpu = validated_section(data, "gpu", {item.name for item in fields(GpuSpec)})

@@ -66,7 +66,7 @@ def test_max_steps_rejects_non_integer_types_across_direct_and_json_construction
     with pytest.raises((TypeError, ValueError), match=r"train\.max_steps"):
         TrainSpec(max_steps=value)
     with pytest.raises((TypeError, ValueError), match=r"train\.max_steps"):
-        JobSpec.from_dict({"train": {"max_steps": value, "credit_assignment": "per_episode"}})
+        JobSpec.from_dict({"train": {"max_steps": value}})
 
 
 def test_max_steps_normalizes_non_positive_to_derived_fallback():
@@ -345,14 +345,9 @@ def test_from_dict_rejects_falsy_non_object_train(bad):
         JobSpec.from_dict({"train": bad})
 
 
-def test_from_dict_defaults_omitted_or_null_train_to_empty():
-    assert JobSpec.from_dict({}).train.credit_assignment == "per_episode"
-    assert JobSpec.from_dict({"train": None}).train.credit_assignment == "per_episode"
-
-
-def test_from_dict_rejects_persisted_train_without_credit_assignment():
-    with pytest.raises(ValueError, match="credit_assignment must be one of"):
-        JobSpec.from_dict({"train": {}})
+@pytest.mark.parametrize("payload", [{}, {"train": None}, {"train": {}}])
+def test_from_dict_defaults_missing_credit_assignment(payload):
+    assert JobSpec.from_dict(payload).train.credit_assignment == "per_episode"
 
 
 def test_from_dict_rejects_removed_legacy_train_seeds():

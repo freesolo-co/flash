@@ -243,11 +243,11 @@ def test_job_spec_from_dict_credit_assignment_validates_worker_boundary() -> Non
     payload = spec_from_dict(_raw(**{"train.credit_assignment": "per_turn"})).to_dict()
     assert _job_from_dict(payload).train.credit_assignment == "per_turn"
 
+    payload["train"].pop("credit_assignment", None)
+    assert JobSpec.from_dict(payload).train.credit_assignment == "per_episode"
+
     for invalid in (None, "", "  ", "per_step"):
-        if invalid is None:
-            payload["train"].pop("credit_assignment", None)
-        else:
-            payload["train"]["credit_assignment"] = invalid
+        payload["train"]["credit_assignment"] = invalid
         with pytest.raises(ValueError, match="credit_assignment must be one of"):
             JobSpec.from_dict(payload)
 
