@@ -47,14 +47,27 @@ def _legacy_adapter_is_multimodal(
 
     try:
         from flash.adapters.artifacts import loadable_adapter_weight_files
-        from flash.serve.export import _non_lm_tensor_is_live, _read_safetensors_header
+        from flash.serve.export import (
+            _load_bin_state,
+            _non_lm_liveness_from_key,
+            _non_lm_tensor_is_live,
+            _read_safetensors_header,
+        )
 
         selected = loadable_adapter_weight_files(os.listdir(adapter_dir))
-        if not selected or any(not name.endswith(".safetensors") for name in selected):
+        if not selected:
             return None
         unread = set(non_language_keys)
         for name in selected:
             path = Path(adapter_dir, name)
+            if name.endswith(".bin"):
+                state = _load_bin_state(path)
+                for key in unread & state.keys():
+                    decided = _non_lm_liveness_from_key(key)
+                    if decided is True or (decided is None and bool(state[key].any())):
+                        return True
+                    unread.remove(key)
+                continue
             header, data_start, file_size = _read_safetensors_header(path)
             with path.open("rb") as source:
                 for key in unread & header.keys():

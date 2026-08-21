@@ -264,6 +264,77 @@ def test_legacy_trained_vision_factors_cannot_warmstart_a_text_run(tmp_path):
         validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
 
 
+class _FakeBinTensor:
+    shape = (1, 1)
+
+    def __init__(self, live: bool):
+        self._live = live
+
+    def any(self):
+        return self._live
+
+
+def _write_legacy_bin_stub(path: Path) -> tuple[dict[str, object], dict[str, tuple[int, ...]]]:
+    language = "base_model.model.model.language_model.layers.0.self_attn.q_proj"
+    vision = "base_model.model.model.visual.blocks.0.attn.proj"
+    tensors = {
+        f"{language}.lora_A.weight": (1, 1),
+        f"{language}.lora_B.weight": (1, 1),
+        f"{vision}.lora_A.weight": (1, 1),
+        f"{vision}.lora_B.weight": (1, 1),
+    }
+    path.mkdir()
+    (path / "adapter_model.bin").write_bytes(b"stub")
+    config: dict[str, object] = {
+        "peft_type": "LORA",
+        "r": 1,
+        "lora_alpha": 2,
+        "target_modules": ["proj", "q_proj"],
+    }
+    (path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+    return config, tensors
+
+
+def _install_fake_bin_payload(monkeypatch, tensors, *, vision_b_live: bool) -> None:
+    import flash.engine.worker.model.adapter as adapter_module
+    import flash.serve.export as export_module
+
+    vision_b_key = next(key for key in tensors if "visual" in key and ".lora_B." in key)
+    state = {
+        key: _FakeBinTensor(live=vision_b_live if key == vision_b_key else False) for key in tensors
+    }
+    monkeypatch.setattr(adapter_module, "_read_adapter_tensor_metadata", lambda _path: tensors)
+    monkeypatch.setattr(export_module, "_load_bin_state", lambda _path: state)
+
+
+def test_legacy_bin_trained_vision_factors_cannot_warmstart_a_text_run(monkeypatch, tmp_path):
+    from flash.engine.worker.model.adapter import validate_warmstart_adapter
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
+    adapter = tmp_path / "legacy-bin-trained-vision"
+    source_config, tensors = _write_legacy_bin_stub(adapter)
+    _install_fake_bin_payload(monkeypatch, tensors, vision_b_live=True)
+
+    with pytest.raises(
+        ValueError,
+        match=r"text-only run cannot continue a multimodal \(image-trained\) adapter",
+    ):
+        validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
+
+
+def test_legacy_bin_inert_vision_factors_warmstart_a_text_run(monkeypatch, tmp_path):
+    from flash.engine.worker.model.adapter import validate_warmstart_adapter
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=False)
+    adapter = tmp_path / "legacy-bin-inert-vision"
+    source_config, tensors = _write_legacy_bin_stub(adapter)
+    _install_fake_bin_payload(monkeypatch, tensors, vision_b_live=False)
+
+    validate_warmstart_adapter(source_config, model_id, str(adapter), targeting)
+
+
 def test_legacy_modality_does_not_swallow_unexpected_classifier_errors(monkeypatch):
     import flash.engine.worker.model.adapter as adapter_module
 
