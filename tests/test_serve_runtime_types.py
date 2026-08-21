@@ -17,7 +17,9 @@ from flash.serve.runtime import (
     AdapterSpec,
     EngineConfig,
     GenerationRequest,
+    PromptError,
     RuntimeConfigurationError,
+    RuntimeNotReadyError,
     StructuredOutputsError,
     normalize_structured_outputs,
 )
@@ -345,6 +347,72 @@ def test_accepted_aliases_are_rendered_in_their_canonical_form(authored, canonic
 
     assert tokenizer.rendered[0] == canonical
     assert tokenizer.rendered[0] == tokenizer.rendered[1]
+
+
+@pytest.mark.parametrize("rejection", [TypeError("str + dict"), ValueError("bad shape")])
+def test_a_template_rejecting_the_request_is_a_client_error_not_an_unavailable_engine(
+    rejection: Exception,
+) -> None:
+    """the template, not the engine, is what refused -- and only the request chose that shape.
+
+    Structural validation upstream deliberately stops short of any single template's rules, so a
+    payload it accepts can still be unrenderable: Qwen3.5 raises `TypeError` on a tool call whose
+    `arguments` is the string the OpenAI schema specifies. Preparation runs before
+    `_rejection_as_prompt_error`, so an unclassified failure here answered 503 and invited a retry
+    that must fail identically, while the engine was healthy the whole time.
+    """
+
+    class _RejectingTokenizer(_Tokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            raise rejection
+
+    preparer = PromptPreparer(
+        EngineConfig(model="model", prompt_cache_size=0), _RejectingTokenizer(), None
+    )
+
+    import asyncio
+
+    with pytest.raises(PromptError) as raised:
+        asyncio.run(
+            preparer.prepare(
+                GenerationRequest(
+                    messages=[
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {"function": {"name": "f", "arguments": "{}"}},
+                            ],
+                        }
+                    ]
+                ),
+                False,
+            )
+        )
+
+    # `PromptError` is what the http layer maps to 400; a bare ValueError would not survive the
+    # trip, and a TypeError would not be classified at all.
+    assert isinstance(raised.value, ValueError)
+    assert "chat template rejected" in str(raised.value)
+
+
+def test_an_engine_fault_surfacing_through_the_template_is_not_blamed_on_the_caller() -> None:
+    # the mapping must name the caller only when the caller is the cause. a runtime fault that
+    # happens to surface inside the template keeps its own meaning, or a dead engine would be
+    # reported as a bad request and never trigger the liveness path.
+    class _FaultingTokenizer(_Tokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            raise RuntimeNotReadyError("engine died")
+
+    preparer = PromptPreparer(
+        EngineConfig(model="model", prompt_cache_size=0), _FaultingTokenizer(), None
+    )
+
+    import asyncio
+
+    with pytest.raises(RuntimeNotReadyError):
+        asyncio.run(
+            preparer.prepare(GenerationRequest(messages=[{"role": "user", "content": "hi"}]), False)
+        )
 
 
 def test_an_alias_shares_the_prompt_cache_entry_with_its_canonical_spelling() -> None:

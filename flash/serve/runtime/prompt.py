@@ -9,7 +9,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
-from .errors import MultimodalRequestError, PromptError
+from .errors import MultimodalRequestError, PromptError, ServingRuntimeError
 from .multimodal import has_image_blocks, normalize_text_messages, prepare_multimodal_request
 from .types import AdapterSpec, EngineConfig, GenerationRequest
 
@@ -133,13 +133,28 @@ class PromptPreparer:
         thinking: bool | None,
     ) -> list[int]:
         if messages is not None:
-            token_ids = self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=False,
-                **effective_chat_template_kwargs(request, thinking),
-            )
+            # a template rejects shapes its own vocabulary cannot render, and only the request
+            # decides that shape -- Qwen3.5 raises `TypeError` on a tool call whose `arguments` is
+            # the string the OpenAI schema specifies. Structural validation upstream deliberately
+            # stops short of any one template's rules, so these reach here. Unclassified, they
+            # escape before `_rejection_as_prompt_error` and answer 503, telling the caller to
+            # retry a request that must fail identically while the engine is perfectly healthy.
+            try:
+                token_ids = self._tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=False,
+                    **effective_chat_template_kwargs(request, thinking),
+                )
+            except ServingRuntimeError:
+                # an engine fault surfacing through the template keeps its own meaning.
+                raise
+            except Exception as exc:
+                # jinja raises its own error types, so this cannot enumerate them. `PromptError`
+                # names the caller as the cause, which is what a rendering failure over
+                # caller-supplied messages means.
+                raise PromptError(f"chat template rejected the request messages: {exc}") from exc
         else:
             token_ids = self._tokenizer.encode(request.prompt, add_special_tokens=False)
         try:
