@@ -833,7 +833,9 @@ def test_multimodal_export_publishes_the_vision_tensors_it_was_told_to_train(tmp
 
     saved = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
-    assert "exclude_modules" not in saved
+    # explicit null, not absent: presence is what marks this artifact multimodal for warm-start
+    # validation, and an absent key means "unmarked legacy artifact, guess from the tensors".
+    assert saved["exclude_modules"] is None
 
 
 def test_multimodal_export_still_requires_a_trained_language_tensor(tmp_path):

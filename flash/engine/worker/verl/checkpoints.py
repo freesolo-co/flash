@@ -727,10 +727,14 @@ def stamp_adapter_dir_provenance(
         raise RuntimeError("adapter base revision does not match the validated target commit")
     cfg["base_model_name_or_path"] = model_id
     cfg["revision"] = model_revision or None
-    if exclude_modules:
-        cfg["exclude_modules"] = exclude_modules
-    else:
-        cfg.pop("exclude_modules", None)
+    # write the key in BOTH directions, because its presence is the modality marker that
+    # `validate_warmstart_adapter` reads: a present `None` means multimodal, a present list means
+    # text-only, and only a genuinely absent key means "legacy artifact, guess from the tensors".
+    # popping it for the multimodal case would stamp a fresh multimodal adapter as unmarked, so
+    # warm start would fall back to the legacy tensor classifier -- and when that classifier
+    # cannot decide it returns None, which skips the mismatch gate and lets a text-only run
+    # continue an image-trained adapter.
+    cfg["exclude_modules"] = exclude_modules or None
     normalize_verl_fused_expert_export(cfg, model_id)
     validate_fused_expert_adapter_config(cfg, model_id)
     if lora_target_parameters(model_id):

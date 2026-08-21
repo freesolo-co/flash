@@ -381,7 +381,10 @@ def test_fused_export_accepts_the_visual_pair_a_multimodal_run_trained(monkeypat
 
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
-    assert "exclude_modules" not in saved
+    # the key is written as an explicit null rather than omitted: its presence is the modality
+    # marker warm-start validation reads, and peft 0.19.1 resolves an explicit null and an absent
+    # key to the same `exclude_modules=None`, so stating it costs nothing at load time.
+    assert saved["exclude_modules"] is None
     assert saved["base_model_name_or_path"] == _MODEL_ID
 
 
@@ -1605,3 +1608,57 @@ def test_tensor_analyzer_rejects_non_peft_fused_shapes(tensors, config):
     from flash.adapters.fused_experts import has_complete_fused_expert_tensors
 
     assert not has_complete_fused_expert_tensors(tensors, config, _MODEL_ID)
+
+
+@pytest.mark.parametrize(
+    ("exclude_modules", "stamped_multimodal"),
+    [(_TEXT_ONLY_EXCLUDE, False), (None, True)],
+)
+def test_stamped_modality_marker_survives_into_warmstart(
+    monkeypatch, tmp_path, exclude_modules, stamped_multimodal
+):
+    """The stamper's output must be readable as a modality marker by warm-start validation.
+
+    The two sides are written independently: `stamp_adapter_dir_provenance` decides what lands in
+    `adapter_config.json`, and `validate_warmstart_adapter` reads presence-vs-absence of that key
+    to classify modality. Every existing modality test hand-writes the config, so nothing pinned
+    that the stamper actually emits what the reader expects. It did not: popping the key for the
+    multimodal case stamped a fresh multimodal adapter as an unmarked legacy artifact.
+    """
+    import flash.engine.worker.model.adapter as adapter_module
+
+    stamp_adapter_dir_provenance = _patch_export_metadata(monkeypatch)
+    _write_expert_adapter(
+        tmp_path,
+        config={
+            "peft_type": "LORA",
+            "r": 32,
+            "lora_alpha": 64,
+            "target_modules": "all-linear",
+            "target_parameters": None,
+            "flash_provenance": {"source": "verl"},
+        },
+    )
+
+    stamp_adapter_dir_provenance(
+        str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=exclude_modules
+    )
+
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    # present in BOTH directions: absence is reserved for genuinely unmarked legacy artifacts.
+    assert "exclude_modules" in saved
+    assert (saved["exclude_modules"] is None) is stamped_multimodal
+
+    # and the reader classifies it from the marker, never by inspecting tensor values.
+    def unexpected_tensor_read(_path):
+        raise AssertionError("a stamped adapter must not fall back to the legacy classifier")
+
+    monkeypatch.setattr(adapter_module, "_read_adapter_tensor_metadata", unexpected_tensor_read)
+    _patch_worker_metadata(monkeypatch)
+    matching = resolve_lora_targeting(_MODEL_ID, algorithm="sft", multimodal=stamped_multimodal)
+    adapter_module.validate_warmstart_adapter(saved, _MODEL_ID, str(tmp_path), matching)
+
+    # the opposite-modality run must be rejected rather than silently allowed through.
+    opposing = resolve_lora_targeting(_MODEL_ID, algorithm="sft", multimodal=not stamped_multimodal)
+    with pytest.raises(ValueError, match="warm-start modality mismatch"):
+        adapter_module.validate_warmstart_adapter(saved, _MODEL_ID, str(tmp_path), opposing)
