@@ -128,6 +128,7 @@ def _normalize_messages(messages: Any) -> tuple[list[dict[str, Any]], list[str]]
             normalized.append(dict(message))
             continue
         if content is None and role == "assistant" and "tool_calls" in message:
+            _validate_tool_calls(message["tool_calls"], message_index)
             normalized.append(dict(message))
             continue
         if not isinstance(content, list):
@@ -137,6 +138,34 @@ def _normalize_messages(messages: Any) -> tuple[list[dict[str, Any]], list[str]]
         blocks = _normalize_blocks(content, role, message_index, sources)
         normalized.append({**message, "content": blocks})
     return normalized, sources
+
+
+def _validate_tool_calls(tool_calls: Any, message_index: int) -> None:
+    """require the shape every tool-aware template iterates over.
+
+    This branch exists to let an assistant message carry `tool_calls` *instead of* content, but it
+    only tested that the key was present, so `tool_calls: 1` or `"x"` reached the chat template and
+    raised a jinja `UndefinedError` from outside `_rejection_as_prompt_error` -- answered 503, which
+    tells the caller to retry a request that must fail identically.
+
+    Deliberately structural and no deeper. A template's real requirements are its own: Qwen3.5
+    renders `[{"function": {"name": "f"}}]` but raises `TypeError` on
+    `[{"function": {"name": "f", "arguments": "{}"}}]`, even though a string `arguments` is what the
+    OpenAI schema specifies. Encoding that here would bind this shared vocabulary to one template
+    and reject payloads a different one accepts, so this rejects only what no template can consume.
+    An empty list is rejected too: it means there are no calls, which leaves `content: null` with
+    nothing to render and is the empty-prompt case this branch is not for.
+    """
+
+    if not isinstance(tool_calls, list) or not tool_calls:
+        raise MultimodalRequestError(
+            f"message {message_index} tool_calls must be a nonempty list of call objects"
+        )
+    for call_index, call in enumerate(tool_calls):
+        if not isinstance(call, dict):
+            raise MultimodalRequestError(
+                f"message {message_index} tool call {call_index} must be an object"
+            )
 
 
 def _normalize_blocks(

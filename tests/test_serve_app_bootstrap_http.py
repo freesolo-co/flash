@@ -979,6 +979,36 @@ def test_the_packaged_app_exposes_exactly_its_documented_route_surface() -> None
         ("non-object block", [{"role": "user", "content": ["hello"]}]),
         ("unknown block type", [{"role": "user", "content": [{"type": "audio"}]}]),
         ("non-string text", [{"role": "user", "content": [{"type": "text", "text": 7}]}]),
+        # `tool_calls` used to be accepted on key presence alone, so a scalar reached the chat
+        # template and raised a jinja UndefinedError -- a 503 for input that can never render.
+        (
+            "scalar tool_calls",
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": 1},
+            ],
+        ),
+        (
+            "null tool_calls",
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": None},
+            ],
+        ),
+        (
+            "non-object tool call entries",
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [1, 2]},
+            ],
+        ),
+        (
+            "empty tool_calls",
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": []},
+            ],
+        ),
     ],
 )
 def test_a_malformed_message_is_rejected_before_the_runtime_is_reached(
