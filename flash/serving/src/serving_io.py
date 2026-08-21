@@ -26,7 +26,7 @@ from flash.serving.src.model_config import (
     is_supported_base_model,
     supports_image_input,
 )
-from flash.serving.src.multimodal import MultimodalRequestError, validate_multimodal_request
+from flash.serving.src.multimodal import MultimodalRequestError, normalize_chat_messages
 from flash.serving.src.persistence import PersistenceRecordError
 from flash.serving.src.schemas import AdapterRecord, GenerateRequest
 
@@ -235,22 +235,25 @@ async def _validate_alias_target(
 
 async def _prepare_generate_request(payload: Any, target: AdapterRecord) -> None:
     messages = getattr(payload, "messages", None)
-    # validate whenever any message uses list-form content so unsupported blocks
-    # (e.g. video) are rejected before dispatch; plain string-content requests still bypass.
-    if not isinstance(messages, list) or not any(
-        isinstance(message, dict) and isinstance(message.get("content"), list)
-        for message in messages
-    ):
+    if not isinstance(messages, list):
         return
+    # Validate EVERY message list, not only ones carrying list-form content. `GenerateRequest`
+    # only checks that this is a list of dicts, and the engine hands it straight to the chat
+    # template -- so a string-content request skipping this bypassed both halves of the shared
+    # contract: a malformed `{"role": "user"}` rendered as an empty prompt and billed the
+    # completion, and `developer` was never rewritten to `system` before gpu dispatch.
     try:
-        await asyncio.to_thread(
-            validate_multimodal_request,
+        normalized = await asyncio.to_thread(
+            normalize_chat_messages,
             messages,
             supports_images=supports_image_input(target.base_model),
             image_limit=image_limit_for(target.base_model),
         )
     except MultimodalRequestError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    # write the normalized list back so the engine templates what was validated, not the original
+    # spelling -- validation alone would still send `developer` through to the tokenizer.
+    payload.messages = normalized
 
 
 def _sse(data: dict[str, Any] | str) -> bytes:

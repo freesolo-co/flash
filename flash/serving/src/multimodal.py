@@ -83,20 +83,29 @@ def has_image_blocks(messages: Any) -> bool:
     return False
 
 
-def validate_multimodal_request(
+def normalize_chat_messages(
     messages: Any,
     *,
     supports_images: bool,
     image_limit: int | None,
-) -> None:
-    """Validate chat messages and fully decode images inside the safety boundary."""
+) -> list[dict[str, Any]]:
+    """Validate chat messages, decode images inside the safety boundary, and return the
+    template-ready list.
+
+    Returns the normalized messages rather than discarding them: role rewrites (`developer` ->
+    `system`) only take effect if the caller templates what was validated.
+    """
     template_messages, sources = _normalize_messages(messages)
-    del template_messages
-    if sources and not supports_images:
+    if not sources:
+        # text-only: nothing to decode, and no image capability to resolve. returning here keeps
+        # the shared shape/role checks universal while leaving the expensive image path untouched.
+        return template_messages
+    if not supports_images:
         raise MultimodalRequestError("the resolved base model does not support image input")
     images = _decode_images(sources, image_limit=image_limit)
     for image in images:
         image.close()
+    return template_messages
 
 
 def prepare_multimodal_request(

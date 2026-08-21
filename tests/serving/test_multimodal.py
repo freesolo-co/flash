@@ -19,8 +19,8 @@ from flash.serving.src.lora_engine import _LoraEngineImpl
 from flash.serving.src.multimodal import (
     MultimodalRequestError,
     has_image_blocks,
+    normalize_chat_messages,
     prepare_multimodal_request,
-    validate_multimodal_request,
 )
 from flash.serving.src.registry import AdapterRegistry
 from flash.serving.src.router import AdapterRouter, build_serving_app
@@ -105,7 +105,7 @@ def _tool_history_messages(*, with_image: bool) -> list[dict[str, Any]]:
 
 
 def _validate(messages: Any, *, supports_images: bool = True, image_limit: int | None = 4) -> None:
-    validate_multimodal_request(
+    normalize_chat_messages(
         messages,
         supports_images=supports_images,
         image_limit=image_limit,
@@ -718,6 +718,7 @@ def _alias(revision: AdapterRecord) -> AdapterRecord:
 class _Pool:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []
+        self.payloads: list[Any] = []
 
     async def generate(
         self,
@@ -729,6 +730,7 @@ class _Pool:
     ) -> dict[str, Any]:
         del expected_checkpoint
         self.calls.append((base_model, payload.adapter_id, record.adapter_id))
+        self.payloads.append(payload)
         return {
             "adapter_id": payload.adapter_id,
             # a real engine attests the adapter it actually resolved, which for a revision is the
@@ -751,6 +753,7 @@ class _Pool:
     ):
         del expected_checkpoint
         self.calls.append((base_model, payload.adapter_id, record.adapter_id))
+        self.payloads.append(payload)
         yield {"type": "ready", "checkpoint": record.checkpoint}
         yield {
             "type": "final",
@@ -787,15 +790,18 @@ def _client(base_model: str) -> tuple[TestClient, _Pool]:
     return TestClient(app, headers={"Authorization": "Bearer test"}), pool
 
 
-def test_text_only_tool_history_skips_multimodal_validation(monkeypatch) -> None:
-    def unexpected_multimodal_work(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("text-only requests must not enter multimodal validation")
+def test_text_only_tool_history_skips_image_decoding(monkeypatch) -> None:
+    """Text-only requests still get shape/role validation; only IMAGE work is skipped.
 
-    monkeypatch.setattr(
-        serving_io_module, "validate_multimodal_request", unexpected_multimodal_work
-    )
-    monkeypatch.setattr(serving_io_module, "supports_image_input", unexpected_multimodal_work)
-    monkeypatch.setattr(serving_io_module, "image_limit_for", unexpected_multimodal_work)
+    They used to bypass validation entirely, which let a malformed `{"role": "user"}` reach the
+    chat template and bill an empty completion. The cheap shared checks are now universal; what
+    a text-only request must still avoid is decoding images it does not have.
+    """
+
+    def unexpected_image_work(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("text-only requests must not decode images")
+
+    monkeypatch.setattr(multimodal, "_decode_images", unexpected_image_work)
     client, pool = _client(QWEN_2B)
     response = client.post(
         "/v1/chat/completions",
@@ -842,7 +848,7 @@ def test_all_message_entry_points_validate_against_resolved_model(
     validated: list[dict[str, Any]] = []
     supports_args: list[str] = []
     limit_args: list[str] = []
-    real_validate = serving_io_module.validate_multimodal_request
+    real_validate = serving_io_module.normalize_chat_messages
     real_supports = serving_io_module.supports_image_input
     real_limit = serving_io_module.image_limit_for
 
@@ -858,7 +864,7 @@ def test_all_message_entry_points_validate_against_resolved_model(
         limit_args.append(base_model)
         return real_limit(base_model)
 
-    monkeypatch.setattr(serving_io_module, "validate_multimodal_request", spy_validate)
+    monkeypatch.setattr(serving_io_module, "normalize_chat_messages", spy_validate)
     monkeypatch.setattr(serving_io_module, "supports_image_input", spy_supports)
     monkeypatch.setattr(serving_io_module, "image_limit_for", spy_limit)
     client, pool = _client(QWEN_2B)
@@ -1073,3 +1079,51 @@ def test_alias_request_attests_the_revision_it_resolved_to() -> None:
     )
     assert response.status_code == 200
     assert response.headers["X-Freesolo-LoRA-Request-Adapter"] == REVISION_ID
+
+
+@pytest.mark.parametrize(
+    ("messages", "expect"),
+    [
+        ([{"role": "user"}], "content must be a string"),
+        ([{"role": "user", "content": None}], "content must be a string"),
+        ([{"role": "nope", "content": "hi"}], "role must be"),
+    ],
+)
+def test_malformed_text_only_messages_are_rejected_before_gpu_dispatch(
+    messages: list[Any], expect: str
+) -> None:
+    """A text-only body used to skip validation entirely and bill an empty completion.
+
+    `GenerateRequest` only checks "list of dicts", and the engine hands the list straight to the
+    chat template, so `{"role": "user"}` rendered as an empty prompt and still charged the caller.
+    """
+    client, pool = _client(QWEN_2B)
+    response = client.post("/v1/chat/completions", json={"model": RUN_ID, "messages": messages})
+    assert response.status_code == 400
+    assert expect in response.text
+    assert pool.calls == [], "a malformed request must never reach the gpu"
+
+
+def test_developer_role_is_rewritten_to_system_for_text_only_requests() -> None:
+    """`developer` is OpenAI's successor to `system`; these models have no such role.
+
+    It was only rewritten when a request also carried list-form content, so a plain text chat
+    reached the tokenizer with a role the template may reject -- after gpu dispatch.
+    """
+    client, pool = _client(QWEN_2B)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": RUN_ID,
+            "messages": [
+                {"role": "developer", "content": "be terse"},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert pool.calls == [(QWEN_2B, REVISION_ID, REVISION_ID)]
+    sent = pool.payloads[-1].messages
+    assert [m["role"] for m in sent] == ["system", "user"], (
+        "the engine must template the normalized roles, not the original spelling"
+    )
