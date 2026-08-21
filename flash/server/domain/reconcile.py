@@ -89,9 +89,9 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     now = time.time() if now is None else now
     remote = status.remote or {}
     spec = status.spec or {}
-    # raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
-    # unknown launch rather than the epoch; falling back to created_at prevents inflated flat-rate
-    # instance billing.
+    # runpod's billing query needs a lower bound even though its endpoint invoice is authoritative.
+    # instance cost attribution independently requires a valid persisted started_ts and returns none
+    # when it is absent or malformed rather than substituting this bound.
     start = float(remote.get("started_ts") or status.created_at)
     # The run's true terminal time (~teardown / billing stop); see _terminal_ts for why this is
     # the frozen finished_at rather than the mutable updated_at (which deploy/heartbeat move past

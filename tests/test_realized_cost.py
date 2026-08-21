@@ -169,35 +169,41 @@ def test_instance_realized_cost_bills_launch_to_run_end_not_padded_end():
     assert rc.realized_usd == 2.0  # 1h x $2/hr
 
 
-def test_reconcile_run_falls_back_to_created_at_when_started_ts_missing_or_zero(monkeypatch):
-    """raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
-    unknown launch rather than the epoch; falling back to status.created_at prevents inflated
-    flat-rate instance billing."""
-    captured: dict = {}
+@pytest.mark.parametrize(
+    "started_ts",
+    [pytest.param(None, id="missing"), 0.0, -1.0, float("inf"), float("nan"), True],
+)
+def test_instance_realized_cost_rejects_invalid_launch_timestamp(started_ts):
+    remote = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29}
+    if started_ts is not None:
+        remote["started_ts"] = started_ts
 
-    def fake_realized(remote, **kw):
-        captured.update(kw)
-        return realized.RealizedCost(provider="lambda", realized_usd=1.0, by_resource={})
+    assert realized.realized_cost_for_remote(remote, start=100.0, end=4600.0) is None
 
-    monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
-    monkeypatch.setattr(reconcile, "_report", lambda body: True)
-    monkeypatch.setattr(runner, "record_realized_cost", lambda *a, **k: None)
+
+def test_reconcile_leaves_invalid_instance_launch_unsettled_and_due(monkeypatch):
     now = 1_000_000.0
-    created = now - 9000.0
-    for started in (0.0, None):  # explicit zero and absent values both fall back
-        captured.clear()
-        remote = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29}
-        if started is not None:
-            remote["started_ts"] = started
-        status = _status(
-            run_id="r-leg",
-            created_at=created,
-            updated_at=now - 7200,
-            finished_at=now - 7200,
-            remote=remote,
-        )
-        assert reconcile.reconcile_run(status, now=now) is True
-        assert captured["start"] == created, started  # NOT 0.0 / the 1970 epoch
+    status = _status(
+        run_id="r-invalid-launch",
+        created_at=now - 10_000.0,
+        updated_at=now - 7200.0,
+        finished_at=now - 7200.0,
+        remote={"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29},
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "_report",
+        lambda _body: pytest.fail("unattributable cost must not be reported"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "record_realized_cost",
+        lambda *_args, **_kwargs: pytest.fail("unattributable cost must remain unsettled"),
+    )
+
+    assert reconcile.reconcile_run(status, now=now) is False
+    assert status.reconciled_at is None
+    assert reconcile._due(status, now) is True
 
 
 def test_reconcile_uses_finished_at_not_deploy_bumped_updated_at_for_instance(monkeypatch):
