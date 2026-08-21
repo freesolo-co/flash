@@ -374,6 +374,61 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
         assert out.gpu_status["gpu_util_pct"] == 94
 
 
+def test_an_error_heartbeat_carries_gpu_diagnostics_through_to_status(monkeypatch):
+    """The failure heartbeat must spell its diagnostics `gpu`, the key the consumer reads.
+
+    an unread spelling is worse than a missing field here: `record_heartbeat` assigns `gpu_status`
+    unconditionally, so an error heartbeat whose diagnostics land under a key nothing reads CLEARS
+    the snapshot a healthy heartbeat already stored -- losing the evidence exactly when an oom
+    needs it. every other producer already spells it `gpu`.
+    """
+    import inspect
+    import tempfile as _tempfile
+
+    import flash.engine.worker as worker
+
+    # the producer half: the error path must not reintroduce a spelling the consumer ignores.
+    assert "diag=gpu_diagnostics()" not in inspect.getsource(worker)
+
+    with _tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+        from tests._helpers.profile import satisfy_sft_profile
+
+        spec = JobSpec(
+            run_id="hb-oom",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            environment=EnvironmentSpec(id="team/example"),
+            train=TrainSpec(max_examples=8),
+        )
+        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
+        status.state = "running"
+        runner._save_status(status)
+
+        runner.record_heartbeat(
+            "hb-oom",
+            {"stage": "sft_step", "step": 20, "gpu": {"device_name": "B200", "gpu_util_pct": 99}},
+        )
+        # the consumer half: the failure heartbeat's own diagnostics must survive, and must not be
+        # replaced by None just because the run is now failing.
+        runner.record_heartbeat(
+            "hb-oom",
+            {
+                "stage": "error_sft",
+                "oom": True,
+                "gpu": {"device_name": "B200", "memory_used_gb": 179.4},
+            },
+        )
+
+        out = runner.get_status("hb-oom")
+        assert out.gpu_status is not None, "the oom heartbeat cleared the gpu snapshot"
+        assert out.gpu_status["memory_used_gb"] == 179.4
+
+
 def test_status_sanitizer_preserves_metric_backlog_and_bounds_other_lists():
     import flash.runner as runner
 
