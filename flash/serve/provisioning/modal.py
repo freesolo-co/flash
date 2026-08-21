@@ -285,6 +285,7 @@ def _adopt_uncleaned(
     finalized: PhaseProof,
     inference_token: str,
     *,
+    expected: ExpectedResources | None = None,
     deadline_at: float,
     probe: EndpointProbe,
     clock: Clock,
@@ -304,7 +305,7 @@ def _adopt_uncleaned(
             sdk,
             inference_token,
             artifact_present=True,
-            expected=None,
+            expected=expected,
             transient_phases=(),
             deadline_at=deadline_at,
             probe=probe,
@@ -321,9 +322,13 @@ def _adopt_uncleaned(
         # drift -- a *replacement* app under the same names -- must stay a definite conflict rather
         # than be mistaken for someone else's successful reclaim.
         if not matches_transient(
-            observe(finalized_plan, sdk),
+            observe(
+                finalized_plan,
+                sdk,
+                app_id_hint=None if expected is None else expected.app_id,
+            ),
             TransientPhase(finalized_plan, False),
-            None,
+            expected,
         ):
             raise
         # hand it to the reclaim: the delete is name-addressed and `allow_missing`, so it is a
@@ -346,6 +351,103 @@ def _adopt_uncleaned(
         # `outcome_unknown` invites. reclaim follows proof, never precedes it.
         return unknown_result(finalized_plan, handle=finalized.handle)
     return _delete_artifact_and_confirm(
+        finalized_plan,
+        sdk,
+        proved,
+        inference_token,
+        deadline_at=deadline_at,
+        probe=probe,
+        clock=clock,
+        sleep=sleep,
+    )
+
+
+def _adopt_bootstrap(
+    bootstrap_plan: ModalCreatePlan,
+    finalized_plan: ModalCreatePlan,
+    sdk: ModalSdk,
+    bootstrap: PhaseProof,
+    inference_token: str,
+    *,
+    deadline_at: float,
+    probe: EndpointProbe,
+    clock: Clock,
+    sleep: Sleeper,
+) -> DeploymentResult:
+    artifact = bootstrap.artifact
+    assert artifact is not None
+    expected = ExpectedResources(
+        app_id=bootstrap.handle.app_id,
+        volume_id=bootstrap.handle.volume_id,
+        inference_secret_id=bootstrap.handle.inference_secret_id,
+        artifact_secret_id=artifact.id,
+    )
+    try:
+        proved = wait_for_phase(
+            bootstrap_plan,
+            sdk,
+            inference_token,
+            artifact_present=True,
+            expected=expected,
+            transient_phases=(),
+            deadline_at=deadline_at,
+            probe=probe,
+            clock=clock,
+            sleep=sleep,
+        )
+    except ModalResourceConflict:
+        successor = observe(finalized_plan, sdk, app_id_hint=expected.app_id)
+        with_artifact = TransientPhase(finalized_plan, True)
+        if matches_transient(successor, with_artifact, expected):
+            finalized = phase_proof(
+                finalized_plan,
+                successor,
+                artifact_present=True,
+                expected=expected,
+            )
+            return _adopt_uncleaned(
+                finalized_plan,
+                sdk,
+                finalized,
+                inference_token,
+                expected=expected,
+                deadline_at=deadline_at,
+                probe=probe,
+                clock=clock,
+                sleep=sleep,
+            )
+        cleaned = TransientPhase(finalized_plan, False)
+        if not matches_transient(successor, cleaned, expected):
+            raise
+        finalized = phase_proof(
+            finalized_plan,
+            successor,
+            artifact_present=False,
+            expected=expected,
+        )
+        proved = wait_for_phase(
+            finalized_plan,
+            sdk,
+            inference_token,
+            artifact_present=False,
+            expected=expected,
+            transient_phases=(),
+            deadline_at=deadline_at,
+            probe=probe,
+            clock=clock,
+            sleep=sleep,
+        )
+        if proved is not None:
+            return DeploymentResult.from_spec(
+                finalized_plan.bundle.spec,
+                status="ready",
+                handle=proved.handle,
+            )
+        return unknown_result(finalized_plan, handle=finalized.handle)
+    if proved is None:
+        return unknown_result(finalized_plan, handle=bootstrap.handle)
+    return _finalize_bootstrap(
+        bootstrap_plan,
         finalized_plan,
         sdk,
         proved,
@@ -425,52 +527,11 @@ def _adopt_existing(
         artifact_present=True,
         expected=None,
     )
-    # a single probe is capped at MAX_PROBE_TIMEOUT_SECONDS, so an adopted bootstrap app that is
-    # still cold answers nothing within that cap and used to end the whole rerun as
-    # `outcome_unknown` -- with most of the deadline unspent. wait for the phase instead, the same
-    # way `_adopt_uncleaned` waits on the finalized one, so a rerun can follow an in-progress
-    # invocation through bootstrap readiness and on into its finalized transition.
-    proved = wait_for_phase(
+    return _adopt_bootstrap(
         bootstrap_plan,
-        sdk,
-        inference_token,
-        artifact_present=True,
-        expected=None,
-        transient_phases=(),
-        deadline_at=deadline_at,
-        probe=probe,
-        clock=clock,
-        sleep=sleep,
-    )
-    if proved is None:
-        return unknown_result(finalized_plan, handle=bootstrap.handle)
-    bootstrap = proved
-    artifact = bootstrap.artifact
-    assert artifact is not None
-    expected = ExpectedResources(
-        app_id=bootstrap.handle.app_id,
-        volume_id=bootstrap.handle.volume_id,
-        inference_secret_id=bootstrap.handle.inference_secret_id,
-        artifact_secret_id=artifact.id,
-    )
-    finalized = wait_for_phase(
         finalized_plan,
         sdk,
-        inference_token,
-        artifact_present=True,
-        expected=expected,
-        transient_phases=(TransientPhase(bootstrap_plan, True),),
-        deadline_at=deadline_at,
-        probe=probe,
-        clock=clock,
-        sleep=sleep,
-    )
-    if finalized is None:
-        return unknown_result(finalized_plan, handle=bootstrap.handle)
-    return _delete_artifact_and_confirm(
-        finalized_plan,
-        sdk,
-        finalized,
+        bootstrap,
         inference_token,
         deadline_at=deadline_at,
         probe=probe,
@@ -752,6 +813,20 @@ def _abort_created_resources(
     return confirmed
 
 
+def _teardown_plan(
+    finalized_plan: ModalCreatePlan,
+    bootstrap_plan: ModalCreatePlan,
+    handle: ModalProviderHandle,
+    observation: ModalObservation,
+) -> ModalCreatePlan:
+    try:
+        exact_teardown_resources(finalized_plan, handle, observation)
+    except ModalResourceConflict:
+        exact_teardown_resources(bootstrap_plan, handle, observation)
+        return bootstrap_plan
+    return finalized_plan
+
+
 def _delete_teardown_resources(
     plan: ModalCreatePlan,
     sdk: ModalSdk,
@@ -780,13 +855,17 @@ def teardown_modal_deployment(
     """stop one exact app, delete exact resources once, and prove terminal absence."""
 
     validate_control_inputs(credentials, deadline_at, clock)
-    plan = build_modal_create_plan(bundle, phase="finalized")
-    _validate_handle(plan, handle)
+    finalized_plan = build_modal_create_plan(bundle, phase="finalized")
+    bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
+    _validate_handle(finalized_plan, handle)
+    plan = finalized_plan
     sdk: ModalSdk | None = None
     mutation_attempted = False
     try:
         sdk = open_sdk(sdk_factory, credentials, plan)
         observation = observe(plan, sdk, app_id_hint=handle.app_id)
+        if observation.apps and observation.apps[0].state == "deployed":
+            plan = _teardown_plan(finalized_plan, bootstrap_plan, handle, observation)
         app, _volume, _inference, _artifact = exact_teardown_resources(plan, handle, observation)
         if app is None:
             return unknown_result(plan, handle=handle)

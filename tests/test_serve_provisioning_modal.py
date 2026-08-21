@@ -631,11 +631,9 @@ def test_adoption_of_a_cold_bootstrap_app_waits_instead_of_probing_once() -> Non
         sleep=clock.sleep,
     )
 
-    # the fix is that the bootstrap phase is *waited on* rather than probed once. what happens after
-    # it warms up -- the finalized redeploy -- is a separate step this fake never performs, so the
-    # run still ends unproven; the regression is the probe count, which was capped at 1 before.
     assert probe.calls >= 3, "the cold bootstrap app was probed once, so no waiting happened"
-    assert result.status != "ready", "the fake never finalizes, so readiness cannot be claimed"
+    assert result.status == "ready"
+    assert ("deploy_app", "finalized") in sdk.calls
 
 
 def test_adoption_keeps_the_artifact_when_readiness_is_never_proven() -> None:
@@ -777,27 +775,100 @@ def test_exact_adoption_requires_authenticated_endpoint_provenance() -> None:
     assert factory.calls == []
 
 
-def test_existing_bootstrap_is_only_reconciled_and_never_blindly_finalized() -> None:
+def test_existing_bootstrap_is_finalized_by_the_sole_retry() -> None:
     bundle = _bundle()
     bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
     sdk = _FakeSdk(bootstrap_plan)
-    handle = _seed_exact(sdk, artifact=True)
+    _seed_exact(sdk, artifact=True)
     clock = _Clock()
 
     result = provision_modal_deployment(
         bundle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
-        deadline_at=4.0,
+        deadline_at=100.0,
         sdk_factory=lambda _credentials, _plan: sdk,
         probe=_Probe(True),
         clock=clock,
         sleep=clock.sleep,
     )
-    assert result.status == "outcome_unknown"
-    assert result.handle == handle
-    assert all(name == "observe" for name, _value in sdk.calls)
-    assert sdk.artifact
+    assert result.status == "ready"
+    assert [value for name, value in sdk.calls if name == "deploy_app"] == ["finalized"]
+    assert sdk.artifact == []
+
+
+@pytest.mark.parametrize("artifact_present", [True, False])
+def test_adoption_accepts_a_pinned_concurrent_finalized_successor(artifact_present: bool) -> None:
+    bundle = _bundle()
+    bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
+    finalized_plan = build_modal_create_plan(bundle, phase="finalized")
+    sdk = _FakeSdk(bootstrap_plan)
+    _seed_exact(sdk, artifact=True)
+    original_observe = sdk.observe
+    observations = 0
+
+    def racing_observe(observed_plan, *, app_id_hint=None):
+        nonlocal observations
+        observations += 1
+        if observations == 2:
+            sdk.apps[0] = replace(sdk.apps[0], tags=finalized_plan.tags)
+            if not artifact_present:
+                sdk.artifact.clear()
+        return original_observe(observed_plan, app_id_hint=app_id_hint)
+
+    sdk.observe = racing_observe  # type: ignore[assignment]
+    clock = _Clock()
+    result = provision_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan: sdk,
+        probe=_Probe(True),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "ready"
+    assert result.error_code is None
+    assert [value for name, value in sdk.calls if name == "deploy_app"] == []
+    assert sdk.artifact == []
+
+
+def test_adoption_rejects_identity_drift_during_a_concurrent_transition() -> None:
+    bundle = _bundle()
+    bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
+    finalized_plan = build_modal_create_plan(bundle, phase="finalized")
+    sdk = _FakeSdk(bootstrap_plan)
+    _seed_exact(sdk, artifact=True)
+    original_observe = sdk.observe
+    observations = 0
+
+    def drifting_observe(observed_plan, *, app_id_hint=None):
+        nonlocal observations
+        observations += 1
+        if observations == 2:
+            sdk.apps[0] = replace(sdk.apps[0], tags=finalized_plan.tags)
+            sdk.volumes[0] = replace(sdk.volumes[0], id="vo-" + "D" * 22)
+        return original_observe(observed_plan, app_id_hint=app_id_hint)
+
+    sdk.observe = drifting_observe  # type: ignore[assignment]
+    clock = _Clock()
+    result = provision_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan: sdk,
+        probe=_Probe(True),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "conflict"
+    assert observations == 3, "the phase conflict was not re-observed exactly once"
+    assert [name for name, _value in sdk.calls if name != "observe"] == []
 
 
 def test_opaque_secret_or_name_only_resources_are_refused_without_mutation() -> None:
@@ -1065,6 +1136,49 @@ def test_modal_resize_is_fixed_invalid_request_before_sdk_construction() -> None
         assert result.status == "failed"
         assert result.error_code == "invalid_request"
     assert calls == 0
+
+
+def test_teardown_stops_bootstrap_app_and_deletes_every_attached_resource() -> None:
+    bundle = _bundle()
+    factory = _Factory()
+
+    def failing_factory(credentials, plan):
+        sdk = factory(credentials, plan)
+        sdk.fail_operation = "deploy_finalized"
+        sdk.fail_with_sdk = True
+        return sdk
+
+    provisioned, _probe = _provision(bundle, failing_factory)
+    sdk = factory.sdk
+    assert sdk is not None
+    assert provisioned.status == "outcome_unknown"
+    assert provisioned.handle is not None
+    assert sdk.apps[0].tags == build_modal_create_plan(bundle, phase="bootstrap").tags
+    sdk.fail_operation = None
+    sdk.calls.clear()
+    clock = _Clock()
+
+    result = teardown_modal_deployment(
+        bundle,
+        provisioned.handle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan: sdk,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "absent"
+    assert [name for name, _value in sdk.calls if name != "observe"] == [
+        "stop_app",
+        "delete_artifact",
+        "delete_inference",
+        "delete_volume",
+    ]
+    assert sdk.apps[0].state == "stopped"
+    assert sdk.volumes == []
+    assert sdk.inference == []
+    assert sdk.artifact == []
 
 
 def test_teardown_stops_before_secret_and_volume_deletion_then_confirms_absence() -> None:
