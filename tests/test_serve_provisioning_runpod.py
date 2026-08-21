@@ -41,6 +41,7 @@ from flash.serve.provisioning._runpod_protocol import (
     template_payload,
     volume_payload,
 )
+from flash.serve.provisioning._runpod_resources import pod_identity_matches
 from flash.serve.provisioning._runpod_transport import (
     GRAPHQL_URL,
     REST_BASE_URL,
@@ -1089,6 +1090,46 @@ def test_teardown_deletes_pod_before_attached_volume_and_confirms_absence() -> N
     assert _mutation_calls(transport) == []
 
 
+class _PodOutlivesDeleteTransport(_FakeTransport):
+    """runpod accepts the pod delete but keeps listing the pod, as its teardown is asynchronous."""
+
+    def _delete(self, path: str) -> None:
+        if path.startswith("/pods/"):
+            return
+        super()._delete(path)
+
+
+def test_teardown_that_cannot_prove_the_pod_is_gone_is_unknown_not_failed() -> None:
+    """an unproved deletion must not be reported as a confirmed failure.
+
+    the pod may already be gone, or may still be live and billing. `failed` reads as "nothing
+    changed" and suppresses the cli's reconcile warning, so the user retries and double-provisions
+    a gpu they are already paying for. the modal teardown returns unknown for exactly this case.
+    """
+
+    bundle = _bundle()
+    transport = _PodOutlivesDeleteTransport()
+    handle = _seed_exact(transport, bundle)
+    factory = _Factory(transport)
+    clock = _Clock()
+    transport.calls.clear()
+
+    result = teardown_runpod_deployment(
+        bundle,
+        handle,
+        RunPodCredentials(PROVIDER_SECRET),
+        deadline_at=100.0,
+        transport_factory=factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "outcome_unknown"
+    # the delete was issued, and the pod outliving it is exactly what could not be confirmed.
+    assert f"DELETE /pods/{POD_ID}" in [call[1] for call in _mutation_calls(transport)]
+    assert transport.pods != []
+
+
 @pytest.mark.parametrize("status", ["STOPPED", "FAILED"])
 def test_teardown_accepts_exact_pods_in_nonready_statuses(status: str) -> None:
     bundle = _bundle()
@@ -1553,6 +1594,59 @@ def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> No
     )
     assert bare[0].network_volume_id is None
     assert bare[0].template_id is None
+
+
+def test_observation_survives_a_pod_waiting_for_its_machine() -> None:
+    # runpod omits `machine` entirely while a pod is CREATED or PENDING: placement is not decided
+    # yet, so there is no gpu type or data center to report. demanding them collapsed the whole
+    # account-wide listing into an opaque transport failure before `readiness_state` could classify
+    # the pending status -- so provisioning aborted instead of waiting for capacity, and any
+    # unrelated queued pod in the customer's account broke this deployment's observation too.
+    for status in ("CREATED", "PENDING"):
+        pending = parse_pods(
+            [
+                {
+                    "id": "abc123def45682",
+                    "name": "queued",
+                    "desiredStatus": status,
+                    "imageName": "pytorch/pytorch:2.6.0",
+                    "gpuCount": 1,
+                    "containerDiskInGb": 60,
+                    "ports": ["8000/http"],
+                }
+            ]
+        )
+        assert pending[0].gpu_type_id is None
+        assert pending[0].data_center_id is None
+
+    # an unplaced pod must never match the plan: `pod_identity_matches` compares both fields
+    # against nonempty plan values, so None simply never matches and cannot be adopted as ready.
+    plan = build_runpod_create_plan(_bundle())
+    assert not pod_identity_matches(
+        plan,
+        pending[0],
+        template_id="tpl0000001",
+        volume_id="vol0000001",
+    )
+
+    # absence must stay absence rather than become a wildcard: a placed pod is still parsed
+    # strictly, so this cannot mask a real schema change that starts sending malformed placement.
+    for malformed in ("", "  ", 7, True):
+        with pytest.raises(ValueError, match="pod gpuTypeId must be a nonempty unpadded string"):
+            parse_pods(
+                [
+                    {
+                        "id": "abc123def45683",
+                        "name": "malformed-placement",
+                        "desiredStatus": "RUNNING",
+                        "imageName": "pytorch/pytorch:2.6.0",
+                        "gpuCount": 1,
+                        "containerDiskInGb": 60,
+                        "ports": ["8000/http"],
+                        "machine": {"gpuTypeId": malformed, "dataCenterId": "US-KS-2"},
+                    }
+                ]
+            )
 
 
 def test_observation_survives_a_resource_that_exposes_no_ports() -> None:

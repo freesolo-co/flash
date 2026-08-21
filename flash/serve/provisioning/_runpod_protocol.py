@@ -104,9 +104,14 @@ class RunPodPodObservation:
     name: str
     desired_status: str
     image_name: str
-    gpu_type_id: str
+    # None until runpod assigns a machine. a CREATED or PENDING pod has no `machine` object yet, so
+    # placement is simply not decided. these are parsed account-wide like the two ids below, so
+    # demanding them failed the whole pass on any foreign pod still waiting for capacity -- and on
+    # our own, before it was placed. `pod_identity_matches` compares both against nonempty plan
+    # values, so None never matches and an unplaced pod is never mistaken for a ready one.
+    gpu_type_id: str | None
     gpu_count: int
-    data_center_id: str
+    data_center_id: str | None
     container_disk_gb: int
     # None when the pod has no network volume attached. every pod in the account is parsed during
     # observation, including ones flash did not create, and demanding an id there failed the whole
@@ -367,6 +372,15 @@ def parse_volumes(value: object) -> tuple[RunPodVolumeObservation, ...]:
     return tuple(parsed)
 
 
+def _first_present(*sources: tuple[dict[str, object], str]) -> object | None:
+    """first value whose key is actually present, or None when no source carries it."""
+
+    for mapping, key in sources:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
 def parse_pods(value: object) -> tuple[RunPodPodObservation, ...]:
     parsed = []
     for entry in _resource_rows(value, "pods"):
@@ -378,8 +392,12 @@ def parse_pods(value: object) -> tuple[RunPodPodObservation, ...]:
         machine = row.get("machine") if type(row.get("machine")) is dict else {}
         gpu = row.get("gpu") if type(row.get("gpu")) is dict else {}
         volume = row.get("networkVolume") if type(row.get("networkVolume")) is dict else {}
-        gpu_type = row.get("gpuTypeId") or machine.get("gpuTypeId") or gpu.get("id")
-        data_center = row.get("dataCenterId") or machine.get("dataCenterId")
+        # `or` would conflate "runpod has not assigned placement yet" with "it sent a malformed
+        # value": an empty string is falsy, so it would fall through to None and read as unplaced.
+        # presence of the key is what distinguishes them, so absence stays absence and anything
+        # actually sent is still validated.
+        gpu_type = _first_present((row, "gpuTypeId"), (machine, "gpuTypeId"), (gpu, "id"))
+        data_center = _first_present((row, "dataCenterId"), (machine, "dataCenterId"))
         network_volume = row.get("networkVolumeId") or volume.get("id")
         parsed.append(
             RunPodPodObservation(
@@ -387,9 +405,11 @@ def parse_pods(value: object) -> tuple[RunPodPodObservation, ...]:
                 name=_string(row.get("name"), "pod name"),
                 desired_status=_string(row.get("desiredStatus"), "pod desiredStatus"),
                 image_name=_string(row.get("imageName"), "pod imageName"),
-                gpu_type_id=_string(gpu_type, "pod gpuTypeId"),
+                gpu_type_id=(None if gpu_type is None else _string(gpu_type, "pod gpuTypeId")),
                 gpu_count=_positive_int(row.get("gpuCount"), "pod gpuCount"),
-                data_center_id=_string(data_center, "pod dataCenterId"),
+                data_center_id=(
+                    None if data_center is None else _string(data_center, "pod dataCenterId")
+                ),
                 container_disk_gb=_positive_int(
                     row.get("containerDiskInGb"), "pod containerDiskInGb"
                 ),

@@ -918,6 +918,11 @@ def teardown_runpod_deployment(
     _validate_control_inputs(credentials, deadline_at, clock)
     plan = build_runpod_create_plan(bundle)
     _validate_handle(plan, handle)
+    # once a delete has been issued, nothing after it can report a plain `failed`: the resource may
+    # already be gone, or may still be live and billing. `failed` reads as "nothing changed" and
+    # suppresses the cli's reconcile warning, inviting a retry that double-provisions. this mirrors
+    # `mutation_attempted` in the modal teardown, which returns unknown for exactly these cases.
+    mutation_attempted = False
     try:
         transport = _transport(transport_factory, credentials)
         observation = _observe(plan, transport, deadline_at=deadline_at)
@@ -925,6 +930,7 @@ def teardown_runpod_deployment(
             plan, handle, observation
         )
         if pod is not None:
+            mutation_attempted = True
             _delete_rest_once(transport, f"/pods/{pod.id}", deadline_at=deadline_at)
             if not _wait_for_pod_absence(
                 plan,
@@ -933,11 +939,11 @@ def teardown_runpod_deployment(
                 clock=clock,
                 sleep=sleep,
             ):
-                return _failure_result(
-                    plan,
-                    _LifecycleFailure("readiness_failed"),
-                    handle=handle,
-                )
+                # the delete was accepted but the pod was still listed at the deadline. absence was
+                # never proved, so this is ambiguous rather than a confirmed failure.
+                return _unknown_result(plan, handle=handle)
+        if any(resource is not None for resource in (template, volume, inference, artifact)):
+            mutation_attempted = True
         if template is not None:
             _delete_rest_once(transport, f"/templates/{template.id}", deadline_at=deadline_at)
         if volume is not None:
@@ -953,10 +959,14 @@ def teardown_runpod_deployment(
         final = _observe(plan, transport, deadline_at=deadline_at)
         if final.resource_count == 0:
             return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
-        return _failure_result(plan, _LifecycleFailure("readiness_failed"), handle=handle)
+        return _unknown_result(plan, handle=handle)
     except RunPodResourceConflict:
+        if mutation_attempted:
+            return _unknown_result(plan, handle=handle)
         return _failure_result(plan, _LifecycleFailure("conflict"), handle=handle)
     except RunPodTransportFailure as exc:
+        if mutation_attempted:
+            return _unknown_result(plan, handle=handle)
         return _failure_result(plan, _from_transport_failure(exc), handle=handle)
 
 

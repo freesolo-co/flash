@@ -196,8 +196,14 @@ runtime_secret = _runtime_secret()
 runtime_secrets = [runtime_secret] if runtime_secret is not None else []
 
 image = (
+    # cuda 13, not 12.8: `serve-runtime` below pins vllm 0.23.0, which requires torch 2.11.0, whose
+    # linux wheels depend on the -cu13 nvidia packages -- and vllm's own `_C` extension links
+    # libcudart.so.13. a 12.8 base still deploys clean, because pip resolves the cuda 13 stack
+    # regardless; the mismatch only surfaces later as `ImportError: libcudart.so.13` on a rented
+    # gpu. `Dockerfile.serve` pairs this same pin with a cuda 13 base and asserts the linkage at
+    # build time -- this image resolves the same bounds, so it needs the same pairing.
     modal.Image.from_registry(
-        "nvidia/cuda:12.8.0-devel-ubuntu22.04",
+        "nvidia/cuda:13.0.0-devel-ubuntu22.04",
         add_python="3.12",
     )
     .apt_install("build-essential", "git", "ninja-build")
