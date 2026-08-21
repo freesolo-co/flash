@@ -1527,7 +1527,13 @@ def test_stale_ready_record_refreshes_in_background():
     from httpx import ASGITransport, AsyncClient
 
     revision = _rec("qa", QWEN)
-    shared = {"rows": [revision, _alias(revision)]}
+    # A row this router does not start with. Its arrival is the only signal that a reload
+    # HYDRATED, as opposed to merely having been entered: the reload callback runs in a worker
+    # thread and counts itself on entry, while hydrate happens later, back on the event loop.
+    # Waiting on the counter would let the undeploy below land inside that gap and coalesce onto
+    # the in-flight fetch, which already snapshotted non-empty rows -- failing against correct code.
+    canary = _rec("canary", QWEN)
+    shared = {"rows": [revision, _alias(revision), canary, _alias(canary)]}
     reloads = {"count": 0}
 
     def _reload():
@@ -1542,34 +1548,29 @@ def test_stale_ready_record_refreshes_in_background():
 
     async def _scenario():
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as ac:
-            assert (
-                await ac.post(
+
+            async def _generate(adapter_id: str) -> int:
+                response = await ac.post(
                     "/generate",
-                    json={"adapter_id": "qa", "prompt": "hi"},
+                    json={"adapter_id": adapter_id, "prompt": "hi"},
                     headers={"Authorization": "Bearer t"},
                 )
-            ).status_code == 200
-            # wait for the first refresh to COMPLETE before changing storage. without this the
-            # scheduled refresh can observe the already-cleared rows, so the test passes on the
-            # FIRST reload and never proves a later TTL window still refreshes -- code that
-            # poisons the ttl clock after one successful reload would serve an undeployed adapter
-            # forever and still pass here.
+                return response.status_code
+
+            # Serve on BOTH ids while deployed. Priming the immutable id matters: a cache keyed on
+            # "immutable revisions never change" is only reachable once the revision has resolved.
+            assert await _generate("qa") == 200
+            assert await _generate(_revision_id("qa")) == 200
             for _ in range(100):
-                if reloads["count"] >= 1:
+                if router.has("canary"):
                     break
                 await asyncio.sleep(0.01)
-            assert reloads["count"] >= 1, "the first background refresh never ran"
+            assert router.has("canary"), "the first background refresh never hydrated"
             settled = reloads["count"]
             # Another container undeploys qa: it drops out of the status=ready reload.
             shared["rows"] = []
             # This hit is stale, but still cached: serve it and schedule the refresh.
-            assert (
-                await ac.post(
-                    "/generate",
-                    json={"adapter_id": "qa", "prompt": "hi"},
-                    headers={"Authorization": "Bearer t"},
-                )
-            ).status_code == 200
+            assert await _generate("qa") == 200
             for _ in range(50):
                 if not router.has("qa"):
                     break
@@ -1577,14 +1578,12 @@ def test_stale_ready_record_refreshes_in_background():
             assert not router.has("qa")
             # a genuinely LATER refresh did the work, not the one that had already settled.
             assert reloads["count"] > settled, "the ttl window stopped refreshing after the first"
-            # After the background refresh, it is no longer routed here.
-            assert (
-                await ac.post(
-                    "/generate",
-                    json={"adapter_id": "qa", "prompt": "hi"},
-                    headers={"Authorization": "Bearer t"},
-                )
-            ).status_code == 404
+            # After the background refresh, NEITHER id is routed here. The immutable id is the one
+            # that matters: `resolve` answers a ready revision directly, so anything that holds one
+            # past its undeploy keeps serving an adapter that no longer exists -- invisible to the
+            # alias, and invisible to the registry if the staleness lives downstream of it.
+            assert await _generate("qa") == 404
+            assert await _generate(_revision_id("qa")) == 404
 
     asyncio.run(_scenario())
 
