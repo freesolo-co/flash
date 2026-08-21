@@ -124,13 +124,13 @@ def test_an_agreeing_config_resolves(monkeypatch, tmp_path) -> None:
 
 @pytest.mark.parametrize(
     ("overrides", "expected"),
-    (
+    [
         ({"peft_type": "IA3"}, "peft_type must be LORA"),
         ({"peft_type": None}, "peft_type must be LORA"),
         ({"task_type": "SEQ_CLS"}, "task_type must be absent or CAUSAL_LM"),
         ({"modules_to_save": ["lm_head"]}, "modules_to_save"),
         ({"revision": 7}, "revision must be a string"),
-    ),
+    ],
 )
 def test_a_config_the_container_will_refuse_is_rejected_before_provisioning(
     monkeypatch, tmp_path, overrides: dict, expected: str
