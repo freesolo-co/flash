@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.steps import (
     final_save_due,
@@ -13,7 +14,7 @@ from flash.engine.plan.steps import (
     sft_update_steps,
     validate_save_steps,
 )
-from flash.schema import ConfigError, spec_and_train_keys_from_file
+from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 
 _BASE_TOML = """
 model = "Qwen/Qwen3.5-0.8B"
@@ -400,3 +401,38 @@ def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
     )
     with pytest.raises(ConfigError, match="platform-managed key"):
         spec_and_train_keys_from_file(str(path))
+
+
+def _spec_with_declared_secret(algorithm: str, secret: str) -> dict:
+    return {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": algorithm,
+        "environment": {"id": "owner/project/env", "secrets": [secret]},
+        "train": {"epochs": 1},
+    }
+
+
+@pytest.mark.parametrize("secret", GRPO_NATIVE_THREAD_ENV)
+@pytest.mark.parametrize("algorithm", ["sft", "opd"])
+def test_non_grpo_authoring_accepts_grpo_native_thread_secrets(algorithm, secret):
+    spec = spec_from_dict(_spec_with_declared_secret(algorithm, secret))
+
+    assert spec.environment.secrets == (secret,)
+
+
+@pytest.mark.parametrize("secret", GRPO_NATIVE_THREAD_ENV)
+def test_grpo_authoring_rejects_native_thread_secrets(secret):
+    with pytest.raises(
+        ConfigError,
+        match=rf"\[environment\] secrets must not include platform-managed key\(s\): {secret}",
+    ):
+        spec_from_dict(_spec_with_declared_secret("grpo", secret))
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "opd", "grpo"])
+def test_all_algorithms_reject_unconditional_control_plane_secrets(algorithm):
+    with pytest.raises(
+        ConfigError,
+        match=r"\[environment\] secrets must not include platform-managed key\(s\): SEED",
+    ):
+        spec_from_dict(_spec_with_declared_secret(algorithm, "SEED"))

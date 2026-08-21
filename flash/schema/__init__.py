@@ -385,7 +385,7 @@ def _validate_top_level(
 
 
 def _validate_environment_section(
-    raw: dict[str, Any],
+    raw: dict[str, Any], algorithm: str
 ) -> tuple[dict[str, Any], tuple[str, ...], tuple[str, ...]]:
     """Validate the environment section, returning it with the parsed pip and secrets tuples."""
     # use `is none` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
@@ -406,7 +406,7 @@ def _validate_environment_section(
     if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
         raise ConfigError("[environment] params must be a table")
     environment_pip = _environment_pip(env_raw.get("pip"))
-    environment_secrets = _environment_secrets(env_raw.get("secrets"))
+    environment_secrets = _environment_secrets(env_raw.get("secrets"), algorithm)
     return env_raw, environment_pip, environment_secrets
 
 
@@ -592,7 +592,7 @@ def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
 ) -> JobSpec:
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
-    env_raw, environment_pip, environment_secrets = _validate_environment_section(raw)
+    env_raw, environment_pip, environment_secrets = _validate_environment_section(raw, algorithm)
     train_raw = _validate_train_section(raw, algorithm)
     if algorithm == "grpo":
         try:

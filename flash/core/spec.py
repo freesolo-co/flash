@@ -27,7 +27,6 @@ from uuid import UUID
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
-from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec_persistence import (
     DROPPED_TOP_LEVEL_KEYS,
     REMOVED_PERSISTED_TRAIN_KEYS,
@@ -268,7 +267,6 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
         # by that list and fail at runtime. control-plane-owned, hence rejected at declaration.
         SECRET_ENV_KEYS_ENV,
         *MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
-        *GRPO_NATIVE_THREAD_ENV,
     }
 )
 

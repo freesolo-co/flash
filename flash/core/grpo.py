@@ -22,6 +22,7 @@ GRPO_NATIVE_THREAD_ENV: Mapping[str, str] = MappingProxyType(
         "TOKENIZERS_PARALLELISM": "false",
     }
 )
+GRPO_CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(GRPO_NATIVE_THREAD_ENV)
 
 
 @dataclass(frozen=True)

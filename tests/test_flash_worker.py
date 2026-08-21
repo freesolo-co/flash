@@ -300,14 +300,47 @@ def test_the_redactor_metadata_name_is_reserved_from_declared_secrets():
 
     assert SECRET_ENV_KEYS_ENV in CONTROL_PLANE_OWNED_ENV_KEYS
     with pytest.raises(ConfigError, match="platform-managed key"):
-        _environment_secrets([SECRET_ENV_KEYS_ENV])
+        _environment_secrets([SECRET_ENV_KEYS_ENV], "grpo")
     # a case variant is a distinct linux env name but not a distinct DECLARATION: build_worker_env
     # tests ownership on the uppercased name, so accepting it here would drop the secret from the
     # worker env without a word and launch the job missing a credential it declared as required.
     # every reserved name is refused across its whole case-space for that reason.
     for variant in (SECRET_ENV_KEYS_ENV.lower(), "Hf_Token", "runpod_api_key"):
         with pytest.raises(ConfigError, match="platform-managed key"):
-            _environment_secrets([variant])
+            _environment_secrets([variant], "grpo")
+
+
+def test_grpo_worker_env_keeps_native_thread_policy_managed():
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+    from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
+    from flash.core.spec import EnvironmentSpec, JobSpec
+    from flash.providers.runpod.serverless import build_worker_env
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="owner/project/env", secrets=("OMP_NUM_THREADS",)),
+    )
+    env = build_worker_env(spec, spec.seed, runtime_secrets={"OMP_NUM_THREADS": "999"})
+
+    assert env["OMP_NUM_THREADS"] == GRPO_NATIVE_THREAD_ENV["OMP_NUM_THREADS"]
+    assert "OMP_NUM_THREADS" not in set(env.get(SECRET_ENV_KEYS_ENV, "").split(","))
+
+
+def test_sft_worker_env_forwards_declared_native_thread_secret():
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+    from flash.core.spec import EnvironmentSpec, JobSpec
+    from flash.providers.runpod.serverless import build_worker_env
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        environment=EnvironmentSpec(id="owner/project/env", secrets=("OMP_NUM_THREADS",)),
+    )
+    env = build_worker_env(spec, spec.seed, runtime_secrets={"OMP_NUM_THREADS": "7"})
+
+    assert env["OMP_NUM_THREADS"] == "7"
+    assert "OMP_NUM_THREADS" in set(env[SECRET_ENV_KEYS_ENV].split(","))
 
 
 def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
@@ -319,9 +352,9 @@ def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
     from flash.schema.fields import ConfigError, _environment_secrets
 
     with pytest.raises(ConfigError, match="invalid environment variable name"):
-        _environment_secrets(["FOO,BAR"])
+        _environment_secrets(["FOO,BAR"], "grpo")
     # a name-shaped secret is still fine; only the delimiter is refused.
-    assert _environment_secrets(["AWS_SECRET_ACCESS_KEY"]) == ("AWS_SECRET_ACCESS_KEY",)
+    assert _environment_secrets(["AWS_SECRET_ACCESS_KEY"], "grpo") == ("AWS_SECRET_ACCESS_KEY",)
 
     # and the metadata builder fails closed rather than emitting an ambiguous list, for a spec
     # constructed around the parser.
