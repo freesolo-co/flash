@@ -173,11 +173,12 @@ def test_save_step_validation_rejects_unreachable_runtime_step():
 
 
 @pytest.mark.parametrize("interval", [0, -1, -20])
-def test_nonpositive_save_every_canonicalizes_to_the_unset_sentinel(interval):
-    # the public schema rejects these, but a persisted or internally built spec reaches TrainSpec
-    # directly. without canonicalization the horizon clamp reads a signed interval as one and
-    # checkpoints every optimizer step.
-    assert TrainSpec(save_every=interval).save_every is None
+def test_nonpositive_save_every_is_rejected(interval):
+    with pytest.raises(ValueError, match=r"train\.save_every must be positive"):
+        TrainSpec(save_every=interval)
+
+
+def test_positive_save_every_is_preserved():
     assert TrainSpec(save_every=20).save_every == 20
 
 
@@ -344,9 +345,10 @@ def test_from_dict_rejects_falsy_non_object_train(bad):
         JobSpec.from_dict({"train": bad})
 
 
-def test_from_dict_defaults_omitted_or_null_train_to_empty():
-    assert JobSpec.from_dict({}).seed == FIXED_SEED
-    assert JobSpec.from_dict({"train": None}).train.max_steps is None
+@pytest.mark.parametrize("payload", [{}, {"train": None}])
+def test_from_dict_rejects_persisted_specs_without_credit_assignment(payload):
+    with pytest.raises(ValueError, match="credit_assignment must be one of"):
+        JobSpec.from_dict(payload)
 
 
 def test_from_dict_rejects_removed_legacy_train_seeds():

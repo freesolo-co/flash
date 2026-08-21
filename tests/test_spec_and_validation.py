@@ -54,7 +54,12 @@ def _raw(**overrides) -> dict:
 
 
 def _job_from_dict(data: dict) -> JobSpec:
-    return JobSpec.from_dict({"project": "11111111-1111-4111-8111-111111111111", **data})
+    payload = {"project": "11111111-1111-4111-8111-111111111111", **data}
+    if "train" not in payload:
+        payload["train"] = {"credit_assignment": "per_episode"}
+    elif isinstance(payload["train"], dict) and "credit_assignment" not in payload["train"]:
+        payload["train"] = {**payload["train"], "credit_assignment": "per_episode"}
+    return JobSpec.from_dict(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +211,8 @@ def test_project_id_is_required_canonicalized_and_roundtrips() -> None:
         spec_from_dict(_raw(project="   "), project_required=True)
     with pytest.raises(ConfigError, match="project must be a valid UUID"):
         spec_from_dict(_raw(project="not-a-uuid"))
-    assert JobSpec.from_dict({"model": "Qwen/Qwen3.5-0.8B"}).project == ""
+    persisted = JobSpec(model="Qwen/Qwen3.5-0.8B").to_internal_dict()
+    assert JobSpec.from_dict(persisted).project == ""
 
     synthetic = JobSpec(model="Qwen/Qwen3.5-0.8B")
     assert synthetic.project == ""
@@ -234,17 +240,26 @@ def test_credit_assignment_rejects_invalid_values(invalid: object) -> None:
 
 
 def test_job_spec_from_dict_credit_assignment_validates_worker_boundary() -> None:
-    # the worker-side deserialization boundary must round-trip valid modes, default a missing value,
-    # and reject a malformed persisted/tampered value rather than silently downgrading to per-episode.
     payload = spec_from_dict(_raw(**{"train.credit_assignment": "per_turn"})).to_dict()
     assert _job_from_dict(payload).train.credit_assignment == "per_turn"
 
-    payload["train"].pop("credit_assignment", None)
-    assert _job_from_dict(payload).train.credit_assignment == "per_episode"
+    for invalid in (None, "", "  ", "per_step"):
+        if invalid is None:
+            payload["train"].pop("credit_assignment", None)
+        else:
+            payload["train"]["credit_assignment"] = invalid
+        with pytest.raises(ValueError, match="credit_assignment must be one of"):
+            JobSpec.from_dict(payload)
 
-    payload["train"]["credit_assignment"] = "per_step"
-    with pytest.raises(ValueError, match="credit_assignment must be one of"):
-        _job_from_dict(payload)
+
+def test_job_spec_from_dict_rejects_nonpositive_save_every() -> None:
+    payload = spec_from_dict(_raw(**{"train.save_every": 20})).to_dict()
+    assert _job_from_dict(payload).train.save_every == 20
+
+    for invalid in (0, -1, -20):
+        payload["train"]["save_every"] = invalid
+        with pytest.raises(ValueError, match=r"train\.save_every must be positive"):
+            _job_from_dict(payload)
 
 
 def test_train_key_validator_rejects_unknown_names_only() -> None:
@@ -411,10 +426,24 @@ def test_internal_from_dict_round_trips_stored_lora_alpha() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16, "lora_alpha": 48},
+        "train": {
+            "epochs": 1,
+            "max_examples": 8,
+            "lora_rank": 16,
+            "lora_alpha": 48,
+            "credit_assignment": "per_episode",
+        },
     }
     assert JobSpec.from_dict(base).train.lora_alpha == 48  # present -> round-trip
-    absent = {**base, "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16}}
+    absent = {
+        **base,
+        "train": {
+            "epochs": 1,
+            "max_examples": 8,
+            "lora_rank": 16,
+            "credit_assignment": "per_episode",
+        },
+    }
     assert JobSpec.from_dict(absent).train.lora_alpha == 32  # absent -> derive 2 x rank
 
 
