@@ -1535,16 +1535,12 @@ def test_stale_ready_record_refreshes_in_background():
     canary = _rec("canary", QWEN)
     shared = {"rows": [revision, _alias(revision), canary, _alias(canary)]}
     reloads = {"count": 0}
-    # plain scalars, read before production is handed the records. the router stores the instances
-    # it is given, so anything derived from those objects would move with a corruption instead of
-    # catching it.
-    material = (
-        revision.repo_id,
-        revision.base_model,
-        revision.checkpoint,
-        revision.org_id,
-        revision.metadata["hf_revision"],
-    )
+    # a deep copy, taken before production is handed the records: the router stores the instances
+    # it is given, so an expectation derived from those objects would move with a corruption
+    # instead of catching it. the whole record rather than a list of fields -- naming fields means
+    # the ones left out (subfolder, repo_type, private, url) can be rewritten by a refresh and
+    # still route from the wrong material with every assertion green.
+    material = revision.model_copy(deep=True)
 
     def _reload():
         reloads["count"] += 1
@@ -1555,15 +1551,6 @@ def test_stale_ready_record_refreshes_in_background():
     app = build_serving_app(
         pool, router, reload_records=_reload, reload_interval_seconds=0.0, chat_authorizer=_allow
     )
-
-    def _served_material(record):
-        return (
-            record.repo_id,
-            record.base_model,
-            record.checkpoint,
-            record.org_id,
-            record.metadata["hf_revision"],
-        )
 
     async def _scenario():
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as ac:
@@ -1598,12 +1585,10 @@ def test_stale_ready_record_refreshes_in_background():
             # codes alone would keep passing while every request is served from the wrong weights.
             refreshed = router.get(_revision_id("qa"))
             assert refreshed is not None, "the refresh dropped the revision it re-fetched"
-            assert _served_material(refreshed) == material, (
+            assert refreshed == material, (
                 f"the refresh replaced the revision's material: {refreshed}"
             )
-            assert [_served_material(record) for record in pool.generated_records] == [
-                material
-            ] * 2, (
+            assert pool.generated_records == [material] * 2, (
                 f"the engine was handed material other than the record storage returned: "
                 f"{pool.generated_records}"
             )
