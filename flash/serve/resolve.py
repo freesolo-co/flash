@@ -181,8 +181,21 @@ def _declared_provenance(config_path: str | None) -> tuple[int | None, str | Non
         raise ResolveError(f"{ADAPTER_CONFIG} declares no usable lora rank: {exc}") from exc
 
     def _text(key: str) -> str | None:
+        """read a config string exactly as the container will compare it.
+
+        `_validate_adapter_config` compares these raw bytes for equality, so a value that matches
+        only after stripping resolved clean here and was then rejected inside the paid container --
+        the outcome this function exists to prevent. normalizing the padding away instead would be
+        worse for `revision`, which the resolver *adopts* into the immutable manifest: that would
+        launder a padded string into the record rather than surface it. rejecting keeps the
+        resolve-time and container-time verdicts identical.
+        """
         value = config.get(key)
-        return value.strip() or None if isinstance(value, str) else None
+        if not isinstance(value, str):
+            return None
+        if value != value.strip():
+            raise ResolveError(f"{ADAPTER_CONFIG} {key} has surrounding whitespace: {value!r}")
+        return value or None
 
     # the container compares `base_model_name_or_path` for equality, so an absent, empty, or
     # non-string one can never match and the deployment is already doomed. returning None here

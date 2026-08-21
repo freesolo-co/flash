@@ -174,6 +174,35 @@ def test_a_config_the_container_accepts_still_resolves(monkeypatch, tmp_path) ->
     assert _resolve().adapter.lora_rank == 32
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"base_model_name_or_path": f"{BASE} "}, id="base-trailing"),
+        pytest.param({"base_model_name_or_path": f" {BASE}"}, id="base-leading"),
+        pytest.param({"revision": f"{BASE_REVISION} "}, id="revision-trailing"),
+    ],
+)
+def test_padded_provenance_is_rejected_before_provider_resources_exist(
+    monkeypatch, tmp_path, overrides: dict
+) -> None:
+    """A value that matches only after stripping must not resolve.
+
+    `_validate_adapter_config` compares these raw bytes for equality inside the container, so a
+    padded value it will refuse used to pass resolution, provision, and start billing before
+    failing -- the exact outcome this guard exists to prevent. Normalizing the padding away
+    instead would be worse for `revision`, which the resolver *adopts* into the immutable
+    manifest: that would launder a padded string into the deployment record rather than surface it.
+    """
+    _install_hub(
+        monkeypatch,
+        tmp_path,
+        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": BASE, **overrides},
+    )
+
+    with pytest.raises(ResolveError, match="surrounding whitespace"):
+        _resolve()
+
+
 def test_an_unreadable_config_is_a_resolve_error(monkeypatch, tmp_path) -> None:
     (tmp_path / ADAPTER_CONFIG).write_text("{not json", encoding="utf-8")
     (tmp_path / ADAPTER_WEIGHTS).write_bytes(b"weights-bytes")
