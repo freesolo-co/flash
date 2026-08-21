@@ -828,6 +828,7 @@ def stamp_adapter_dir_provenance(
         # exempt for the same reason as the non-moe path: warm start admits a legacy adapter
         # carrying zero-delta visual factors, peft rebuilds them from that source config, and
         # rejecting them on presence would make the run unpublishable after it already trained.
+        pair_tensors = tensors
         if not multimodal:
             carried = {key for key in tensors if is_non_language_lora_key(key)}
             live = carried - _inert_non_language_keys(adapter_dir, carried)
@@ -835,8 +836,14 @@ def stamp_adapter_dir_provenance(
                 raise RuntimeError(
                     f"exported text adapter contains non-language tensor {sorted(live)[0]!r}"
                 )
-            tensors = {key: shape for key, shape in tensors.items() if key not in carried}
-        pairs = fused_expert_lora_tensor_pairs(tensors, cfg, model_id)
+            # prune ONLY the pair input. `_validate_adapter_tensor_values` re-reads every tensor
+            # on disk and requires its key set to equal `metadata` exactly, so handing it the
+            # pruned map would fail as "tensor sources disagree with their metadata" on precisely
+            # the grandfathered artifact the skip above exists to admit. the inert keys still get
+            # their finite-value check that way; they are excluded only from pair evidence, which
+            # is what `fused_expert_lora_tensor_pairs` would otherwise count as real.
+            pair_tensors = {key: shape for key, shape in tensors.items() if key not in carried}
+        pairs = fused_expert_lora_tensor_pairs(pair_tensors, cfg, model_id)
         if pairs is None:
             raise RuntimeError(
                 f"exported adapter for {model_id} does not contain complete fused expert LoRA "

@@ -8,6 +8,7 @@ CPU-only; the per-key REST call is mocked.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import urllib.error
@@ -809,3 +810,73 @@ def test_poll_survives_an_unrelated_unverifiable_cleanup_record(tmp_path, monkey
     # own legacy prefix upgraded to the full fingerprint before the call.
     assert result.ok is True
     assert polled == {"fingerprint": live_fingerprint, "job_id": "job-1"}
+
+
+def test_attach_survives_an_unrelated_unverifiable_cleanup_record(tmp_path, monkeypatch):
+    """Restart recovery must not die because some OTHER historical record cannot be verified.
+
+    `attach_run` calls the fingerprint migration ABOVE its own try, and the restart sweep
+    dispatches it as a bare daemon thread. So an all-or-nothing migration here kills recovery
+    silently: the run stays nonterminal and its remote keeps billing, with no handler reached.
+    Same shape as the poll, cancel, and drain sites; this one was missed.
+    """
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+    from flash.providers.runpod import api
+    from flash.runner.supervise.attach import attach_run
+
+    key = "still-in-the-pool"
+    live_fingerprint = api.key_fingerprint(key)
+
+    def record(endpoint_id, fingerprint, job_id=None):
+        return {
+            "provider": "runpod",
+            "endpoint_id": endpoint_id,
+            "endpoint_name": f"flash-{endpoint_id}",
+            "key_fingerprint": fingerprint,
+            "job_id": job_id,
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+
+    departed = api.key_fingerprint("departed-owner")[:16]
+    spec = JobSpec(run_id="attach-unrelated-stale", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path))
+    runner._save_status(
+        runner.RunStatus(
+            run_id="attach-unrelated-stale",
+            state="running",
+            spec=spec.to_dict(),
+            remote=record("ep-live", live_fingerprint[:16], job_id="job-1"),
+        ),
+        _cleanup_remotes=[record("ep-departed", departed)],
+    )
+    monkeypatch.setattr(api._keys, "keys", lambda: [key])
+    monkeypatch.setattr(
+        api._CLIENT,
+        "request_with_retries_for_key",
+        lambda *_a, **_k: [{"id": "ep-live"}],
+    )
+
+    # stop right after the migration: reaching the handle proves the migration did not escape,
+    # which is the whole contract under test.
+    reached = {}
+
+    class _StopAttach(Exception):
+        pass
+
+    def fake_build(worker_spec, persisted_remote):
+        reached["fingerprint"] = persisted_remote.get("key_fingerprint")
+        raise _StopAttach
+
+    monkeypatch.setattr(
+        "flash.runner.supervise.attach._build_attach_context",
+        fake_build,
+    )
+
+    with contextlib.suppress(Exception):
+        attach_run("attach-unrelated-stale")
+
+    # the unrelated unverifiable record did not abort attach before it reached its own handle,
+    # and this run's legacy prefix was still upgraded durably by the resolvable half.
+    assert reached.get("fingerprint") == live_fingerprint

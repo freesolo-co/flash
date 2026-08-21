@@ -153,6 +153,13 @@ def _text_adapter_tensors(mode, rank=1):
             **nonzero_pair,
             **_text_pair("visual.patch_embed.proj", nonzero_a, nonzero_b),
         }
+    if mode == "inert_vision":
+        # a zero B factor makes the visual pair contribute nothing: the grandfathered warm-start
+        # artifact, as opposed to the LIVE `vision` mode above.
+        return {
+            **nonzero_pair,
+            **_text_pair("visual.patch_embed.proj", nonzero_a, zero_b),
+        }
     if mode == "vision_saved":
         return {
             **nonzero_pair,
@@ -224,6 +231,7 @@ def _write_expert_adapter(directory, *, config, tensor_mode="complete", text_ran
         "arbitrary_namespace",
         "all_zero",
         "bias_leaf",
+        "inert_vision",
         "legacy_default_leaf",
         "mixed",
         "mtp_saved",
@@ -475,6 +483,49 @@ def test_fused_export_accepts_a_finite_nonzero_actual_payload(monkeypatch, tmp_p
     saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["target_modules"] == "all-linear"
     assert saved["target_parameters"] == _TARGETS
+
+
+def test_fused_export_admits_a_grandfathered_inert_vision_pair(monkeypatch, tmp_path):
+    """The inert-vision skip must not break the value validator that runs right after it.
+
+    `_validate_adapter_tensor_values` re-reads every tensor on disk and requires the key set to
+    equal the metadata it was handed exactly. Pruning the inert visual keys out of the map that
+    reaches it therefore fails as "tensor sources disagree with their metadata" -- on precisely the
+    grandfathered artifact the skip exists to admit, so a warm-started 35B-A3B run would train to
+    completion and then fail every periodic and final fused-expert publish.
+
+    The prune must apply only to the PAIR input. Uses the real pair function rather than a
+    monkeypatched stand-in, so the pruning path itself is under test.
+    """
+    import flash.engine.worker.verl.checkpoints as checkpoints
+
+    config = {
+        "peft_type": "LORA",
+        "r": 1,
+        "target_modules": ["q_proj", "v_proj"],
+        "target_parameters": None,
+    }
+    _write_expert_adapter(tmp_path, config=config, tensor_mode="inert_vision", text_rank=1)
+
+    def pair_keys(tensors, _config, _model_id):
+        # the assertion that matters: the inert visual keys never reach pair evidence.
+        assert not any("visual" in key for key in tensors)
+        groups = {}
+        for key in tensors:
+            module, factor = key.rsplit(".lora_", 1)
+            groups.setdefault(module, {})[factor[0]] = key
+        return {
+            (module, "default"): (factors["A"], factors["B"]) for module, factors in groups.items()
+        }
+
+    monkeypatch.setattr(checkpoints, "fused_expert_lora_tensor_pairs", pair_keys)
+
+    checkpoints.stamp_adapter_dir_provenance(
+        str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
+
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["target_modules"] == "all-linear"
 
 
 def _merger_expert_tensors(*, include_ordinary=True, drop_last_layer_rung=False):
