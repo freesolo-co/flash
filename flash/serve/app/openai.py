@@ -68,12 +68,12 @@ def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAICha
     ):
         raise OpenAIRequestError("messages must be a nonempty array of objects")
     # being a dict is not being a *message*. the checks above accept `{}`, `{"role": "bogus"}`, and
-    # a `content` of any type, none of which generation can honor -- and the runtime only validates
-    # message shape on its multimodal branch, so a text-only request reached the chat template
-    # unchecked. that rendered a missing `content` as an empty prompt (200 on nonsense) and turned
-    # a bad `role` into a template failure answered 503, which reads as "retry later" for a request
-    # that can never succeed. this is the strict subset the docstring promises, so it belongs here,
-    # before the request is bound to an adapter and dispatched.
+    # a `content` of any type, none of which generation can honor. rejecting here makes those a
+    # 422 rather than an empty prompt rendered from a missing `content` (200 on nonsense) or a
+    # template failure answered 503, which reads as "retry later" for a request that can never
+    # succeed. this only validates: the accepted spellings are rewritten to what the template
+    # understands in `PromptPreparer`, past the image dispatch, because normalizing here would
+    # strip the image payloads this endpoint must forward.
     validate_messages(messages)
     stream = payload.get("stream", False)
     if type(stream) is not bool:

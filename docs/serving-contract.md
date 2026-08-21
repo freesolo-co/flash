@@ -101,8 +101,10 @@ Lifecycle states are:
   Readiness uses a model-scaled 10 to 15 minute budget. Each request is capped at 60 seconds, transport
   errors and 5xx responses are retried, and `Retry-After` is clamped to two seconds. Loading must
   outlive the request that queued it.
-  `structured_outputs` belongs to the registered revision, not the chat request. Support `json`,
-  `regex`, `choice`, and `json_object`, or reject unsupported forms during registration.
+  `structured_outputs` registered here is the revision's default, and is part of its immutable
+  identity. Support `json`, `regex`, `choice`, and `json_object`, or reject unsupported forms
+  during registration. A chat request may still override the default for its own call; see
+  "Chat and provenance".
 
 ## Activation
 
@@ -131,8 +133,11 @@ The alias record must contain `metadata.alias_of` for response-loss reconciliati
 
 `POST /v1/chat/completions` is OpenAI-compatible. `model` is the run alias. Unknown, disabled, or
 unactivated aliases return `404` or `503`.
-The registered grammar is authoritative. Requests may include `stop` and
-`chat_template_kwargs.enable_thinking`, but cannot replace the grammar.
+The registered grammar is the default for every call to that revision. A request may override it
+per call with `structured_outputs`, or with the OpenAI-standard `response_format` accepted at this
+endpoint only; `{}` (equivalently `response_format: {"type": "text"}`) means explicitly
+unconstrained for that call and does not change what is registered. Requests may also include
+`stop` and `chat_template_kwargs.enable_thinking`.
 Every successful response reports the exact revision, checkpoint, and Hugging Face commit in:
 
 - body object `freesolo` with `adapter_revision`, `checkpoint`, and `hf_revision`;

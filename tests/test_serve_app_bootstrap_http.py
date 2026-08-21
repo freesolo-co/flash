@@ -141,6 +141,12 @@ def _chat_body(**overrides):
     return body
 
 
+def _raw_chat_body(extra: str) -> str:
+    """a chat body as raw text, because `json.dumps` emits the very tokens under test."""
+
+    return '{"model": "run-1", "messages": [{"role": "user", "content": "hi"}], ' + extra + "}"
+
+
 def _locked_paths(paths):
     @contextmanager
     def locked(*_args):
@@ -656,6 +662,76 @@ def test_stream_missing_duplicate_or_failed_terminal_is_sanitized_without_fake_s
             for item in payloads
         )
         assert "secret engine failure" not in response.text
+
+
+def test_a_chat_request_may_override_the_registered_grammar_for_its_own_call() -> None:
+    """the registered grammar is a per-revision *default*, not an unbreakable constraint.
+
+    The fixture adapter registers `{"json_object": true}`. A request-level `structured_outputs`
+    replaces it for that call, and `response_format: {"type": "text"}` normalizes to `{}` -- the
+    explicit "unconstrained for this call" marker, distinct from an absent field. Both leave the
+    registered default untouched for the next request, which is what makes the override per-call
+    rather than a mutation of an immutable revision.
+    """
+
+    owner, runtime = _published_owner()
+    assert owner.models["run-1"].adapter.structured_outputs_default == {"json_object": True}
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+
+    for override, expected in (
+        ({"structured_outputs": {"regex": "[ab]+"}}, {"regex": "[ab]+"}),
+        ({"response_format": {"type": "text"}}, {}),
+        ({}, None),
+    ):
+        response = asyncio.run(
+            _request(
+                app,
+                "POST",
+                "/v1/chat/completions",
+                headers=_auth(),
+                json=_chat_body(**override),
+            )
+        )
+        assert response.status_code == 200
+        assert runtime.generation_requests[-1].structured_outputs == expected
+
+    # the revision still carries its own default after every override above.
+    assert owner.models["run-1"].adapter.structured_outputs_default == {"json_object": True}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _raw_chat_body('"chat_template_kwargs": {"nested": NaN}'),
+        _raw_chat_body('"structured_outputs": {"json": {"maximum": Infinity}}'),
+        _raw_chat_body('"temperature": -Infinity'),
+    ],
+)
+def test_non_finite_json_constants_are_rejected_as_invalid_json(body: str) -> None:
+    """`NaN` and `Infinity` are python spellings, not json, and must not reach the runtime.
+
+    `json.loads` accepts them by default. `temperature` and `top_p` are guarded by `math.isfinite`,
+    but nothing walks inside `chat_template_kwargs` or a structured-output schema -- so a nested
+    non-finite reached the tokenizer or vllm's grammar compiler and came back 503, telling the
+    caller the service is down about a body it should have called invalid. Sent as raw text
+    because `json.dumps` emits these same tokens, so a dict fixture could not express the case.
+    """
+
+    owner, runtime = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers={**_auth(), "content-type": "application/json"},
+            content=body,
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_json"
+    assert runtime.generation_requests == []
 
 
 @pytest.mark.parametrize("stream", [False, True])

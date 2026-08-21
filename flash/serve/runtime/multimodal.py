@@ -64,20 +64,37 @@ def has_image_blocks(messages: Any) -> bool:
 def validate_messages(messages: Any) -> None:
     """raise unless every message satisfies the rules generation will later assume.
 
+    This is the boundary check, and it deliberately discards the normalized result rather than
+    returning it: normalization replaces each image block with a bare `{"type": "image"}` and
+    carries the payload out separately, so a caller that swapped in the normalized messages would
+    drop every image. Only the text branch may adopt them, which is why the rewrite lives in
+    `normalize_text_messages` and is applied in `PromptPreparer`, past the image dispatch.
+    """
+
+    _normalize_messages(messages)
+
+
+def normalize_text_messages(messages: Any) -> list[dict[str, Any]]:
+    """return template-ready messages for a request that carries no image blocks.
+
     `PromptPreparer.prepare` dispatches on `has_image_blocks`, so until now only image-bearing
-    requests were ever checked. A text-only request went straight to `apply_chat_template`, which
-    is a jinja renderer, not a validator: a missing `content` rendered as the empty string and
+    requests were normalized. A text-only request went straight to `apply_chat_template`, which is
+    a jinja renderer, not a validator: a missing `content` rendered as the empty string and
     generated from an empty prompt (200 with garbage), while a non-string `content` or an unknown
     `role` raised a `TemplateError` from outside `_rejection_as_prompt_error` and was answered 503
     -- telling the caller the service is down and inviting a retry that must fail identically.
 
-    Reusing `_normalize_messages` rather than restating its rules is deliberate: a second copy of
-    the role and block vocabulary is exactly how the two paths would drift apart again. It only
-    walks the list and discards the result -- image *payloads* are decoded in `_decode_images`,
-    which this does not call, so validating costs no base64 work and touches no pillow.
+    Validating alone is not enough, because this vocabulary is wider than any one chat template's.
+    `developer` is accepted here and rewritten to `system`, and `input_text` blocks are rewritten
+    to `text`; Qwen3.5's template raises `Unexpected message role` on the former and only some
+    templates read the latter. Returning the rewritten messages -- rather than checking a copy and
+    rendering the original -- is what makes the accepted spelling and the rendered prompt the same
+    request. Image *payloads* are decoded in `_decode_images`, which this does not call, so a
+    text-only request still costs no base64 work and touches no pillow.
     """
 
-    _normalize_messages(messages)
+    normalized, _sources = _normalize_messages(messages)
+    return normalized
 
 
 def prepare_multimodal_request(

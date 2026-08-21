@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from PIL import Image
@@ -297,15 +298,69 @@ def test_adapter_thinking_and_structured_defaults_are_normalized() -> None:
 class _Tokenizer:
     def __init__(self) -> None:
         self.template_calls: list[dict] = []
+        self.rendered: list[Any] = []
         self.encode_calls = 0
 
-    def apply_chat_template(self, _messages, **kwargs):
+    def apply_chat_template(self, messages, **kwargs):
         self.template_calls.append(kwargs)
+        self.rendered.append(messages)
         return [1, 2, 3]
 
     def encode(self, _prompt, **_kwargs):
         self.encode_calls += 1
         return [4, 5]
+
+
+@pytest.mark.parametrize(
+    ("authored", "canonical"),
+    [
+        (
+            [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        ),
+        (
+            [{"role": "developer", "content": "be terse"}],
+            [{"role": "system", "content": "be terse"}],
+        ),
+    ],
+)
+def test_accepted_aliases_are_rendered_in_their_canonical_form(authored, canonical) -> None:
+    """the boundary accepts these spellings, so the template must be handed what it understands.
+
+    `parse_chat_request` validates a normalized copy and used to forward the original, and only
+    image-bearing requests were normalized before rendering. A real Qwen3.5 template raises
+    `Unexpected message role` on `developer` -- answered 503, "retry later", for a request that can
+    never succeed -- and templates that read only canonical `text` blocks silently drop an
+    `input_text` block, generating from the wrong prompt. Asserting against the canonical
+    rendering, not just "it did not raise", is what pins the alias to the same prompt.
+    """
+
+    tokenizer = _Tokenizer()
+    preparer = PromptPreparer(EngineConfig(model="model", prompt_cache_size=0), tokenizer, None)
+
+    import asyncio
+
+    asyncio.run(preparer.prepare(GenerationRequest(messages=authored), False))
+    asyncio.run(preparer.prepare(GenerationRequest(messages=canonical), False))
+
+    assert tokenizer.rendered[0] == canonical
+    assert tokenizer.rendered[0] == tokenizer.rendered[1]
+
+
+def test_an_alias_shares_the_prompt_cache_entry_with_its_canonical_spelling() -> None:
+    tokenizer = _Tokenizer()
+    preparer = PromptPreparer(EngineConfig(model="model", prompt_cache_size=4), tokenizer, None)
+    alias = [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    canonical = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+
+    import asyncio
+
+    asyncio.run(preparer.prepare(GenerationRequest(messages=alias), False))
+    asyncio.run(preparer.prepare(GenerationRequest(messages=canonical), False))
+
+    # keying on the authored messages would tokenize the same rendered prompt twice.
+    assert len(tokenizer.template_calls) == 1
+    assert preparer.cache_entries == 1
 
 
 def test_text_prompt_cache_is_bounded_and_keys_thinking() -> None:

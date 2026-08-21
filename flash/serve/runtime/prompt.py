@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import MultimodalRequestError, PromptError
-from .multimodal import has_image_blocks, prepare_multimodal_request
+from .multimodal import has_image_blocks, normalize_text_messages, prepare_multimodal_request
 from .types import AdapterSpec, EngineConfig, GenerationRequest
 
 _RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
@@ -106,13 +106,19 @@ class PromptPreparer:
         request: GenerationRequest,
         thinking: bool | None,
     ) -> dict[str, Any]:
-        key = self._cache_key(request, thinking)
+        # normalizing here rather than at the http boundary is what keeps the image path intact:
+        # normalization strips image payloads out into a separate channel, so only this branch --
+        # already past the `has_image_blocks` dispatch -- can safely adopt the rewritten messages.
+        # the key is derived from them too, so `input_text` and `text` spellings of one prompt
+        # share the entry they already share a rendering of, instead of tokenizing twice.
+        messages = None if request.messages is None else normalize_text_messages(request.messages)
+        key = self._cache_key(request, messages, thinking)
         if key is not None:
             cached = self._cache.get(key)
             if cached is not None:
                 self._cache.move_to_end(key)
                 return {"prompt_token_ids": list(cached)}
-        token_ids = await asyncio.to_thread(self._tokenize, request, thinking)
+        token_ids = await asyncio.to_thread(self._tokenize, request, messages, thinking)
         if key is not None:
             self._cache[key] = tuple(token_ids)
             self._cache.move_to_end(key)
@@ -120,10 +126,15 @@ class PromptPreparer:
                 self._cache.popitem(last=False)
         return {"prompt_token_ids": token_ids}
 
-    def _tokenize(self, request: GenerationRequest, thinking: bool | None) -> list[int]:
-        if request.messages is not None:
+    def _tokenize(
+        self,
+        request: GenerationRequest,
+        messages: list[dict[str, Any]] | None,
+        thinking: bool | None,
+    ) -> list[int]:
+        if messages is not None:
             token_ids = self._tokenizer.apply_chat_template(
-                request.messages,
+                messages,
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=False,
@@ -139,14 +150,15 @@ class PromptPreparer:
     def _cache_key(
         self,
         request: GenerationRequest,
+        messages: list[dict[str, Any]] | None,
         thinking: bool | None,
     ) -> tuple[str, str] | None:
         if self._config.prompt_cache_size <= 0:
             return None
-        if request.messages is not None:
+        if messages is not None:
             try:
                 raw = json.dumps(
-                    request.messages,
+                    messages,
                     ensure_ascii=False,
                     separators=(",", ":"),
                     sort_keys=True,
