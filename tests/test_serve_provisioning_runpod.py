@@ -37,9 +37,6 @@ from flash.serve.provisioning._runpod_protocol import (
     parse_deleted_secret,
     parse_pods,
     parse_templates,
-    pod_payload,
-    template_payload,
-    volume_payload,
 )
 from flash.serve.provisioning._runpod_resources import (
     RunPodResourceConflict,
@@ -413,21 +410,13 @@ def _seed_exact(
     transport.secrets = [{"id": "secret01", "name": names.inference_secret}]
     if artifact_secret:
         transport.secrets.append({"id": "secret02", "name": names.artifact_secret})
-    volume = {"id": "volume01", **volume_payload(bundle, names)}
-    template = {
-        "id": "template01",
-        **template_payload(
-            bundle,
-            names,
-            include_artifact_secret=artifact_secret,
-        ),
-    }
-    pod_request = pod_payload(
-        bundle,
-        names,
-        template_id="template01",
-        volume_id="volume01",
-    )
+    # seed from the plan the production path actually sends. building these rows from a second
+    # payload implementation let the fixtures agree with a shape runpod rejects -- `dockerStartCmd`
+    # as a joined string and `env` as {key, value} rows -- while production sent argv and an object.
+    plan = build_runpod_create_plan(bundle)
+    volume = {"id": "volume01", **plan.volume_payload()}
+    template = {"id": "template01", **plan.template_payload(artifact_secret)}
+    pod_request = plan.pod_payload(template_id="template01", volume_id="volume01")
     pod = {
         "id": POD_ID,
         "name": pod_request["name"],
@@ -558,18 +547,8 @@ def test_pod_creation_constrains_the_host_cuda_version() -> None:
     # let it place a pod on an L4 host reporting driver 12080: the container died at engine init and
     # restarted forever, which externally is indistinguishable from a slow image pull. asking for a
     # gpu type does not ask for a driver, so the constraint has to be stated on every create path.
-    bundle = _bundle()
-    names = serving_resource_names(
-        bundle.spec.deployment_id,
-        bundle.spec.generation,
-        bundle.spec.engine.engine_id,
-        workload_role="pod",
-    )
+    planned = json.loads(build_runpod_create_plan(_bundle()).pod_static_json)
 
-    direct = pod_payload(bundle, names, template_id="template01", volume_id="volume01")
-    planned = json.loads(build_runpod_create_plan(bundle).pod_static_json)
-
-    assert direct["allowedCudaVersions"] == ["13.0"]
     assert planned["allowedCudaVersions"] == ["13.0"]
 
 

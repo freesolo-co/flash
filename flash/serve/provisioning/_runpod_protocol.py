@@ -6,10 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import TypeAlias
 
-from flash.serve.control import RunPodPlacement
 from flash.serve.control._urls import validate_runpod_pod_id
-
-from ._common import DeploymentBundle, ServingResourceNames, encode_manifest_environment
 
 PROXY_PORT = 8000
 PROXY_PORT_SPEC = "8000/http"
@@ -451,82 +448,3 @@ def secret_reference(name: str) -> str:
     return f"{{{{ RUNPOD_SECRET_{name} }}}}"
 
 
-def expected_environment(
-    bundle: DeploymentBundle,
-    names: ServingResourceNames,
-    *,
-    include_artifact_secret: bool,
-) -> tuple[tuple[str, str], ...]:
-    environment = {
-        "FLASH_INFERENCE_TOKEN": secret_reference(names.inference_secret),
-        "FLASH_SERVING_CACHE_ROOT": SERVING_CACHE_ROOT,
-        "FLASH_SERVING_HOST": "0.0.0.0",
-        "FLASH_SERVING_IMAGE_DIGEST": bundle.image.digest,
-        "FLASH_SERVING_MANIFEST": encode_manifest_environment(bundle.manifest),
-        "FLASH_SERVING_MANIFEST_ID": bundle.manifest.manifest_id,
-        "FLASH_SERVING_PORT": str(PROXY_PORT),
-    }
-    if include_artifact_secret:
-        environment["FLASH_ARTIFACT_TOKEN"] = secret_reference(names.artifact_secret)
-    return tuple(sorted(environment.items()))
-
-
-def template_payload(
-    bundle: DeploymentBundle,
-    names: ServingResourceNames,
-    *,
-    include_artifact_secret: bool,
-) -> dict[str, object]:
-    placement = bundle.spec.placement
-    assert type(placement) is RunPodPlacement
-    return {
-        "name": names.template,
-        "imageName": bundle.image.reference,
-        "dockerStartCmd": LAUNCH_COMMAND,
-        "containerDiskInGb": placement.container_disk_gb,
-        "volumeInGb": 0,
-        "volumeMountPath": NETWORK_VOLUME_MOUNT,
-        "ports": [PROXY_PORT_SPEC],
-        "env": [
-            {"key": key, "value": value}
-            for key, value in expected_environment(
-                bundle,
-                names,
-                include_artifact_secret=include_artifact_secret,
-            )
-        ],
-        "isServerless": False,
-    }
-
-
-def volume_payload(bundle: DeploymentBundle, names: ServingResourceNames) -> dict[str, object]:
-    placement = bundle.spec.placement
-    assert type(placement) is RunPodPlacement
-    return {
-        "name": names.volume,
-        "size": placement.volume_size_gb,
-        "dataCenterId": placement.data_center_id,
-    }
-
-
-def pod_payload(
-    bundle: DeploymentBundle,
-    names: ServingResourceNames,
-    *,
-    template_id: str,
-    volume_id: str,
-) -> dict[str, object]:
-    placement = bundle.spec.placement
-    assert type(placement) is RunPodPlacement
-    return {
-        "name": names.app_or_pod,
-        "imageName": bundle.image.reference,
-        "gpuTypeIds": [placement.gpu_type_id],
-        "gpuCount": placement.gpu_count,
-        "allowedCudaVersions": list(ALLOWED_CUDA_VERSIONS),
-        "dataCenterIds": [placement.data_center_id],
-        "containerDiskInGb": placement.container_disk_gb,
-        "networkVolumeId": volume_id,
-        "templateId": template_id,
-        "ports": [PROXY_PORT_SPEC],
-    }
