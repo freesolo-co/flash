@@ -563,7 +563,7 @@ def _close_descriptors(descriptors: list[int]) -> None:
             os.close(fd)
 
 
-def terminate_and_reap(process: subprocess.Popen[Any]) -> None:
+def _terminate_and_reap(process: subprocess.Popen[Any]) -> None:
     with contextlib.suppress(Exception):
         process.terminate()
     try:
@@ -625,7 +625,7 @@ def start_launcher_process(
         return process
     except BaseException:
         if process is not None:
-            terminate_and_reap(process)
+            _terminate_and_reap(process)
         raise
     finally:
         _close_descriptors(read_fds)

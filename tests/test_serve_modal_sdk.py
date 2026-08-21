@@ -508,85 +508,32 @@ assert network_calls == []
     assert result.returncode == 0, result.stderr
 
 
-class _FakeChild:
-    """the `Popen` contract the wrapper actually depends on: it must be waited on."""
-
-    def __init__(self, exit_code: int = 0) -> None:
-        self.exit_code = exit_code
-        self.waited = 0
-        self.terminated = False
-
-    def wait(self, timeout: float | None = None) -> int:
-        self.waited += 1
-        return self.exit_code
-
-    def terminate(self) -> None:
-        self.terminated = True
-
-    def kill(self) -> None:
-        self.terminated = True
-
-
 def test_fixed_wrapper_uses_packaged_secret_scrubbing_child_boundary(monkeypatch) -> None:
     from flash.serve.app import launch
 
     calls = []
-    child = _FakeChild()
-
-    def _start():
-        calls.append(True)
-        return child
-
-    monkeypatch.setattr(launch, "start_launcher_process", _start)
+    monkeypatch.setattr(launch, "start_launcher_process", lambda: calls.append(True))
     launch_modal_server()
     assert calls == [True]
-    # the stub used to return None, which only passed because the wrapper threw the handle away.
-    assert child.waited == 1
 
 
-def test_wrapper_owns_the_child_for_the_containers_lifetime(monkeypatch) -> None:
-    """returning while the child still runs severs the app's only recovery path.
+def test_wrapper_returns_while_the_child_still_runs(monkeypatch) -> None:
+    """modal probes the port only *after* this call returns, so it must not block.
 
-    `@modal.web_server` treats this call as the container's lifetime, but
-    `start_launcher_process` returns as soon as the child is spawned. Discarding that handle let
-    the wrapper finish in milliseconds, so nothing observed the child's exit -- and
-    `_exit_on_engine_death` in `app/__main__.py` deliberately ends the process precisely so the
-    provider replaces the container. With `max_containers=1` and `min_containers=0` there is no
-    second container to serve, so a dead engine left the deployment permanently unanswerable
-    rather than being restarted.
+    `user_code_imports.py` runs the `web_server` callable, then `asgi.wait_for_web_server` and
+    `asgi.web_server_proxy`. Waiting on the child here never returns, so neither the readiness
+    probe nor the proxy is ever built and the endpoint serves nothing. A blocking wrapper looks
+    like a tidier lifetime but is a total outage; this pins the spawn-and-return contract.
     """
 
     from flash.serve.app import launch
 
-    child = _FakeChild(exit_code=3)
-    monkeypatch.setattr(launch, "start_launcher_process", lambda: child)
-
-    with pytest.raises(SystemExit) as excinfo:
-        launch_modal_server()
-
-    assert child.waited == 1, "wrapper returned without waiting for the child"
-    assert excinfo.value.code == 3, "child failure must reach modal rather than reading as success"
-
-
-def test_an_interrupted_wrapper_tears_the_child_down(monkeypatch) -> None:
-    """a wrapper killed mid-wait must not leave a gpu process on a finished container."""
-
-    from flash.serve.app import launch
-
-    class _Interrupted(_FakeChild):
+    class _NeverExits:
         def wait(self, timeout: float | None = None) -> int:
-            self.waited += 1
-            if self.waited == 1:
-                raise KeyboardInterrupt
-            return 0
+            raise AssertionError("wrapper must not wait on the child; modal needs it to return")
 
-    child = _Interrupted()
-    monkeypatch.setattr(launch, "start_launcher_process", lambda: child)
-
-    with pytest.raises(KeyboardInterrupt):
-        launch_modal_server()
-
-    assert child.terminated, "an interrupted wrapper must reap the child it started"
+    monkeypatch.setattr(launch, "start_launcher_process", lambda: _NeverExits())
+    launch_modal_server()
 
 
 def test_pinned_sdk_binds_exact_client_workspace_environment_and_secret_sinks() -> None:
