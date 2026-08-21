@@ -447,11 +447,22 @@ def inspect_adapter_config(
         raise ValueError(f"could not verify adapter metadata: {source} is not a JSON object")
     if str(config.get("peft_type") or "").strip().upper() != "LORA":
         raise ValueError(f"could not verify adapter metadata: {source} peft_type must be LORA")
+    # both fields are REQUIRED, not "checked when present": every warm-start source is a
+    # flash-owned adapter resolved from a run or checkpoint reference, and the one exporter every
+    # publish path funnels through stamps `base_model_name_or_path = model_id` unconditionally
+    # (engine/worker/verl/checkpoints.py) while the builder always sets `task_type = CAUSAL_LM`
+    # (engine/worker/model/adapter.py). treating a blank value as "no opinion" made the base-model
+    # match SKIP itself, so an adapter trained on a different base passed preflight and was
+    # inherited into the run -- the check failing open is worse than an old artifact failing loudly.
     task_type = str(config.get("task_type") or "").strip().upper()
-    if task_type and task_type != "CAUSAL_LM":
+    if task_type != "CAUSAL_LM":
         raise ValueError(f"could not verify adapter metadata: {source} task_type must be CAUSAL_LM")
     base_model = _normalized_model(config.get("base_model_name_or_path"))
-    if base_model and base_model != _normalized_model(target_model):
+    if not base_model:
+        raise ValueError(
+            f"could not verify adapter metadata: {source} does not name its base model"
+        )
+    if base_model != _normalized_model(target_model):
         raise ValueError(
             f"train.init_from_adapter base model {base_model!r} does not match target model "
             f"{target_model!r}"

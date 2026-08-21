@@ -122,14 +122,27 @@ def test_inspection_rejects_incompatible_base_model():
         )
 
 
-def test_inspection_allows_empty_optional_compatibility_fields():
-    metadata = inspect_adapter_config(
-        _config(base_model_name_or_path="", task_type=""),
-        source="adapter",
-        target_model="Qwen/Qwen3.5-4B",
-    )
-    assert metadata.rank == 16
-    assert metadata.alpha == 32
+def test_inspection_requires_the_adapter_to_name_its_base_model():
+    # a blank base model must not read as "no opinion": that made the base-model comparison below
+    # skip itself, so an adapter trained on a DIFFERENT base passed preflight and was inherited
+    # into the run. every flash-published adapter is stamped by the exporter, so a blank value is
+    # an artifact that predates it and must fail loudly rather than silently disable the check.
+    with pytest.raises(ValueError, match="does not name its base model"):
+        inspect_adapter_config(
+            _config(base_model_name_or_path=""),
+            source="adapter",
+            target_model="Qwen/Qwen3.5-4B",
+        )
+
+
+def test_inspection_requires_a_causal_lm_task_type():
+    # same failure direction: a blank task_type skipped the check instead of failing it.
+    with pytest.raises(ValueError, match="task_type must be CAUSAL_LM"):
+        inspect_adapter_config(
+            _config(task_type=""),
+            source="adapter",
+            target_model="Qwen/Qwen3.5-4B",
+        )
 
 
 def test_inspection_requires_alpha_metadata():
