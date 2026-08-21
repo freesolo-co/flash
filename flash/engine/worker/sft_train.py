@@ -69,9 +69,9 @@ def _warmstart_adapter_path(
     adapter_dir = _w._download_adapter(source)
     if not adapter_dir:
         raise RuntimeError("the prepared warm-start adapter could not be downloaded")
-    with open(os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8") as file:
-        config = json.load(file)
     config_path = os.path.join(adapter_dir, "adapter_config.json")
+    with open(config_path, encoding="utf-8") as file:
+        config = json.load(file)
     rank = rank_from_adapter_config(config, source=config_path)
     if rank != expected_rank:
         raise ValueError(
