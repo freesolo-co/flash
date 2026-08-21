@@ -1528,8 +1528,10 @@ def test_stale_ready_record_refreshes_in_background():
 
     revision = _rec("qa", QWEN)
     shared = {"rows": [revision, _alias(revision)]}
+    reloads = {"count": 0}
 
     def _reload():
+        reloads["count"] += 1
         return list(shared["rows"])
 
     pool = FakePool()
@@ -1547,6 +1549,17 @@ def test_stale_ready_record_refreshes_in_background():
                     headers={"Authorization": "Bearer t"},
                 )
             ).status_code == 200
+            # wait for the first refresh to COMPLETE before changing storage. without this the
+            # scheduled refresh can observe the already-cleared rows, so the test passes on the
+            # FIRST reload and never proves a later TTL window still refreshes -- code that
+            # poisons the ttl clock after one successful reload would serve an undeployed adapter
+            # forever and still pass here.
+            for _ in range(100):
+                if reloads["count"] >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert reloads["count"] >= 1, "the first background refresh never ran"
+            settled = reloads["count"]
             # Another container undeploys qa: it drops out of the status=ready reload.
             shared["rows"] = []
             # This hit is stale, but still cached: serve it and schedule the refresh.
@@ -1562,6 +1575,8 @@ def test_stale_ready_record_refreshes_in_background():
                     break
                 await asyncio.sleep(0.01)
             assert not router.has("qa")
+            # a genuinely LATER refresh did the work, not the one that had already settled.
+            assert reloads["count"] > settled, "the ttl window stopped refreshing after the first"
             # After the background refresh, it is no longer routed here.
             assert (
                 await ac.post(
@@ -1672,6 +1687,11 @@ def test_concurrent_misses_hydrate_in_order_without_stampeding():
 
     revision = _rec("late", QWEN)
     fresh = [revision, _alias(revision)]
+    # snapshot the expectation BEFORE production can touch these objects. the router stores the
+    # instances it is handed, so comparing against the originals would compare a record with
+    # itself: code that corrupts them after hydrate moves both sides of the assertion together
+    # and passes while the caller receives the corruption.
+    expected = (_alias(revision).model_copy(deep=True), revision.model_copy(deep=True))
     calls = {"count": 0}
     hydrated: list[int] = []
 
@@ -1710,19 +1730,14 @@ def test_concurrent_misses_hydrate_in_order_without_stampeding():
     # the empty fetch must not land after the fresh one. asserting the ORDER, not a fixed list:
     # requiring `[0]` would mean the later miss reused the earlier snapshot, which is the defect.
     assert hydrated == sorted(hydrated), f"a stale fetch hydrated after a fresher one: {hydrated}"
-    # the caller whose miss forced the follow-up fetch must SEE it, and see exactly what storage
-    # returned. bounding the fetch count alone let an implementation read storage and drop the
-    # records on the floor -- counts and ordering both held while every caller 404'd. checking only
-    # `adapter_id`/`base_model` was the next hole: those survive a hydrate of the wrong records, so
-    # a pair resolving from `wrong/repository` still passed. compare the records themselves.
-    #
-    # `any`, not `all`: the first caller legitimately gets the empty snapshot and 404s, because its
-    # own fetch began before the adapter was committed. requiring both would encode a false
-    # contract; requiring one exact match is the real invariant.
+    # at least one caller must SEE the follow-up fetch. `any`, not `all`: the first caller
+    # legitimately gets the empty snapshot and 404s, because its own fetch began before the adapter
+    # was committed. requiring both would encode a false contract.
     resolved = [result for result in results if not isinstance(result, HTTPException)]
     assert resolved, "the follow-up fetch ran but no caller could resolve the adapter it read"
-    # no caller sees a half-applied hydrate: each either resolves the committed pair or 404s.
-    assert all(result == (_alias(revision), revision) for result in resolved), (
+    # and every successful resolution must equal the immutable snapshot -- not merely share an
+    # adapter id, and not merely be whatever the router currently holds.
+    assert all(result == expected for result in resolved), (
         f"a caller resolved records that are not the ones storage returned: {resolved}"
     )
 
@@ -1761,6 +1776,9 @@ def test_a_reload_that_snapshotted_first_cannot_answer_a_later_miss():
     from flash.serving.src.lookup import AdapterLookup
 
     revision = _rec("committed-late", QWEN)
+    # snapshotted before production sees the records, for the same reason as above: the router
+    # keeps the instances it is handed, so the originals cannot serve as an expectation.
+    expected = (_alias(revision).model_copy(deep=True), revision.model_copy(deep=True))
     storage: list[AdapterRecord] = []
     snapshotted = threading.Event()
     release = threading.Event()
@@ -1792,8 +1810,7 @@ def test_a_reload_that_snapshotted_first_cannot_answer_a_later_miss():
     assert calls["count"] == 2, "the later miss reused a snapshot taken before it began"
     # and the second fetch's records must actually land, as themselves. the fetch count only proves
     # storage was re-read; the point of re-reading it is that the adapter committed in between
-    # becomes resolvable. asserting merely `is not None` would accept a hydrate of different
-    # records that happen to share the routable id, so compare the exact committed pair.
-    assert router.resolve("committed-late") == (_alias(revision), revision), (
-        "storage was re-read but the adapter committed before that miss stayed invisible"
+    # becomes resolvable as exactly what was committed.
+    assert router.resolve("committed-late") == expected, (
+        "storage was re-read but did not resolve to the exact records it returned"
     )
