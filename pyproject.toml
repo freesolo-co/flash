@@ -90,7 +90,11 @@ serving = [
     # extra alone could not import the app it exists to run. CI only passed because it also
     # installs `server`, which happens to carry fastapi.
     "fastapi",
-    "modal>=1.0.0",
+    # the same exact pin as `server`, deliberately. both extras drive the same modal lifecycle, and
+    # this one is what the serving image installs ALONE -- so a range here lets the container
+    # resolve a different modal than the control plane was validated against, on a rebuild that
+    # changed nothing else. one policy per package.
+    "modal==1.5.4",
     "orjson>=3.10.0",
     # `src/multimodal.py` decodes and normalizes inbound images at module scope. the `gpu` extra
     # gets Pillow transitively via vllm, but this extra deliberately excludes vllm, so it has to
