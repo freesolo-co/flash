@@ -17,7 +17,6 @@ from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
 from flash.engine.profiling.workload_profile import (
-    reasoning_warning_rows,
     rendered_reasoning_loss_warning,
     unpacked_batch_warning,
 )
@@ -190,17 +189,29 @@ def _print_reasoning_loss_warning(status: object) -> None:
     if not isinstance(profile, dict):
         return
 
-    def required_count(key: str) -> int:
-        value = profile[key]
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"workload profile {key} must be an integer")
-        return value
+    # tolerant, unlike every other reader of this profile, because of WHERE the dict comes from and
+    # what this function is for. it is the quote response of a control plane the CLI does not ship
+    # with, so a field this build expects can legitimately be absent from a peer's reply during a
+    # rolling upgrade -- forward compatibility, not legacy debt. and the whole function is one
+    # advisory warning line: these call sites are not wrapped, so raising here would abort `train
+    # --cost` and the SFT dry run AFTER the server already returned a valid quote. losing a warning
+    # is a far smaller harm than failing the command that carries it.
+    def optional_count(key: str) -> int | None:
+        value = profile.get(key)
+        return None if isinstance(value, bool) or not isinstance(value, int) else value
 
+    authored = optional_count("authored_reasoning_turns")
+    rendered = optional_count("rendered_reasoning_spans")
+    rows = optional_count("reasoning_rows")
+    if authored is None or rendered is None or rows is None:
+        return
     message = rendered_reasoning_loss_warning(
-        authored_turns=required_count("authored_reasoning_turns"),
-        rendered_spans=required_count("rendered_reasoning_spans"),
-        truncated_spans=required_count("truncated_reasoning_spans"),
-        rows=reasoning_warning_rows(profile),
+        authored_turns=authored,
+        rendered_spans=rendered,
+        # absent on a profile from a producer that had not yet split the two causes apart. zero
+        # reads as "none were truncated", which is exactly the pre-split behaviour.
+        truncated_spans=optional_count("truncated_reasoning_spans") or 0,
+        rows=rows,
     )
     if not message:
         return
