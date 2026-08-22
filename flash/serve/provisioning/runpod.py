@@ -58,6 +58,7 @@ from ._runpod_readiness import (
     Observe,
     PatchPod,
     PatchTemplate,
+    adopt_existing_generation,
     await_ready_and_reclaim,
     failure_result,
     read_only_reconcile,
@@ -608,41 +609,21 @@ def provision_runpod_deployment(
     try:
         transport = open_transport(transport_factory, credentials)
         discovery_deadline_at = min(deadline_at, clock() + _CLEANUP_RESERVE_SECONDS)
-        observation = _observe(plan, transport, deadline_at=deadline_at)
-        saw_resource = observation.resource_count > 0
-        try:
-            complete = complete_resource_set(plan, observation)
-        except RunPodResourceConflict:
-            return failure_result(plan, LifecycleFailure("conflict"))
-        while (
-            saw_resource and not complete and sleep_until_poll(discovery_deadline_at, clock, sleep)
-        ):
-            observation = _observe(plan, transport, deadline_at=deadline_at)
-            saw_resource = saw_resource or observation.resource_count > 0
-            try:
-                complete = complete_resource_set(plan, observation)
-            except RunPodResourceConflict:
-                return failure_result(plan, LifecycleFailure("conflict"))
-        if complete:
-            return await_ready_and_reclaim(
-                plan,
-                _bind_observe(transport, deadline_at=deadline_at),
-                _bind_patch_template(transport, deadline_at=deadline_at),
-                _bind_patch_pod(transport, deadline_at=deadline_at),
-                _bind_delete_secret(transport, deadline_at=deadline_at),
-                inference_token,
-                observation.artifact_secrets[0] if observation.artifact_secrets else None,
-                # adoption owns resources it did not create and has no ledger to undo, so an
-                # unproven pod is reported unknown rather than failed. see `read_only_reconcile`.
-                unproven_is_failure=False,
-                absent_after_deadline=False,
-                deadline_at=deadline_at,
-                probe=probe,
-                clock=clock,
-                sleep=sleep,
-            )
-        if saw_resource:
-            return unknown_result(plan, reason="readiness_deadline_unproven")
+        adopted = adopt_existing_generation(
+            plan,
+            _bind_observe(transport, deadline_at=deadline_at),
+            _bind_patch_template(transport, deadline_at=deadline_at),
+            _bind_patch_pod(transport, deadline_at=deadline_at),
+            _bind_delete_secret(transport, deadline_at=deadline_at),
+            inference_token,
+            discovery_deadline_at=discovery_deadline_at,
+            deadline_at=deadline_at,
+            probe=probe,
+            clock=clock,
+            sleep=sleep,
+        )
+        if adopted is not None:
+            return adopted
         # from here on this call owns resources, so every phase stops short of the caller's
         # deadline to leave the teardown below a live one.
         work_deadline_at = _work_deadline(deadline_at, clock)

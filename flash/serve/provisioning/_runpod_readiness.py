@@ -498,6 +498,64 @@ def delete_artifact_and_confirm(
     return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
 
 
+def adopt_existing_generation(
+    plan: RunPodCreatePlan,
+    observe: Observe,
+    patch_template: PatchTemplate,
+    patch_pod: PatchPod,
+    delete_secret: DeleteSecret,
+    inference_token: str,
+    *,
+    discovery_deadline_at: float,
+    deadline_at: float,
+    probe: EndpointProbe,
+    clock: Clock,
+    sleep: Sleeper,
+) -> DeploymentResult | None:
+    """adopt a resource generation that may be only partly visible.
+
+    runpod listings are eventually consistent, so a newly created resource can be invisible while
+    its siblings are already listed. A partial observation is an ordinary mid-create state, so once
+    any resource is seen this polls for the complete set. A genuinely empty account falls through
+    after the first observation without spending the discovery window.
+    """
+
+    observation = observe(plan)
+    saw_resource = observation.resource_count > 0
+    try:
+        complete = complete_resource_set(plan, observation)
+    except RunPodResourceConflict:
+        return failure_result(plan, LifecycleFailure("conflict"))
+    while saw_resource and not complete and sleep_until_poll(discovery_deadline_at, clock, sleep):
+        observation = observe(plan)
+        saw_resource = saw_resource or observation.resource_count > 0
+        try:
+            complete = complete_resource_set(plan, observation)
+        except RunPodResourceConflict:
+            return failure_result(plan, LifecycleFailure("conflict"))
+    if complete:
+        return await_ready_and_reclaim(
+            plan,
+            observe,
+            patch_template,
+            patch_pod,
+            delete_secret,
+            inference_token,
+            observation.artifact_secrets[0] if observation.artifact_secrets else None,
+            # adoption owns resources it did not create and has no ledger to undo, so an unproven
+            # pod is reported unknown rather than failed. see `read_only_reconcile`.
+            unproven_is_failure=False,
+            absent_after_deadline=False,
+            deadline_at=deadline_at,
+            probe=probe,
+            clock=clock,
+            sleep=sleep,
+        )
+    if saw_resource:
+        return unknown_result(plan, reason="readiness_deadline_unproven")
+    return None
+
+
 def await_ready_and_reclaim(
     plan: RunPodCreatePlan,
     observe: Observe,
