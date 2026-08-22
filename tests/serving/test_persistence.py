@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from flash.serving.src.persistence import (
-    _PERSISTED_COLUMNS,
+    PERSISTED_COLUMNS,
     PersistenceConflict,
     PersistenceRecordError,
     PersistenceReferenceError,
@@ -156,7 +156,7 @@ def test_insert_is_non_upserting_and_returns_authoritative_row() -> None:
     FakeClient.post_rows = [_row()]
     stored = insert_adapter(_record(), _settings())
     request = FakeClient.requests[0]
-    assert request["params"] == {"select": _PERSISTED_COLUMNS}
+    assert request["params"] == {"select": PERSISTED_COLUMNS}
     assert request["headers"]["Prefer"] == "return=representation"
     assert request["json"]["url"] == "https://huggingface.co/org/run"
     assert request["json"]["private"] is True
@@ -213,7 +213,7 @@ def test_replace_adapter_uses_updated_at_cas() -> None:
     )
     request = FakeClient.requests[0]
     assert request["params"] == {
-        "select": _PERSISTED_COLUMNS,
+        "select": PERSISTED_COLUMNS,
         "adapter_id": f"eq.{REVISION_ID}",
         "updated_at": "eq.2026-07-14T00:00:01+00:00",
     }

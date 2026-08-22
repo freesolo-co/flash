@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 
+from flash.serving.src.persisted_columns import PERSISTED_COLUMNS
 from flash.serving.src.schemas import (
     AdapterRecord,
     PersistedAdapterRecord,
@@ -35,11 +36,7 @@ class PersistenceRecordError(RuntimeError):
 
 
 _ADAPTER_PAGE = 1000
-_PERSISTED_COLUMNS = (
-    "adapter_id,repo_id,org_id,url,base_model,subfolder,repo_type,checkpoint,private,"
-    "status,metadata,created_at,updated_at,deployment_generation"
-)
-_PERSISTED_ROW_FIELDS = frozenset(_PERSISTED_COLUMNS.split(","))
+_PERSISTED_ROW_FIELDS = frozenset(PERSISTED_COLUMNS.split(","))
 
 
 def utc_now_iso() -> str:
@@ -50,7 +47,7 @@ def load_adapters(settings: Settings) -> list[AdapterRecord]:
     if not settings.has_supabase:
         return []
     params = {
-        "select": _PERSISTED_COLUMNS,
+        "select": PERSISTED_COLUMNS,
         "status": "eq.ready",
         "order": "adapter_id.asc",
         "limit": str(_ADAPTER_PAGE),
@@ -96,7 +93,7 @@ def get_adapter(adapter_id: str, settings: Settings) -> AdapterRecord | None:
         response = client.get(
             supabase_table_url(settings, ADAPTER_TABLE),
             params={
-                "select": _PERSISTED_COLUMNS,
+                "select": PERSISTED_COLUMNS,
                 "adapter_id": f"eq.{adapter_id}",
                 "limit": "1",
             },
@@ -121,7 +118,7 @@ def insert_adapter(record: AdapterRecord, settings: Settings) -> AdapterRecord:
     with httpx.Client(timeout=30.0) as client:
         response = client.post(
             supabase_table_url(settings, ADAPTER_TABLE),
-            params={"select": _PERSISTED_COLUMNS},
+            params={"select": PERSISTED_COLUMNS},
             headers={**supabase_headers(settings, "flash"), "Prefer": "return=representation"},
             json=_adapter_to_row(record, now),
         )
@@ -163,7 +160,7 @@ def replace_adapter_cas(
         response = client.patch(
             supabase_table_url(settings, ADAPTER_TABLE),
             params={
-                "select": _PERSISTED_COLUMNS,
+                "select": PERSISTED_COLUMNS,
                 "adapter_id": f"eq.{record.adapter_id}",
                 "updated_at": f"eq.{expected_updated_at}",
             },

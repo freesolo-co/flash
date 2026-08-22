@@ -209,13 +209,13 @@ jobs:
           # selecting only `id` proved the TABLE exists while a schema still missing, say,
           # `deployment_generation` passed this gate and then failed on every read after deploy.
           # read the list from the source of truth so it cannot drift away from persistence.py.
-          # the helper PARSES that module instead of importing it: this job installs only modal and
-          # python-dotenv, while persistence.py imports httpx at module scope, so an import here
+          # import the constants module, not persistence.py: this job installs only modal and
+          # python-dotenv, while persistence.py imports httpx at module scope, so importing it
           # would raise ModuleNotFoundError and the guard below would block every prod deploy.
-          if ! columns="$(python scripts/persisted_columns.py)" || [ -z "$columns" ]; then
+          if ! columns="$(python -c 'from flash.serving.src.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
             # failing closed matters here: an empty list would degrade the query back to a bare
             # existence check and this gate would pass while proving nothing.
-            echo "::error::Could not read _PERSISTED_COLUMNS; refusing to deploy against an unverified schema."
+            echo "::error::Could not read PERSISTED_COLUMNS; refusing to deploy against an unverified schema."
             exit 1
           fi
           endpoint="${supabase_url%/}/rest/v1/hosted_lora_adapters?select=${columns}&limit=1"
