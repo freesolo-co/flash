@@ -851,6 +851,10 @@ def test_non_moe_export_rejects_a_pair_whose_outer_dimension_disagrees(tmp_path)
     check passes. but two tensors targeting the same `q_proj` suffix claim different widths, so at
     most one of them can match the base module. without this check the export publishes and only
     fails later at peft or vllm load, with no provenance back to the run that wrote it.
+
+    scope: this is cross-pair consistency, not a base-model check. a suffix whose pairs are
+    UNIFORMLY wrong, or one carrying a single pair, still passes -- catching those needs the base
+    model's own dims, which this boundary does not have.
     """
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 
