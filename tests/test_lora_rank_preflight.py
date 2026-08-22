@@ -241,7 +241,9 @@ def test_adapter_identity_binds_config_and_weight_metadata(monkeypatch):
                     path="sft/sft-run/adapter/adapter_model.safetensors",
                     blob_id=None,
                     size=123,
-                    lfs={"sha256": state["oid"], "size": 123},
+                    # attribute-style, as `list_repo_tree` really returns it: `RepoFile.__init__`
+                    # builds a `BlobLfsInfo` dataclass, never a mapping.
+                    lfs=SimpleNamespace(sha256=state["oid"], size=123),
                 )
             ]
 
@@ -270,7 +272,7 @@ def test_adapter_identity_digests_decimal_config_values_exactly(monkeypatch):
                     path="sft/sft-run/adapter/adapter_model.safetensors",
                     blob_id=None,
                     size=123,
-                    lfs={"sha256": "sha256:weights-v1", "size": 123},
+                    lfs=SimpleNamespace(sha256="sha256:weights-v1", size=123),
                 )
             ]
 

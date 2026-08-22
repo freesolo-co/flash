@@ -360,7 +360,8 @@ def test_warmstart_identity_binds_every_shard(monkeypatch):
                     path=f"sft/run/adapter/{name}",
                     blob_id=None,
                     size=123,
-                    lfs={"sha256": oids[name], "size": 123},
+                    # attribute-style `BlobLfsInfo`, the only shape `list_repo_tree` produces.
+                    lfs=SimpleNamespace(sha256=oids[name], size=123),
                 )
                 for name in (*_SHARDS, _INDEX)
             ]
