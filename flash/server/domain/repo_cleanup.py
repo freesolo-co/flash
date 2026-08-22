@@ -120,7 +120,10 @@ def deployed_prefixes() -> tuple[set[tuple[str, str]], set[str], bool]:
     whole: set[str] = set()
     complete = True
     for rec in records:
-        repo = rec.get("repoId") or rec.get("repo_id")
+        # snake_case is the wire spelling: freesolo's `AdapterRecord` declares `repo_id`
+        # with no serialization alias, and its persistence layer reads and writes the same
+        # key. a camelCase reading here would never match and would fail this closed.
+        repo = rec.get("repo_id")
         if not isinstance(repo, str) or not repo.strip():
             complete = False  # a live adapter we can't even attribute to a repo -> fail closed
             continue
