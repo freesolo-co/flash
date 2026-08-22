@@ -844,6 +844,40 @@ def test_non_moe_export_accepts_complete_pairs_for_every_declared_target(tmp_pat
     assert saved["target_modules"] == "all-linear"
 
 
+def test_non_moe_export_rejects_a_pair_whose_outer_dimension_disagrees(tmp_path):
+    """rank and composability do not constrain the base module's own width.
+
+    both pairs below are internally consistent -- rank 1, and B @ A composes -- so every existing
+    check passes. but two tensors targeting the same `q_proj` suffix claim different widths, so at
+    most one of them can match the base module. without this check the export publishes and only
+    fails later at peft or vllm load, with no provenance back to the run that wrote it.
+    """
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    tensors = {
+        **_text_pair(
+            "self_attn.q_proj",
+            np.ones((1, 2), dtype=np.float16),
+            np.ones((2, 1), dtype=np.float16),
+        ),
+    }
+    wide = "base_model.model.layers.1.self_attn.q_proj"
+    tensors[f"{wide}.lora_A.weight"] = np.ones((1, 4), dtype=np.float16)
+    tensors[f"{wide}.lora_B.weight"] = np.ones((4, 1), dtype=np.float16)
+    config = {"peft_type": "LORA", "r": 1, "target_modules": ["q_proj"]}
+    _write_small_safetensors(tmp_path / "adapter_model.safetensors", tensors)
+    config_path = tmp_path / "adapter_config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="outer dimension"):
+        stamp_adapter_dir_provenance(
+            str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
+
+    assert config_path.read_bytes() == before
+
+
 def test_non_moe_export_preserves_the_orphan_pair_rejection_message(tmp_path):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 

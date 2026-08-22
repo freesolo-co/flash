@@ -634,6 +634,7 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
     pairs: dict[str, dict[str, str]] = {}
     language_pairs: dict[str, dict[str, str]] = {}
     target_evidence: set[str] = set()
+    target_widths: dict[str, dict[str, int]] = {}
     for key, shape in metadata.items():
         non_language = is_non_language_lora_key(key)
         if non_language and not multimodal:
@@ -666,6 +667,19 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
         pairs.setdefault(module, {})[match.group("factor")] = key
         if not non_language:
             language_pairs.setdefault(module, {})[match.group("factor")] = key
+        # the outer dimension is the base module's own width, so every tensor targeting the same
+        # suffix must agree on it. rank and mutual composability are checked above and neither
+        # constrains it: a correctly-ranked pair whose outer dim names a different module's width
+        # publishes here and only fails later, at peft or vllm load, with no provenance back to
+        # the export that wrote it.
+        for target in matched_targets:
+            width = shape[1] if match.group("factor") == "A" else shape[0]
+            seen = target_widths.setdefault(target, {}).setdefault(match.group("factor"), width)
+            if seen != width:
+                raise RuntimeError(
+                    f"{label} tensor {key!r} has outer dimension {width} where target "
+                    f"{target!r} was already {seen}"
+                )
 
     incomplete = sorted(module for module, factors in pairs.items() if set(factors) != {"A", "B"})
     if not pairs or incomplete:
