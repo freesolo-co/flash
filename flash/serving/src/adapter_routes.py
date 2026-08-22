@@ -8,7 +8,7 @@ Every route here is gated on the shared internal key: these are control-plane op
 caller-facing inference.
 """
 
-from typing import Any
+from typing import Any, TypeGuard
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
@@ -64,6 +64,78 @@ async def add_adapter(
     return stored
 
 
+def _is_same_generation_winner(
+    current: AdapterRecord | None, registration: AdapterRecord
+) -> TypeGuard[AdapterRecord]:
+    """Return whether another attempt promoted this lifecycle generation."""
+
+    return (
+        current is not None
+        and current.status == "ready"
+        and current.deployment_generation == registration.deployment_generation
+    )
+
+
+def _is_unfenced_original(
+    current: AdapterRecord | None, registration: AdapterRecord
+) -> TypeGuard[AdapterRecord]:
+    """Return whether the original disabled lifecycle generation remains unfenced."""
+
+    return (
+        current is not None
+        and current.status == "disabled"
+        and current.updated_at == registration.updated_at
+    )
+
+
+async def _reconcile_failed_promotion(context: ServingContext, registration: AdapterRecord) -> None:
+    """Keep a failed promotion from orphaning its loaded gpu adapter."""
+
+    try:
+        current = await get_authoritative(registration.adapter_id)
+        if _is_same_generation_winner(current, registration):
+            # another attempt from this shared lifecycle generation won the promotion. adopt its
+            # durable row instead of unloading the gpu registration that now legitimately backs it.
+            context.router.upsert(current, revive=True)
+            return
+
+        if _is_unfenced_original(current, registration):
+            # advance updated_at before unloading so every in-flight promoter sharing this lifecycle
+            # generation loses its old cas. a concurrent winner is adopted after a lost fence race.
+            expected_updated_at = current.updated_at
+            # unreachable from _register_revision; make the optional field explicit at this boundary.
+            if expected_updated_at is None:
+                return
+            fenced = await _replace_stored_cas(
+                current,
+                expected_updated_at=expected_updated_at,
+            )
+            if fenced is None:
+                current = await get_authoritative(registration.adapter_id)
+                if _is_same_generation_winner(current, registration):
+                    context.router.upsert(current, revive=True)
+                    return
+                if _is_unfenced_original(current, registration):
+                    print(
+                        f"adapter registration reconciliation skipped for "
+                        f"{registration.adapter_id}: lifecycle generation could not be fenced",
+                        flush=True,
+                    )
+                    return
+    except HTTPException as exc:
+        print(
+            f"adapter registration reconciliation skipped for {registration.adapter_id}: {exc!r}",
+            flush=True,
+        )
+        return
+
+    await context.unregister_safe(
+        registration.base_model,
+        registration.adapter_id,
+        registration.deployment_generation,
+    )
+
+
 async def _register_revision(context: ServingContext, stored: AdapterRecord) -> None:
     """Load the revision onto its gpu engine, then promote the durable row to ready.
 
@@ -86,9 +158,12 @@ async def _register_revision(context: ServingContext, stored: AdapterRecord) -> 
             expected_updated_at=registration.updated_at,
         )
     except HTTPException:
+        await _reconcile_failed_promotion(context, registration)
         return
-    if committed is not None:
-        context.router.upsert(committed, revive=True)
+    if committed is None:
+        await _reconcile_failed_promotion(context, registration)
+        return
+    context.router.upsert(committed, revive=True)
 
 
 @adapter_router.get("/adapters/{adapter_id}")

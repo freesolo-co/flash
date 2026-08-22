@@ -10,6 +10,7 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.testclient import TestClient
 
+from flash.serving.src import adapter_routes
 from flash.serving.src.adapter_routes import remove_adapter
 from flash.serving.src.persistence import (
     PersistenceConflict,
@@ -167,11 +168,13 @@ class FakePool:
         self.generated: list[tuple[str, str, str]] = []
         self.unregistered: list[str] = []
         self.unregistered_generations: list[str | None] = []
+        self.loaded_generations: dict[str, str | None] = {}
 
     async def register(self, base_model: str, record: AdapterRecord) -> None:
         assert base_model == record.base_model
         self.registered.append(record.adapter_id)
         self.registered_generations.append(record.deployment_generation)
+        self.loaded_generations[record.adapter_id] = record.deployment_generation
 
     async def unregister(
         self,
@@ -182,6 +185,8 @@ class FakePool:
         del base_model
         self.unregistered.append(adapter_id)
         self.unregistered_generations.append(expected_generation)
+        if self.loaded_generations.get(adapter_id) == expected_generation:
+            self.loaded_generations.pop(adapter_id, None)
 
     async def generate(
         self,
@@ -303,14 +308,125 @@ def test_new_registration_creates_disabled_revision_and_alias_then_marks_only_re
         "run_id": RUN_ID,
         "alias_of": REVISION_A,
     }
-    assert persistence.rows[REVISION_A].status == "ready"
-    generation = persistence.rows[REVISION_A].deployment_generation
+    committed = persistence.rows[REVISION_A]
+    assert committed.status == "ready"
+    generation = committed.deployment_generation
     assert generation is not None
     assert persistence.replacements == [REVISION_A]
     assert pool.registered == [REVISION_A]
     assert pool.registered_generations == [generation]
+    assert pool.unregistered == []
+    assert pool.loaded_generations == {REVISION_A: generation}
+    assert router.get(REVISION_A) == committed
     assert router.resolve(REVISION_A) is not None
     assert router.resolve(RUN_ID) is None
+
+
+def test_registration_promotion_http_error_unloads_unrecorded_adapter(setup, monkeypatch) -> None:
+    client, pool, router, persistence = setup
+    replace = adapter_routes._replace_stored_cas
+
+    async def fail_promotion(record: AdapterRecord, *, expected_updated_at: str):
+        if record.status == "ready":
+            raise HTTPException(503, "adapter storage is unavailable")
+        return await replace(record, expected_updated_at=expected_updated_at)
+
+    monkeypatch.setattr(adapter_routes, "_replace_stored_cas", fail_promotion)
+
+    response = _register(client, _registration())
+
+    assert response.status_code == 200
+    assert persistence.rows[REVISION_A].status == "disabled"
+    assert router.resolve(REVISION_A) is None
+    assert pool.loaded_generations == {}, "failed promotion left an unrecorded adapter loaded"
+    assert pool.unregistered == [REVISION_A]
+    assert pool.unregistered_generations == [pool.registered_generations[0]]
+
+
+def test_registration_promotion_cas_miss_unloads_unrecorded_adapter(setup, monkeypatch) -> None:
+    client, pool, router, persistence = setup
+    replace = adapter_routes._replace_stored_cas
+    missed_promotion = False
+
+    async def miss_promotion(record: AdapterRecord, *, expected_updated_at: str):
+        nonlocal missed_promotion
+        if record.status == "ready" and not missed_promotion:
+            missed_promotion = True
+            return None
+        return await replace(record, expected_updated_at=expected_updated_at)
+
+    monkeypatch.setattr(adapter_routes, "_replace_stored_cas", miss_promotion)
+
+    response = _register(client, _registration())
+
+    assert response.status_code == 200
+    assert persistence.rows[REVISION_A].status == "disabled"
+    assert router.resolve(REVISION_A) is None
+    assert pool.loaded_generations == {}, "cas loser left an unrecorded adapter loaded"
+    assert pool.unregistered == [REVISION_A]
+    assert pool.unregistered_generations == [pool.registered_generations[0]]
+
+
+def test_registration_reconciliation_preserves_concurrent_promotion_winner(
+    setup, monkeypatch
+) -> None:
+    client, pool, router, persistence = setup
+    promotion_missed = False
+
+    async def concurrent_winner(record: AdapterRecord, *, expected_updated_at: str):
+        nonlocal promotion_missed
+        if record.status == "ready" and not promotion_missed:
+            promotion_missed = True
+            return
+        assert record.status == "disabled"
+        winner = record.model_copy(
+            update={
+                "status": "ready",
+                "deployment_generation": expected_updated_at,
+            }
+        )
+        persistence.rows[record.adapter_id] = persistence._stamp(winner)
+
+    monkeypatch.setattr(adapter_routes, "_replace_stored_cas", concurrent_winner)
+
+    response = _register(client, _registration())
+
+    assert response.status_code == 200
+    winner = persistence.rows[REVISION_A]
+    assert winner.status == "ready"
+    assert router.get(REVISION_A) == winner
+    assert pool.unregistered == [], "reconciliation unloaded the concurrent promotion winner"
+    assert pool.loaded_generations == {REVISION_A: winner.deployment_generation}, (
+        "concurrent promotion winner lost its loaded adapter"
+    )
+
+
+def test_registration_reconciliation_survives_unload_failure(setup, monkeypatch) -> None:
+    client, pool, _, persistence = setup
+    replace = adapter_routes._replace_stored_cas
+
+    async def miss_promotion(record: AdapterRecord, *, expected_updated_at: str):
+        if record.status == "ready":
+            return None
+        return await replace(record, expected_updated_at=expected_updated_at)
+
+    async def fail_unregister(
+        _base_model: str,
+        _adapter_id: str,
+        _expected_generation: str | None = None,
+    ) -> None:
+        raise RuntimeError("engine unavailable")
+
+    monkeypatch.setattr(adapter_routes, "_replace_stored_cas", miss_promotion)
+    pool.unregister = fail_unregister
+
+    response = _register(client, _registration())
+
+    assert response.status_code == 200
+    assert persistence.rows[REVISION_A].status == "disabled"
+    assert pool.loaded_generations == {REVISION_A: pool.registered_generations[0]}, (
+        "failed cleanup disturbed the loaded adapter"
+    )
 
 
 def test_get_revision_is_not_found_until_ready_then_returns_full_identity(setup) -> None:
