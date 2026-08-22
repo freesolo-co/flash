@@ -85,8 +85,17 @@ _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
 
 def _is_critical_stage(stage: str) -> bool:
     """A terminal transition or an error is CRITICAL: never throttled (the commit must land) and
-    given the longer upload-lock timeout, because no later heartbeat can repair a missed one."""
-    return stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
+    given the longer upload-lock timeout, because no later heartbeat can repair a missed one.
+
+    `_failed` earns this as much as the `error_` prefix does: a failure heartbeat is emitted once, at
+    the moment the failure is known, and nothing later restates it. `checkpoint_upload_failed` is
+    raised from inside a long HF upload, which is precisely when `_HB_UPLOAD_IN_FLIGHT` is set and an
+    unforced ping is dropped -- so the one report of the failure would be discarded exactly in the
+    case that produces it.
+    """
+    return (
+        stage in _HB_TERMINAL_STAGES or stage.startswith("error_") or stage.endswith("_failed")
+    )
 
 
 # Guards throttle bookkeeping; slow HF commit runs outside this lock so heartbeat and liveness

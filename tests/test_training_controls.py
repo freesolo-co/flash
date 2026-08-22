@@ -285,6 +285,55 @@ def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path,
     assert f"{failure_stage} companion failed" in failed[0]["error"]
 
 
+def test_upload_failure_cause_reaches_the_rendered_run_log():
+    """The payload is not the deliverable: `get_logs()` shows only what the formatter renders.
+
+    The formatter emits a fixed list of numeric metric keys, so a stage whose entire content is an
+    explanation rather than a measurement committed the cause and printed `stage=... step=50` alone.
+    """
+    from flash.providers._lifecycle.poll import _format_heartbeat
+
+    line = _format_heartbeat(
+        {
+            "stage": "checkpoint_upload_failed",
+            "step": 50,
+            "failure_stage": "resume",
+            "error": "PermissionError: hf quota refused credential <redacted>",
+        }
+    )
+
+    assert "stage=checkpoint_upload_failed" in line
+    assert "step=50" in line
+    assert "failure_stage=resume" in line
+    assert "error=PermissionError: hf quota refused credential <redacted>" in line
+
+
+def test_a_heartbeat_without_a_failure_cause_is_unchanged():
+    """The failure fields are additive: an ordinary step line must not grow an empty `error=`."""
+    from flash.providers._lifecycle.poll import _format_heartbeat
+
+    line = _format_heartbeat({"stage": "sft_step", "step": 12, "error": "   ", "failure_stage": ""})
+
+    assert line == "worker: stage=sft_step step=12"
+
+
+def test_an_upload_failure_is_critical_so_an_in_flight_commit_cannot_drop_it():
+    """This heartbeat is raised from inside a long HF upload -- when a ping is otherwise dropped.
+
+    `_HB_UPLOAD_IN_FLIGHT` is set for the duration of that upload, and an unforced non-critical
+    stage returns not-due immediately. The failure is reported once and nothing restates it, so the
+    one case that produces this heartbeat is the case that would discard it.
+    """
+    from flash.engine.worker.io.heartbeat import _is_critical_stage
+
+    assert _is_critical_stage("checkpoint_upload_failed")
+    # the existing classes still hold, and an ordinary training step stays throttled.
+    assert _is_critical_stage("done")
+    assert _is_critical_stage("error_oom")
+    assert not _is_critical_stage("sft_step")
+    assert not _is_critical_stage("rl_step")
+
+
 def test_seed_training_rngs_initializes_all_supported_generators(monkeypatch):
     from flash.engine.worker.runtime import rng
 

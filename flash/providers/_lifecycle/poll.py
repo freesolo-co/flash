@@ -262,6 +262,14 @@ def _format_heartbeat(hb: dict) -> str:
         for name, value in reward_metrics.items():
             if isinstance(value, (int, float)):
                 msg += f" {name}={value:.3f}"
+    # a failure stage's cause, rendered last so it reads as prose after the numeric fields. the
+    # metric loop above formats a fixed key list, so a stage that carries an explanation instead of a
+    # measurement would otherwise commit the cause to the payload and print only the stage name --
+    # the failure is reported and its reason is dropped in the same line.
+    for key in ("failure_stage", "error"):
+        value = hb.get(key)
+        if isinstance(value, str) and value.strip():
+            msg += f" {key}={value.strip()}"
     msg += format_gpu_status(hb.get("gpu"))
     sample_lines: list[str] = []
     rendered_samples = 0
