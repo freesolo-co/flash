@@ -144,7 +144,7 @@ def test_lora_is_added_beside_the_requested_kv_pool_when_the_engine_fits(
         lora_rank=64,
     )
 
-    assert adapter_gb == pytest.approx(6.591273472)
+    assert adapter_gb == pytest.approx(6.591276032)
     # the adapter lives inside vllm but beside, not instead of, its requested kv pool.
     assert util * 180.0 == pytest.approx(35.0 + adapter_gb + expected_kv_gb)
     assert util * 180.0 - 35.0 - adapter_gb == pytest.approx(expected_kv_gb)
@@ -221,6 +221,46 @@ def test_grpo_kv_floor_searches_lifted_cap_transition():
     # The 0.55 cap is gated by total card size. The floor must not only test need/0.55 and
     # otherwise jump all the way to need/0.45; the first valid lifted-cap card is smaller.
     assert grpo_kv_floor_gb(35.0, 2048, 8) == 178
+
+
+def test_grpo_kv_floor_reserves_rank_local_lora_before_admitting_a_card():
+    from flash.engine.plan.vram import _lora_weight_memory_gb, grpo_kv_floor_gb
+
+    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    card_gb = 40.0
+    tensor_parallel = 8
+    adapter_gb = _lora_weight_memory_gb(64, info, tensor_parallel=tensor_parallel)
+    weights_gb = info.params_b * 2.0 / tensor_parallel
+    requested_kv_gb = 8.0
+    util = colocate_kv_util(
+        info.params_b,
+        2048,
+        card_gb,
+        sleep_mode=False,
+        num_generations=8,
+        active_params_b=info.active_params_b,
+        model_info=info,
+        tensor_parallel=tensor_parallel,
+        lora_rank=64,
+    )
+    fitted_kv_gb = util * card_gb - weights_gb - adapter_gb
+
+    assert adapter_gb == pytest.approx(5.815663616)
+    assert fitted_kv_gb == pytest.approx(3.434336384)
+    assert fitted_kv_gb < requested_kv_gb / 2.0
+    assert (
+        grpo_kv_floor_gb(
+            info.params_b,
+            2048,
+            8,
+            active_params_b=info.active_params_b,
+            model_info=info,
+            lora_rank=64,
+            tensor_parallel=tensor_parallel,
+        )
+        == 42
+    )
+    assert card_gb < 42
 
 
 def test_robust_to_missing_params_and_zero_context():

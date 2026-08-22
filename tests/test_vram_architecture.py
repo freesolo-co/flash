@@ -76,13 +76,14 @@ def test_qwen36_moe_tp2_lora_footprint_keeps_one_projection_factor_replicated():
     full_params = _lora_parameter_count(64, info)
     rank_params = _lora_parameter_count(64, info, tensor_parallel=2)
 
-    # across the catalog shapes, 2.778560512b parameters belong to the larger projection factors and
-    # 1.034152448b to the smaller ones. vllm default tp keeps the former replicated and halves only
-    # the latter: 2.778560512b + 1.034152448b / 2 = 3.295636736b parameters on each rank.
+    # vllm keeps the shared-expert gate's min-dim-1 factor whole on every rank. the gate shape costs
+    # 5,245,440 parameters rather than the fractional-shard result of 5,244,160.
+    gate_shape_params = 64 * 40 * (2048 + 1)
+    assert gate_shape_params == 5_245_440
     assert full_params == 3_812_712_960
-    assert rank_params == 3_295_636_736
+    assert rank_params == 3_295_638_016
     assert rank_params > full_params / 2
-    assert _lora_weight_memory_gb(64, info, tensor_parallel=2) == pytest.approx(6.591273472)
+    assert _lora_weight_memory_gb(64, info, tensor_parallel=2) == pytest.approx(6.591276032)
 
 
 @pytest.mark.parametrize("model_id", tuple(MODELS))

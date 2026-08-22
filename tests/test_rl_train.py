@@ -1827,7 +1827,7 @@ def test_multigpu_gpu_mem_util_reserves_rank_local_lora_inside_vllm_without_redu
     info = MODELS["Qwen/Qwen3.6-35B-A3B"]
     card_gb = float(get_gpu_info("B200").vram_gb)
     adapter_gb = _lora_weight_memory_gb(64, info, tensor_parallel=2)
-    assert adapter_gb == pytest.approx(6.591273472)
+    assert adapter_gb == pytest.approx(6.591276032)
 
     without_adapter = colocate_kv_util(
         float(info.params_b),
@@ -1852,10 +1852,8 @@ def test_multigpu_gpu_mem_util_reserves_rank_local_lora_inside_vllm_without_redu
     )
 
     # tp2 gives each rank 35 gb of weights. the resident short-context pool is the 8 gb floor, and
-    # the default tp lora layout adds 6.591273472 gb on that same rank. all three live inside vllm's
-    # share: 35 + 8 + 6.591273472 = 49.591273472 gb. subtracting that footprint would leave only
-    # 1.408726528 gb for kv; the old subtraction plus even-shard assumption left 4.18728704 gb.
-    assert got * card_gb == pytest.approx(49.591273472)
+    # the default tp lora layout adds 6.591276032 gb on that same rank.
+    assert got * card_gb == pytest.approx(49.591276032)
     assert got == pytest.approx(without_adapter + adapter_gb / card_gb)
     assert got * card_gb - 35.0 - adapter_gb == pytest.approx(8.0)
 
