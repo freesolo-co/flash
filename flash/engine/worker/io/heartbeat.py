@@ -225,6 +225,11 @@ def heartbeat(
             }
             if failure:
                 _w._HB_PENDING_CHECKPOINT_FAILURE = failure
+        elif stage == "checkpoint_uploaded":
+            # a later checkpoint landed, so the earlier failure is history rather than the run's
+            # outcome. leaving it latched would stamp `done` with a cause the run recovered from,
+            # which reads as "finished, but your checkpoint is missing" for a run that has one.
+            _w._HB_PENDING_CHECKPOINT_FAILURE = None
         elif stage in _HB_TERMINAL_STAGES and _w._HB_PENDING_CHECKPOINT_FAILURE:
             for key, value in _w._HB_PENDING_CHECKPOINT_FAILURE.items():
                 kw.setdefault(key, value)

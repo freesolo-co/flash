@@ -551,6 +551,46 @@ def test_finalize_preserves_pending_checkpoint_upload_failure(monkeypatch):
     assert committed[-1]["error"] == "Permission denied"
 
 
+def test_finalize_drops_a_checkpoint_failure_a_later_upload_recovered(monkeypatch):
+    """A run that recovered must not finish reporting the failure it recovered from.
+
+    The pending cause exists so a failure is not lost to the terminal heartbeat overwriting it.
+    But a later successful checkpoint settles the question: the run HAS a checkpoint, so carrying
+    the old cause into `done` reads as "finished, but your checkpoint is missing" for a run whose
+    checkpoint is present.
+    """
+    import json
+
+    monkeypatch.setenv("RUN_MODE", "sft")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+    from flash.engine.result.accounting import RunMetrics
+
+    committed = []
+
+    def capture(path, destination, **_kwargs):
+        if destination == "heartbeat.json":
+            with open(path) as file:
+                committed.append(json.load(file))
+        return True
+
+    monkeypatch.setattr(RunMetrics, "save", lambda self, path: None)
+    monkeypatch.setattr(w, "hf_upload_file", capture)
+    monkeypatch.setattr(w, "gpu_diagnostics", dict)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+
+    w.heartbeat(
+        "checkpoint_upload_failed", step=50, failure_stage="resume", error="Permission denied"
+    )
+    w.heartbeat("checkpoint_uploaded", step=100)
+    w._finalize(RunMetrics(phase="sft"))
+
+    assert committed[-1]["stage"] == "done"
+    assert "failure_stage" not in committed[-1]
+    assert "error" not in committed[-1]
+
+
 def test_heartbeat_terminal_only_mode(monkeypatch):
     """TERMINAL_ONLY mode throttles every non-terminal stage (not just rl_step) so a fan-out of
     runs sharing one HF_REPO stays under the 128-commits/hour cap; terminal done/error_* still
