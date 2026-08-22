@@ -1340,11 +1340,6 @@ def _compile_so(c_path, so_path, src):
     return subprocess.run([cc, "-shared", "-fPIC", "-o", so_path, c_path]).returncode == 0
 
 
-def _maps_has(name):
-    with open("/proc/self/maps") as f:
-        return any(name in line for line in f)
-
-
 def test_find_real_libcudart_handles_bare_soname_without_crashing(monkeypatch):
     """find_library('cudart') returns a bare soname (e.g. 'libcudart.so.12'), not a path. The
     os.path.exists guard must not silently drop it; with no loadable cudart present it still resolves

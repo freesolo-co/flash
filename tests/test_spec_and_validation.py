@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from contextlib import contextmanager
 from dataclasses import fields, replace
 
 import pytest
@@ -1818,30 +1817,6 @@ def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() ->
     assert _preparation_digest(public, worker, None) == _preparation_digest(
         JobSpec.from_dict(stored), worker, None
     )
-
-
-@contextmanager
-def _serializing_without_prompts_per_step():
-    """Serialize `JobSpec` the way 1.1.40 did: with no ``prompts_per_step`` key at all.
-
-    That build predates the field, so its payload carried no such key -- which hashes differently
-    from the explicit null today's dataclass always emits. A digest meant to stand in for a real
-    persisted snapshot has to be taken over those historical bytes, or the test asserts against a
-    shape production never wrote.
-    """
-    original_internal, original_public = JobSpec.to_internal_dict, JobSpec.to_dict
-
-    def _drop(emit):
-        return lambda self: {
-            **emit(self),
-            "train": {k: v for k, v in emit(self)["train"].items() if k != "prompts_per_step"},
-        }
-
-    JobSpec.to_internal_dict, JobSpec.to_dict = _drop(original_internal), _drop(original_public)
-    try:
-        yield
-    finally:
-        JobSpec.to_internal_dict, JobSpec.to_dict = original_internal, original_public
 
 
 def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> None:
