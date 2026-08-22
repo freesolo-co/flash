@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from flash.cli.commands import serve_deploy
+from flash.cli.commands import serve_deploy, serve_undeploy
 from flash.cli.commands.serve_deploy import cmd_serve_deploy
 from flash.cli.commands.serve_undeploy import cmd_serve_undeploy
 from flash.cli.serve_parser import _add_serve_commands
@@ -93,6 +93,43 @@ def _stub_credentials(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, str]:
 
 def _result(bundle, status: str, error_code: str | None = None) -> DeploymentResult:
     return DeploymentResult.from_spec(bundle.spec, status=status, error_code=error_code)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("generation", 1, "does not match the exact deployment generation"),
+        ("app_id", "wrong-provider-id", "does not match the pinned provider contract"),
+    ],
+)
+def test_undeploy_rejects_mismatched_handle_input_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    _stub_resolution(monkeypatch)
+    _stub_credentials(monkeypatch)
+    args = _args()
+    if field == "generation":
+        args.generation = 2
+    original_provider_handle = serve_undeploy._provider_handle
+
+    def _mismatched_handle(parsed_args, bundle):
+        handle = original_provider_handle(parsed_args, bundle)
+        # simulate ids copied from a different generation or mistyped after provider output. the
+        # frozen handle normally prevents mutation, but the cli boundary must still validate what it
+        # is about to hand to teardown rather than relying on provider code to report user input.
+        object.__setattr__(handle, field, value)
+        return handle
+
+    monkeypatch.setattr(serve_undeploy, "_provider_handle", _mismatched_handle)
+
+    assert cmd_serve_undeploy(args) == 1
+    captured = capsys.readouterr()
+    assert message in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_undeploy_routes_to_the_named_provider(monkeypatch: pytest.MonkeyPatch) -> None:

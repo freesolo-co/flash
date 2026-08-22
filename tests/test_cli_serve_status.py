@@ -99,6 +99,49 @@ def _result(bundle, status: str) -> DeploymentResult:
     )
 
 
+def test_status_rejects_provider_invalid_placement_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    args = _args()
+    args.modal_workspace = "UPPER"
+
+    assert cmd_serve_status(args) == 1
+    captured = capsys.readouterr()
+    assert "error:" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_status_bundle_failure_is_not_mislabeled_as_credentials(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = _args()
+    args.model = "not-a-catalog-model"
+
+    assert cmd_serve_status(args) == 1
+    captured = capsys.readouterr()
+    assert "error:" in captured.err
+    assert "credentials are read from the environment" not in captured.err
+
+
+def test_status_credential_failure_keeps_request_scoped_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_resolution(monkeypatch)
+    monkeypatch.delenv(serve_deploy.MODAL_TOKEN_ID_ENV, raising=False)
+    monkeypatch.delenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, raising=False)
+
+    assert cmd_serve_status(_args()) == 1
+    captured = capsys.readouterr()
+    assert (
+        "credentials are read from the environment for this one request and are never stored"
+        in (captured.err)
+    )
+
+
 def test_status_routes_to_the_named_read_only_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 

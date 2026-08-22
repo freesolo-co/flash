@@ -11,6 +11,7 @@ import sys
 import time
 
 from flash.cli.commands.serve_deploy import (
+    _build_provider_plan,
     _credentials,
     _deployment_bundle,
     _err,
@@ -57,6 +58,13 @@ def cmd_serve_status(args) -> int:
     provider = args.provider
     try:
         bundle = _deployment_bundle(args)
+        # bundle construction only validates the generic placement type. the provider plan applies
+        # the exact hostname contract before reconciliation can contact the provider.
+        _build_provider_plan(provider, bundle)
+    except (ValueError, TypeError) as exc:
+        return _err(str(exc))
+
+    try:
         credentials = _credentials(provider)
         runtime_secrets = _runtime_secrets()
     except (ValueError, TypeError) as exc:

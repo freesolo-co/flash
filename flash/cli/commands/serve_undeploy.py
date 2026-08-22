@@ -111,6 +111,19 @@ def cmd_serve_undeploy(args) -> int:
     try:
         bundle = _deployment_bundle(args)
         handle = _provider_handle(args, bundle)
+        if provider == "modal":
+            from flash.serve.provisioning._modal_plan import build_modal_create_plan
+            from flash.serve.provisioning.modal import _validate_handle
+
+            plan = build_modal_create_plan(bundle, phase="finalized")
+        else:
+            from flash.serve.provisioning._runpod_plan import build_runpod_create_plan
+            from flash.serve.provisioning.runpod import _validate_handle
+
+            plan = build_runpod_create_plan(bundle)
+        # validate the user-authored identity before provider teardown. only this local validation is
+        # caught; the provider call remains outside so lifecycle defects still surface in full.
+        _validate_handle(plan, handle)
         credentials = _credentials(provider)
     except (ValueError, TypeError) as exc:
         return _err(str(exc))
