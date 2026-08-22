@@ -1030,20 +1030,8 @@ def test_warm_start_cost_quotes_the_card_the_parser_accepts(tmp_path, capsys, mo
     )
 
 
-def test_higher_warm_start_rank_can_select_cheaper_hardware():
-    """Rank-1 dollars are not a lower bound when the estimator cost-ranks hardware shapes.
-
-    Catalog geometry requires 180 GB at rank 1, which fits one 180 GB B200 exactly. Rank 8 requires
-    182 GB, so it moves to two 141 GB H200s. The current RunPod snapshot prices B200 at $5.89/hour
-    and H200 at $4.39/hour per card, while the estimator's sharded step model makes the H200 pair
-    cheaper for this workload. Pricing may legitimately change, so pin the ordering and selected
-    shapes rather than exact dollar totals.
-    """
-    from dataclasses import replace
-
-    from flash.cost import estimate_cost
+def _warm_start_rank_boundary_config():
     from flash.cost.spec import runconfig_from_spec
-    from flash.providers.base import GPU_INFO
 
     spec = spec_from_dict(
         {
@@ -1054,8 +1042,17 @@ def test_higher_warm_start_rank_can_select_cheaper_hardware():
             "train": {"prompts_per_step": 8, "max_examples": 40, "group_size": 2},
         }
     )
-    config = runconfig_from_spec(spec)
+    return runconfig_from_spec(spec)
 
+
+def test_higher_warm_start_rank_crosses_hardware_shape_boundary():
+    """Catalog geometry, not mutable prices, owns the rank-dependent hardware boundary."""
+    from dataclasses import replace
+
+    from flash.cost import estimate_cost
+    from flash.providers.base import GPU_INFO
+
+    config = _warm_start_rank_boundary_config()
     rank_1 = estimate_cost(replace(config, lora_rank=1))
     rank_8 = estimate_cost(replace(config, lora_rank=8))
 
@@ -1063,6 +1060,25 @@ def test_higher_warm_start_rank_can_select_cheaper_hardware():
     assert GPU_INFO["H200"].vram_gb == 141
     assert (rank_1.required_vram_gb, rank_1.gpu_count, rank_1.gpu) == (180, 1, "B200")
     assert (rank_8.required_vram_gb, rank_8.gpu_count, rank_8.gpu) == (182, 2, "H200")
+
+
+def test_higher_warm_start_rank_can_select_cheaper_hardware(monkeypatch):
+    """Controlled prices prove that crossing the shape boundary can lower total cost."""
+    from dataclasses import replace
+
+    from flash.cost import estimate_cost
+    from flash.providers import base
+
+    b200 = replace(base.GPU_INFO["B200"], hourly_usd=5.50)
+    h200 = replace(base.GPU_INFO["H200"], hourly_usd=4.00)
+    monkeypatch.setattr(base, "GPU_INFO", {"B200": b200, "H200": h200})
+
+    config = _warm_start_rank_boundary_config()
+    rank_1 = estimate_cost(replace(config, lora_rank=1))
+    rank_8 = estimate_cost(replace(config, lora_rank=8))
+
+    assert (rank_1.gpu, rank_1.gpu_count, rank_1.gpu_hourly_usd) == ("B200", 1, 5.50)
+    assert (rank_8.gpu, rank_8.gpu_count, rank_8.gpu_hourly_usd) == ("H200", 2, 4.00)
     assert rank_8.total_usd < rank_1.total_usd
 
 
