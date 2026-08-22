@@ -399,10 +399,22 @@ def validate_materialized_adapter(
     before, contents = _read_exact_regular_files(directory, adapter.files)
     config = _load_strict_config(contents[_CONFIG_NAME])
     _validate_adapter_config(config, adapter, manifest)
-    tensors = _read_safetensors_tensor_metadata(str(directory / _WEIGHTS_NAME))
+    validate_adapter_weight_structure(directory / _WEIGHTS_NAME, config, adapter.base_model)
     after, _ = _read_exact_regular_files(directory, adapter.files)
     if after != before:
         raise MaterializationError("adapter cache entry changed during validation")
+    return config
+
+
+def validate_adapter_weight_structure(
+    weights_path: str | os.PathLike[str], config: Mapping[str, Any], base_model: str
+) -> None:
+    """validate the safetensors and LoRA contract shared by resolution and hydration."""
+
+    try:
+        tensors = _read_safetensors_tensor_metadata(os.fspath(weights_path))
+    except (OSError, ValueError) as exc:
+        raise MaterializationError("adapter safetensors structure is invalid") from exc
     if not tensors:
         raise MaterializationError("adapter safetensors contains no tensors")
     _validate_lora_pairs(tensors)
@@ -418,14 +430,13 @@ def validate_materialized_adapter(
         ".lora_B." in key for key in tensors
     ):
         raise MaterializationError("adapter safetensors has no complete LoRA factor evidence")
-    if lora_target_parameters(adapter.base_model):
+    if lora_target_parameters(base_model):
         try:
-            validate_fused_expert_adapter_config(config, adapter.base_model)
+            validate_fused_expert_adapter_config(config, base_model)
         except ValueError as exc:
             raise MaterializationError("fused-expert adapter config is invalid") from exc
-        if not has_complete_fused_expert_tensors(tensors, config, adapter.base_model):
+        if not has_complete_fused_expert_tensors(tensors, config, base_model):
             raise MaterializationError("fused-expert adapter tensors are incomplete")
-    return config
 
 
 @contextlib.contextmanager

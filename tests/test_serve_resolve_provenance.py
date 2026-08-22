@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
+from safetensors.numpy import save_file
 
 from flash.serve import resolve as resolve_module
 from flash.serve.resolve import ADAPTER_CONFIG, ADAPTER_WEIGHTS, ResolveError, resolve_adapter
@@ -25,7 +27,17 @@ ARTIFACT_REVISION = "a" * 40
 def _install_hub(monkeypatch, tmp_path: Path, config: dict) -> None:
     """Stand up the two hub reads the resolver makes, backed by real files on disk."""
     (tmp_path / ADAPTER_CONFIG).write_text(json.dumps(config), encoding="utf-8")
-    (tmp_path / ADAPTER_WEIGHTS).write_bytes(b"weights-bytes")
+    rank = config.get("r", 32)
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+        rank = 32
+    module = "base_model.model.layers.0.self_attn.q_proj"
+    save_file(
+        {
+            f"{module}.lora_A.weight": np.zeros((rank, 2), dtype=np.float32),
+            f"{module}.lora_B.weight": np.zeros((2, rank), dtype=np.float32),
+        },
+        tmp_path / ADAPTER_WEIGHTS,
+    )
 
     class _Info:
         sha = ARTIFACT_REVISION
@@ -120,6 +132,53 @@ def test_an_agreeing_config_resolves(monkeypatch, tmp_path) -> None:
     assert resolved.adapter.lora_rank == 32
     assert resolved.adapter.base_model == BASE
     assert resolved.adapter.artifact_revision == ARTIFACT_REVISION
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        pytest.param("invalid-structure", "structure is invalid", id="invalid-structure"),
+        pytest.param("incomplete-pair", "incomplete LoRA tensor pair", id="incomplete-pair"),
+        pytest.param("rank-contradiction", "ranks contradict", id="rank-contradiction"),
+    ],
+)
+def test_unusable_adapter_weights_fail_resolution_without_an_extra_download(
+    monkeypatch, tmp_path, failure: str, expected: str
+) -> None:
+    config = {"peft_type": "LORA", "r": 32, "base_model_name_or_path": BASE}
+    _install_hub(monkeypatch, tmp_path, config)
+    weights_path = tmp_path / ADAPTER_WEIGHTS
+    module = "base_model.model.layers.0.self_attn.q_proj"
+    if failure == "invalid-structure":
+        weights_path.write_bytes(b"nonempty but not safetensors")
+    elif failure == "incomplete-pair":
+        save_file(
+            {f"{module}.lora_A.weight": np.zeros((32, 2), dtype=np.float32)},
+            weights_path,
+        )
+    else:
+        save_file(
+            {
+                f"{module}.lora_A.weight": np.zeros((16, 2), dtype=np.float32),
+                f"{module}.lora_B.weight": np.zeros((2, 16), dtype=np.float32),
+            },
+            weights_path,
+        )
+    downloads: list[str] = []
+
+    def download(*, filename: str, **_kwargs) -> str:
+        downloads.append(filename)
+        return str(tmp_path / Path(filename).name)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
+
+    with pytest.raises(ResolveError, match=expected):
+        _resolve()
+
+    assert downloads == [
+        "rl/run1/seed0/adapter/adapter_config.json",
+        "rl/run1/seed0/adapter/adapter_model.safetensors",
+    ]
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.schema import format_adapter_revision
 from flash.serve.app import AdapterExecutionInput, ArtifactFile, ExecutionInputs
+from flash.serve.app.materialize import MaterializationError, validate_adapter_weight_structure
 from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
 from flash.serve.profiles import ServingProfile
 from flash.serve.provisioning import ServingImage
@@ -116,6 +117,7 @@ def _artifact_files(repo_id: str, repo_type: str, revision: str, subfolder: str)
     prefix = subfolder.strip("/")
     files: list[ArtifactFile] = []
     config_path: str | None = None
+    weights_path: str | None = None
     for name in (ADAPTER_CONFIG, ADAPTER_WEIGHTS):
         remote = f"{prefix}/{name}" if prefix else name
         try:
@@ -134,7 +136,9 @@ def _artifact_files(repo_id: str, repo_type: str, revision: str, subfolder: str)
         files.append(ArtifactFile(path=name, size=size, sha256=digest))
         if name == ADAPTER_CONFIG:
             config_path = str(local)
-    return tuple(files), config_path
+        else:
+            weights_path = str(local)
+    return tuple(files), config_path, weights_path
 
 
 class _DuplicateConfigKey(ValueError):
@@ -152,7 +156,9 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
     return result
 
 
-def _declared_provenance(config_path: str | None) -> tuple[int | None, str | None, str | None]:
+def _declared_provenance(
+    config_path: str | None,
+) -> tuple[dict[str, object] | None, int | None, str | None, str | None]:
     """read the rank and base-model provenance the adapter stamps into its own config.
 
     the config is already on disk from the digest pass, so this costs nothing extra. reading it is
@@ -162,7 +168,7 @@ def _declared_provenance(config_path: str | None) -> tuple[int | None, str | Non
     """
 
     if config_path is None:
-        return None, None, None
+        return None, None, None, None
     try:
         with open(config_path, "rb") as handle:
             raw = handle.read()
@@ -234,7 +240,7 @@ def _declared_provenance(config_path: str | None) -> tuple[int | None, str | Non
     if revision is not None and not isinstance(revision, str):
         raise ResolveError(f"{ADAPTER_CONFIG} revision must be a string when present")
 
-    return rank, declared_base, _text("revision")
+    return config, rank, declared_base, _text("revision")
 
 
 def _checkpoint_step_from_subfolder(
@@ -298,14 +304,14 @@ def resolve_adapter(
     if len(artifact_revision) != 40:
         raise ResolveError(f"{artifact_repo_id} did not resolve to an immutable commit")
 
-    files, config_path = _artifact_files(
+    files, config_path, weights_path = _artifact_files(
         artifact_repo_id, artifact_repo_type, artifact_revision, artifact_subfolder
     )
 
     # the adapter's own config is the authority on what it was trained against. checking it here
     # turns a mistyped --lora-rank or --model into a resolution error, instead of a failure inside
     # the paid GPU container after provisioning has already begun.
-    declared_rank, declared_base, declared_base_revision = _declared_provenance(config_path)
+    config, declared_rank, declared_base, declared_base_revision = _declared_provenance(config_path)
     if declared_rank is not None and declared_rank != lora_rank:
         raise ResolveError(
             f"--lora-rank {lora_rank} disagrees with {ADAPTER_CONFIG}, which declares "
@@ -321,6 +327,21 @@ def resolve_adapter(
     # never saw. the container compares these directly and would reject the mismatch anyway.
     if declared_base_revision is not None and declared_base_revision != base_model_revision:
         base_model_revision = declared_base_revision
+
+    if config is None or weights_path is None:
+        raise ResolveError(
+            f"{artifact_repo_id}@{artifact_revision} did not resolve both required adapter files"
+        )
+    try:
+        validate_adapter_weight_structure(weights_path, config, base_model)
+    except MaterializationError as exc:
+        prefix = artifact_subfolder.strip("/")
+        remote = f"{prefix}/{ADAPTER_WEIGHTS}" if prefix else ADAPTER_WEIGHTS
+        raise ResolveError(
+            f"{artifact_repo_id}@{artifact_revision}:{remote} is not a deployable LoRA adapter: "
+            f"{exc}"
+        ) from exc
+
     # the aggregate digest binds the control record to the exact file table the manifest carries,
     # so a spec and a manifest cannot disagree about what was deployed.
     from flash.serve.app import aggregate_file_digest
