@@ -298,15 +298,21 @@ class _FakeTransport:
             response = self._create(path, payload)
         elif method == "PATCH":
             assert payload is not None
-            volume_id = path.rsplit("/", 1)[-1]
+            resource, resource_id = path.strip("/").split("/", 1)
+            rows = self.templates if resource == "templates" else self.volumes
             response = None
-            for volume in self.volumes:
-                if volume["id"] == volume_id:
-                    volume["size"] = payload["size"]
-                    response = dict(volume)
+            for index, row in enumerate(rows):
+                if row["id"] == resource_id:
+                    updated = (
+                        {"id": resource_id, **payload}
+                        if resource == "templates"
+                        else {**row, **payload}
+                    )
+                    rows[index] = updated
+                    response = dict(updated)
                     break
             if response is None:
-                raise AssertionError("unknown fake volume")
+                raise AssertionError("unknown fake patch target")
         elif method == "DELETE":
             self._delete(path)
             response = None
@@ -583,9 +589,7 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
     assert template_env["FLASH_INFERENCE_TOKEN"] == (
         f"{{{{ RUNPOD_SECRET_{names.inference_secret} }}}}"
     )
-    assert template_env["FLASH_ARTIFACT_TOKEN"] == (
-        f"{{{{ RUNPOD_SECRET_{names.artifact_secret} }}}}"
-    )
+    assert "FLASH_ARTIFACT_TOKEN" not in template_env
     assert transport.volumes[0]["dataCenterId"] == bundle.spec.placement.data_center_id
     assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
     assert not hasattr(result.handle, "artifact_secret_id")
@@ -599,6 +603,7 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
         ("rest", "POST /networkvolumes"),
         ("rest", "POST /templates"),
         ("rest", "POST /pods"),
+        ("rest", "PATCH /templates/template01"),
         ("graphql", "secretDelete"),
     ]
 
@@ -885,8 +890,187 @@ def test_adoption_deletes_one_lingering_artifact_only_after_endpoint_proof() -> 
     assert result.handle == handle
     assert probe.calls
     assert probe.calls[0][1] is True
-    assert [call[1] for call in _mutation_calls(transport)] == ["secretDelete"]
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "PATCH /templates/template01",
+        "secretDelete",
+    ]
     assert [item["name"] for item in transport.secrets] == [_names(bundle).inference_secret]
+
+
+def test_artifact_reference_is_absent_before_its_secret_is_deleted() -> None:
+    bundle = _bundle()
+    plan = build_runpod_create_plan(bundle)
+
+    class _ObserveTemplateAtDeleteTransport(_FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.environment_at_delete: tuple[tuple[str, str], ...] | None = None
+            self.pending_template: dict[str, object] | None = None
+
+        def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
+            if mutation and "secretDelete" in document:
+                self.environment_at_delete = tuple(sorted(self.templates[0]["env"].items()))
+            return super().graphql(
+                document,
+                variables,
+                mutation=mutation,
+                deadline_at=deadline_at,
+            )
+
+        def rest(
+            self,
+            method,
+            path,
+            payload,
+            *,
+            mutation: bool,
+            deadline_at: float,
+            query=None,
+        ):
+            if method == "GET" and path == "/templates" and self.pending_template is not None:
+                self.templates[0] = self.pending_template
+                self.pending_template = None
+            if method == "PATCH" and path == "/templates/template02":
+                original = dict(self.templates[0])
+                response = super().rest(
+                    method,
+                    path,
+                    payload,
+                    mutation=mutation,
+                    deadline_at=deadline_at,
+                    query=query,
+                )
+                self.pending_template = dict(self.templates[0])
+                self.templates[0] = original
+                return response
+            return super().rest(
+                method,
+                path,
+                payload,
+                mutation=mutation,
+                deadline_at=deadline_at,
+                query=query,
+            )
+
+    transport = _ObserveTemplateAtDeleteTransport()
+    _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    class _ReplaceTemplateBeforeCleanupProbe(_Probe):
+        def __call__(self, url, token, probed_bundle, timeout_seconds):
+            accepted = super().__call__(url, token, probed_bundle, timeout_seconds)
+            transport.templates[0]["id"] = "template02"
+            transport.pods[0]["templateId"] = "template02"
+            return accepted
+
+    result, _factory, _probe = _provision(
+        bundle,
+        transport,
+        artifact_token=None,
+        probe=_ReplaceTemplateBeforeCleanupProbe(True),
+    )
+    mutations = [call[1] for call in _mutation_calls(transport)]
+
+    assert (
+        result.status,
+        transport.environment_at_delete,
+        mutations,
+    ) == (
+        "ready",
+        plan.environment_without_artifact,
+        ["PATCH /templates/template02", "secretDelete"],
+    )
+
+
+def test_artifact_secret_survives_until_the_template_patch_is_observed() -> None:
+    bundle = _bundle()
+
+    class _IgnoredTemplatePatchTransport(_FakeTransport):
+        def rest(
+            self,
+            method,
+            path,
+            payload,
+            *,
+            mutation: bool,
+            deadline_at: float,
+            query=None,
+        ):
+            if method == "PATCH" and path == "/templates/template01":
+                original = dict(self.templates[0])
+                response = super().rest(
+                    method,
+                    path,
+                    payload,
+                    mutation=mutation,
+                    deadline_at=deadline_at,
+                    query=query,
+                )
+                self.templates[0] = original
+                return response
+            return super().rest(
+                method,
+                path,
+                payload,
+                mutation=mutation,
+                deadline_at=deadline_at,
+                query=query,
+            )
+
+    transport = _IgnoredTemplatePatchTransport()
+    _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=4.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(True),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert (
+        result.status,
+        [call[1] for call in _mutation_calls(transport)],
+        [item["name"] for item in transport.secrets],
+    ) == (
+        "outcome_unknown",
+        ["PATCH /templates/template01"],
+        [_names(bundle).inference_secret, _names(bundle).artifact_secret],
+    )
+
+
+def test_artifact_cleanup_does_not_patch_a_template_that_drifted_after_readiness() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    class _DriftingProbe(_Probe):
+        def __call__(self, url, token, probed_bundle, timeout_seconds):
+            accepted = super().__call__(url, token, probed_bundle, timeout_seconds)
+            transport.templates[0]["imageName"] = "registry.example/other@sha256:" + "0" * 64
+            return accepted
+
+    result, _factory, _probe = _provision(
+        bundle,
+        transport,
+        artifact_token=None,
+        probe=_DriftingProbe(True),
+    )
+
+    assert (
+        result.status,
+        _mutation_calls(transport),
+        [item["name"] for item in transport.secrets],
+    ) == (
+        "outcome_unknown",
+        [],
+        [_names(bundle).inference_secret, _names(bundle).artifact_secret],
+    )
 
 
 def test_production_probe_overrun_never_accepts_readiness_or_cleans_artifact() -> None:
@@ -991,7 +1175,12 @@ def test_ambiguous_adoption_artifact_cleanup_is_outcome_unknown() -> None:
     result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
     assert result.status == "outcome_unknown"
     assert result.handle == handle
-    assert len([call for call in _mutation_calls(transport) if call[1] == "secretDelete"]) == 1
+    mutations = [call[1] for call in _mutation_calls(transport)]
+    assert mutations == ["PATCH /templates/template01"]
+    assert [item["name"] for item in transport.secrets] == [
+        _names(bundle).inference_secret,
+        _names(bundle).artifact_secret,
+    ]
 
 
 def test_volume_resize_only_grows_and_mutates_once() -> None:
@@ -1244,7 +1433,7 @@ def test_teardown_refuses_mismatched_exact_resource_before_deletion() -> None:
     assert _mutation_calls(transport) == []
 
 
-def test_artifact_cleanup_ambiguity_keeps_handle_and_never_retries() -> None:
+def test_artifact_template_patch_ambiguity_keeps_handle_and_secret() -> None:
     bundle = _bundle()
     transport = _FakeTransport()
     transport.fail_mutation_at = 6
@@ -1255,8 +1444,13 @@ def test_artifact_cleanup_ambiguity_keeps_handle_and_never_retries() -> None:
     assert result.error_code == "resource_ambiguous"
     assert result.handle is not None
     assert transport.mutation_count == 6
-    deletes = [call for call in _mutation_calls(transport) if call[1] == "secretDelete"]
-    assert len(deletes) == 1
+    mutations = [call[1] for call in _mutation_calls(transport)]
+    assert mutations.count("PATCH /templates/template01") == 1
+    assert "secretDelete" not in mutations
+    assert [item["name"] for item in transport.secrets] == [
+        _names(bundle).inference_secret,
+        _names(bundle).artifact_secret,
+    ]
 
 
 def test_stdlib_transport_attempts_mutation_once_and_sanitizes_malformed_success() -> None:

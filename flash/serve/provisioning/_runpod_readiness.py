@@ -4,11 +4,12 @@
 is the readiness wait: polling the provider until the exact pod is running and its endpoint answers
 a probe, then deleting the hydration artifact the pod no longer needs. It is the one part of the
 lifecycle every entry point shares -- create, adopt, and read-only reconcile all end in this same
-wait -- and it touches provider state only through the observe and delete callables handed to it.
+wait -- and it touches provider state only through the observe, patch, and delete callables handed
+to it.
 
 The split follows `_runpod_lifecycle`'s rule: this module imports nothing from `runpod.py`. The
-pieces it needs from that file arrive as parameters (`observe`, `delete_secret`) rather than
-imports, which is also what lets the tests drive it without a transport.
+pieces it needs from that file arrive as callables rather than imports, which is also what lets the
+tests drive it without a transport.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ READINESS_POLL_SECONDS = 2.0
 MAX_PROBE_TIMEOUT_SECONDS = 30.0
 
 Observe = Callable[[RunPodCreatePlan], RunPodObservation]
+PatchTemplate = Callable[[str, dict[str, object]], None]
 DeleteSecret = Callable[[str], None]
 
 
@@ -217,6 +219,7 @@ def confirm_artifact_absence(
 def delete_artifact_and_confirm(
     plan: RunPodCreatePlan,
     observe: Observe,
+    patch_template: PatchTemplate,
     delete_secret: DeleteSecret,
     artifact: RunPodSecretObservation,
     handle: RunPodProviderHandle,
@@ -225,6 +228,29 @@ def delete_artifact_and_confirm(
     clock: Clock,
     sleep: Sleeper,
 ) -> DeploymentResult:
+    # the template must stop referring to the one-shot secret before the secret is deleted. patch
+    # only the exact template observed now, then re-observe the stripped environment before delete.
+    try:
+        _secret, template, _volume, _pod = exact_core_resources(plan, observe(plan))
+    except (RunPodResourceConflict, RunPodTransportFailure):
+        return unknown_result(plan, handle=handle)
+    if template.environment != plan.environment_without_artifact:
+        try:
+            patch_template(template.id, plan.template_payload(False))
+        except RunPodTransportFailure:
+            return unknown_result(plan, handle=handle)
+        while True:
+            try:
+                stripped = observe(plan)
+                _secret, stripped_template, _volume, _pod = exact_core_resources(plan, stripped)
+            except (RunPodResourceConflict, RunPodTransportFailure):
+                return unknown_result(plan, handle=handle)
+            if stripped_template.id != template.id:
+                return unknown_result(plan, handle=handle)
+            if stripped_template.environment == plan.environment_without_artifact:
+                break
+            if not sleep_until_poll(deadline_at, clock, sleep):
+                return unknown_result(plan, handle=handle)
     try:
         delete_secret(artifact.id)
     except RunPodTransportFailure:
@@ -247,6 +273,7 @@ def delete_artifact_and_confirm(
 def await_ready_and_reclaim(
     plan: RunPodCreatePlan,
     observe: Observe,
+    patch_template: PatchTemplate,
     delete_secret: DeleteSecret,
     inference_token: str,
     artifact: RunPodSecretObservation | None,
@@ -296,6 +323,7 @@ def await_ready_and_reclaim(
     return delete_artifact_and_confirm(
         plan,
         observe,
+        patch_template,
         delete_secret,
         artifact,
         ready.handle,

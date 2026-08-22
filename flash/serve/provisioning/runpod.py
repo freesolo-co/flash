@@ -54,6 +54,7 @@ from ._runpod_readiness import (
     DeleteSecret,
     EndpointProbe,
     Observe,
+    PatchTemplate,
     await_ready_and_reclaim,
     failure_result,
     read_only_reconcile,
@@ -172,6 +173,22 @@ def _bind_observe(transport: RunPodTransport, *, deadline_at: float) -> Observe:
     """give the readiness module a way to re-read state without handing it the transport."""
 
     return lambda plan: _observe(plan, transport, deadline_at=deadline_at)
+
+
+def _bind_patch_template(transport: RunPodTransport, *, deadline_at: float) -> PatchTemplate:
+    def patch(template_id: str, payload: dict[str, object]) -> None:
+        mutation_call(
+            lambda: transport.rest(
+                "PATCH",
+                f"/templates/{template_id}",
+                payload,
+                mutation=True,
+                deadline_at=deadline_at,
+            ),
+            identity,
+        )
+
+    return patch
 
 
 def _bind_delete_secret(transport: RunPodTransport, *, deadline_at: float) -> DeleteSecret:
@@ -552,6 +569,7 @@ def provision_runpod_deployment(
             return await_ready_and_reclaim(
                 plan,
                 _bind_observe(transport, deadline_at=deadline_at),
+                _bind_patch_template(transport, deadline_at=deadline_at),
                 _bind_delete_secret(transport, deadline_at=deadline_at),
                 inference_token,
                 observation.artifact_secrets[0] if observation.artifact_secrets else None,
@@ -578,6 +596,7 @@ def provision_runpod_deployment(
         ready = await_ready_and_reclaim(
             plan,
             _bind_observe(transport, deadline_at=work_deadline_at),
+            _bind_patch_template(transport, deadline_at=work_deadline_at),
             _bind_delete_secret(transport, deadline_at=work_deadline_at),
             inference_token,
             artifact,

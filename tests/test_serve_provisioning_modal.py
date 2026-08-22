@@ -1929,6 +1929,74 @@ def test_a_failed_abort_delete_reports_that_cleanup_was_not_confirmed() -> None:
     assert isinstance(raised.value, KeyboardInterrupt)
 
 
+@pytest.mark.parametrize(
+    ("failing_call", "expected_operations"),
+    [
+        (
+            "create_artifact_secret",
+            [
+                "observe",
+                "create_inference",
+                "create_artifact",
+                "delete_artifact",
+                "delete_inference",
+            ],
+        ),
+        (
+            "create_volume",
+            [
+                "observe",
+                "create_inference",
+                "create_artifact",
+                "create_volume",
+                "delete_artifact",
+                "delete_inference",
+                "delete_volume",
+            ],
+        ),
+    ],
+)
+def test_a_definite_create_failure_after_acceptance_tears_down_created_resources(
+    failing_call: str,
+    expected_operations: list[str],
+) -> None:
+    sdk_holder: list[_FakeSdk] = []
+
+    class _FailAfterAcceptSdk(_FakeSdk):
+        def __init__(self, plan) -> None:
+            super().__init__(plan)
+            sdk_holder.append(self)
+
+    original = getattr(_FailAfterAcceptSdk, failing_call)
+
+    def fail_after_accept(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise ModalSdkFailure("provider_rejected")
+
+    setattr(_FailAfterAcceptSdk, failing_call, fail_after_accept)
+    factory = _Factory()
+    factory.sdk_class = _FailAfterAcceptSdk
+
+    result, _probe = _provision(_bundle(), factory)
+    sdk = sdk_holder[0]
+
+    assert (
+        result.status,
+        result.error_code,
+        [name for name, _payload in sdk.calls],
+        sdk.inference,
+        sdk.artifact,
+        sdk.volumes,
+    ) == (
+        "failed",
+        "provider_rejected",
+        expected_operations,
+        [],
+        [],
+        [],
+    )
+
+
 @pytest.mark.parametrize("interrupted_call", ["create_volume", "create_inference_secret"])
 def test_a_create_interrupted_after_the_provider_accepted_it_is_still_torn_down(
     interrupted_call: str,

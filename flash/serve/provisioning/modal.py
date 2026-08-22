@@ -627,8 +627,22 @@ def provision_modal_deployment(
             sleep=sleep,
         )
     except ModalResourceConflict:
+        # identity conflict means the deterministic names may belong to another caller, so aborting
+        # by those names would be destructive without proof that this call created the resources.
         return failure_result(finalized_plan, LifecycleFailure("conflict"))
     except ModalSdkFailure as exc:
+        # an ambiguous mutation may have landed under the deterministic name after our initial empty
+        # observation, so deleting it could destroy a concurrent deployment. a definite failure makes
+        # this create terminal, so its attempted resources are aborted. once readiness was proved, the
+        # deployment is working and the interrupt-path bound applies: leave it recoverable.
+        if (
+            not exc.outcome_unknown
+            and sdk is not None
+            and created.any_created
+            and not reached_ready
+            and not _abort_created_resources(finalized_plan, sdk, created)
+        ):
+            return unknown_result(finalized_plan)
         return failure_result(finalized_plan, from_sdk_failure(exc))
     except BaseException:
         # Ctrl-C derives from BaseException, so neither handler above sees it. Without this the
