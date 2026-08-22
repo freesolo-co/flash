@@ -377,10 +377,9 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
 def test_an_error_heartbeat_carries_gpu_diagnostics_through_to_status(monkeypatch):
     """The failure heartbeat must spell its diagnostics `gpu`, the key the consumer reads.
 
-    an unread spelling is worse than a missing field here: `record_heartbeat` assigns `gpu_status`
-    unconditionally, so an error heartbeat whose diagnostics land under a key nothing reads CLEARS
-    the snapshot a healthy heartbeat already stored -- losing the evidence exactly when an oom
-    needs it. every other producer already spells it `gpu`.
+    a wrong spelling loses the FAILURE's own diagnostics -- the memory figure that says whether an
+    oom was the cause -- and leaves `gpu_status` showing the last healthy sample instead, which
+    reads as if nothing was wrong. every other producer already spells it `gpu`.
     """
     import inspect
     import tempfile as _tempfile
@@ -427,6 +426,57 @@ def test_an_error_heartbeat_carries_gpu_diagnostics_through_to_status(monkeypatc
         out = runner.get_status("hb-oom")
         assert out.gpu_status is not None, "the oom heartbeat cleared the gpu snapshot"
         assert out.gpu_status["memory_used_gb"] == 179.4
+
+
+def test_a_heartbeat_without_gpu_keeps_the_attempts_snapshot(monkeypatch):
+    """Only 8 of the ~51 heartbeat producers send `gpu`; the rest must not blank the snapshot.
+
+    the periodic liveness tick samples the card, but a checkpoint upload can run for minutes
+    between two of them, and every heartbeat in that window omits `gpu`. assigning it
+    unconditionally made `flash runs status` and the `gpuStatus` API field report no GPU for a
+    healthy running job -- and the longer the upload, the longer the blank.
+
+    a NEW attempt still starts clean: it is a different card, so carrying the old one forward would
+    describe hardware this attempt never touched.
+    """
+    import tempfile as _tempfile
+
+    with _tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+        from tests._helpers.profile import satisfy_sft_profile
+
+        spec = JobSpec(
+            run_id="hb-carry",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            environment=EnvironmentSpec(id="team/example"),
+            train=TrainSpec(max_examples=8),
+        )
+        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
+        status.state = "running"
+        runner._save_status(status)
+
+        runner.record_heartbeat(
+            "hb-carry",
+            {"stage": "sft_step", "attempt": 1, "gpu": {"device_name": "B200", "gpu_util_pct": 91}},
+        )
+        # the long silent stretch: a checkpoint upload, which sends no gpu sample at all.
+        runner.record_heartbeat("hb-carry", {"stage": "checkpoint_uploading", "attempt": 1})
+
+        out = runner.get_status("hb-carry")
+        assert out.gpu_status is not None, "a checkpoint heartbeat blanked the gpu snapshot"
+        assert out.gpu_status["device_name"] == "B200"
+        assert out.gpu_status["gpu_util_pct"] == 91
+
+        # a retry is a different card; nothing from attempt 1 may describe it.
+        runner.record_heartbeat("hb-carry", {"stage": "boot", "attempt": 2})
+        assert runner.get_status("hb-carry").gpu_status is None, (
+            "attempt 2 inherited attempt 1's gpu snapshot"
+        )
 
 
 def test_status_sanitizer_preserves_metric_backlog_and_bounds_other_lists():

@@ -285,19 +285,26 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             status = runner.get_status(run_id)
         except FileNotFoundError:
             return
+        prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
+        # a boot/retry heartbeat for a NEW attempt must inherit nothing from the previous one: its
+        # metrics are a different run of the steps and its gpu snapshot is a different card.
+        same_attempt = prev is not None and prev.get("attempt") == hb.get("attempt")
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.
         if isinstance(hb, dict) and not hb.get("metrics_last"):
-            prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
             prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
-            # only carry the backlog forward within the same attempt; a boot/retry heartbeat for a
-            # new attempt must not inherit the prior attempt's stale per-step metrics.
-            same_attempt = prev is not None and prev.get("attempt") == hb.get("attempt")
             if same_attempt and isinstance(prev_metrics, list) and prev_metrics:
                 hb["metrics_last"] = prev_metrics
         status.last_heartbeat = hb
-        status.gpu_status = gpu if isinstance(gpu, dict) else None
+        # carried forward on the same rule as the metric backlog above, and for the same reason: most
+        # heartbeats carry no `gpu` at all -- only the periodic liveness tick and the terminal ones do
+        # -- so assigning unconditionally blanks the snapshot on every checkpoint-stage heartbeat and
+        # leaves `flash runs status` and the API reporting no GPU for a running job.
+        if isinstance(gpu, dict):
+            status.gpu_status = gpu
+        elif not same_attempt:
+            status.gpu_status = None
         status.updated_at = time.time()
         runner._save_status_unlocked(status)
     runner._report_status(status)
