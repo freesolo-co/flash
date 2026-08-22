@@ -91,6 +91,7 @@ class MemoryPersistence:
         # a 503. a fake that only ever raises the former cannot reach the handlers that recover
         # that 503, so a transport-level outage is modelled separately.
         self.get_transport_failure_ids: set[str] = set()
+        self.insert_failure_ids: set[str] = set()
         self.replace_failure_ids: set[str] = set()
         self._clock = itertools.count(1)
 
@@ -113,6 +114,8 @@ class MemoryPersistence:
         return self.rows.get(adapter_id)
 
     def insert(self, record: AdapterRecord, _settings: object) -> AdapterRecord:
+        if record.adapter_id in self.insert_failure_ids:
+            raise OSError("storage unavailable")
         if record.adapter_id in self.rows:
             raise PersistenceConflict("exists")
         stored = self._stamp(record)
@@ -320,6 +323,26 @@ def test_new_registration_creates_disabled_revision_and_alias_then_marks_only_re
     assert router.get(REVISION_A) == committed
     assert router.resolve(REVISION_A) is not None
     assert router.resolve(RUN_ID) is None
+
+
+def test_registration_recovers_disabled_alias_after_revision_insert_outage(setup) -> None:
+    client, pool, _, persistence = setup
+    persistence.insert_failure_ids.add(REVISION_A)
+
+    failed = _register(client, _registration())
+
+    assert failed.status_code == 503
+    orphan = persistence.rows[RUN_ID]
+    assert orphan.status == "disabled"
+    assert orphan.alias_of == REVISION_A
+    persistence.insert_failure_ids.clear()
+
+    recovered = _register(client, _registration(step=40, sha=SHA_B))
+
+    assert recovered.status_code == 200
+    assert persistence.rows[RUN_ID].alias_of == REVISION_B
+    assert REVISION_B in persistence.rows
+    assert pool.registered == [REVISION_B]
 
 
 def test_registration_promotion_http_error_unloads_unrecorded_adapter(setup, monkeypatch) -> None:

@@ -66,6 +66,42 @@ async def _reserve_alias(
         raise HTTPException(status.HTTP_409_CONFLICT, "run alias namespace is occupied") from exc
 
 
+async def _recover_or_validate_alias(
+    alias: AdapterRecord,
+    revision: AdapterRecord,
+    *,
+    allow_missing: str | None,
+) -> AdapterRecord:
+    alias_of = alias.alias_of
+    if alias.status == "disabled" and alias_of != revision.adapter_id:
+        assert alias_of is not None
+        try:
+            old_target = await _get_stored(alias_of)
+        except PersistenceRecordError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid") from exc
+        if old_target is None:
+            if alias.updated_at is None:
+                raise HTTPException(status.HTTP_409_CONFLICT, "run alias has no CAS authority")
+            replacement = alias.model_copy(
+                update={
+                    "metadata": {
+                        "record_type": "alias",
+                        "run_id": revision.run_id,
+                        "alias_of": revision.adapter_id,
+                    }
+                }
+            )
+            committed = await _replace_stored_cas(
+                replacement,
+                expected_updated_at=alias.updated_at,
+            )
+            if committed is None:
+                raise HTTPException(status.HTTP_409_CONFLICT, "run alias changed concurrently")
+            alias = committed
+    await _validate_alias_target(alias, allow_missing=allow_missing)
+    return alias
+
+
 async def persist_revision(
     router: AdapterRouter, revision: AdapterRecord
 ) -> tuple[AdapterRecord, AdapterRecord]:
@@ -89,8 +125,9 @@ async def persist_revision(
     alias, alias_inserted = await _reserve_alias(router, revision, run_id)
     _validate_alias(alias, revision)
     if not alias_inserted:
-        await _validate_alias_target(
+        alias = await _recover_or_validate_alias(
             alias,
+            revision,
             allow_missing=revision.adapter_id if existing is None else None,
         )
 
