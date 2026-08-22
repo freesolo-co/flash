@@ -756,25 +756,46 @@ def _metered_chat_stream(events, reports):
     )
 
 
-def test_stream_disconnect_still_schedules_terminal_usage_once():
+def test_stream_disconnect_closes_engine_and_schedules_partial_usage_once():
     async def scenario():
         release_final = asyncio.Event()
         sent_partial = asyncio.Event()
         disconnect_sent = asyncio.Event()
+        engine_closed = asyncio.Event()
         reports = []
 
-        async def events():
-            yield {"type": "delta", "text": "partial"}
-            await release_final.wait()
-            yield {
-                "type": "final",
-                "finish_reason": "stop",
-                "prompt_tokens": 11,
-                "completion_tokens": 7,
-                "request_id": "req-disconnected",
-            }
+        class Events:
+            def __init__(self):
+                self.index = 0
 
-        response = StreamingResponse(_metered_chat_stream(events(), reports))
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.index += 1
+                if self.index == 1:
+                    return {
+                        "type": "delta",
+                        "text": "partial",
+                        "prompt_tokens": 11,
+                        "completion_tokens": 3,
+                        "request_id": "req-disconnected",
+                    }
+                if self.index == 2:
+                    await release_final.wait()
+                    return {
+                        "type": "final",
+                        "finish_reason": "stop",
+                        "prompt_tokens": 11,
+                        "completion_tokens": 7,
+                        "request_id": "req-disconnected",
+                    }
+                raise StopAsyncIteration
+
+            async def aclose(self):
+                engine_closed.set()
+
+        response = StreamingResponse(_metered_chat_stream(Events(), reports))
 
         async def receive():
             await sent_partial.wait()
@@ -796,29 +817,27 @@ def test_stream_disconnect_still_schedules_terminal_usage_once():
             )
         )
         await disconnect_sent.wait()
-        # hold the terminal event past the disconnect. the response must NOT complete here: the
-        # shielded drain keeps billing inside the request's own shutdown order, so a container
-        # stopping in this window still has a task to await rather than a silently dropped charge.
-        await asyncio.sleep(0)
-        assert not response_task.done(), (
-            "the response completed while the terminal event was still pending -- "
-            "the drain is orphaned and its usage can be lost"
-        )
-        assert reports == [], "usage cannot be scheduled before the terminal event arrives"
+        done, _ = await asyncio.wait({response_task}, timeout=0.1)
+        closed_before_terminal = engine_closed.is_set()
+        reports_before_terminal = reports.copy()
         release_final.set()
         await response_task
-        return reports
+        return done, closed_before_terminal, reports_before_terminal, reports
 
-    reports = asyncio.run(scenario())
-    assert reports == [
+    done, engine_closed, reports_before_terminal, reports = asyncio.run(scenario())
+    assert done, "the response kept draining engine tokens after the client disconnected"
+    assert engine_closed, "the disconnect did not close the engine iterator"
+    expected = [
         {
-            "type": "final",
-            "finish_reason": "stop",
+            "type": "delta",
+            "text": "partial",
             "prompt_tokens": 11,
-            "completion_tokens": 7,
+            "completion_tokens": 3,
             "request_id": "req-disconnected",
         }
     ]
+    assert reports_before_terminal == expected
+    assert reports == expected
 
 
 def test_stream_normal_completion_schedules_usage_once_without_changing_bytes():

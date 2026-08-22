@@ -47,6 +47,27 @@ from flash.serving.src.model_config import (
 )
 
 
+def _stream_usage_fields(
+    request_output: Any,
+    completion_tokens: int,
+    *,
+    start: float,
+    request_id: str,
+    engine_replica_id: str,
+    checkpoint: str,
+) -> dict[str, Any]:
+    return {
+        "prompt_tokens": _num_prompt_tokens(request_output),
+        "completion_tokens": completion_tokens,
+        "cached_tokens": _num_cached_tokens(request_output),
+        "cached_tokens_reported": _cached_tokens_reported(request_output),
+        "inference_time_seconds": time.time() - start,
+        "request_id": request_id,
+        "engine_replica_id": engine_replica_id,
+        "checkpoint": checkpoint,
+    }
+
+
 class _LoraEngineImpl:
     """Implementation of one vLLM multi-LoRA engine for a base model.
 
@@ -793,16 +814,28 @@ class _LoraEngineImpl:
                 self._self_heal_if_dead("stream_generate")
                 raise
 
-            # ``thinking`` rides the ready event because it must be known BEFORE the first delta:
-            # the openai layer routes deltas to reasoning_content or content as they arrive, so
-            # learning the mode at "final" would be too late.
+            completion_token_ids = list(getattr(first_output.outputs[0], "token_ids", []) or [])
+            usage_context = {
+                "start": start,
+                "request_id": request_id,
+                "engine_replica_id": self._replica_identifier(),
+                "checkpoint": active_checkpoint,
+            }
+
+            def usage_fields(request_output: Any) -> dict[str, Any]:
+                return _stream_usage_fields(
+                    request_output, len(completion_token_ids), **usage_context
+                )
+
+            # ``thinking`` rides the ready event because it must be known before the first delta.
+            # usage rides it too because vllm has already produced its first output, and a client may
+            # disconnect before the first text delta reaches the front door.
             yield {
                 "type": "ready",
-                "checkpoint": active_checkpoint,
                 "thinking": thinking_default,
+                **usage_fields(first_output),
             }
             final_output = None
-            completion_token_ids: list[int] = []
             previous_text = ""
             out = first_output
             try:
@@ -824,12 +857,16 @@ class _LoraEngineImpl:
                         else:
                             completion_token_ids.extend(token_ids)
                             cumulative_output = False
+                    delta = ""
                     if text:
                         delta, previous_text = _stream_text_delta(
                             text, previous_text, cumulative_output=cumulative_output
                         )
-                        if delta:
-                            yield {"type": "delta", "text": delta}
+                    yield {
+                        "type": "delta",
+                        "text": delta,
+                        **usage_fields(out),
+                    }
                     try:
                         out = await anext(output_stream)
                     except StopAsyncIteration:
@@ -840,21 +877,12 @@ class _LoraEngineImpl:
             if final_output is None:
                 raise RuntimeError("vLLM returned no output")
             output = final_output.outputs[0]
-            prompt_tokens = _num_prompt_tokens(final_output)
             yield {
                 "type": "final",
                 "ok": True,
                 "adapter_id": payload.adapter_id,
                 "finish_reason": getattr(output, "finish_reason", None),
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": len(completion_token_ids),
-                # prefix-cached prompt tokens (see generate()); billed at a discount by the backend.
-                "cached_tokens": _num_cached_tokens(final_output),
-                "cached_tokens_reported": _cached_tokens_reported(final_output),
-                "inference_time_seconds": time.time() - start,
-                "request_id": request_id,
-                "engine_replica_id": self._replica_identifier(),
-                "checkpoint": active_checkpoint,
+                **usage_fields(final_output),
                 # see generate(): the rendered thinking mode, which the streamed text alone
                 # cannot reveal.
                 "thinking": thinking_default,

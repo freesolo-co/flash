@@ -23,6 +23,49 @@ from flash.serving.src.serving_io import (
 )
 
 
+async def _next_event_or_disconnect(
+    events: AsyncIterator[dict[str, Any]], disconnect_wait: asyncio.Task[bool]
+) -> dict[str, Any] | None:
+    if disconnect_wait.done():
+        return None
+    next_event = asyncio.create_task(anext(events))
+    done, _ = await asyncio.wait({next_event, disconnect_wait}, return_when=asyncio.FIRST_COMPLETED)
+    if next_event in done:
+        return next_event.result()
+    next_event.cancel()
+    await asyncio.gather(next_event, return_exceptions=True)
+    return None
+
+
+async def _close_async_iterator(events: AsyncIterator[dict[str, Any]]) -> None:
+    close = getattr(events, "aclose", None)
+    if close is not None:
+        await close()
+
+
+async def _replay_first_event(
+    first: dict[str, Any], events: AsyncIterator[dict[str, Any]]
+) -> AsyncIterator[dict[str, Any]]:
+    try:
+        yield first
+        async for event in events:
+            yield event
+    finally:
+        await _close_async_iterator(events)
+
+
+async def _await_producer_shutdown(producer: asyncio.Task[None]) -> None:
+    cancelled = False
+    while not producer.done():
+        try:
+            await asyncio.shield(producer)
+        except asyncio.CancelledError:
+            cancelled = True
+    producer.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 async def _produce_openai_chat_stream(
     router: AdapterRouter,
     schedule_usage: Callable[[AdapterRecord, dict[str, Any], str | None], None],
@@ -74,44 +117,73 @@ async def _produce_openai_chat_stream(
 
         splitter = _ReasoningStreamSplitter(thinking)
         final: dict[str, Any] = {}
-        async for event in terminating_on_engine_error(router, events, adapter_id):
-            kind = event.get("type")
-            if kind == "delta":
-                text = event.get("text") or ""
-                if not text:
-                    continue
-                reasoning_delta, content_delta = splitter.feed(text)
-                if reasoning_delta:
-                    await emit(_delta_chunk({"reasoning_content": reasoning_delta}))
-                if content_delta:
-                    await emit(_delta_chunk({"content": content_delta}))
-            elif kind == "final":
-                final = event
-            elif kind == "error":
-                # the 200 and its headers went out with the first chunk, so the status can no
-                # longer carry the failure. without this the failure would propagate and starlette
-                # would drop the connection: the caller receives a well-formed but silently
-                # truncated stream with no error and no [done], indistinguishable from a short
-                # completion. emit the error into the stream and then close the protocol normally
-                # so the failure is detectable by an unmodified openai client.
-                await emit(
-                    _sse(
-                        {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": adapter_id,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
-                            "error": {
-                                "message": event["message"],
-                                "type": "engine_error",
-                                "code": event["code"],
-                            },
-                        }
+        latest_usage: dict[str, Any] = {}
+        guarded_events = terminating_on_engine_error(router, events, adapter_id)
+        disconnect_wait = asyncio.create_task(disconnected.wait())
+        try:
+            while True:
+                try:
+                    event = await _next_event_or_disconnect(guarded_events, disconnect_wait)
+                except StopAsyncIteration:
+                    break
+                if event is None:
+                    break
+                kind = event.get("type")
+                if (
+                    event.get("prompt_tokens") is not None
+                    and event.get("completion_tokens") is not None
+                ):
+                    latest_usage = event
+                if kind == "delta":
+                    text = event.get("text") or ""
+                    if not text:
+                        continue
+                    reasoning_delta, content_delta = splitter.feed(text)
+                    if reasoning_delta:
+                        await emit(_delta_chunk({"reasoning_content": reasoning_delta}))
+                    if content_delta:
+                        await emit(_delta_chunk({"content": content_delta}))
+                elif kind == "final":
+                    final = event
+                elif kind == "error":
+                    # the 200 and its headers went out with the first chunk, so the status can no
+                    # longer carry the failure. without this the failure would propagate and starlette
+                    # would drop the connection: the caller receives a well-formed but silently
+                    # truncated stream with no error and no [done], indistinguishable from a short
+                    # completion. emit the error into the stream and then close the protocol normally
+                    # so the failure is detectable by an unmodified openai client.
+                    await emit(
+                        _sse(
+                            {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": adapter_id,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                                "error": {
+                                    "message": event["message"],
+                                    "type": "engine_error",
+                                    "code": event["code"],
+                                },
+                            }
+                        )
                     )
-                )
-                await emit(_sse("[DONE]"))
-                return
+                    await emit(_sse("[DONE]"))
+                    return
+        finally:
+            disconnect_wait.cancel()
+            await asyncio.gather(disconnect_wait, return_exceptions=True)
+            # bill before close so a transport cleanup failure cannot discard completed work.
+            if disconnected.is_set() and latest_usage:
+                schedule_usage(record, latest_usage, caller_org)
+            try:
+                await _close_async_iterator(guarded_events)
+            finally:
+                await _close_async_iterator(events)
+
+        if disconnected.is_set():
+            return
+
         trailing = splitter.flush()
         if trailing:
             await emit(_delta_chunk({"reasoning_content": trailing}))
@@ -188,10 +260,9 @@ async def openai_chat_stream(
         disconnected.set()
         with contextlib.suppress(asyncio.QueueEmpty):
             output.get_nowait()
-        # keep the terminal engine event and billing schedule inside the request's shutdown order.
-        # shielded: starlette cancels this iterator on disconnect, and an unshielded await would
-        # carry that cancellation into the producer and lose the usage the disconnect must still bill.
-        await asyncio.shield(producer)
+        # keep cancellation out of the producer, but do not let it detach from the request before
+        # it has closed the engine iterator and scheduled the last cumulative usage snapshot.
+        await _await_producer_shutdown(producer)
 
 
 async def prepare_stream(
@@ -222,18 +293,13 @@ async def prepare_stream(
     if first.get("type") == "ready":
         active_checkpoint = first.get("checkpoint")
         provenance = _revision_provenance(target, active_checkpoint)
-        # the ready event carries the rendered thinking mode; it precedes every delta, so the
-        # openai layer can route the first chunk correctly.
+        # replay ready internally so its first-output usage remains available if the client
+        # disconnects before a text delta, while keeping it out of the client-facing sse protocol.
         return (
-            events,
+            _replay_first_event(first, events),
             _provenance_headers(provenance, active_checkpoint),
             bool(first.get("thinking")),
         )
-
-    async def replay() -> AsyncIterator[dict[str, Any]]:
-        yield first
-        async for event in events:
-            yield event
 
     active_checkpoint = _active_checkpoint_ref(target)
     provenance = _revision_provenance(target, active_checkpoint)
@@ -241,7 +307,11 @@ async def prepare_stream(
     # guessing from ``target.thinking``: a base-model serve honors a caller enable_thinking
     # override, so the record can disagree with what was actually rendered, and splitting a
     # non-thinking completion that merely quotes </think> would tear the answer in half.
-    return replay(), _provenance_headers(provenance, active_checkpoint), False
+    return (
+        _replay_first_event(first, events),
+        _provenance_headers(provenance, active_checkpoint),
+        False,
+    )
 
 
 async def generate_once(

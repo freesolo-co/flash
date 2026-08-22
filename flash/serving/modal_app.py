@@ -547,12 +547,18 @@ class _ModalEnginePool:
         expected_checkpoint: str | None = None,
     ):
         engine = await self._engine(base_model)
-        async for event in engine.stream_generate.remote_gen.aio(
+        remote_stream = engine.stream_generate.remote_gen.aio(
             payload.model_dump(by_alias=True),
             self._record_payload(record),
             expected_checkpoint,
-        ):
-            yield event
+        )
+        try:
+            async for event in remote_stream:
+                yield event
+        finally:
+            close = getattr(remote_stream, "aclose", None)
+            if close is not None:
+                await close()
 
     async def register(self, base_model: str, record: Any) -> None:
         engine = await self._engine(base_model)

@@ -17,6 +17,7 @@ import asyncio
 import dataclasses
 import sys
 import types
+import uuid
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -400,7 +401,37 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
         )
     )
     assert [event["type"] for event in events] == ["ready", "delta", "final"]
-    assert events[1] == {"type": "delta", "text": "ok"}
+    ready = events[0].copy()
+    assert ready.pop("inference_time_seconds") >= 0
+    # the two ids are uuid4-derived, so they cannot be spelled literally. pin their shape here and
+    # their VALUE on the delta below, against this event -- writing `ready["request_id"]` into this
+    # dict would compare the value to itself and pin nothing at all.
+    request_id = ready.pop("request_id")
+    replica_id = ready.pop("engine_replica_id")
+    assert uuid.UUID(request_id).version == 4
+    assert uuid.UUID(hex=replica_id).version == 4
+    assert ready == {
+        "type": "ready",
+        "thinking": False,
+        "prompt_tokens": 1,
+        "completion_tokens": 2,
+        "cached_tokens": 0,
+        "cached_tokens_reported": True,
+        "checkpoint": "",
+    }
+    delta = events[1].copy()
+    assert delta.pop("inference_time_seconds") >= 0
+    assert delta == {
+        "type": "delta",
+        "text": "ok",
+        "prompt_tokens": 1,
+        "completion_tokens": 2,
+        "cached_tokens": 0,
+        "cached_tokens_reported": True,
+        "request_id": request_id,
+        "engine_replica_id": replica_id,
+        "checkpoint": "",
+    }
     assert events[-1]["finish_reason"] == "stop"
     assert events[-1]["prompt_tokens"] == 1
     assert events[-1]["completion_tokens"] == 2
@@ -415,7 +446,19 @@ def test_stream_close_after_ready_closes_inner_generator(modal_app_module):
 
     async def prime_and_close():
         stream = eng._stream_generate({"adapter_id": "r1", "prompt": "hi"})
-        assert await anext(stream) == {"type": "ready", "checkpoint": "", "thinking": False}
+        ready = (await anext(stream)).copy()
+        assert ready.pop("inference_time_seconds") >= 0
+        assert ready == {
+            "type": "ready",
+            "thinking": False,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "cached_tokens_reported": True,
+            "request_id": ready["request_id"],
+            "engine_replica_id": ready["engine_replica_id"],
+            "checkpoint": "",
+        }
         await stream.aclose()
         assert eng.engine.cleanup_ran is True
 
