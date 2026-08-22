@@ -55,15 +55,7 @@ from flash.cli.commands.traces import (
     RECORDS_FORMAT,
     cmd_traces_export,
 )
-
-# `_ThemedParser.error` calls all three below, and re-exporting them here is also how the CLI error
-# tests reach the suggestion logic as `cli._friendly_message`.
-from flash.cli.errors import (
-    _friendly_message,
-    _parser_options,
-    _root_only_options,
-    _selected_parser,
-)
+from flash.cli.errors import friendly_error
 from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
 from flash.core.catalog import ALGORITHMS
@@ -195,16 +187,10 @@ class _ThemedParser(argparse.ArgumentParser):
             super().error(message)  # argparse's raw usage + `prog: error: msg`, then exit 2
         # themed twin: the red ✗ error line (same idiom as main()'s catch-all and `flash login`),
         # then a dimmed pointer at this parser's own --help instead of the raw usage block. unknown
-        # commands and flags get a short "did you mean" suggestion (see _friendly_message).
-        # candidates come from the parser the invocation actually selected, plus the root's own
-        # flags. argparse reports a subcommand's unknown tokens from the ROOT, so `self` here is
-        # the root even when the user typed a subcommand; the stashed argv says which one.
-        # a subparser raising its own error has no stash, and is already the selected parser.
-        root = getattr(self, "_flash_argv", None)
-        selected = _selected_parser(self, root) if root is not None else self
-        candidates = {*_parser_options(selected), *_root_only_options(self)}
+        # commands and flags get a short "did you mean" suggestion (see `friendly_error`). the argv
+        # stash is what tells it which subcommand was selected; only the root parser carries one.
         print(
-            render.error(_friendly_message(message, sorted(candidates), _root_only_options(self))),
+            render.error(friendly_error(message, self, getattr(self, "_flash_argv", None))),
             file=sys.stderr,
         )
         # dimmed pointer at THIS parser's own --help (argparse sets prog per parser: `flash --help`

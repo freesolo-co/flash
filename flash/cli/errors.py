@@ -4,11 +4,15 @@ argparse reports a mistyped flag by printing the whole usage block, which buries
 was actually wrong. These helpers reduce that to a single line naming the token and, where one
 exists, the closest real alternative.
 
-Two details make the suggestion trustworthy rather than merely present. The candidate pool spans
-every subcommand, because argparse hands a subcommand's unknown tokens back to the ROOT parser to
-report -- so the root error has to know about flags it does not own. And root flags are positional
-in this CLI (`flash --debug login`, never `flash login --debug`), so a suggestion drawn from that
-pool can name a real flag that still fails where the user typed it; those carry their position.
+The hard part is making the suggestion one the user can actually follow, and both difficulties come
+from where argparse raises. A subcommand's unknown tokens are handed back to the ROOT parser to
+report, so the error has to know about flags it does not own -- but drawing candidates from the
+whole tree offers flags belonging to unrelated commands, which fail exactly like the original typo.
+The pool is therefore the SELECTED command's options plus the root's, resolved from the invocation.
+
+Root flags are also positional here (`flash --debug login`, never `flash login --debug`), so a
+suggestion can name a real flag that still fails where the user typed it. Those carry their
+position, and a correctly spelled one is repositioned rather than respelled.
 """
 
 from __future__ import annotations
@@ -19,6 +23,25 @@ import re
 from collections.abc import Iterable
 
 from flash._internal.channel import CLI_NAME
+
+
+def friendly_error(
+    message: str, parser: argparse.ArgumentParser, argv: Iterable[str] | None
+) -> str:
+    """Rewrite one argparse usage error for the themed CLI.
+
+    The whole suggestion policy lives behind this call: which parser's flags are candidates, which
+    of them need repositioning, and how the message reads. The caller is an ``error()`` override on
+    every parser in the tree and should stay a two-liner -- deciding a candidate pool inline there
+    would put policy in a hook that exists to print.
+    """
+    if argv is None:
+        # a subparser raising its own error: it IS the selected parser, and it holds no argv stash.
+        selected, root_only = parser, frozenset()
+    else:
+        selected, root_only = _selected_parser(parser, argv), _root_only_options(parser)
+    candidates = sorted({*_parser_options(selected), *root_only})
+    return _friendly_message(message, candidates, root_only)
 
 
 def _friendly_message(
