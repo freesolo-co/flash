@@ -11,7 +11,6 @@ caller-facing inference.
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
-from fastapi.responses import JSONResponse
 
 from flash.serving.src.context import ServingContext
 from flash.serving.src.registration import activate_revision, persist_revision
@@ -28,7 +27,6 @@ from flash.serving.src.undeploy import (
     get_authoritative,
     resolve_undeploy_target,
     undeploy_body,
-    undeploy_conflict_detail,
 )
 
 adapter_router = APIRouter(tags=["adapters"])
@@ -139,14 +137,14 @@ async def remove_adapter(
 
     # phase 1: compare-and-swap every matched row to "disabled" in persistence first, collecting
     # the rows that durably converged.
-    disabled_aliases, disabled_revisions, stuck_ready, pending_teardown = await disable_matched(
-        matches, get_authoritative=get_authoritative
-    )
+    result = await disable_matched(matches, get_authoritative=get_authoritative)
 
     # phase 2: remove every durably disabled row from routing immediately. gpu eviction is
     # deferred until after either the success or conflict response, so a scaled-to-zero
     # engine's cold start cannot make undeploy callers time out.
-    for cleanup_record, expected_generation in apply_teardown(context.router, pending_teardown):
+    for cleanup_record, expected_generation in apply_teardown(
+        context.router, result.pending_teardown
+    ):
         background_tasks.add_task(
             context.unregister_safe,
             cleanup_record.base_model,
@@ -154,19 +152,13 @@ async def remove_adapter(
             expected_generation,
         )
 
-    if stuck_ready:
-        return JSONResponse(
-            status_code=status.HTTP_409_CONFLICT,
-            content=undeploy_conflict_detail(
-                run_id, disabled_aliases, disabled_revisions, stuck_ready
-            ),
-            background=background_tasks,
-        )
+    if failure_response := result.failure_response(run_id, background_tasks):
+        return failure_response
 
     return undeploy_body(
         adapter_id,
         run_id,
         matches[0].base_model,
-        disabled_aliases,
-        disabled_revisions,
+        result.disabled_aliases,
+        result.disabled_revisions,
     )

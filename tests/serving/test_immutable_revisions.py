@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import itertools
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 import pytest
+from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from flash.serving.src.persistence import PersistenceConflict, PersistenceReferenceError
+from flash.serving.src.adapter_routes import remove_adapter
+from flash.serving.src.persistence import (
+    PersistenceConflict,
+    PersistenceRecordError,
+    PersistenceReferenceError,
+)
 from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import (
     AdapterRecord,
@@ -78,6 +85,7 @@ class MemoryPersistence:
         self.force_replace_miss_ids: set[str] = set()
         self.concurrent_disable_once: set[str] = set()
         self.concurrent_redeploy_once: dict[str, str] = {}
+        self.get_failure_ids: set[str] = set()
         self._clock = itertools.count(1)
 
     def _stamp(self, record: AdapterRecord) -> AdapterRecord:
@@ -92,6 +100,8 @@ class MemoryPersistence:
         )
 
     def get(self, adapter_id: str, _settings: object) -> AdapterRecord | None:
+        if adapter_id in self.get_failure_ids:
+            raise PersistenceRecordError("storage unavailable")
         return self.rows.get(adapter_id)
 
     def insert(self, record: AdapterRecord, _settings: object) -> AdapterRecord:
@@ -782,6 +792,66 @@ def test_delete_repeated_cas_miss_returns_conflict(setup) -> None:
     assert response.status_code == 409
     assert persistence.rows[RUN_ID].status == "ready"
     assert persistence.rows[FINAL_REVISION].status == "ready"
+    assert pool.unregistered == []
+
+
+@pytest.mark.parametrize("failure_path", ["missing_timestamp", "cas_loser"])
+def test_delete_storage_failure_tears_down_rows_that_already_converged(
+    setup, failure_path: str
+) -> None:
+    client, pool, router, persistence = setup
+    assert _register(client, _registration()).status_code == 200
+    assert (
+        client.post(
+            f"/adapters/{REVISION_A}/activate",
+            json={"expected_adapter_revision": None},
+        ).status_code
+        == 200
+    )
+    persistence.get_failure_ids.add(REVISION_A)
+    if failure_path == "missing_timestamp":
+        router.upsert(persistence.rows[REVISION_A].model_copy(update={"updated_at": None}))
+    else:
+        persistence.force_replace_miss_ids.add(REVISION_A)
+
+    response = client.delete(f"/adapters/{RUN_ID}")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "adapter storage is unavailable"}
+    assert persistence.rows[RUN_ID].status == "disabled"
+    assert persistence.rows[REVISION_A].status == "ready"
+    assert pool.unregistered == [RUN_ID]
+    assert router.resolve(RUN_ID) is None
+
+
+def test_delete_pre_cas_storage_failure_returns_503_without_teardown(setup) -> None:
+    _, pool, router, persistence = setup
+    persistence.get_failure_ids.add(RUN_ID)
+    app = build_serving_app(pool, router, internal_key="secret")
+    request = Request(
+        {
+            "type": "http",
+            "method": "DELETE",
+            "path": f"/adapters/{RUN_ID}",
+            "headers": [(b"x-freesolo-internal-key", b"secret")],
+            "query_string": b"",
+            "app": app,
+        }
+    )
+    background_tasks = BackgroundTasks()
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(
+            remove_adapter(
+                adapter_id=RUN_ID,
+                request=request,
+                background_tasks=background_tasks,
+            )
+        )
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.detail == "adapter storage is unavailable"
+    assert background_tasks.tasks == []
     assert pool.unregistered == []
 
 

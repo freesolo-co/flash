@@ -1,14 +1,17 @@
 """Durable half of an adapter undeploy: compare-and-swap every matched row to "disabled".
 
 Split out of router.py's ``remove_adapter``. This is the phase that talks to persistence and
-decides which rows converged; the caller owns routing removal, gpu eviction and the response
-shape, so this function touches neither the router nor the engine pool.
+decides which rows converged; the caller owns routing removal and gpu eviction, so this function
+touches neither the router nor the engine pool. Failure responses live with the cascade result so
+they cannot escape before its accumulated teardown is attached.
 """
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
-from fastapi import HTTPException, status
+from fastapi import BackgroundTasks, HTTPException, status
+from fastapi.responses import JSONResponse
 
 from flash.serving.src.persistence import PersistenceRecordError
 from flash.serving.src.routing import AdapterRouter
@@ -20,15 +23,51 @@ from flash.serving.src.serving_io import _get_stored, _replace_stored_cas
 _CAS_ATTEMPTS = 3
 
 
+# a named result keeps partial teardown and failure state together without widening a tuple.
+@dataclass
+class DisableResult:
+    """Durable cascade state retained until routing and gpu teardown are scheduled."""
+
+    disabled_aliases: list[str]
+    disabled_revisions: list[str]
+    stuck_ready: list[str]
+    pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None]]
+    storage_unavailable: bool = False
+
+    def failure_response(
+        self, run_id: str, background_tasks: BackgroundTasks
+    ) -> JSONResponse | None:
+        """Return a failure response only after the caller has applied pending teardown."""
+        if self.storage_unavailable:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "adapter storage is unavailable"},
+                background=background_tasks,
+            )
+        if not self.stuck_ready:
+            return None
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=undeploy_conflict_detail(
+                run_id,
+                self.disabled_aliases,
+                self.disabled_revisions,
+                self.stuck_ready,
+            ),
+            background=background_tasks,
+        )
+
+
 async def disable_matched(
     matches: list[AdapterRecord],
     *,
     get_authoritative: Callable[[str], Awaitable[AdapterRecord | None]],
-) -> tuple[list[str], list[str], list[str], list[tuple[AdapterRecord, AdapterRecord | None]]]:
+) -> DisableResult:
     """CAS every matched row to "disabled", returning what converged and what did not.
 
-    Returns ``(disabled_aliases, disabled_revisions, stuck_ready, pending_teardown)``. The cascade
-    spans multiple rows with no cross-row transaction, so a sibling can stay stuck-ready. The
+    The named result keeps teardown and failure state together without growing the former
+    positional tuple. The cascade spans multiple rows with no cross-row transaction, so a sibling
+    can stay stuck-ready. The
     caller still tears down every converged row (even on the conflict path) rather than deferring:
     a reload only rehydrates "ready" rows, so a row left disabled-but-registered would never be
     re-enumerated by a retry and its gpu lora registration would leak permanently.
@@ -37,13 +76,20 @@ async def disable_matched(
     disabled_revisions: list[str] = []
     stuck_ready: list[str] = []
     pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None]] = []
+    storage_unavailable = False
 
     for candidate in matches:
         current: AdapterRecord | None = candidate
         converged = False
         for _ in range(_CAS_ATTEMPTS):
             if current.updated_at is None:
-                current = await get_authoritative(candidate.adapter_id)
+                try:
+                    current = await get_authoritative(candidate.adapter_id)
+                except HTTPException as exc:
+                    if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
+                        raise
+                    storage_unavailable = True
+                    break
                 if current is None or current.status != "ready":
                     converged = True
                     break
@@ -60,15 +106,15 @@ async def disable_matched(
                 break
             try:
                 current = await _get_stored(candidate.adapter_id)
-            except PersistenceRecordError as exc:
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "adapter storage is unavailable",
-                ) from exc
+            except PersistenceRecordError:
+                storage_unavailable = True
+                break
             if current is None or current.status != "ready":
                 converged = True
                 break
 
+        if storage_unavailable:
+            break
         if not converged:
             stuck_ready.append(candidate.adapter_id)
             continue
@@ -78,7 +124,13 @@ async def disable_matched(
         else:
             disabled_revisions.append(candidate.adapter_id)
 
-    return disabled_aliases, disabled_revisions, stuck_ready, pending_teardown
+    return DisableResult(
+        disabled_aliases=disabled_aliases,
+        disabled_revisions=disabled_revisions,
+        stuck_ready=stuck_ready,
+        pending_teardown=pending_teardown,
+        storage_unavailable=storage_unavailable,
+    )
 
 
 def apply_teardown(
