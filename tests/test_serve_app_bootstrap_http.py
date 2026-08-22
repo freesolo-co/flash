@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
@@ -447,6 +447,104 @@ def test_request_body_accepts_exact_limit_and_rejects_headers_or_streams_over_li
     )
     assert over_stream.status_code == 413
     assert over_stream.json()["error"]["code"] == "request_too_large"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_disconnect_cancels_generation_after_body_is_consumed(stream: bool) -> None:
+    owner, runtime = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    body = json.dumps(_chat_body(stream=stream)).encode()
+
+    async def scenario() -> None:
+        generation_started = asyncio.Event()
+        generation_cancelled = asyncio.Event()
+        stream_closed = asyncio.Event()
+        receive_count = 0
+
+        if stream:
+
+            class HangingStream:
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    generation_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        generation_cancelled.set()
+                        raise
+
+                async def aclose(self):
+                    stream_closed.set()
+
+            def stream_request(request):
+                runtime.generation_requests.append(request)
+                return HangingStream()
+
+            runtime.stream = stream_request
+        else:
+
+            async def generate(request):
+                runtime.generation_requests.append(request)
+                generation_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    generation_cancelled.set()
+                    raise
+
+            runtime.generate = generate
+
+        async def receive():
+            nonlocal receive_count
+            receive_count += 1
+            if receive_count == 1:
+                return {"type": "http.request", "body": body, "more_body": False}
+            await generation_started.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            raise AssertionError("a disconnected request must not send a response")
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [
+                (b"authorization", f"Bearer {AUTH_TOKEN}".encode()),
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+            "client": ("127.0.0.1", 12345),
+            "server": ("test", 80),
+        }
+
+        app_task = asyncio.create_task(app(scope, receive, send))
+        try:
+            await asyncio.wait_for(generation_started.wait(), timeout=1)
+            await asyncio.wait({app_task}, timeout=0.1)
+            assert generation_cancelled.is_set(), (
+                "generation continued after the request disconnected"
+            )
+            assert stream_closed.is_set() is stream
+            assert receive_count == 2
+            with pytest.raises(asyncio.CancelledError):
+                await app_task
+        finally:
+            if not app_task.done():
+                app_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await app_task
+
+    asyncio.run(scenario())
+    assert len(runtime.generation_requests) == 1
 
 
 def test_nonstream_reasoning_accounting_provenance_and_structured_precedence() -> None:

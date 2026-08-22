@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import inspect
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import suppress
 from typing import Any
 
@@ -122,7 +122,10 @@ def create_app(
         headers = provenance_headers(provenance)
         if not parsed.stream:
             try:
-                result = await state.bootstrap.runtime.generate(parsed.generation)
+                result = await _await_until_disconnect(
+                    request,
+                    state.bootstrap.runtime.generate(parsed.generation),
+                )
             except AdapterNotFoundError:
                 return _error(404, "model_not_found", "requested model is not deployed")
             except (PromptError, RuntimeConfigurationError):
@@ -145,7 +148,10 @@ def create_app(
 
         event_stream = state.bootstrap.runtime.stream(parsed.generation)
         try:
-            first = await anext(event_stream)
+            first = await _await_until_disconnect(request, anext(event_stream))
+        except asyncio.CancelledError:
+            await _close_iterator(event_stream)
+            raise
         except AdapterNotFoundError:
             await _close_iterator(event_stream)
             return _error(404, "model_not_found", "requested model is not deployed")
@@ -226,6 +232,38 @@ async def _read_request_body(request: Request) -> bytes:
             raise _RequestBodyTooLarge
         body.extend(chunk)
     return bytes(body)
+
+
+async def _await_until_disconnect(request: Request, awaitable: Awaitable[Any]) -> Any:
+    operation_task = asyncio.ensure_future(awaitable)
+    disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
+    try:
+        done, _ = await asyncio.wait(
+            (operation_task, disconnect_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation_task in done:
+            return await operation_task
+        await disconnect_task
+        operation_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await operation_task
+        raise asyncio.CancelledError
+    finally:
+        if not operation_task.done():
+            operation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await operation_task
+        if not disconnect_task.done():
+            disconnect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect_task
+
+
+async def _wait_for_disconnect(request: Request) -> None:
+    # the body is already consumed, so the receive channel now carries only disconnect lifecycle.
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
 
 
 def _decimal_exceeds_limit(value: str, limit: int) -> bool:
