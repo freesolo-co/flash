@@ -171,10 +171,14 @@ async def _await_until_disconnect(request: Request, awaitable: Awaitable[Any]) -
     disconnect = asyncio.create_task(_wait_for_disconnect(request))
     try:
         done, _ = await asyncio.wait({operation, disconnect}, return_when=asyncio.FIRST_COMPLETED)
-        if disconnect in done:
-            disconnect.result()
-            raise asyncio.CancelledError
-        return operation.result()
+        # `done` is a SET: if generation finished and the peer left in the same tick, both are in
+        # it. deciding on the disconnect first discards a result whose `schedule_usage` already
+        # ran, billing the caller for a response nobody receives. resolve the tie toward the
+        # operation, matching the packaged helper in flash/serve/app/http.py.
+        if operation in done:
+            return operation.result()
+        disconnect.result()
+        raise asyncio.CancelledError
     finally:
         disconnect.cancel()
         if not operation.done():

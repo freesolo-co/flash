@@ -396,3 +396,24 @@ def test_connected_preparation_preserves_headers_events_and_usage() -> None:
     ]
     assert context.chat_stream_calls == 1
     assert closed
+
+
+def test_completed_generation_wins_a_same_tick_disconnect_race() -> None:
+    """a generation that finished must not be discarded because the peer left in the same tick.
+
+    `asyncio.wait(FIRST_COMPLETED)` returns a SET: when generation and disconnect both resolve
+    before the loop wakes, BOTH are in `done`. deciding on the disconnect first throws away a
+    result whose `schedule_usage` has already run, so the caller is billed for a response nobody
+    returns. the packaged helper in flash/serve/app/http.py resolves the tie toward the operation,
+    and this pins the hosted copy to the same rule.
+    """
+
+    async def scenario() -> Any:
+        async def already_done() -> str:
+            return "generated"
+
+        # both futures are resolved before the await, which forces the two-member `done` set.
+        request = _request(lambda: asyncio.sleep(0, {"type": "http.disconnect"}))
+        return await inference_routes._await_until_disconnect(request, already_done())
+
+    assert asyncio.run(scenario()) == "generated"
