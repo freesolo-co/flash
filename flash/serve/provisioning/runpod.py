@@ -83,7 +83,8 @@ from ._runpod_transport import (
 _DEFAULT_ENDPOINT_PROBE = RunPodEndpointProbe()
 
 # how much of the caller's deadline is held back for teardown. one observe, one pod delete, a
-# short absence wait, then four deletes and a confirming observe.
+# short absence wait, then four deletes and a confirming observe. the same bounded interval lets an
+# explicit reclaim discover a create that became visible only after its ambiguous response.
 _CLEANUP_RESERVE_SECONDS = 30.0
 
 
@@ -436,9 +437,9 @@ def _abort_observation_matches(
             # deleting on that basis tears down a running deployment the user is paying for.
             #
             # this also refuses to delete our own create if it landed but its id never reached us.
-            # that leak is recoverable through a later proof-based reclaim; deleting a race winner's
-            # live resource is not. ambiguous provider errors therefore stay unknown and reclaim
-            # follows proof rather than guessing ownership.
+            # automatic cleanup cannot distinguish those cases. explicit identity-authorized
+            # undeploy is the recovery path; ambiguous provider errors stay unknown rather than
+            # guessing ownership inside the losing create process.
             return False
         # confirmed: ours only if the id matches the one the provider returned to us.
         if values[0].id != confirmed_id:
@@ -741,9 +742,117 @@ def _validate_handle(plan: RunPodCreatePlan, handle: RunPodProviderHandle) -> No
         raise ValueError("runpod handle does not match the exact deployment generation")
 
 
+def _require_reclaim_identity(
+    plan: RunPodCreatePlan,
+    observation: RunPodObservation,
+) -> None:
+    if any(not template_identity_matches(plan, item) for item in observation.templates):
+        raise RunPodResourceConflict("template does not match the deployment identity")
+    if any(not volume_identity_matches(plan, item) for item in observation.volumes):
+        raise RunPodResourceConflict("network volume does not match the deployment identity")
+    if not observation.pods:
+        return
+    template_ids = tuple(item.id for item in observation.templates)
+    volume_ids = tuple(item.id for item in observation.volumes)
+    if not template_ids or not volume_ids:
+        raise RunPodResourceConflict("pod dependencies are not observable")
+    for pod in observation.pods:
+        if not any(
+            pod_identity_matches(plan, pod, template_id=template_id, volume_id=volume_id)
+            for template_id in template_ids
+            for volume_id in volume_ids
+        ):
+            raise RunPodResourceConflict("pod does not match the deployment identity")
+
+
+def _reclaim_runpod_deployment(
+    plan: RunPodCreatePlan,
+    transport: RunPodTransport,
+    *,
+    deadline_at: float,
+    clock: Clock,
+    sleep: Sleeper,
+) -> DeploymentResult:
+    """reclaim resources after an ambiguous create returned no provider handle."""
+
+    mutation_attempted = False
+    observed_resource = False
+    attempted_deletes: set[tuple[str, str]] = set()
+    discovery_deadline_at = min(deadline_at, clock() + _CLEANUP_RESERVE_SECONDS)
+    try:
+        while True:
+            observation = _observe(plan, transport, deadline_at=deadline_at)
+            _require_reclaim_identity(plan, observation)
+            if observation.resource_count == 0:
+                if clock() >= discovery_deadline_at:
+                    if observed_resource:
+                        return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
+                    return unknown_result(plan, reason="teardown_cleanup_unconfirmed")
+                # an ambiguous create may still be pending behind the provider's eventually
+                # consistent listing. one empty read cannot prove absence, so wait a bounded interval
+                # for it to materialize and report unknown if it never becomes observable.
+                sleep_until_poll(discovery_deadline_at, clock, sleep)
+                continue
+
+            observed_resource = True
+            if observation.pods:
+                resources = (("pod", item) for item in observation.pods)
+            else:
+                resources = (
+                    *(("template", item) for item in observation.templates),
+                    *(("volume", item) for item in observation.volumes),
+                    *(("artifact_secret", item) for item in observation.artifact_secrets),
+                    *(("inference_secret", item) for item in observation.inference_secrets),
+                )
+            issued_delete = False
+            for kind, resource in resources:
+                key = (kind, resource.id)
+                if key in attempted_deletes:
+                    continue
+                attempted_deletes.add(key)
+                issued_delete = True
+                mutation_attempted = True
+                if kind == "pod":
+                    _delete_tolerating_ambiguity(
+                        lambda resource_id=resource.id: _delete_rest_once(
+                            transport, f"/pods/{resource_id}", deadline_at=deadline_at
+                        )
+                    )
+                elif kind == "template":
+                    _delete_tolerating_ambiguity(
+                        lambda resource_id=resource.id: _delete_rest_once(
+                            transport, f"/templates/{resource_id}", deadline_at=deadline_at
+                        )
+                    )
+                elif kind == "volume":
+                    _delete_tolerating_ambiguity(
+                        lambda resource_id=resource.id: _delete_rest_once(
+                            transport,
+                            f"/networkvolumes/{resource_id}",
+                            deadline_at=deadline_at,
+                        )
+                    )
+                else:
+                    _delete_tolerating_ambiguity(
+                        lambda resource_id=resource.id: _delete_secret_once(
+                            transport, resource_id, deadline_at=deadline_at
+                        )
+                    )
+            if not issued_delete and not sleep_until_poll(deadline_at, clock, sleep):
+                return unknown_result(plan, reason="teardown_cleanup_unconfirmed")
+    except RunPodResourceConflict:
+        if mutation_attempted:
+            return unknown_result(plan, reason="teardown_cleanup_unconfirmed")
+        return failure_result(plan, LifecycleFailure("conflict"))
+    except RunPodTransportFailure as exc:
+        if mutation_attempted:
+            return unknown_result(plan, reason="teardown_cleanup_unconfirmed")
+        return failure_result(plan, _from_transport_failure(exc))
+
+
 def teardown_runpod_deployment(
     bundle: DeploymentBundle,
-    handle: RunPodProviderHandle,
+    handle: RunPodProviderHandle | None,
     credentials: RunPodCredentials,
     *,
     deadline_at: float,
@@ -751,10 +860,27 @@ def teardown_runpod_deployment(
     clock: Clock = time.monotonic,
     sleep: Sleeper = time.sleep,
 ) -> DeploymentResult:
-    """delete one exact generation once per resource and prove authoritative absence."""
+    """delete one exact generation and prove authoritative absence.
+
+    A provider handle keeps the ordinary path bound to provider-returned ids. ``None`` is reserved
+    for explicit undeploy after an ambiguous create returned no ids: the immutable deployment bundle
+    authorizes reclaim by exact deterministic identity, including duplicate resources from retries.
+    """
 
     validate_control_inputs(credentials, deadline_at, clock)
     plan = build_runpod_create_plan(bundle)
+    if handle is None:
+        try:
+            transport = open_transport(transport_factory, credentials)
+        except RunPodTransportFailure as exc:
+            return failure_result(plan, _from_transport_failure(exc))
+        return _reclaim_runpod_deployment(
+            plan,
+            transport,
+            deadline_at=deadline_at,
+            clock=clock,
+            sleep=sleep,
+        )
     _validate_handle(plan, handle)
     # once a delete has been issued, nothing after it can report a plain `failed`: the resource may
     # already be gone, or may still be live and billing. `failed` reads as "nothing changed" and

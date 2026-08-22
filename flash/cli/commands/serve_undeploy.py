@@ -1,8 +1,9 @@
 """tear down one exact customer-owned serving deployment and prove absence.
 
-The deployment bundle is reconstructed from the same immutable arguments as ``serve deploy``.
-Provider-assigned resource ids come from deploy or status output and bind deletion to one exact
-resource generation. Provider credentials remain request-scoped environment values.
+The deployment bundle is reconstructed from the immutable identity printed by ``serve deploy``.
+Provider-assigned ids bind ordinary deletion to one exact generation. When an ambiguous RunPod
+create returned no ids, explicit undeploy reclaims exact deterministic identities instead. Provider
+credentials remain request-scoped environment values.
 """
 
 from __future__ import annotations
@@ -70,6 +71,17 @@ def _provider_handle(args, bundle):
         ("modal_app_id", "modal_volume_id", "modal_inference_secret_id"),
     )
     plan = build_runpod_create_plan(bundle)
+    id_names = (
+        "runpod_pod_id",
+        "runpod_network_volume_id",
+        "runpod_template_id",
+        "runpod_inference_secret_id",
+    )
+    supplied_ids = [name for name in id_names if getattr(args, name, "")]
+    if not supplied_ids:
+        return None
+    if len(supplied_ids) != len(id_names):
+        raise ValueError("runpod provider ids must be supplied together or omitted for reclaim")
     pod_id = _required_arg(args, "runpod_pod_id")
     return RunPodProviderHandle(
         deployment_id=bundle.spec.deployment_id,
@@ -122,9 +134,11 @@ def cmd_serve_undeploy(args) -> int:
             from flash.serve.provisioning.runpod import _validate_handle
 
             plan = build_runpod_create_plan(bundle)
-        # validate the user-authored identity before provider teardown. only this local validation is
-        # caught; the provider call remains outside so lifecycle defects still surface in full.
-        _validate_handle(plan, handle)
+        # validate user-authored provider ids before teardown. runpod may have none only when an
+        # ambiguous create returned no handle; the immutable deployment identity then authorizes the
+        # bounded exact-name reclaim instead.
+        if handle is not None:
+            _validate_handle(plan, handle)
         credentials = _credentials(provider)
     except (ValueError, TypeError) as exc:
         return _err(str(exc))

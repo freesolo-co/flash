@@ -364,6 +364,30 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     assert "outcome_unknown" in capsys.readouterr().out
 
 
+def test_runpod_unknown_outcome_explains_idless_identity_reclaim(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _unknown(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        from flash.serve.control import DeploymentResult
+
+        return DeploymentResult.from_spec(
+            bundle.spec,
+            status="outcome_unknown",
+            error_code="resource_ambiguous",
+            error_reason="mutation_outcome_unknown",
+        )
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setattr("flash.serve.provisioning.runpod.provision_runpod_deployment", _unknown)
+
+    assert cmd_serve_deploy(_args(provider="runpod")) == 1
+    captured = capsys.readouterr()
+    assert "identity    " in captured.out
+    assert "omit all four id flags" in captured.err
+    assert "flash serve status" not in captured.err
+
+
 def test_identity_reporting_does_not_swallow_keyboard_interrupt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -404,7 +428,7 @@ def test_readiness_timeout_names_the_pod_and_points_to_teardown(
     assert "outcome could not be confirmed" not in captured.err
 
 
-def test_artifact_cleanup_timeout_reports_a_ready_service_without_teardown_advice(
+def test_artifact_cleanup_timeout_reports_a_live_billing_service(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from flash.serve.control import DeploymentResult
@@ -427,9 +451,44 @@ def test_artifact_cleanup_timeout_reports_a_ready_service_without_teardown_advic
     captured = capsys.readouterr()
     assert "service reached readiness" in captured.err
     assert "artifact cleanup did not settle" in captured.err
+    assert "live and billing" in captured.err
     assert "flash serve status" in captured.err
+    # the pod proved ready, so it bills until it is torn down. the earlier wording withheld the
+    # teardown command, which left the cost to the user to work out.
+    assert "flash serve undeploy" in captured.err
     assert "readiness did not prove" not in captured.err
-    assert "flash serve undeploy" not in captured.err
+
+
+def test_artifact_cleanup_rejection_warns_that_the_pod_is_live_and_billing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """a definite cleanup rejection must not read like an ordinary failed deploy.
+
+    the pod proved ready before cleanup ran, so it is live and billing. reporting `failed` with a
+    bare error line sent the user away believing nothing was provisioned, while the gpu kept
+    charging. every `artifact_cleanup_` reason is raised after readiness, so all of them warn.
+    """
+
+    from flash.serve.control import DeploymentResult
+
+    def _rejected(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        ready = _result(bundle)
+        return DeploymentResult.from_spec(
+            bundle.spec,
+            status="failed",
+            handle=ready.handle,
+            error_code="provider_rejected",
+            error_reason="artifact_cleanup_patch_rejected",
+        )
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setattr("flash.serve.provisioning.runpod.provision_runpod_deployment", _rejected)
+
+    assert cmd_serve_deploy(_args(provider="runpod")) == 1
+    captured = capsys.readouterr()
+    assert "live and billing" in captured.err
+    assert "flash serve undeploy" in captured.err
 
 
 def test_interrupted_deploy_prints_recovery_identity_without_masking_interrupt(

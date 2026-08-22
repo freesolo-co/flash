@@ -108,14 +108,17 @@ def _report(result, bundle) -> int:
     if result.error_reason:
         print(f"reason      {result.error_reason}", file=sys.stderr)
     if (
-        result.error_code == "artifact_cleanup_timeout"
+        # every artifact-cleanup reason is raised after readiness proved, so the pod is live and
+        # billing whatever the status says. keying on the family rather than one reason keeps a
+        # definite cleanup rejection from printing a bare error that reads like a failed deploy.
+        str(result.error_reason or "").startswith("artifact_cleanup_")
         and handle is not None
         and handle.provider == "runpod"
     ):
         print(
             f"\nthe service reached readiness on pod {handle.pod_id}, but artifact cleanup did "
-            "not settle within the deadline. run `flash serve status` to inspect the deployment "
-            "before deciding whether any further action is needed.",
+            "not settle. the pod is live and billing. run `flash serve status` to inspect the "
+            "deployment, then `flash serve undeploy` to stop it billing if you do not want it.",
             file=sys.stderr,
         )
     elif (
@@ -131,12 +134,21 @@ def _report(result, bundle) -> int:
     elif result.status == "outcome_unknown":
         # the provider may or may not hold live resources. saying "failed" here would invite a
         # retry that double-provisions and bills twice.
-        print(
-            "\nthe provider outcome could not be confirmed. resources may exist; run `flash serve "
-            "status` to inspect them, then `flash serve undeploy` to stop them billing before "
-            "retrying rather than provisioning again.",
-            file=sys.stderr,
-        )
+        if result.provider == "runpod":
+            print(
+                "\nthe provider outcome could not be confirmed. resources may exist; run `flash "
+                "serve undeploy` with the identity printed above to stop them billing before "
+                "retrying. if create returned no runpod resource ids, omit all four id flags to "
+                "reclaim by that exact deployment identity.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "\nthe provider outcome could not be confirmed. resources may exist; run `flash "
+                "serve status` to inspect them, then `flash serve undeploy` to stop them billing "
+                "before retrying rather than provisioning again.",
+                file=sys.stderr,
+            )
     return 1
 
 

@@ -461,6 +461,25 @@ class _FakeTransport:
             raise AssertionError("unexpected fake delete path")
 
 
+class _LateVisibleAmbiguousVolumeTransport(_FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hidden_volume_observations = 0
+
+    def _list(self, path: str) -> list[dict[str, object]]:
+        if (
+            path == "/networkvolumes"
+            and self.mutation_count >= 3
+            and self.volumes
+            and self.hidden_volume_observations < 3
+        ):
+            # the live 500 landed the volume, but runpod's immediate abort observations did not
+            # expose it. a later reclaim listing does, matching the measured consistency window.
+            self.hidden_volume_observations += 1
+            return []
+        return super()._list(path)
+
+
 class _AmbiguousAbortDeleteTransport(_FakeTransport):
     def __init__(self, resource_kind: str, *, delete_lands: bool) -> None:
         super().__init__()
@@ -1100,6 +1119,65 @@ def test_create_failure_boundaries_reclaim_only_fully_confirmed_resources(
         assert not any(
             call[1] == "secretDelete" or "DELETE" in call[1] for call in _mutation_calls(transport)
         )
+
+
+def test_identity_reclaim_deletes_a_volume_that_materializes_after_ambiguous_create() -> None:
+    bundle = _bundle()
+    transport = _LateVisibleAmbiguousVolumeTransport()
+    transport.fail_mutation_at = 3
+    transport.failure_mode = "ambiguous_after"
+
+    failed, _factory, _probe = _provision(bundle, transport)
+
+    assert failed.status == "outcome_unknown"
+    assert failed.error_code == "resource_ambiguous"
+    assert failed.handle is None
+    assert transport.hidden_volume_observations == 2
+    assert len(transport.volumes) == 1
+    assert not any(call[1] == "DELETE /networkvolumes/volume01" for call in transport.calls)
+
+    transport.calls.clear()
+    reclaimed = teardown_runpod_deployment(
+        bundle,
+        None,
+        RunPodCredentials(PROVIDER_SECRET),
+        deadline_at=transport.clock() + 100.0,
+        transport_factory=_Factory(transport),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert reclaimed.status == "absent"
+    assert transport.hidden_volume_observations == 3
+    assert transport.volumes == []
+    assert [call[1] for call in _mutation_calls(transport)] == ["DELETE /networkvolumes/volume01"]
+
+
+def test_identity_reclaim_deletes_duplicate_exact_name_volumes() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    plan = build_runpod_create_plan(bundle)
+    transport.volumes = [
+        {"id": "volume01", **plan.volume_payload()},
+        {"id": "volume02", **plan.volume_payload()},
+    ]
+
+    reclaimed = teardown_runpod_deployment(
+        bundle,
+        None,
+        RunPodCredentials(PROVIDER_SECRET),
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert reclaimed.status == "absent"
+    assert transport.volumes == []
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "DELETE /networkvolumes/volume01",
+        "DELETE /networkvolumes/volume02",
+    ]
 
 
 @pytest.mark.parametrize(("resource_kind", "failure_boundary"), [("template", 4), ("secret", 2)])

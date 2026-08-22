@@ -183,8 +183,9 @@ def _add_serve_undeploy(serve_sub: argparse._SubParsersAction) -> None:
     """`serve undeploy`: remove one exact deployment generation and prove absence.
 
     Provider credentials remain request-only environment values. Provider-assigned resource ids are
-    not secrets; the deploy command prints them so teardown can bind every deletion to the exact
-    generation instead of trusting reusable deterministic names.
+    not secrets; the deploy command prints them so ordinary teardown can bind every deletion to the
+    exact generation. RunPod ids may all be omitted only to reclaim an ambiguous create from the
+    immutable deployment identity printed by deploy.
     """
 
     undeploy = serve_sub.add_parser(
