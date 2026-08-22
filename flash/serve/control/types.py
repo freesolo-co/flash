@@ -814,11 +814,3 @@ def validate_deployment_result(result: DeploymentResult) -> None:
             image_digest=result.image_digest,
             handle=result.handle,
         )
-
-
-def sanitized_dict(value: object) -> dict[str, object]:
-    """serialize one exact allowlisted control record through explicit schemas."""
-
-    from ._serialization import serialize_control_record
-
-    return serialize_control_record(value)

@@ -29,7 +29,6 @@ from flash.serve.control import (
     RunPodProviderHandle,
     canonical_mapping_fingerprint,
     plan_deployment,
-    sanitized_dict,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -307,8 +306,8 @@ def test_multiple_compatible_adapters_return_one_order_stable_spec() -> None:
     assert "engine" not in {entry.name for entry in fields(ResolvedAdapter)}
     assert "engine" in {entry.name for entry in fields(DeploymentRequest)}
     assert "groups" not in {entry.name for entry in fields(forward)}
-    assert "group_id" not in sanitized_dict(forward)
-    assert "group_name" not in sanitized_dict(forward)
+    assert "group_id" not in {entry.name for entry in fields(forward)}
+    assert "group_name" not in {entry.name for entry in fields(forward)}
     for legacy_name in ("DeploymentGroup", "DeploymentPlan", "GroupResult"):
         assert not hasattr(control, legacy_name)
 
@@ -330,7 +329,7 @@ def test_deployment_spec_requires_canonical_adapter_order_at_every_boundary() ->
 
     object.__setattr__(planned, "adapters", reversed_adapters)
     with pytest.raises(ValueError, match="canonical ordering"):
-        sanitized_dict(planned)
+        _ = planned.spec_id
 
 
 def test_request_is_the_single_engine_authority() -> None:
@@ -341,8 +340,8 @@ def test_request_is_the_single_engine_authority() -> None:
     spec = plan_deployment(request)
 
     assert spec.engine is engine
-    assert sanitized_dict(spec)["engine"]["dtype"] == "float16"
-    assert "engine" not in sanitized_dict(spec)["adapters"][0]
+    assert spec.engine.dtype == "float16"
+    assert "engine" not in {entry.name for entry in fields(spec.adapters[0])}
 
 
 def test_capacity_at_limit_succeeds_and_capacity_plus_one_fails_without_chunking() -> None:
@@ -611,51 +610,45 @@ def _runpod_handle(spec: DeploymentSpec) -> RunPodProviderHandle:
     )
 
 
-def test_sanitized_handles_and_results_are_json_safe_secret_free_and_flat() -> None:
+def test_handles_and_results_expose_exact_secret_free_public_fields() -> None:
     modal_spec = plan_deployment(_modal_request(_adapter(1)))
     runpod_spec = _runpod_spec()
     handles_and_specs = (
         (_modal_handle(modal_spec), modal_spec),
         (_runpod_handle(runpod_spec), runpod_spec),
     )
-    modal_spec_payload = sanitized_dict(modal_spec)
-    spec_encoded = json.dumps(modal_spec_payload, sort_keys=True)
-    assert SECRET_SENTINEL not in spec_encoded
-    assert modal_spec_payload["placement"]["workspace_name"] == "workspace-1"
-    assert "workspace_id" not in modal_spec_payload["placement"]
-    assert "volume_size_gb" not in modal_spec_payload["placement"]
+    assert modal_spec.placement.workspace_name == "workspace-1"
+    assert "workspace_id" not in {entry.name for entry in fields(modal_spec.placement)}
+    assert "volume_size_gb" not in {entry.name for entry in fields(modal_spec.placement)}
 
     for handle, spec in handles_and_specs:
         result = DeploymentResult.from_spec(spec, status="ready", handle=handle)
-        payload = sanitized_dict(result)
-        encoded = json.dumps(payload, sort_keys=True)
-        assert SECRET_SENTINEL not in encoded
-        assert handle.public_url in encoded
-        assert handle.image_digest in encoded
-        assert spec.engine.engine_id in encoded
-        assert set(payload) == {
-            "deployment_id",
-            "generation",
-            "provider",
-            "placement",
-            "engine_id",
-            "image_digest",
-            "spec_id",
+        assert {entry.name for entry in fields(result)} == {
+            "spec",
             "status",
             "handle",
             "error_code",
         }
-        assert not any("group" in key for key in payload)
+        assert result.deployment_id == spec.deployment_id
+        assert result.generation == spec.generation
+        assert result.provider == spec.provider
+        assert result.placement == spec.placement
+        assert result.engine_id == spec.engine.engine_id
+        assert result.image_digest == handle.image_digest
+        assert result.spec_id == spec.spec_id
+        assert result.status == "ready"
+        assert result.handle is handle
+        assert result.error_code is None
         assert "group_id" not in {entry.name for entry in fields(handle)}
-        assert payload["handle"]["inference_secret_id"] == handle.inference_secret_id
-        assert payload["handle"]["inference_secret_name"] == "flash-inference-secret"
-        assert not any(key.startswith("artifact_secret") for key in payload["handle"])
+        assert handle.inference_secret_name == "flash-inference-secret"
+        assert not any(entry.name.startswith("artifact_secret") for entry in fields(handle))
+        assert SECRET_SENTINEL not in repr((result.spec, result.status, result.handle, result.error_code))
         if type(handle) is ModalProviderHandle:
-            assert payload["handle"]["workspace_name"] == "workspace-1"
-            assert "workspace_id" not in payload["handle"]
+            assert handle.workspace_name == "workspace-1"
+            assert "workspace_id" not in {entry.name for entry in fields(handle)}
         else:
-            assert payload["handle"]["template_id"] == "template-1"
-            assert payload["handle"]["template_name"] == "flash-template"
+            assert handle.template_id == "template-1"
+            assert handle.template_name == "flash-template"
 
     with pytest.raises(ValueError, match="pod_id"):
         replace(handles_and_specs[1][0], pod_id="")
@@ -675,7 +668,7 @@ def test_deployment_result_requires_an_exact_spec_and_matching_handle_provenance
         DeploymentResult()
 
     legitimate = DeploymentResult.from_spec(spec, status="ready", handle=handle)
-    assert sanitized_dict(legitimate)["spec_id"] == spec.spec_id
+    assert legitimate.spec_id == spec.spec_id
 
     raw_error = RuntimeError(SECRET_SENTINEL)
     with pytest.raises(ValueError, match="allowlisted deployment error") as exc_info:
@@ -723,7 +716,7 @@ def test_deployment_result_accepts_complete_lifecycle_matrix(
         handle=handle,
         error_code=error_code,
     )
-    assert sanitized_dict(result)["status"] == status
+    assert result.status == status
 
 
 @pytest.mark.parametrize(
@@ -783,7 +776,7 @@ def test_deployment_result_validates_shared_placement_provenance() -> None:
             )
 
 
-def test_deployment_result_equality_and_serialization_include_public_provenance() -> None:
+def test_deployment_result_equality_and_fields_include_public_provenance() -> None:
     first_spec = plan_deployment(_modal_request(_adapter(1)))
     second_spec = replace(first_spec, generation=first_spec.generation + 1)
     first = DeploymentResult.from_spec(first_spec, status="ready", handle=_modal_handle(first_spec))
@@ -815,11 +808,11 @@ def test_deployment_result_equality_and_serialization_include_public_provenance(
     assert first != different_adapters
     assert first.spec_id != different_adapters.spec_id
     assert first_spec.spec_id != different_adapters_spec.spec_id
-    assert sanitized_dict(first)["generation"] == first_spec.generation
-    assert sanitized_dict(second)["generation"] == second_spec.generation
-    assert sanitized_dict(first)["spec_id"] == first_spec.spec_id
-    assert sanitized_dict(different_adapters)["spec_id"] == different_adapters_spec.spec_id
-    assert sanitized_dict(first)["placement"] == sanitized_dict(first_spec)["placement"]
+    assert first.generation == first_spec.generation
+    assert second.generation == second_spec.generation
+    assert first.spec_id == first_spec.spec_id
+    assert different_adapters.spec_id == different_adapters_spec.spec_id
+    assert first.placement == first_spec.placement
 
 
 def test_two_placements_differing_only_in_web_suffix_are_two_specs() -> None:
@@ -827,7 +820,7 @@ def test_two_placements_differing_only_in_web_suffix_are_two_specs() -> None:
 
     Modal builds a web url as `<workspace>-<web_suffix>--<label>.modal.run`, so a placement that
     differs only in its suffix names a different endpoint. If `_placement_payload` omits it, the
-    two hash to one `spec_id`: a serialized spec no longer round-trips to the origin it describes,
+    two hash to one `spec_id`: the identity no longer distinguishes the origin it describes,
     and the probe's `provenance["spec_id"]` check would accept a deployment reachable at a
     different url than the one that was planned.
     """
@@ -850,7 +843,7 @@ def test_two_placements_differing_only_in_web_suffix_are_two_specs() -> None:
     )
 
     assert without.spec_id != with_suffix.spec_id
-    assert sanitized_dict(without)["placement"] != sanitized_dict(with_suffix)["placement"]
+    assert without.placement != with_suffix.placement
 
 
 @pytest.mark.parametrize(
@@ -925,51 +918,6 @@ def test_modal_handle_rejects_noncanonical_provider_urls(url: str) -> None:
     spec = plan_deployment(_modal_request(_adapter(1)))
     with pytest.raises(ValueError, match="public_url"):
         replace(_modal_handle(spec), public_url=url)
-
-
-def test_serializers_reject_subclasses_nonrecords_and_malformed_nested_records() -> None:
-    spec = plan_deployment(_modal_request(_adapter(1)))
-
-    class SpecSubclass(type(spec)):
-        pass
-
-    with pytest.raises(ValueError, match="exact DeploymentSpec"):
-        SpecSubclass(
-            deployment_id=spec.deployment_id,
-            generation=spec.generation,
-            provider=spec.provider,
-            placement=spec.placement,
-            engine=spec.engine,
-            adapters=spec.adapters,
-        )
-
-    subclass = object.__new__(SpecSubclass)
-    for entry in fields(spec):
-        object.__setattr__(subclass, entry.name, getattr(spec, entry.name))
-    object.__setattr__(subclass, "secret", SECRET_SENTINEL)
-    with pytest.raises(TypeError, match="exact sanitized"):
-        sanitized_dict(subclass)
-    for nonrecord in (spec.engine, _modal_request(_adapter(1)), {"deployment_id": "x"}):
-        with pytest.raises(TypeError, match="exact sanitized"):
-            sanitized_dict(nonrecord)
-
-    malformed = replace(spec, adapters=spec.adapters)
-    object.__setattr__(malformed, "placement", ModalCredentials("id", SECRET_SENTINEL))
-    with pytest.raises(ValueError, match="ModalPlacement"):
-        sanitized_dict(malformed)
-
-
-def test_serializers_revalidate_exact_records_after_forced_mutation() -> None:
-    spec = plan_deployment(_modal_request(_adapter(1)))
-    object.__setattr__(spec.engine, "max_cpu_loras", spec.engine.max_loras - 1)
-    with pytest.raises(ValueError, match="max_cpu_loras must be at least max_loras"):
-        sanitized_dict(spec)
-
-    result_spec = plan_deployment(_modal_request(_adapter(2)))
-    result = DeploymentResult.from_spec(result_spec, status="absent")
-    object.__setattr__(result, "status", "failed")
-    with pytest.raises(ValueError, match="require an allowlisted error_code"):
-        sanitized_dict(result)
 
 
 def test_control_records_have_no_credential_fields() -> None:

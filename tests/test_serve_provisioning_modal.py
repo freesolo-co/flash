@@ -22,7 +22,6 @@ from flash.serve.control import (
     ModalCredentials,
     ModalPlacement,
     ModalProviderHandle,
-    sanitized_dict,
 )
 from flash.serve.provisioning import (
     DeploymentBundle,
@@ -489,7 +488,7 @@ def test_request_secrets_are_confined_to_one_shot_sinks_and_sanitized_results() 
     sdk = factory.sdk
     assert sdk is not None
 
-    rendered = json.dumps(sanitized_dict(result), sort_keys=True) + repr(result) + repr(sdk.calls)
+    rendered = repr((result.spec, result.status, result.handle, result.error_code)) + repr(sdk.calls)
     assert factory.calls == [(True, True)]
     assert probe.calls[0][1] is True
     assert ("create_inference", True) in sdk.calls
@@ -1134,7 +1133,9 @@ def test_ambiguous_high_level_mutation_is_called_once_and_never_retried() -> Non
     assert result.error_code == "resource_ambiguous"
     assert [name for name, _value in sdk.calls].count("create_volume") == 1
     assert "deploy_app" not in [name for name, _value in sdk.calls]
-    assert PROVIDER_SECRET not in json.dumps(sanitized_dict(result))
+    assert PROVIDER_SECRET not in repr(
+        (result.spec, result.status, result.handle, result.error_code)
+    )
 
 
 def test_reconcile_is_read_only_for_ready_absent_and_lingering_artifact() -> None:
@@ -1629,7 +1630,7 @@ def test_provider_error_reprs_and_results_never_leak_credential_sentinels() -> N
         return sdk
 
     result, _probe = _provision(bundle, failing_factory, artifact_token=None)
-    rendered = repr(result) + json.dumps(sanitized_dict(result))
+    rendered = repr((result.spec, result.status, result.handle, result.error_code))
     assert result.status == "outcome_unknown"
     for secret in (PROVIDER_ID, PROVIDER_SECRET, INFERENCE_SECRET):
         assert secret not in rendered
@@ -1715,7 +1716,7 @@ def test_modal_endpoint_provenance_requires_exact_ids_aliases_and_full_mapping()
     assert all(_provenance_matches(case, bundle) is False for case in cases)
 
 
-def test_modal_handle_rejects_malformed_role_ids_at_creation_and_serialization() -> None:
+def test_modal_handle_rejects_malformed_role_ids_at_creation() -> None:
     bundle = _bundle()
     plan = build_modal_create_plan(bundle)
     sdk = _FakeSdk(plan)
@@ -1727,10 +1728,6 @@ def test_modal_handle_rejects_malformed_role_ids_at_creation_and_serialization()
     ):
         with pytest.raises(ValueError, match="pinned provider contract"):
             replace(handle, **{field: malformed})
-
-    object.__setattr__(handle, "app_id", "ap-short")
-    with pytest.raises(ValueError, match="pinned provider contract"):
-        sanitized_dict(handle)
 
 
 def test_import_purity_blocks_modal_for_control_app_manifest_and_materialize() -> None:

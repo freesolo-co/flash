@@ -21,7 +21,6 @@ from .types import (
     ResolvedAdapter,
     RunPodPlacement,
     RunPodProviderHandle,
-    sanitized_dict,
 )
 
 __all__ = [
@@ -47,5 +46,4 @@ __all__ = [
     "RunPodProviderHandle",
     "canonical_mapping_fingerprint",
     "plan_deployment",
-    "sanitized_dict",
 ]

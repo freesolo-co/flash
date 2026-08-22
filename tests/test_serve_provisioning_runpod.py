@@ -18,7 +18,6 @@ from flash.serve.control import (
     RunPodCredentials,
     RunPodPlacement,
     RunPodProviderHandle,
-    sanitized_dict,
 )
 from flash.serve.provisioning import (
     DeploymentBundle,
@@ -650,12 +649,12 @@ def test_secret_sentinels_are_confined_to_exact_request_sinks() -> None:
     transport = _FakeTransport()
     result, factory, probe = _provision(bundle, transport)
 
-    encoded = json.dumps(sanitized_dict(result), sort_keys=True)
+    encoded = repr((result.spec, result.status, result.handle, result.error_code))
     assert all(
         secret not in encoded for secret in (PROVIDER_SECRET, INFERENCE_SECRET, ARTIFACT_SECRET)
     )
     assert all(
-        secret not in repr(result)
+        secret not in repr((result.spec, result.status, result.handle, result.error_code))
         for secret in (PROVIDER_SECRET, INFERENCE_SECRET, ARTIFACT_SECRET)
     )
     assert factory.accepted_keys == [True]
@@ -744,7 +743,7 @@ def test_wrong_account_fails_closed_with_sanitized_error() -> None:
     assert result.status == "failed"
     assert result.error_code == "authentication_failed"
     assert result.handle is None
-    assert PROVIDER_SECRET not in json.dumps(sanitized_dict(result))
+    assert PROVIDER_SECRET not in repr((result.spec, result.status, result.handle, result.error_code))
 
 
 def test_ambiguous_mutation_is_not_retried_and_returns_outcome_unknown() -> None:
@@ -1846,7 +1845,7 @@ def test_probe_exceptions_are_sanitized_as_unproven_adoption() -> None:
     )
     assert result.status == "outcome_unknown"
     assert result.handle == handle
-    assert INFERENCE_SECRET not in json.dumps(sanitized_dict(result))
+    assert INFERENCE_SECRET not in repr((result.spec, result.status, result.handle, result.error_code))
 
 
 def test_teardown_refuses_mismatched_exact_resource_before_deletion() -> None:

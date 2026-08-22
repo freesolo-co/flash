@@ -7,20 +7,14 @@ import hashlib
 from ._canonical import canonical_json
 from .types import (
     AdapterAliasIntent,
-    DeploymentResult,
     DeploymentSpec,
     EngineIdentity,
     ModalPlacement,
-    ModalProviderHandle,
     ResolvedAdapter,
     RunPodPlacement,
-    RunPodProviderHandle,
-    validate_deployment_result,
     validate_deployment_spec,
     validate_engine_identity,
-    validate_modal_handle,
     validate_resolved_adapter,
-    validate_runpod_handle,
 )
 
 
@@ -147,94 +141,3 @@ def spec_identity(value: DeploymentSpec) -> str:
     _require_exact(value, DeploymentSpec, "spec")
     validate_deployment_spec(value)
     return _spec_identity_from_payload(_spec_payload(value))
-
-
-def serialize_spec(value: DeploymentSpec) -> dict[str, object]:
-    _require_exact(value, DeploymentSpec, "spec")
-    validate_deployment_spec(value)
-    payload = _spec_payload(value)
-    return {"spec_id": _spec_identity_from_payload(payload), **payload}
-
-
-def _serialize_modal_handle(value: ModalProviderHandle) -> dict[str, object]:
-    _require_exact(value, ModalProviderHandle, "handle")
-    validate_modal_handle(value)
-    return {
-        "deployment_id": value.deployment_id,
-        "generation": value.generation,
-        "engine_id": value.engine_id,
-        "workspace_name": value.workspace_name,
-        "app_id": value.app_id,
-        "app_name": value.app_name,
-        "volume_id": value.volume_id,
-        "volume_name": value.volume_name,
-        "inference_secret_id": value.inference_secret_id,
-        "inference_secret_name": value.inference_secret_name,
-        "environment": value.environment,
-        "region": value.region,
-        "image_digest": value.image_digest,
-        "public_url": value.public_url,
-        "provider": value.provider,
-    }
-
-
-def _serialize_runpod_handle(value: RunPodProviderHandle) -> dict[str, object]:
-    _require_exact(value, RunPodProviderHandle, "handle")
-    validate_runpod_handle(value)
-    return {
-        "deployment_id": value.deployment_id,
-        "generation": value.generation,
-        "engine_id": value.engine_id,
-        "account_id": value.account_id,
-        "pod_id": value.pod_id,
-        "pod_name": value.pod_name,
-        "network_volume_id": value.network_volume_id,
-        "network_volume_name": value.network_volume_name,
-        "template_id": value.template_id,
-        "template_name": value.template_name,
-        "inference_secret_id": value.inference_secret_id,
-        "inference_secret_name": value.inference_secret_name,
-        "data_center_id": value.data_center_id,
-        "image_digest": value.image_digest,
-        "public_url": value.public_url,
-        "provider": value.provider,
-    }
-
-
-def _serialize_handle(value: object) -> dict[str, object]:
-    if type(value) is ModalProviderHandle:
-        return _serialize_modal_handle(value)
-    if type(value) is RunPodProviderHandle:
-        return _serialize_runpod_handle(value)
-    raise TypeError("handle must be an exact sanitized provider handle")
-
-
-def _serialize_result(value: DeploymentResult) -> dict[str, object]:
-    _require_exact(value, DeploymentResult, "result")
-    validate_deployment_result(value)
-    return {
-        "deployment_id": value.deployment_id,
-        "generation": value.generation,
-        "provider": value.provider,
-        "placement": _placement_payload(value.placement),
-        "engine_id": value.engine_id,
-        "image_digest": value.image_digest,
-        "spec_id": value.spec_id,
-        "status": value.status,
-        "handle": None if value.handle is None else _serialize_handle(value.handle),
-        "error_code": value.error_code,
-    }
-
-
-def serialize_control_record(value: object) -> dict[str, object]:
-    """serialize only exact public records and their exact nested schemas."""
-
-    if type(value) is DeploymentSpec:
-        return serialize_spec(value)
-    if type(value) is ModalProviderHandle:
-        return _serialize_modal_handle(value)
-    if type(value) is RunPodProviderHandle:
-        return _serialize_runpod_handle(value)
-    if type(value) is DeploymentResult:
-        return _serialize_result(value)
-    raise TypeError("only exact sanitized control records can be serialized")
