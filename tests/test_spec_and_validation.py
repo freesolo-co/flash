@@ -476,6 +476,66 @@ def test_warmstart_accepts_omitted_child_rank_with_internal_placeholder() -> Non
     assert spec.train.lora_rank == 32
 
 
+def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200() -> None:
+    from flash.providers.allocator import required_vram_gb
+
+    train = {
+        "epochs": 1,
+        "max_examples": 10,
+        "prompts_per_step": 8,
+        "group_size": 4,
+        "max_context_tokens": 1536,
+        "max_completion_tokens": 512,
+    }
+    base = _raw(
+        model="Qwen/Qwen3.6-35B-A3B",
+        algorithm="grpo",
+        **{
+            "gpu.type": "B200",
+            **{f"train.{key}": value for key, value in train.items()},
+        },
+    )
+    base["train"].pop("lora_rank")
+
+    warm = spec_from_dict(
+        {
+            **base,
+            "train": {**base["train"], "init_from_adapter": "source-rank-4"},
+        }
+    )
+    cold_rank4 = spec_from_dict({**base, "train": {**base["train"], "lora_rank": 4}})
+
+    assert warm.train.lora_rank == 32
+    assert cold_rank4.train.lora_rank == 4
+    assert (
+        required_vram_gb(warm.model, warm.algorithm, train={**base["train"], "lora_rank": 4}) == 180
+    )
+    assert (
+        required_vram_gb(warm.model, warm.algorithm, train={**base["train"], "lora_rank": 32})
+        == 199
+    )
+    with pytest.raises(ConfigError, match=r"requires at least 199 GB"):
+        spec_from_dict({**base, "train": {**base["train"], "lora_rank": 32}})
+
+
+def test_warmstart_still_rejects_a_shape_impossible_at_the_minimum_rank() -> None:
+    raw = _raw(
+        model="Qwen/Qwen3.6-35B-A3B",
+        **{
+            "gpu.type": "B200",
+            "train.init_from_adapter": "source-run",
+            "train.max_context_tokens": 32768,
+            "train.max_completion_tokens": 512,
+            "train.prompts_per_step": 8,
+            "train.group_size": 4,
+        },
+    )
+    raw["train"].pop("lora_rank")
+
+    with pytest.raises(ConfigError, match=r"grpo needs >= 216 GB VRAM"):
+        spec_from_dict(raw)
+
+
 def test_public_warmstart_serialization_omits_resolved_internal_fields() -> None:
     spec = _job_from_dict(
         {

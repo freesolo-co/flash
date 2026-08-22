@@ -957,13 +957,19 @@ def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
     monkeypatch.setenv("FLASH_STYLE", "0")
     # group_size 2 is grpo's floor (advantages are group-relative) and is valid for opd too.
     body = SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"').replace(
-        "batch_size = 8\n", "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
+        "batch_size = 8\n",
+        'prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\ninit_from_adapter = "source-run"\n',
     )
 
     assert cmd_train(_sft_args(tmp_path, body)) == 0
     captured = capsys.readouterr()
     assert "TOTAL" in captured.out
     assert "shadowed!" not in captured.err
+    assert (
+        "warning: warm-start (train.init_from_adapter) cost uses the default LoRA rank; the "
+        "source adapter's authoritative rank is resolved server-side, so this offline estimate "
+        "may be higher or lower than the resolved run cost.\n" in captured.err
+    )
 
 
 def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):

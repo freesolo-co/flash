@@ -483,16 +483,32 @@ def _validate_gpu_section(
         # provider preferences are soft; configured unnamed providers remain eligible.
 
     requested_gpu_count = authored_gpu_ceiling(gpu_spec.type, gpu_count)
+    init_from_adapter = train_raw.get("init_from_adapter")
+    unresolved_warmstart_rank = (
+        isinstance(init_from_adapter, str)
+        and bool(init_from_adapter.strip())
+        and "lora_rank" not in train_raw
+    )
+    # the client cannot resolve a run id to the source adapter metadata, so rank 32 is only a
+    # serialization placeholder here. keep geometry checks and reject shapes that cannot fit even at
+    # the minimum valid rank; the server replaces this value from adapter_config.json before its
+    # authoritative allocation-time vram check.
+    preflight_train = {**train_raw, "lora_rank": 1} if unresolved_warmstart_rank else train_raw
     preflight_gpu_count = provisional_gpu_count(
         model,
         algorithm,
-        train=train_raw,
+        train=preflight_train,
         thinking=thinking,
         geometry_model_revision=model_revision,
         gpu_count=requested_gpu_count,
     )
     try:
-        if gpu_types and preflight_gpu_count <= 1 and not model_revision:
+        if (
+            gpu_types
+            and preflight_gpu_count <= 1
+            and not model_revision
+            and not unresolved_warmstart_rank
+        ):
             from flash.providers.allocator import required_vram_gb
 
             required_vram = required_vram_gb(
@@ -517,7 +533,7 @@ def _validate_gpu_section(
         provisional_gpu(
             model,
             algorithm=algorithm,
-            train=train_raw,
+            train=preflight_train,
             thinking=thinking,
             geometry_model_revision=model_revision,
             gpu_count=preflight_gpu_count,
