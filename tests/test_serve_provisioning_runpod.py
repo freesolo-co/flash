@@ -36,6 +36,7 @@ from flash.serve.provisioning._runpod_protocol import (
     parse_deleted_secret,
     parse_pods,
     parse_templates,
+    parse_volumes,
 )
 from flash.serve.provisioning._runpod_resources import pod_identity_matches
 from flash.serve.provisioning._runpod_transport import (
@@ -425,11 +426,13 @@ class _FakeTransport:
                 "name": payload["name"],
                 "desiredStatus": "RUNNING",
                 "imageName": payload["imageName"],
-                "gpuTypeId": payload["gpuTypeIds"][0],
+                "machine": {
+                    "gpuTypeId": payload["gpuTypeIds"][0],
+                    "dataCenterId": payload["dataCenterIds"][0],
+                },
                 "gpuCount": payload["gpuCount"],
-                "dataCenterId": payload["dataCenterIds"][0],
                 "containerDiskInGb": payload["containerDiskInGb"],
-                "networkVolumeId": payload["networkVolumeId"],
+                "networkVolume": {"id": payload["networkVolumeId"]},
                 "templateId": payload["templateId"],
                 "ports": payload["ports"],
                 # runpod copies the template environment into the pod at creation; later template
@@ -515,11 +518,13 @@ def _seed_exact(
         "name": pod_request["name"],
         "desiredStatus": status,
         "imageName": pod_request["imageName"],
-        "gpuTypeId": pod_request["gpuTypeIds"][0],
+        "machine": {
+            "gpuTypeId": pod_request["gpuTypeIds"][0],
+            "dataCenterId": pod_request["dataCenterIds"][0],
+        },
         "gpuCount": pod_request["gpuCount"],
-        "dataCenterId": pod_request["dataCenterIds"][0],
         "containerDiskInGb": pod_request["containerDiskInGb"],
-        "networkVolumeId": pod_request["networkVolumeId"],
+        "networkVolume": {"id": pod_request["networkVolumeId"]},
         "templateId": pod_request["templateId"],
         "ports": pod_request["ports"],
         "env": {**dict(template["env"]), "PUBLIC_KEY": PROVIDER_PUBLIC_KEY},
@@ -2763,47 +2768,9 @@ def test_observation_survives_a_pod_waiting_for_its_machine() -> None:
             )
 
 
-def test_observation_survives_a_resource_that_exposes_no_ports() -> None:
-    # runpod sends `ports: null` for a resource created without exposed ports rather than an
-    # empty list. observed live: a foreign pod in the account came back that way, `_ports` rejected
-    # null, and the whole listing collapsed into an opaque transport failure -- so flash could
-    # never see its own pods. an empty string was always accepted and means the same thing.
-    pod = parse_pods(
-        [
-            {
-                "id": "abc123def45680",
-                "name": "portless",
-                "desiredStatus": "RUNNING",
-                "imageName": "pytorch/pytorch:2.6.0",
-                "gpuCount": 1,
-                "containerDiskInGb": 60,
-                "ports": None,
-                "machine": {"gpuTypeId": "NVIDIA H200", "dataCenterId": "EUR-IS-4"},
-            }
-        ]
-    )
-    assert pod[0].ports == ()
-
-    template = parse_templates(
-        [
-            {
-                "id": "tpl0000009",
-                "name": "portless-template",
-                "imageName": "pytorch/pytorch:2.6.0",
-                "dockerStartCmd": ["sleep", "infinity"],
-                "containerDiskInGb": 60,
-                "volumeMountPath": "/workspace",
-                "ports": None,
-                "env": {},
-            }
-        ]
-    )
-    assert template[0].ports == ()
-
-    # absence must stay absence, not become a wildcard that lets any port shape through: a
-    # genuinely malformed value is still rejected, so this cannot mask a real schema change.
-    for malformed in (0, 12.5, {"8000": "http"}, True):
-        with pytest.raises(ValueError, match="pod ports must be a string or list"):
+def test_pod_observation_rejects_non_list_ports() -> None:
+    for malformed in (None, "", "8000/http", 0, 12.5, {"8000": "http"}, True):
+        with pytest.raises(ValueError, match="pod ports must be a list"):
             parse_pods(
                 [
                     {
@@ -2830,7 +2797,7 @@ def test_pod_observation_accepts_an_empty_environment_value() -> None:
                 "imageName": "pytorch/pytorch:2.6.0",
                 "gpuCount": 1,
                 "containerDiskInGb": 60,
-                "ports": "8000/http",
+                "ports": ["8000/http"],
                 "env": {"PUBLIC_KEY": "", "NORMAL_VAR": "populated"},
                 "machine": {"gpuTypeId": "NVIDIA H100", "dataCenterId": "US-KS-2"},
             }
@@ -2854,7 +2821,7 @@ def test_a_foreign_empty_env_pod_does_not_fail_the_account_observation() -> None
                 "imageName": "pytorch/pytorch:2.6.0",
                 "gpuCount": 1,
                 "containerDiskInGb": 60,
-                "ports": "8000/http",
+                "ports": ["8000/http"],
                 "env": {"PUBLIC_KEY": ""},
                 "machine": {"gpuTypeId": "NVIDIA H100", "dataCenterId": "US-KS-2"},
             },
@@ -2865,7 +2832,7 @@ def test_a_foreign_empty_env_pod_does_not_fail_the_account_observation() -> None
                 "imageName": "ghcr.io/x/y@sha256:" + "a" * 64,
                 "gpuCount": 1,
                 "containerDiskInGb": 60,
-                "ports": "8000/http",
+                "ports": ["8000/http"],
                 "env": {"REAL": "value"},
                 "machine": {"gpuTypeId": "NVIDIA H100", "dataCenterId": "US-KS-2"},
             },
@@ -2885,11 +2852,8 @@ def test_template_observation_preserves_opaque_environment_values() -> None:
                 "dockerStartCmd": ["sleep", "infinity"],
                 "containerDiskInGb": 60,
                 "volumeMountPath": "/workspace",
-                "ports": "8000/http",
-                "env": [
-                    {"key": "EMPTY", "value": ""},
-                    {"key": "PADDED", "value": "  keep exactly  "},
-                ],
+                "ports": ["8000/http"],
+                "env": {"EMPTY": "", "PADDED": "  keep exactly  "},
             }
         ]
     )
@@ -2908,7 +2872,7 @@ def test_environment_still_rejects_an_empty_key() -> None:
                     "imageName": "pytorch/pytorch:2.6.0",
                     "gpuCount": 1,
                     "containerDiskInGb": 60,
-                    "ports": "8000/http",
+                    "ports": ["8000/http"],
                     "env": {"": "value"},
                     "machine": {"gpuTypeId": "NVIDIA L4", "dataCenterId": "US-KS-2"},
                 }
@@ -2931,7 +2895,7 @@ def test_observation_survives_a_resource_that_sets_no_environment() -> None:
                 "imageName": "pytorch/pytorch:2.6.0",
                 "gpuCount": 1,
                 "containerDiskInGb": 60,
-                "ports": "8000/http",
+                "ports": ["8000/http"],
                 "env": None,
                 "machine": {"gpuTypeId": "NVIDIA H200", "dataCenterId": "EUR-IS-4"},
             }
@@ -2948,7 +2912,7 @@ def test_observation_survives_a_resource_that_sets_no_environment() -> None:
                 "dockerStartCmd": ["sleep", "infinity"],
                 "containerDiskInGb": 60,
                 "volumeMountPath": "/workspace",
-                "ports": "8000/http",
+                "ports": ["8000/http"],
                 "env": None,
             }
         ]
@@ -2957,8 +2921,8 @@ def test_observation_survives_a_resource_that_sets_no_environment() -> None:
 
     # absence must stay absence rather than becoming a wildcard that lets any env shape through: a
     # genuinely malformed value is still rejected, so this cannot mask a real schema change.
-    for malformed in (0, 12.5, "FOO=bar", True):
-        with pytest.raises(ValueError, match="template env must be an object or list"):
+    for malformed in (0, 12.5, "FOO=bar", [{"key": "FOO", "value": "bar"}], True):
+        with pytest.raises(ValueError, match="template env must be an object"):
             parse_pods(
                 [
                     {
@@ -2968,7 +2932,7 @@ def test_observation_survives_a_resource_that_sets_no_environment() -> None:
                         "imageName": "pytorch/pytorch:2.6.0",
                         "gpuCount": 1,
                         "containerDiskInGb": 60,
-                        "ports": "8000/http",
+                        "ports": ["8000/http"],
                         "env": malformed,
                         "machine": {"gpuTypeId": "NVIDIA L4", "dataCenterId": "US-KS-2"},
                     }
@@ -2998,7 +2962,7 @@ def test_template_observation_reads_argv_and_omitted_defaults() -> None:
     assert parsed[0].volume_gb == 0
     assert parsed[0].is_serverless is False
 
-    for broken in ([], "", 5, [""], ["ok", 3]):
+    for broken in ([], "", "bash -lc run.sh", 5, [""], ["ok", 3]):
         with pytest.raises(ValueError, match="dockerStartCmd"):
             parse_templates(
                 [
@@ -3014,6 +2978,70 @@ def test_template_observation_reads_argv_and_omitted_defaults() -> None:
                     }
                 ]
             )
+
+
+@pytest.mark.parametrize(
+    ("parser", "wrapped"),
+    [
+        (parse_templates, {"templates": []}),
+        (parse_volumes, {"networkVolumes": []}),
+        (parse_pods, {"pods": []}),
+    ],
+)
+def test_rest_collection_parsers_reject_object_wrappers(parser, wrapped) -> None:
+    with pytest.raises(ValueError, match="response must be a list"):
+        parser(wrapped)
+
+
+def test_pod_observation_ignores_flat_identity_fields() -> None:
+    pod = parse_pods(
+        [
+            {
+                "id": "abc123def45684",
+                "name": "flat-identity",
+                "desiredStatus": "RUNNING",
+                "imageName": "pytorch/pytorch:2.6.0",
+                "gpuTypeId": "NVIDIA L4",
+                "gpuCount": 1,
+                "dataCenterId": "US-KS-2",
+                "containerDiskInGb": 60,
+                "networkVolumeId": "vol0000001",
+                "ports": ["8000/http"],
+            }
+        ]
+    )[0]
+
+    assert pod.gpu_type_id is None
+    assert pod.data_center_id is None
+    assert pod.network_volume_id is None
+
+
+def test_malformed_rest_collection_is_classified_as_transport_failure() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    original = transport.rest
+
+    def wrapped_templates(method: str, path: str, payload, **kwargs):
+        response = original(method, path, payload, **kwargs)
+        if method == "GET" and path == "/templates":
+            return {"templates": response}
+        return response
+
+    transport.rest = wrapped_templates  # type: ignore[assignment]
+    clock = transport.clock
+    result = reconcile_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(True),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "transport_failed"
 
 
 def test_foreign_templates_are_filtered_before_strict_parsing() -> None:

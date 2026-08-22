@@ -187,43 +187,19 @@ def _nonnegative_int(value: object, name: str) -> int:
 
 
 def _ports(value: object, name: str) -> tuple[str, ...]:
-    """read runpod's ports field, which is absent for a resource that exposes none.
-
-    the api omits `ports` entirely (json null) rather than sending an empty list, and it does that
-    for resources flash did not create as well as its own. rejecting null failed the whole
-    observation pass on the first foreign port-less pod in the account, so flash could never see
-    its own pods -- the same failure `_docker_start_cmd` below already had to fix. an empty string
-    was always accepted here and means exactly this, so null maps to the same empty result.
-    """
-
-    if value is None:
-        raw: list[object] = []
-    elif type(value) is str:
-        raw = value.split(",") if value else []
-    elif type(value) is list:
-        raw = list(value)
-    else:
-        raise ValueError(f"{name} must be a string or list")
-    parsed = tuple(_string(item, name) for item in raw)
+    if type(value) is not list:
+        raise ValueError(f"{name} must be a list")
+    parsed = tuple(_string(item, name) for item in value)
     if len(parsed) != len(set(parsed)):
         raise ValueError(f"{name} contains duplicates")
     return parsed
 
 
 def _docker_start_cmd(value: object) -> str:
-    """read runpod's argv-shaped dockerStartCmd back as the joined command string.
+    """read runpod's argv-shaped dockerStartCmd back as the joined command string."""
 
-    the api types this as array<string> and returns it that way for every template in the
-    account, including ones flash did not create -- so demanding a string here failed the whole
-    observation pass on a foreign template and never reached our own. the joined form is what
-    `_runpod_resources` compares against LAUNCH_COMMAND. a plain string is still accepted because
-    runpod's graphql surface answers with one.
-    """
-
-    if type(value) is str:
-        return _string(value, "template dockerStartCmd")
     if type(value) is not list or not value:
-        raise ValueError("template dockerStartCmd must be a string or nonempty list of strings")
+        raise ValueError("template dockerStartCmd must be a nonempty list of strings")
     return " ".join(_string(part, "template dockerStartCmd entry") for part in value)
 
 
@@ -243,15 +219,9 @@ def _environment(value: object) -> tuple[tuple[str, str], ...]:
     # never owned it. no overrides is the same observation as an empty map.
     if value is None:
         return ()
-    if type(value) is dict:
-        items = list(value.items())
-    elif type(value) is list:
-        items = []
-        for entry in value:
-            row = _mapping(entry, "template env entry")
-            items.append((row.get("key"), row.get("value")))
-    else:
-        raise ValueError("template env must be an object or list")
+    if type(value) is not dict:
+        raise ValueError("template env must be an object")
+    items = list(value.items())
     parsed = tuple(sorted((_string(key, "env key"), _environment_value(val)) for key, val in items))
     if len(parsed) != len({key for key, _value in parsed}):
         raise ValueError("template env contains duplicate keys")
@@ -259,13 +229,9 @@ def _environment(value: object) -> tuple[tuple[str, str], ...]:
 
 
 def _resource_rows(value: object, key: str) -> list[object]:
-    if type(value) is list:
-        return value
-    root = _mapping(value, f"{key} response")
-    rows = root.get(key)
-    if type(rows) is not list:
-        raise ValueError(f"{key} response must contain a list")
-    return rows
+    if type(value) is not list:
+        raise ValueError(f"{key} response must be a list")
+    return value
 
 
 def parse_account_secrets(value: object) -> tuple[str, tuple[RunPodSecretObservation, ...]]:
@@ -409,10 +375,6 @@ def parse_pods(value: object, *, keep_name: str | None = None) -> tuple[RunPodPo
         name = _string(row.get("name"), "pod name")
         if keep_name is not None and name != keep_name:
             continue
-        # runpod's rest Pod schema carries no flat gpuTypeId / dataCenterId / networkVolumeId.
-        # they live in the nested `machine`, `gpu`, and `networkVolume` objects, which the api
-        # only returns when includeMachine / includeNetworkVolume are set. the flat keys are read
-        # first because runpod's graphql surface does return them at the top level.
         machine = row.get("machine") if type(row.get("machine")) is dict else {}
         gpu = row.get("gpu") if type(row.get("gpu")) is dict else {}
         volume = row.get("networkVolume") if type(row.get("networkVolume")) is dict else {}
@@ -420,9 +382,9 @@ def parse_pods(value: object, *, keep_name: str | None = None) -> tuple[RunPodPo
         # value": an empty string is falsy, so it would fall through to None and read as unplaced.
         # presence of the key is what distinguishes them, so absence stays absence and anything
         # actually sent is still validated.
-        gpu_type = _first_present((row, "gpuTypeId"), (machine, "gpuTypeId"), (gpu, "id"))
-        data_center = _first_present((row, "dataCenterId"), (machine, "dataCenterId"))
-        network_volume = row.get("networkVolumeId") or volume.get("id")
+        gpu_type = _first_present((machine, "gpuTypeId"), (gpu, "id"))
+        data_center = machine.get("dataCenterId")
+        network_volume = volume.get("id")
         parsed.append(
             RunPodPodObservation(
                 id=validate_runpod_pod_id(row.get("id")),
