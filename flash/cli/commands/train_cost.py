@@ -316,15 +316,14 @@ def _republish_advice(environment_id: str) -> str:
         )
     if not is_github_environment_ref(environment_id):
         return "Commit local dataset edits and update [environment] id before relying on them."
-    # the plane resolves this ref from the REMOTE repository, so a local commit is invisible to it
-    # until pushed. a pinned sha is immutable, though, and pushing moves nothing: that ref resolves
-    # to the same tree forever, so the only way to pick up an edit is to repin. the two cases need
-    # opposite instructions, and only the sha case is decidable from the id -- a tag and a branch
-    # are the same string shape, so both get the movable-ref wording.
+    # the plane loads this ref from the remote repository, so a local commit is invisible until
+    # pushed. a pinned sha must then be updated to that new commit because pushing alone cannot move
+    # the existing immutable pin. only the sha case is decidable from the id: tags and branches have
+    # the same string shape, so both get the movable-ref wording.
     if github_environment_ref_is_pinned(environment_id):
         return (
-            "This ref pins an immutable commit, so pushing will not change it; update "
-            "[environment] id to the new commit to pick up dataset edits."
+            "This ref pins an immutable commit. Push the new commit, then update [environment] id "
+            "to its SHA to pick up dataset edits; pushing alone cannot move the existing SHA pin."
         )
     return (
         "Push the commit to the remote ref this id resolves, then update [environment] id only "

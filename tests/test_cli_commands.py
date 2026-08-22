@@ -1448,12 +1448,8 @@ def test_a_github_ref_is_told_to_push_not_to_edit_its_id(monkeypatch, capsys) ->
     assert "only to pin a different ref" in err
 
 
-def test_a_pinned_sha_ref_is_told_to_repin_not_to_push(monkeypatch, capsys) -> None:
-    """A pinned commit is immutable, so "push the commit" is advice that cannot work.
-
-    That ref resolves to the same tree forever. Telling this user to push would have them publish
-    an edit and watch the next quote report the identical counts, with nothing to indicate why.
-    """
+def test_a_pinned_sha_ref_is_told_to_push_then_repin(monkeypatch, capsys) -> None:
+    """A new commit must exist remotely before the immutable pin can be updated to it."""
     from types import SimpleNamespace
 
     from flash.cli.commands import train_cost
@@ -1473,9 +1469,10 @@ def test_a_pinned_sha_ref_is_told_to_repin_not_to_push(monkeypatch, capsys) -> N
 
     err = capsys.readouterr().err
     assert "pins an immutable commit" in err
-    assert "update [environment] id to the new commit" in err
-    # the movable-ref instruction must not also appear: the two are contradictory.
-    assert "Push the commit" not in err
+    assert "Push the new commit, then update [environment] id to its SHA" in err
+    assert "pushing alone cannot move the existing SHA pin" in err
+    # the movable-ref instruction must not also appear: the two refs update differently.
+    assert "remote ref this id resolves" not in err
 
 
 def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypatch) -> None:
