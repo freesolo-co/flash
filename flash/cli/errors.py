@@ -100,18 +100,28 @@ def _friendly_message(message: str, context: _SuggestionContext) -> str:
     if suggestion in context.root_only:
         # a root flag only parses before the subcommand, so naming it alone hands back a correction
         # that fails the same way. say where it goes, or the second attempt is the first error again.
-        return (
-            f"unrecognized argument '{bad}' (did you mean '{suggestion}'? "
-            f"it goes before the command: `{CLI_NAME} {suggestion} <command>`)"
-        )
+        return f"unrecognized argument '{bad}' (did you mean '{suggestion}'? {_placement_hint(suggestion)})"
     return f"unrecognized argument '{bad}' (did you mean '{suggestion}'?)"
 
 
+def _placement_hint(flag: str) -> str:
+    """Say where a root flag belongs, and claim nothing about the rest of the line.
+
+    This hint knows one thing: the flag parses only ahead of the subcommand. It does not know what
+    removing the flag from where it sat exposes. `--wait` takes an optional value, so a flag lifted
+    from between `--wait` and a run id leaves the run id to be swallowed as the timeout -- which
+    `_wait_seconds` then catches and explains precisely. Stating the destination and stopping there
+    keeps this hint true for every line; the one case it cannot see already answers itself.
+
+    Both the repositioning message and the respelling-plus-repositioning message end in this same
+    advice, so they share it rather than each spelling it out and drifting apart.
+    """
+    return f"it goes before the command, as `{CLI_NAME} {flag} ...`"
+
+
 def _reposition_message(flag: str) -> str:
-    return (
-        f"unrecognized argument '{flag}' (it goes before the command: "
-        f"`{CLI_NAME} {flag} <command>`)"
-    )
+    """Answer a correctly spelled root flag that landed after the subcommand."""
+    return f"unrecognized argument '{flag}' ({_placement_hint(flag)})"
 
 
 def _suggestion_context(
@@ -194,23 +204,37 @@ def _option_tuples(parser: argparse.ArgumentParser, token: str) -> list:
     return parser._get_option_tuples(token)
 
 
+def _parse_optional_fields(
+    parser: argparse.ArgumentParser, token: str
+) -> tuple[object, str | None, str | None] | None:
+    """The action, option spelling and explicit remainder argparse reads out of a token.
+
+    `_parse_optional` has three shapes across the interpreters `requires-python` admits: a 3-tuple
+    before 3.11.9/3.12.3, a 4-tuple once a separator was inserted, and from 3.12.11 a LIST of those
+    tuples, one per prefix match. Normalizing here keeps that churn in one place, and keeps the
+    separator out of the caller: the exact-spelling reconstruction the caller does already settles
+    what the separator would have told it. An unfamiliar shape returns None rather than raising,
+    because this runs inside the handler whose whole job is to render someone else's error.
+    """
+    parsed = parser._parse_optional(token)
+    if isinstance(parsed, list):
+        # several prefix matches means the spelling is ambiguous, so it is not one repeated flag.
+        parsed = parsed[0] if len(parsed) == 1 else None
+    if not isinstance(parsed, tuple) or len(parsed) not in (3, 4):
+        return None
+    return parsed[0], parsed[1], parsed[-1]
+
+
 def _is_repeated_root_short_option(
     root: argparse.ArgumentParser, token: str, root_only: frozenset[str]
 ) -> bool:
     """Whether token is a compact repeat of a count-style root option, such as ``-vv``."""
     if not token.startswith("-") or token.startswith("--"):
         return False
-    parsed = root._parse_optional(token)
-    if parsed is None:
+    fields = _parse_optional_fields(root, token)
+    if fields is None:
         return False
-    # argparse widened this tuple from 3 to 4 in 3.11.9/3.12.3 by inserting a separator, and
-    # `requires-python` still admits the narrower interpreters. only the action, the option and the
-    # explicit remainder are common to both, and the separator adds nothing the exact-spelling
-    # check below does not already settle -- so read the three shared fields positionally and let
-    # the reconstruction decide. an unfamiliar arity is not worth raising from inside an error path.
-    if len(parsed) not in (3, 4):
-        return False
-    action, option, explicit = parsed[0], parsed[1], parsed[-1]
+    action, option, explicit = fields
     return (
         isinstance(action, argparse._CountAction)
         and option in root_only

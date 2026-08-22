@@ -535,7 +535,7 @@ def test_a_root_flag_suggestion_says_where_the_flag_goes(monkeypatch, capsys) ->
     err = capsys.readouterr().err
     assert "did you mean '--verbose'" in err
     assert "it goes before the command" in err
-    assert "flash --verbose <command>" in err
+    assert "flash --verbose ..." in err
 
 
 def test_a_subcommand_flag_suggestion_is_not_given_a_reposition_hint(monkeypatch, capsys) -> None:
@@ -595,7 +595,7 @@ def test_a_correctly_spelled_root_flag_is_repositioned_not_respelled(monkeypatch
     assert excinfo.value.code == 2
     err = capsys.readouterr().err
     assert "it goes before the command" in err
-    assert "flash --verbose <command>" in err
+    assert "flash --verbose ..." in err
     assert "--version" not in err
 
 
@@ -622,8 +622,8 @@ def test_repeated_short_root_flag_is_repositioned_without_downgrading(monkeypatc
     err = capsys.readouterr().err
     assert "unrecognized argument '-vv'" in err
     assert "it goes before the command" in err
-    assert "flash -vv <command>" in err
-    assert "flash -v <command>" not in err
+    assert "flash -vv ..." in err
+    assert "flash -v ..." not in err
 
 
 def test_flag_typo_after_option_terminator_has_no_unusable_suggestion(monkeypatch, capsys) -> None:
@@ -657,16 +657,20 @@ def test_a_lone_dash_reaches_argparses_own_message(monkeypatch, capsys) -> None:
     assert "-v" not in err
 
 
-@pytest.mark.parametrize("arity", [3, 4])
-def test_a_repeated_short_root_flag_is_recognized_under_both_parse_optional_shapes(
-    monkeypatch, arity
+@pytest.mark.parametrize("shape", ["tuple3", "tuple4", "list"])
+def test_a_repeated_short_root_flag_is_recognized_under_every_parse_optional_shape(
+    monkeypatch, shape
 ) -> None:
-    """`_parse_optional` returns 3 items before 3.11.9/3.12.3, and `requires-python` admits those.
+    """`_parse_optional` has three shapes across the interpreters `requires-python` admits.
 
-    Reading the separator positionally raised ValueError there, so the themed path crashed on
-    exactly the interpreters it was not developed on. The predicate is exercised directly rather
-    than through `cli.main`: argparse's own parse loop unpacks this tuple too, so narrowing it
-    parser-wide fails inside argparse and would prove nothing about our handling.
+    A 3-tuple before 3.11.9/3.12.3, a 4-tuple after the separator was inserted, and from 3.12.11
+    a LIST of those tuples. Each one has broken this predicate in a different way: the 4-tuple
+    unpack raised ValueError on the older interpreters, and the arity guard written for both
+    tuples silently rejected the list, which put `-vv` back on the path that downgrades it to `-v`.
+
+    The predicate is exercised directly rather than through `cli.main`, because argparse's own
+    parse loop reads this same value: reshaping it parser-wide fails inside argparse and would
+    prove nothing about our handling.
     """
     from flash.cli.errors import _is_repeated_root_short_option
 
@@ -674,14 +678,19 @@ def test_a_repeated_short_root_flag_is_recognized_under_both_parse_optional_shap
     root.add_argument("-v", action="count")
     original = root._parse_optional
 
-    def narrow(arg_string):
+    def reshaped(arg_string):
         parsed = original(arg_string)
-        # drop the separator argparse inserted at index 2 in the newer releases.
-        return (parsed[0], parsed[1], parsed[3]) if parsed and len(parsed) == 4 else parsed
+        if isinstance(parsed, list):  # normalize the interpreter's own shape away first
+            parsed = parsed[0] if len(parsed) == 1 else None
+        if parsed is None:
+            return None
+        if shape == "tuple3":  # drop the separator argparse inserted at index 2
+            return (parsed[0], parsed[1], parsed[3]) if len(parsed) == 4 else parsed
+        if shape == "list":
+            return [parsed]
+        return parsed
 
-    if arity == 3:
-        monkeypatch.setattr(root, "_parse_optional", narrow)
-    assert len(root._parse_optional("-vv")) == arity
+    monkeypatch.setattr(root, "_parse_optional", reshaped)
     assert _is_repeated_root_short_option(root, "-vv", frozenset({"-v"})) is True
     # a short flag that is not a repeat of itself must not be repositioned as one.
     assert _is_repeated_root_short_option(root, "-vx", frozenset({"-v"})) is False
