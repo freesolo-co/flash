@@ -46,6 +46,7 @@ def _add_serve_commands(sub: argparse._SubParsersAction) -> None:
     serve = sub.add_parser("serve", help="manage serving in your own provider account")
     serve_sub = serve.add_subparsers(dest="serve_cmd", required=True)
     _add_serve_deploy(serve_sub)
+    _add_serve_status(serve_sub)
     _add_serve_undeploy(serve_sub)
 
 
@@ -151,6 +152,19 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction) -> None:
     from flash.cli.commands.serve_deploy import cmd_serve_deploy
 
     deploy.set_defaults(func=cmd_serve_deploy)
+
+
+def _add_serve_status(serve_sub: argparse._SubParsersAction) -> None:
+    """`serve status`: read and prove one exact deployment without provider mutation."""
+
+    status = serve_sub.add_parser(
+        "status",
+        help="show the proved state of one deployment in your provider account",
+    )
+    _add_deployment_arguments(status)
+    from flash.cli.commands.serve_status import cmd_serve_status
+
+    status.set_defaults(func=cmd_serve_status)
 
 
 def _add_serve_undeploy(serve_sub: argparse._SubParsersAction) -> None:

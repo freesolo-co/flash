@@ -75,6 +75,22 @@ def _image(reference: str):
     return ServingImage(reference=reference, digest=digest)
 
 
+def _report_handle(handle, *, endpoint: bool = True) -> None:
+    """print only sanitized provider identity, never request credentials."""
+
+    if endpoint:
+        print(f"endpoint    {handle.public_url}")
+    if handle.provider == "modal":
+        print(f"app id      {handle.app_id}")
+        print(f"volume id   {handle.volume_id}")
+        print(f"secret id   {handle.inference_secret_id}")
+    else:
+        print(f"pod id      {handle.pod_id}")
+        print(f"volume id   {handle.network_volume_id}")
+        print(f"template id {handle.template_id}")
+        print(f"secret id   {handle.inference_secret_id}")
+
+
 def _report(result) -> int:
     print(f"deployment  {result.deployment_id} generation {result.generation}")
     print(f"provider    {result.provider}")
@@ -83,16 +99,7 @@ def _report(result) -> int:
     print(f"status      {result.status}")
     handle = result.handle
     if handle is not None:
-        print(f"endpoint    {handle.public_url}")
-        if handle.provider == "modal":
-            print(f"app id      {handle.app_id}")
-            print(f"volume id   {handle.volume_id}")
-            print(f"secret id   {handle.inference_secret_id}")
-        else:
-            print(f"pod id      {handle.pod_id}")
-            print(f"volume id   {handle.network_volume_id}")
-            print(f"template id {handle.template_id}")
-            print(f"secret id   {handle.inference_secret_id}")
+        _report_handle(handle)
     if result.status == "ready":
         return 0
     if result.error_code:
@@ -102,7 +109,8 @@ def _report(result) -> int:
         # retry that double-provisions and bills twice.
         print(
             "\nthe provider outcome could not be confirmed. resources may exist; run `flash serve "
-            "undeploy` to stop them billing before retrying rather than provisioning again.",
+            "status` to inspect them, then `flash serve undeploy` to stop them billing before "
+            "retrying rather than provisioning again.",
             file=sys.stderr,
         )
     return 1
@@ -119,6 +127,17 @@ def _build_provider_plan(provider: str, bundle) -> None:
     from flash.serve.provisioning._runpod_plan import build_runpod_create_plan
 
     build_runpod_create_plan(bundle)
+
+
+def _runtime_secrets():
+    """build request-scoped endpoint secrets from the environment."""
+
+    from flash.serve.provisioning import ServingRuntimeSecrets
+
+    return ServingRuntimeSecrets(
+        inference_token=_required_env(INFERENCE_KEY_ENV),
+        artifact_token=_optional_env(ARTIFACT_TOKEN_ENV),
+    )
 
 
 def _deployment_bundle(args):
@@ -177,8 +196,6 @@ def _deployment_bundle(args):
 
 
 def cmd_serve_deploy(args) -> int:
-    from flash.serve.provisioning import ServingRuntimeSecrets
-
     provider = args.provider
     try:
         bundle = _deployment_bundle(args)
@@ -214,10 +231,7 @@ def cmd_serve_deploy(args) -> int:
         # absence as "hydration cannot run": with a token it uses the two-phase bootstrap that
         # deploys with the secret, hydrates the volume, then redeploys without it and deletes the
         # secret, so the token never outlives hydration.
-        runtime_secrets = ServingRuntimeSecrets(
-            inference_token=_required_env(INFERENCE_KEY_ENV),
-            artifact_token=_optional_env(ARTIFACT_TOKEN_ENV),
-        )
+        runtime_secrets = _runtime_secrets()
     except ValueError as exc:
         return _err(
             f"{exc}. provider credentials are read from the environment for this one request "
@@ -266,7 +280,7 @@ def _warn_unconfirmed_cleanup(provider: str, deployment_id: str) -> None:
 
     print(
         f"\nwarning: interrupted before ready, and {provider} cleanup could not be confirmed for "
-        f"{deployment_id}. resources may still exist and bill; run `flash serve undeploy` before "
-        f"retrying rather than provisioning again.",
+        f"{deployment_id}. resources may still exist and bill; run `flash serve status` to inspect "
+        f"them, then `flash serve undeploy` before retrying rather than provisioning again.",
         file=sys.stderr,
     )
