@@ -287,21 +287,6 @@ jobs:
             sleep "$sleep_seconds"
           done
 
-      - name: Stop stale Modal canary apps
-        if: steps.gate.outputs.deploy == 'true' && matrix.app == 'serving'
-        working-directory: .
-        run: |
-          # Do not stop the live production app before `modal deploy`: Modal's deploy path keeps the
-          # previous version serving if a build/deploy fails. Only tear down known stale canary names
-          # that are no longer managed by this workflow.
-          # freesolo-deployment is the decommissioned legacy tinker app (removed from the deploy
-          # matrix in #526); include it so the orphaned live app is stopped and not left billing.
-          stale_app_names="freesolo-lora-serving-math9b freesolo-deployment"
-          for name in $stale_app_names; do
-            echo "Stopping stale Modal app '${name}', if present..."
-            modal app stop "$name" --yes || true
-          done
-
       - name: Deploy ${{ matrix.app }}
         if: steps.gate.outputs.deploy == 'true'
         env:
