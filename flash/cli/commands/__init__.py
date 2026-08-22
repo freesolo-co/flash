@@ -425,7 +425,7 @@ def cmd_train(args) -> int:
         else:
             print(json.dumps(status, indent=2))
         if spec.algorithm == "sft":
-            _print_published_sft_environment_note(status)
+            _print_published_sft_environment_note(status, spec)
         _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
         print_status_prompt_budget_warning(status)
         _print_reasoning_loss_warning(status)

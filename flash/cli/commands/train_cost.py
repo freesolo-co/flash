@@ -114,6 +114,17 @@ def _client_train_schema(authored_train_keys: frozenset[str]) -> dict:
     }
 
 
+def _has_inline_records(spec) -> bool:
+    """Whether this config supplied its SFT rows inline rather than from the resolved package.
+
+    One predicate for every surface that attributes the counts -- the cost rows and the provenance
+    note sit within a few lines of each other, so disagreeing about where the data came from would
+    print two contradictory answers in one quote.
+    """
+    params = getattr(getattr(spec, "environment", None), "params", None)
+    return isinstance(params, dict) and params.get("records") is not None
+
+
 def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
     """Rows describing the published packaged-dataset estimate behind an SFT quote.
 
@@ -142,12 +153,15 @@ def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
     environment_id = text("environment_id")
     environment_revision = text("environment_revision")
     digest = text("content_digest")
+    # inline `[environment.params] records` supply the rows from the request body, so the resolved
+    # package contributed the environment but not the dataset. labelling those counts "published
+    # copy" names a source they did not come from.
+    inline_records = _has_inline_records(spec)
+    origin = "inline records" if inline_records else "published copy"
     examples = None
     if retained is not None and selected is not None:
         examples = f"{retained:,} trained of {selected:,} selected from "
-        examples += (
-            f"{source:,} source rows in published copy" if source is not None else "published copy"
-        )
+        examples += f"{source:,} source rows in {origin}" if source is not None else origin
         if dropped:
             examples += f" ({dropped:,} dropped)"
     tokens = None
@@ -157,10 +171,20 @@ def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
             tokens += f", {supervised:,} supervised"
     return [
         ("run", f"{spec.model}  [SFT{f', {steps} steps' if steps is not None else ''}]"),
-        ("env", f"published environment {environment_id}" if environment_id else None),
+        (
+            "env",
+            (f"{'resolved' if inline_records else 'published'} environment {environment_id}")
+            if environment_id
+            else None,
+        ),
         (
             "revision",
-            f"{environment_revision[:12]} (published commit)" if environment_revision else None,
+            (
+                f"{environment_revision[:12]} "
+                f"({'resolved' if inline_records else 'published'} commit)"
+            )
+            if environment_revision
+            else None,
         ),
         ("workload", f"{packing} ({architecture})" if packing and architecture else None),
         ("examples", examples),
@@ -250,7 +274,11 @@ def _print_published_sft_environment_note(status: object, spec=None) -> None:
     if not isinstance(revision, str) or not revision.strip():
         return
 
-    from flash.envs.identity import is_github_environment_ref, is_managed_environment_slug
+    from flash.envs.identity import (
+        github_environment_ref_is_pinned,
+        is_github_environment_ref,
+        is_managed_environment_slug,
+    )
 
     source = profile.get("source_examples")
     source_suffix = (
@@ -260,8 +288,7 @@ def _print_published_sft_environment_note(status: object, spec=None) -> None:
     )
     environment_id = environment_id.strip()
     revision = revision.strip()
-    params = getattr(getattr(spec, "environment", None), "params", None)
-    if isinstance(params, dict) and params.get("records") is not None:
+    if _has_inline_records(spec):
         # the rows were submitted inline, so the resolved package supplied the environment but not
         # the dataset. naming the published copy as their source would be simply wrong.
         message = (
@@ -282,13 +309,20 @@ def _print_published_sft_environment_note(status: object, spec=None) -> None:
         )
     elif is_github_environment_ref(environment_id):
         # the plane resolves this ref from the REMOTE repository, so a local commit is invisible to
-        # it until pushed. for a branch ref the id does not change at all, which is why "update the
-        # id" was the wrong instruction: it is unnecessary here and, if taken as pinning a new sha,
-        # names a commit the remote does not have yet.
-        message += (
-            " Push the commit to the remote branch this ref resolves, then update [environment] id "
-            "only to pin a different ref."
-        )
+        # it until pushed. a pinned sha is immutable, though, and pushing moves nothing: that ref
+        # resolves to the same tree forever, so the only way to pick up an edit is to repin. the
+        # two cases need opposite instructions, and only the sha case is decidable from the id --
+        # a tag and a branch are the same string shape, so both get the movable-ref wording.
+        if github_environment_ref_is_pinned(environment_id):
+            message += (
+                " This ref pins an immutable commit, so pushing will not change it; update "
+                "[environment] id to the new commit to pick up dataset edits."
+            )
+        else:
+            message += (
+                " Push the commit to the remote ref this id resolves, then update [environment] id "
+                "only to pin a different ref."
+            )
     else:
         message += " Commit local dataset edits and update [environment] id before relying on them."
     print(render.note(message) if render.styled() else message, file=sys.stderr)

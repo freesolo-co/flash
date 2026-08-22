@@ -1351,6 +1351,47 @@ def test_train_dry_run_attributes_sft_counts_to_the_published_environment(
     assert "flash env push" in captured.err
 
 
+def test_train_dry_run_attributes_inline_records_to_the_config(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    """The dry run must reach the inline-records branch, not just the cost path.
+
+    Both call the same note, but only the cost path was passing `spec`. Without it the helper sees
+    no params, so a config whose rows came from its own body was told the counts came from the
+    published copy and to `env push` to change them -- fixing a file the counts never came from.
+    """
+    original_create_run = fake_client.create_run
+
+    def create_run_with_profile(*args, **kwargs):
+        response = original_create_run(*args, **kwargs)
+        response["workload_profile"] = {
+            "environment_id": "owner/project/env",
+            "environment_revision": "a" * 40,
+            "source_examples": 2,
+        }
+        return response
+
+    monkeypatch.setattr(fake_client, "create_run", create_run_with_profile)
+    config = tmp_path / "inline.toml"
+    config.write_text(
+        'model = "Qwen/Qwen3.5-4B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
+        'algorithm = "sft"\n'
+        '[environment]\nid = "owner/project/env"\n'
+        '[environment.params]\nrecords = [{ input = "a", output = "b" }]\n'
+        "[train]\nepochs = 1\nmax_examples = 2\n"
+    )
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+    err = capsys.readouterr().err
+
+    assert "inline [environment.params] records" in err
+    assert "not from the published environment's dataset files" in err
+    # the published wording and its remediation must be absent: they name the wrong source.
+    assert "come from this resolved published copy" not in err
+    assert "env push" not in err
+
+
 def test_inline_records_are_not_attributed_to_the_published_dataset(monkeypatch, capsys) -> None:
     """Inline `records` are read from the request body, not the resolved package.
 
@@ -1403,8 +1444,92 @@ def test_a_github_ref_is_told_to_push_not_to_edit_its_id(monkeypatch, capsys) ->
     )
 
     err = capsys.readouterr().err
-    assert "Push the commit to the remote branch this ref resolves" in err
+    assert "Push the commit to the remote ref this id resolves" in err
     assert "only to pin a different ref" in err
+
+
+def test_a_pinned_sha_ref_is_told_to_repin_not_to_push(monkeypatch, capsys) -> None:
+    """A pinned commit is immutable, so "push the commit" is advice that cannot work.
+
+    That ref resolves to the same tree forever. Telling this user to push would have them publish
+    an edit and watch the next quote report the identical counts, with nothing to indicate why.
+    """
+    from types import SimpleNamespace
+
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    status = {
+        "workload_profile": {
+            "environment_id": f"github:freesolo-co/envs@{'c' * 40}:gsm8k/environment.py",
+            "environment_revision": "c" * 40,
+            "source_examples": 12,
+        }
+    }
+
+    train_cost._print_published_sft_environment_note(
+        status, SimpleNamespace(environment=SimpleNamespace(params={}))
+    )
+
+    err = capsys.readouterr().err
+    assert "pins an immutable commit" in err
+    assert "update [environment] id to the new commit" in err
+    # the movable-ref instruction must not also appear: the two are contradictory.
+    assert "Push the commit" not in err
+
+
+def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypatch) -> None:
+    """The cost panel and the provenance note sit within a few lines of each other.
+
+    If only the note learns that the rows came from the request body, the panel above it still
+    reads "source rows in published copy" and the quote contradicts itself in one screen.
+    """
+    from types import SimpleNamespace
+
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    profile = {
+        "environment_id": "owner/project/env",
+        "environment_revision": "d" * 40,
+        "source_examples": 9,
+        "retained_examples": 8,
+        "selected_examples": 9,
+    }
+    spec = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        environment=SimpleNamespace(params={"records": [{"input": "x"}]}),
+    )
+
+    rows = dict(train_cost._sft_cost_rows(spec, profile))
+
+    assert "inline records" in rows["examples"]
+    assert "published copy" not in rows["examples"]
+    assert rows["env"] == "resolved environment owner/project/env"
+    assert "published" not in rows["revision"]
+
+
+def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
+    """The inline branch must not relabel an ordinary published quote."""
+    from types import SimpleNamespace
+
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    profile = {
+        "environment_id": "owner/project/env",
+        "environment_revision": "e" * 40,
+        "source_examples": 9,
+        "retained_examples": 8,
+        "selected_examples": 9,
+    }
+    spec = SimpleNamespace(model="Qwen/Qwen3.5-4B", environment=SimpleNamespace(params={}))
+
+    rows = dict(train_cost._sft_cost_rows(spec, profile))
+
+    assert "source rows in published copy" in rows["examples"]
+    assert rows["env"] == "published environment owner/project/env"
+    assert "(published commit)" in rows["revision"]
 
 
 def test_train_dry_run_sends_declared_runtime_secrets(
