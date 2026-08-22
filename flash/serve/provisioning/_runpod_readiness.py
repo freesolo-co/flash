@@ -24,7 +24,6 @@ from ._runpod_protocol import (
     RunPodObservation,
     RunPodPodObservation,
     RunPodSecretObservation,
-    RunPodTemplateObservation,
 )
 from ._runpod_resources import (
     RunPodResourceConflict,
@@ -234,28 +233,32 @@ def _await_stripped_resources(
     observe: Observe,
     template_id: str,
     pod_id: str,
-    is_stripped: Callable[[RunPodTemplateObservation, RunPodPodObservation], bool],
     *,
+    require_pod_running: bool,
     deadline_at: float,
     clock: Clock,
     sleep: Sleeper,
-) -> tuple[RunPodTemplateObservation, RunPodPodObservation] | None:
-    """wait until one cleanup transition is observed on the same template and pod."""
+) -> bool:
+    """wait until both artifact references are absent on the same template and pod."""
 
     while True:
         try:
             _secret, template, _volume, pod = exact_core_resources(plan, observe(plan))
         except (RunPodResourceConflict, RunPodTransportFailure):
-            return None
+            return False
         # a successful patch response is not proof that the next read still names the resources we
         # patched. deterministic names can be reused after replacement, so ids bind cleanup to the
         # exact template and pod whose artifact reference was present before the transition.
         if template.id != template_id or pod.id != pod_id:
-            return None
-        if is_stripped(template, pod):
-            return template, pod
+            return False
+        if (
+            template.environment == plan.environment_without_artifact
+            and _pod_environment_is_stripped(plan, pod)
+            and (not require_pod_running or readiness_state(pod.desired_status) == "running")
+        ):
+            return True
         if not sleep_until_poll(deadline_at, clock, sleep):
-            return None
+            return False
 
 
 def delete_artifact_and_confirm(
@@ -278,48 +281,29 @@ def delete_artifact_and_confirm(
         _secret, template, _volume, pod = exact_core_resources(plan, observe(plan))
     except (RunPodResourceConflict, RunPodTransportFailure):
         return unknown_result(plan, handle=handle)
-    if template.environment != plan.environment_without_artifact:
+    needs_template_patch = template.environment != plan.environment_without_artifact
+    needs_pod_patch = not _pod_environment_is_stripped(plan, pod)
+    if needs_template_patch or needs_pod_patch:
         try:
-            patch_template(template.id, plan.template_payload(False))
+            if needs_template_patch:
+                patch_template(template.id, plan.template_payload(False))
+            if needs_pod_patch:
+                # the payload carries only flash-authored entries. if runpod replaces rather than merges
+                # the map, provider-added values such as PUBLIC_KEY are dropped; the serving workload does
+                # not consume them. if runpod retains them, the subset check below deliberately allows it.
+                patch_pod(pod.id, plan.pod_environment_payload())
         except RunPodTransportFailure:
             return unknown_result(plan, handle=handle)
-        stripped = _await_stripped_resources(
+        if not _await_stripped_resources(
             plan,
             observe,
             template.id,
             pod.id,
-            lambda current_template, _pod: (
-                current_template.environment == plan.environment_without_artifact
-            ),
+            require_pod_running=needs_pod_patch,
             deadline_at=deadline_at,
             clock=clock,
             sleep=sleep,
-        )
-        if stripped is None:
-            return unknown_result(plan, handle=handle)
-        template, pod = stripped
-    if not _pod_environment_is_stripped(plan, pod):
-        try:
-            # the payload carries only flash-authored entries. if runpod replaces rather than merges
-            # the map, provider-added values such as PUBLIC_KEY are dropped; the serving workload does
-            # not consume them. if runpod retains them, the subset check below deliberately allows it.
-            patch_pod(pod.id, plan.pod_environment_payload())
-        except RunPodTransportFailure:
-            return unknown_result(plan, handle=handle)
-        stripped = _await_stripped_resources(
-            plan,
-            observe,
-            template.id,
-            pod.id,
-            lambda _template, current_pod: (
-                _pod_environment_is_stripped(plan, current_pod)
-                and readiness_state(current_pod.desired_status) == "running"
-            ),
-            deadline_at=deadline_at,
-            clock=clock,
-            sleep=sleep,
-        )
-        if stripped is None:
+        ):
             return unknown_result(plan, handle=handle)
     try:
         delete_secret(artifact.id)

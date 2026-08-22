@@ -1127,6 +1127,59 @@ def test_artifact_reference_is_absent_before_its_secret_is_deleted() -> None:
     )
 
 
+def test_artifact_secret_survives_if_template_reference_returns_during_pod_patch() -> None:
+    bundle = _bundle()
+    plan = build_runpod_create_plan(bundle)
+
+    class _TemplateRepatchedDuringPodPatchTransport(_FakeTransport):
+        def rest(
+            self,
+            method,
+            path,
+            payload,
+            *,
+            mutation: bool,
+            deadline_at: float,
+            query=None,
+        ):
+            response = super().rest(
+                method,
+                path,
+                payload,
+                mutation=mutation,
+                deadline_at=deadline_at,
+                query=query,
+            )
+            if method == "PATCH" and path == f"/pods/{POD_ID}":
+                # a concurrent deploy can adopt and repatch the deterministic template while this
+                # cleanup is waiting for its independent live-pod patch to become observable.
+                self.templates[0]["env"] = dict(plan.environment_with_artifact)
+            return response
+
+    transport = _TemplateRepatchedDuringPodPatchTransport()
+    _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=4.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(True),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert "FLASH_ARTIFACT_TOKEN" in transport.templates[0]["env"]
+    assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "PATCH /templates/template01",
+        f"PATCH /pods/{POD_ID}",
+    ]
+
+
 def test_artifact_secret_survives_until_the_template_patch_is_observed() -> None:
     bundle = _bundle()
 
@@ -1183,7 +1236,7 @@ def test_artifact_secret_survives_until_the_template_patch_is_observed() -> None
         [item["name"] for item in transport.secrets],
     ) == (
         "outcome_unknown",
-        ["PATCH /templates/template01"],
+        ["PATCH /templates/template01", f"PATCH /pods/{POD_ID}"],
         [_names(bundle).inference_secret, _names(bundle).artifact_secret],
     )
 
