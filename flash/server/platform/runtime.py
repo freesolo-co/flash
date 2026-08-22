@@ -428,9 +428,10 @@ def _deferred_resubmit_loop(spec) -> None:
 def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) -> str:
     """Return the newest worker artifact under a prefix.
 
-    Console uses one overwritten name; errors and raylogs use the highest attempt. Fall back when
-    listing fails, and derive attempt-scoped names from the writer's definition to prevent silent
-    reader/writer drift.
+    Attempt-scoped console and error artifacts use the highest uploaded attempt, which can still be
+    older than the live attempt while its replacement has not uploaded yet. Console falls back to its
+    canonical final name and errors to attempt 0 when listing fails; derive scoped names from the
+    writer's definition to prevent silent reader/writer drift.
     """
     import re
 

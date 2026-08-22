@@ -1132,6 +1132,7 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
         if attempt == 0:
             print("Traceback (most recent call last):\ntorch.OutOfMemoryError: CUDA OOM", file=log)
             return PollResult(False, failure="stalled", detail="infra")
+        print("worker: stage=rl_step attempt=1 step=1", file=log)
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
@@ -1146,6 +1147,9 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
     assert marker in text, "a retry must say which attempt the following bytes belong to"
     assert text.index("CUDA OOM") < text.index(marker), (
         "the marker must sit after the failure it disowns, or it cannot separate the two attempts"
+    )
+    assert text.index(marker) < text.index("worker: stage=rl_step attempt=1 step=1"), (
+        "the replacement attempt's heartbeat must follow the boundary that assigns its provenance"
     )
 
 
