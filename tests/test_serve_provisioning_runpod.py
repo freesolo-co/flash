@@ -1968,7 +1968,7 @@ def test_teardown_refuses_mismatched_exact_resource_before_deletion() -> None:
     bundle = _bundle()
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle)
-    transport.templates[0]["dockerStartCmd"] = "python -c bad"
+    transport.templates[0]["dockerStartCmd"] = ["python", "-c", "bad"]
     factory = _Factory(transport)
     clock = transport.clock
     transport.calls.clear()
