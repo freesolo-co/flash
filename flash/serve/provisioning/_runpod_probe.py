@@ -8,7 +8,7 @@ import urllib.request
 
 from ._common import DeploymentBundle
 from ._modal_probe import _provenance_matches as _modal_provenance_matches
-from ._runpod_transport import build_no_redirect_opener
+from ._runpod_transport import USER_AGENT, build_no_redirect_opener
 
 _MAX_PROBE_RESPONSE_BYTES = 2 * 1024 * 1024
 
@@ -35,6 +35,13 @@ class RunPodEndpointProbe:
             headers={
                 "Accept": "application/json",
                 "Authorization": f"Bearer {inference_token}",
+                # cloudflare fronts `*.proxy.runpod.net` and answers urllib's default
+                # "Python-urllib/x.y" agent with a 403 error 1010 (browser_signature_banned) while
+                # serving the identical request under any other agent. without this the probe can
+                # never succeed against a real pod: it burns the whole readiness deadline against a
+                # pod that is serving correctly and reports the deployment as outcome_unknown.
+                # shared with the lifecycle transport so the two clients cannot drift.
+                "User-Agent": USER_AGENT,
             },
             method="GET",
         )

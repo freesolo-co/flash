@@ -62,6 +62,7 @@ from tests.test_serve_app_manifest import _spec_and_inputs
 PROVIDER_SECRET = "provider-api-secret-sentinel"
 INFERENCE_SECRET = "inference-secret-sentinel"
 ARTIFACT_SECRET = "artifact-secret-sentinel"
+PROVIDER_PUBLIC_KEY = "ssh-rsa provider-managed"
 POD_ID = "abc123def4567"
 
 
@@ -299,7 +300,11 @@ class _FakeTransport:
         elif method == "PATCH":
             assert payload is not None
             resource, resource_id = path.strip("/").split("/", 1)
-            rows = self.templates if resource == "templates" else self.volumes
+            rows = {
+                "templates": self.templates,
+                "networkvolumes": self.volumes,
+                "pods": self.pods,
+            }[resource]
             response = None
             for index, row in enumerate(rows):
                 if row["id"] == resource_id:
@@ -359,7 +364,14 @@ class _FakeTransport:
             "/networkvolumes": self.volumes,
             "/pods": self.pods,
         }[path]
-        return [dict(item) for item in selected]
+        rows = [dict(item) for item in selected]
+        if path == "/pods":
+            # runpod adds PUBLIC_KEY to live pod observations even though flash never authored it.
+            # keeping that provider-owned entry on every read prevents the fake from teaching strict
+            # equality against a pod environment that can never equal the authored template map.
+            for row in rows:
+                row["env"] = {**dict(row.get("env", {})), "PUBLIC_KEY": PROVIDER_PUBLIC_KEY}
+        return rows
 
     def _create(self, path: str, payload: dict[str, object]) -> dict[str, object]:
         if path == "/networkvolumes":
@@ -371,6 +383,7 @@ class _FakeTransport:
             self.templates.append(created)
             return dict(created)
         if path == "/pods":
+            template = next(item for item in self.templates if item["id"] == payload["templateId"])
             created = {
                 "id": POD_ID,
                 "name": payload["name"],
@@ -383,6 +396,9 @@ class _FakeTransport:
                 "networkVolumeId": payload["networkVolumeId"],
                 "templateId": payload["templateId"],
                 "ports": payload["ports"],
+                # runpod copies the template environment into the pod at creation; later template
+                # patches do not mutate this independent live-pod copy.
+                "env": {**dict(template["env"]), "PUBLIC_KEY": PROVIDER_PUBLIC_KEY},
             }
             self.pods.append(created)
             response = dict(created)
@@ -435,6 +451,7 @@ def _seed_exact(
         "networkVolumeId": pod_request["networkVolumeId"],
         "templateId": pod_request["templateId"],
         "ports": pod_request["ports"],
+        "env": {**dict(template["env"]), "PUBLIC_KEY": PROVIDER_PUBLIC_KEY},
     }
     transport.volumes = [volume]
     transport.templates = [template]
@@ -590,6 +607,7 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
         f"{{{{ RUNPOD_SECRET_{names.inference_secret} }}}}"
     )
     assert "FLASH_ARTIFACT_TOKEN" not in template_env
+    assert "FLASH_ARTIFACT_TOKEN" not in transport.pods[0]["env"]
     assert transport.volumes[0]["dataCenterId"] == bundle.spec.placement.data_center_id
     assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
     assert not hasattr(result.handle, "artifact_secret_id")
@@ -604,6 +622,7 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
         ("rest", "POST /templates"),
         ("rest", "POST /pods"),
         ("rest", "PATCH /templates/template01"),
+        ("rest", f"PATCH /pods/{POD_ID}"),
         ("graphql", "secretDelete"),
     ]
 
@@ -892,9 +911,129 @@ def test_adoption_deletes_one_lingering_artifact_only_after_endpoint_proof() -> 
     assert probe.calls[0][1] is True
     assert [call[1] for call in _mutation_calls(transport)] == [
         "PATCH /templates/template01",
+        f"PATCH /pods/{POD_ID}",
         "secretDelete",
     ]
     assert [item["name"] for item in transport.secrets] == [_names(bundle).inference_secret]
+
+
+def test_artifact_cleanup_tolerates_provider_owned_pod_environment_entries() -> None:
+    bundle = _bundle()
+    plan = build_runpod_create_plan(bundle)
+    transport = _FakeTransport()
+    _seed_exact(transport, bundle, artifact_secret=True)
+    assert transport.pods[0]["env"]["PUBLIC_KEY"] == PROVIDER_PUBLIC_KEY
+    transport.calls.clear()
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "ready"
+    observed_environment = dict(parse_pods(transport._list("/pods"))[0].environment)
+    assert observed_environment["PUBLIC_KEY"] == PROVIDER_PUBLIC_KEY
+    assert "FLASH_ARTIFACT_TOKEN" not in observed_environment
+    assert all(
+        observed_environment[key] == value for key, value in plan.environment_without_artifact
+    )
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "PATCH /templates/template01",
+        f"PATCH /pods/{POD_ID}",
+        "secretDelete",
+    ]
+
+
+def test_artifact_cleanup_does_not_repatch_an_already_stripped_pod() -> None:
+    bundle = _bundle()
+    plan = build_runpod_create_plan(bundle)
+    transport = _FakeTransport()
+    _seed_exact(transport, bundle, artifact_secret=True)
+    transport.pods[0]["env"] = dict(plan.environment_without_artifact)
+    transport.calls.clear()
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "ready"
+    assert parse_pods(transport.pods)[0].environment == plan.environment_without_artifact
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "PATCH /templates/template01",
+        "secretDelete",
+    ]
+
+
+def test_artifact_pod_environment_patch_failure_is_outcome_unknown() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, artifact_secret=True)
+    transport.fail_mutation_at = 2
+    transport.failure_mode = "definite_before"
+    transport.calls.clear()
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "outcome_unknown"
+    assert result.handle == handle
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "PATCH /templates/template01",
+        f"PATCH /pods/{POD_ID}",
+    ]
+    assert [item["name"] for item in transport.secrets] == [
+        _names(bundle).inference_secret,
+        _names(bundle).artifact_secret,
+    ]
+
+
+def test_artifact_secret_survives_until_a_patched_pod_is_running_again() -> None:
+    bundle = _bundle()
+
+    class _RestartingPodAfterPatchTransport(_FakeTransport):
+        def rest(
+            self,
+            method,
+            path,
+            payload,
+            *,
+            mutation: bool,
+            deadline_at: float,
+            query=None,
+        ):
+            response = super().rest(
+                method,
+                path,
+                payload,
+                mutation=mutation,
+                deadline_at=deadline_at,
+                query=query,
+            )
+            if method == "PATCH" and path == f"/pods/{POD_ID}":
+                # runpod may restart a pod while applying its new specification. an updated env is
+                # not enough to reclaim the secret until the live workload is running again.
+                self.pods[0]["desiredStatus"] = "RESTARTING"
+            return response
+
+    transport = _RestartingPodAfterPatchTransport()
+    handle = _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=4.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(True),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert result.handle == handle
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "PATCH /templates/template01",
+        f"PATCH /pods/{POD_ID}",
+    ]
+    assert [item["name"] for item in transport.secrets] == [
+        _names(bundle).inference_secret,
+        _names(bundle).artifact_secret,
+    ]
 
 
 def test_artifact_reference_is_absent_before_its_secret_is_deleted() -> None:
@@ -904,12 +1043,16 @@ def test_artifact_reference_is_absent_before_its_secret_is_deleted() -> None:
     class _ObserveTemplateAtDeleteTransport(_FakeTransport):
         def __init__(self) -> None:
             super().__init__()
-            self.environment_at_delete: tuple[tuple[str, str], ...] | None = None
+            self.template_environment_at_delete: tuple[tuple[str, str], ...] | None = None
+            self.pod_environment_at_delete: tuple[tuple[str, str], ...] | None = None
             self.pending_template: dict[str, object] | None = None
 
         def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
             if mutation and "secretDelete" in document:
-                self.environment_at_delete = tuple(sorted(self.templates[0]["env"].items()))
+                self.template_environment_at_delete = tuple(
+                    sorted(self.templates[0]["env"].items())
+                )
+                self.pod_environment_at_delete = tuple(sorted(self.pods[0]["env"].items()))
             return super().graphql(
                 document,
                 variables,
@@ -973,12 +1116,14 @@ def test_artifact_reference_is_absent_before_its_secret_is_deleted() -> None:
 
     assert (
         result.status,
-        transport.environment_at_delete,
+        transport.template_environment_at_delete,
+        transport.pod_environment_at_delete,
         mutations,
     ) == (
         "ready",
         plan.environment_without_artifact,
-        ["PATCH /templates/template02", "secretDelete"],
+        plan.environment_without_artifact,
+        ["PATCH /templates/template02", f"PATCH /pods/{POD_ID}", "secretDelete"],
     )
 
 
@@ -1039,6 +1184,70 @@ def test_artifact_secret_survives_until_the_template_patch_is_observed() -> None
     ) == (
         "outcome_unknown",
         ["PATCH /templates/template01"],
+        [_names(bundle).inference_secret, _names(bundle).artifact_secret],
+    )
+
+
+def test_artifact_secret_survives_until_the_pod_patch_is_observed() -> None:
+    bundle = _bundle()
+
+    class _IgnoredPodPatchTransport(_FakeTransport):
+        def rest(
+            self,
+            method,
+            path,
+            payload,
+            *,
+            mutation: bool,
+            deadline_at: float,
+            query=None,
+        ):
+            if method == "PATCH" and path == f"/pods/{POD_ID}":
+                original = dict(self.pods[0])
+                response = super().rest(
+                    method,
+                    path,
+                    payload,
+                    mutation=mutation,
+                    deadline_at=deadline_at,
+                    query=query,
+                )
+                # runpod may accept an update before its next observation reflects the new pod
+                # specification. deleting the secret on the patch response alone leaves a live pod
+                # carrying a reference to a secret that no longer exists when that update is lost.
+                self.pods[0] = original
+                return response
+            return super().rest(
+                method,
+                path,
+                payload,
+                mutation=mutation,
+                deadline_at=deadline_at,
+                query=query,
+            )
+
+    transport = _IgnoredPodPatchTransport()
+    _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=4.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(True),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert (
+        result.status,
+        [call[1] for call in _mutation_calls(transport)],
+        [item["name"] for item in transport.secrets],
+    ) == (
+        "outcome_unknown",
+        ["PATCH /templates/template01", f"PATCH /pods/{POD_ID}"],
         [_names(bundle).inference_secret, _names(bundle).artifact_secret],
     )
 
@@ -1149,6 +1358,52 @@ def test_production_probe_rejects_redirect_without_second_request() -> None:
     assert probe(handle.public_url, INFERENCE_SECRET, bundle, 3.0) is False
     assert observed == [{"url": handle.public_url + "/v1/models", "auth_ok": True}]
     assert "attacker.invalid" not in repr(observed)
+
+
+def test_production_probe_sends_a_non_default_user_agent() -> None:
+    """cloudflare fronts the runpod pod proxy and 403s urllib's default agent.
+
+    verified against a live pod: the same authenticated GET returned 403 error 1010
+    (browser_signature_banned) under "Python-urllib/3.11" and 200 under any other agent. the probe
+    maps that 403 to `False`, so without an explicit agent readiness never converges -- a pod that
+    is serving correctly burns the whole deadline and the deployment reports `outcome_unknown`.
+    """
+
+    from flash.serve.provisioning._modal_probe import _expected_models
+
+    bundle = _bundle()
+    handle = _seed_exact(_FakeTransport(), bundle)
+    observed: list[str | None] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            # the exact payload a correctly serving pod returns, derived from the same expectation
+            # the probe checks -- so this asserts on the agent rather than on a provenance mismatch.
+            return json.dumps(
+                {
+                    "data": [
+                        {"id": model_id, "flash_provenance": provenance}
+                        for model_id, provenance in _expected_models(bundle).items()
+                    ]
+                }
+            ).encode()
+
+    def opener(request, *, timeout: float):
+        observed.append(request.get_header("User-agent"))
+        return Response()
+
+    probe = RunPodEndpointProbe(opener=opener)
+    assert probe(handle.public_url, INFERENCE_SECRET, bundle, 3.0) is True
+    assert observed == [USER_AGENT]
+    assert not any((agent or "").startswith("Python-urllib") for agent in observed)
 
 
 def test_artifact_secret_duplicates_are_conflict_without_cleanup() -> None:
@@ -1760,6 +2015,7 @@ def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> No
                 "gpuCount": 1,
                 "containerDiskInGb": 60,
                 "ports": ["8000/http"],
+                "env": {"B": "2", "A": "1"},
                 "templateId": "tpl0000001",
                 "machine": {"gpuTypeId": "NVIDIA L4", "dataCenterId": "US-KS-2"},
                 "networkVolume": {"id": "vol0000001"},
@@ -1769,6 +2025,7 @@ def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> No
     assert nested[0].gpu_type_id == "NVIDIA L4"
     assert nested[0].data_center_id == "US-KS-2"
     assert nested[0].network_volume_id == "vol0000001"
+    assert nested[0].environment == (("A", "1"), ("B", "2"))
 
     # a pod with no volume and no template is a real state for pods flash did not create. every
     # pod in the account is parsed, so rejecting those aborts observation before reaching ours.
@@ -1789,6 +2046,7 @@ def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> No
     )
     assert bare[0].network_volume_id is None
     assert bare[0].template_id is None
+    assert bare[0].environment == ()
 
 
 def test_a_pod_awaiting_placement_is_still_recognized_as_ours() -> None:
