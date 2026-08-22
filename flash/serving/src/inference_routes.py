@@ -11,6 +11,7 @@ import asyncio
 import re
 import time
 import uuid
+from collections.abc import Awaitable
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -47,12 +48,15 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     caller_org = await context.authorize_inference(request, payload.adapter_id)
     requested, target = await context.lookup.resolve(payload.adapter_id)
     await _prepare_generate_request(payload, target)
-    result = await context.generate(
-        payload,
-        requested,
-        target,
-        expected_checkpoint=_expected_checkpoint(request),
-        caller_org=caller_org,
+    result = await _await_until_disconnect(
+        request,
+        context.generate(
+            payload,
+            requested,
+            target,
+            expected_checkpoint=_expected_checkpoint(request),
+            caller_org=caller_org,
+        ),
     )
     return _inference_json_response(result, target)
 
@@ -68,12 +72,15 @@ async def generate_for_adapter(
     caller_org = await context.authorize_inference(request, req.adapter_id)
     requested, target = await context.lookup.resolve(req.adapter_id)
     await _prepare_generate_request(req, target)
-    result = await context.generate(
-        req,
-        requested,
-        target,
-        expected_checkpoint=_expected_checkpoint(request),
-        caller_org=caller_org,
+    result = await _await_until_disconnect(
+        request,
+        context.generate(
+            req,
+            requested,
+            target,
+            expected_checkpoint=_expected_checkpoint(request),
+            caller_org=caller_org,
+        ),
     )
     return _inference_json_response(result, target)
 
@@ -131,12 +138,15 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
             caller_org=caller_org,
         )
 
-    generation = await context.generate(
-        req,
-        requested,
-        target,
-        expected_checkpoint=_expected_checkpoint(request),
-        caller_org=caller_org,
+    generation = await _await_until_disconnect(
+        request,
+        context.generate(
+            req,
+            requested,
+            target,
+            expected_checkpoint=_expected_checkpoint(request),
+            caller_org=caller_org,
+        ),
     )
     # already attested in `generate_once`, before usage was metered; this only strips the field
     # off the body so it does not leak into the OpenAI-shaped response.
@@ -154,6 +164,22 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     if target.is_revision:
         response_headers["X-Freesolo-LoRA-Request-Adapter"] = lora_request_adapter
     return JSONResponse(response, headers=response_headers)
+
+
+async def _await_until_disconnect(request: Request, awaitable: Awaitable[Any]) -> Any:
+    operation = asyncio.ensure_future(awaitable)
+    disconnect = asyncio.create_task(_wait_for_disconnect(request))
+    try:
+        done, _ = await asyncio.wait({operation, disconnect}, return_when=asyncio.FIRST_COMPLETED)
+        if disconnect in done:
+            disconnect.result()
+            raise asyncio.CancelledError
+        return operation.result()
+    finally:
+        disconnect.cancel()
+        if not operation.done():
+            operation.cancel()
+        await asyncio.gather(operation, disconnect, return_exceptions=True)
 
 
 async def _wait_for_disconnect(request: Request) -> None:

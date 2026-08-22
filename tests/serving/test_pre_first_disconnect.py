@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from fastapi import Request
 
+from flash.serving.src import inference_routes
 from flash.serving.src.inference_routes import _discard_prepared_stream, _stream_chat_completion
 from flash.serving.src.routing import AdapterRouter
 from flash.serving.src.schemas import AdapterRecord, GenerateRequest
@@ -49,6 +50,73 @@ def _request(receive) -> Request:
         },
         receive,
     )
+
+
+@pytest.mark.parametrize("route", ["generate", "generate_for_adapter", "chat_completions"])
+def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) -> None:
+    async def scenario() -> tuple[bool, bool]:
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+        messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        record = _record()
+
+        class Lookup:
+            async def resolve(self, _adapter_id: str):
+                return record, record
+
+        class Context:
+            lookup = Lookup()
+
+            async def authorize_inference(self, *_args):
+                return "org-1"
+
+            async def generate(self, *_args, **_kwargs):
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+        async def receive():
+            return await messages.get()
+
+        context = Context()
+        monkeypatch.setattr(
+            inference_routes.ServingContext,
+            "of",
+            staticmethod(lambda _request: context),
+        )
+        request = _request(receive)
+        if route == "generate":
+            awaitable = inference_routes.generate(
+                GenerateRequest(adapter_id=record.adapter_id, prompt="hi"), request
+            )
+        elif route == "generate_for_adapter":
+            awaitable = inference_routes.generate_for_adapter(
+                record.adapter_id, {"prompt": "hi"}, request
+            )
+        else:
+            awaitable = inference_routes.chat_completions(
+                {
+                    "model": record.adapter_id,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                request,
+            )
+        task = asyncio.create_task(awaitable)
+        await entered.wait()
+        await messages.put({"type": "http.disconnect"})
+        done, _ = await asyncio.wait({task}, timeout=0.2)
+        cancelled_before_cleanup = cancelled.is_set()
+        if not done:
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return bool(done), cancelled_before_cleanup
+
+    completed, generation_cancelled = asyncio.run(scenario())
+    assert completed, "the handler kept generating after the peer disconnected"
+    assert generation_cancelled, "the handler returned without cancelling generation"
 
 
 class _Context:
