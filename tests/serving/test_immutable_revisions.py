@@ -86,6 +86,10 @@ class MemoryPersistence:
         self.concurrent_disable_once: set[str] = set()
         self.concurrent_redeploy_once: dict[str, str] = {}
         self.get_failure_ids: set[str] = set()
+        # `_get_stored` re-raises PersistenceRecordError but maps every *other* storage failure to
+        # a 503. a fake that only ever raises the former cannot reach the handlers that recover
+        # that 503, so a transport-level outage is modelled separately.
+        self.get_transport_failure_ids: set[str] = set()
         self.replace_failure_ids: set[str] = set()
         self._clock = itertools.count(1)
 
@@ -103,6 +107,8 @@ class MemoryPersistence:
     def get(self, adapter_id: str, _settings: object) -> AdapterRecord | None:
         if adapter_id in self.get_failure_ids:
             raise PersistenceRecordError("storage unavailable")
+        if adapter_id in self.get_transport_failure_ids:
+            raise OSError("connection reset by peer")
         return self.rows.get(adapter_id)
 
     def insert(self, record: AdapterRecord, _settings: object) -> AdapterRecord:
@@ -798,7 +804,16 @@ def test_delete_repeated_cas_miss_returns_conflict(setup) -> None:
     assert pool.unregistered == []
 
 
-@pytest.mark.parametrize("failure_path", ["missing_timestamp", "cas_loser", "cas_write"])
+@pytest.mark.parametrize(
+    "failure_path",
+    [
+        "missing_timestamp",
+        "missing_timestamp_transport",
+        "cas_loser",
+        "cas_loser_transport",
+        "cas_write",
+    ],
+)
 def test_delete_storage_failure_tears_down_rows_that_already_converged(
     setup, failure_path: str
 ) -> None:
@@ -811,11 +826,20 @@ def test_delete_storage_failure_tears_down_rows_that_already_converged(
         ).status_code
         == 200
     )
-    if failure_path == "missing_timestamp":
-        persistence.get_failure_ids.add(REVISION_A)
+    if failure_path.startswith("missing_timestamp"):
+        # a cached row with no timestamp cannot be compare-and-swapped, so the cascade re-reads it
+        # first. that read is one of the two that can fail.
+        if failure_path.endswith("_transport"):
+            persistence.get_transport_failure_ids.add(REVISION_A)
+        else:
+            persistence.get_failure_ids.add(REVISION_A)
         router.upsert(persistence.rows[REVISION_A].model_copy(update={"updated_at": None}))
-    elif failure_path == "cas_loser":
-        persistence.get_failure_ids.add(REVISION_A)
+    elif failure_path.startswith("cas_loser"):
+        # the row loses its compare-and-swap and the retry's re-read is what hits the outage.
+        if failure_path.endswith("_transport"):
+            persistence.get_transport_failure_ids.add(REVISION_A)
+        else:
+            persistence.get_failure_ids.add(REVISION_A)
         persistence.force_replace_miss_ids.add(REVISION_A)
     else:
         # the outage hits the compare-and-swap write itself rather than a read around it. that
