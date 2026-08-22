@@ -233,13 +233,16 @@ def _await_stripped_resources(
     observe: Observe,
     template_id: str,
     pod_id: str,
+    handle: RunPodProviderHandle,
+    inference_token: str,
     *,
-    require_pod_running: bool,
+    require_endpoint_probe: bool,
     deadline_at: float,
+    probe: EndpointProbe,
     clock: Clock,
     sleep: Sleeper,
 ) -> bool:
-    """wait until both artifact references are absent on the same template and pod."""
+    """wait until both artifact references are absent and a restarted pod serves again."""
 
     while True:
         try:
@@ -251,10 +254,23 @@ def _await_stripped_resources(
         # exact template and pod whose artifact reference was present before the transition.
         if template.id != template_id or pod.id != pod_id:
             return False
-        if (
+        resources_are_stripped = (
             template.environment == plan.environment_without_artifact
             and _pod_environment_is_stripped(plan, pod)
-            and (not require_pod_running or readiness_state(pod.desired_status) == "running")
+        )
+        if resources_are_stripped and (
+            not require_endpoint_probe
+            or (
+                readiness_state(pod.desired_status) == "running"
+                and probe_with_deadline(
+                    probe,
+                    handle,
+                    inference_token,
+                    plan,
+                    deadline_at=deadline_at,
+                    clock=clock,
+                )
+            )
         ):
             return True
         if not sleep_until_poll(deadline_at, clock, sleep):
@@ -269,8 +285,10 @@ def delete_artifact_and_confirm(
     delete_secret: DeleteSecret,
     artifact: RunPodSecretObservation,
     handle: RunPodProviderHandle,
+    inference_token: str,
     *,
     deadline_at: float,
+    probe: EndpointProbe,
     clock: Clock,
     sleep: Sleeper,
 ) -> DeploymentResult:
@@ -294,13 +312,19 @@ def delete_artifact_and_confirm(
                 patch_pod(pod.id, plan.pod_environment_payload())
         except RunPodTransportFailure:
             return unknown_result(plan, handle=handle)
+        # the endpoint probe authenticates with the inference token, not the artifact token. prove
+        # the restarted workload before deleting the artifact secret so an unproven transition
+        # remains recoverable, while the stripped references prevent the restarted pod using it.
         if not _await_stripped_resources(
             plan,
             observe,
             template.id,
             pod.id,
-            require_pod_running=needs_pod_patch,
+            handle,
+            inference_token,
+            require_endpoint_probe=needs_pod_patch,
             deadline_at=deadline_at,
+            probe=probe,
             clock=clock,
             sleep=sleep,
         ):
@@ -383,7 +407,9 @@ def await_ready_and_reclaim(
         delete_secret,
         artifact,
         ready.handle,
+        inference_token,
         deadline_at=deadline_at,
+        probe=probe,
         clock=clock,
         sleep=sleep,
     )

@@ -184,6 +184,25 @@ class _Probe:
         return self.accepted
 
 
+class _SequenceProbe(_Probe):
+    def __init__(self, *accepted: bool) -> None:
+        if not accepted:
+            raise ValueError("at least one result is required")
+        super().__init__()
+        self.accepted_results = accepted
+
+    def __call__(
+        self,
+        url: str,
+        token: str,
+        bundle: DeploymentBundle,
+        timeout_seconds: float,
+    ) -> bool:
+        super().__call__(url, token, bundle, timeout_seconds)
+        index = min(len(self.calls) - 1, len(self.accepted_results) - 1)
+        return self.accepted_results[index]
+
+
 class _Factory:
     def __init__(self, transport: _FakeTransport) -> None:
         self.transport = transport
@@ -594,7 +613,10 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
     assert result.handle.image_digest == bundle.image.digest
     assert result.handle.account_id == bundle.spec.placement.account_id
     assert factory.accepted_keys == [True]
-    assert probe.calls == [(result.handle.public_url, True, bundle, 30.0)]
+    assert probe.calls == [
+        (result.handle.public_url, True, bundle, 30.0),
+        (result.handle.public_url, True, bundle, 30.0),
+    ]
     assert transport.pods[0]["ports"] == [PROXY_PORT_SPEC]
     assert transport.pods[0]["imageName"] == bundle.image.reference
     assert transport.templates[0]["imageName"] == bundle.image.reference
@@ -641,7 +663,7 @@ def test_secret_sentinels_are_confined_to_exact_request_sinks() -> None:
         for secret in (PROVIDER_SECRET, INFERENCE_SECRET, ARTIFACT_SECRET)
     )
     assert factory.accepted_keys == [True]
-    assert [call[1] for call in probe.calls] == [True]
+    assert [call[1] for call in probe.calls] == [True, True]
 
     secret_mutations = [
         payload
@@ -1074,6 +1096,130 @@ def test_artifact_secret_survives_until_a_patched_pod_is_running_again() -> None
         _names(bundle).inference_secret,
         _names(bundle).artifact_secret,
     ]
+
+
+def test_patched_running_pod_is_not_ready_until_its_endpoint_serves_again() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, artifact_secret=True)
+    probe = _SequenceProbe(True, False)
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=2.0,
+        transport_factory=_Factory(transport),
+        probe=probe,
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert transport.pods[0]["desiredStatus"] == "RUNNING"
+    assert result.status == "outcome_unknown", (
+        "desiredStatus RUNNING was accepted without post-restart endpoint proof"
+    )
+    assert result.handle == handle
+    assert len(probe.calls) == 2, "the endpoint was not re-probed after the pod patch"
+    assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
+
+
+def test_patched_pod_is_ready_after_its_endpoint_serves_again() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, artifact_secret=True)
+    probe = _SequenceProbe(True, True)
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=4.0,
+        transport_factory=_Factory(transport),
+        probe=probe,
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert result.status == "ready"
+    assert result.handle == handle
+    assert len(probe.calls) == 2, "the restarted pod was not proven through the endpoint"
+    assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
+
+
+def test_post_restart_probe_stops_at_the_deadline_when_endpoint_never_serves() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, artifact_secret=True)
+    probe = _SequenceProbe(True, False)
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=5.0,
+        transport_factory=_Factory(transport),
+        probe=probe,
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert result.handle == handle
+    assert transport.clock.now == 5.0, "the post-restart wait exceeded its deadline"
+    assert len(probe.calls) == 4, "the bounded poll count changed or the wait did not terminate"
+    assert all(call[3] <= 5.0 - index * 2.0 for index, call in enumerate(probe.calls[1:]))
+    assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
+
+
+def test_post_restart_probe_uses_the_established_user_agent() -> None:
+    from flash.serve.provisioning._modal_probe import _expected_models
+
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, artifact_secret=True)
+    observed: list[str | None] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return json.dumps(
+                {
+                    "data": [
+                        {"id": model_id, "flash_provenance": provenance}
+                        for model_id, provenance in _expected_models(bundle).items()
+                    ]
+                }
+            ).encode()
+
+    def opener(request, *, timeout: float):
+        observed.append(request.get_header("User-agent"))
+        return Response()
+
+    result = provision_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=4.0,
+        transport_factory=_Factory(transport),
+        probe=RunPodEndpointProbe(opener=opener),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert result.status == "ready"
+    assert result.handle == handle
+    assert observed == [USER_AGENT, USER_AGENT], (
+        "the post-restart proof did not reuse the established RunPod endpoint probe"
+    )
+    assert not any((agent or "").startswith("Python-urllib") for agent in observed)
 
 
 def test_artifact_reference_is_absent_before_its_secret_is_deleted() -> None:
