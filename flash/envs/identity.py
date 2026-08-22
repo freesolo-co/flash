@@ -258,12 +258,10 @@ def is_commit_sha(value: str) -> bool:
 
 
 def github_environment_ref_is_pinned(value: str) -> bool:
-    """True when a ``github:`` environment id names an immutable commit rather than a movable ref.
+    """True when a ``github:`` environment id names an immutable commit.
 
-    Callers advise users how to publish a dataset edit, and the two cases need different advice:
-    a branch or tag picks the edit up once pushed, while a pinned sha requires pushing the new
-    commit and then repointing the id. Only the sha case is decidable from the id -- a tag and a
-    branch share one string shape -- so anything else is reported as movable.
+    Only the SHA case is decidable from the id. Branches and tags share one string shape, so callers
+    must give symbolic-ref advice that is valid for either rather than assuming the ref is movable.
     """
     parsed = _parse_github_environment_ref(value)
     return parsed is not None and is_commit_sha(parsed.ref)

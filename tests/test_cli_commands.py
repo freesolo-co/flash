@@ -1322,7 +1322,7 @@ def test_train_dry_run_keeps_compatibility_on_stderr(
     assert call[1]["train"] == {"epochs": 1, "max_examples": 2}
 
 
-def test_train_dry_run_attributes_sft_counts_to_the_published_environment(
+def test_train_dry_run_attributes_sft_counts_to_the_managed_environment(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:
     original_create_run = fake_client.create_run
@@ -1348,18 +1348,14 @@ def test_train_dry_run_attributes_sft_counts_to_the_published_environment(
         "published environment: owner/project/env @ aaaaaaaaaaaa (125 source rows)" in captured.err
     )
     assert "dataset counts come from this resolved published copy, not local files" in captured.err
-    assert "flash env push" in captured.err
+    assert "If you expected local dataset edits to be included" in captured.err
+    assert "run `flash env push` again for this managed environment" in captured.err
 
 
-def test_train_dry_run_attributes_inline_records_to_the_config(
+def test_train_dry_run_keeps_inline_records_off_the_published_environment_note(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:
-    """The dry run must reach the inline-records branch, not just the cost path.
-
-    Both call the same note, but only the cost path was passing `spec`. Without it the helper sees
-    no params, so a config whose rows came from its own body was told the counts came from the
-    published copy and to `env push` to change them -- fixing a file the counts never came from.
-    """
+    """inline rows are already authoritative, so the published-copy warning does not apply."""
     original_create_run = fake_client.create_run
 
     def create_run_with_profile(*args, **kwargs):
@@ -1383,96 +1379,13 @@ def test_train_dry_run_attributes_inline_records_to_the_config(
     )
 
     assert _run(["train", str(config), "--dry-run"]) == 0
-    err = capsys.readouterr().err
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
 
-    assert "inline [environment.params] records" in err
-    assert "not from the published environment's dataset files" in err
-    # the published wording and its remediation must be absent: they name the wrong source.
-    assert "come from this resolved published copy" not in err
-    assert "env push" not in err
-
-
-def test_inline_records_are_not_attributed_to_the_published_dataset(monkeypatch, capsys) -> None:
-    """Inline `records` are read from the request body, not the resolved package.
-
-    Reporting them as the published copy's counts sends the user to publish dataset files that had
-    no part in producing the numbers they are looking at.
-    """
-    from types import SimpleNamespace
-
-    from flash.cli.commands import train_cost
-
-    monkeypatch.setenv("FLASH_STYLE", "0")
-    status = {
-        "workload_profile": {
-            "environment_id": "owner/project/env",
-            "environment_revision": "a" * 40,
-            "source_examples": 3,
-        }
-    }
-    spec = SimpleNamespace(environment=SimpleNamespace(params={"records": [{"input": "x"}]}))
-
-    train_cost._print_published_sft_environment_note(status, spec)
-
-    err = capsys.readouterr().err
-    assert "inline [environment.params] records" in err
-    assert "not from the published environment's dataset files" in err
-    assert "env push" not in err
-
-
-def test_a_github_ref_is_told_to_push_not_to_edit_its_id(monkeypatch, capsys) -> None:
-    """The plane resolves a `github:` ref from the REMOTE, so a local commit is invisible until pushed.
-
-    For a branch ref the id does not change at all, so "update [environment] id" was both
-    unnecessary and, read as pinning a new sha, a commit the remote does not yet have.
-    """
-    from types import SimpleNamespace
-
-    from flash.cli.commands import train_cost
-
-    monkeypatch.setenv("FLASH_STYLE", "0")
-    status = {
-        "workload_profile": {
-            "environment_id": "github:freesolo-co/envs@main:gsm8k/environment.py",
-            "environment_revision": "b" * 40,
-            "source_examples": 12,
-        }
-    }
-
-    train_cost._print_published_sft_environment_note(
-        status, SimpleNamespace(environment=SimpleNamespace(params={}))
-    )
-
-    err = capsys.readouterr().err
-    assert "Push the commit to the remote ref this id resolves" in err
-    assert "only to pin a different ref" in err
-
-
-def test_a_pinned_sha_ref_is_told_to_push_then_repin(monkeypatch, capsys) -> None:
-    """A new commit must exist remotely before the immutable pin can be updated to it."""
-    from types import SimpleNamespace
-
-    from flash.cli.commands import train_cost
-
-    monkeypatch.setenv("FLASH_STYLE", "0")
-    status = {
-        "workload_profile": {
-            "environment_id": f"github:freesolo-co/envs@{'c' * 40}:gsm8k/environment.py",
-            "environment_revision": "c" * 40,
-            "source_examples": 12,
-        }
-    }
-
-    train_cost._print_published_sft_environment_note(
-        status, SimpleNamespace(environment=SimpleNamespace(params={}))
-    )
-
-    err = capsys.readouterr().err
-    assert "pins an immutable commit" in err
-    assert "Push the new commit, then update [environment] id to its SHA" in err
-    assert "pushing alone cannot move the existing SHA pin" in err
-    # the movable-ref instruction must not also appear: the two refs update differently.
-    assert "remote ref this id resolves" not in err
+    assert payload["workload_profile"]["source_examples"] == 2
+    assert "published environment:" not in captured.err
+    assert "SFT dataset counts come from" not in captured.err
+    assert "env push" not in captured.err
 
 
 def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypatch) -> None:

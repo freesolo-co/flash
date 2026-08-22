@@ -250,16 +250,10 @@ def _print_reasoning_loss_warning(status: object) -> None:
 
 
 def _print_published_sft_environment_note(status: object, spec) -> None:
-    """Attribute SFT preview counts to whatever actually produced them.
+    """Warn when SFT counts came from a published managed or GitHub environment."""
+    if _has_inline_records(spec):
+        return
 
-    Which is not always the published package: inline `[environment.params] records` are read from
-    the request body instead, and telling that user to publish local files would send them to fix
-    something the counts never came from.
-
-    `spec` is required rather than defaulted. It was optional first, and the dry-run call site
-    simply omitted it -- so the inline branch was unreachable there while every test passed, and
-    the wrong attribution printed for months of quotes. A missing argument now fails loudly.
-    """
     profile = status.get("workload_profile") if isinstance(status, dict) else None
     if not isinstance(profile, dict):
         return
@@ -270,64 +264,46 @@ def _print_published_sft_environment_note(status: object, spec) -> None:
     if not isinstance(revision, str) or not revision.strip():
         return
 
+    environment_id = environment_id.strip()
+    advice = _republish_advice(environment_id)
+    if advice is None:
+        return
+
     source = profile.get("source_examples")
     source_suffix = (
         f" ({source:,} source rows)"
         if isinstance(source, int) and not isinstance(source, bool)
         else ""
     )
-    environment_id = environment_id.strip()
-    revision = revision.strip()
-    if _has_inline_records(spec):
-        # the rows were submitted inline, so the resolved package supplied the environment but not
-        # the dataset. naming the published copy as their source would be simply wrong.
-        message = (
-            f"environment: {environment_id} @ {revision[:12]}{source_suffix}. SFT dataset counts "
-            "come from the inline [environment.params] records in this config, not from the "
-            "published environment's dataset files."
-        )
-        print(render.note(message) if render.styled() else message, file=sys.stderr)
-        return
     message = (
-        f"published environment: {environment_id} @ {revision[:12]}{source_suffix}. "
-        "SFT dataset counts come from this resolved published copy, not local files."
-        f" {_republish_advice(environment_id)}"
+        f"published environment: {environment_id} @ {revision.strip()[:12]}{source_suffix}. "
+        "SFT dataset counts come from this resolved published copy, not local files. "
+        f"{advice}"
     )
     print(render.note(message) if render.styled() else message, file=sys.stderr)
 
 
-def _republish_advice(environment_id: str) -> str:
-    """How to make a local dataset edit visible to the next quote, for this kind of id.
-
-    Each id kind resolves its published copy differently, so the step that republishes one does
-    nothing for another. Advice the user follows and sees no change is worse than none, since the
-    counts look confirmed rather than stale.
-    """
+def _republish_advice(environment_id: str) -> str | None:
+    """Return conditional remediation for a managed or GitHub environment id."""
     from flash.envs.identity import (
         github_environment_ref_is_pinned,
         is_github_environment_ref,
         is_managed_environment_slug,
     )
 
+    prefix = "If you expected local dataset edits to be included, "
     if is_managed_environment_slug(environment_id):
-        return (
-            f"For this managed id, that copy is the last successful `{_commands().CLI_NAME} env "
-            "push`; push again after local dataset edits."
-        )
+        return f"{prefix}run `{_commands().CLI_NAME} env push` again for this managed environment."
     if not is_github_environment_ref(environment_id):
-        return "Commit local dataset edits and update [environment] id before relying on them."
-    # the plane loads this ref from the remote repository, so a local commit is invisible until
-    # pushed. a pinned sha must then be updated to that new commit because pushing alone cannot move
-    # the existing immutable pin. only the sha case is decidable from the id: tags and branches have
-    # the same string shape, so both get the movable-ref wording.
+        return None
     if github_environment_ref_is_pinned(environment_id):
         return (
-            "This ref pins an immutable commit. Push the new commit, then update [environment] id "
-            "to its SHA to pick up dataset edits; pushing alone cannot move the existing SHA pin."
+            f"{prefix}publish the new commit, then update [environment] id to the full new commit "
+            "SHA; the existing immutable SHA cannot move."
         )
     return (
-        "Push the commit to the remote ref this id resolves, then update [environment] id only "
-        "to pin a different ref."
+        f"{prefix}make the named remote branch or tag point at the new commit. A tag may instead "
+        "need a new tag and an updated [environment] id rather than moving the existing tag."
     )
 
 

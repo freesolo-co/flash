@@ -474,6 +474,54 @@ def test_sft_cost_asks_the_server_for_the_quote_without_creating_a_training_run(
     assert not any(key.startswith("workload_profile") for key in call["spec"])
 
 
+@pytest.mark.parametrize(
+    ("environment_id", "expected", "absent"),
+    [
+        (
+            "github:freesolo-co/envs@main:gsm8k/environment.py",
+            "make the named remote branch or tag point at the new commit",
+            "full new commit SHA",
+        ),
+        (
+            "github:freesolo-co/envs@v1.2.3:gsm8k/environment.py",
+            "A tag may instead need a new tag and an updated [environment] id",
+            "full new commit SHA",
+        ),
+        (
+            f"github:freesolo-co/envs@{'c' * 40}:gsm8k/environment.py",
+            "publish the new commit, then update [environment] id to the full new commit SHA",
+            "named remote branch or tag",
+        ),
+    ],
+    ids=("branch", "tag", "sha"),
+)
+def test_github_republish_advice_covers_branch_tag_and_sha(environment_id, expected, absent):
+    from flash.cli.commands import train_cost
+
+    advice = train_cost._republish_advice(environment_id)
+
+    assert expected in advice
+    assert absent not in advice
+
+
+def test_published_environment_note_ignores_unknown_environment_ids(monkeypatch, capsys):
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    train_cost._print_published_sft_environment_note(
+        {
+            "workload_profile": {
+                "environment_id": "local-environment",
+                "environment_revision": "a" * 40,
+                "source_examples": 10,
+            }
+        },
+        types.SimpleNamespace(environment=types.SimpleNamespace(params={})),
+    )
+
+    assert capsys.readouterr().err == ""
+
+
 def test_sft_cost_reports_the_dataset_estimate_and_no_invented_hardware(
     tmp_path, monkeypatch, capsys
 ):
