@@ -32,6 +32,7 @@ from flash.serve.provisioning._runpod_probe import RunPodEndpointProbe, _provena
 from flash.serve.provisioning._runpod_protocol import (
     CREATE_SECRET,
     DELETE_SECRET,
+    OBSERVE_ACCOUNT,
     PROXY_PORT_SPEC,
     parse_deleted_secret,
     parse_pods,
@@ -52,6 +53,7 @@ from flash.serve.provisioning._runpod_transport import (
     build_no_redirect_opener,
 )
 from flash.serve.provisioning.runpod import (
+    RunPodDataCenterUnsupported,
     _delete_tolerating_ambiguity,
     _observe,
     _work_deadline,
@@ -247,6 +249,7 @@ class _FakeTransport:
     def __init__(self, account_id: str = "account-01") -> None:
         self.clock = _Clock()
         self.account_id = account_id
+        self.storage_support_by_data_center = {"US-KS-2": True}
         self.secrets: list[dict[str, object]] = []
         self.templates: list[dict[str, object]] = []
         self.volumes: list[dict[str, object]] = []
@@ -292,10 +295,16 @@ class _FakeTransport:
         if not mutation:
             return {
                 "data": {
+                    "dataCenters": [
+                        {"id": data_center_id, "storageSupport": storage_support}
+                        for data_center_id, storage_support in sorted(
+                            self.storage_support_by_data_center.items()
+                        )
+                    ],
                     "myself": {
                         "id": self.account_id,
                         "secrets": [dict(item) for item in self.secrets],
-                    }
+                    },
                 }
             }
         self._begin_mutation()
@@ -936,6 +945,63 @@ def test_pod_creation_constrains_the_host_cuda_version() -> None:
     planned = json.loads(build_runpod_create_plan(_bundle()).pod_static_json)
 
     assert planned["allowedCudaVersions"] == ["13.0"]
+
+
+def test_unsupported_storage_data_center_is_rejected_before_every_mutation() -> None:
+    assert "storageSupport" in OBSERVE_ACCOUNT
+    assert "gpuAvailability" not in OBSERVE_ACCOUNT
+    bundle = _bundle()
+    transport = _FakeTransport()
+    transport.storage_support_by_data_center = {
+        "EU-NL-1": True,
+        "US-KS-2": False,
+        "US-TX-3": True,
+    }
+
+    with pytest.raises(RunPodDataCenterUnsupported) as exc_info:
+        _provision(bundle, transport)
+
+    failure = exc_info.value
+    assert failure.code == "provider_rejected"
+    assert failure.outcome_unknown is False
+    assert failure.data_center_id == "US-KS-2"
+    assert failure.storage_data_center_ids == ("EU-NL-1", "US-TX-3")
+    assert str(failure) == (
+        "runpod data center US-KS-2 does not support network volumes. "
+        "valid data centers: EU-NL-1, US-TX-3"
+    )
+    assert transport.mutation_count == 0
+    assert _mutation_calls(transport) == []
+    assert transport.calls
+    assert all(mutation is False for _kind, _operation, mutation, _payload in transport.calls)
+
+
+def test_supported_storage_data_center_proceeds_to_creation() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    transport.fail_mutation_at = 1
+    transport.failure_mode = "definite_before"
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "failed"
+    assert result.error_code == "provider_rejected"
+    assert transport.mutation_count == 1
+    assert [call[1] for call in _mutation_calls(transport)] == ["secretCreate"]
+
+
+def test_existing_generation_in_unsupported_storage_data_center_is_adopted() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    expected_handle = _seed_exact(transport, bundle)
+    transport.storage_support_by_data_center = {"US-KS-2": False, "US-TX-3": True}
+    transport.calls.clear()
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "ready"
+    assert result.handle == expected_handle
+    assert _mutation_calls(transport) == []
 
 
 def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:

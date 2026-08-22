@@ -153,6 +153,37 @@ def test_deploy_routes_to_the_named_provider(monkeypatch: pytest.MonkeyPatch) ->
     assert calls == ["modal", "runpod"]
 
 
+def test_runpod_storage_precondition_message_reaches_the_user(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from flash.serve.provisioning.runpod import RunPodDataCenterUnsupported
+
+    def _reject(*_args, **_kwargs):
+        raise RunPodDataCenterUnsupported("US-TX-4", ("EU-NL-1", "US-TX-3"))
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setattr("flash.serve.provisioning.runpod.provision_runpod_deployment", _reject)
+
+    assert (
+        cmd_serve_deploy(
+            _args(
+                provider="runpod",
+                modal_workspace="",
+                modal_environment="",
+                runpod_account="account",
+                runpod_data_center="US-TX-4",
+            )
+        )
+        == 1
+    )
+    assert capsys.readouterr().err == (
+        "error: runpod data center US-TX-4 does not support network volumes. "
+        "valid data centers: EU-NL-1, US-TX-3\n"
+    )
+
+
 def test_dry_run_contacts_no_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     def _explode(*_args, **_kwargs):
         raise AssertionError("a dry run must not reach the provider")

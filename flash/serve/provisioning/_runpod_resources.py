@@ -125,6 +125,7 @@ def merge_resource_observations(
 
     return RunPodObservation(
         account_id=current.account_id,
+        storage_data_center_ids=current.storage_data_center_ids,
         inference_secrets=merged(previous.inference_secrets, current.inference_secrets),
         artifact_secrets=merged(previous.artifact_secrets, current.artifact_secrets),
         templates=merged(previous.templates, current.templates),

@@ -36,13 +36,13 @@ from ._runpod_probe import RunPodEndpointProbe
 from ._runpod_protocol import (
     CREATE_SECRET,
     DELETE_SECRET,
-    LIST_ACCOUNT_SECRETS,
+    OBSERVE_ACCOUNT,
     RunPodObservation,
     RunPodPodObservation,
     RunPodSecretObservation,
     RunPodTemplateObservation,
     RunPodVolumeObservation,
-    parse_account_secrets,
+    parse_account_observation,
     parse_created_pod,
     parse_created_secret,
     parse_created_template,
@@ -89,6 +89,23 @@ _DEFAULT_ENDPOINT_PROBE = RunPodEndpointProbe()
 _CLEANUP_RESERVE_SECONDS = 30.0
 
 
+class RunPodDataCenterUnsupported(ValueError):
+    """actionable structural precondition failure derived from runpod's data center catalog."""
+
+    __slots__ = ("code", "data_center_id", "outcome_unknown", "storage_data_center_ids")
+
+    def __init__(self, data_center_id: str, storage_data_center_ids: tuple[str, ...]) -> None:
+        self.code = "provider_rejected"
+        self.outcome_unknown = False
+        self.data_center_id = data_center_id
+        self.storage_data_center_ids = storage_data_center_ids
+        valid = ", ".join(storage_data_center_ids) or "none reported by RunPod"
+        super().__init__(
+            f"runpod data center {data_center_id} does not support network volumes. "
+            f"valid data centers: {valid}"
+        )
+
+
 def _work_deadline(deadline_at: float, clock: Clock) -> float:
     """the deadline for every phase of a create that can leave a resource behind.
 
@@ -118,14 +135,14 @@ def _observe(
     *,
     deadline_at: float,
 ) -> RunPodObservation:
-    account_id, secrets = read_call(
+    account_id, secrets, storage_data_center_ids = read_call(
         lambda: transport.graphql(
-            LIST_ACCOUNT_SECRETS,
+            OBSERVE_ACCOUNT,
             {},
             mutation=False,
             deadline_at=deadline_at,
         ),
-        parse_account_secrets,
+        parse_account_observation,
     )
     templates = read_call(
         lambda: transport.rest("GET", "/templates", None, mutation=False, deadline_at=deadline_at),
@@ -157,6 +174,7 @@ def _observe(
     )
     assert type(account_id) is str
     assert type(secrets) is tuple
+    assert type(storage_data_center_ids) is tuple
     assert type(templates) is tuple
     assert type(volumes) is tuple
     assert type(pods) is tuple
@@ -164,6 +182,7 @@ def _observe(
         raise RunPodTransportFailure("authentication_failed")
     return RunPodObservation(
         account_id=account_id,
+        storage_data_center_ids=storage_data_center_ids,
         inference_secrets=tuple(
             item for item in secrets if item.name == plan.names.inference_secret
         ),
@@ -177,6 +196,17 @@ def _observe(
 def _from_transport_failure(exc: RunPodTransportFailure) -> LifecycleFailure:
     reason = "mutation_outcome_unknown" if exc.outcome_unknown else None
     return LifecycleFailure(exc.code, exc.outcome_unknown, reason)
+
+
+def _require_storage_data_center(
+    plan: RunPodCreatePlan,
+    observation: RunPodObservation,
+) -> None:
+    if plan.placement.data_center_id not in observation.storage_data_center_ids:
+        raise RunPodDataCenterUnsupported(
+            plan.placement.data_center_id,
+            observation.storage_data_center_ids,
+        )
 
 
 def _bind_observe(transport: RunPodTransport, *, deadline_at: float) -> Observe:
@@ -607,9 +637,19 @@ def provision_runpod_deployment(
 
     try:
         transport = open_transport(transport_factory, credentials)
+        observation = _observe(plan, transport, deadline_at=deadline_at)
+        first_observation = True
+
+        def observe(plan: RunPodCreatePlan) -> RunPodObservation:
+            nonlocal first_observation
+            if first_observation:
+                first_observation = False
+                return observation
+            return _observe(plan, transport, deadline_at=deadline_at)
+
         adopted = adopt_existing_generation(
             plan,
-            _bind_observe(transport, deadline_at=deadline_at),
+            observe,
             _bind_patch_template(transport, deadline_at=deadline_at),
             _bind_patch_pod(transport, deadline_at=deadline_at),
             _bind_delete_secret(transport, deadline_at=deadline_at),
@@ -621,6 +661,7 @@ def provision_runpod_deployment(
         )
         if adopted is not None:
             return adopted
+        _require_storage_data_center(plan, observation)
         # from here on this call owns resources, so every phase stops short of the caller's
         # deadline to leave the teardown below a live one.
         work_deadline_at = _work_deadline(deadline_at, clock)

@@ -308,11 +308,17 @@ def cmd_serve_deploy(args) -> int:
                 bundle, credentials, runtime_secrets, deadline_at=deadline_at
             )
         else:
-            from flash.serve.provisioning.runpod import provision_runpod_deployment
-
-            result = provision_runpod_deployment(
-                bundle, credentials, runtime_secrets, deadline_at=deadline_at
+            from flash.serve.provisioning.runpod import (
+                RunPodDataCenterUnsupported,
+                provision_runpod_deployment,
             )
+
+            try:
+                result = provision_runpod_deployment(
+                    bundle, credentials, runtime_secrets, deadline_at=deadline_at
+                )
+            except RunPodDataCenterUnsupported as exc:
+                return _err(str(exc))
     except InterruptedProvisioning as interrupted:
         # the interrupt still propagates -- the user pressed Ctrl-C and the exit code must say so.
         # but the generic handler prints only "aborted", which reads as "nothing was created",

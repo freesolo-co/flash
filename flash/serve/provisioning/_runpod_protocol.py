@@ -27,8 +27,12 @@ ALLOWED_CUDA_VERSIONS = ("13.0",)
 
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,127}")
 
-LIST_ACCOUNT_SECRETS = """
-query FlashServingAccountSecrets {
+OBSERVE_ACCOUNT = """
+query FlashServingAccount {
+  dataCenters {
+    id
+    storageSupport
+  }
   myself {
     id
     secrets {
@@ -121,6 +125,7 @@ class RunPodObservation:
     """one authoritative account-scoped view of deterministic resources."""
 
     account_id: str
+    storage_data_center_ids: tuple[str, ...]
     inference_secrets: tuple[RunPodSecretObservation, ...]
     artifact_secrets: tuple[RunPodSecretObservation, ...]
     templates: tuple[RunPodTemplateObservation, ...]
@@ -225,7 +230,9 @@ def _resource_rows(value: object, key: str) -> list[object]:
     return value
 
 
-def parse_account_secrets(value: object) -> tuple[str, tuple[RunPodSecretObservation, ...]]:
+def parse_account_observation(
+    value: object,
+) -> tuple[str, tuple[RunPodSecretObservation, ...], tuple[str, ...]]:
     root = _mapping(value, "graphql response")
     if "errors" in root:
         raise ValueError("graphql response contains errors")
@@ -244,7 +251,20 @@ def parse_account_secrets(value: object) -> tuple[str, tuple[RunPodSecretObserva
                 name=_string(row.get("name"), "secret name"),
             )
         )
-    return account_id, tuple(secrets)
+    storage_data_centers = []
+    seen_data_centers = set()
+    for entry in _resource_rows(data.get("dataCenters"), "dataCenters"):
+        row = _mapping(entry, "data center")
+        data_center_id = _provider_id(row.get("id"), "data center id")
+        if data_center_id in seen_data_centers:
+            raise ValueError("dataCenters response contains duplicate ids")
+        seen_data_centers.add(data_center_id)
+        storage_support = row.get("storageSupport")
+        if type(storage_support) is not bool:
+            raise ValueError("data center storageSupport must be a boolean")
+        if storage_support:
+            storage_data_centers.append(data_center_id)
+    return account_id, tuple(secrets), tuple(sorted(storage_data_centers))
 
 
 def parse_created_secret(value: object) -> RunPodSecretObservation:
