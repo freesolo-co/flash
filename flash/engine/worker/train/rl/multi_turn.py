@@ -239,6 +239,11 @@ class MultiTurnBridge:
         # per-run turn totals, published through `turn_accounting`. guarded by the same lock as
         # every other mutable bridge state.
         self._scored_episodes = 0
+        # counted from the parent's own `next_turn`, NOT from the child's `turn_count`. these
+        # counters exist to prove the child's turn loop really iterated, so deriving them from a
+        # number the child reports about itself would make a child that collapsed to one turn
+        # report whatever it liked -- the one failure they are here to catch. `step` validates
+        # every ordinal against `next_turn` before incrementing it, so the parent's count is exact.
         self._scored_turns = 0
         self._max_observed_turns = 0
         self._sessions: dict[str, dict] = {}
@@ -581,9 +586,18 @@ class MultiTurnBridge:
             # one /score call per terminal episode, so this counts episodes exactly once. recorded
             # in `score` rather than in `step` because a truncated turn returns terminal without
             # ever reaching the env, and it is still a turn the model generated and trained on.
+            #
+            # `next_turn`, not the payload's `turn_count`: they are different quantities on purpose.
+            # `turn_count` is the SCOREABLE turn total the child derives from `turn_spans`, which
+            # deliberately omits an unusable turn because the env never saw it and returns no reward
+            # for it -- that is the scoring contract and it stays as it is. the counters here want
+            # the GENERATED total, which is what the sentence above says they mean, and taking it
+            # from the parent's own validated ordinal also stops the child from self-reporting the
+            # very number that would expose it collapsing to one turn per episode.
+            generated_turns = int(session["next_turn"])
             self._scored_episodes += 1
-            self._scored_turns += turn_count
-            self._max_observed_turns = max(self._max_observed_turns, turn_count)
+            self._scored_turns += generated_turns
+            self._max_observed_turns = max(self._max_observed_turns, generated_turns)
             # snapshot under the same lock that guards the session: `step` mutates this list in
             # place, and a concurrent episode's turn would otherwise be read mid-append.
             prompt = list(state.get("prompt") or ())

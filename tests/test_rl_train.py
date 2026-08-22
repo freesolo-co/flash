@@ -8881,6 +8881,86 @@ def test_single_turn_episode_is_reported_as_one_turn():
     assert accounting["mean_turns_per_episode"] == 1.0
 
 
+def test_turn_accounting_ignores_a_child_reported_turn_count():
+    """The counters must come from the parent's ordinal, not from the child's self-report.
+
+    These exist to prove the child's turn loop really iterated: a collapse to one turn per episode
+    keeps every other gate green. Deriving them from `turn_count` in the child's own `/score`
+    payload let the subject of the measurement supply the measurement -- a child that generated one
+    turn could claim five and the accounting would agree. `step` validates every ordinal against
+    `next_turn` before incrementing it, so the parent already knows the answer exactly.
+
+    The payload here claims 5 turns for an episode the parent watched generate 2.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(done_after=2),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=5,
+        prompt_ids=[[1]],
+        tokenizer=_BridgeGlueTokenizer(),
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        _post(
+            "/multiturn/start",
+            {
+                "index": 0,
+                "session_id": "s",
+                "raw_prompt": [{"role": "user", "content": "a"}],
+                "prompt_ids": [1],
+                "image_count": 0,
+                "image_digests": [],
+            },
+        ).close()
+        prefix = [1]
+        generated = 0
+        for turn in range(5):
+            completion = str(turn)
+            response_ids = [ord(completion)]
+            response = json.load(
+                _post(
+                    "/multiturn/step",
+                    {
+                        "session_id": "s",
+                        "turn_ordinal": turn,
+                        "accepted_prefix": prefix,
+                        "response_ids": response_ids,
+                        "completion_text": completion,
+                        "image_count": 0,
+                        "image_digests": [],
+                    },
+                )
+            )
+            generated += 1
+            if response["terminal"]:
+                break
+            prefix.extend([*response_ids, *(ord(character) for character in "next")])
+        assert generated == 2, "the env was configured to end the episode after two turns"
+        # the child claims more turns than it generated.
+        _post("/multiturn/score", {"session_id": "s", "turn_count": 5}).close()
+    finally:
+        bridge.shutdown()
+        server.shutdown()
+
+    accounting = bridge.turn_accounting()
+    assert accounting["episodes_scored"] == 1
+    assert accounting["turn_records"] == 2, "the child's inflated turn_count reached the accounting"
+    assert accounting["max_turns_observed"] == 2
+    assert accounting["mean_turns_per_episode"] == 2.0
+
+
 def test_a_failed_score_does_not_inflate_the_turn_accounting():
     """Accounting must describe episodes that were really scored, not requests that arrived.
 
