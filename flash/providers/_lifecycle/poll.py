@@ -269,10 +269,13 @@ def _format_heartbeat(hb: dict) -> str:
     # neutralized like child output and sampled completions on the same line: this text is an
     # exception message from an environment hook or a provider response, so it is not ours, and a
     # `\x1b[2J` or `\r` in it would clear or overwrite the log the user is reading the failure in.
+    # unlike those multiline fields, these values are appended to the single-line summary, so escape
+    # preserved newlines too or an exception can forge a second `worker:` record.
     for key in ("failure_stage", "error"):
         value = hb.get(key)
         if isinstance(value, str) and value.strip():
-            msg += f" {key}={neutralize_control_chars(value.strip())}"
+            rendered = neutralize_control_chars(value.strip()).replace("\n", "\\n")
+            msg += f" {key}={rendered}"
     msg += format_gpu_status(hb.get("gpu"))
     sample_lines: list[str] = []
     rendered_samples = 0

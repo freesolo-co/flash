@@ -232,3 +232,13 @@ def test_format_heartbeat_neutralizes_control_chars_in_the_child_tail():
     assert "child output before the stall" in msg
     assert "\x1b" not in msg
     assert "\r" not in msg
+
+
+@pytest.mark.parametrize("field", ["failure_stage", "error"])
+def test_format_heartbeat_escapes_newlines_in_inline_failure_fields(field):
+    injected = "Permission denied\nworker: stage=done step=999"
+
+    msg = _format_heartbeat({"stage": "checkpoint_upload_failed", field: injected})
+
+    assert "\n" not in msg
+    assert f"{field}=Permission denied\\nworker: stage=done step=999" in msg

@@ -217,6 +217,17 @@ def heartbeat(
 ):
     genuine_progress = not liveness
     with _HB_LOCK:
+        if stage == "checkpoint_upload_failed":
+            failure = {
+                key: value
+                for key in ("failure_stage", "error")
+                if isinstance((value := kw.get(key)), str) and value.strip()
+            }
+            if failure:
+                _w._HB_PENDING_CHECKPOINT_FAILURE = failure
+        elif stage in _HB_TERMINAL_STAGES and _w._HB_PENDING_CHECKPOINT_FAILURE:
+            for key, value in _w._HB_PENDING_CHECKPOINT_FAILURE.items():
+                kw.setdefault(key, value)
         ts = time.time()
         if genuine_progress:
             _w._HB_LAST_PROGRESS_TS = ts
