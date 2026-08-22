@@ -209,17 +209,19 @@ def runconfig_from_spec(spec) -> RunConfig:
         opd_multi_turn=opd_multi_turn,
         opd_max_turns=opd_max_turns,
         provider=g.provider or "auto",
-        # read defensively like disk_gb below: this reads a gpu-shaped object, not always a GpuSpec,
-        # and a caller that predates the preference has no such attribute to offer.
-        providers=getattr(g, "providers", ()) or (),
+        # `g` is always a GpuSpec: `spec.gpu` is a typed field whose default_factory constructs one,
+        # and `g.provider` / `g.type` / `g.count` / `g.max_wall_seconds` are read plainly right here,
+        # so anything else would already have raised AttributeError before reaching this line. every
+        # field below also carries a dataclass default, which is what makes a getattr default doubly
+        # unreachable rather than merely unused.
+        providers=g.providers or (),
         gpu_type=g.type,
         # the rest of an ordered `[gpu] type` list. allocation cost-ranks every acceptable class, so
         # dropping these here quotes the head alone and the affordability precheck can refuse a run
-        # whose cheaper authored fallback it would really have rented. read defensively for the same
-        # reason as `providers` above: this is not always a GpuSpec.
-        gpu_type_fallbacks=tuple(getattr(g, "type_fallbacks", ()) or ()),
+        # whose cheaper authored fallback it would really have rented.
+        gpu_type_fallbacks=tuple(g.type_fallbacks or ()),
         model_revision=spec.model_revision,
-        disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
+        disk_gb=float(g.disk_gb or 0.0),
         # deliberately NOT spec.authored_gpu_count: this asks whether a shape has been RESOLVED
         # yet, not what the author wrote. the marker is provenance and survives allocation, so an
         # allocated run still reports no authored ceiling -- quoting that as auto would re-size a
