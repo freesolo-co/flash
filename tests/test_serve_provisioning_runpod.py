@@ -747,7 +747,7 @@ def test_ambiguous_mutation_is_not_retried_and_returns_outcome_unknown() -> None
     ("failure_mode", "expected_status"),
     [("definite_before", "failed"), ("ambiguous_after", "outcome_unknown")],
 )
-def test_create_failure_boundaries_abort_all_partial_resources(
+def test_create_failure_boundaries_reclaim_only_fully_confirmed_resources(
     boundary: int,
     failure_mode: str,
     expected_status: str,
@@ -762,12 +762,21 @@ def test_create_failure_boundaries_abort_all_partial_resources(
     assert result.status == expected_status
     if failure_mode == "definite_before":
         assert result.error_code == "provider_rejected"
+        assert transport.secrets == []
+        assert transport.templates == []
+        assert transport.volumes == []
+        assert transport.pods == []
     else:
         assert result.error_code == "resource_ambiguous"
-    assert transport.secrets == []
-    assert transport.templates == []
-    assert transport.volumes == []
-    assert transport.pods == []
+        # the failed mutation landed but its response never reached the ledger, so cleanup cannot
+        # prove which matching resource is ours. preserve the whole connected set for later reclaim.
+        assert len(transport.secrets) == min(boundary, 2)
+        assert len(transport.volumes) == int(boundary >= 3)
+        assert len(transport.templates) == int(boundary >= 4)
+        assert len(transport.pods) == int(boundary >= 5)
+        assert not any(
+            call[1] == "secretDelete" or "DELETE" in call[1] for call in _mutation_calls(transport)
+        )
 
 
 def test_malformed_success_id_binds_no_invalid_proxy_url() -> None:
@@ -781,10 +790,15 @@ def test_malformed_success_id_binds_no_invalid_proxy_url() -> None:
     assert result.error_code == "resource_ambiguous"
     assert result.handle is None
     assert len([call for call in _mutation_calls(transport) if call[1] == "POST /pods"]) == 1
-    assert transport.secrets == []
-    assert transport.templates == []
-    assert transport.volumes == []
-    assert transport.pods == []
+    # the malformed response cannot confirm the live pod's id. keep its connected resources for
+    # proof-based reclaim rather than deleting a pod that this attempt cannot establish it owns.
+    assert len(transport.secrets) == 1
+    assert len(transport.templates) == 1
+    assert len(transport.volumes) == 1
+    assert len(transport.pods) == 1
+    assert not any(
+        call[1] == "secretDelete" or "DELETE" in call[1] for call in _mutation_calls(transport)
+    )
 
 
 def test_losing_racer_never_deletes_the_winners_resources() -> None:
@@ -811,8 +825,8 @@ def test_losing_racer_never_deletes_the_winners_resources() -> None:
     def _winner_lands() -> None:
         # only the secret: the winner is mid-provision, exactly one create ahead of the loser.
         # this is the case plan identity alone cannot survive -- with the later kinds absent,
-        # nothing the loser never attempted is present to betray the resources as another run's,
-        # so the secret must be spared on the strength of the rejection itself.
+        # nothing else betrays the resources as another run's. without a provider-confirmed id,
+        # the loser has no ownership proof and must leave the secret for reclaim.
         transport.secrets = [dict(item) for item in winner_secrets]
 
     transport.on_first_mutation = _winner_lands
@@ -826,6 +840,32 @@ def test_losing_racer_never_deletes_the_winners_resources() -> None:
     assert transport.secrets == winner_secrets
     assert handle.pod_id == winner_pods[0]["id"]
     # and it must not have issued a single delete against them.
+    assert [call for call in _mutation_calls(transport) if "DELETE" in call[1]] == []
+    assert [call for call in _mutation_calls(transport) if call[1] == "secretDelete"] == []
+
+
+def test_ambiguous_race_loser_leaves_unconfirmed_winner_secret_for_reclaim() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    _seed_exact(transport, bundle)
+    winner_secrets = [dict(item) for item in transport.secrets]
+    transport.secrets, transport.volumes, transport.templates, transport.pods = [], [], [], []
+
+    def _winner_lands() -> None:
+        transport.secrets = [dict(item) for item in winner_secrets]
+
+    transport.on_first_mutation = _winner_lands
+    transport.fail_mutation_at = 1
+    transport.failure_mode = "ambiguous_before"
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    # the provider did not return this secret's id to the loser, so matching deterministic identity
+    # cannot authorize deletion. declining cleanup must stay unknown so a later reclaim can prove it.
+    assert result.status == "outcome_unknown"
+    assert transport.secrets == winner_secrets, (
+        "ambiguous cleanup deleted a secret without a confirmed provider id"
+    )
     assert [call for call in _mutation_calls(transport) if "DELETE" in call[1]] == []
     assert [call for call in _mutation_calls(transport) if call[1] == "secretDelete"] == []
 
