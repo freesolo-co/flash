@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from os import getpid, kill
+from signal import SIGTERM
+from threading import Thread
+
 
 def launch_modal_server() -> None:
     """spawn the packaged child boundary and return immediately.
@@ -20,13 +24,20 @@ def launch_modal_server() -> None:
     to become reachable, not for this call to finish, and modal's own documented example is the
     same spawn-and-return shape (`subprocess.Popen(...)` with no wait).
 
-    The consequence is that a dead engine is not recovered by this process exiting -- see
-    `_exit_on_engine_death` in `app/__main__.py`, which asks uvicorn to exit for exactly that
-    purpose. That signal reaches modal through the child's own exit and the port going unreachable,
-    not through this wrapper. Do not add a `process.wait()` here to close that gap; it trades a
-    recovery-path weakness for a total outage.
+    Modal notices a post-startup dead port when a request fails and then gracefully stops the
+    container, but an idle child exit otherwise leaves a dead-port window and usually sacrifices
+    that first request. Do not add a blocking `process.wait()` here; it trades that recovery gap for
+    a total outage. A daemon watcher waits off the caller thread and sends SIGTERM to this supervised
+    parent on any child exit, including uvicorn's clean engine-death exit, so Modal's installed
+    handler performs its normal container cleanup and replacement.
     """
 
     from flash.serve.app.launch import start_launcher_process
 
-    start_launcher_process()
+    process = start_launcher_process()
+
+    def stop_parent_when_child_exits() -> None:
+        process.wait()
+        kill(getpid(), SIGTERM)
+
+    Thread(target=stop_parent_when_child_exits, daemon=True).start()

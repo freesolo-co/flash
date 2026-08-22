@@ -173,8 +173,10 @@ async def _produce_openai_chat_stream(
         finally:
             disconnect_wait.cancel()
             await asyncio.gather(disconnect_wait, return_exceptions=True)
-            # bill before close so a transport cleanup failure cannot discard completed work.
-            if disconnected.is_set() and latest_usage:
+            # one billing point prevents normal completion, an engine error, or a simultaneous
+            # disconnect plus error from double billing. errors carry only message and code, while
+            # cumulative events update latest_usage; the empty guard skips unobserved usage.
+            if latest_usage:
                 schedule_usage(record, latest_usage, caller_org)
             try:
                 await _close_async_iterator(guarded_events)
@@ -188,7 +190,6 @@ async def _produce_openai_chat_stream(
         if trailing:
             await emit(_delta_chunk({"reasoning_content": trailing}))
 
-        schedule_usage(record, final, caller_org)
         done_chunk: dict[str, Any] = {
             "id": completion_id,
             "object": "chat.completion.chunk",

@@ -508,11 +508,48 @@ assert network_calls == []
     assert result.returncode == 0, result.stderr
 
 
+class _DeferredThread:
+    def __init__(self, *, target, daemon: bool) -> None:
+        self.target = target
+        self.daemon = daemon
+        self.started = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def run(self) -> None:
+        self.target()
+
+
+def _defer_modal_watcher(monkeypatch) -> list[_DeferredThread]:
+    from flash.serve.provisioning import _modal_wrapper
+
+    watchers = []
+
+    def make_thread(*, target, daemon: bool) -> _DeferredThread:
+        watcher = _DeferredThread(target=target, daemon=daemon)
+        watchers.append(watcher)
+        return watcher
+
+    monkeypatch.setattr(_modal_wrapper, "Thread", make_thread)
+    return watchers
+
+
 def test_fixed_wrapper_uses_packaged_secret_scrubbing_child_boundary(monkeypatch) -> None:
     from flash.serve.app import launch
 
+    class _Exited:
+        def wait(self) -> int:
+            return 0
+
     calls = []
-    monkeypatch.setattr(launch, "start_launcher_process", lambda: calls.append(True))
+
+    def start():
+        calls.append(True)
+        return _Exited()
+
+    _defer_modal_watcher(monkeypatch)
+    monkeypatch.setattr(launch, "start_launcher_process", start)
     launch_modal_server()
     assert calls == [True]
 
@@ -528,12 +565,53 @@ def test_wrapper_returns_while_the_child_still_runs(monkeypatch) -> None:
 
     from flash.serve.app import launch
 
-    class _NeverExits:
-        def wait(self, timeout: float | None = None) -> int:
-            raise AssertionError("wrapper must not wait on the child; modal needs it to return")
+    class _Running:
+        wait_calls = 0
 
-    monkeypatch.setattr(launch, "start_launcher_process", lambda: _NeverExits())
+        def wait(self) -> int:
+            self.wait_calls += 1
+            raise AssertionError("the caller thread waited on a live child")
+
+    process = _Running()
+    watchers = _defer_modal_watcher(monkeypatch)
+    monkeypatch.setattr(launch, "start_launcher_process", lambda: process)
     launch_modal_server()
+
+    assert process.wait_calls == 0
+    assert len(watchers) == 1
+    assert watchers[0].started is True
+    assert watchers[0].daemon is True
+
+
+def _assert_modal_wrapper_signals_parent(monkeypatch, exit_code: int) -> None:
+    import signal
+
+    from flash.serve.app import launch
+    from flash.serve.provisioning import _modal_wrapper
+
+    parent_pid = 2468
+    signals = []
+
+    class _Exited:
+        def wait(self) -> int:
+            return exit_code
+
+    watchers = _defer_modal_watcher(monkeypatch)
+    monkeypatch.setattr(launch, "start_launcher_process", lambda: _Exited())
+    monkeypatch.setattr(_modal_wrapper, "getpid", lambda: parent_pid)
+    monkeypatch.setattr(_modal_wrapper, "kill", lambda pid, signum: signals.append((pid, signum)))
+    launch_modal_server()
+    watchers[0].run()
+
+    assert signals == [(parent_pid, signal.SIGTERM)]
+
+
+def test_wrapper_signals_parent_after_nonzero_child_exit(monkeypatch) -> None:
+    _assert_modal_wrapper_signals_parent(monkeypatch, 17)
+
+
+def test_wrapper_signals_parent_after_zero_child_exit(monkeypatch) -> None:
+    _assert_modal_wrapper_signals_parent(monkeypatch, 0)
 
 
 def test_pinned_sdk_binds_exact_client_workspace_environment_and_secret_sinks() -> None:
