@@ -21,7 +21,7 @@ from flash.serve.app.bootstrap import (
     engine_config_from_manifest,
 )
 from flash.serve.app.http import (
-    _MAX_CHAT_REQUEST_BYTES,
+    MAX_CHAT_REQUEST_BYTES,
     _decimal_exceeds_limit,
     _stream_body,
     create_app,
@@ -395,10 +395,10 @@ def test_bearer_rejections_always_compare_one_fixed_length_digest(monkeypatch) -
 
 def test_request_body_ceiling_covers_current_encoded_image_contract() -> None:
     encoded_images = 4 * (((16 * 1024 * 1024) + 2) // 3)
-    assert _MAX_CHAT_REQUEST_BYTES == 24 * 1024 * 1024
-    assert _MAX_CHAT_REQUEST_BYTES - encoded_images >= 2 * 1024 * 1024
-    assert _decimal_exceeds_limit(str(_MAX_CHAT_REQUEST_BYTES), _MAX_CHAT_REQUEST_BYTES) is False
-    assert _decimal_exceeds_limit("9" * 5000, _MAX_CHAT_REQUEST_BYTES) is True
+    assert MAX_CHAT_REQUEST_BYTES == 24 * 1024 * 1024
+    assert MAX_CHAT_REQUEST_BYTES - encoded_images >= 2 * 1024 * 1024
+    assert _decimal_exceeds_limit(str(MAX_CHAT_REQUEST_BYTES), MAX_CHAT_REQUEST_BYTES) is False
+    assert _decimal_exceeds_limit("9" * 5000, MAX_CHAT_REQUEST_BYTES) is True
 
 
 def test_request_body_accepts_exact_limit_and_rejects_headers_or_streams_over_limit(
@@ -407,7 +407,7 @@ def test_request_body_accepts_exact_limit_and_rejects_headers_or_streams_over_li
     owner, _ = _published_owner()
     app = create_app(owner, bearer_token=AUTH_TOKEN)
     limit = 64
-    monkeypatch.setattr(http_module, "_MAX_CHAT_REQUEST_BYTES", limit)
+    monkeypatch.setattr(http_module, "MAX_CHAT_REQUEST_BYTES", limit)
 
     exact = asyncio.run(
         _request(

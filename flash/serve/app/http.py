@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from flash.serve.contract import reject_non_finite_json_constant
+from flash.serve.contract import MAX_CHAT_REQUEST_BYTES, reject_non_finite_json_constant
 from flash.serve.runtime import (
     AdapterNotFoundError,
     EngineDeadError,
@@ -40,8 +40,6 @@ from .openai import (
     usage_stream_chunk,
 )
 
-# 16 mib of compressed images expands below 22 mib in base64, leaving over 2 mib for json and text.
-_MAX_CHAT_REQUEST_BYTES = 24 * 1024 * 1024
 _REJECTED_AUTH_DIGEST = hashlib.sha256(b"flash-rejected-authorization").digest()
 
 
@@ -225,11 +223,11 @@ def _authorize(request: Request, state: _HttpState) -> JSONResponse | None:
 
 async def _read_request_body(request: Request) -> bytes:
     lengths = request.headers.getlist("content-length")
-    if len(lengths) == 1 and _decimal_exceeds_limit(lengths[0], _MAX_CHAT_REQUEST_BYTES):
+    if len(lengths) == 1 and _decimal_exceeds_limit(lengths[0], MAX_CHAT_REQUEST_BYTES):
         raise _RequestBodyTooLarge
     body = bytearray()
     async for chunk in request.stream():
-        if len(body) + len(chunk) > _MAX_CHAT_REQUEST_BYTES:
+        if len(body) + len(chunk) > MAX_CHAT_REQUEST_BYTES:
             raise _RequestBodyTooLarge
         body.extend(chunk)
     return bytes(body)

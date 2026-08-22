@@ -17,7 +17,9 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from flash.serve.contract import MAX_CHAT_REQUEST_BYTES
 from flash.serving.src.adapter_routes import adapter_router
+from flash.serving.src.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.context import APP_STATE_ATTR, ServingContext
 from flash.serving.src.inference_routes import inference_router
 from flash.serving.src.lookup import AdapterLookup
@@ -90,6 +92,8 @@ def build_serving_app(
         lifespan=_lifespan_for(context, on_startup, usage_reporter, chat_authorizer),
     )
     setattr(api.state, APP_STATE_ATTR, context)
+    # fastapi resolves body parameters before handlers run, so cap the raw receive channel first.
+    api.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_CHAT_REQUEST_BYTES)
 
     @api.get("/healthz", tags=["system"])
     async def healthz() -> dict[str, Any]:
