@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import time
 import uuid
@@ -707,53 +706,6 @@ def _follow_status(
         return 130
 
 
-def _artifact_attempt(name: str) -> int | None:
-    """Return the bounded attempt encoded by a worker artifact name."""
-    from flash.providers._lifecycle.poll import _attempt_int
-
-    match = re.search(r"_attempt(\d+)\.txt$", name)
-    return _attempt_int(int(match.group(1))) if match else None
-
-
-def _worker_section_name(name: str, current_attempt: int | None) -> str:
-    """Label an attempt-scoped artifact and identify superseded output."""
-    attempt = _artifact_attempt(name)
-    if attempt is None:
-        return name
-    if current_attempt is None:
-        return f"{name} (attempt={attempt})"
-    if attempt != current_attempt:
-        return f"{name} (attempt={attempt}, previous attempt; current attempt={current_attempt})"
-    return f"{name} (attempt={attempt}, current attempt)"
-
-
-def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:
-    worker_output = client.get_worker_output(run_id) or {}
-    if not worker_output:
-        return printed_any
-    try:
-        current_attempt = render.live_attempt(client.get_run(run_id) or {})
-    except Exception:
-        # artifact text is best-effort diagnostic output; a status refresh failure must not hide it.
-        current_attempt = None
-    for name, text in worker_output.items():
-        if not text:
-            continue
-        # the primary run log is printed first and worker artifacts are appended afterwards, so their
-        # position is not chronological. the highest uploaded artifact can still belong to a worker
-        # that was torn down while its replacement has not uploaded a console yet; label provenance
-        # from the filename rather than letting the final section masquerade as the live attempt.
-        section_name = _worker_section_name(name, current_attempt)
-        sep = "\n" if printed_any else ""
-        if render.styled():
-            print(f"{sep}{render.log_section(section_name)}")
-        else:
-            print(f"{sep}----- {section_name} -----")
-        print(text, end="" if text.endswith("\n") else "\n")
-        printed_any = True
-    return printed_any
-
-
 def cmd_log(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
@@ -1007,4 +959,11 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _print_unpacked_batch_warning,
     _sft_cost_rows,
     _warn_if_wandb_requested_without_key,
+)
+
+# re-exported so `commands._print_worker_output(...)` keeps resolving for `cmd_log` and the CLI tests.
+from flash.cli.commands.worker_output import (  # noqa: E402,F401
+    _artifact_attempt,
+    _print_worker_output,
+    _worker_section_name,
 )
