@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 from flash.serve.control import (
     DeploymentResult,
@@ -289,6 +290,14 @@ def _delete_rest_once(
             raise
 
 
+def _delete_tolerating_ambiguity(delete: Callable[[], None]) -> None:
+    try:
+        delete()
+    except RunPodTransportFailure as exc:
+        if not exc.outcome_unknown:
+            raise
+
+
 def _create_secret(
     transport: RunPodTransport,
     ledger: MutationLedger,
@@ -486,11 +495,9 @@ def _abort_created_resources(
         artifact = observation.artifact_secrets[0] if observation.artifact_secrets else None
         inference = observation.inference_secrets[0] if observation.inference_secrets else None
         if pod is not None:
-            try:
-                _delete_rest_once(transport, f"/pods/{pod.id}", deadline_at=deadline_at)
-            except RunPodTransportFailure as exc:
-                if not exc.outcome_unknown:
-                    raise
+            _delete_tolerating_ambiguity(
+                lambda: _delete_rest_once(transport, f"/pods/{pod.id}", deadline_at=deadline_at)
+            )
             if not _wait_for_pod_absence(
                 plan,
                 transport,
@@ -500,33 +507,27 @@ def _abort_created_resources(
             ):
                 return False
         if template is not None:
-            try:
-                _delete_rest_once(transport, f"/templates/{template.id}", deadline_at=deadline_at)
-            except RunPodTransportFailure as exc:
-                if not exc.outcome_unknown:
-                    raise
+            _delete_tolerating_ambiguity(
+                lambda: _delete_rest_once(
+                    transport, f"/templates/{template.id}", deadline_at=deadline_at
+                )
+            )
         if volume is not None:
-            try:
-                _delete_rest_once(
+            _delete_tolerating_ambiguity(
+                lambda: _delete_rest_once(
                     transport,
                     f"/networkvolumes/{volume.id}",
                     deadline_at=deadline_at,
                 )
-            except RunPodTransportFailure as exc:
-                if not exc.outcome_unknown:
-                    raise
+            )
         if artifact is not None:
-            try:
-                _delete_secret_once(transport, artifact.id, deadline_at=deadline_at)
-            except RunPodTransportFailure as exc:
-                if not exc.outcome_unknown:
-                    raise
+            _delete_tolerating_ambiguity(
+                lambda: _delete_secret_once(transport, artifact.id, deadline_at=deadline_at)
+            )
         if inference is not None:
-            try:
-                _delete_secret_once(transport, inference.id, deadline_at=deadline_at)
-            except RunPodTransportFailure as exc:
-                if not exc.outcome_unknown:
-                    raise
+            _delete_tolerating_ambiguity(
+                lambda: _delete_secret_once(transport, inference.id, deadline_at=deadline_at)
+            )
         return _observe(plan, transport, deadline_at=deadline_at).resource_count == 0
     except (RunPodResourceConflict, RunPodTransportFailure):
         return False

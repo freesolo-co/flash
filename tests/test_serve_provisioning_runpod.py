@@ -48,6 +48,7 @@ from flash.serve.provisioning._runpod_transport import (
     build_no_redirect_opener,
 )
 from flash.serve.provisioning.runpod import (
+    _delete_tolerating_ambiguity,
     _observe,
     _work_deadline,
     provision_runpod_deployment,
@@ -808,6 +809,17 @@ def test_wrong_account_fails_closed_with_sanitized_error() -> None:
     assert PROVIDER_SECRET not in repr(
         (result.spec, result.status, result.handle, result.error_code)
     )
+
+
+def test_delete_tolerating_ambiguity_rethrows_definite_failure() -> None:
+    def fail() -> None:
+        raise RunPodTransportFailure("provider_rejected")
+
+    with pytest.raises(RunPodTransportFailure) as exc_info:
+        _delete_tolerating_ambiguity(fail)
+
+    assert exc_info.value.code == "provider_rejected"
+    assert exc_info.value.outcome_unknown is False
 
 
 def test_ambiguous_mutation_is_not_retried_and_returns_outcome_unknown() -> None:
