@@ -19,6 +19,7 @@ from flash.engine.plan.recipe import RECIPE, resolve_teacher
 from flash.server.domain.teacher_errors import TeacherBrokerError, ValidatedCompletionRequest
 from flash.server.domain.teacher_requests import (
     CAPABILITY_PATTERN,
+    MAX_REQUEST_BODY_BYTES,
     REQUEST_ID_PATTERN,
     _canonical_json,
     _reject_nonfinite,
@@ -36,6 +37,7 @@ from flash.server.domain.teacher_requests import (
 # names below are unused in this file by design, which is what __all__ tells ruff.
 __all__ = [
     "CAPABILITY_PATTERN",
+    "MAX_REQUEST_BODY_BYTES",
     "REQUEST_ID_PATTERN",
     "TeacherBrokerError",
     "ValidatedCompletionRequest",
@@ -69,7 +71,6 @@ PARASAIL_CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 PARASAIL_SCORING_MODE = "supplied_token_completion_v1"
 PARASAIL_API_KEY_ENV = "PARASAIL_API_KEY"
 
-MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024
 MAX_RESPONSE_BODY_BYTES = 32 * 1024 * 1024
 MAX_PROVIDER_ERROR_BODY_BYTES = 64 * 1024
 # per-logical-request upstream attempt budget, enforced by mark_teacher_request_started.
