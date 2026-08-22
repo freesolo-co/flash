@@ -48,6 +48,7 @@ from flash.serve.provisioning._runpod_transport import (
     build_no_redirect_opener,
 )
 from flash.serve.provisioning.runpod import (
+    _observe,
     provision_runpod_deployment,
     reconcile_runpod_deployment,
     teardown_runpod_deployment,
@@ -3000,6 +3001,29 @@ def test_observation_survives_a_foreign_template_in_the_customers_account() -> N
     # business to validate.
     assert reconciled.status == "absent"
     assert reconciled.error_code is None
+
+
+def test_observation_filters_foreign_cpu_pods_before_strict_field_parsing() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    expected = _seed_exact(transport, bundle)
+    transport.pods.insert(
+        0,
+        {
+            "id": "cpu123def4567",
+            "name": "someone-elses-cpu-pod",
+            "desiredStatus": "RUNNING",
+            "imageName": "ubuntu:24.04",
+            "gpuCount": 0,
+            # cpu-only account pods need neither gpu placement nor flash's container disk field.
+        },
+    )
+    plan = build_runpod_create_plan(bundle)
+
+    observed = _observe(plan, transport, deadline_at=100.0)
+
+    assert [pod.id for pod in observed.pods] == [expected.pod_id]
+    assert [pod.name for pod in observed.pods] == [plan.names.app_or_pod]
 
 
 class _InterruptingProbe:

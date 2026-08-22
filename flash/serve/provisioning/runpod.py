@@ -145,7 +145,9 @@ def _observe(
             deadline_at=deadline_at,
             query={"includeMachine": "true", "includeNetworkVolume": "true"},
         ),
-        parse_pods,
+        # only flash's own pod is parsed strictly; foreign account pods may be cpu-only or omit
+        # fields this deployment requires and must not fail the whole observation.
+        lambda raw: parse_pods(raw, keep_name=plan.names.app_or_pod),
     )
     assert type(account_id) is str
     assert type(secrets) is tuple

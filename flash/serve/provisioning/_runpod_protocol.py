@@ -392,10 +392,22 @@ def _first_present(*sources: tuple[dict[str, object], str]) -> object | None:
     return None
 
 
-def parse_pods(value: object) -> tuple[RunPodPodObservation, ...]:
+def parse_pods(value: object, *, keep_name: str | None = None) -> tuple[RunPodPodObservation, ...]:
+    """read the account's pods, strictly parsing only the ones flash owns.
+
+    `keep_name` filters by pod name before every provider-specific field below. the customer's
+    account can hold cpu-only or otherwise unrelated pods that legitimately omit gpu and disk
+    fields flash requires, and one such row raising would blank this deployment's whole
+    observation. that is not hypothetical: a real account returned `env` as a list on two
+    foreign pods, so the observation came back empty and the deploy ended resource_ambiguous.
+    """
+
     parsed = []
     for entry in _resource_rows(value, "pods"):
         row = _mapping(entry, "pod")
+        name = _string(row.get("name"), "pod name")
+        if keep_name is not None and name != keep_name:
+            continue
         # runpod's rest Pod schema carries no flat gpuTypeId / dataCenterId / networkVolumeId.
         # they live in the nested `machine`, `gpu`, and `networkVolume` objects, which the api
         # only returns when includeMachine / includeNetworkVolume are set. the flat keys are read
@@ -413,7 +425,7 @@ def parse_pods(value: object) -> tuple[RunPodPodObservation, ...]:
         parsed.append(
             RunPodPodObservation(
                 id=validate_runpod_pod_id(row.get("id")),
-                name=_string(row.get("name"), "pod name"),
+                name=name,
                 desired_status=_string(row.get("desiredStatus"), "pod desiredStatus"),
                 image_name=_string(row.get("imageName"), "pod imageName"),
                 gpu_type_id=(None if gpu_type is None else _string(gpu_type, "pod gpuTypeId")),
