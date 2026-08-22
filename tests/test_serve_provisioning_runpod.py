@@ -743,7 +743,9 @@ def test_wrong_account_fails_closed_with_sanitized_error() -> None:
     assert result.status == "failed"
     assert result.error_code == "authentication_failed"
     assert result.handle is None
-    assert PROVIDER_SECRET not in repr((result.spec, result.status, result.handle, result.error_code))
+    assert PROVIDER_SECRET not in repr(
+        (result.spec, result.status, result.handle, result.error_code)
+    )
 
 
 def test_ambiguous_mutation_is_not_retried_and_returns_outcome_unknown() -> None:
@@ -1845,7 +1847,9 @@ def test_probe_exceptions_are_sanitized_as_unproven_adoption() -> None:
     )
     assert result.status == "outcome_unknown"
     assert result.handle == handle
-    assert INFERENCE_SECRET not in repr((result.spec, result.status, result.handle, result.error_code))
+    assert INFERENCE_SECRET not in repr(
+        (result.spec, result.status, result.handle, result.error_code)
+    )
 
 
 def test_teardown_refuses_mismatched_exact_resource_before_deletion() -> None:

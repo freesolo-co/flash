@@ -495,7 +495,9 @@ def test_request_secrets_are_confined_to_one_shot_sinks_and_sanitized_results() 
     sdk = factory.sdk
     assert sdk is not None
 
-    rendered = repr((result.spec, result.status, result.handle, result.error_code)) + repr(sdk.calls)
+    rendered = repr((result.spec, result.status, result.handle, result.error_code)) + repr(
+        sdk.calls
+    )
     assert factory.calls == [(True, True)]
     assert probe.calls[0][1] is True
     assert ("create_inference", True) in sdk.calls

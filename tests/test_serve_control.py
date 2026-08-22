@@ -642,7 +642,9 @@ def test_handles_and_results_expose_exact_secret_free_public_fields() -> None:
         assert "group_id" not in {entry.name for entry in fields(handle)}
         assert handle.inference_secret_name == "flash-inference-secret"
         assert not any(entry.name.startswith("artifact_secret") for entry in fields(handle))
-        assert SECRET_SENTINEL not in repr((result.spec, result.status, result.handle, result.error_code))
+        assert SECRET_SENTINEL not in repr(
+            (result.spec, result.status, result.handle, result.error_code)
+        )
         if type(handle) is ModalProviderHandle:
             assert handle.workspace_name == "workspace-1"
             assert "workspace_id" not in {entry.name for entry in fields(handle)}
