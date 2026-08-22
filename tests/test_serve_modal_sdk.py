@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from synchronicity import Synchronizer
 
 from flash.serve.control import ModalCredentials
 from flash.serve.provisioning._modal_plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
@@ -25,6 +27,14 @@ from tests.test_serve_provisioning_modal import (
     VOLUME_ID,
     _bundle,
 )
+
+_MODAL_SYNCHRONIZER = Synchronizer()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _close_modal_synchronizer():
+    yield
+    _MODAL_SYNCHRONIZER._close_loop()
 
 
 class _AioCallable:
@@ -362,13 +372,20 @@ class _IdMutationStub:
     def __init__(self, module) -> None:
         self.module = module
 
+    async def _before_mutation(self) -> None:
+        self.module.id_mutation_loops.append(asyncio.get_running_loop())
+        if self.module.block_id_mutation:
+            await asyncio.Event().wait()
+
     async def AppStop(self, request) -> None:
+        await self._before_mutation()
         self.module.mutations.append(("stop_app_by_id", request.app_id, request.source, {}))
         self.module.deployed_apps = [
             app for app in self.module.deployed_apps if app.app_id != request.app_id
         ]
 
     async def SecretDelete(self, request) -> None:
+        await self._before_mutation()
         self.module.mutations.append(("delete_secret_by_id", request.secret_id, None, {}))
         self.module.resources = {
             key: resource
@@ -377,6 +394,7 @@ class _IdMutationStub:
         }
 
     async def VolumeDelete(self, request) -> None:
+        await self._before_mutation()
         self.module.mutations.append(("delete_volume_by_id", request.volume_id, None, {}))
         self.module.resources = {
             key: resource
@@ -391,6 +409,7 @@ class _Client:
         self.close_count = 0
         self.close_error = False
         self.stub = _IdMutationStub(module)
+        self._sync_synchronizer = _MODAL_SYNCHRONIZER
 
     def _close(self) -> None:
         self.close_count += 1
@@ -457,13 +476,23 @@ class _ModalModule:
         self.environment_error = False
         self.workspace_name = plan.placement.workspace_name
         self.environment_name = plan.placement.environment
+        self.client_owner_loop = None
+        self.id_mutation_loops: list[asyncio.AbstractEventLoop] = []
+        self.block_id_mutation = False
         self.client = _Client(self)
         self.Secret = _SecretApi(self)
         self.Secret.objects.list = _AioCallable(self.Secret.objects.list)
         self.Volume = _VolumeApi(self)
         self.Volume.objects.list = _AioCallable(self.Volume.objects.list)
         self.experimental = _Experimental(self)
-        self.Client = SimpleNamespace(from_credentials=_AioCallable(self._from_credentials))
+
+        async def from_credentials(token_id: str, token_secret: str):
+            self.client_owner_loop = asyncio.get_running_loop()
+            return self._from_credentials(token_id, token_secret)
+
+        self.Client = SimpleNamespace(
+            from_credentials=_MODAL_SYNCHRONIZER.create_blocking(from_credentials)
+        )
         self.Workspace = SimpleNamespace(from_context=self._workspace)
         self.Environment = SimpleNamespace(from_name=self._environment)
         self.Image = SimpleNamespace(from_registry=self._image)
@@ -839,6 +868,40 @@ def test_destructive_mutations_bind_confirmed_provider_ids() -> None:
         ("delete_secret_by_id", INFERENCE_SECRET_ID, None, {}),
         ("delete_volume_by_id", VOLUME_ID, None, {}),
     ]
+
+
+def test_id_mutation_runs_on_the_modal_client_owning_loop() -> None:
+    plan = build_modal_create_plan(_bundle())
+    modal = _ModalModule(plan)
+    sdk = _sdk(plan, modal)
+
+    try:
+        sdk.delete_secret(plan, INFERENCE_SECRET_ID)
+
+        assert modal.client_owner_loop is not None
+        assert modal.id_mutation_loops == [modal.client_owner_loop]
+    finally:
+        sdk.close()
+
+
+def test_id_mutation_deadline_is_ambiguous_and_cancels_the_owning_loop_rpc() -> None:
+    plan = build_modal_create_plan(_bundle())
+    modal = _ModalModule(plan)
+    sdk = _sdk(plan, modal, deadline_at=time.monotonic() + 1.0, clock=time.monotonic)
+    modal.block_id_mutation = True
+    started_at = time.monotonic()
+
+    try:
+        with pytest.raises(ModalSdkFailure) as exc_info:
+            sdk.delete_secret(plan, INFERENCE_SECRET_ID, deadline_at=started_at + 0.02)
+
+        assert time.monotonic() - started_at < 0.2
+        assert exc_info.value.code == "resource_ambiguous"
+        assert exc_info.value.outcome_unknown is True
+        assert modal.id_mutation_loops == [modal.client_owner_loop]
+        assert modal.mutations == []
+    finally:
+        sdk.close()
 
 
 def test_id_mutation_declines_when_the_generated_request_is_unavailable(monkeypatch) -> None:

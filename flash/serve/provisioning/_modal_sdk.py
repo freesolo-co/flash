@@ -762,14 +762,21 @@ class PinnedModalSdk:
             api_pb2 = importlib.import_module("modal_proto.api_pb2")
             request_type = getattr(api_pb2, request_name)
             rpc = getattr(self._client.stub, rpc_name)
+            synchronizer = vars(self._client)["_sync_synchronizer"]
             if request_name == "AppStopRequest":
                 fields["source"] = api_pb2.APP_STOP_SOURCE_PYTHON_CLIENT
             request = request_type(**fields)
+
+            async def invoke() -> object:
+                return await rpc(request)
+
+            synchronized_rpc = synchronizer.create_blocking(invoke)
+            operation = synchronized_rpc.aio
         except Exception:
             # name mutations can target a newer same-generation deployment after ownership proof.
             # if the pinned generated id rpc is unavailable, decline cleanup as ambiguous instead.
             raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True) from None
-        self._mutate(lambda: rpc(request), deadline_at=deadline_at)
+        self._mutate(operation, deadline_at=deadline_at)
 
     def stop_app(
         self,

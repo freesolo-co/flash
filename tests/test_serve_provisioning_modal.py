@@ -35,6 +35,7 @@ from flash.serve.provisioning._modal_deployment import _work_deadline
 from flash.serve.provisioning._modal_plan import (
     MODAL_APP_TAG_LIMIT,
     MODAL_DEPLOYMENT_TAG_LIMIT,
+    MODAL_STARTUP_TIMEOUT_SECONDS,
     build_modal_create_plan,
 )
 from flash.serve.provisioning._modal_probe import ModalEndpointProbe, _provenance_matches
@@ -467,6 +468,7 @@ def test_plan_is_complete_secret_free_and_binds_pinned_image() -> None:
     assert plan.min_containers == 0
     assert plan.max_containers == 1
     assert plan.buffer_containers == 0
+    assert plan.startup_timeout_seconds == MODAL_STARTUP_TIMEOUT_SECONDS == 1800
     assert plan.scaledown_window_seconds > 0
     assert plan.environment
     assert "FLASH_SERVING_MANIFEST" in dict(plan.environment)
