@@ -84,6 +84,15 @@ def _report(result) -> int:
     handle = result.handle
     if handle is not None:
         print(f"endpoint    {handle.public_url}")
+        if handle.provider == "modal":
+            print(f"app id      {handle.app_id}")
+            print(f"volume id   {handle.volume_id}")
+            print(f"secret id   {handle.inference_secret_id}")
+        else:
+            print(f"pod id      {handle.pod_id}")
+            print(f"volume id   {handle.network_volume_id}")
+            print(f"template id {handle.template_id}")
+            print(f"secret id   {handle.inference_secret_id}")
     if result.status == "ready":
         return 0
     if result.error_code:
@@ -92,8 +101,8 @@ def _report(result) -> int:
         # the provider may or may not hold live resources. saying "failed" here would invite a
         # retry that double-provisions and bills twice.
         print(
-            "\nthe provider outcome could not be confirmed. resources may exist; reconcile "
-            "before retrying rather than provisioning again.",
+            "\nthe provider outcome could not be confirmed. resources may exist; run `flash serve "
+            "undeploy` to stop them billing before retrying rather than provisioning again.",
             file=sys.stderr,
         )
     return 1
@@ -112,80 +121,73 @@ def _build_provider_plan(provider: str, bundle) -> None:
     build_runpod_create_plan(bundle)
 
 
-def cmd_serve_deploy(args) -> int:
+def _deployment_bundle(args):
+    """rebuild the exact immutable deployment input shared by deploy and undeploy."""
+
     from flash.serve.control import DeploymentRequest
-    from flash.serve.profiles import ProfileError, get_profile, placement_for
-    from flash.serve.provisioning import DeploymentBundle, ServingRuntimeSecrets
-    from flash.serve.resolve import execution_inputs, resolve_adapter
+    from flash.serve.profiles import get_profile, placement_for
+    from flash.serve.resolve import execution_inputs, resolve_adapter, resolve_base_revision
+    from flash.server.domain.serving_resources import resolve_deployment_bundle
+
+    provider = args.provider
+    profile = get_profile(args.model)
+    image = _image(args.image)
+    placement = placement_for(
+        profile,
+        provider,
+        workspace_name=getattr(args, "modal_workspace", "") or "",
+        environment=getattr(args, "modal_environment", "") or "",
+        region=getattr(args, "modal_region", "") or "",
+        # "" means the no-suffix environment, which is a real modal configuration, so it maps
+        # to none rather than being rejected as missing.
+        web_suffix=(getattr(args, "modal_web_suffix", "") or "") or None,
+        account_id=getattr(args, "runpod_account", "") or "",
+        data_center_id=getattr(args, "runpod_data_center", "") or "",
+    )
+    base_revision = resolve_base_revision(profile.served_model)
+    resolved = resolve_adapter(
+        run_id=args.run,
+        artifact_repo_id=args.artifact_repo,
+        artifact_subfolder=args.artifact_subfolder,
+        artifact_repo_type=getattr(args, "artifact_repo_type", "dataset"),
+        base_model=args.model,
+        base_model_revision=resolve_base_revision(args.model),
+        lora_rank=args.lora_rank,
+        checkpoint_step=getattr(args, "checkpoint_step", None),
+        thinking_default=bool(getattr(args, "thinking", False)),
+    )
+    engine = profile.engine(
+        model_revision=base_revision,
+        tokenizer_revision=base_revision,
+        image=image,
+    )
+    request = DeploymentRequest(
+        deployment_id=args.deployment_id,
+        generation=args.generation,
+        provider=provider,
+        placement=placement,
+        engine=engine,
+        adapters=(resolved.adapter,),
+    )
+    return resolve_deployment_bundle(
+        request,
+        execution_inputs(profile, image, (resolved,)),
+        image,
+    )
+
+
+def cmd_serve_deploy(args) -> int:
+    from flash.serve.provisioning import ServingRuntimeSecrets
 
     provider = args.provider
     try:
-        profile = get_profile(args.model)
-        image = _image(args.image)
-        placement = placement_for(
-            profile,
-            provider,
-            workspace_name=getattr(args, "modal_workspace", "") or "",
-            environment=getattr(args, "modal_environment", "") or "",
-            region=getattr(args, "modal_region", "") or "",
-            # "" means the no-suffix environment, which is a real modal configuration, so it maps
-            # to None rather than being rejected as missing.
-            web_suffix=(getattr(args, "modal_web_suffix", "") or "") or None,
-            account_id=getattr(args, "runpod_account", "") or "",
-            data_center_id=getattr(args, "runpod_data_center", "") or "",
-        )
-    except (ProfileError, ValueError) as exc:
-        return _err(str(exc))
-
-    try:
-        from flash.serve.resolve import resolve_base_revision
-
-        base_revision = resolve_base_revision(profile.served_model)
-        resolved = resolve_adapter(
-            run_id=args.run,
-            artifact_repo_id=args.artifact_repo,
-            artifact_subfolder=args.artifact_subfolder,
-            artifact_repo_type=getattr(args, "artifact_repo_type", "dataset"),
-            base_model=args.model,
-            base_model_revision=resolve_base_revision(args.model),
-            lora_rank=args.lora_rank,
-            checkpoint_step=getattr(args, "checkpoint_step", None),
-            thinking_default=bool(getattr(args, "thinking", False)),
-        )
-    # `ResolveError` subclasses `ValueError`, so this still reports resolution failures the same
-    # way. the wider catch also covers validation raised beneath the resolver -- a negative
-    # `--checkpoint-step` reaches `format_adapter_revision`, and a nonimmutable revision reaches
-    # `ResolvedAdapter`, both of which raise plain `ValueError`. those are bad user input, so they
-    # belong on the normal cli error path rather than the unexpected-error traceback.
-    except ValueError as exc:
-        return _err(str(exc))
-
-    try:
-        engine = profile.engine(
-            model_revision=base_revision,
-            tokenizer_revision=base_revision,
-            image=image,
-        )
-        request = DeploymentRequest(
-            deployment_id=args.deployment_id,
-            generation=args.generation,
-            provider=provider,
-            placement=placement,
-            engine=engine,
-            adapters=(resolved.adapter,),
-        )
-        from flash.server.domain.serving_resources import (
-            dry_run_deployment,
-            resolve_deployment_bundle,
-        )
-
-        bundle: DeploymentBundle = resolve_deployment_bundle(
-            request,
-            execution_inputs(profile, image, (resolved,)),
-            image,
-        )
+        bundle = _deployment_bundle(args)
+    # resolver errors subclass valueerror. the wider catch also covers validation beneath the
+    # resolver and bundle construction, so bad user input stays on the normal cli error path.
     except (ValueError, TypeError) as exc:
         return _err(str(exc))
+
+    from flash.server.domain.serving_resources import dry_run_deployment
 
     try:
         # build the provider plan too, not just the bundle. the generic placement types accept
@@ -264,7 +266,7 @@ def _warn_unconfirmed_cleanup(provider: str, deployment_id: str) -> None:
 
     print(
         f"\nwarning: interrupted before ready, and {provider} cleanup could not be confirmed for "
-        f"{deployment_id}. resources may still exist and bill; reconcile before retrying rather "
-        f"than provisioning again.",
+        f"{deployment_id}. resources may still exist and bill; run `flash serve undeploy` before "
+        f"retrying rather than provisioning again.",
         file=sys.stderr,
     )

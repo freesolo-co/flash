@@ -1,8 +1,8 @@
-"""Parser wiring for customer-owned serving deployment.
+"""Parser wiring for customer-owned serving deployment lifecycle commands.
 
-One subcommand, ``serve deploy``: provision a serving deployment in the user's own Modal or RunPod
-account. Kept separate from ``models deploy``, which uses the hosted serving backend rather than
-standing one up. A hosted-plane user never needs this.
+``serve deploy`` provisions one deployment in the user's Modal or RunPod account. ``serve
+undeploy`` tears down that same exact deployment generation. Kept separate from ``models deploy``
+and ``models undeploy``, which use the hosted serving backend rather than customer-owned resources.
 """
 
 from __future__ import annotations
@@ -43,9 +43,85 @@ def _positive_int(raw: str) -> int:
 
 
 def _add_serve_commands(sub: argparse._SubParsersAction) -> None:
-    serve = sub.add_parser("serve", help="host a serving deployment on your own provider account")
+    serve = sub.add_parser("serve", help="manage serving in your own provider account")
     serve_sub = serve.add_subparsers(dest="serve_cmd", required=True)
     _add_serve_deploy(serve_sub)
+    _add_serve_undeploy(serve_sub)
+
+
+def _add_deployment_arguments(command: argparse.ArgumentParser) -> None:
+    """add the exact deployment identity shared by deploy and undeploy."""
+
+    command.add_argument(
+        "--provider",
+        required=True,
+        choices=("modal", "runpod"),
+        help="which of your accounts holds the deployment",
+    )
+    command.add_argument("--model", required=True, help="base model id to serve")
+    command.add_argument("--run", required=True, help="run id whose adapter to serve")
+    command.add_argument(
+        "--deployment-id", required=True, help="stable id for this deployment across generations"
+    )
+    command.add_argument(
+        "--generation",
+        type=_positive_int,
+        default=1,
+        help="generation number for this deployment (default: 1)",
+    )
+    command.add_argument(
+        "--image",
+        required=True,
+        help="digest-qualified serving image reference (name@sha256:...)",
+    )
+    command.add_argument("--artifact-repo", required=True, help="hub repo holding the adapter")
+    command.add_argument(
+        "--artifact-subfolder", required=True, help="path within the repo holding the adapter"
+    )
+    # flash runs publish adapters into dataset repos, so that stays the default. the override
+    # exists for an adapter published as a model repo, where resolution would otherwise fail
+    # against the wrong repo type rather than reporting that the repo is a different kind.
+    command.add_argument(
+        "--artifact-repo-type",
+        choices=("dataset", "model"),
+        default="dataset",
+        help="hub repo type holding the adapter (default: dataset, as flash runs publish)",
+    )
+    command.add_argument("--lora-rank", type=int, required=True, help="the adapter's lora rank")
+    command.add_argument(
+        "--checkpoint-step",
+        type=int,
+        default=None,
+        help="serve one saved step instead of the final adapter",
+    )
+    command.add_argument(
+        "--thinking", action="store_true", help="default this adapter to thinking mode"
+    )
+    # modal placement
+    command.add_argument("--modal-workspace", default="", help="modal workspace name")
+    command.add_argument("--modal-environment", default="", help="modal environment name")
+    # modal builds web urls as `<workspace>-<web-suffix>--<label>.modal.run`. the suffix is a
+    # per-environment setting the operator chooses, not the environment name, and one environment
+    # per workspace may have none, so it cannot be derived and is omitted for that environment.
+    command.add_argument(
+        "--modal-web-suffix",
+        default="",
+        help="modal environment web suffix, if the environment has one (see `modal environment`)",
+    )
+    # modal prices a pinned region above an unpinned one and a narrower region draws on a smaller
+    # capacity pool, so prefer a broad value ("us-east") over a specific one ("us-east-1").
+    command.add_argument(
+        "--modal-region", default="", help="modal region, e.g. us-east (broad is cheaper)"
+    )
+    # runpod placement
+    command.add_argument("--runpod-account", default="", help="runpod account id")
+    command.add_argument("--runpod-data-center", default="", help="runpod data center id")
+    command.add_argument(
+        "--timeout",
+        type=_positive_finite_seconds,
+        default=1800.0,
+        help="seconds to wait for the provider operation (default: 1800)",
+    )
 
 
 def _add_serve_deploy(serve_sub: argparse._SubParsersAction) -> None:
@@ -66,76 +142,7 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction) -> None:
         "deploy",
         help="provision one deployment on your own modal or runpod account",
     )
-    deploy.add_argument(
-        "--provider",
-        required=True,
-        choices=("modal", "runpod"),
-        help="which of your accounts to provision in",
-    )
-    deploy.add_argument("--model", required=True, help="base model id to serve")
-    deploy.add_argument("--run", required=True, help="run id whose adapter to serve")
-    deploy.add_argument(
-        "--deployment-id", required=True, help="stable id for this deployment across generations"
-    )
-    deploy.add_argument(
-        "--generation",
-        type=_positive_int,
-        default=1,
-        help="generation number for this deployment (default: 1)",
-    )
-    deploy.add_argument(
-        "--image",
-        required=True,
-        help="digest-qualified serving image reference (name@sha256:...)",
-    )
-    deploy.add_argument("--artifact-repo", required=True, help="hub repo holding the adapter")
-    deploy.add_argument(
-        "--artifact-subfolder", required=True, help="path within the repo holding the adapter"
-    )
-    # flash runs publish adapters into dataset repos, so that stays the default. the override
-    # exists for an adapter published as a model repo, where resolution would otherwise fail
-    # against the wrong repo type rather than reporting that the repo is a different kind.
-    deploy.add_argument(
-        "--artifact-repo-type",
-        choices=("dataset", "model"),
-        default="dataset",
-        help="hub repo type holding the adapter (default: dataset, as flash runs publish)",
-    )
-    deploy.add_argument("--lora-rank", type=int, required=True, help="the adapter's lora rank")
-    deploy.add_argument(
-        "--checkpoint-step",
-        type=int,
-        default=None,
-        help="serve one saved step instead of the final adapter",
-    )
-    deploy.add_argument(
-        "--thinking", action="store_true", help="default this adapter to thinking mode"
-    )
-    # modal placement
-    deploy.add_argument("--modal-workspace", default="", help="modal workspace name")
-    deploy.add_argument("--modal-environment", default="", help="modal environment name")
-    # modal builds web urls as `<workspace>-<web-suffix>--<label>.modal.run`. the suffix is a
-    # per-environment setting the operator chooses, NOT the environment name, and one environment
-    # per workspace may have none -- so it cannot be derived and is omitted for that environment.
-    deploy.add_argument(
-        "--modal-web-suffix",
-        default="",
-        help="modal environment web suffix, if the environment has one (see `modal environment`)",
-    )
-    # modal prices a pinned region above an unpinned one and a narrower region draws on a smaller
-    # capacity pool, so prefer a broad value ("us-east") over a specific one ("us-east-1").
-    deploy.add_argument(
-        "--modal-region", default="", help="modal region, e.g. us-east (broad is cheaper)"
-    )
-    # runpod placement
-    deploy.add_argument("--runpod-account", default="", help="runpod account id")
-    deploy.add_argument("--runpod-data-center", default="", help="runpod data center id")
-    deploy.add_argument(
-        "--timeout",
-        type=_positive_finite_seconds,
-        default=1800.0,
-        help="seconds to wait for the deployment to become ready (default: 1800)",
-    )
+    _add_deployment_arguments(deploy)
     deploy.add_argument(
         "--dry-run",
         action="store_true",
@@ -144,3 +151,42 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction) -> None:
     from flash.cli.commands.serve_deploy import cmd_serve_deploy
 
     deploy.set_defaults(func=cmd_serve_deploy)
+
+
+def _add_serve_undeploy(serve_sub: argparse._SubParsersAction) -> None:
+    """`serve undeploy`: remove one exact deployment generation and prove absence.
+
+    Provider credentials remain request-only environment values. Provider-assigned resource ids are
+    not secrets; the deploy command prints them so teardown can bind every deletion to the exact
+    generation instead of trusting reusable deterministic names.
+    """
+
+    undeploy = serve_sub.add_parser(
+        "undeploy",
+        help="tear down one deployment and prove its resources are absent",
+    )
+    _add_deployment_arguments(undeploy)
+    undeploy.add_argument("--modal-app-id", default="", help="modal app id printed by deploy")
+    undeploy.add_argument("--modal-volume-id", default="", help="modal volume id printed by deploy")
+    undeploy.add_argument(
+        "--modal-inference-secret-id",
+        default="",
+        help="modal inference secret id printed by deploy",
+    )
+    undeploy.add_argument("--runpod-pod-id", default="", help="runpod pod id printed by deploy")
+    undeploy.add_argument(
+        "--runpod-network-volume-id",
+        default="",
+        help="runpod network volume id printed by deploy",
+    )
+    undeploy.add_argument(
+        "--runpod-template-id", default="", help="runpod template id printed by deploy"
+    )
+    undeploy.add_argument(
+        "--runpod-inference-secret-id",
+        default="",
+        help="runpod inference secret id printed by deploy",
+    )
+    from flash.cli.commands.serve_undeploy import cmd_serve_undeploy
+
+    undeploy.set_defaults(func=cmd_serve_undeploy)

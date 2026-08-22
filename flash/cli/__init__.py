@@ -126,6 +126,7 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         "self-hosted serving",
         [
             ("serve deploy", "provision a serving deployment in your own provider account"),
+            ("serve undeploy", "tear down a deployment in your own provider account"),
         ],
     ),
 ]

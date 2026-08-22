@@ -320,7 +320,7 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     assert cmd_serve_deploy(_args()) == 1
     captured = capsys.readouterr()
     assert "outcome_unknown" in captured.out
-    assert "reconcile" in captured.err
+    assert "flash serve undeploy" in captured.err
 
 
 def _deploy_help(parser: argparse.ArgumentParser) -> str:
