@@ -85,8 +85,7 @@ from ._runpod_transport import (
 _DEFAULT_ENDPOINT_PROBE = RunPodEndpointProbe()
 
 # how much of the caller's deadline is held back for teardown. one observe, one pod delete, a
-# short absence wait, then four deletes and a confirming observe. the same bounded interval lets an
-# explicit reclaim discover a create that became visible only after its ambiguous response.
+# short absence wait, then four deletes and a confirming observe.
 _CLEANUP_RESERVE_SECONDS = 30.0
 
 
@@ -111,19 +110,6 @@ def _work_deadline(deadline_at: float, clock: Clock) -> float:
 
     remaining_seconds = max(0.0, deadline_at - clock())
     return deadline_at - min(_CLEANUP_RESERVE_SECONDS, remaining_seconds / 2.0)
-
-
-def _discovery_deadline(deadline_at: float, clock: Clock) -> float:
-    """bound the window that proves an empty listing really is an empty account.
-
-    a share of the budget rather than a flat cap, for the same reason `_work_deadline` takes one:
-    a caller whose whole deadline is shorter than the reserve would otherwise spend all of it
-    confirming absence and have nothing left to create with, so a short-deadline deploy could never
-    provision at all. half the budget leaves both phases room at any deadline.
-    """
-
-    remaining_seconds = max(0.0, deadline_at - clock())
-    return min(deadline_at, clock() + min(_CLEANUP_RESERVE_SECONDS, remaining_seconds / 2.0))
 
 
 def _observe(
@@ -621,7 +607,6 @@ def provision_runpod_deployment(
 
     try:
         transport = open_transport(transport_factory, credentials)
-        discovery_deadline_at = _discovery_deadline(deadline_at, clock)
         adopted = adopt_existing_generation(
             plan,
             _bind_observe(transport, deadline_at=deadline_at),
@@ -629,7 +614,6 @@ def provision_runpod_deployment(
             _bind_patch_pod(transport, deadline_at=deadline_at),
             _bind_delete_secret(transport, deadline_at=deadline_at),
             inference_token,
-            discovery_deadline_at=discovery_deadline_at,
             deadline_at=deadline_at,
             probe=probe,
             clock=clock,

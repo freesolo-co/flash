@@ -39,6 +39,7 @@ from ._runpod_transport import RunPodTransportFailure
 
 READINESS_POLL_SECONDS = 2.0
 MAX_PROBE_TIMEOUT_SECONDS = 30.0
+_RESOURCE_DISCOVERY_SECONDS = 30.0
 
 Observe = Callable[[RunPodCreatePlan], RunPodObservation]
 PatchTemplate = Callable[[str, dict[str, object]], None]
@@ -109,6 +110,21 @@ def sleep_until_poll(deadline_at: float, clock: Clock, sleep: Sleeper) -> bool:
     return clock() < deadline_at
 
 
+def _resource_discovery_deadline(deadline_at: float, clock: Clock) -> float:
+    now = clock()
+    remaining_seconds = max(0.0, deadline_at - now)
+    return min(deadline_at, now + min(_RESOURCE_DISCOVERY_SECONDS, remaining_seconds / 2.0))
+
+
+def _incomplete_resource_deadline(
+    deadline_at: float,
+    discovery_deadline_at: float,
+    *,
+    resource_presence_known: bool,
+) -> float:
+    return deadline_at if resource_presence_known else discovery_deadline_at
+
+
 def probe_with_deadline(
     probe: EndpointProbe,
     handle: RunPodProviderHandle,
@@ -148,6 +164,7 @@ def read_only_reconcile(
 ) -> DeploymentResult:
     last_handle: RunPodProviderHandle | None = None
     saw_resource = False
+    discovery_deadline_at = _resource_discovery_deadline(deadline_at, clock)
     while True:
         try:
             observation = observe(plan)
@@ -172,7 +189,12 @@ def read_only_reconcile(
                 LifecycleFailure("conflict", reason="readiness_resource_conflict"),
             )
         if not complete:
-            if sleep_until_poll(deadline_at, clock, sleep):
+            incomplete_deadline_at = _incomplete_resource_deadline(
+                deadline_at,
+                discovery_deadline_at,
+                resource_presence_known=saw_resource or not absent_after_deadline,
+            )
+            if sleep_until_poll(incomplete_deadline_at, clock, sleep):
                 continue
             if absent_after_deadline and not saw_resource:
                 return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
@@ -506,7 +528,6 @@ def adopt_existing_generation(
     delete_secret: DeleteSecret,
     inference_token: str,
     *,
-    discovery_deadline_at: float,
     deadline_at: float,
     probe: EndpointProbe,
     clock: Clock,
@@ -515,12 +536,14 @@ def adopt_existing_generation(
     """adopt a resource generation that may not be visible yet.
 
     runpod listings are eventually consistent, so both a partial and a fully empty observation can
-    be an ordinary mid-create state. Poll one discovery window before deciding the resources are
-    absent. A genuinely fresh create therefore waits through that bounded window, which prevents an
-    invisible existing pod from being mistaken for permission to rent a second one.
+    be an ordinary mid-create state. Poll one bounded discovery window while nothing is visible, but
+    use the full operation deadline once any resource appears because those partial resources may be
+    live and billing. A genuinely fresh create therefore cannot mistake an invisible existing pod
+    for permission to rent a second one or abandon a visible partial generation after discovery.
     """
 
     saw_resource = False
+    discovery_deadline_at = _resource_discovery_deadline(deadline_at, clock)
     while True:
         observation = observe(plan)
         saw_resource = saw_resource or observation.resource_count > 0
@@ -546,7 +569,12 @@ def adopt_existing_generation(
                 clock=clock,
                 sleep=sleep,
             )
-        if not sleep_until_poll(discovery_deadline_at, clock, sleep):
+        incomplete_deadline_at = _incomplete_resource_deadline(
+            deadline_at,
+            discovery_deadline_at,
+            resource_presence_known=saw_resource,
+        )
+        if not sleep_until_poll(incomplete_deadline_at, clock, sleep):
             break
     if saw_resource:
         return unknown_result(plan, reason="readiness_deadline_unproven")

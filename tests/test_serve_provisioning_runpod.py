@@ -1132,6 +1132,24 @@ def test_genuinely_empty_account_creates_after_the_discovery_window() -> None:
     assert len([call for call in _mutation_calls(transport) if call[1] == "POST /pods"]) == 1
 
 
+def test_partial_adoption_uses_the_full_operation_deadline() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    _seed_exact(transport, bundle)
+    transport.templates.clear()
+    transport.volumes.clear()
+    transport.pods.clear()
+    transport.calls.clear()
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "outcome_unknown"
+    assert result.error_reason == "readiness_deadline_unproven"
+    assert transport.clock.now == 100.0
+    assert transport.clock.now > 30.0
+    assert _mutation_calls(transport) == []
+
+
 def test_fresh_create_waits_through_an_empty_first_readiness_observation() -> None:
     bundle = _bundle()
     transport = _PartialThenCompleteTransport(post_create=True)
@@ -1499,6 +1517,30 @@ def test_reconcile_is_read_only_and_reports_ready_or_absent() -> None:
         sleep=clock.sleep,
     )
     assert absent.status == "absent"
+    assert _mutation_calls(transport) == []
+
+
+def test_read_only_reconcile_bounds_empty_listing_discovery() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    clock = transport.clock
+
+    result = reconcile_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=3600.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(True),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    pod_observations = [call for call in transport.calls if call[1] == "GET /pods"]
+    assert result.status == "absent"
+    assert len(pod_observations) > 1
+    assert clock.now == 30.0
+    assert clock.now < 3600.0
     assert _mutation_calls(transport) == []
 
 
