@@ -167,11 +167,13 @@ class RunStatus:
     # scoped here so a plane that never configured Vast never blocks a handle-less recovery on it. None
     # for runs created outside submit() / pre-feature records.
     submitted_instance_providers: list[str] | None = None
-    # Realized provider cost (COGS), pulled from the provider's billing API after the run
-    # finishes by the reconciliation job (flash/server/domain/reconcile.py) and reported to the
-    # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the flash.cost ESTIMATE
-    # we charge the customer); ``reconciled_at`` marks that the realized pull has happened so it
-    # isn't re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
+    # Realized provider cost (COGS) net of the worker-measured startup, pulled from the provider's
+    # billing API after the run finishes by the reconciliation job
+    # (flash/server/domain/reconcile.py) and reported to the freesolo backend for estimator
+    # accuracy. Startup is removed because the quote never bills it; the gross bill is kept in the
+    # report's ``source``. Distinct from ``cost_usd`` (the flash.cost ESTIMATE we charge the
+    # customer); ``reconciled_at`` marks that the realized pull has happened so it isn't
+    # re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
     realized_cost_usd: float | None = None
     reconciled_at: float | None = None
     # Stamped ONCE on first terminal transition; survives later updated_at bumps from deploy/reconcile.
