@@ -100,6 +100,34 @@ class _CreatedResources:
     def any_created(self) -> bool:
         return self.inference or self.artifact or self.volume or self.app_deployed
 
+    def confirm(
+        self,
+        *,
+        volume_id: str | None = None,
+        inference_secret_id: str | None = None,
+        artifact_secret_id: str | None = None,
+    ) -> None:
+        """record one provider id as its create returns to this invocation."""
+
+        current = self.confirmed or ExpectedResources(
+            app_id=None,
+            volume_id="",
+            inference_secret_id="",
+            artifact_secret_id=None,
+        )
+        self.confirmed = ExpectedResources(
+            app_id=current.app_id,
+            volume_id=volume_id if volume_id is not None else current.volume_id,
+            inference_secret_id=(
+                inference_secret_id
+                if inference_secret_id is not None
+                else current.inference_secret_id
+            ),
+            artifact_secret_id=(
+                artifact_secret_id if artifact_secret_id is not None else current.artifact_secret_id
+            ),
+        )
+
 
 def _create_resources(
     plan: ModalCreatePlan,
@@ -114,23 +142,24 @@ def _create_resources(
     record = created if created is not None else _CreatedResources()
     record.inference = True
     inference = mutation(lambda: sdk.create_inference_secret(plan, inference_token))
+    assert type(inference) is ModalNamedResource
+    record.confirm(inference_secret_id=inference.id)
     artifact = None
     if artifact_token is not None:
         record.artifact = True
         artifact = mutation(lambda: sdk.create_artifact_secret(plan, artifact_token))
+        assert type(artifact) is ModalNamedResource
+        record.confirm(artifact_secret_id=artifact.id)
     record.volume = True
     volume = mutation(lambda: sdk.create_volume(plan))
-    assert type(inference) is ModalNamedResource
-    assert artifact is None or type(artifact) is ModalNamedResource
     assert type(volume) is ModalNamedResource
-    expected = ExpectedResources(
+    record.confirm(volume_id=volume.id)
+    return ExpectedResources(
         app_id=None,
         volume_id=volume.id,
         inference_secret_id=inference.id,
         artifact_secret_id=None if artifact is None else artifact.id,
     )
-    record.confirmed = expected
-    return expected
 
 
 def _deploy_once_then_wait(

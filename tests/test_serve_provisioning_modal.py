@@ -2287,6 +2287,35 @@ def test_a_create_failure_after_acceptance_stays_ambiguous_without_returned_ids(
         assert sdk.volumes
 
 
+def test_volume_create_interrupt_cleans_only_the_previously_confirmed_secret() -> None:
+    class _InterruptBeforeVolumeCreateSdk(_FakeSdk):
+        def create_volume(self, plan) -> ModalNamedResource:
+            self.calls.append(("create_volume", None))
+            raise KeyboardInterrupt
+
+    factory = _Factory()
+    factory.sdk_class = _InterruptBeforeVolumeCreateSdk
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _provision(_bundle(), factory, artifact_token=None)
+
+    assert not isinstance(raised.value, InterruptedProvisioning)
+    sdk = factory.sdk
+    assert sdk is not None
+    operations = [name for name, _payload in sdk.calls]
+    assert operations == [
+        "observe",
+        "create_inference",
+        "create_volume",
+        "observe",
+        "delete_inference",
+        "observe",
+    ]
+    assert "delete_volume" not in operations
+    assert sdk.inference == []
+    assert sdk.volumes == []
+
+
 @pytest.mark.parametrize("interrupted_call", ["create_volume", "create_inference_secret"])
 def test_a_create_interrupted_after_the_provider_accepted_it_stays_ambiguous_without_ownership(
     interrupted_call: str,
