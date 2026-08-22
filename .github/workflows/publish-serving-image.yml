@@ -29,7 +29,13 @@ on:
 
 concurrency:
   group: publish-serving-image-${{ github.ref }}
-  cancel-in-progress: true
+  # NOT cancel-in-progress, unlike publish-image.yml, because the publish gate below diffs only
+  # `github.event.before..github.sha`. Cancelling a relevant push A for an irrelevant push B means
+  # B's gate sees only A..B, decides `publish=false`, and exits -- so A's serving code never gets a
+  # digest and the tags keep pointing at pre-A code until some later relevant change happens.
+  # deploy-modal.yml already sets false for the same reason: the run has a side effect that a
+  # replacement run does not repeat.
+  cancel-in-progress: false
 
 jobs:
   publish-serving-image:
