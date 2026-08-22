@@ -814,7 +814,10 @@ class _LoraEngineImpl:
                 self._self_heal_if_dead("stream_generate")
                 raise
 
-            completion_token_ids = list(getattr(first_output.outputs[0], "token_ids", []) or [])
+            completion_token_ids: list[int] = []
+            first_completion_tokens = len(
+                list(getattr(first_output.outputs[0], "token_ids", []) or [])
+            )
             usage_context = {
                 "start": start,
                 "request_id": request_id,
@@ -833,7 +836,7 @@ class _LoraEngineImpl:
             yield {
                 "type": "ready",
                 "thinking": thinking_default,
-                **usage_fields(first_output),
+                **_stream_usage_fields(first_output, first_completion_tokens, **usage_context),
             }
             final_output = None
             previous_text = ""
@@ -844,23 +847,15 @@ class _LoraEngineImpl:
                     output = out.outputs[0]
                     text = output.text or ""
                     token_ids = list(getattr(output, "token_ids", []) or [])
-                    cumulative_output = None
                     if token_ids:
-                        if token_ids[: len(completion_token_ids)] == completion_token_ids:
-                            # cumulative: this chunk is a prefix-extension of what we've accumulated
-                            # (>= in length, prefix matches). replace rather than extend. using >= (not
-                            # >) means a repeated cumulative chunk of the same length is a no-op replace,
-                            # never a double-count. defensive fallback for a vllm build that ignores
-                            # delta; current vllm returns true deltas, which take the extend branch below.
-                            completion_token_ids = token_ids
-                            cumulative_output = True
-                        else:
-                            completion_token_ids.extend(token_ids)
-                            cumulative_output = False
+                        # _stream_generate pins delta output, so each chunk is new tokens appended
+                        # without inspecting contents; test_serve_structured_outputs.py pins the
+                        # sampling-param output kind that enforces this contract.
+                        completion_token_ids.extend(token_ids)
                     delta = ""
                     if text:
                         delta, previous_text = _stream_text_delta(
-                            text, previous_text, cumulative_output=cumulative_output
+                            text, previous_text, cumulative_output=False
                         )
                     yield {
                         "type": "delta",

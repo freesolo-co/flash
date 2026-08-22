@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import sys
 import types
 import uuid
@@ -29,6 +30,7 @@ from flash.serving.src.model_config import reasoning_parser_for
 from flash.serving.src.registry import AdapterRegistry
 from flash.serving.src.responses import openai_generate_fields
 from flash.serving.src.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.streaming import openai_chat_stream
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
@@ -109,6 +111,35 @@ class _CaptureEngine:
             prompt_token_ids=[1],
             num_cached_tokens=0,
         )
+
+
+class _RepeatedDeltaEngine(_CaptureEngine):
+    async def generate(
+        self,
+        prompt_input,
+        sampling_params,
+        request_id,
+        lora_request=None,
+        reasoning_ended=None,
+        reasoning_parser_kwargs=None,
+    ):
+        self.sampling_params.append(sampling_params)
+        self.reasoning_ended.append(reasoning_ended)
+        self.reasoning_parser_kwargs.append(reasoning_parser_kwargs)
+        for text, token_id, finish_reason in (
+            ("\n", 10, None),
+            ("\n", 10, None),
+            ("done", 11, "stop"),
+        ):
+            yield types.SimpleNamespace(
+                outputs=[
+                    types.SimpleNamespace(
+                        text=text, finish_reason=finish_reason, token_ids=[token_id]
+                    )
+                ],
+                prompt_token_ids=[1, 2],
+                num_cached_tokens=0,
+            )
 
 
 class _FirstAdvanceErrorEngine(_CaptureEngine):
@@ -438,6 +469,86 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     sp = eng.engine.sampling_params[-1]
     assert sp.structured_outputs.json == SCHEMA  # raw schema normalized to a json constraint
     assert eng.engine.reasoning_ended[-1] is True
+
+
+def _repeated_delta_events(modal_app_module):
+    eng = _engine(modal_app_module)
+    eng.engine = _RepeatedDeltaEngine()
+
+    async def drain():
+        return [event async for event in eng._stream_generate({"adapter_id": "r1", "prompt": "hi"})]
+
+    return eng, asyncio.run(drain())
+
+
+def test_stream_generate_extends_repeated_delta_tokens(modal_app_module):
+    from vllm.sampling_params import RequestOutputKind
+
+    eng, events = _repeated_delta_events(modal_app_module)
+
+    assert eng.engine.sampling_params[-1].output_kind == RequestOutputKind.DELTA
+    assert [event["completion_tokens"] for event in events if event["type"] == "delta"] == [
+        1,
+        2,
+        3,
+    ]
+
+
+def test_stream_generate_reports_repeated_delta_usage_totals(modal_app_module):
+    _, events = _repeated_delta_events(modal_app_module)
+
+    assert events[0]["completion_tokens"] == 1
+    assert events[-1]["prompt_tokens"] == 2
+    assert events[-1]["completion_tokens"] == 3
+
+
+def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
+    _, events = _repeated_delta_events(modal_app_module)
+    record = AdapterRecord(
+        adapter_id="r1",
+        repo_id=QWEN,
+        base_model=QWEN,
+        serve_base_model=True,
+        thinking=False,
+        status="ready",
+    )
+
+    async def event_stream():
+        for event in events:
+            yield event
+
+    async def drain():
+        return [
+            chunk
+            async for chunk in openai_chat_stream(
+                MagicMock(),
+                MagicMock(),
+                record=record,
+                events=event_stream(),
+                adapter_id="r1",
+                completion_id="completion-1",
+                created=1,
+                include_usage=True,
+                caller_org=None,
+            )
+        ]
+
+    chunks = asyncio.run(drain())
+    payloads = [
+        json.loads(chunk.removeprefix(b"data: ").removesuffix(b"\n\n"))
+        for chunk in chunks
+        if chunk != b"data: [DONE]\n\n"
+    ]
+    emitted_text = "".join(
+        payload["choices"][0]["delta"].get("content", "") for payload in payloads
+    )
+
+    assert emitted_text == "\n\ndone"
+    assert payloads[-1]["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 3,
+        "total_tokens": 5,
+    }
 
 
 def test_stream_close_after_ready_closes_inner_generator(modal_app_module):
