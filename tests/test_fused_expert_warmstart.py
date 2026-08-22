@@ -668,6 +668,31 @@ def test_export_rejects_debris_only_modules_without_writing(tmp_path):
     assert config_path.read_bytes() == before
 
 
+def test_export_rejects_empty_exclude_modules_without_writing(tmp_path):
+    """an empty regex would validate as text-only and then persist as multimodal.
+
+    modality is read as ``exclude_modules is None`` but was written as ``exclude_modules or None``,
+    so `""` passed the text-only tensor checks and then stamped the config a warm start reads back
+    as multimodal. the two readings must not be able to disagree.
+    """
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    config = {
+        "peft_type": "LORA",
+        "r": 32,
+        "target_modules": list(_TARGETS),
+        "target_parameters": None,
+    }
+    _write_expert_adapter(tmp_path, config=config)
+    config_path = tmp_path / "adapter_config.json"
+    before = config_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="non-empty regex or None"):
+        stamp_adapter_dir_provenance(str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules="")
+
+    assert config_path.read_bytes() == before
+
+
 def test_export_rejects_direct_parameter_only_config_without_writing(tmp_path):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 

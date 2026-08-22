@@ -503,18 +503,6 @@ _TEXT_LORA_KEY_RE = re.compile(
     r"^(?P<module>base_model\.model\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+)"
     r"(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+))*)\.lora_(?P<factor>[AB])\.weight$"
 )
-_NON_LANGUAGE_ADAPTER_SEGMENTS = frozenset(
-    {
-        "mtp",
-        "multi_modal_projector",
-        "patch_embed",
-        "visual",
-        "vision",
-        "vision_encoder",
-        "vision_model",
-        "vision_tower",
-    }
-)
 
 
 def _pair_has_nonzero_delta(factor_a, factor_b, *, require_finite_scan: bool) -> bool:
@@ -631,7 +619,7 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
         or any(not isinstance(target, str) or not target for target in targets)
     ):
         raise RuntimeError(
-            "exported text adapter must declare the concrete non-empty target_modules list emitted "
+            f"{label} must declare the concrete non-empty target_modules list emitted "
             "by the Verl merger"
         )
     try:
@@ -643,8 +631,7 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
     language_pairs: dict[str, dict[str, str]] = {}
     target_evidence: set[str] = set()
     for key, shape in metadata.items():
-        segments = set(key.lower().split("."))
-        non_language = bool(segments & _NON_LANGUAGE_ADAPTER_SEGMENTS)
+        non_language = is_non_language_lora_key(key)
         if non_language and not multimodal:
             raise RuntimeError(f"{label} contains non-language tensor {key!r}")
         match = _TEXT_LORA_KEY_RE.fullmatch(key)
@@ -731,6 +718,13 @@ def stamp_adapter_dir_provenance(
     that way: a vision tensor is contamination in a text-only export and a trained weight in a
     multimodal one. it is required rather than defaulted so a new export path must state which.
     """
+    if exclude_modules is not None and not exclude_modules.strip():
+        # modality is read from this argument as `is None` and written below as `or None`. an empty
+        # string would validate as text-only and then persist as multimodal, so warm start would
+        # read back the opposite modality from the one the tensors were checked against. reject it
+        # rather than pick a side: `resolve_lora_targeting` never emits it, so it can only reach
+        # here from a new caller that has not stated a modality.
+        raise RuntimeError("exclude_modules must be a non-empty regex or None")
     multimodal = exclude_modules is None
     cfg_path = os.path.join(adapter_dir, "adapter_config.json")
     with open(cfg_path) as f:
@@ -746,8 +740,9 @@ def stamp_adapter_dir_provenance(
     cfg["base_model_name_or_path"] = model_id
     cfg["revision"] = model_revision or None
     # write the key in both directions because every warm-start artifact must state its modality.
-    # a present none means multimodal and a present regex means text-only.
-    cfg["exclude_modules"] = exclude_modules or None
+    # a present none means multimodal and a present regex means text-only. the empty string was
+    # rejected above, so this writes back exactly the value the validation below was keyed on.
+    cfg["exclude_modules"] = exclude_modules
     normalize_verl_fused_expert_export(cfg, model_id)
     validate_fused_expert_adapter_config(cfg, model_id)
     if lora_target_parameters(model_id):
