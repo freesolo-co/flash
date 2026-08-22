@@ -26,6 +26,7 @@ DeploymentStatus: TypeAlias = Literal[
     "absent",
 ]
 DeploymentErrorCode: TypeAlias = Literal[
+    "artifact_cleanup_timeout",
     "authentication_failed",
     "capacity_unavailable",
     "conflict",
@@ -37,10 +38,33 @@ DeploymentErrorCode: TypeAlias = Literal[
     "resource_ambiguous",
     "transport_failed",
 ]
+DeploymentErrorReason: TypeAlias = Literal[
+    "artifact_cleanup_conflict",
+    "artifact_cleanup_delete_unknown",
+    "artifact_cleanup_identity_drift",
+    "artifact_cleanup_observation_failed",
+    "artifact_cleanup_patch_unknown",
+    "artifact_cleanup_unproven",
+    "create_cleanup_unconfirmed",
+    "mutation_outcome_unknown",
+    "readiness_artifact_present",
+    "readiness_deadline_cleanup_unconfirmed",
+    "readiness_deadline_unproven",
+    "readiness_observation_cleanup_unconfirmed",
+    "readiness_observation_failed",
+    "readiness_resource_conflict",
+    "readiness_resource_conflict_cleanup_unconfirmed",
+    "readiness_status_invalid",
+    "readiness_status_invalid_cleanup_unconfirmed",
+    "readiness_terminal",
+    "readiness_terminal_cleanup_unconfirmed",
+    "teardown_cleanup_unconfirmed",
+]
 
 _DEPLOYMENT_STATUSES = frozenset({"ready", "provisioning", "failed", "outcome_unknown", "absent"})
 _DEPLOYMENT_ERROR_CODES = frozenset(
     {
+        "artifact_cleanup_timeout",
         "authentication_failed",
         "capacity_unavailable",
         "conflict",
@@ -51,6 +75,30 @@ _DEPLOYMENT_ERROR_CODES = frozenset(
         "readiness_timeout",
         "resource_ambiguous",
         "transport_failed",
+    }
+)
+_DEPLOYMENT_ERROR_REASONS = frozenset(
+    {
+        "artifact_cleanup_conflict",
+        "artifact_cleanup_delete_unknown",
+        "artifact_cleanup_identity_drift",
+        "artifact_cleanup_observation_failed",
+        "artifact_cleanup_patch_unknown",
+        "artifact_cleanup_unproven",
+        "create_cleanup_unconfirmed",
+        "mutation_outcome_unknown",
+        "readiness_artifact_present",
+        "readiness_deadline_cleanup_unconfirmed",
+        "readiness_deadline_unproven",
+        "readiness_observation_cleanup_unconfirmed",
+        "readiness_observation_failed",
+        "readiness_resource_conflict",
+        "readiness_resource_conflict_cleanup_unconfirmed",
+        "readiness_status_invalid",
+        "readiness_status_invalid_cleanup_unconfirmed",
+        "readiness_terminal",
+        "readiness_terminal_cleanup_unconfirmed",
+        "teardown_cleanup_unconfirmed",
     }
 )
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -719,6 +767,7 @@ class DeploymentResult:
     status: DeploymentStatus
     handle: ProviderHandle | None
     error_code: DeploymentErrorCode | None
+    error_reason: DeploymentErrorReason | None
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("deployment results must be constructed from an exact DeploymentSpec")
@@ -759,6 +808,7 @@ class DeploymentResult:
         status: DeploymentStatus,
         handle: ProviderHandle | None = None,
         error_code: DeploymentErrorCode | None = None,
+        error_reason: DeploymentErrorReason | None = None,
     ) -> DeploymentResult:
         """construct one result bound to the exact planned deployment spec."""
 
@@ -771,6 +821,7 @@ class DeploymentResult:
             "status": status,
             "handle": handle,
             "error_code": error_code,
+            "error_reason": error_reason,
         }
         for name, value in values.items():
             object.__setattr__(result, name, value)
@@ -791,6 +842,10 @@ def validate_deployment_result(result: DeploymentResult) -> None:
         type(result.error_code) is not str or result.error_code not in _DEPLOYMENT_ERROR_CODES
     ):
         raise ValueError("error_code is not an allowlisted deployment error")
+    if result.error_reason is not None and (
+        type(result.error_reason) is not str or result.error_reason not in _DEPLOYMENT_ERROR_REASONS
+    ):
+        raise ValueError("error_reason is not an allowlisted deployment reason")
 
     if result.status == "ready" and result.handle is None:
         raise ValueError("ready deployment results require a sanitized provider handle")
@@ -803,6 +858,8 @@ def validate_deployment_result(result: DeploymentResult) -> None:
             )
     elif result.error_code is not None:
         raise ValueError(f"{result.status} deployment results cannot carry an error_code")
+    if result.error_reason is not None and result.error_code is None:
+        raise ValueError("deployment error_reason requires an error_code")
 
     if result.handle is not None:
         if type(result.handle) not in {ModalProviderHandle, RunPodProviderHandle}:

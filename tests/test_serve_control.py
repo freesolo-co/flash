@@ -628,6 +628,7 @@ def test_handles_and_results_expose_exact_secret_free_public_fields() -> None:
             "status",
             "handle",
             "error_code",
+            "error_reason",
         }
         assert result.deployment_id == spec.deployment_id
         assert result.generation == spec.generation
@@ -675,6 +676,15 @@ def test_deployment_result_requires_an_exact_spec_and_matching_handle_provenance
     raw_error = RuntimeError(SECRET_SENTINEL)
     with pytest.raises(ValueError, match="allowlisted deployment error") as exc_info:
         DeploymentResult.from_spec(spec, status="failed", error_code=raw_error)
+    assert SECRET_SENTINEL not in str(exc_info.value)
+
+    with pytest.raises(ValueError, match="allowlisted deployment reason") as exc_info:
+        DeploymentResult.from_spec(
+            spec,
+            status="failed",
+            error_code="resource_ambiguous",
+            error_reason=SECRET_SENTINEL,
+        )
     assert SECRET_SENTINEL not in str(exc_info.value)
 
     mismatches = (

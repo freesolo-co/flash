@@ -6,6 +6,7 @@ from .planning import PlanningError, plan_deployment
 from .types import (
     AdapterAliasIntent,
     DeploymentErrorCode,
+    DeploymentErrorReason,
     DeploymentRequest,
     DeploymentResult,
     DeploymentSpec,
@@ -26,6 +27,7 @@ from .types import (
 __all__ = [
     "AdapterAliasIntent",
     "DeploymentErrorCode",
+    "DeploymentErrorReason",
     "DeploymentRequest",
     "DeploymentResult",
     "DeploymentSpec",

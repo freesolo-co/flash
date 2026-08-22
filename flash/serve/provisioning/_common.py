@@ -17,6 +17,7 @@ from typing import Literal
 from flash.serve.app.manifest import ManifestError, ServingManifest, load_serving_manifest
 from flash.serve.control import (
     DeploymentErrorCode,
+    DeploymentErrorReason,
     DeploymentResult,
     DeploymentSpec,
     ProviderHandle,
@@ -41,6 +42,7 @@ class LifecycleFailure:
 
     code: DeploymentErrorCode
     outcome_unknown: bool = False
+    reason: DeploymentErrorReason | None = None
 
 
 def validate_deadline(deadline_at: float, clock: Clock) -> None:
@@ -66,6 +68,7 @@ _ENGINE_ID_RE = re.compile(r"[0-9a-f]{64}")
 _PROVIDER_NAME_RE = re.compile(r"[a-z][a-z0-9-]*[a-z0-9]")
 _ERROR_CODES = frozenset(
     {
+        "artifact_cleanup_timeout",
         "authentication_failed",
         "capacity_unavailable",
         "conflict",
@@ -79,6 +82,7 @@ _ERROR_CODES = frozenset(
     }
 )
 _ERROR_MESSAGES = {
+    "artifact_cleanup_timeout": "provider artifact cleanup deadline was exceeded",
     "authentication_failed": "provider authentication failed",
     "capacity_unavailable": "provider capacity is unavailable",
     "conflict": "provider resource conflict",
@@ -462,6 +466,7 @@ def failed_deployment_result(
     *,
     outcome_unknown: bool = False,
     handle: ProviderHandle | None = None,
+    error_reason: DeploymentErrorReason | None = None,
 ) -> DeploymentResult:
     """build one sanitized failed or outcome-unknown result."""
 
@@ -472,6 +477,7 @@ def failed_deployment_result(
         status=status,
         handle=handle,
         error_code=failure.code,
+        error_reason=error_reason,
     )
 
 

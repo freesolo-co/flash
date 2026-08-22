@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from enum import Enum, auto
 
-from flash.serve.control import DeploymentResult, RunPodProviderHandle
+from flash.serve.control import DeploymentErrorReason, DeploymentResult, RunPodProviderHandle
 
 from ._common import Clock, DeploymentBundle, LifecycleFailure, Sleeper, failed_deployment_result
 from ._runpod_plan import RunPodCreatePlan
@@ -47,7 +47,9 @@ DeleteSecret = Callable[[str], None]
 class _Confirmation(Enum):
     CONFIRMED = auto()
     TIMED_OUT = auto()
-    AMBIGUOUS = auto()
+    OBSERVATION_FAILED = auto()
+    CONFLICT = auto()
+    IDENTITY_DRIFT = auto()
 
 
 class EndpointProbe:
@@ -73,17 +75,19 @@ def failure_result(
         failure.code,
         outcome_unknown=failure.outcome_unknown,
         handle=handle,
+        error_reason=failure.reason,
     )
 
 
 def unknown_result(
     plan: RunPodCreatePlan,
     *,
+    reason: DeploymentErrorReason,
     handle: RunPodProviderHandle | None = None,
 ) -> DeploymentResult:
     return failure_result(
         plan,
-        LifecycleFailure("resource_ambiguous", outcome_unknown=True),
+        LifecycleFailure("resource_ambiguous", outcome_unknown=True, reason=reason),
         handle=handle,
     )
 
@@ -136,9 +140,17 @@ def read_only_reconcile(
     while True:
         try:
             observation = observe(plan)
-        except RunPodTransportFailure:
+        except RunPodTransportFailure as exc:
             if not sleep_until_poll(deadline_at, clock, sleep):
-                raise
+                return failure_result(
+                    plan,
+                    LifecycleFailure(
+                        exc.code,
+                        outcome_unknown=exc.outcome_unknown,
+                        reason="readiness_observation_failed",
+                    ),
+                    handle=last_handle,
+                )
             continue
         if observation.resource_count == 0:
             return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
@@ -146,10 +158,17 @@ def read_only_reconcile(
             secret, template, volume, pod = exact_core_resources(plan, observation)
             last_handle = build_handle(plan, secret, template, volume, pod)
         except RunPodResourceConflict:
-            return failure_result(plan, LifecycleFailure("conflict"))
+            return failure_result(
+                plan,
+                LifecycleFailure("conflict", reason="readiness_resource_conflict"),
+            )
         state = readiness_state(pod.desired_status)
         if state == "invalid":
-            return failure_result(plan, LifecycleFailure("conflict"), handle=last_handle)
+            return failure_result(
+                plan,
+                LifecycleFailure("conflict", reason="readiness_status_invalid"),
+                handle=last_handle,
+            )
         if state == "failed":
             # same reasoning as the unproven case below: a terminal pod is only *definitely*
             # failed to a caller that can undo what it made. adoption and the read-only
@@ -157,8 +176,16 @@ def read_only_reconcile(
             # the customer account, so answering "failed" lets the supervisor drop the record and
             # strand them, and suppresses the cli's outcome-unknown reconciliation warning.
             if not unproven_is_failure:
-                return unknown_result(plan, handle=last_handle)
-            return failure_result(plan, LifecycleFailure("readiness_failed"), handle=last_handle)
+                return unknown_result(
+                    plan,
+                    reason="readiness_terminal",
+                    handle=last_handle,
+                )
+            return failure_result(
+                plan,
+                LifecycleFailure("readiness_failed", reason="readiness_terminal"),
+                handle=last_handle,
+            )
         if (
             state == "running"
             and (not observation.artifact_secrets or allow_transient_artifact)
@@ -178,7 +205,11 @@ def read_only_reconcile(
             )
         if observation.artifact_secrets and not allow_transient_artifact:
             if not sleep_until_poll(deadline_at, clock, sleep):
-                return unknown_result(plan, handle=last_handle)
+                return unknown_result(
+                    plan,
+                    reason="readiness_artifact_present",
+                    handle=last_handle,
+                )
             continue
         if not sleep_until_poll(deadline_at, clock, sleep):
             if state == "pending":
@@ -194,10 +225,14 @@ def read_only_reconcile(
             # pod keeps billing. it reports unproven instead, which is the truth in both cases and
             # the retry-safe one in the second.
             if not unproven_is_failure:
-                return unknown_result(plan, handle=last_handle)
+                return unknown_result(
+                    plan,
+                    reason="readiness_deadline_unproven",
+                    handle=last_handle,
+                )
             return failure_result(
                 plan,
-                LifecycleFailure("readiness_failed"),
+                LifecycleFailure("readiness_failed", reason="readiness_deadline_unproven"),
                 handle=last_handle,
             )
 
@@ -227,10 +262,10 @@ def confirm_artifact_absence(
             exact_core_resources(plan, observation)
         except RunPodTransportFailure:
             if not sleep_until_poll(deadline_at, clock, sleep):
-                return _Confirmation.AMBIGUOUS
+                return _Confirmation.OBSERVATION_FAILED
             continue
         except RunPodResourceConflict:
-            return _Confirmation.AMBIGUOUS
+            return _Confirmation.CONFLICT
         if not observation.artifact_secrets:
             return _Confirmation.CONFIRMED
         if not sleep_until_poll(deadline_at, clock, sleep):
@@ -265,15 +300,15 @@ def _await_stripped_resources(
             _secret, template, _volume, pod = exact_core_resources(plan, observe(plan))
         except RunPodTransportFailure:
             if not sleep_until_poll(deadline_at, clock, sleep):
-                return _Confirmation.AMBIGUOUS
+                return _Confirmation.OBSERVATION_FAILED
             continue
         except RunPodResourceConflict:
-            return _Confirmation.AMBIGUOUS
+            return _Confirmation.CONFLICT
         # a successful patch response is not proof that the next read still names the resources we
         # patched. deterministic names can be reused after replacement, so ids bind cleanup to the
         # exact template and pod whose artifact reference was present before the transition.
         if template.id != template_id or pod.id != pod_id:
-            return _Confirmation.AMBIGUOUS
+            return _Confirmation.IDENTITY_DRIFT
         resources_are_stripped = (
             template.environment == plan.environment_without_artifact
             and _pod_environment_is_stripped(plan, pod)
@@ -301,10 +336,28 @@ def _unconfirmed_cleanup_result(
     plan: RunPodCreatePlan,
     confirmation: _Confirmation,
     handle: RunPodProviderHandle,
+    *,
+    timeout_reason: DeploymentErrorReason,
 ) -> DeploymentResult:
     if confirmation is _Confirmation.TIMED_OUT:
-        return failure_result(plan, LifecycleFailure("readiness_timeout"), handle=handle)
-    return unknown_result(plan, handle=handle)
+        return failure_result(
+            plan,
+            LifecycleFailure(
+                "artifact_cleanup_timeout",
+                reason=timeout_reason,
+            ),
+            handle=handle,
+        )
+    reason_by_confirmation = {
+        _Confirmation.OBSERVATION_FAILED: "artifact_cleanup_observation_failed",
+        _Confirmation.CONFLICT: "artifact_cleanup_conflict",
+        _Confirmation.IDENTITY_DRIFT: "artifact_cleanup_identity_drift",
+    }
+    return unknown_result(
+        plan,
+        reason=reason_by_confirmation[confirmation],
+        handle=handle,
+    )
 
 
 def delete_artifact_and_confirm(
@@ -330,10 +383,18 @@ def delete_artifact_and_confirm(
             _secret, template, _volume, pod = exact_core_resources(plan, observe(plan))
         except RunPodTransportFailure:
             if not sleep_until_poll(deadline_at, clock, sleep):
-                return unknown_result(plan, handle=handle)
+                return unknown_result(
+                    plan,
+                    reason="artifact_cleanup_observation_failed",
+                    handle=handle,
+                )
             continue
         except RunPodResourceConflict:
-            return unknown_result(plan, handle=handle)
+            return unknown_result(
+                plan,
+                reason="artifact_cleanup_conflict",
+                handle=handle,
+            )
         break
     needs_template_patch = template.environment != plan.environment_without_artifact
     needs_pod_patch = not _pod_environment_is_stripped(plan, pod)
@@ -347,7 +408,11 @@ def delete_artifact_and_confirm(
                 # not consume them. if runpod retains them, the subset check below deliberately allows it.
                 patch_pod(pod.id, plan.pod_environment_payload())
         except RunPodTransportFailure:
-            return unknown_result(plan, handle=handle)
+            return unknown_result(
+                plan,
+                reason="artifact_cleanup_patch_unknown",
+                handle=handle,
+            )
         # the endpoint probe authenticates with the inference token, not the artifact token. prove
         # the restarted workload before deleting the artifact secret so an unproven transition
         # remains recoverable, while the stripped references prevent the restarted pod using it.
@@ -365,11 +430,20 @@ def delete_artifact_and_confirm(
             sleep=sleep,
         )
         if confirmation is not _Confirmation.CONFIRMED:
-            return _unconfirmed_cleanup_result(plan, confirmation, handle)
+            return _unconfirmed_cleanup_result(
+                plan,
+                confirmation,
+                handle,
+                timeout_reason="artifact_cleanup_unproven",
+            )
     try:
         delete_secret(artifact.id)
     except RunPodTransportFailure:
-        return unknown_result(plan, handle=handle)
+        return unknown_result(
+            plan,
+            reason="artifact_cleanup_delete_unknown",
+            handle=handle,
+        )
     confirmation = confirm_artifact_absence(
         plan,
         observe,
@@ -378,7 +452,12 @@ def delete_artifact_and_confirm(
         sleep=sleep,
     )
     if confirmation is not _Confirmation.CONFIRMED:
-        return _unconfirmed_cleanup_result(plan, confirmation, handle)
+        return _unconfirmed_cleanup_result(
+            plan,
+            confirmation,
+            handle,
+            timeout_reason="artifact_cleanup_delete_unknown",
+        )
     return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
 
 

@@ -572,6 +572,52 @@ class _PostReadyObservationFailureTransport(_FakeTransport):
         return response
 
 
+class _TerminalThenEventuallyAbsentTransport(_FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stale_template: dict[str, object] | None = None
+
+    def rest(
+        self,
+        method,
+        path,
+        payload,
+        *,
+        mutation: bool,
+        deadline_at: float,
+        query=None,
+    ):
+        if method == "GET" and path == "/pods" and self.pods:
+            self.pods[0]["desiredStatus"] = "EXITED"
+        return super().rest(
+            method,
+            path,
+            payload,
+            mutation=mutation,
+            deadline_at=deadline_at,
+            query=query,
+        )
+
+    def _delete(self, path: str) -> None:
+        if path == "/templates/template01":
+            self.stale_template = dict(self.templates[0])
+        super()._delete(path)
+
+    def _list(self, path: str) -> list[dict[str, object]]:
+        if path == "/templates" and self.stale_template is not None:
+            stale = self.stale_template
+            self.stale_template = None
+            return [stale]
+        return super()._list(path)
+
+
+class _TerminalThenUnconfirmedCleanupTransport(_TerminalThenEventuallyAbsentTransport):
+    def _list(self, path: str) -> list[dict[str, object]]:
+        if path == "/templates" and self.stale_template is not None:
+            return [dict(self.stale_template)]
+        return super()._list(path)
+
+
 class _PostReadyIdentityDriftTransport(_FakeTransport):
     def rest(
         self,
@@ -890,12 +936,17 @@ def test_secret_sentinels_are_confined_to_exact_request_sinks() -> None:
     transport = _FakeTransport()
     result, factory, probe = _provision(bundle, transport)
 
-    encoded = repr((result.spec, result.status, result.handle, result.error_code))
+    encoded = repr(
+        (result.spec, result.status, result.handle, result.error_code, result.error_reason)
+    )
     assert all(
         secret not in encoded for secret in (PROVIDER_SECRET, INFERENCE_SECRET, ARTIFACT_SECRET)
     )
     assert all(
-        secret not in repr((result.spec, result.status, result.handle, result.error_code))
+        secret
+        not in repr(
+            (result.spec, result.status, result.handle, result.error_code, result.error_reason)
+        )
         for secret in (PROVIDER_SECRET, INFERENCE_SECRET, ARTIFACT_SECRET)
     )
     assert factory.accepted_keys == [True]
@@ -985,7 +1036,7 @@ def test_wrong_account_fails_closed_with_sanitized_error() -> None:
     assert result.error_code == "authentication_failed"
     assert result.handle is None
     assert PROVIDER_SECRET not in repr(
-        (result.spec, result.status, result.handle, result.error_code)
+        (result.spec, result.status, result.handle, result.error_code, result.error_reason)
     )
 
 
@@ -1009,6 +1060,7 @@ def test_ambiguous_mutation_is_not_retried_and_returns_outcome_unknown() -> None
 
     assert result.status == "outcome_unknown"
     assert result.error_code == "resource_ambiguous"
+    assert result.error_reason == "mutation_outcome_unknown"
     assert transport.mutation_count == 1
     assert len(_mutation_calls(transport)) == 1
 
@@ -1374,7 +1426,7 @@ def test_artifact_secret_survives_until_a_patched_pod_is_running_again() -> None
     )
 
     assert result.status == "failed"
-    assert result.error_code == "readiness_timeout"
+    assert result.error_code == "artifact_cleanup_timeout"
     assert result.handle == handle
     assert [call[1] for call in _mutation_calls(transport)] == [
         "PATCH /templates/template01",
@@ -1407,7 +1459,8 @@ def test_patched_running_pod_is_not_ready_until_its_endpoint_serves_again() -> N
     assert result.status == "failed", (
         "desiredStatus RUNNING was accepted without post-restart endpoint proof"
     )
-    assert result.error_code == "readiness_timeout"
+    assert result.error_code == "artifact_cleanup_timeout"
+    assert result.error_reason == "artifact_cleanup_unproven"
     assert result.handle == handle
     assert len(probe.calls) == 2, "the endpoint was not re-probed after the pod patch"
     assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
@@ -1466,7 +1519,8 @@ def test_post_ready_cleanup_deadline_is_definite_without_weakening_ambiguity() -
     result, _factory, probe = _provision(bundle, transport, probe=_Probe(True))
 
     assert result.status == "failed"
-    assert result.error_code == "readiness_timeout"
+    assert result.error_code == "artifact_cleanup_timeout"
+    assert result.error_reason == "artifact_cleanup_unproven"
     assert result.handle is not None
     assert result.handle.pod_id == POD_ID
     assert transport.clock.now == 70.0, "the post-ready wait exceeded its work deadline"
@@ -1474,16 +1528,18 @@ def test_post_ready_cleanup_deadline_is_definite_without_weakening_ambiguity() -
     assert transport.pods, "a tracked ready pod must remain available for explicit teardown"
     assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
 
-    for ambiguous_transport in (
-        _PostReadyObservationFailureTransport(),
-        _PostReadyResourceConflictTransport(),
-        _PostReadyIdentityDriftTransport(),
-        _PostDeleteObservationFailureTransport(),
-        _PostDeleteResourceConflictTransport(),
-    ):
+    ambiguous_cases = (
+        (_PostReadyObservationFailureTransport(), "artifact_cleanup_observation_failed"),
+        (_PostReadyResourceConflictTransport(), "artifact_cleanup_conflict"),
+        (_PostReadyIdentityDriftTransport(), "artifact_cleanup_identity_drift"),
+        (_PostDeleteObservationFailureTransport(), "artifact_cleanup_observation_failed"),
+        (_PostDeleteResourceConflictTransport(), "artifact_cleanup_conflict"),
+    )
+    for ambiguous_transport, expected_reason in ambiguous_cases:
         ambiguous, _factory, _probe = _provision(bundle, ambiguous_transport)
         assert ambiguous.status == "outcome_unknown"
         assert ambiguous.error_code == "resource_ambiguous"
+        assert ambiguous.error_reason == expected_reason
         assert ambiguous.handle is not None
         assert ambiguous.handle.pod_id == POD_ID
 
@@ -1508,7 +1564,8 @@ def test_artifact_absence_deadline_is_definite_and_keeps_the_handle() -> None:
     result, _factory, _probe = _provision(bundle, transport, probe=_Probe(True))
 
     assert result.status == "failed"
-    assert result.error_code == "readiness_timeout"
+    assert result.error_code == "artifact_cleanup_timeout"
+    assert result.error_reason == "artifact_cleanup_delete_unknown"
     assert result.handle is not None
     assert result.handle.pod_id == POD_ID
     assert transport.clock.now == 70.0, "artifact confirmation exceeded its work deadline"
@@ -1702,7 +1759,7 @@ def test_artifact_secret_survives_if_template_reference_returns_during_pod_patch
     )
 
     assert result.status == "failed"
-    assert result.error_code == "readiness_timeout"
+    assert result.error_code == "artifact_cleanup_timeout"
     assert "FLASH_ARTIFACT_TOKEN" in transport.templates[0]["env"]
     assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
     assert [call[1] for call in _mutation_calls(transport)] == [
@@ -1770,7 +1827,7 @@ def test_artifact_secret_survives_until_the_template_patch_is_observed() -> None
         ["PATCH /templates/template01", f"PATCH /pods/{POD_ID}"],
         [_names(bundle).inference_secret, _names(bundle).artifact_secret],
     )
-    assert result.error_code == "readiness_timeout"
+    assert result.error_code == "artifact_cleanup_timeout"
 
 
 def test_artifact_secret_survives_until_the_pod_patch_is_observed() -> None:
@@ -1835,7 +1892,7 @@ def test_artifact_secret_survives_until_the_pod_patch_is_observed() -> None:
         ["PATCH /templates/template01", f"PATCH /pods/{POD_ID}"],
         [_names(bundle).inference_secret, _names(bundle).artifact_secret],
     )
-    assert result.error_code == "readiness_timeout"
+    assert result.error_code == "artifact_cleanup_timeout"
 
 
 def test_artifact_cleanup_does_not_patch_a_template_that_drifted_after_readiness() -> None:
@@ -2198,7 +2255,7 @@ def test_probe_exceptions_are_sanitized_as_unproven_adoption() -> None:
     assert result.status == "outcome_unknown"
     assert result.handle == handle
     assert INFERENCE_SECRET not in repr(
-        (result.spec, result.status, result.handle, result.error_code)
+        (result.spec, result.status, result.handle, result.error_code, result.error_reason)
     )
 
 
@@ -2792,6 +2849,35 @@ def test_adoption_reports_unproven_rather_than_failed_when_the_deadline_expires(
     assert _mutation_calls(transport) == [], "adoption must never tear down a pod it did not create"
 
 
+def test_terminal_create_waits_for_eventual_cleanup_absence() -> None:
+    bundle = _bundle()
+    transport = _TerminalThenEventuallyAbsentTransport()
+
+    result, _factory, _probe = _provision(bundle, transport, probe=_Probe(False))
+
+    assert result.status == "failed"
+    assert result.error_code == "readiness_failed"
+    assert result.error_reason == "readiness_terminal"
+    assert transport.clock.now == 2.0
+    assert transport.pods == []
+    assert transport.templates == []
+    assert transport.volumes == []
+    assert transport.secrets == []
+
+
+def test_terminal_create_with_unconfirmed_cleanup_stays_outcome_unknown() -> None:
+    bundle = _bundle()
+    transport = _TerminalThenUnconfirmedCleanupTransport()
+
+    result, _factory, _probe = _provision(bundle, transport, probe=_Probe(False))
+
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "resource_ambiguous"
+    assert result.error_reason == "readiness_terminal_cleanup_unconfirmed"
+    assert result.handle is not None
+    assert result.handle.pod_id == POD_ID
+
+
 def test_a_create_whose_pod_never_proves_readiness_is_still_torn_down() -> None:
     """readiness must not spend the deadline that teardown needs.
 
@@ -2919,6 +3005,7 @@ def test_read_only_reconcile_reports_unproven_rather_than_failed_for_a_terminal_
     )
 
     assert result.status == "outcome_unknown"
+    assert result.error_reason == "readiness_terminal"
     assert result.handle == handle
     assert transport.pods, "the resources are still there, so the verdict must not read as done"
     assert _mutation_calls(transport) == [], "a read-only reconcile must not mutate provider state"

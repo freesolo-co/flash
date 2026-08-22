@@ -336,7 +336,10 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
 
         identities.append(encode_deployment_identity(bundle))
         return DeploymentResult.from_spec(
-            bundle.spec, status="outcome_unknown", error_code="transport_failed"
+            bundle.spec,
+            status="outcome_unknown",
+            error_code="transport_failed",
+            error_reason="readiness_observation_failed",
         )
 
     _stub_resolution(monkeypatch)
@@ -347,6 +350,7 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     captured = capsys.readouterr()
     assert "outcome_unknown" in captured.out
     assert f"identity    {identities[0]}\n" in captured.out
+    assert "reason      readiness_observation_failed" in captured.err
     assert "flash serve status" in captured.err
     assert "flash serve undeploy" in captured.err
 
@@ -398,6 +402,34 @@ def test_readiness_timeout_names_the_pod_and_points_to_teardown(
     assert "pod pod1234567890" in captured.err
     assert "flash serve undeploy" in captured.err
     assert "outcome could not be confirmed" not in captured.err
+
+
+def test_artifact_cleanup_timeout_reports_a_ready_service_without_teardown_advice(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from flash.serve.control import DeploymentResult
+
+    def _timed_out(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        ready = _result(bundle)
+        return DeploymentResult.from_spec(
+            bundle.spec,
+            status="failed",
+            handle=ready.handle,
+            error_code="artifact_cleanup_timeout",
+            error_reason="artifact_cleanup_unproven",
+        )
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setattr("flash.serve.provisioning.runpod.provision_runpod_deployment", _timed_out)
+
+    assert cmd_serve_deploy(_args(provider="runpod")) == 1
+    captured = capsys.readouterr()
+    assert "service reached readiness" in captured.err
+    assert "artifact cleanup did not settle" in captured.err
+    assert "flash serve status" in captured.err
+    assert "readiness did not prove" not in captured.err
+    assert "flash serve undeploy" not in captured.err
 
 
 def test_interrupted_deploy_prints_recovery_identity_without_masking_interrupt(

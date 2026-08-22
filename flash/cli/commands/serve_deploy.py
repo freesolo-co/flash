@@ -105,7 +105,20 @@ def _report(result, bundle) -> int:
         return 0
     if result.error_code:
         print(f"error       {result.error_code}", file=sys.stderr)
+    if result.error_reason:
+        print(f"reason      {result.error_reason}", file=sys.stderr)
     if (
+        result.error_code == "artifact_cleanup_timeout"
+        and handle is not None
+        and handle.provider == "runpod"
+    ):
+        print(
+            f"\nthe service reached readiness on pod {handle.pod_id}, but artifact cleanup did "
+            "not settle within the deadline. run `flash serve status` to inspect the deployment "
+            "before deciding whether any further action is needed.",
+            file=sys.stderr,
+        )
+    elif (
         result.error_code == "readiness_timeout"
         and handle is not None
         and handle.provider == "runpod"

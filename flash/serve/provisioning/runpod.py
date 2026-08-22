@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 
 from flash.serve.control import (
+    DeploymentErrorReason,
     DeploymentResult,
     RunPodCredentials,
     RunPodProviderHandle,
@@ -172,7 +173,8 @@ def _observe(
 
 
 def _from_transport_failure(exc: RunPodTransportFailure) -> LifecycleFailure:
-    return LifecycleFailure(exc.code, exc.outcome_unknown)
+    reason = "mutation_outcome_unknown" if exc.outcome_unknown else None
+    return LifecycleFailure(exc.code, exc.outcome_unknown, reason)
 
 
 def _bind_observe(transport: RunPodTransport, *, deadline_at: float) -> Observe:
@@ -528,7 +530,11 @@ def _abort_created_resources(
             _delete_tolerating_ambiguity(
                 lambda: _delete_secret_once(transport, inference.id, deadline_at=deadline_at)
             )
-        return _observe(plan, transport, deadline_at=deadline_at).resource_count == 0
+        while True:
+            if _observe(plan, transport, deadline_at=deadline_at).resource_count == 0:
+                return True
+            if not sleep_until_poll(deadline_at, clock, sleep):
+                return False
     except (RunPodResourceConflict, RunPodTransportFailure):
         return False
 
@@ -556,7 +562,20 @@ def _failure_after_create_attempt(
     )
     if absent and not failure.outcome_unknown:
         return failure_result(plan, failure)
-    return unknown_result(plan, handle=handle)
+    cleanup_reason_by_failure: dict[DeploymentErrorReason, DeploymentErrorReason] = {
+        "readiness_deadline_unproven": "readiness_deadline_cleanup_unconfirmed",
+        "readiness_observation_failed": "readiness_observation_cleanup_unconfirmed",
+        "readiness_resource_conflict": "readiness_resource_conflict_cleanup_unconfirmed",
+        "readiness_status_invalid": "readiness_status_invalid_cleanup_unconfirmed",
+        "readiness_terminal": "readiness_terminal_cleanup_unconfirmed",
+    }
+    if failure.reason in cleanup_reason_by_failure:
+        reason = cleanup_reason_by_failure[failure.reason]
+    elif failure.outcome_unknown:
+        reason = "mutation_outcome_unknown"
+    else:
+        reason = "create_cleanup_unconfirmed"
+    return unknown_result(plan, reason=reason, handle=handle)
 
 
 def provision_runpod_deployment(
@@ -641,14 +660,17 @@ def provision_runpod_deployment(
         )
         if ready.status == "ready":
             return ready
-        if ready.error_code == "readiness_timeout":
+        if ready.error_code in {"readiness_timeout", "artifact_cleanup_timeout"}:
             return ready
         if ready.status == "failed":
             return _failure_after_create_attempt(
                 plan,
                 transport,
                 ledger,
-                LifecycleFailure(ready.error_code or "readiness_failed"),
+                LifecycleFailure(
+                    ready.error_code or "readiness_failed",
+                    reason=ready.error_reason,
+                ),
                 handle=handle,
                 deadline_at=deadline_at,
                 clock=clock,
@@ -757,7 +779,11 @@ def teardown_runpod_deployment(
             ):
                 # the delete was accepted but the pod was still listed at the deadline. absence was
                 # never proved, so this is ambiguous rather than a confirmed failure.
-                return unknown_result(plan, handle=handle)
+                return unknown_result(
+                    plan,
+                    reason="teardown_cleanup_unconfirmed",
+                    handle=handle,
+                )
         if any(resource is not None for resource in (template, volume, inference, artifact)):
             mutation_attempted = True
         if template is not None:
@@ -775,12 +801,24 @@ def teardown_runpod_deployment(
         final = _observe(plan, transport, deadline_at=deadline_at)
         if final.resource_count == 0:
             return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
-        return unknown_result(plan, handle=handle)
+        return unknown_result(
+            plan,
+            reason="teardown_cleanup_unconfirmed",
+            handle=handle,
+        )
     except RunPodResourceConflict:
         if mutation_attempted:
-            return unknown_result(plan, handle=handle)
+            return unknown_result(
+                plan,
+                reason="teardown_cleanup_unconfirmed",
+                handle=handle,
+            )
         return failure_result(plan, LifecycleFailure("conflict"), handle=handle)
     except RunPodTransportFailure as exc:
         if mutation_attempted:
-            return unknown_result(plan, handle=handle)
+            return unknown_result(
+                plan,
+                reason="teardown_cleanup_unconfirmed",
+                handle=handle,
+            )
         return failure_result(plan, _from_transport_failure(exc), handle=handle)
