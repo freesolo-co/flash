@@ -9164,6 +9164,38 @@ def test_normalize_initial_prompt_rejects_a_state_with_no_prompt():
         normalize_initial_prompt(_Prompt(), state, None)
 
 
+def test_opd_multigpu_gpu_mem_util_matches_the_shared_tp_aware_resolver():
+    request = SimpleNamespace(
+        model_revision="",
+        knobs=SimpleNamespace(group_size=4),
+        spec=SimpleNamespace(gpu=SimpleNamespace(type="H200")),
+    )
+    prompt_state = SimpleNamespace(max_model_len=2048)
+    workload = SimpleNamespace(prompts_per_step=2)
+    runtime = SimpleNamespace(gpu_count=2)
+    model_id = "Qwen/Qwen3.6-35B-A3B"
+
+    got = opd_train._resolve_opd_gpu_mem_util(
+        request, prompt_state, workload, runtime, model_id, fp8_kv=False
+    )
+    want = rl_train.resolve_gpu_mem_util(
+        {
+            "model_id": model_id,
+            "model_revision": "",
+            "engine_len": 2048,
+            "group_size": 8,
+        },
+        gpu_type="H200",
+        n_gpus=2,
+        fp8_kv=False,
+        sleep_unsupported=True,
+        preserve_legacy_floor=True,
+    )
+
+    assert got == want
+    assert got < rl_train._DEFAULT_GPU_MEM_UTIL
+
+
 def test_build_opd_overrides_sizes_the_rollout_memory_budget():
     # opd emitted no gpu_memory_utilization at all, so verl substituted its own default of 0.5 and
     # the engine claimed half the CARD on every wake regardless of what the trainer held. this is

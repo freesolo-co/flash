@@ -138,15 +138,18 @@ def colocate_kv_util(
     fp8_kv: bool = False,
     model_info=None,
     preserve_legacy_floor: bool = False,
+    tensor_parallel: int = 1,
 ) -> float:
-    """vllm_gpu_memory_utilization for the colocated GRPO rollout engine.
+    """vllm_gpu_memory_utilization for one colocated rollout tensor-parallel rank.
 
-    Budget vLLM's weight copy plus KV cache. Catalog models use geometry with measured overhead
-    and an 8 GB floor; uncataloged models retain the conservative legacy equation.
+    Budget the rank's weight shard plus a conservative full KV cache. Catalog models use geometry
+    with measured overhead and an 8 GB floor; uncataloged models retain the legacy KV equation.
     """
-    weights_gb = (
-        max(0.5, float(params_b or 1.0)) * 2.0
-    )  # vLLM's bf16 weight copy lives in the budget
+    total_weights_gb = max(0.5, float(params_b or 1.0)) * 2.0
+    tp_size = max(1, int(tensor_parallel))
+    # tensor parallelism shards vllm's bf16 weights, but kv heads can replicate when tp is wider than
+    # the model's kv-head count. shard only the weight term and keep the full kv budget on every rank.
+    weights_gb = total_weights_gb if tp_size == 1 else total_weights_gb / tp_size
     # catalog geometry is authoritative. active params remain only for the uncataloged fallback, while
     # the weight copy always uses total parameters.
     kv_params_b = float(active_params_b) if active_params_b else params_b
@@ -184,4 +187,5 @@ def colocate_kv_util(
             preserve_legacy_floor=preserve_legacy_floor,
         ),
     )
-    return min(_util_cap, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
+    sized = min(_util_cap, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
+    return max(0.10, sized) if tp_size > 1 else sized
