@@ -2715,11 +2715,8 @@ def test_a_deployment_that_vanishes_during_artifact_cleanup_is_not_reported_read
 
 
 def test_observation_survives_a_pod_waiting_for_its_machine() -> None:
-    # runpod omits `machine` entirely while a pod is CREATED or PENDING: placement is not decided
-    # yet, so there is no gpu type or data center to report. demanding them collapsed the whole
-    # account-wide listing into an opaque transport failure before `readiness_state` could classify
-    # the pending status -- so provisioning aborted instead of waiting for capacity, and any
-    # unrelated queued pod in the customer's account broke this deployment's observation too.
+    # a created or pending selected pod can omit machine placement. the parser preserves that
+    # absence so readiness can classify it as pending rather than treating it as malformed.
     for status in ("CREATED", "PENDING"):
         pending = parse_pods(
             [
@@ -2881,11 +2878,8 @@ def test_environment_still_rejects_an_empty_key() -> None:
 
 
 def test_observation_survives_a_resource_that_sets_no_environment() -> None:
-    # runpod sends `env: null` for a resource with no overrides rather than an empty object, the
-    # same shape `ports` and `dockerStartCmd` already had to accept. every account resource is
-    # parsed before the name filter, so rejecting null collapsed the whole listing into an opaque
-    # transport failure -- one foreign env-less pod blocked provision, readiness, and artifact
-    # cleanup for a deployment that never owned it.
+    # a retained resource with an absent env carries no observed overrides. present values remain
+    # strict objects, so absence does not broaden the accepted environment shape.
     pod = parse_pods(
         [
             {

@@ -101,22 +101,16 @@ class RunPodPodObservation:
     name: str
     desired_status: str
     image_name: str
-    # None until runpod assigns a machine. a CREATED or PENDING pod has no `machine` object yet, so
-    # placement is simply not decided. these are parsed account-wide like the two ids below, so
-    # demanding them failed the whole pass on any foreign pod still waiting for capacity -- and on
-    # our own, before it was placed. `pod_identity_matches` compares both against nonempty plan
-    # values, so None never matches and an unplaced pod is never mistaken for a ready one.
+    # None when the selected pod has no machine or gpu identity. identity matching permits absent
+    # placement only while the pod is pending and requires exact values once it is running.
     gpu_type_id: str | None
     gpu_count: int
     data_center_id: str | None
     container_disk_gb: int
-    # None when the pod has no network volume attached. every pod in the account is parsed during
-    # observation, including ones flash did not create, and demanding an id there failed the whole
-    # pass on a foreign volume-less pod. our own pods always carry one, and `pod_matches` compares
-    # this against the plan's volume id, so None simply never matches.
+    # None when the selected pod has no nested network volume id. identity matching requires the
+    # exact id while the pod is running and permits absence only after it releases its attachments.
     network_volume_id: str | None
-    # None when the pod was not created from a template. runpod returns "" rather than omitting
-    # the key, and the same foreign-pod reasoning as network_volume_id applies.
+    # None when the selected pod has no nonempty template id.
     template_id: str | None
     ports: tuple[str, ...]
     environment: tuple[tuple[str, str], ...]
@@ -212,11 +206,8 @@ def _environment_value(value: object) -> str:
 
 
 def _environment(value: object) -> tuple[tuple[str, str], ...]:
-    # runpod sends json null rather than an empty object for a resource with no overrides, exactly
-    # as it does for `ports` and `dockerStartCmd` above. every account resource is parsed before the
-    # name filter, so rejecting null failed the whole observation pass on the first foreign env-less
-    # pod or template -- blocking provision, readiness, and artifact cleanup for a deployment that
-    # never owned it. no overrides is the same observation as an empty map.
+    # a missing or null env and an empty object both carry no observed overrides. retained resources
+    # with a present env are parsed strictly as an object of opaque string values.
     if value is None:
         return ()
     if type(value) is not dict:
@@ -410,9 +401,9 @@ def parse_pods(value: object, *, keep_name: str | None = None) -> tuple[RunPodPo
                     else None
                 ),
                 ports=_ports(row.get("ports"), "pod ports"),
-                # every account pod is parsed, including foreign pods that legitimately omit env.
-                # an absent environment therefore means no overrides rather than a failed pass.
-                environment=_environment(row.get("env", {})),
+                # keep_name has already excluded foreign pods; an absent env on the selected pod
+                # carries no observed overrides.
+                environment=_environment(row.get("env")),
             )
         )
     return tuple(parsed)
