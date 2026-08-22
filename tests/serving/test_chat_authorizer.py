@@ -483,9 +483,8 @@ def test_cache_entry_expires_after_ttl(modal_app_module, monkeypatch):
     assert calls["n"] == 2
 
 
-def test_engine_secret_excludes_router_only_credentials(modal_app_module, monkeypatch: Any) -> None:
+def test_engine_secret_contains_only_engine_credentials(modal_app_module, monkeypatch: Any) -> None:
     for name in (
-        "HF_API_KEY",
         "HF_TOKEN",
         "PLATFORM_BACKEND_URL",
         "FREESOLO_INTERNAL_KEY",
@@ -500,8 +499,8 @@ def test_engine_secret_excludes_router_only_credentials(modal_app_module, monkey
 
     assert "FREESOLO_INTERNAL_KEY" not in engine_values
     assert "PLATFORM_BACKEND_URL" not in engine_values
-    assert engine_values["SUPABASE_URL"] == "value-for-SUPABASE_URL"
-    assert engine_values["SUPABASE_SERVICE_ROLE_KEY"] == "value-for-SUPABASE_SERVICE_ROLE_KEY"
+    assert "SUPABASE_URL" not in engine_values
+    assert "SUPABASE_SERVICE_ROLE_KEY" not in engine_values
 
     modal_app_module.modal.Secret.from_dict.reset_mock()
     modal_app_module._runtime_secret()

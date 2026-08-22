@@ -68,7 +68,7 @@ def modal_app_module():
 _DEVELOPMENT_CUSTOM_DOMAIN = "serve-dev.freesolo.co"
 _DEVELOPMENT_WIRING = {
     "FREESOLO_INTERNAL_KEY": "dev-internal-key",
-    "HF_API_KEY": "dev-hf-key",
+    "HF_TOKEN": "dev-hf-key",
     "PLATFORM_BACKEND_URL": "https://api-dev.freesolo.co",
     "SUPABASE_PROJECT_REF": "production-project-ref",
     "SUPABASE_PROJECT_REF_DEV": "dev-project-ref",
@@ -80,7 +80,6 @@ _DEPLOYMENT_ENV_VARS = (
     "SERVING_DEPLOYMENT_MODE",
     "SERVING_CUSTOM_DOMAIN",
     "FREESOLO_INTERNAL_KEY",
-    "HF_API_KEY",
     "HF_TOKEN",
     "PLATFORM_BACKEND_URL",
     "SUPABASE_PROJECT_REF",
@@ -301,6 +300,94 @@ def test_invalid_deployment_mode_fails_import() -> None:
     assert "SERVING_DEPLOYMENT_MODE must be 'production' or 'development'" in result.stderr
 
 
+def test_engine_secret_allowlists_only_hf_token(modal_app_module, monkeypatch) -> None:
+    values = {
+        "HF_TOKEN": "hf-secret",
+        "SERVING_DEPLOYMENT_MODE": "development",
+        "SERVING_CUSTOM_DOMAIN": _DEVELOPMENT_CUSTOM_DOMAIN,
+        "FREESOLO_INTERNAL_KEY": "internal-secret",
+        "PLATFORM_BACKEND_URL": "https://api-dev.freesolo.co",
+        "FREESOLO_DEPLOYMENT_SHA": "deployment-sha",
+        "FREESOLO_DEPLOYMENT_ID": "deployment-id",
+        "SUPABASE_PROJECT_REF": "production-project-ref",
+        "SUPABASE_PROJECT_REF_DEV": "dev-project-ref",
+        "SUPABASE_URL": "https://dev-project-ref.supabase.co",
+        "SUPABASE_SERVICE_ROLE_KEY": "supabase-secret",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+    modal_app_module.modal.Secret.from_dict.reset_mock()
+    modal_app_module._engine_secret()
+    engine_values = modal_app_module.modal.Secret.from_dict.call_args.args[0]
+
+    assert "SUPABASE_SERVICE_ROLE_KEY" not in engine_values
+    assert "SUPABASE_URL" not in engine_values
+    assert engine_values == {"HF_TOKEN": "hf-secret"}
+
+
+def test_router_secret_keeps_supabase_credentials(modal_app_module, monkeypatch) -> None:
+    monkeypatch.setenv("HF_TOKEN", "hf-secret")
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "supabase-secret")
+
+    modal_app_module.modal.Secret.from_dict.reset_mock()
+    modal_app_module._runtime_secret()
+    router_values = modal_app_module.modal.Secret.from_dict.call_args.args[0]
+
+    assert router_values["SUPABASE_URL"] == "https://project.supabase.co"
+    assert router_values["SUPABASE_SERVICE_ROLE_KEY"] == "supabase-secret"
+
+
+def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_path) -> None:
+    from flash.serving.src.registry import AdapterRegistry
+
+    revision = "a" * 40
+    adapter_id = f"run-1@step-1.{revision}"
+    record_dict = {
+        "adapter_id": adapter_id,
+        "repo_id": "org/private-adapter",
+        "base_model": "Qwen/Qwen3.5-4B",
+        "org_id": "org-1",
+        "checkpoint": "run-1/step-1",
+        "private": True,
+        "thinking": False,
+        "status": "ready",
+        "metadata": {
+            "record_type": "revision",
+            "run_id": "run-1",
+            "checkpoint_step": 1,
+            "hf_revision": revision,
+        },
+    }
+    engine = object.__new__(modal_app_module._LoraEngineImpl)
+    engine.base_model = record_dict["base_model"]
+    engine.registry = AdapterRegistry()
+    engine._adapter_locks = {}
+    engine._adapter_locks_guard = asyncio.Lock()
+    resolved_path = tmp_path / "adapter"
+    resolved_request = object()
+
+    async def ensure_adapter_local(record):
+        assert record.adapter_id == adapter_id
+        return resolved_path
+
+    def cached_lora_request(record, path):
+        assert record.adapter_id == adapter_id
+        assert path == resolved_path
+        return resolved_request
+
+    engine._ensure_adapter_local_locked = ensure_adapter_local
+    engine._cached_lora_request_locked = cached_lora_request
+    assert engine.registry.list_ready() == []
+
+    lora_request, record = asyncio.run(engine._lora_request(adapter_id, record_dict))
+
+    assert lora_request is resolved_request
+    assert record.adapter_id == adapter_id
+    assert engine.registry.get(adapter_id) == record
+
+
 def test_lora_engine_import_does_not_require_pillow() -> None:
     code = """
 import builtins
@@ -406,7 +493,6 @@ def test_35b_moe_routes_to_h200(modal_app_module):
     assert gpu_for("Qwen/Qwen3.6-35B-A3B") == "H200"
     assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("H200", 16)]
     assert by_key[("H200", 16)].pinned_gpu == "H200"
-    assert modal_app_module.should_warm("Qwen/Qwen3.6-35B-A3B") is True
 
 
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
@@ -498,104 +584,21 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
     assert impl._health(_Dense())["max_model_len"] != cfg.MAX_MODEL_LEN
 
 
-def test_autoscaler_floor_kwargs_pins_min_and_omits_unset(modal_app_module, monkeypatch):
-    """The shared floor kwargs always pin min_containers + scaledown_window, and include the buffer/
-    cap only when configured (so start_all and the pool warm-up apply an identical floor)."""
-    mod = modal_app_module
-    monkeypatch.setattr(mod, "MIN_CONTAINERS", 1)
-    monkeypatch.setattr(mod, "BUFFER_CONTAINERS", 0)
-    monkeypatch.setattr(mod, "MAX_CONTAINERS", None)
-    kw = mod._autoscaler_floor_kwargs("L4")
-    assert kw["min_containers"] == 1
-    # update_autoscaler REPLACES the decorator's config, so the floor must carry the SAME per-tier
-    # window _build_engine pinned — otherwise enabling a warm floor silently widens cheap tiers back
-    # to the flat 30-minute hold.
-    assert kw["scaledown_window"] == mod.scaledown_window_for("L4")
-    assert mod._autoscaler_floor_kwargs("H200")["scaledown_window"] == mod.scaledown_window_for(
-        "H200"
-    )
-    assert "buffer_containers" not in kw  # omitted when 0
-    assert "max_containers" not in kw  # omitted when None
-
-    monkeypatch.setattr(mod, "BUFFER_CONTAINERS", 2)
-    monkeypatch.setattr(mod, "MAX_CONTAINERS", 5)
-    kw2 = mod._autoscaler_floor_kwargs("L4")
-    assert kw2["buffer_containers"] == 2
-    assert kw2["max_containers"] == 5
-
-
-def test_warm_all_warms_every_catalog_base_model(modal_app_module, monkeypatch):
-    """warm_all pins the floor AND force-boots one container for EVERY catalog base model — so a
-    fresh deploy self-heals all tiers, not just whichever models receive traffic first."""
-    import asyncio
-
+def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
     from flash.serving.src import model_config
 
     mod = modal_app_module
-    monkeypatch.setattr(mod, "MIN_CONTAINERS", 1)
-    monkeypatch.setattr(model_config, "base_models", lambda: ["m1", "m2", "m3"])
-    monkeypatch.setattr(mod, "should_warm", lambda _bm: True)
-
-    pool = mod._ModalEnginePool()
-    floored: list[str] = []
-    spawned: list[str] = []
-
-    async def _fake_engine(base_model: str):
-        floored.append(base_model)  # stands in for the update_autoscaler floor set in _engine
-
-        class _Health:
-            @staticmethod
-            def spawn():
-                spawned.append(base_model)
-
-        return type("E", (), {"health": _Health})()
-
-    monkeypatch.setattr(pool, "_engine", _fake_engine)
-    asyncio.run(pool.warm_all())
-
-    assert sorted(floored) == ["m1", "m2", "m3"]  # floor pinned for each
-    assert sorted(spawned) == ["m1", "m2", "m3"]  # one container booted for each
-
-
-def test_warm_all_skips_non_warm_models(modal_app_module, monkeypatch):
-    """A model that opts out with warm=False is NOT pre-warmed — it scales to zero and cold-starts on
-    demand instead of pinning an engine warm on every deploy. (No catalog model currently opts out —
-    the mechanism is still exercised here with a synthetic model.)"""
-    import asyncio
-
-    from flash.serving.src import model_config
-
-    mod = modal_app_module
-    monkeypatch.setattr(mod, "MIN_CONTAINERS", 1)
-    monkeypatch.setattr(model_config, "base_models", lambda: ["warm_a", "cold_b", "warm_c"])
+    monkeypatch.setattr(model_config, "base_models", lambda: ["ok", "boom"])
     monkeypatch.setattr(model_config, "gpu_for", lambda _bm: "L4")
-    monkeypatch.setattr(mod, "should_warm", lambda bm: bm != "cold_b")
-
-    pool = mod._ModalEnginePool()
-    warmed: list[str] = []
-
-    async def _fake_warm(base_model: str) -> None:
-        warmed.append(base_model)
-
-    monkeypatch.setattr(pool, "warm", _fake_warm)
-    asyncio.run(pool.warm_all())
-
-    assert sorted(warmed) == ["warm_a", "warm_c"]  # cold_b (warm=False) skipped
-
-
-def _stub_start_all_modal(mod, monkeypatch, floored, spawned, *, failures=None):
-    """Make ``start_all``'s ``modal.Cls.from_name(...)(base_model=...)`` return a fake engine instance
-    that records which models get an autoscaler floor (``update_autoscaler``) and a boot
-    (``health.spawn``)."""
-    failures = set(failures or ())
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {})
+    spawned: list[str] = []
 
     class _Handle:
         def __init__(self, base_model: str) -> None:
             self.base_model = base_model
 
         def get(self, timeout: int = 0) -> str:
-            if self.base_model in failures:
+            if self.base_model == "boom":
                 raise RuntimeError("cold start failed")
             return "ok"
 
@@ -607,126 +610,21 @@ def _stub_start_all_modal(mod, monkeypatch, floored, spawned, *, failures=None):
                     spawned.append(base_model)
                     return _Handle(base_model)
 
-            class _Instance:
-                health = _Health()
-
-                @staticmethod
-                def update_autoscaler(**_kwargs: int) -> None:
-                    floored.append(base_model)
-                    return
-
-            return _Instance()
+            return type("Instance", (), {"health": _Health()})()
 
         return _factory
 
     monkeypatch.setattr(mod.modal.Cls, "from_name", _from_name)
 
-
-def test_start_all_bare_run_skips_non_warm_models(modal_app_module, monkeypatch):
-    """A bare ``start_all`` (warm everything) mirrors ``warm_all``: a ``warm=False`` model gets
-    NEITHER an autoscaler floor NOR a ``health.spawn`` boot, so an opted-out scale-to-zero model
-    isn't force-booted on every full warm run."""
-    from flash.serving.src import model_config
-
-    mod = modal_app_module
-    monkeypatch.setattr(mod, "MIN_CONTAINERS", 1)
-    monkeypatch.setattr(model_config, "base_models", lambda: ["warm_a", "cold_b", "warm_c"])
-    monkeypatch.setattr(model_config, "gpu_for", lambda _bm: "L4")
-    monkeypatch.setattr(mod, "should_warm", lambda bm: bm != "cold_b")
-    floored: list[str] = []
-    spawned: list[str] = []
-    _stub_start_all_modal(mod, monkeypatch, floored, spawned)
-
-    mod.start_all()
-
-    assert sorted(spawned) == ["warm_a", "warm_c"]  # cold_b (warm=False) NOT booted
-    assert sorted(floored) == ["warm_a", "warm_c"]  # and NOT floored
-
-
-def test_start_all_explicit_base_model_forces_a_non_warm_model(modal_app_module, monkeypatch):
-    """An explicit ``--base-model`` is a deliberate force: a ``warm=False`` model IS booted and
-    floored when named directly (the CLI escape hatch for confirming the 35B boots)."""
-    from flash.serving.src import model_config
-
-    mod = modal_app_module
-    monkeypatch.setattr(mod, "MIN_CONTAINERS", 1)
-    monkeypatch.setattr(model_config, "base_models", lambda: ["warm_a", "cold_b"])
-    monkeypatch.setattr(model_config, "gpu_for", lambda _bm: "L4")
-    monkeypatch.setattr(mod, "should_warm", lambda bm: bm != "cold_b")
-    floored: list[str] = []
-    spawned: list[str] = []
-    _stub_start_all_modal(mod, monkeypatch, floored, spawned)
-
-    mod.start_all(base_model="cold_b")
-
-    assert spawned == ["cold_b"]  # forced -> booted despite warm=False
-    assert floored == ["cold_b"]  # forced -> floor pinned too
-
-
-def test_start_all_empty_base_model_is_a_bare_run_not_a_force(modal_app_module, monkeypatch):
-    """A falsey-but-not-None base_model (empty string) must behave like a bare 'warm everything' run —
-    skip warm=False models — NOT a force that warms every model while the list also expands to all."""
-    from flash.serving.src import model_config
-
-    mod = modal_app_module
-    monkeypatch.setattr(mod, "MIN_CONTAINERS", 1)
-    monkeypatch.setattr(model_config, "base_models", lambda: ["warm_a", "cold_b", "warm_c"])
-    monkeypatch.setattr(model_config, "gpu_for", lambda _bm: "L4")
-    monkeypatch.setattr(mod, "should_warm", lambda bm: bm != "cold_b")
-    floored: list[str] = []
-    spawned: list[str] = []
-    _stub_start_all_modal(mod, monkeypatch, floored, spawned)
-
-    mod.start_all(base_model="")
-
-    assert sorted(spawned) == ["warm_a", "warm_c"]  # "" is NOT a force -> cold_b still skipped
-    assert sorted(floored) == ["warm_a", "warm_c"]
-
-
-def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
-    """The deploy workflow's warm step must fail CI if any engine fails to report healthy."""
-    from flash.serving.src import model_config
-
-    mod = modal_app_module
-    monkeypatch.setattr(mod, "MIN_CONTAINERS", 1)
-    monkeypatch.setattr(model_config, "base_models", lambda: ["ok", "boom"])
-    monkeypatch.setattr(model_config, "gpu_for", lambda _bm: "L4")
-    monkeypatch.setattr(mod, "should_warm", lambda _bm: True)
-    floored: list[str] = []
-    spawned: list[str] = []
-    _stub_start_all_modal(mod, monkeypatch, floored, spawned, failures={"boom"})
-
     with pytest.raises(RuntimeError, match="boom"):
         mod.start_all()
 
     assert sorted(spawned) == ["boom", "ok"]
-    assert sorted(floored) == ["boom", "ok"]
-
-
-def test_warm_all_is_noop_when_warming_disabled(modal_app_module, monkeypatch):
-    """MIN_CONTAINERS=0 disables warming: warm_all must touch no engines (no boot storm on
-    every router start)."""
-    import asyncio
-
-    mod = modal_app_module
-    monkeypatch.setattr(mod, "MIN_CONTAINERS", 0)
-
-    pool = mod._ModalEnginePool()
-    touched: list[str] = []
-
-    async def _fake_engine(base_model: str):
-        touched.append(base_model)
-
-    monkeypatch.setattr(pool, "_engine", _fake_engine)
-    asyncio.run(pool.warm_all())
-
-    assert touched == []
 
 
 def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_module, monkeypatch):
-    """A zero floor skips autoscaler updates without suppressing demand-driven remote calls."""
+    """The pool never updates autoscaling and still dispatches demand-driven remote calls."""
     mod = modal_app_module
-    monkeypatch.setattr(mod, "MIN_CONTAINERS", 0)
     bound_models: list[str] = []
     generate_calls: list[tuple[dict, dict, str | None]] = []
     stream_calls: list[tuple[dict, dict, str | None]] = []
@@ -832,31 +730,6 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
             "generation-1",
         )
     ]
-
-
-def test_warm_all_continues_past_a_failing_model(modal_app_module, monkeypatch):
-    """One model's warm failure is swallowed (best-effort) so the remaining models still warm."""
-    import asyncio
-
-    from flash.serving.src import model_config
-
-    mod = modal_app_module
-    monkeypatch.setattr(mod, "MIN_CONTAINERS", 1)
-    monkeypatch.setattr(model_config, "base_models", lambda: ["ok1", "boom", "ok2"])
-    monkeypatch.setattr(mod, "should_warm", lambda _bm: True)
-
-    pool = mod._ModalEnginePool()
-    warmed: list[str] = []
-
-    async def _fake_warm(base_model: str):
-        if base_model == "boom":
-            raise RuntimeError("cold start failed")
-        warmed.append(base_model)
-
-    monkeypatch.setattr(pool, "warm", _fake_warm)
-    asyncio.run(pool.warm_all())  # must not raise
-
-    assert sorted(warmed) == ["ok1", "ok2"]
 
 
 # ---- Functional: actually run _load() and capture the AsyncEngineArgs (vLLM/tokenizer stubbed) ----

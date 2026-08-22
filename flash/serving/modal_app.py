@@ -5,7 +5,6 @@ README to deploy.
 """
 
 import asyncio
-import inspect
 import os
 from pathlib import Path
 from typing import Any
@@ -64,8 +63,8 @@ if SERVING_DEPLOYMENT_MODE == "development":
         "SUPABASE_SERVICE_ROLE_KEY",
     )
     missing = [name for name in required if not os.environ.get(name, "").strip()]
-    if not (os.environ.get("HF_API_KEY", "").strip() or os.environ.get("HF_TOKEN", "").strip()):
-        missing.append("HF_API_KEY(or-HF_TOKEN)")
+    if not os.environ.get("HF_TOKEN", "").strip():
+        missing.append("HF_TOKEN")
     if missing:
         raise ValueError(
             "development serving requires explicit environment wiring: " + ", ".join(missing)
@@ -132,11 +131,10 @@ def scaledown_window_for(gpu: str) -> int:
     return SCALEDOWN_WINDOW_SECONDS_BY_GPU.get(gpu, DEFAULT_SCALEDOWN_WINDOW_SECONDS)
 
 
-# gpu model engines scale to zero by default. inference and adapter registration remote calls start
-# the matching parameter-bound engine on demand. modal parameterized classes cannot put
-# min_containers on the decorator, so a positive floor would be applied with update_autoscaler().
+# gpu model engines scale to zero. inference and adapter registration remote calls start the matching
+# parameter-bound engine on demand.
 MIN_CONTAINERS = 0
-# No autoscaling cap per base-model engine (Modal adds capacity as concurrency demands).
+# no autoscaling cap per base-model engine; modal adds capacity as concurrency demands.
 MAX_CONTAINERS = None
 # Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
 # A real-GPU sweep (scripts/gpu_canary.py::sweep_concurrency on A10G/Qwen2.5-1.5B) showed vLLM
@@ -148,59 +146,30 @@ MAX_CONTAINERS = None
 # the router/global ceiling. TARGET_INPUTS auto-derives to 48 (= 64*3//4).
 MAX_INPUTS = 64
 TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
-# no buffer containers beyond demand-driven capacity.
-BUFFER_CONTAINERS = 0
 
-
-# the single shared internal key + backend url. FREESOLO_INTERNAL_KEY guards /adapters,
-# authenticates serving's calls to the backend (metering + POST /api/serving/authorize), and is the
-# trusted-caller bypass for always-enforced external chat. both must be set so the usage reporter
-# and the chat authorizer are wired.
-#
-# router only. nothing reachable from the engine class reads either one: `.internal_key` and
-# `.backend_url` are read in src/context.py (request auth) and in the router-side helpers below,
-# and lora_engine never imports context. the engines run with trust_remote_code=True, so shipping
-# the trusted-caller bypass credential into a container that executes model code would hand it to
-# code that has no use for it.
-_ROUTER_ONLY_NAMES = ("PLATFORM_BACKEND_URL", "FREESOLO_INTERNAL_KEY")
+# engines enable trust_remote_code, so their secret uses an allowlist: future credentials
+# default to staying router-only. engines hydrate adapter state per request from the router-forwarded
+# record; only the hf token is needed to download private base weights and adapters.
+_ENGINE_SECRET_NAMES = ("HF_TOKEN",)
+_RUNTIME_SECRET_NAMES = (
+    *_ENGINE_SECRET_NAMES,
+    "SERVING_DEPLOYMENT_MODE",
+    "SERVING_CUSTOM_DOMAIN",
+    "PLATFORM_BACKEND_URL",
+    "FREESOLO_INTERNAL_KEY",
+    # immutable deployment provenance and attempt identity used by the public readiness endpoint.
+    "FREESOLO_DEPLOYMENT_SHA",
+    "FREESOLO_DEPLOYMENT_ID",
+    "SUPABASE_PROJECT_REF",
+    "SUPABASE_PROJECT_REF_DEV",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    # only credentials and wiring are forwarded. autoscaling and engine configuration are constants.
+)
 
 
 def _runtime_values() -> dict[str, str]:
-    names = (
-        "HF_API_KEY",
-        "HF_TOKEN",
-        "SERVING_DEPLOYMENT_MODE",
-        "SERVING_CUSTOM_DOMAIN",
-        *_ROUTER_ONLY_NAMES,
-        # immutable deployment provenance and attempt identity used by the public readiness endpoint.
-        "FREESOLO_DEPLOYMENT_SHA",
-        "FREESOLO_DEPLOYMENT_ID",
-        "SUPABASE_PROJECT_REF",
-        "SUPABASE_PROJECT_REF_DEV",
-        # the engine needs these too, not just the router: _load hydrates its adapter registry at
-        # cold start through _load_adapters_for_base -> persistence.load_adapters, which returns an
-        # empty list when `has_supabase` is false. dropping them from the engine would not raise,
-        # it would silently serve an engine that knows about no adapters.
-        "SUPABASE_URL",
-        "SUPABASE_SERVICE_ROLE_KEY",
-        # Only credentials/wiring are forwarded. All autoscaling/container config (min/max/buffer
-        # containers, scaledown window, router floor) AND all per-engine vLLM config are now
-        # hardcoded constants (here and in src/settings.py) — no HOSTING_* tuning vars are forwarded
-        # because none are read; they would have no effect.
-    )
-    values = {name: value for name in names if (value := os.environ.get(name))}
-    # The repo/frontend .env uses NEXT_PUBLIC_SUPABASE_URL + SUPABASE_SECRET_KEY; fall back to those
-    # so the durable adapter registry (persist + reload-on-miss) is configured without renaming env
-    # vars at the deploy site. Without Supabase the registry is per-container in-memory only: with
-    # max_inputs concurrency Modal runs multiple router containers, so an adapter deployed on one is
-    # invisible to the container that serves a later chat -> 404 ("adapter not found").
-    if "SUPABASE_URL" not in values and (u := os.environ.get("NEXT_PUBLIC_SUPABASE_URL")):
-        values["SUPABASE_URL"] = u
-    if "SUPABASE_SERVICE_ROLE_KEY" not in values and (k := os.environ.get("SUPABASE_SECRET_KEY")):
-        values["SUPABASE_SERVICE_ROLE_KEY"] = k
-    if "HF_TOKEN" not in values and (token := values.get("HF_API_KEY")):
-        values["HF_TOKEN"] = token
-    return values
+    return {name: value for name in _RUNTIME_SECRET_NAMES if (value := os.environ.get(name))}
 
 
 def _secret_from(values: dict[str, str]) -> modal.Secret | None:
@@ -212,7 +181,9 @@ def _runtime_secret() -> modal.Secret | None:
 
 
 def _engine_secret() -> modal.Secret | None:
-    return _secret_from({k: v for k, v in _runtime_values().items() if k not in _ROUTER_ONLY_NAMES})
+    return _secret_from(
+        {name: value for name in _ENGINE_SECRET_NAMES if (value := os.environ.get(name))}
+    )
 
 
 runtime_secret = _runtime_secret()
@@ -313,12 +284,7 @@ from flash.serving.src.lora_engine import _LoraEngineImpl  # noqa: E402
 # model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for
 # `modal deploy` (which imports modal_app.py locally) — unlike the vllm/transformers imports, which
 # stay lazy inside the engine methods.
-from flash.serving.src.model_config import (  # noqa: E402
-    base_models,
-    engine_overrides_for,
-    gpu_for,
-    should_warm,
-)
+from flash.serving.src.model_config import base_models, engine_overrides_for, gpu_for  # noqa: E402
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
@@ -460,87 +426,8 @@ def _engine_cls_for(base_model: str) -> Any:
     return ENGINE_BY_KEY[_engine_key(base_model)]
 
 
-def _autoscaler_floor_kwargs(gpu: str) -> dict[str, int]:
-    """Build settings for an explicitly enabled warm floor.
-
-    The pool startup hook and ``start_all`` share this helper so an optional positive floor cannot
-    drift between the two paths.
-
-    ``update_autoscaler`` REPLACES the decorator's settings, so it must pass the same per-tier
-    scaledown window ``_build_engine`` pinned for this ``gpu``. Sending a flat value here would
-    silently widen every cheap tier back to the old 30-minute hold at runtime.
-    """
-    kwargs: dict[str, int] = {
-        "min_containers": MIN_CONTAINERS,
-        "scaledown_window": scaledown_window_for(gpu),
-    }
-    if BUFFER_CONTAINERS > 0:
-        kwargs["buffer_containers"] = BUFFER_CONTAINERS
-    if MAX_CONTAINERS is not None:
-        kwargs["max_containers"] = MAX_CONTAINERS
-    return kwargs
-
-
 class _ModalEnginePool:
-    """Dispatches router calls to each base model's per-GPU-tier ``LoraEngine`` container."""
-
-    def __init__(self) -> None:
-        self._autoscaler_configured: set[str] = set()
-        self._autoscaler_lock = asyncio.Lock()
-
-    async def _update_autoscaler(self, engine: Any, **kwargs: int) -> None:
-        update = engine.update_autoscaler
-        aio = getattr(update, "aio", None)
-        result = aio(**kwargs) if aio is not None else update(**kwargs)
-        if inspect.isawaitable(result):
-            await result
-
-    async def _engine(self, base_model: str) -> Any:
-        engine = _engine_cls_for(base_model)(base_model=base_model)
-        # the zero global floor leaves every model at scale-to-zero. if a positive floor is enabled,
-        # warm=false remains a per-model opt-out.
-        if (
-            MIN_CONTAINERS <= 0
-            or not should_warm(base_model)
-            or base_model in self._autoscaler_configured
-        ):
-            return engine
-        async with self._autoscaler_lock:
-            if base_model in self._autoscaler_configured:
-                return engine
-            await self._update_autoscaler(engine, **_autoscaler_floor_kwargs(gpu_for(base_model)))
-            self._autoscaler_configured.add(base_model)
-        return engine
-
-    async def warm(self, base_model: str) -> Any:
-        """Apply any configured warm floor and force-boot one container for ``base_model``."""
-        engine = await self._engine(base_model)  # applies a positive floor when one is enabled
-        spawn = engine.health.spawn
-        aio = getattr(spawn, "aio", None)
-        result = aio() if aio is not None else spawn()
-        if inspect.isawaitable(result):
-            await result
-        return engine
-
-    async def warm_all(self) -> None:
-        """Warm eligible catalog models only when a positive global floor is configured.
-
-        The production zero floor makes this startup hook a no-op, so gpu engines start only when
-        inference or adapter registration dispatches a remote call. With a positive floor, models
-        marked ``warm: False`` remain scale-to-zero.
-        """
-        if MIN_CONTAINERS <= 0:
-            return
-        from flash.serving.src.model_config import base_models
-
-        async def _safe(bm: str) -> None:
-            try:
-                await self.warm(bm)
-            except Exception as exc:  # one model's failure must not block the rest
-                print(f"serving warm: FAILED {bm}: {type(exc).__name__}: {exc}", flush=True)
-
-        # skip warm=false models when a positive floor is explicitly enabled.
-        await asyncio.gather(*(_safe(bm) for bm in base_models() if should_warm(bm)))
+    """Dispatches router calls to each base model's per-gpu-tier ``LoraEngine`` container."""
 
     @staticmethod
     def _record_payload(record: Any) -> dict[str, Any]:
@@ -558,7 +445,7 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
-        engine = await self._engine(base_model)
+        engine = _engine_cls_for(base_model)(base_model=base_model)
         return await engine.generate.remote.aio(
             payload.model_dump(by_alias=True),
             self._record_payload(record),
@@ -573,7 +460,7 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ):
-        engine = await self._engine(base_model)
+        engine = _engine_cls_for(base_model)(base_model=base_model)
         remote_stream = engine.stream_generate.remote_gen.aio(
             payload.model_dump(by_alias=True),
             self._record_payload(record),
@@ -588,7 +475,7 @@ class _ModalEnginePool:
                 await close()
 
     async def register(self, base_model: str, record: Any) -> None:
-        engine = await self._engine(base_model)
+        engine = _engine_cls_for(base_model)(base_model=base_model)
         await engine.register.remote.aio(
             self._record_payload(record),
             getattr(record, "deployment_generation", None),
@@ -600,7 +487,7 @@ class _ModalEnginePool:
         adapter_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        engine = await self._engine(base_model)
+        engine = _engine_cls_for(base_model)(base_model=base_model)
         await engine.unregister.remote.aio(adapter_id, expected_generation)
 
 
@@ -870,8 +757,6 @@ def router():
         # the adapter (the backend authorizes), or the shared internal key to bypass. The authorizer
         # must be wired (backend URL + internal key) or non-internal chat fails closed.
         chat_authorizer=_build_chat_authorizer(settings),
-        # keep the optional warm-floor hook wired; it is a no-op at the production zero floor.
-        on_startup=pool.warm_all,
     )
 
 
@@ -881,32 +766,19 @@ def start_all(base_model: str | None = None) -> None:
 
     Normal deploys leave gpu engines at zero until inference or adapter registration reaches the
     matching base model. This manual diagnostic can boot one model with ``--base-model`` or every
-    warm-eligible catalog model without changing the production minimum-container default.
+    catalog model without changing the scale-to-zero deployment.
     """
     from flash.serving.src.model_config import base_models, gpu_for
 
     started = {}
     failures: list[str] = []
-    # an explicit --base-model boots that model even when warm=false. a bare run mirrors warm_all and
-    # skips warm=false models. use the same truthiness for `forced` and the model list so an empty
-    # string behaves like "warm everything" rather than forcing every model.
-    forced = bool(base_model)
     models = [base_model] if base_model else list(base_models())
     for bm in models:
-        if not forced and not should_warm(bm):
-            print(
-                f"skipped {bm}: warm=False (scale-to-zero; pass --base-model to force)", flush=True
-            )
-            continue
         # Each base model's engine lives on its (GPU tier, concurrency) class.
         engine = modal.Cls.from_name(
             APP_NAME, _engine_class_name(gpu_for(bm), _engine_concurrency(bm)[0])
         )
         instance = engine(base_model=bm)
-        if MIN_CONTAINERS > 0:
-            result = instance.update_autoscaler(**_autoscaler_floor_kwargs(gpu_for(bm)))
-            if inspect.isawaitable(result):
-                asyncio.run(result)
         started[bm] = instance.health.spawn()
     for bm, handle in started.items():
         try:
