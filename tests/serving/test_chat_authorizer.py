@@ -417,6 +417,56 @@ def test_failed_authorization_is_not_cached(modal_app_module, monkeypatch):
     assert calls["n"] == 2
 
 
+def test_expired_key_is_evicted_before_reauthorization(modal_app_module, monkeypatch):
+    import asyncio
+    import inspect
+
+    from fastapi import HTTPException
+
+    _counting_client(
+        monkeypatch,
+        lambda n: _FakeResp(200, {"orgId": "org-1"}) if n == 1 else _FakeResp(500, {}),
+    )
+    authorize = _new_authorizer(modal_app_module)
+    cache = inspect.getclosurevars(authorize).nonlocals["_cache"]
+    cache_key = ("synthetic-expired-key", "adapter-1")
+
+    async def run() -> None:
+        await authorize(*cache_key)
+        _, org_id = cache[cache_key]
+        cache[cache_key] = (float("-inf"), org_id)
+        with pytest.raises(HTTPException):
+            await authorize(*cache_key)
+
+    asyncio.run(run())
+
+    assert cache_key not in cache
+
+
+def test_prune_removes_expired_keys_below_capacity(modal_app_module, monkeypatch):
+    import asyncio
+    import inspect
+
+    _counting_client(monkeypatch, lambda _n: _FakeResp(200, {"orgId": "org-1"}))
+    authorize = _new_authorizer(modal_app_module)
+    closure = inspect.getclosurevars(authorize).nonlocals
+    cache = closure["_cache"]
+    clock = [0.0]
+    monkeypatch.setattr(closure["time"], "monotonic", lambda: clock[0])
+    expired_key = ("synthetic-expired-key", "adapter-1")
+    current_key = ("synthetic-current-key", "adapter-2")
+
+    async def run() -> None:
+        await authorize(*expired_key)
+        clock[0] = modal_app_module._AUTH_CACHE_TTL_SECONDS + 1
+        await authorize(*current_key)
+
+    asyncio.run(run())
+
+    assert expired_key not in cache
+    assert current_key in cache
+
+
 def test_cache_entry_expires_after_ttl(modal_app_module, monkeypatch):
     import asyncio
 

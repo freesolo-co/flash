@@ -737,8 +737,6 @@ def _build_chat_authorizer(settings: Any) -> Any:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unavailable")
 
     def _prune(now: float) -> None:
-        if len(_cache) <= _AUTH_CACHE_MAX_ENTRIES:
-            return
         for expired in [k for k, (exp, _) in _cache.items() if exp <= now]:
             _cache.pop(expired, None)
         if len(_cache) > _AUTH_CACHE_MAX_ENTRIES:
@@ -764,8 +762,11 @@ def _build_chat_authorizer(settings: Any) -> Any:
     async def authorize(api_key: str, adapter_id: str) -> "str | None":
         ck = (api_key, adapter_id)
         cached = _cache.get(ck)
-        if cached is not None and cached[0] > time.monotonic():
-            return cached[1]
+        now = time.monotonic()
+        if cached is not None:
+            if cached[0] > now:
+                return cached[1]
+            _cache.pop(ck, None)
         task = _inflight.get(ck)
         if task is None:
             task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, adapter_id))
