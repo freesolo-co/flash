@@ -62,6 +62,7 @@ from flash.cli.errors import (
     _friendly_message,
     _parser_options,
     _root_only_options,
+    _selected_parser,
 )
 from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
@@ -195,10 +196,15 @@ class _ThemedParser(argparse.ArgumentParser):
         # themed twin: the red ✗ error line (same idiom as main()'s catch-all and `flash login`),
         # then a dimmed pointer at this parser's own --help instead of the raw usage block. unknown
         # commands and flags get a short "did you mean" suggestion (see _friendly_message).
+        # candidates come from the parser the invocation actually selected, plus the root's own
+        # flags. argparse reports a subcommand's unknown tokens from the ROOT, so `self` here is
+        # the root even when the user typed a subcommand; the stashed argv says which one.
+        # a subparser raising its own error has no stash, and is already the selected parser.
+        root = getattr(self, "_flash_argv", None)
+        selected = _selected_parser(self, root) if root is not None else self
+        candidates = {*_parser_options(selected), *_root_only_options(self)}
         print(
-            render.error(
-                _friendly_message(message, _parser_options(self), _root_only_options(self))
-            ),
+            render.error(_friendly_message(message, sorted(candidates), _root_only_options(self))),
             file=sys.stderr,
         )
         # dimmed pointer at THIS parser's own --help (argparse sets prog per parser: `flash --help`
@@ -899,6 +905,12 @@ def _redacted_args(raw_args: list[str]) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_parser()
+    # the tokens this invocation was actually given, for the error hook: argparse reports a
+    # subcommand's unknown flags from the ROOT parser, so scoping the suggestion to the selected
+    # command needs the argv `main` was called with. reading sys.argv there instead would be right
+    # only for the console-script path and wrong for every embedded caller -- including the tests,
+    # where it silently reads pytest's own argv and restores the whole-tree pool.
+    parser._flash_argv = raw_args
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)

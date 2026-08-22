@@ -550,6 +550,54 @@ def test_a_subcommand_flag_suggestion_is_not_given_a_reposition_hint(monkeypatch
     assert "it goes before the command" not in err
 
 
+@pytest.mark.parametrize(
+    ("argv", "absent"),
+    [
+        # --follow is real on `runs log`, not on `login`; --api-key is real on `login`, not here.
+        (["login", "--folow"], "--follow"),
+        (["runs", "log", "flash-1", "--api-ke"], "--api-key"),
+    ],
+)
+def test_a_flag_from_an_unrelated_command_is_not_suggested(
+    monkeypatch, capsys, argv, absent
+) -> None:
+    """A suggestion the user cannot follow is worse than none.
+
+    The candidate pool has to span subcommands for a suggestion to be reachable at all, since
+    argparse reports a subcommand's unknown tokens from the root. Drawing from the WHOLE tree
+    though offers flags that belong to some other command, so the corrected line is rejected
+    exactly like the first one and the hint has cost the user a round trip.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(argv)
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert absent not in err
+    assert "did you mean" not in err
+
+
+def test_a_correctly_spelled_root_flag_is_repositioned_not_respelled(monkeypatch, capsys) -> None:
+    """`--verbose` after a command is a placement error, so there is nothing to correct it to.
+
+    Dropping the exact token from the pool is what keeps a typo from being echoed back as its own
+    fix, but it also removes `--verbose` here and lets the nearest sibling stand in: the answer was
+    "did you mean '--version'?", a different flag with a different meaning.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["train", "x.toml", "--verbose"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "it goes before the command" in err
+    assert "flash --verbose <command>" in err
+    assert "--version" not in err
+
+
 def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("COLORTERM", "truecolor")

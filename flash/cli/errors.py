@@ -51,10 +51,17 @@ def _friendly_message(
     )
     if bad is None:
         return message
-    # the candidate pool spans every subcommand's flags, so a flag that is real SOMEWHERE else
-    # reaches this suggestion: `flash login --repository X` would otherwise answer "did you mean
-    # '--repository'?" -- echoing the token the user just typed as its own correction. dropping the
-    # exact token keeps the suggestion to flags that differ from what was rejected.
+    # a correctly spelled ROOT flag in the wrong position is not a typo, so there is nothing to
+    # correct it to: the fix is to move it. this has to be answered before the exact-token
+    # exclusion below, which would otherwise drop `--verbose` from the pool and let the nearest
+    # sibling stand in -- `flash train x.toml --verbose` answered "did you mean '--version'?",
+    # pointing at a different flag with a different meaning.
+    if bad in root_only:
+        return _reposition_message(bad)
+    # the candidate pool spans the selected command's flags plus the root's, so a flag that is real
+    # SOMEWHERE else can still reach this suggestion: `flash login --repository X` would otherwise
+    # answer "did you mean '--repository'?" -- echoing the token the user just typed as its own
+    # correction. dropping the exact token keeps the suggestion to flags that differ from it.
     candidates = [option for option in options if option != bad]
     near = difflib.get_close_matches(bad, candidates, n=1)
     if not near:
@@ -70,6 +77,13 @@ def _friendly_message(
     return f"unrecognized argument '{bad}' (did you mean '{suggestion}'?)"
 
 
+def _reposition_message(flag: str) -> str:
+    return (
+        f"unrecognized argument '{flag}' (it goes before the command: "
+        f"`{CLI_NAME} {flag} <command>`)"
+    )
+
+
 def _parser_options(parser: argparse.ArgumentParser) -> Iterable[str]:
     """Yield option strings registered on a parser and its subparsers.
 
@@ -82,6 +96,36 @@ def _parser_options(parser: argparse.ArgumentParser) -> Iterable[str]:
         if isinstance(action, argparse._SubParsersAction):
             for subparser in action.choices.values():
                 yield from _parser_options(subparser)
+
+
+def _selected_parser(
+    parser: argparse.ArgumentParser, argv: Iterable[str]
+) -> argparse.ArgumentParser:
+    """Walk the subcommand path in ``argv`` to the parser that owns the invocation.
+
+    The whole-tree pool is what makes a suggestion reachable at all -- argparse reports a
+    subcommand's unknown tokens from the ROOT parser -- but drawing candidates from the whole tree
+    means an unrelated command's flag can be offered: `flash login --folow` answered '--follow',
+    and `flash runs log ID --api-ke` answered '--api-key'. Both corrections are rejected again,
+    because those flags belong to other commands. Narrowing to the parser actually selected keeps
+    the candidates to flags that would work where the user typed them.
+    """
+    current = parser
+    for token in argv:
+        if token.startswith("-"):
+            continue
+        subparsers = next(
+            (a for a in current._actions if isinstance(a, argparse._SubParsersAction)), None
+        )
+        if subparsers is None:
+            break
+        nxt = subparsers.choices.get(token)
+        if nxt is None:
+            # not a command name, so it is a positional argument (a config path, a run id) and the
+            # command path has ended. anything after it cannot name a deeper subparser.
+            break
+        current = nxt
+    return current
 
 
 def _root_only_options(parser: argparse.ArgumentParser) -> frozenset[str]:
