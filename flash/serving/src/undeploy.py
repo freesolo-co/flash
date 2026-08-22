@@ -58,6 +58,39 @@ class DisableResult:
         )
 
 
+async def _cas_row_to_disabled(
+    candidate: AdapterRecord,
+    *,
+    get_authoritative: Callable[[str], Awaitable[AdapterRecord | None]],
+) -> tuple[bool, AdapterRecord | None]:
+    """CAS one row to "disabled", returning whether it converged and the row it converged to.
+
+    Storage outages propagate rather than being handled per call site: every read and write here
+    fails the whole cascade the same way, so the caller owns that single decision. A row that lost
+    its race and is no longer "ready" has converged -- someone else already moved it.
+    """
+
+    current: AdapterRecord | None = candidate
+    for _ in range(_CAS_ATTEMPTS):
+        if current.updated_at is None:
+            current = await get_authoritative(candidate.adapter_id)
+            if current is None or current.status != "ready":
+                return True, current
+            if current.updated_at is None:
+                return False, current
+
+        committed = await _replace_stored_cas(
+            current.model_copy(update={"status": "disabled"}),
+            expected_updated_at=current.updated_at,
+        )
+        if committed is not None:
+            return True, committed
+        current = await get_authoritative(candidate.adapter_id)
+        if current is None or current.status != "ready":
+            return True, current
+    return False, current
+
+
 async def disable_matched(
     matches: list[AdapterRecord],
     *,
@@ -79,49 +112,14 @@ async def disable_matched(
     storage_unavailable = False
 
     for candidate in matches:
-        current: AdapterRecord | None = candidate
-        converged = False
-        for _ in range(_CAS_ATTEMPTS):
-            if current.updated_at is None:
-                try:
-                    current = await get_authoritative(candidate.adapter_id)
-                except HTTPException as exc:
-                    if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
-                        raise
-                    storage_unavailable = True
-                    break
-                if current is None or current.status != "ready":
-                    converged = True
-                    break
-                if current.updated_at is None:
-                    break
-
-            try:
-                committed = await _replace_stored_cas(
-                    current.model_copy(update={"status": "disabled"}),
-                    expected_updated_at=current.updated_at,
-                )
-            except HTTPException as exc:
-                if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
-                    raise
-                storage_unavailable = True
-                break
-            if committed is not None:
-                current = committed
-                converged = True
-                break
-            try:
-                current = await get_authoritative(candidate.adapter_id)
-            except HTTPException as exc:
-                if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
-                    raise
-                storage_unavailable = True
-                break
-            if current is None or current.status != "ready":
-                converged = True
-                break
-
-        if storage_unavailable:
+        try:
+            converged, current = await _cas_row_to_disabled(
+                candidate, get_authoritative=get_authoritative
+            )
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
+                raise
+            storage_unavailable = True
             break
         if not converged:
             stuck_ready.append(candidate.adapter_id)
