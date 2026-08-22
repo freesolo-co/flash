@@ -30,6 +30,12 @@ ServingHealthErrorCode = Literal[
 ]
 
 
+def reject_non_finite_json_constant(constant: str) -> None:
+    """refuse constants such as nan and infinity that json does not define."""
+
+    raise ValueError(f"json does not define {constant}")
+
+
 class ServingHealthError(ValueError):
     """A malformed serving health response with a stable machine-readable reason."""
 

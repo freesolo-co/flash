@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from flash.serve.contract import reject_non_finite_json_constant
 from flash.serve.runtime import (
     AdapterNotFoundError,
     EngineDeadError,
@@ -281,24 +282,10 @@ def _strict_json(raw: bytes) -> Any:
         return json.loads(
             raw,
             object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_non_finite,
+            parse_constant=reject_non_finite_json_constant,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid json") from exc
-
-
-def _reject_non_finite(constant: str) -> Any:
-    """refuse `NaN`, `Infinity`, and `-Infinity`, which json does not define.
-
-    `json.loads` accepts these python spellings by default. `temperature` and `top_p` are checked
-    with `math.isfinite`, but nothing walks *inside* `chat_template_kwargs` or a structured-output
-    schema, so a non-finite there reaches the tokenizer or vllm's grammar compiler and is answered
-    503 -- "the service is down" for a body this endpoint should have called invalid. Rejecting at
-    the parse boundary covers every nested position at once, which is why it belongs here rather
-    than in another per-field guard.
-    """
-
-    raise ValueError(f"json does not define {constant}")
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

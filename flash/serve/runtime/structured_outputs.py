@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from flash.serve.contract import reject_non_finite_json_constant
+
 from .errors import StructuredOutputsError
 
 CONSTRAINT_KEYS = ("json", "regex", "choice", "json_object")
@@ -50,11 +52,7 @@ def _decode_json(value: str) -> Any:
     reached vllm's grammar compiler from a request the outer guard had already approved.
     """
 
-    return json.loads(value, parse_constant=_reject_non_finite)
-
-
-def _reject_non_finite(constant: str) -> Any:
-    raise ValueError(f"json does not define {constant}")
+    return json.loads(value, parse_constant=reject_non_finite_json_constant)
 
 
 def _normalize_string(value: str) -> dict[str, Any]:

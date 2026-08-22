@@ -21,10 +21,10 @@ from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.schema import format_adapter_revision
 from flash.serve.app import AdapterExecutionInput, ArtifactFile, ExecutionInputs
 from flash.serve.app.materialize import MaterializationError, validate_adapter_weight_structure
+from flash.serve.contract import reject_non_finite_json_constant
 from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
 from flash.serve.profiles import ServingProfile
 from flash.serve.provisioning import ServingImage
-from flash.serve.runtime.structured_outputs import _reject_non_finite
 
 # a peft lora adapter is exactly these files. requiring the pair (rather than accepting whatever
 # the prefix happens to contain) keeps an incomplete upload from deploying as if it were whole:
@@ -184,7 +184,7 @@ def _declared_provenance(
         config = json.loads(
             raw.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_non_finite,
+            parse_constant=reject_non_finite_json_constant,
         )
     except _DuplicateConfigKey as exc:
         raise ResolveError(str(exc)) from exc
