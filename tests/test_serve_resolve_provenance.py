@@ -123,6 +123,75 @@ def test_an_agreeing_config_resolves(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("artifact_subfolder", "checkpoint_step", "expected"),
+    [
+        pytest.param(
+            "rl/run1/adapter",
+            10,
+            "identifies the final adapter",
+            id="final-subfolder-with-step",
+        ),
+        pytest.param(
+            "rl/run1/checkpoints/step-10/adapter",
+            None,
+            "--checkpoint-step is unset",
+            id="step-subfolder-without-step",
+        ),
+        pytest.param(
+            "rl/run1/checkpoints/step-10/adapter",
+            20,
+            "identifies checkpoint step 10",
+            id="different-steps",
+        ),
+    ],
+)
+def test_checkpoint_selection_must_agree_with_a_canonical_artifact_subfolder(
+    monkeypatch, artifact_subfolder: str, checkpoint_step: int | None, expected: str
+) -> None:
+    # the path selects the actual bytes, so rejecting before the hub read prevents an authored flag
+    # from relabeling final weights as a saved step or one saved step as another.
+    monkeypatch.setattr(
+        resolve_module,
+        "_hub_api",
+        lambda: pytest.fail("a contradictory checkpoint must fail before hub access"),
+    )
+
+    with pytest.raises(ResolveError, match=expected):
+        _resolve(artifact_subfolder=artifact_subfolder, checkpoint_step=checkpoint_step)
+
+
+def test_checkpoint_provenance_is_derived_from_an_agreeing_step_subfolder(
+    monkeypatch, tmp_path
+) -> None:
+    _install_hub(
+        monkeypatch,
+        tmp_path,
+        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": BASE},
+    )
+
+    resolved = _resolve(
+        artifact_subfolder="rl/run1/checkpoints/step-10/adapter", checkpoint_step=10
+    )
+
+    assert resolved.adapter.checkpoint == "step-10"
+    assert resolved.adapter.adapter_revision == f"run1@step-10.{ARTIFACT_REVISION}"
+
+
+def test_unrecognized_artifact_layout_keeps_the_authored_checkpoint(monkeypatch, tmp_path) -> None:
+    # older or external layouts cannot attest a step from their path. refusing them would add a new
+    # deployment failure unrelated to the mismatch this guard can prove, so they remain pass-through.
+    _install_hub(
+        monkeypatch,
+        tmp_path,
+        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": BASE},
+    )
+
+    resolved = _resolve(artifact_subfolder="sft/run-1-step-2", checkpoint_step=2)
+
+    assert resolved.adapter.checkpoint == "step-2"
+
+
+@pytest.mark.parametrize(
     ("overrides", "expected"),
     [
         ({"peft_type": "IA3"}, "peft_type must be LORA"),

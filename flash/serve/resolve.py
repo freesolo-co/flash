@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 
 from flash.adapters.lora_rank import rank_from_adapter_config
@@ -28,6 +29,7 @@ from flash.serve.provisioning import ServingImage
 # the config alone loads no weights, and the weights alone have no rank metadata.
 ADAPTER_CONFIG = "adapter_config.json"
 ADAPTER_WEIGHTS = "adapter_model.safetensors"
+_CHECKPOINT_ADAPTER_SUBFOLDER_RE = re.compile(r"(?:^|/)checkpoints/step-(?P<step>\d+)/adapter$")
 
 
 class ResolveError(ValueError):
@@ -235,6 +237,42 @@ def _declared_provenance(config_path: str | None) -> tuple[int | None, str | Non
     return rank, declared_base, _text("revision")
 
 
+def _checkpoint_step_from_subfolder(
+    artifact_subfolder: str, checkpoint_step: int | None
+) -> int | None:
+    """attest a recognized flash artifact path against the authored checkpoint selection."""
+
+    match = _CHECKPOINT_ADAPTER_SUBFOLDER_RE.search(artifact_subfolder)
+    if match is not None:
+        selected_step = int(match.group("step"))
+        if checkpoint_step is None:
+            raise ResolveError(
+                f"--artifact-subfolder {artifact_subfolder!r} identifies checkpoint step "
+                f"{selected_step}, but --checkpoint-step is unset; set --checkpoint-step "
+                f"{selected_step} or select the final adapter subfolder"
+            )
+        if checkpoint_step != selected_step:
+            raise ResolveError(
+                f"--checkpoint-step {checkpoint_step} disagrees with --artifact-subfolder "
+                f"{artifact_subfolder!r}, which identifies checkpoint step {selected_step}"
+            )
+        return selected_step
+
+    parts = artifact_subfolder.split("/")
+    if parts[-1:] == ["adapter"] and "checkpoints" not in parts:
+        if checkpoint_step is not None:
+            raise ResolveError(
+                f"--checkpoint-step {checkpoint_step} selects a saved step, but "
+                f"--artifact-subfolder {artifact_subfolder!r} identifies the final adapter; "
+                "remove --checkpoint-step or select its checkpoints/step-N/adapter subfolder"
+            )
+        return None
+
+    # non-flash layouts predate this convention, so they keep the authored selection rather than
+    # becoming a new resolution failure merely because their checkpoint cannot be inferred.
+    return checkpoint_step
+
+
 def resolve_adapter(
     *,
     run_id: str,
@@ -251,6 +289,7 @@ def resolve_adapter(
 ) -> ResolvedDeploymentInputs:
     """resolve one owned run into its control adapter and execution file table."""
 
+    checkpoint_step = _checkpoint_step_from_subfolder(artifact_subfolder, checkpoint_step)
     try:
         info = _hub_api().repo_info(repo_id=artifact_repo_id, repo_type=artifact_repo_type)
         artifact_revision = str(getattr(info, "sha", "") or "").strip().lower()
