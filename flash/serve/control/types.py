@@ -40,6 +40,7 @@ DeploymentErrorCode: TypeAlias = Literal[
 ]
 DeploymentErrorReason: TypeAlias = Literal[
     "artifact_cleanup_conflict",
+    "artifact_cleanup_delete_rejected",
     "artifact_cleanup_delete_unknown",
     "artifact_cleanup_identity_drift",
     "artifact_cleanup_observation_failed",
@@ -81,6 +82,7 @@ _DEPLOYMENT_ERROR_CODES = frozenset(
 _DEPLOYMENT_ERROR_REASONS = frozenset(
     {
         "artifact_cleanup_conflict",
+        "artifact_cleanup_delete_rejected",
         "artifact_cleanup_delete_unknown",
         "artifact_cleanup_identity_drift",
         "artifact_cleanup_observation_failed",

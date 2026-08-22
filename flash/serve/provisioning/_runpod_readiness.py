@@ -606,11 +606,11 @@ def await_ready_and_reclaim(
     `serve deploy`, the documented way to continue a deployment that returned `provisioning`,
     structurally unable to ever finish one.
 
-    `artifact` is the id observed *before* the wait, never a re-read one. The wait can be minutes
-    and these names are deterministic, so a re-read can return a successor generation's artifact
-    and delete a token that generation still needs. Deleting an already-deleted id is the safe
-    direction: the delete tolerates `not_found` and `confirm_artifact_absence` refuses to report
-    clean while any artifact remains.
+    `artifact` is the id observed before the wait when it was already visible. Adoption performs
+    one post-readiness re-read only when that initial listing omitted it, because RunPod can expose
+    the complete core resource set before its eventually consistent secret listing catches up.
+    Deleting an already-deleted id is safe: the delete tolerates `not_found`, and
+    `confirm_artifact_absence` refuses to report clean while any artifact remains.
 
     `on_ready` fires the instant readiness is proven, before the artifact is reclaimed. The create
     path's interrupt cleanup keys off it: everything before that point is a half-built deployment
@@ -633,7 +633,24 @@ def await_ready_and_reclaim(
         return ready
     on_ready()
     if artifact is None:
-        return ready
+        try:
+            observation = observe(plan)
+            ensure_unique_resources(observation)
+        except RunPodTransportFailure:
+            return unknown_result(
+                plan,
+                reason="artifact_cleanup_observation_failed",
+                handle=cast("RunPodProviderHandle", ready.handle),
+            )
+        except RunPodResourceConflict:
+            return unknown_result(
+                plan,
+                reason="artifact_cleanup_conflict",
+                handle=cast("RunPodProviderHandle", ready.handle),
+            )
+        artifact = observation.artifact_secrets[0] if observation.artifact_secrets else None
+        if artifact is None:
+            return ready
     return delete_artifact_and_confirm(
         plan,
         observe,

@@ -110,18 +110,16 @@ def _report(result, bundle) -> int:
         print(f"error       {result.error_code}", file=sys.stderr)
     if result.error_reason:
         print(f"reason      {result.error_reason}", file=sys.stderr)
-    if (
-        # every artifact-cleanup reason is raised after readiness proved, so the pod is live and
-        # billing whatever the status says. keying on the family rather than one reason keeps a
-        # definite cleanup rejection from printing a bare error that reads like a failed deploy.
-        str(result.error_reason or "").startswith("artifact_cleanup_")
-        and handle is not None
-        and handle.provider == "runpod"
-    ):
+    if str(result.error_reason or "").startswith("artifact_cleanup_") and handle is not None:
+        # every artifact-cleanup reason is raised after readiness proved, so the provider resource
+        # is live and billing whatever the status says.
+        resource_kind = "pod" if handle.provider == "runpod" else "app"
+        resource_id = handle.pod_id if handle.provider == "runpod" else handle.app_id
         print(
-            f"\nthe service reached readiness on pod {handle.pod_id}, but artifact cleanup did "
-            "not settle. the pod is live and billing. run `flash serve status` to inspect the "
-            "deployment, then `flash serve undeploy` to stop it billing if you do not want it.",
+            f"\nthe service reached readiness on {resource_kind} {resource_id}, but artifact cleanup "
+            f"did not settle. the {resource_kind} is live and billing. run `flash serve status` to "
+            "inspect the deployment, then `flash serve undeploy` to stop it billing if you do not "
+            "want it.",
             file=sys.stderr,
         )
     elif (

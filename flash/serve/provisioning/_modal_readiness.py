@@ -89,6 +89,7 @@ def failure_result(
         failure.code,
         outcome_unknown=failure.outcome_unknown,
         handle=handle,
+        error_reason=failure.reason,
     )
 
 

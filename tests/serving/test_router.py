@@ -1689,7 +1689,7 @@ def test_generate_miss_reloads_from_shared_storage():
     assert client.post("/generate", json={"adapter_id": "late", "prompt": "hi"}).status_code == 200
     assert reloaded["count"] == 1
     assert client.post("/generate", json={"adapter_id": "late", "prompt": "hi"}).status_code == 200
-    assert reloaded["count"] == 1  # cached now, no second reload
+    assert reloaded["count"] == 2  # mutable aliases re-read authority on every resolution
     # Still-unknown after reload -> 404.
     assert client.post("/generate", json={"adapter_id": "ghost", "prompt": "hi"}).status_code == 404
 
@@ -1710,14 +1710,18 @@ def test_first_request_after_alias_move_routes_to_new_revision():
             },
         },
     )
-    shared = [new_revision, _alias(new_revision)]
+    shared = {"rows": [old_revision, _alias(old_revision)]}
     pool = FakePool()
     client = _serve(
         pool,
         AdapterRouter([old_revision, _alias(old_revision)]),
-        reload_records=lambda: list(shared),
-        reload_interval_seconds=0.0,
+        reload_records=lambda: list(shared["rows"]),
+        reload_interval_seconds=30.0,
     )
+    primed = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"})
+    assert primed.status_code == 200
+    assert pool.generated_records[-1].adapter_id == old_revision.adapter_id
+    shared["rows"] = [new_revision, _alias(new_revision)]
 
     response = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"})
 

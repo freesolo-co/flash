@@ -528,6 +528,32 @@ def test_artifact_cleanup_rejection_warns_that_the_pod_is_live_and_billing(
     assert "flash serve undeploy" in captured.err
 
 
+def test_modal_artifact_cleanup_rejection_warns_that_the_app_is_live_and_billing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from flash.serve.control import DeploymentResult
+
+    def _rejected(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        ready = _result(bundle)
+        return DeploymentResult.from_spec(
+            bundle.spec,
+            status="failed",
+            handle=ready.handle,
+            error_code="provider_rejected",
+            error_reason="artifact_cleanup_delete_rejected",
+        )
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _rejected)
+
+    assert cmd_serve_deploy(_args(provider="modal")) == 1
+    captured = capsys.readouterr()
+    assert "app ap-1111111111111111111111" in captured.err
+    assert "app is live and billing" in captured.err
+    assert "flash serve undeploy" in captured.err
+
+
 def test_interrupted_deploy_prints_recovery_identity_without_masking_interrupt(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

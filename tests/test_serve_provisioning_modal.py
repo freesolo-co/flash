@@ -1410,6 +1410,30 @@ def test_reconcile_is_read_only_for_ready_absent_and_lingering_artifact() -> Non
     assert all(name == "observe" for name, _value in sdk.calls)
 
 
+def test_artifact_cleanup_rejection_reports_the_live_modal_app() -> None:
+    bundle = _bundle()
+    factory = _Factory()
+
+    class _RejectedDeleteSdk(_FakeSdk):
+        def delete_secret(self, plan, secret_id: str, *, deadline_at=None) -> None:
+            if secret_id == ARTIFACT_SECRET_ID:
+                self.calls.append(("delete_artifact", None))
+                raise ModalSdkFailure("provider_rejected")
+            super().delete_secret(plan, secret_id, deadline_at=deadline_at)
+
+    factory.sdk_class = _RejectedDeleteSdk
+    result, _probe = _provision(bundle, factory)
+
+    sdk = factory.sdk
+    assert sdk is not None
+    assert result.status == "failed"
+    assert result.error_reason == "artifact_cleanup_delete_rejected"
+    assert result.handle is not None
+    assert result.handle.app_id == APP_ID
+    assert sdk.apps[0].state == "deployed"
+    assert sdk.artifact, "the rejected cleanup must leave the artifact secret visible"
+
+
 def test_artifact_cleanup_ambiguity_keeps_handle_and_never_retries() -> None:
     bundle = _bundle()
     factory = _Factory()
@@ -1588,6 +1612,31 @@ def test_teardown_stops_before_secret_and_volume_deletion_then_confirms_absence(
         sleep=clock.sleep,
     )
     assert reconciled.status == "absent"
+    assert all(name == "observe" for name, _value in sdk.calls)
+
+
+def test_repeated_teardown_of_an_already_absent_generation_is_idempotent() -> None:
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    handle = _seed_exact(sdk, artifact=True)
+    sdk.apps.clear()
+    sdk.volumes.clear()
+    sdk.inference.clear()
+    sdk.artifact.clear()
+    sdk.calls.clear()
+
+    result = teardown_modal_deployment(
+        bundle,
+        handle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
+        clock=_Clock(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.status == "absent"
     assert all(name == "observe" for name, _value in sdk.calls)
 
 
@@ -2492,6 +2541,9 @@ def test_loopback_image_registries_are_rejected_before_any_modal_call() -> None:
         "localhost:5000",
         "registry.localhost",
         "localhost.localdomain",
+        "local",
+        "registry.local",
+        "registry.local:5000",
         "127.0.0.1",
         "10.20.30.40",
         "169.254.1.2",

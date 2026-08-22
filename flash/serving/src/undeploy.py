@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from flash.serving.src.persistence import PersistenceRecordError
 from flash.serving.src.routing import AdapterRouter
 from flash.serving.src.schemas import AdapterRecord
-from flash.serving.src.serving_io import _get_stored, _replace_stored_cas
+from flash.serving.src.serving_io import _get_stored, _list_run_stored, _replace_stored_cas
 
 # Rows that lose the compare-and-swap are re-read and retried. Bounded so a row losing every race
 # reports as stuck rather than spinning inside the request.
@@ -66,17 +66,17 @@ async def _cas_row_to_disabled(
     """CAS one row to "disabled", returning the terminal row it was last observed as.
 
     Storage outages propagate rather than being handled per call site: every read and write here
-    fails the whole cascade the same way, so the caller owns that single decision. Convergence is
-    not returned alongside the row because the row already carries it: a vanished row and a row no
-    longer "ready" have both converged (someone else moved it), and a row still "ready" is the only
-    way this can fail to converge. Returning both would admit states that cannot occur.
+    fails the whole cascade the same way, so the caller owns that single decision. Disabled loading
+    rows are also written so their timestamp advances and every in-flight promotion loses its stale
+    cas authority. A vanished row and a non-ready row observed after a lost cas have converged;
+    a row still ready after all attempts is the only conflict result.
     """
 
     current: AdapterRecord | None = candidate
     for _ in range(_CAS_ATTEMPTS):
         if current.updated_at is None:
             current = await get_authoritative(candidate.adapter_id)
-            if current is None or current.status != "ready" or current.updated_at is None:
+            if current is None or current.updated_at is None:
                 return current
 
         committed = await _replace_stored_cas(
@@ -169,6 +169,17 @@ async def get_authoritative(adapter_id: str) -> AdapterRecord | None:
         ) from exc
 
 
+async def list_authoritative_run(run_id: str) -> list[AdapterRecord]:
+    """Read every persisted lifecycle row for a run, including disabled loading revisions."""
+    try:
+        return await _list_run_stored(run_id)
+    except PersistenceRecordError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "adapter storage is unavailable",
+        ) from exc
+
+
 async def resolve_undeploy_target(
     router: AdapterRouter, adapter_id: str
 ) -> tuple[AdapterRecord | None, str, list[AdapterRecord]]:
@@ -193,12 +204,25 @@ async def resolve_undeploy_target(
     else:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
 
-    matches = [
+    ready = [
         candidate
         for candidate in router.ready_records()
         if (candidate.is_alias and candidate.adapter_id == run_id)
         or (candidate.is_revision and candidate.run_id == run_id)
     ]
+    persisted = await list_authoritative_run(run_id)
+    # a disabled revision with no deployment generation is the durable row an in-flight load still
+    # holds cas authority for. settled disabled rows already carry their former loaded generation.
+    loading = [
+        candidate
+        for candidate in persisted
+        if candidate.is_revision
+        and candidate.run_id == run_id
+        and candidate.status == "disabled"
+        and candidate.deployment_generation is None
+    ]
+    ready_ids = {candidate.adapter_id for candidate in ready}
+    matches = ready + [candidate for candidate in loading if candidate.adapter_id not in ready_ids]
     if not matches:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
     return None, run_id, matches

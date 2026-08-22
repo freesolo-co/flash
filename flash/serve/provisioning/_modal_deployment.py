@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from flash.serve.control import DeploymentResult
 
-from ._common import Clock, Sleeper
+from ._common import Clock, LifecycleFailure, Sleeper
 from ._modal_lifecycle import mutation, observe
 from ._modal_plan import ModalCreatePlan
 from ._modal_readiness import (
@@ -276,7 +276,12 @@ def _delete_artifact_and_confirm(
         )
     except ModalSdkFailure as exc:
         if not exc.outcome_unknown:
-            return failure_result(finalized_plan, from_sdk_failure(exc), handle=proof.handle)
+            failure = from_sdk_failure(exc)
+            return failure_result(
+                finalized_plan,
+                LifecycleFailure(failure.code, reason="artifact_cleanup_delete_rejected"),
+                handle=proof.handle,
+            )
     try:
         cleaned = wait_for_phase(
             finalized_plan,

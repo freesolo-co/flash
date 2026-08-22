@@ -128,6 +128,20 @@ def _expected_checkpoint(request: Request) -> str | None:
     return value.strip() if value is not None else None
 
 
+async def _list_run_stored(run_id: str) -> list[AdapterRecord]:
+    from flash.serving.src.persistence import list_run_adapters
+    from flash.serving.src.settings import get_settings
+
+    try:
+        return await asyncio.to_thread(list_run_adapters, run_id, get_settings())
+    except PersistenceRecordError:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "adapter storage is unavailable"
+        ) from exc
+
+
 async def _get_stored(adapter_id: str) -> AdapterRecord | None:
     from flash.serving.src.persistence import PersistenceRecordError, get_adapter
     from flash.serving.src.settings import get_settings

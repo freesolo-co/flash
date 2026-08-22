@@ -1657,6 +1657,47 @@ def test_read_only_reconcile_never_reports_ready_with_transient_artifact_secret(
     assert len(transport.secrets) == 2
 
 
+def test_adoption_rechecks_for_an_artifact_that_appears_after_readiness() -> None:
+    class _LateArtifactTransport(_FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.account_reads = 0
+
+        def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
+            response = super().graphql(
+                document,
+                variables,
+                mutation=mutation,
+                deadline_at=deadline_at,
+            )
+            if mutation:
+                return response
+            self.account_reads += 1
+            if self.account_reads <= 2:
+                secrets = response["data"]["myself"]["secrets"]
+                response["data"]["myself"]["secrets"] = [
+                    item for item in secrets if item["name"] != self.plan_names.artifact_secret
+                ]
+            return response
+
+    bundle = _bundle()
+    transport = _LateArtifactTransport()
+    transport.plan_names = _names(bundle)
+    _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "ready"
+    assert transport.account_reads >= 3
+    assert [item["name"] for item in transport.secrets] == [_names(bundle).inference_secret]
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "PATCH /templates/template01",
+        f"PATCH /pods/{POD_ID}",
+        "secretDelete",
+    ]
+
+
 def test_adoption_deletes_one_lingering_artifact_only_after_endpoint_proof() -> None:
     bundle = _bundle()
     transport = _FakeTransport()
@@ -4101,6 +4142,9 @@ def test_loopback_image_registries_are_rejected_before_any_runpod_call() -> None
         "localhost:5000",
         "registry.localhost",
         "localhost.localdomain",
+        "local",
+        "registry.local",
+        "registry.local:5000",
         "127.0.0.1",
         "10.20.30.40",
         "169.254.1.2",

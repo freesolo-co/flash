@@ -237,6 +237,22 @@ def _generate(eng: Any, **payload_extra: Any) -> Any:
     return eng.engine.sampling_params[-1]
 
 
+def test_nonstream_generation_requires_a_real_finish_reason(modal_app_module) -> None:
+    class _NonterminalEngine:
+        async def generate(self, *_args, **_kwargs):
+            yield types.SimpleNamespace(
+                outputs=[types.SimpleNamespace(text="partial", finish_reason=None, token_ids=[1])],
+                prompt_token_ids=[1],
+                num_cached_tokens=0,
+            )
+
+    eng = _engine(modal_app_module)
+    eng.engine = _NonterminalEngine()
+
+    with pytest.raises(RuntimeError, match="ended without a finish reason"):
+        asyncio.run(eng._generate({"adapter_id": "r1", "prompt": "hi"}))
+
+
 def test_reasoning_api_compatibility_check_fails_closed():
     @dataclasses.dataclass
     class NoParserArgs:

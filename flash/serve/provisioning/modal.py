@@ -459,6 +459,8 @@ def teardown_modal_deployment(
             plan = _teardown_plan(finalized_plan, bootstrap_plan, handle, observation)
         app, _volume, _inference, _artifact = exact_teardown_resources(plan, handle, observation)
         if app is None:
+            if observation.resource_count == 0:
+                return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
             return unknown_result(plan, handle=handle)
         if app.state == "deployed":
             mutation_attempted = True

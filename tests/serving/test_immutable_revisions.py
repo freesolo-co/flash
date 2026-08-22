@@ -113,6 +113,9 @@ class MemoryPersistence:
             raise OSError("connection reset by peer")
         return self.rows.get(adapter_id)
 
+    def list_run(self, run_id: str, _settings: object) -> list[AdapterRecord]:
+        return [record for record in self.rows.values() if record.run_id == run_id]
+
     def insert(self, record: AdapterRecord, _settings: object) -> AdapterRecord:
         if record.adapter_id in self.insert_failure_ids:
             raise OSError("storage unavailable")
@@ -232,6 +235,7 @@ def setup(monkeypatch):
     pool = FakePool()
     router = AdapterRouter()
     monkeypatch.setattr("flash.serving.src.persistence.get_adapter", persistence.get)
+    monkeypatch.setattr("flash.serving.src.persistence.list_run_adapters", persistence.list_run)
     monkeypatch.setattr("flash.serving.src.persistence.insert_adapter", persistence.insert)
     monkeypatch.setattr("flash.serving.src.persistence.replace_adapter_cas", persistence.replace)
     client = TestClient(
@@ -759,6 +763,36 @@ def test_delete_run_alias_cascades_ready_alias_and_revisions(setup) -> None:
         ).status_code
         == 404
     )
+
+
+def test_delete_run_alias_fences_a_revision_that_is_still_loading(setup) -> None:
+    client, pool, _, persistence = setup
+    assert _register(client, _registration()).status_code == 200
+    assert (
+        client.post(
+            f"/adapters/{REVISION_A}/activate",
+            json={"expected_adapter_revision": None},
+        ).status_code
+        == 200
+    )
+    loading = ImmutableAdapterRegistration.model_validate(
+        _registration(step=40, sha=SHA_B)
+    ).to_record()
+    loading = persistence._stamp(loading)
+    persistence.rows[REVISION_B] = loading
+
+    response = client.delete(f"/adapters/{RUN_ID}")
+
+    assert response.status_code == 200
+    assert response.json()["disabled_revisions"] == [REVISION_A, REVISION_B]
+    assert persistence.rows[REVISION_B].updated_at != loading.updated_at
+    stale_promotion = persistence.replace(
+        loading.model_copy(update={"status": "ready"}),
+        expected_updated_at=loading.updated_at,
+        settings=object(),
+    )
+    assert stale_promotion is None, "the loading revision retained authority to become ready"
+    assert pool.unregistered == [RUN_ID, REVISION_A, REVISION_B]
 
 
 def test_delete_run_alias_disables_revisions_when_alias_already_disabled(setup) -> None:

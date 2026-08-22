@@ -725,6 +725,9 @@ class _LoraEngineImpl:
         if final_output is None:
             raise RuntimeError("vLLM returned no output")
         output = final_output.outputs[0]
+        finish_reason = getattr(output, "finish_reason", None)
+        if finish_reason is None:
+            raise RuntimeError("vLLM generation ended without a finish reason")
         completion_token_ids = list(getattr(output, "token_ids", []) or [])
         prompt_tokens = _num_prompt_tokens(final_output)
         return {
@@ -736,7 +739,7 @@ class _LoraEngineImpl:
                 else {}
             ),
             "text": output.text,
-            "finish_reason": getattr(output, "finish_reason", None),
+            "finish_reason": finish_reason,
             "token_ids": completion_token_ids,
             # token counts for per-token billing; the router forwards these to the backend.
             "prompt_tokens": prompt_tokens,

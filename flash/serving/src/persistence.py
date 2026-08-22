@@ -86,6 +86,44 @@ def load_adapters(settings: Settings) -> list[AdapterRecord]:
     return records
 
 
+def list_run_adapters(run_id: str, settings: Settings) -> list[AdapterRecord]:
+    """load every persisted alias and revision for one run, regardless of lifecycle status."""
+    if not settings.has_supabase:
+        return []
+    params = {
+        "select": PERSISTED_COLUMNS,
+        "metadata->>run_id": f"eq.{run_id}",
+        "order": "adapter_id.asc",
+        "limit": str(_ADAPTER_PAGE),
+    }
+    records: list[AdapterRecord] = []
+    cursor: str | None = None
+    with httpx.Client(timeout=30.0) as client:
+        while True:
+            page_params = dict(params)
+            if cursor is not None:
+                page_params["adapter_id"] = f"gt.{cursor}"
+            response = client.get(
+                supabase_table_url(settings, ADAPTER_TABLE),
+                params=page_params,
+                headers=supabase_headers(settings, "flash"),
+            )
+            raise_for_supabase(response, "load hosted LoRA run adapters")
+            rows = response.json()
+            if not isinstance(rows, list):
+                raise PersistenceRecordError(
+                    "Supabase load hosted LoRA run adapters response must be a list"
+                )
+            records.extend(_records_from_response(response, "load hosted LoRA run adapters"))
+            if len(rows) < _ADAPTER_PAGE:
+                break
+            last_row = rows[-1]
+            if not isinstance(last_row, dict) or not isinstance(last_row.get("adapter_id"), str):
+                raise PersistenceRecordError("Supabase run adapter page has no cursor authority")
+            cursor = last_row["adapter_id"]
+    return records
+
+
 def get_adapter(adapter_id: str, settings: Settings) -> AdapterRecord | None:
     if not settings.has_supabase:
         return None

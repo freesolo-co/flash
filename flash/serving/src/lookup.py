@@ -81,11 +81,11 @@ class AdapterLookup:
     ) -> tuple[AdapterRecord, AdapterRecord]:
         resolved = self._router.resolve(adapter_id)
         stale = resolved is not None and self._is_stale()
-        if stale and self._reload_records is not None:
+        if resolved is not None and self._reload_records is not None:
             if resolved[0].is_alias:
                 if await self._reload_safe():
                     resolved = self._router.resolve(adapter_id)
-            else:
+            elif stale:
                 self._schedule_reload()
         elif resolved is None and self._reload_records is not None:
             await self.reload()
