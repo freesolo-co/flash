@@ -662,7 +662,7 @@ def provision_runpod_deployment(
         )
         if adopted is not None:
             return adopted
-        if False:
+        if artifact_token is None:
             raise FreshDeploymentArtifactTokenRequired
         _require_storage_data_center(plan, observation)
         # from here on this call owns resources, so every phase stops short of the caller's
