@@ -965,11 +965,43 @@ def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
     captured = capsys.readouterr()
     assert "TOTAL" in captured.out
     assert "shadowed!" not in captured.err
+    # no `lora_rank` is authored here, so the quote is the minimum-rank lower bound rather than a
+    # figure derived from the placeholder.
     assert (
-        "warning: warm-start (train.init_from_adapter) cost uses the default LoRA rank; the "
-        "source adapter's authoritative rank is resolved server-side, so this offline estimate "
-        "may be higher or lower than the resolved run cost.\n" in captured.err
+        "warning: warm-start (train.init_from_adapter) cost is estimated at the minimum LoRA rank "
+        "because the source adapter's rank is resolved server-side, so treat it as a lower bound: "
+        "a higher source rank costs more.\n" in captured.err
     )
+
+
+def test_warm_start_cost_quotes_the_card_the_parser_accepts(tmp_path, capsys, monkeypatch):
+    """The quote must not refuse the exact configuration the parser now admits.
+
+    `estimate_cost` reads the rank for both the price and the exact-card fit, so quoting at the
+    serialization placeholder rejected a single B200 as needing 199 GB and advised `--gpus 2` -- a
+    shortfall the real source rank may not have. Sized at the rank-1 lower bound it fits in 180 GB.
+    """
+    from flash.cli import commands
+
+    monkeypatch.setattr(
+        commands,
+        "client_from_config",
+        lambda *_a, **_kw: pytest.fail("offline quote must not contact the plane"),
+    )
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    body = SFT_TOML.replace('algorithm = "sft"', 'algorithm = "grpo"').replace(
+        "batch_size = 8\n",
+        'prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\ninit_from_adapter = "source-run"\n',
+    )
+    # SFT_TOML ends with an empty `[gpu]`, so the pin is appended into that section.
+    body = body.replace('model = "Qwen/Qwen3.5-4B"', 'model = "Qwen/Qwen3.6-35B-A3B"')
+    body += 'type = "B200"\ncount = 1\n'
+
+    assert cmd_train(_sft_args(tmp_path, body)) == 0
+    captured = capsys.readouterr()
+    assert "TOTAL" in captured.out
+    assert "--gpus 2" not in captured.err
+    assert "lower bound" in captured.err
 
 
 def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):

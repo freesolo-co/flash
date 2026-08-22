@@ -532,7 +532,27 @@ def test_warmstart_still_rejects_a_shape_impossible_at_the_minimum_rank() -> Non
     )
     raw["train"].pop("lora_rank")
 
-    with pytest.raises(ConfigError, match=r"grpo needs >= 216 GB VRAM"):
+    # the pinned class is named, because the exact-card gate reaches this shape before the pool-wide
+    # search does. the requirement is the same 216 GB either way.
+    with pytest.raises(ConfigError, match=r"gpu\.type 'B200' .* at least 216 GB"):
+        spec_from_dict(raw)
+
+
+def test_warmstart_still_validates_the_authored_card_at_the_minimum_rank() -> None:
+    """Relaxing the rank must not switch the exact-card gate off.
+
+    That gate is the only parse-time check of an authored `gpu.type`; skipping it let a pin that
+    cannot hold the run at ANY rank parse, because the fallback search ranks the whole pool rather
+    than the pinned class. Rank 1 is a true lower bound, so a card rejected against it cannot fit
+    whatever rank the source turns out to have.
+    """
+    raw = _raw(
+        model="Qwen/Qwen3.6-35B-A3B",
+        **{"gpu.type": "A100 PCIe", "train.init_from_adapter": "source-run"},
+    )
+    raw["train"].pop("lora_rank")
+
+    with pytest.raises(ConfigError, match=r"gpu\.type 'A100 PCIe' has 80 GB VRAM"):
         spec_from_dict(raw)
 
 

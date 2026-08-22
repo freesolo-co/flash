@@ -503,18 +503,19 @@ def _validate_gpu_section(
         gpu_count=requested_gpu_count,
     )
     try:
-        if (
-            gpu_types
-            and preflight_gpu_count <= 1
-            and not model_revision
-            and not unresolved_warmstart_rank
-        ):
+        if gpu_types and preflight_gpu_count <= 1 and not model_revision:
             from flash.providers.allocator import required_vram_gb
 
+            # sized from `preflight_train`, so an unresolved warm start is measured at rank 1 rather
+            # than at the placeholder. that is a true LOWER bound: no source adapter can need less.
+            # a card rejected here therefore cannot fit at any rank the source could turn out to
+            # have, which keeps an impossible pin (an 80 GB A100 for a run needing 180 GB at rank 1)
+            # rejected at parse time. relaxing the rank is not the same as dropping the check --
+            # dropping it would let the authored `gpu.type` go unvalidated entirely.
             required_vram = required_vram_gb(
                 model,
                 algorithm,
-                train=train_raw,
+                train=preflight_train,
                 thinking=thinking,
             )
             # every authored class is checked, not just the head: a fallback too small to hold the
