@@ -504,6 +504,28 @@ def test_github_republish_advice_covers_branch_tag_and_sha(environment_id, expec
     assert absent not in advice
 
 
+def test_managed_hub_github_ref_uses_env_push_advice():
+    from flash.cli.commands import train_cost
+
+    advice = train_cost._republish_advice(
+        "github:freesolo-co/environment-hub@main:owner/project/env/environment.py"
+    )
+
+    assert "env push" in advice
+    assert "named remote branch or tag" not in advice
+
+
+def test_managed_republish_advice_prints_required_env_push_arguments():
+    from flash.cli.commands import train_cost
+
+    advice = train_cost._republish_advice("owner/project/env")
+
+    assert (
+        f"{train_cost._commands().CLI_NAME} env push --name NAME --project PROJECT_UUID [path]"
+        in advice
+    )
+
+
 def test_published_environment_note_ignores_unknown_environment_ids(monkeypatch, capsys):
     from flash.cli.commands import train_cost
 

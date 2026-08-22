@@ -286,14 +286,21 @@ def _print_published_sft_environment_note(status: object, spec) -> None:
 def _republish_advice(environment_id: str) -> str | None:
     """Return conditional remediation for a managed or GitHub environment id."""
     from flash.envs.identity import (
+        canonical_managed_environment_slug,
         github_environment_ref_is_pinned,
         is_github_environment_ref,
-        is_managed_environment_slug,
     )
 
     prefix = "If you expected local dataset edits to be included, "
-    if is_managed_environment_slug(environment_id):
-        return f"{prefix}run `{_commands().CLI_NAME} env push` again for this managed environment."
+    try:
+        managed_slug = canonical_managed_environment_slug(environment_id)
+    except ValueError:
+        return None
+    if managed_slug is not None:
+        return (
+            f"{prefix}run `{_commands().CLI_NAME} env push --name NAME "
+            "--project PROJECT_UUID [path]` again for this managed environment."
+        )
     if not is_github_environment_ref(environment_id):
         return None
     if github_environment_ref_is_pinned(environment_id):

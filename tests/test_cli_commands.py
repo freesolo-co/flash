@@ -1349,7 +1349,10 @@ def test_train_dry_run_attributes_sft_counts_to_the_managed_environment(
     )
     assert "dataset counts come from this resolved published copy, not local files" in captured.err
     assert "If you expected local dataset edits to be included" in captured.err
-    assert "run `flash env push` again for this managed environment" in captured.err
+    assert (
+        "run `flash env push --name NAME --project PROJECT_UUID [path]` again for this managed "
+        "environment"
+    ) in captured.err
 
 
 def test_train_dry_run_keeps_inline_records_off_the_published_environment_note(
