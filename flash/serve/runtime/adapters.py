@@ -1,4 +1,4 @@
-"""process-local lora registration, locking, identity, and eviction."""
+"""process-local lora registration, locking, identity, and unload."""
 
 from __future__ import annotations
 
@@ -44,8 +44,8 @@ class _AdapterGate:
 
     Generations only read an incarnation, so any number may run at once -- vllm batches them, and
     holding a plain lock across a whole generation capped every adapter at one in-flight request
-    regardless of `max_num_seqs`. Registration, eviction, and unload mutate the incarnation vllm is
-    serving, so they need the adapter to themselves.
+    regardless of `max_num_seqs`. Registration and unload mutate the incarnation vllm is serving,
+    so they need the adapter to themselves.
 
     Writers are exclusive against each other via `lock`, and against readers via `drained`, which is
     set exactly while `readers == 0`. A writer holds `lock` for its whole operation, so no reader can
@@ -162,7 +162,7 @@ class AdapterManager:
         """pin one incarnation for the full operation so replacement cannot cross-wire it.
 
         Held as a reader: concurrent generations on the same adapter run together, while a
-        replacement or eviction waits for them to finish rather than interleaving with them.
+        replacement or unload waits for them to finish rather than interleaving with them.
         """
         gate = await self._adapter_gate(adapter_id)
         async with gate.lock:
@@ -178,23 +178,6 @@ class AdapterManager:
             yield binding
         finally:
             gate.leave()
-
-    async def evict(
-        self,
-        adapter_id: str,
-        expected_incarnation: str | None = None,
-    ) -> bool:
-        """remove lora state from vllm while retaining the registration for lazy reload."""
-        async with self._exclusive(adapter_id):
-            entry = self._entries.get(adapter_id)
-            if entry is None:
-                return False
-            self._require_incarnation(entry, expected_incarnation)
-            if not entry.loaded:
-                return False
-            await self._remove_lora(entry.lora_request.lora_int_id)
-            entry.loaded = False
-            return True
 
     async def unload(
         self,

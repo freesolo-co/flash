@@ -1,4 +1,4 @@
-"""adapter concurrency, incarnation replacement, ids, pinning, eviction, and unload."""
+"""adapter concurrency, incarnation replacement, ids, pinning, reload, and unload."""
 
 from __future__ import annotations
 
@@ -152,8 +152,8 @@ def test_generations_on_one_incarnation_run_concurrently(adapter_dir: Path) -> N
     assert set(order[2:]) == {"first:exit", "second:exit"}
 
 
-def test_eviction_waits_for_inflight_generations(adapter_dir: Path) -> None:
-    """concurrent readers must not let eviction pull lora state out from under a generation."""
+def test_unload_waits_for_inflight_generations(adapter_dir: Path) -> None:
+    """concurrent readers must not let an unload pull lora state out from under a generation."""
 
     engine = _Engine()
     manager = AdapterManager(engine, EngineConfig(model="model"))
@@ -170,13 +170,13 @@ def test_eviction_waits_for_inflight_generations(adapter_dir: Path) -> None:
 
         generation = asyncio.create_task(hold_generation())
         await acquired.wait()
-        eviction = asyncio.create_task(manager.evict("adapter", "one"))
+        unloading = asyncio.create_task(manager.unload("adapter", "one"))
         await asyncio.sleep(0)
-        assert eviction.done() is False
+        assert unloading.done() is False
         assert engine.removed == []
         release.set()
         await generation
-        assert await eviction is True
+        assert await unloading is True
 
     asyncio.run(exercise())
     assert engine.removed == [engine.added[0].lora_int_id]
@@ -285,16 +285,35 @@ def test_collision_safe_ids_probe_without_cross_wiring(
     assert set(ids.values()) == {7, 8}
 
 
-def test_evict_reloads_on_acquire_then_unloads(adapter_dir: Path) -> None:
+def test_a_registration_left_unloaded_reloads_on_acquire_then_unloads(adapter_dir: Path) -> None:
+    """a registration can outlive its vllm state, and the next acquire must restore it.
+
+    A replacement that fails partway removes the prior incarnation's lora from vllm but keeps
+    it registered, so the entry is left present-but-unloaded. That is the only way the runtime
+    reaches this state, so the reload is driven through it rather than through a helper no
+    caller invokes.
+    """
+
     engine = _Engine()
     manager = AdapterManager(engine, EngineConfig(model="model", pin_loras=True))
-    asyncio.run(manager.register(_spec(adapter_dir)))
+    asyncio.run(manager.register(_spec(adapter_dir, "one")))
     int_id = engine.added[0].lora_int_id
 
-    assert asyncio.run(manager.evict("adapter", "one")) is True
-    assert asyncio.run(manager.evict("adapter", "one")) is False
+    engine.fail_pin = True
+    with pytest.raises(RuntimeError):
+        asyncio.run(manager.register(_spec(adapter_dir, "two")))
+    engine.fail_pin = False
+
+    # the replacement lost its lora state, and "one" is still the registered incarnation.
     assert manager.registered_count == 1
     assert manager.loaded_count == 0
+
+    async def stale_acquire() -> None:
+        async with manager.acquire("adapter", "two"):
+            raise AssertionError("the failed replacement must not become acquirable")
+
+    with pytest.raises(StaleIncarnationError):
+        asyncio.run(stale_acquire())
 
     async def acquire() -> None:
         async with manager.acquire("adapter", "one") as binding:
@@ -302,10 +321,9 @@ def test_evict_reloads_on_acquire_then_unloads(adapter_dir: Path) -> None:
             assert binding.lora_request.lora_int_id == int_id
 
     asyncio.run(acquire())
-    assert len(engine.added) == 2
+    assert manager.loaded_count == 1
     assert engine.pinned == [int_id, int_id]
     assert asyncio.run(manager.unload("adapter", "one")) is True
-    assert engine.removed == [int_id, int_id]
     assert manager.registered_count == manager.loaded_count == 0
 
 
