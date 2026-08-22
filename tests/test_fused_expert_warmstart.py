@@ -882,6 +882,43 @@ def test_non_moe_export_rejects_a_pair_whose_outer_dimension_disagrees(tmp_path)
     assert config_path.read_bytes() == before
 
 
+def test_multimodal_export_accepts_a_suffix_shared_across_both_stacks(tmp_path):
+    """a VL model's vision tower and language model share leaf names at DIFFERENT widths.
+
+    a multimodal run carries no exclude regex, so `all-linear` covers both stacks and the merger
+    writes `...language_model...mlp.down_proj` (text intermediate) alongside
+    `...visual.blocks.N.mlp.down_proj` (vision intermediate). those are two different base modules
+    that legitimately disagree on outer dimension. keying the width check by the bare target suffix
+    read that as corruption and failed a HEALTHY image export at publish time, after the paid run
+    had already finished -- worse than the load-time failure the check exists to prevent.
+
+    widths are the real ones from tests/fixtures/qwen35_08b_target_metadata.json: text hidden 1024
+    / intermediate 3584, vision hidden 768 / intermediate 3072.
+    """
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    def stack_pair(prefix, hidden, intermediate):
+        return {
+            f"{prefix}.lora_A.weight": np.ones((1, intermediate), dtype=np.float16),
+            f"{prefix}.lora_B.weight": np.ones((hidden, 1), dtype=np.float16),
+        }
+
+    tensors = {
+        **stack_pair("base_model.model.model.language_model.layers.0.mlp.down_proj", 1024, 3584),
+        **stack_pair("base_model.model.model.language_model.layers.1.mlp.down_proj", 1024, 3584),
+        **stack_pair("base_model.model.model.visual.blocks.0.mlp.down_proj", 768, 3072),
+    }
+    config = {"peft_type": "LORA", "r": 1, "target_modules": ["down_proj"]}
+    _write_small_safetensors(tmp_path / "adapter_model.safetensors", tensors)
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    stamp_adapter_dir_provenance(str(tmp_path), "Qwen/Qwen3.5-9B", "d" * 40, exclude_modules=None)
+
+    saved = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["target_modules"] == "all-linear"
+    assert saved["exclude_modules"] is None
+
+
 def test_non_moe_export_preserves_the_orphan_pair_rejection_message(tmp_path):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 

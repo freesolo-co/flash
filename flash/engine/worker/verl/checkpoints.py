@@ -503,6 +503,10 @@ def export_peft_adapter(
 # boundary, and that producer always strips the adapter name, so a namespaced key here means the
 # directory holds something the merger did not write. the fused validator accepts both because it
 # also runs at the warm-start boundary over previously published adapters.
+# collapse layer indexes so every layer of one stack shares a width bucket, while the vision and
+# language stacks stay distinct: `...layers.0.mlp.down_proj` and `...layers.31.mlp.down_proj` are
+# the same base module shape, `...visual.blocks.0.mlp.down_proj` is not.
+_LAYER_INDEX_RE = re.compile(r"\.\d+\.")
 _TEXT_LORA_KEY_RE = re.compile(
     r"^(?P<module>base_model\.model\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+)"
     r"(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+))*)\.lora_(?P<factor>[AB])\.weight$"
@@ -634,7 +638,7 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
     pairs: dict[str, dict[str, str]] = {}
     language_pairs: dict[str, dict[str, str]] = {}
     target_evidence: set[str] = set()
-    target_widths: dict[str, dict[str, int]] = {}
+    module_widths: dict[str, dict[str, int]] = {}
     for key, shape in metadata.items():
         non_language = is_non_language_lora_key(key)
         if non_language and not multimodal:
@@ -667,19 +671,26 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
         pairs.setdefault(module, {})[match.group("factor")] = key
         if not non_language:
             language_pairs.setdefault(module, {})[match.group("factor")] = key
-        # the outer dimension is the base module's own width, so every tensor targeting the same
-        # suffix must agree on it. rank and mutual composability are checked above and neither
-        # constrains it: a correctly-ranked pair whose outer dim names a different module's width
-        # publishes here and only fails later, at peft or vllm load, with no provenance back to
-        # the export that wrote it.
-        for target in matched_targets:
-            width = shape[1] if match.group("factor") == "A" else shape[0]
-            seen = target_widths.setdefault(target, {}).setdefault(match.group("factor"), width)
-            if seen != width:
-                raise RuntimeError(
-                    f"{label} tensor {key!r} has outer dimension {width} where target "
-                    f"{target!r} was already {seen}"
-                )
+        # the outer dimension is the base module's own width, so tensors on the same base module
+        # must agree on it. rank and mutual composability are checked above and neither constrains
+        # it: a correctly-ranked pair whose outer dim names a different module's width publishes
+        # here and only fails later, at peft or vllm load, with no provenance back to the export.
+        #
+        # keyed by the LAYER-STRIPPED module path, NOT the bare target suffix. a VL model's vision
+        # tower and language model legitimately share leaf names at different widths -- a
+        # multimodal run has no exclude regex, so `all-linear` covers both stacks and the merger
+        # writes `...language_model...mlp.down_proj` (text intermediate) alongside
+        # `...visual.blocks.N.mlp.down_proj` (vision intermediate). those are two different base
+        # modules, and requiring them to agree fails a HEALTHY image export at publish time, after
+        # the paid run has already finished.
+        stack = _LAYER_INDEX_RE.sub(".", module)
+        width = shape[1] if match.group("factor") == "A" else shape[0]
+        seen = module_widths.setdefault(stack, {}).setdefault(match.group("factor"), width)
+        if seen != width:
+            raise RuntimeError(
+                f"{label} tensor {key!r} has outer dimension {width} where module "
+                f"{stack!r} was already {seen}"
+            )
 
     incomplete = sorted(module for module, factors in pairs.items() if set(factors) != {"A", "B"})
     if not pairs or incomplete:
