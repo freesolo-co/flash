@@ -509,9 +509,12 @@ def export_peft_adapter(
 #
 # the collapse is not exhaustive, deliberately. `re.sub` is non-overlapping, so consecutive indexes
 # only partly collapse (`a.b.0.1.2.proj` -> `a.b.1.proj`), and a trailing index is left alone
-# (`a.proj.7`). both OVER-split -- they invent extra buckets -- so the only cost is a missed catch,
-# never a false reject of a healthy export. no catalog layout produces either shape today (fused
-# experts collapse correctly: `layers.0.mlp.experts.3.down_proj` -> `layers.mlp.experts.down_proj`).
+# (`a.proj.7`). both OVER-split. a partial bucket is always contained in a single fully-collapsed
+# bucket -- substitution only ever removes text, so two paths that survive to the same partial form
+# cannot separate under further passes -- so an unhandled shape can only invent EXTRA buckets. that
+# costs a missed catch and never a false reject of a healthy export, which is why leaving these
+# shapes unhandled is safe rather than merely untested. fused experts do collapse fully:
+# `layers.0.mlp.experts.3.down_proj` -> `layers.mlp.experts.down_proj`.
 _LAYER_INDEX_RE = re.compile(r"\.\d+\.")
 _TEXT_LORA_KEY_RE = re.compile(
     r"^(?P<module>base_model\.model\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+)"
