@@ -20,8 +20,12 @@ from flash.schema import format_adapter_revision, parse_adapter_revision
 if TYPE_CHECKING:
     from flash.runner import RunStatus
 
+# reads the TOP-LEVEL `status.state`, where `deployed` is a live value this build writes.
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
-_RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
+# reads the NESTED `status.deployment["state"]`, a different vocabulary: no build has ever written
+# `deployed` there. the cli keeps both spellings on purpose, because it reads this field back from
+# a remote control plane whose version it does not control.
+_RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready"})
 _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 _REVOCATION_RETRY_STATE = "revocation_failed"
 _INACTIVE_DEPLOYMENT_STATES = frozenset({"undeployed", "dry_run"})
