@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -19,6 +20,11 @@ REST_BASE_URL = "https://rest.runpod.io/v1"
 # that has to be bumped in lockstep with the package version.
 USER_AGENT = "flash-serving"
 _DEFAULT_TIMEOUT_SECONDS = 30.0
+# enough to reach the message in runpod's error envelope without buffering a large body.
+_ERROR_BODY_BYTES = 4096
+# runpod's own wording for "the gpu you asked for is not available right now", returned as a
+# 500 rather than the 402/429 it uses elsewhere for the same condition.
+_NO_CAPACITY_RE = re.compile(r"no instances currently available", re.IGNORECASE)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -185,7 +191,8 @@ class StdlibRunPodTransport:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             try:
-                code = self._http_error_code(exc.code, mutation=mutation)
+                body = self._error_body(exc)
+                code = self._http_error_code(exc.code, mutation=mutation, body=body)
             finally:
                 exc.close()
             raise code from None
@@ -237,8 +244,23 @@ class StdlibRunPodTransport:
         return min(_DEFAULT_TIMEOUT_SECONDS, remaining)
 
     @staticmethod
-    def _http_error_code(status: int, *, mutation: bool) -> RunPodTransportFailure:
+    def _error_body(exc: urllib.error.HTTPError) -> str:
+        """read the provider's stated reason, which is unreachable once the error is closed."""
+
+        try:
+            return exc.read(_ERROR_BODY_BYTES).decode("utf-8", "replace")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _http_error_code(status: int, *, mutation: bool, body: str = "") -> RunPodTransportFailure:
         if 300 <= status < 400 or status == 408 or 500 <= status < 600:
+            # runpod answers a plain capacity shortfall with a 500 whose body says so. nothing was
+            # created, so treating it as ambiguous would tell the user resources may be billing and
+            # send them to `serve status` and `serve undeploy` for a pod that never existed. only
+            # this exact wording narrows: any other 5xx may have landed and must stay unknown.
+            if _NO_CAPACITY_RE.search(body) is not None:
+                return RunPodTransportFailure("capacity_unavailable")
             return RunPodTransportFailure(
                 "resource_ambiguous" if mutation else "transport_failed",
                 outcome_unknown=mutation,

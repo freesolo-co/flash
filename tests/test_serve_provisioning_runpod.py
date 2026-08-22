@@ -3381,3 +3381,98 @@ def test_runpod_readiness_requires_the_same_exact_provenance_as_modal() -> None:
     wrong = json.loads(json.dumps(exact))
     wrong["data"][0]["flash_provenance"]["requested_model"] = "someone-elses-model"
     assert not _provenance_matches(wrong, bundle)
+
+
+class _NoCapacityPodTransport(_FakeTransport):
+    """the real shape runpod returns when it has no gpu of the planned type to give.
+
+    measured live: `POST /pods` answers HTTP 500 with
+    `{"error":"create pod: There are no instances currently available"}`, which the transport now
+    reads as a definite `capacity_unavailable`. this covers what the lifecycle does with it: the
+    four resources created before the pod must be torn down and the failure reported plainly.
+    """
+
+    def rest(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None,
+        *,
+        mutation: bool,
+        deadline_at: float,
+        query: dict[str, str] | None = None,
+    ) -> object:
+        if method == "POST" and path == "/pods":
+            raise RunPodTransportFailure("capacity_unavailable")
+        return super().rest(
+            method, path, payload, mutation=mutation, deadline_at=deadline_at, query=query
+        )
+
+
+def test_proven_empty_abort_reports_failure_not_an_unknown_outcome() -> None:
+    """a create that leaves nothing behind must not warn about resources that may be billing.
+
+    `_abort_created_resources` only returns True after re-observing the account and finding
+    `resource_count == 0`, which is an authoritative proof that nothing exists to bill. discarding
+    that proof sends the user to `serve status` and `serve undeploy` for resources that provably
+    do not exist. the interrupt path already makes exactly this distinction.
+    """
+    bundle = _bundle()
+    transport = _NoCapacityPodTransport()
+
+    result, _factory, _probe = _provision(bundle, transport)
+
+    assert result.status == "failed", result.status
+    assert result.error_code == "capacity_unavailable"
+    assert result.handle is None
+    # nothing survived the abort, which is what makes the plain failure honest.
+    assert not transport.pods, transport.pods
+    assert not transport.templates, transport.templates
+    assert not transport.volumes, transport.volumes
+
+
+def test_no_capacity_500_is_a_definite_rejection_not_an_ambiguous_outcome() -> None:
+    """runpod reports a plain capacity shortfall as a 500, which must not read as ambiguous.
+
+    measured live against `POST /pods`:
+    `{"error":"create pod: There are no instances currently available","status":500}`.
+    nothing is created, so the outcome is not in doubt -- but a blanket 5xx-on-mutation rule
+    reports `outcome_unknown`, telling the user resources may be billing and sending them to
+    `serve status` and `serve undeploy` for a pod that never existed. runpod already answers 402
+    and 429 with `capacity_unavailable`; this is the same condition wearing a different status.
+    """
+    body = b'{"error":"create pod: There are no instances currently available","status":500}'
+
+    def opener(_request, *, timeout: float):
+        raise urllib.error.HTTPError(
+            "https://rest.runpod.io/v1/pods", 500, "sanitized", None, io.BytesIO(body)
+        )
+
+    transport = StdlibRunPodTransport(PROVIDER_SECRET, opener=opener, clock=lambda: 0.0)
+    with pytest.raises(RunPodTransportFailure) as exc_info:
+        transport.rest("POST", "/pods", {}, mutation=True, deadline_at=10.0)
+    assert exc_info.value.code == "capacity_unavailable"
+    assert exc_info.value.outcome_unknown is False
+
+
+def test_unrelated_500_stays_ambiguous_on_a_mutation() -> None:
+    """only the provider's own no-capacity wording is definite; every other 5xx stays unknown.
+
+    a 500 whose cause is not stated may well have landed, so narrowing must not leak into the
+    general case that protects a possibly-created resource from being forgotten.
+    """
+
+    def opener(_request, *, timeout: float):
+        raise urllib.error.HTTPError(
+            "https://rest.runpod.io/v1/pods",
+            500,
+            "sanitized",
+            None,
+            io.BytesIO(b'{"error":"internal server error"}'),
+        )
+
+    transport = StdlibRunPodTransport(PROVIDER_SECRET, opener=opener, clock=lambda: 0.0)
+    with pytest.raises(RunPodTransportFailure) as exc_info:
+        transport.rest("POST", "/pods", {}, mutation=True, deadline_at=10.0)
+    assert exc_info.value.code == "resource_ambiguous"
+    assert exc_info.value.outcome_unknown is True

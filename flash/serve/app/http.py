@@ -102,7 +102,15 @@ def create_app(
         try:
             payload = _strict_json(await _read_request_body(request))
         except _RequestBodyTooLarge:
-            return _error(413, "request_too_large", "request body exceeds the byte limit")
+            # both rejection branches stop before the body is drained, so the unread bytes would
+            # corrupt the next request on a reused connection. closing is what makes them
+            # unreachable, matching the hosted middleware's handling of the same case.
+            return _error(
+                413,
+                "request_too_large",
+                "request body exceeds the byte limit",
+                headers={"connection": "close"},
+            )
         except ValueError:
             return _error(400, "invalid_json", "request body is not valid json")
         if type(payload) is not dict:
@@ -295,10 +303,13 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _error(status: int, code: str, message: str) -> JSONResponse:
+def _error(
+    status: int, code: str, message: str, *, headers: dict[str, str] | None = None
+) -> JSONResponse:
     return JSONResponse(
         {"error": {"message": message, "type": "invalid_request_error", "code": code}},
         status_code=status,
+        headers=headers,
     )
 
 

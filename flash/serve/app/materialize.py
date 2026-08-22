@@ -21,9 +21,9 @@ from flash.adapters.fused_experts import (
     validate_fused_expert_adapter_config,
 )
 from flash.adapters.lora_rank import (
-    declared_lora_ranks,
     lora_tensor_rank_disagrees,
     rank_from_adapter_config,
+    strict_declared_lora_ranks,
 )
 from flash.engine.worker.model.lora import _read_safetensors_tensor_metadata
 from flash.serve.contract import reject_non_finite_json_constant
@@ -419,7 +419,12 @@ def validate_adapter_weight_structure(
     if not tensors:
         raise MaterializationError("adapter safetensors contains no tensors")
     _validate_lora_pairs(tensors)
-    declared = declared_lora_ranks(config)
+    # the strict reader rejects malformed rank declarations instead of skipping them, which is what
+    # a serving load boundary needs. it raises ValueError, so translate like the fused-expert call.
+    try:
+        declared = strict_declared_lora_ranks(config)
+    except ValueError as exc:
+        raise MaterializationError("adapter_config.json rank declarations are invalid") from exc
     contradictions = [
         key for key, shape in tensors.items() if lora_tensor_rank_disagrees(key, shape, declared)
     ]

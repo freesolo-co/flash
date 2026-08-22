@@ -448,6 +448,12 @@ def test_request_body_accepts_exact_limit_and_rejects_headers_or_streams_over_li
     assert over_stream.status_code == 413
     assert over_stream.json()["error"]["code"] == "request_too_large"
 
+    # both branches reject before the body is drained, so the unread bytes make the connection
+    # unusable for a following request. closing is what makes those bytes unreachable, and it is
+    # what the hosted middleware already does for the same early rejection.
+    assert over_header.headers["connection"] == "close"
+    assert over_stream.headers["connection"] == "close"
+
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_disconnect_cancels_generation_after_body_is_consumed(stream: bool) -> None:
