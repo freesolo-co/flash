@@ -29,7 +29,8 @@ _CLEANUP_RESERVE_SECONDS = 30.0
 
 
 def _work_deadline(deadline_at: float, clock: Clock) -> float:
-    return deadline_at - min(_CLEANUP_RESERVE_SECONDS, (deadline_at - clock()) / 2.0)
+    remaining_seconds = max(0.0, deadline_at - clock())
+    return deadline_at - min(_CLEANUP_RESERVE_SECONDS, remaining_seconds / 2.0)
 
 
 @dataclass(slots=True)

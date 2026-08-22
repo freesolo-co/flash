@@ -48,6 +48,7 @@ from flash.serve.provisioning._runpod_transport import (
 )
 from flash.serve.provisioning.runpod import (
     _observe,
+    _work_deadline,
     provision_runpod_deployment,
     reconcile_runpod_deployment,
     teardown_runpod_deployment,
@@ -161,6 +162,27 @@ class _Clock:
 
     def sleep(self, seconds: float) -> None:
         self.now += seconds
+
+
+@pytest.mark.parametrize(
+    ("deadline_at", "now", "expected"),
+    [
+        (160.0, 100.0, 130.0),
+        (110.0, 100.0, 105.0),
+        (100.0, 100.0, 100.0),
+        (100.0, 160.0, 100.0),
+        (100.0, 300.0, 100.0),
+    ],
+)
+def test_work_deadline_never_exceeds_the_caller_deadline(
+    deadline_at: float,
+    now: float,
+    expected: float,
+) -> None:
+    work_deadline = _work_deadline(deadline_at, lambda: now)
+
+    assert work_deadline <= deadline_at
+    assert work_deadline == expected
 
 
 class _Probe:

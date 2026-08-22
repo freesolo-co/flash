@@ -30,6 +30,7 @@ from flash.serve.provisioning import (
     ServingRuntimeSecrets,
     serving_resource_names,
 )
+from flash.serve.provisioning._modal_deployment import _work_deadline
 from flash.serve.provisioning._modal_plan import (
     MODAL_APP_TAG_LIMIT,
     MODAL_DEPLOYMENT_TAG_LIMIT,
@@ -144,6 +145,27 @@ class _Clock:
 
     def sleep(self, seconds: float) -> None:
         self.now += seconds
+
+
+@pytest.mark.parametrize(
+    ("deadline_at", "now", "expected"),
+    [
+        (160.0, 100.0, 130.0),
+        (110.0, 100.0, 105.0),
+        (100.0, 100.0, 100.0),
+        (100.0, 160.0, 100.0),
+        (100.0, 300.0, 100.0),
+    ],
+)
+def test_work_deadline_never_exceeds_the_caller_deadline(
+    deadline_at: float,
+    now: float,
+    expected: float,
+) -> None:
+    work_deadline = _work_deadline(deadline_at, lambda: now)
+
+    assert work_deadline <= deadline_at
+    assert work_deadline == expected
 
 
 class _Probe:
