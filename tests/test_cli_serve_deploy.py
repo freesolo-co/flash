@@ -308,9 +308,12 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # a retry after an unconfirmed outcome can double-provision and bill twice.
+    identities: list[str] = []
+
     def _unknown(bundle, credentials, secrets, *, deadline_at, **_kwargs):
         from flash.serve.control import DeploymentResult
 
+        identities.append(encode_deployment_identity(bundle))
         return DeploymentResult.from_spec(
             bundle.spec, status="outcome_unknown", error_code="transport_failed"
         )
@@ -322,8 +325,18 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     assert cmd_serve_deploy(_args()) == 1
     captured = capsys.readouterr()
     assert "outcome_unknown" in captured.out
+    assert f"identity    {identities[0]}\n" in captured.out
     assert "flash serve status" in captured.err
     assert "flash serve undeploy" in captured.err
+
+    def _encoding_fails(_bundle):
+        raise RuntimeError("encoding failed")
+
+    monkeypatch.setattr(
+        "flash.cli.commands.serve_identity.encode_deployment_identity", _encoding_fails
+    )
+    assert cmd_serve_deploy(_args()) == 1
+    assert "outcome_unknown" in capsys.readouterr().out
 
 
 def test_interrupted_deploy_prints_recovery_identity_without_masking_interrupt(

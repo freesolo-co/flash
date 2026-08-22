@@ -92,8 +92,6 @@ def _report_handle(handle, *, endpoint: bool = True) -> None:
 
 
 def _report(result, bundle) -> int:
-    from flash.cli.commands.serve_identity import encode_deployment_identity
-
     print(f"deployment  {result.deployment_id} generation {result.generation}")
     print(f"provider    {result.provider}")
     print(f"engine      {result.engine_id}")
@@ -102,7 +100,7 @@ def _report(result, bundle) -> int:
     handle = result.handle
     if handle is not None:
         _report_handle(handle)
-        print(f"identity    {encode_deployment_identity(bundle)}")
+    _report_identity(bundle)
     if result.status == "ready":
         return 0
     if result.error_code:
@@ -119,8 +117,8 @@ def _report(result, bundle) -> int:
     return 1
 
 
-def _report_interrupted_identity(bundle) -> None:
-    """print recovery identity without replacing the interrupt if reporting fails."""
+def _report_identity(bundle) -> None:
+    """print recovery identity without replacing the reported outcome if encoding fails."""
 
     try:
         from flash.cli.commands.serve_identity import encode_deployment_identity
@@ -284,7 +282,7 @@ def cmd_serve_deploy(args) -> int:
         # the interrupt still propagates -- the user pressed Ctrl-C and the exit code must say so.
         # but the generic handler prints only "aborted", which reads as "nothing was created",
         # and here something was: cleanup ran and could not confirm the resources are gone.
-        _report_interrupted_identity(bundle)
+        _report_identity(bundle)
         _warn_unconfirmed_cleanup(interrupted.provider, args.deployment_id)
         raise
     return _report(result, bundle)
