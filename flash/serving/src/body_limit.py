@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
-from starlette.responses import JSONResponse
+from fastapi.responses import JSONResponse
 
 
 class RequestBodyLimitMiddleware:
