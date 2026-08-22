@@ -570,7 +570,6 @@ def provision_modal_deployment(
     finalized_plan = build_modal_create_plan(bundle, phase="finalized")
     sdk: ModalSdk | None = None
     created = _CreatedResources()
-    expected: ExpectedResources | None = None
     reached_ready = False
     try:
         sdk = open_sdk(sdk_factory, credentials, finalized_plan)
@@ -664,7 +663,7 @@ def provision_modal_deployment(
                 create_plan,
                 sdk,
                 created,
-                expected=created.confirmed or expected,
+                expected=created.confirmed,
                 deadline_at=deadline_at,
                 clock=clock,
                 sleep=sleep,
@@ -687,7 +686,7 @@ def provision_modal_deployment(
                 create_plan,
                 sdk,
                 created,
-                expected=created.confirmed or expected,
+                expected=created.confirmed,
                 deadline_at=deadline_at,
                 clock=clock,
                 sleep=sleep,
