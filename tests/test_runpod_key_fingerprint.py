@@ -35,6 +35,22 @@ def test_key_fingerprint_is_stable_and_non_revealing():
     assert api.key_fingerprint("a-different-key") != fp  # distinguishes accounts
 
 
+def test_the_prefix_form_is_what_a_deployed_release_writes_not_history():
+    """The 16-char shape is a LIVE producer's output, so its resolver is not deletable as legacy.
+
+    Pinned because it was already deleted once in this branch as dead compatibility code and
+    restored a day later. `dev`'s `key_fingerprint` is `sha256(...).hexdigest()[:12]`; only this
+    branch widened it to the full digest. Every endpoint a currently deployed release creates
+    therefore persists this shape, and a cleanup record whose owner cannot be resolved leaves a
+    live RunPod endpoint billing with nothing able to tear it down.
+    """
+    from flash.providers.runpod import api
+
+    deployed_shape = api.key_fingerprint("some-pool-key")[:16]
+    assert api._is_prefix_key_fingerprint(deployed_shape)
+    assert not api._is_valid_key_fingerprint(deployed_shape)
+
+
 def test_key_lookup_rejects_unknown_fingerprint_without_leaking_credentials(monkeypatch):
     from flash.providers.runpod import api
 
@@ -76,7 +92,7 @@ def test_repeated_identical_pool_key_still_resolves_its_fingerprint(monkeypatch)
     assert api._key_for_fingerprint(api.key_fingerprint("secretB")) == "secretB"
 
 
-def test_legacy_fingerprint_owner_listing_deletes_through_authenticated_path(monkeypatch):
+def test_prefix_fingerprint_owner_listing_deletes_through_authenticated_path(monkeypatch):
     from flash.providers.runpod import api
     from flash.runner.supervise.recovery import _delete_runpod_endpoint
 
@@ -86,7 +102,9 @@ def test_legacy_fingerprint_owner_listing_deletes_through_authenticated_path(mon
     monkeypatch.setattr(
         api,
         "list_endpoints_by_key",
-        lambda **_kwargs: pytest.fail("legacy prefix must resolve before inventory fallback"),
+        lambda **_kwargs: pytest.fail(
+            "the persisted prefix must resolve before inventory fallback"
+        ),
     )
     calls = []
 
@@ -106,7 +124,7 @@ def test_legacy_fingerprint_owner_listing_deletes_through_authenticated_path(mon
     ]
 
 
-def test_legacy_fingerprint_already_gone_retires_cleanup_record(monkeypatch):
+def test_prefix_fingerprint_already_gone_retires_cleanup_record(monkeypatch):
     from flash.providers.runpod import api
     from flash.runner.supervise.recovery import _delete_runpod_endpoint
 
@@ -128,7 +146,7 @@ def test_legacy_fingerprint_already_gone_retires_cleanup_record(monkeypatch):
     _delete_runpod_endpoint({"endpoint_id": "ep-legacy", "key_fingerprint": full_fingerprint[:16]})
 
 
-def test_legacy_fingerprint_rejects_ambiguous_prefix_owners(monkeypatch):
+def test_prefix_fingerprint_rejects_ambiguous_prefix_owners(monkeypatch):
     from flash.providers.runpod import api
 
     keys = ["owner-a", "owner-b"]
@@ -145,10 +163,10 @@ def test_legacy_fingerprint_rejects_ambiguous_prefix_owners(monkeypatch):
     )
 
     with pytest.raises(api.RunpodApiError, match="expected exactly one"):
-        api.resolve_legacy_key_fingerprint("ep-legacy", "rpk-" + "a" * 12)
+        api.resolve_prefix_key_fingerprint("ep-legacy", "rpk-" + "a" * 12)
 
 
-def test_legacy_fingerprint_rejects_endpoint_live_under_other_account(monkeypatch):
+def test_prefix_fingerprint_rejects_endpoint_live_under_other_account(monkeypatch):
     from flash.providers.runpod import api
 
     key = "legacy-owner"
@@ -166,8 +184,8 @@ def test_legacy_fingerprint_rejects_endpoint_live_under_other_account(monkeypatc
 
     monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", alive_under_other_account)
 
-    with pytest.raises(api.RunpodApiError, match="not owned by the legacy fingerprint match"):
-        api.resolve_legacy_key_fingerprint("ep-legacy", full_fingerprint[:16])
+    with pytest.raises(api.RunpodApiError, match="not owned by the fingerprint prefix match"):
+        api.resolve_prefix_key_fingerprint("ep-legacy", full_fingerprint[:16])
 
 
 def test_rotated_sole_replacement_with_same_48_bit_prefix_cannot_confirm_absence(monkeypatch):

@@ -32,7 +32,16 @@ def _is_valid_key_fingerprint(fingerprint: object) -> bool:
     )
 
 
-def _is_legacy_key_fingerprint(fingerprint: object) -> bool:
+def _is_prefix_key_fingerprint(fingerprint: object) -> bool:
+    """The 12-hex-digit prefix form, which is what DEPLOYED `dev` persists right now.
+
+    Deliberately not called "legacy": `dev`'s `key_fingerprint` is
+    `sha256(...).hexdigest()[:12]` today, so every endpoint any currently deployed release
+    creates carries this shape. Only this branch widened it to the full digest. Naming it
+    legacy already caused one wrong deletion of the resolver below (it was removed as dead
+    compatibility, then restored a day later) -- and a RunPod endpoint whose owner cannot be
+    resolved bills forever with nothing able to tear it down.
+    """
     return (
         isinstance(fingerprint, str)
         and len(fingerprint) == 16
@@ -139,10 +148,13 @@ def _list_endpoints_for_key(
     return out
 
 
-def resolve_legacy_key_fingerprint(endpoint_id: str, fingerprint: str) -> str:
-    """Upgrade a historical prefix only after its sole matching key proves endpoint ownership."""
-    if not _is_legacy_key_fingerprint(fingerprint):
-        raise RunpodApiError("persisted legacy RunPod key fingerprint is invalid")
+def resolve_prefix_key_fingerprint(endpoint_id: str, fingerprint: str) -> str:
+    """Widen a persisted prefix only after its sole matching key proves endpoint ownership.
+
+    Required by CURRENTLY DEPLOYED releases, not by history: see `_is_prefix_key_fingerprint`.
+    """
+    if not _is_prefix_key_fingerprint(fingerprint):
+        raise RunpodApiError("persisted RunPod key fingerprint prefix is invalid")
     configured_keys = _keys.keys()
     matches = [
         (key, full_fingerprint)
@@ -151,7 +163,7 @@ def resolve_legacy_key_fingerprint(endpoint_id: str, fingerprint: str) -> str:
     ]
     key = _unique_matching_key(
         [match_key for match_key, _ in matches],
-        "expected exactly one RunPod pool key matching the persisted legacy fingerprint",
+        "expected exactly one RunPod pool key matching the persisted fingerprint prefix",
     )
     full_fingerprint = key_fingerprint(key)
     try:
@@ -184,7 +196,7 @@ def _confirm_deleted(endpoint_id: str, fingerprint: str) -> None:
         raise RunpodApiError(
             f"runpod endpoint ownership lookup failed for {endpoint_id}; owner unconfirmed"
         ) from None
-    foreign = f"runpod endpoint {endpoint_id} is not owned by the legacy fingerprint match"
+    foreign = f"runpod endpoint {endpoint_id} is not owned by the fingerprint prefix match"
     if any(isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id for endpoint in fleet):
         raise RunpodApiError(foreign)
     try:

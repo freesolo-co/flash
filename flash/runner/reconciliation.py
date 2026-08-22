@@ -341,7 +341,7 @@ def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
     NOT true that such a record has nothing to delete: `key_fingerprint` is validated at exactly 68
     chars, while a deployed release writes the 16-char form, so every endpoint created by that
     release fails `from_dict` here. `_delete_runpod_endpoint` resolves precisely that case through
-    `resolve_legacy_key_fingerprint`, and the teardown loop builds a base `JobHandle`, which
+    `resolve_prefix_key_fingerprint`, and the teardown loop builds a base `JobHandle`, which
     validates only `provider`. Dropping these records here is what strands them -- a live RunPod
     endpoint then bills forever with nothing left to tear it down.
     """

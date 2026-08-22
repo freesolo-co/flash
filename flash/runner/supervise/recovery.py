@@ -179,7 +179,7 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
 
 
 def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
-    """Delete one exact RunPod endpoint without trusting legacy handle metadata."""
+    """Delete one exact RunPod endpoint without trusting the persisted handle's own metadata."""
     from flash.providers.runpod import api as runpod_api
 
     endpoint_id = data.get("endpoint_id")
@@ -197,9 +197,9 @@ def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
     try:
         runpod_api._key_for_fingerprint(fingerprint)
     except runpod_api.RunpodApiError:
-        if runpod_api._is_legacy_key_fingerprint(fingerprint):
+        if runpod_api._is_prefix_key_fingerprint(fingerprint):
             try:
-                fingerprint = runpod_api.resolve_legacy_key_fingerprint(endpoint_id, fingerprint)
+                fingerprint = runpod_api.resolve_prefix_key_fingerprint(endpoint_id, fingerprint)
             except runpod_api.RunpodApiError:
                 pass
             else:

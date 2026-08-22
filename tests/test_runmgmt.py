@@ -1501,7 +1501,7 @@ def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
     form, so such a record fails the strict `from_dict` behind `_canonical_cleanup_remote` and
     `_remote_resource_identity`. The teardown loop builds a base `JobHandle` (which validates only
     `provider`) and `_delete_runpod_endpoint` resolves that exact fingerprint through
-    `resolve_legacy_key_fingerprint`. Filtering the record out before teardown would leave a live
+    `resolve_prefix_key_fingerprint`. Filtering the record out before teardown would leave a live
     RunPod endpoint billing forever with nothing left to delete it.
     """
     import json as _json
@@ -1541,7 +1541,7 @@ def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
         return True
 
     monkeypatch.setattr(runpod_api, "_key_for_fingerprint", _key_for_fingerprint)
-    monkeypatch.setattr(runpod_api, "resolve_legacy_key_fingerprint", resolve_legacy)
+    monkeypatch.setattr(runpod_api, "resolve_prefix_key_fingerprint", resolve_legacy)
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
 
     attempted = runner._drain_cleanup_remotes(spec.run_id)
