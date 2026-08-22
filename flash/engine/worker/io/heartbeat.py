@@ -93,9 +93,7 @@ def _is_critical_stage(stage: str) -> bool:
     unforced ping is dropped -- so the one report of the failure would be discarded exactly in the
     case that produces it.
     """
-    return (
-        stage in _HB_TERMINAL_STAGES or stage.startswith("error_") or stage.endswith("_failed")
-    )
+    return stage in _HB_TERMINAL_STAGES or stage.startswith("error_") or stage.endswith("_failed")
 
 
 # Guards throttle bookkeeping; slow HF commit runs outside this lock so heartbeat and liveness
