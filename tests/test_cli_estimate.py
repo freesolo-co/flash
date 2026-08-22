@@ -974,6 +974,29 @@ def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
     )
 
 
+def test_an_authored_rank_never_reaches_the_warm_start_quote(tmp_path, capsys, monkeypatch):
+    """The parser settles this, so the quote has no authored rank to price against.
+
+    `lora_rank` alongside `init_from_adapter` is rejected before the cost path runs, because the
+    source adapter's rank is authoritative. A second branch in the quote for an authored rank would
+    therefore be unreachable -- this pins the rejection that makes it so.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    body = SFT_TOML.replace('algorithm = "sft"', 'algorithm = "grpo"').replace(
+        "batch_size = 8\n",
+        "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
+        'init_from_adapter = "source-run"\nlora_rank = 64\n',
+    )
+
+    from flash.schema.fields import ConfigError
+
+    with pytest.raises(
+        ConfigError, match=r"train\.lora_rank cannot be set with train\.init_from_adapter"
+    ):
+        cmd_train(_sft_args(tmp_path, body))
+    assert capsys.readouterr().out == ""
+
+
 def test_warm_start_cost_quotes_the_card_the_parser_accepts(tmp_path, capsys, monkeypatch):
     """The quote must not refuse the exact configuration the parser now admits.
 
