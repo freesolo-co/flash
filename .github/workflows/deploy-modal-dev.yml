@@ -196,7 +196,22 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
-          endpoint="${SUPABASE_URL%/}/rest/v1/hosted_lora_adapters?select=id&limit=1"
+          # probe the columns the runtime actually reads, not `id` -- which is not even among them.
+          # selecting only `id` proved the TABLE exists while a schema still missing, say,
+          # `deployment_generation` passed this gate and then failed on every read after deploy.
+          # this is the same check the production workflow applies; dev kept the weaker one, so a
+          # pending serving migration could deploy a development router that cannot hydrate its
+          # registry and only fails later at readiness.
+          # import the constants module, not persistence.py: this job installs only modal and
+          # python-dotenv, while persistence.py imports httpx at module scope, so importing it
+          # would raise ModuleNotFoundError and the guard below would block every dev deploy.
+          if ! columns="$(python -c 'from flash.serving.src.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
+            # failing closed matters here: an empty list would degrade the query back to a bare
+            # existence check and this gate would pass while proving nothing.
+            echo "::error::Could not read PERSISTED_COLUMNS; refusing to deploy against an unverified schema."
+            exit 1
+          fi
+          endpoint="${SUPABASE_URL%/}/rest/v1/hosted_lora_adapters?select=${columns}&limit=1"
           headers=(
             --header "apikey: $SUPABASE_SERVICE_ROLE_KEY"
             --header "Accept-Profile: flash"
