@@ -1792,6 +1792,96 @@ def test_abort_declines_a_plan_identical_app_with_a_different_confirmed_id() -> 
     assert sdk.artifact
 
 
+def test_abort_without_an_app_declines_unconfirmed_race_winner_resources() -> None:
+    plan = build_modal_create_plan(_bundle(), phase="bootstrap")
+    sdk = _FakeSdk(plan)
+    sdk.inference = [ModalNamedResource("st-" + "R" * 22, plan.names.inference_secret)]
+    sdk.artifact = [ModalNamedResource("st-" + "B" * 22, plan.names.artifact_secret)]
+    sdk.volumes = [ModalNamedResource("vo-" + "R" * 22, plan.names.volume)]
+    created = _CreatedResources(inference=True, artifact=True, volume=True)
+    clock = _Clock()
+
+    absent = _abort_created_resources(
+        plan,
+        sdk,
+        created,
+        expected=None,
+        deadline_at=100.0,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert absent is False
+    operations = [name for name, _value in sdk.calls]
+    assert operations == ["observe"], "abort deleted resources without confirmed ownership"
+    assert sdk.volumes
+    assert sdk.inference
+    assert sdk.artifact
+
+
+def test_abort_without_an_app_declines_an_unconfirmed_app_attempt() -> None:
+    plan = build_modal_create_plan(_bundle(), phase="finalized")
+    sdk = _FakeSdk(plan)
+    created = _CreatedResources(app_deployed=True)
+    clock = _Clock()
+
+    absent = _abort_created_resources(
+        plan,
+        sdk,
+        created,
+        expected=None,
+        deadline_at=100.0,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert absent is False
+    assert [name for name, _value in sdk.calls] == ["observe"]
+
+
+def test_abort_without_an_app_deletes_resources_with_matching_confirmed_ids() -> None:
+    plan = build_modal_create_plan(_bundle(), phase="bootstrap")
+    sdk = _FakeSdk(plan)
+    _seed_exact(sdk, artifact=True)
+    sdk.apps = []
+    expected = ExpectedResources(
+        app_id=None,
+        volume_id=VOLUME_ID,
+        inference_secret_id=INFERENCE_SECRET_ID,
+        artifact_secret_id=ARTIFACT_SECRET_ID,
+    )
+    created = _CreatedResources(
+        inference=True,
+        artifact=True,
+        volume=True,
+        confirmed=expected,
+    )
+    clock = _Clock()
+
+    absent = _abort_created_resources(
+        plan,
+        sdk,
+        created,
+        expected=expected,
+        deadline_at=100.0,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert absent is True
+    operations = [name for name, _value in sdk.calls]
+    assert operations == [
+        "observe",
+        "delete_artifact",
+        "delete_inference",
+        "delete_volume",
+        "observe",
+    ]
+    assert sdk.volumes == []
+    assert sdk.inference == []
+    assert sdk.artifact == []
+
+
 def test_abort_with_confirmed_ids_stops_waits_deletes_and_confirms_absence() -> None:
     plan = build_modal_create_plan(_bundle(), phase="bootstrap")
     sdk = _DelayedAbortSdk(plan)
@@ -2175,33 +2265,15 @@ def test_a_failed_abort_delete_reports_that_cleanup_was_not_confirmed() -> None:
     [
         (
             "create_artifact_secret",
-            [
-                "observe",
-                "create_inference",
-                "create_artifact",
-                "observe",
-                "delete_artifact",
-                "delete_inference",
-                "observe",
-            ],
+            ["observe", "create_inference", "create_artifact", "observe"],
         ),
         (
             "create_volume",
-            [
-                "observe",
-                "create_inference",
-                "create_artifact",
-                "create_volume",
-                "observe",
-                "delete_artifact",
-                "delete_inference",
-                "delete_volume",
-                "observe",
-            ],
+            ["observe", "create_inference", "create_artifact", "create_volume", "observe"],
         ),
     ],
 )
-def test_a_definite_create_failure_after_acceptance_tears_down_created_resources(
+def test_a_create_failure_after_acceptance_stays_ambiguous_without_returned_ids(
     failing_call: str,
     expected_operations: list[str],
 ) -> None:
@@ -2225,34 +2297,25 @@ def test_a_definite_create_failure_after_acceptance_tears_down_created_resources
     result, _probe = _provision(_bundle(), factory)
     sdk = sdk_holder[0]
 
-    assert (
-        result.status,
-        result.error_code,
-        [name for name, _payload in sdk.calls],
-        sdk.inference,
-        sdk.artifact,
-        sdk.volumes,
-    ) == (
-        "failed",
-        "provider_rejected",
-        expected_operations,
-        [],
-        [],
-        [],
-    )
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "resource_ambiguous"
+    assert [name for name, _payload in sdk.calls] == expected_operations
+    assert sdk.inference
+    assert sdk.artifact
+    if failing_call == "create_volume":
+        assert sdk.volumes
 
 
 @pytest.mark.parametrize("interrupted_call", ["create_volume", "create_inference_secret"])
-def test_a_create_interrupted_after_the_provider_accepted_it_is_still_torn_down(
+def test_a_create_interrupted_after_the_provider_accepted_it_stays_ambiguous_without_ownership(
     interrupted_call: str,
 ) -> None:
     """the window between Modal accepting a create and the caller seeing its handle.
 
-    Ctrl-C landing there used to leave nothing recorded, because the record was written from the
-    return value -- so abort skipped exactly the resource that exists, reported full success, and
-    the cli printed a plain "aborted" over a volume the customer keeps paying for. Marking the
-    attempt before the call is what makes an unseen handle still deletable, since every name comes
-    from the plan.
+    marking before the call preserves knowledge that a create may have landed, so abort cannot
+    report clean absence. the missing returned id also means ownership is unproved: deleting the
+    deterministic name could destroy a same-generation race winner, so the resource stays for later
+    proof-based reclaim and the user receives an ambiguous interruption.
     """
 
     factory = _Factory()
@@ -2275,16 +2338,18 @@ def test_a_create_interrupted_after_the_provider_accepted_it_is_still_torn_down(
     _interrupt_after(interrupted_call)
     factory.sdk_class = _InterruptAfterAcceptSdk
 
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(InterruptedProvisioning):
         _provision(_bundle(), factory)
 
-    # the interrupted resource is the one that used to leak, but nothing else may be left behind
-    # either, and the abort must have confirmed every step -- an unconfirmed one would have
-    # surfaced as `InterruptedProvisioning` rather than the bare interrupt asserted above.
     sdk = sdk_holder[0]
-    assert sdk.volumes == []
-    assert sdk.inference == []
-    assert sdk.artifact == []
+    operations = [name for name, _payload in sdk.calls]
+    assert operations[-1] == "observe"
+    assert "delete_volume" not in operations
+    assert "delete_inference" not in operations
+    if interrupted_call == "create_volume":
+        assert sdk.volumes, "the accepted volume was not retained as the ambiguous resource"
+    else:
+        assert sdk.inference, "the accepted secret was not retained as the ambiguous resource"
 
 
 def test_a_fully_confirmed_abort_leaves_the_interrupt_unchanged() -> None:

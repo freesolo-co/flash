@@ -9,9 +9,13 @@ from flash.serve.control import ModalProviderHandle
 from ._common import Clock, Sleeper
 from ._modal_lifecycle import mutation, observe
 from ._modal_plan import ModalCreatePlan
-from ._modal_readiness import sleep_until_poll
-from ._modal_resources import exact_teardown_resources, resources_are_absent
-from ._modal_sdk import ModalNamedResource, ModalObservation, ModalSdk
+from ._modal_readiness import ExpectedResources, sleep_until_poll
+from ._modal_resources import (
+    ModalResourceConflict,
+    exact_teardown_resources,
+    resources_are_absent,
+)
+from ._modal_sdk import ModalNamedResource, ModalObservation, ModalSdk, ModalSdkFailure
 
 
 def wait_for_terminal_app(
@@ -67,6 +71,63 @@ def delete_teardown_resources(
         run(lambda: mutation(lambda: sdk.delete_secret(plan, inference.name)))
     if volume is not None:
         run(lambda: mutation(lambda: sdk.delete_volume(plan)))
+
+
+def delete_confirmed_abort_resources(
+    plan: ModalCreatePlan,
+    sdk: ModalSdk,
+    initial: ModalObservation,
+    expected: ExpectedResources | None,
+    *,
+    artifact_attempted: bool,
+    inference_attempted: bool,
+    volume_attempted: bool,
+    app_deployed: bool,
+) -> bool:
+    """delete no-app abort resources only after proving this invocation owns them."""
+
+    if app_deployed:
+        # no observed app means its name cannot be bound to the id this invocation received.
+        return False
+    resources = (
+        (
+            artifact_attempted,
+            initial.artifact_secrets[0] if initial.artifact_secrets else None,
+            None if expected is None else expected.artifact_secret_id,
+            plan.names.artifact_secret,
+        ),
+        (
+            inference_attempted,
+            initial.inference_secrets[0] if initial.inference_secrets else None,
+            None if expected is None else expected.inference_secret_id,
+            plan.names.inference_secret,
+        ),
+        (
+            volume_attempted,
+            initial.volumes[0] if initial.volumes else None,
+            None if expected is None else expected.volume_id,
+            plan.names.volume,
+        ),
+    )
+    if any(
+        resource is not None
+        and (not attempted or resource.id != confirmed_id or resource.name != expected_name)
+        for attempted, resource, confirmed_id, expected_name in resources
+    ):
+        return False
+    delete_teardown_resources(
+        plan,
+        sdk,
+        initial.volumes[0] if initial.volumes and volume_attempted else None,
+        initial.inference_secrets[0] if initial.inference_secrets and inference_attempted else None,
+        initial.artifact_secrets[0] if initial.artifact_secrets and artifact_attempted else None,
+        suppress_failures=True,
+    )
+    try:
+        final = observe(plan, sdk)
+        return resources_are_absent(final, allow_terminal_app=False)
+    except (ModalResourceConflict, ModalSdkFailure):
+        return False
 
 
 def confirm_teardown_absence(

@@ -59,6 +59,7 @@ from ._modal_sdk import (
 )
 from ._modal_teardown import (
     confirm_teardown_absence,
+    delete_confirmed_abort_resources,
     delete_teardown_resources,
     suppressed,
     wait_for_terminal_app,
@@ -78,11 +79,11 @@ class _CreatedResources:
     -- Ctrl-C landing between the accept and the assignment -- leaves the resource live and
     billing. Recording after the call meant cleanup walked past exactly that resource and still
     reported success, so the CLI printed a plain abort over a volume the customer keeps paying for.
-    Marking first inverts the error: the worst case is deleting a resource that was never made,
-    and every delete here is name-addressed with `allow_missing=True`, so that case is a no-op.
+    marking first keeps an unresolved create visible even when no provider id returns. cleanup then
+    declines name-addressed deletion and reports ambiguity instead of falsely claiming clean absence.
 
-    The flags remain separate from `confirmed`: an attempted create is enough to try a name-addressed
-    delete only while no app is observable, but it cannot prove ownership of an observed resource.
+    The flags remain separate from `confirmed`: an attempt keeps ambiguous cleanup from reporting
+    success, while only provider ids returned to this invocation authorize name-addressed deletes.
     provider ids enter `confirmed` only after the mutation return reaches this invocation.
 
     `app_deployed` is the expensive one. The secrets and the volume are cheap storage; the app is
@@ -868,30 +869,18 @@ def _abort_created_resources(
         except (ModalResourceConflict, ModalSdkFailure):
             return False
 
-    if created.app_deployed:
-        # the deploy call may have failed before returning an id. stop by the deterministic name,
-        # but never treat that mutation acknowledgement as proof that no app remains.
-        suppressed(lambda: mutation(lambda: sdk.stop_app(plan)))
-    # handles may never have reached the caller for these creates, so names from the plan are the
-    # only cleanup keys. allow_missing makes an attempted create that never landed a safe no-op.
-    for attempted, name in (
-        (created.artifact, plan.names.artifact_secret),
-        (created.inference, plan.names.inference_secret),
-    ):
-        if attempted:
-            suppressed(lambda name=name: mutation(lambda: sdk.delete_secret(plan, name)))
-    if created.volume:
-        suppressed(lambda: mutation(lambda: sdk.delete_volume(plan)))
-    try:
-        final = observe(plan, sdk)
-        # a deploy was attempted but no app id was observable, so no lifecycle read can prove the
-        # app terminal. named-resource absence alone must not erase that uncertainty.
-        return not created.app_deployed and resources_are_absent(
-            final,
-            allow_terminal_app=False,
-        )
-    except (ModalResourceConflict, ModalSdkFailure):
-        return False
+    # plan identity is byte-identical across same-generation racers. only provider ids returned to
+    # this invocation can authorize a name-addressed delete of an observed secret or volume.
+    return delete_confirmed_abort_resources(
+        plan,
+        sdk,
+        initial,
+        expected,
+        artifact_attempted=created.artifact,
+        inference_attempted=created.inference,
+        volume_attempted=created.volume,
+        app_deployed=created.app_deployed,
+    )
 
 
 def _teardown_plan(
