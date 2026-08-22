@@ -1716,22 +1716,16 @@ def test_stale_ready_record_refreshes_in_background():
                 )
                 return response.status_code
 
-            async def _until(predicate, message: str) -> None:
-                # a generous deadline rather than a fixed poll count: the success path still exits
-                # on the first 10ms tick, but a loaded machine cannot fail a correct refresh.
-                deadline = asyncio.get_running_loop().time() + 5.0
-                while not predicate():
-                    if asyncio.get_running_loop().time() >= deadline:
-                        pytest.fail(message)
-                    await asyncio.sleep(0.01)
+            lookup = app.state.serving_context.lookup
 
             # serve on both ids while deployed. priming the immutable id matters: a cache keyed on
             # "immutable revisions never change" is only reachable once the revision has resolved.
             assert await _generate("qa") == 200
             assert await _generate(_revision_id("qa")) == 200
-            await _until(
-                lambda: router.has("canary"), "the first background refresh never hydrated"
-            )
+            first_refresh = lookup._last_reload["task"]
+            assert first_refresh is not None, "the first background refresh was not scheduled"
+            await first_refresh
+            assert router.has("canary"), "the first background refresh never hydrated"
             settled = reloads["count"]
             # a refresh must re-serve the same adapter, not merely an adapter under the same id.
             # existence survives a reload that rebuilds records from the wrong material, so status
@@ -1757,7 +1751,11 @@ def test_stale_ready_record_refreshes_in_background():
                 f"the stale cached hit was served from other material: "
                 f"{pool.generated_records[served:]}"
             )
-            await _until(lambda: not router.has("qa"), "the undeploy never landed")
+            undeploy_refresh = lookup._last_reload["task"]
+            assert undeploy_refresh is not None, "the undeploy refresh was not scheduled"
+            assert undeploy_refresh is not first_refresh, "the stale hit reused the settled refresh"
+            await undeploy_refresh
+            assert not router.has("qa"), "the undeploy never landed"
             # a genuinely later refresh did the work, not the one that had already settled.
             assert reloads["count"] > settled, "the ttl window stopped refreshing after the first"
             # after the background refresh, neither id is routed here. the immutable id is the one
