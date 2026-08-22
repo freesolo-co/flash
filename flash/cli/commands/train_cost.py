@@ -155,9 +155,11 @@ def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
     digest = text("content_digest")
     # inline `[environment.params] records` supply the rows from the request body, so the resolved
     # package contributed the environment but not the dataset. labelling those counts "published
-    # copy" names a source they did not come from.
+    # copy" names a source they did not come from. one adjective decides all three rows, so they
+    # cannot describe the same quote two different ways.
     inline_records = _has_inline_records(spec)
     origin = "inline records" if inline_records else "published copy"
+    resolved = "resolved" if inline_records else "published"
     examples = None
     if retained is not None and selected is not None:
         examples = f"{retained:,} trained of {selected:,} selected from "
@@ -171,20 +173,10 @@ def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
             tokens += f", {supervised:,} supervised"
     return [
         ("run", f"{spec.model}  [SFT{f', {steps} steps' if steps is not None else ''}]"),
-        (
-            "env",
-            (f"{'resolved' if inline_records else 'published'} environment {environment_id}")
-            if environment_id
-            else None,
-        ),
+        ("env", f"{resolved} environment {environment_id}" if environment_id else None),
         (
             "revision",
-            (
-                f"{environment_revision[:12]} "
-                f"({'resolved' if inline_records else 'published'} commit)"
-            )
-            if environment_revision
-            else None,
+            f"{environment_revision[:12]} ({resolved} commit)" if environment_revision else None,
         ),
         ("workload", f"{packing} ({architecture})" if packing and architecture else None),
         ("examples", examples),
@@ -257,12 +249,16 @@ def _print_reasoning_loss_warning(status: object) -> None:
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
-def _print_published_sft_environment_note(status: object, spec=None) -> None:
+def _print_published_sft_environment_note(status: object, spec) -> None:
     """Attribute SFT preview counts to whatever actually produced them.
 
     Which is not always the published package: inline `[environment.params] records` are read from
     the request body instead, and telling that user to publish local files would send them to fix
     something the counts never came from.
+
+    `spec` is required rather than defaulted. It was optional first, and the dry-run call site
+    simply omitted it -- so the inline branch was unreachable there while every test passed, and
+    the wrong attribution printed for months of quotes. A missing argument now fails loudly.
     """
     profile = status.get("workload_profile") if isinstance(status, dict) else None
     if not isinstance(profile, dict):
@@ -273,12 +269,6 @@ def _print_published_sft_environment_note(status: object, spec=None) -> None:
         return
     if not isinstance(revision, str) or not revision.strip():
         return
-
-    from flash.envs.identity import (
-        github_environment_ref_is_pinned,
-        is_github_environment_ref,
-        is_managed_environment_slug,
-    )
 
     source = profile.get("source_examples")
     source_suffix = (
@@ -301,31 +291,45 @@ def _print_published_sft_environment_note(status: object, spec=None) -> None:
     message = (
         f"published environment: {environment_id} @ {revision[:12]}{source_suffix}. "
         "SFT dataset counts come from this resolved published copy, not local files."
+        f" {_republish_advice(environment_id)}"
     )
+    print(render.note(message) if render.styled() else message, file=sys.stderr)
+
+
+def _republish_advice(environment_id: str) -> str:
+    """How to make a local dataset edit visible to the next quote, for this kind of id.
+
+    Each id kind resolves its published copy differently, so the step that republishes one does
+    nothing for another. Advice the user follows and sees no change is worse than none, since the
+    counts look confirmed rather than stale.
+    """
+    from flash.envs.identity import (
+        github_environment_ref_is_pinned,
+        is_github_environment_ref,
+        is_managed_environment_slug,
+    )
+
     if is_managed_environment_slug(environment_id):
-        message += (
-            f" For this managed id, that copy is the last successful `{_commands().CLI_NAME} env "
+        return (
+            f"For this managed id, that copy is the last successful `{_commands().CLI_NAME} env "
             "push`; push again after local dataset edits."
         )
-    elif is_github_environment_ref(environment_id):
-        # the plane resolves this ref from the REMOTE repository, so a local commit is invisible to
-        # it until pushed. a pinned sha is immutable, though, and pushing moves nothing: that ref
-        # resolves to the same tree forever, so the only way to pick up an edit is to repin. the
-        # two cases need opposite instructions, and only the sha case is decidable from the id --
-        # a tag and a branch are the same string shape, so both get the movable-ref wording.
-        if github_environment_ref_is_pinned(environment_id):
-            message += (
-                " This ref pins an immutable commit, so pushing will not change it; update "
-                "[environment] id to the new commit to pick up dataset edits."
-            )
-        else:
-            message += (
-                " Push the commit to the remote ref this id resolves, then update [environment] id "
-                "only to pin a different ref."
-            )
-    else:
-        message += " Commit local dataset edits and update [environment] id before relying on them."
-    print(render.note(message) if render.styled() else message, file=sys.stderr)
+    if not is_github_environment_ref(environment_id):
+        return "Commit local dataset edits and update [environment] id before relying on them."
+    # the plane resolves this ref from the REMOTE repository, so a local commit is invisible to it
+    # until pushed. a pinned sha is immutable, though, and pushing moves nothing: that ref resolves
+    # to the same tree forever, so the only way to pick up an edit is to repin. the two cases need
+    # opposite instructions, and only the sha case is decidable from the id -- a tag and a branch
+    # are the same string shape, so both get the movable-ref wording.
+    if github_environment_ref_is_pinned(environment_id):
+        return (
+            "This ref pins an immutable commit, so pushing will not change it; update "
+            "[environment] id to the new commit to pick up dataset edits."
+        )
+    return (
+        "Push the commit to the remote ref this id resolves, then update [environment] id only "
+        "to pin a different ref."
+    )
 
 
 def _print_sft_cost(status: dict, spec) -> None:
