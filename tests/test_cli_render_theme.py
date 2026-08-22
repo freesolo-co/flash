@@ -454,7 +454,7 @@ def test_invalid_command_suggests_closest_match(monkeypatch, capsys) -> None:
         cli.main(["models", "deploly"])  # a typo of canonical `models deploy`
     assert excinfo.value.code == 2
     err = capsys.readouterr().err
-    assert "did you mean 'deploy'?" in err
+    assert "unknown command 'deploly' (did you mean 'deploy'?)" in err
     assert "choose from" not in err  # the full choice list is gone on a TTY
     assert "--help" in err
 
@@ -465,6 +465,57 @@ def test_invalid_command_suggests_closest_match(monkeypatch, capsys) -> None:
     err = capsys.readouterr().err
     assert "invalid choice" in err  # machine path unchanged
     assert "choose from" in err  # the full argparse list stays on the machine path
+
+
+@pytest.mark.parametrize("bad_args", [["--key", "X"], ["--key=X"]])
+def test_invalid_login_flag_suggests_api_key(monkeypatch, capsys, bad_args) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", *bad_args])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized argument '--key' (did you mean '--api-key'?)" in err
+    assert "--help" in err
+
+
+def test_invalid_flag_machine_path_keeps_argparse_message(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", "--key", "X"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "error: unrecognized arguments: --key X" in err
+    assert "did you mean" not in err
+
+
+def test_invalid_flag_without_close_match_keeps_original_message(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", "--xyzzy", "X"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --xyzzy X" in err
+    assert "did you mean" not in err
+
+
+def test_flag_valid_on_another_command_is_not_suggested_to_itself(monkeypatch, capsys) -> None:
+    # --repository is real on `models export`, so the cross-subcommand candidate pool contains it
+    # and the closest match to '--repository' is itself. echoing the rejected token back as its own
+    # correction reads as a bug in the cli, so no suggestion is better than that one.
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", "--repository", "X"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --repository X" in err
+    assert "did you mean '--repository'" not in err
 
 
 def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:
