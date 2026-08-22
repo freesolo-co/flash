@@ -779,19 +779,8 @@ def test_a_nonpositive_lora_rank_is_rejected_at_parse(bad: str) -> None:
         _parse([*_required_deploy_argv(), "--lora-rank", bad])
 
 
-@pytest.mark.parametrize("bad", ["-1", "-999"])
-def test_checkpoint_step_zero_is_accepted_but_negatives_are_rejected_at_parse(bad: str) -> None:
-    accepted = _parse(
-        [
-            *_required_deploy_argv(),
-            "--lora-rank",
-            "32",
-            "--checkpoint-step",
-            "0",
-        ]
-    )
-    assert accepted.checkpoint_step == 0
-
+@pytest.mark.parametrize("bad", ["0", "-1", "-999"])
+def test_a_nonpositive_checkpoint_step_is_rejected_at_parse(bad: str) -> None:
     with pytest.raises(SystemExit):
         _parse(
             [

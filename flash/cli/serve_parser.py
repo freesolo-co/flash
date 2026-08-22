@@ -40,14 +40,6 @@ def _positive_int(raw: str) -> int:
     return value
 
 
-def _non_negative_int(raw: str) -> int:
-    """reject an integer below zero while preserving checkpoint step zero."""
-    value = int(raw)
-    if value < 0:
-        raise argparse.ArgumentTypeError(f"must be a non-negative integer, not {raw!r}")
-    return value
-
-
 def _add_serve_commands(sub: argparse._SubParsersAction) -> None:
     serve = sub.add_parser("serve", help="manage serving in your own provider account")
     serve_sub = serve.add_subparsers(dest="serve_cmd", required=True)
@@ -99,7 +91,7 @@ def _add_deployment_arguments(command: argparse.ArgumentParser) -> None:
     )
     command.add_argument(
         "--checkpoint-step",
-        type=_non_negative_int,
+        type=_positive_int,
         default=None,
         help="serve one saved step instead of the final adapter",
     )
