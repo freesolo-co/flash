@@ -57,5 +57,10 @@ def _declared_oversize(headers: list[tuple[bytes, bytes]], max_bytes: int) -> bo
 
 
 async def _too_large_response(scope: dict[str, Any], receive: Any, send: Any) -> None:
-    response = JSONResponse({"detail": "request body too large"}, status_code=413)
+    # closing makes unread bytes unreachable, so do not drain and keep rejection work bounded.
+    response = JSONResponse(
+        {"detail": "request body too large"},
+        status_code=413,
+        headers={"connection": "close"},
+    )
     await response(scope, receive, send)
