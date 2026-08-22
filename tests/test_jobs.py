@@ -3141,6 +3141,10 @@ def _adapter_config(*, rank=32, alpha=64):
         "base_model_name_or_path": "Qwen/Qwen3.5-0.8B",
         "r": rank,
         "lora_alpha": alpha,
+        # peft>=0.19 writes this on every save, so a config without it is not a shape any supported
+        # writer produces -- and submit rejects an unmarked adapter outright. these cases are about
+        # ref/rank/pin handling, so they need the marker a real source adapter carries.
+        "exclude_modules": None,
     }
 
 

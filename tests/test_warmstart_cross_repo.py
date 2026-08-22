@@ -213,6 +213,9 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
             "rank_pattern": {"module": 64},
             "lora_alpha": 64,
             "alpha_pattern": {"module": 128},
+            # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
+            # these cases are about rank/revision/identity, not modality.
+            "exclude_modules": None,
         }
 
     monkeypatch.setattr(rank_mod, "load_hf_adapter_config", load_config)
@@ -405,6 +408,9 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
             "base_model_name_or_path": "Qwen/Qwen3.5-4B",
             "r": 64,
             "lora_alpha": 128,
+            # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
+            # these cases are about rank/revision/identity, not modality.
+            "exclude_modules": None,
         },
     )
     monkeypatch.setattr(
@@ -595,6 +601,9 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
             "base_model_name_or_path": "Qwen/Qwen3.5-4B",
             "r": 64,
             "lora_alpha": 128,
+            # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
+            # these cases are about rank/revision/identity, not modality.
+            "exclude_modules": None,
         },
     )
     monkeypatch.setattr(
@@ -895,6 +904,9 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
             "base_model_name_or_path": public.model,
             "r": 64 if revision == _REVISION else 8,
             "lora_alpha": 128 if revision == _REVISION else 16,
+            # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
+            # these cases are about rank/revision/identity, not modality.
+            "exclude_modules": None,
         }
 
     monkeypatch.setattr(rank_mod, "load_hf_adapter_config", load_config)
@@ -1189,6 +1201,9 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
             "base_model_name_or_path": source.model,
             "r": 64,
             "lora_alpha": 128,
+            # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
+            # these cases are about rank/revision/identity, not modality.
+            "exclude_modules": None,
         },
     )
     monkeypatch.setattr(
