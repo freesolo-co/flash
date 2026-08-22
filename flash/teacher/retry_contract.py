@@ -57,18 +57,19 @@ _OPD_RESUME_ACCOUNTING_SCHEMA = {
     "mt_turn_records": "nonneg_int",
     "coverage_sum": "nonneg_number",
     "train_wall_seconds": "nonneg_number",
+    # alignment GRANULARITY (mean aligned-groups-per-sequence), distinct from the coverage pair
+    # above: a collapsed alignment that maps every student token onto one group still scores
+    # coverage ~1.0, so coverage alone cannot flag that failure mode. required, not optional --
+    # `accounting_snapshot` is the only producer of a version-4 state and always emits both, so an
+    # absent field means a corrupt record, and the reader's default-to-0 would publish
+    # `mean_align_granularity = 0.0` for a run that measured every group.
+    "align_group_sum": "nonneg_number",
+    "align_group_n": "nonneg_int",
     "loss_curve": "list",
     "coverage_curve": "list",
     "skip_counts": "dict",
     "opd_phase_seconds": "dict",
     "opd_phase_counts": "dict",
-}
-# alignment granularity, accumulated by the verl worker. distinct from the coverage pair above, so
-# alignment carries its own pair and both must be validated when present rather than coerced past
-# the fail-closed contract.
-_OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA = {
-    "align_group_sum": "nonneg_number",
-    "align_group_n": "nonneg_int",
 }
 
 
@@ -151,26 +152,6 @@ def validate_opd_resume_state_metadata(
             raise ValueError(f"opd resume state {field} must be a list")
         elif field_type == "dict" and not isinstance(value, dict):
             raise ValueError(f"opd resume state {field} must be an object")
-
-    for field, field_type in _OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA.items():
-        if field not in state:
-            continue
-        if field_type == "nonneg_int":
-            _nonnegative_integer(state[field], field=field)
-        else:
-            _finite_number(state[field], field=field, nonnegative=True)
-    # present-together or absent-together, checked AFTER the per-field validation above so a corrupt
-    # value still reports its own field rather than this. verl writes both (its accounting snapshot
-    # emits the pair) and trl writes neither, so a state carrying exactly one is corrupt: the reader
-    # defaults the absent one to 0 independently, and the published mean_align_granularity then
-    # divides a real sum by a zeroed count, or reports 0.0 for a run that measured every group.
-    present = [field for field in _OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA if field in state]
-    if present and len(present) != len(_OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA):
-        missing = sorted(set(_OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA) - set(present))
-        raise ValueError(
-            "opd resume state alignment accumulators must be present as a pair; missing "
-            + ", ".join(missing)
-        )
 
     for field in ("loss_curve", "coverage_curve"):
         curve = state[field]

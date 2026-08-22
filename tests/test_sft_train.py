@@ -55,6 +55,7 @@ def _cfg(**over):
         "lora_rank": 16,
         "lora_alpha": 32,
         "target_modules": "all-linear",
+        "exclude_modules": None,
         "ulysses_sp_size": 2,
         "lr": 1e-4,
         "warmup_ratio": 0.03,
@@ -99,6 +100,7 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
         "model.lora_rank": "16",
         "model.lora_alpha": "32",
         "model.target_modules": "all-linear",
+        "model.exclude_modules": "null",
         "model.lora_adapter_path": "null",
         "model.use_remove_padding": "true",
         "model.use_liger": "false",
@@ -3036,6 +3038,110 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     )
 
 
+def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monkeypatch):
+    """the final export must carry the same text-only policy as both step checkpoints."""
+    from flash.engine.worker import sft_train
+
+    exports = []
+
+    class TwoCheckpointWatcher:
+        def __init__(self, **kwargs):
+            self.local_dir = kwargs["local_dir"]
+            self.export_root = kwargs["export_root"]
+            self.python_bin = kwargs["python_bin"]
+            self.model_id = kwargs["model_id"]
+            self.model_revision = kwargs["model_revision"]
+            self.exclude_modules = kwargs["exclude_modules"]
+            self.preprocessor = kwargs["preprocessor"]
+            self.required_steps = frozenset(kwargs["required_steps"])
+            self.lifecycle = CheckpointLedger()
+
+        def start(self):
+            return None
+
+        def stop(self, *, require_complete):
+            assert require_complete is True
+            for step in (1, 2):
+                sft_train._export_checkpoint_adapter(
+                    os.path.join(self.local_dir, f"global_step_{step}"),
+                    os.path.join(self.export_root, f"step-{step}"),
+                    model_id=self.model_id,
+                    model_revision=self.model_revision,
+                    exclude_modules=self.exclude_modules,
+                    python_bin=self.python_bin,
+                    preprocessor=self.preprocessor,
+                )
+                self.lifecycle.mark_deployable_published(step)
+
+        def raise_if_failed(self):
+            return None
+
+    spec, captured = _stub_sft_run(
+        monkeypatch,
+        save_at_steps=(1, 2),
+        watcher_cls=TwoCheckpointWatcher,
+    )
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
+
+    def strict_export(
+        actor_dir,
+        adapter_dir,
+        *,
+        model_id,
+        model_revision,
+        exclude_modules,
+        python_bin,
+        preprocessor,
+    ):
+        exports.append(
+            {
+                "actor_dir": actor_dir,
+                "adapter_dir": adapter_dir,
+                "model_id": model_id,
+                "model_revision": model_revision,
+                "exclude_modules": exclude_modules,
+                "python_bin": python_bin,
+                "preprocessor": preprocessor,
+            }
+        )
+        os.makedirs(adapter_dir, exist_ok=True)
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", strict_export)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        captured["command"] = command
+        captured["child_env"] = env
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:1 - train/loss:1.1 - train/global_tokens:4\n")
+        on_step(1)
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        heartbeat()
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+
+    assert len(exports) == 3
+    assert [os.path.basename(export["actor_dir"]) for export in exports] == [
+        "global_step_1",
+        "global_step_2",
+        "global_step_2",
+    ]
+    assert [os.path.basename(export["adapter_dir"]) for export in exports] == [
+        "step-1",
+        "step-2",
+        "adapter",
+    ]
+    expected_exclusion = r"^(?!model\.language_model(?:\.|$)).*$"
+    assert {export["exclude_modules"] for export in exports} == {expected_exclusion}
+    assert {export["model_id"] for export in exports} == {spec.model}
+    assert {export["model_revision"] for export in exports} == {spec.model_revision}
+    assert {export["python_bin"] for export in exports} == {"/venv/bin/python"}
+    assert {export["preprocessor"] for export in exports} == {None}
+
+
 @pytest.mark.parametrize("multimodal", [True, False])
 def test_sft_runner_carries_the_prepared_processor_to_every_export(monkeypatch, multimodal):
     from flash.engine.worker import sft_train
@@ -3293,6 +3399,25 @@ def test_the_child_caps_at_the_quoted_horizon_without_an_authored_max_steps(monk
     horizon = data.profile.authoritative_steps
     assert f"trainer.total_training_steps={horizon}" in child.command
     assert "trainer.total_training_steps=null" not in child.command
+
+
+def test_text_sft_keeps_export_policy_out_of_the_frozen_verl_runtime_config(monkeypatch):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+    options = sft_train_runner._resolve_sft_options(spec)
+    data = sft_train_runner._prepare_sft_data(options)
+    model = sft_train_runner._prepare_sft_model(options, data)
+    assert model.exclude_modules is not None
+    capabilities = sft_train_runner._SftCapabilities(
+        python_bin="/venv/bin/python", caps={}, gdn_hybrid=False, gdn_module=""
+    )
+
+    child = sft_train_runner._prepare_sft_child(options, data, model, capabilities, True, None)
+
+    assert "model.exclude_modules=null" in child.command
+    assert child.expected_shims.count("text-lora-targeting") == 1
 
 
 def test_a_packed_quote_fails_closed_when_environment_filtering_leaves_less_than_one_batch(
@@ -4625,6 +4750,37 @@ def test_required_saves_are_never_skipped_even_when_the_publisher_lags(monkeypat
     assert published == [350, 450], f"a required save was dropped as superseded: {published}"
 
 
+def test_a_required_backlog_still_drops_its_superseded_optional_saves(monkeypatch, tmp_path):
+    """The coalescing must survive `save_at_steps`, which is when the disk is tightest.
+
+    Each export writes a full model copy to the container disk while training writes the next
+    checkpoint to the same disk, which is the whole reason superseded periodic saves are skipped.
+    Gating that on `required_steps` being EMPTY disabled it for every run that authored
+    `save_at_steps` -- so the runs most likely to lag were the ones that kept every copy.
+    """
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=(350,)
+    )
+
+    selected = [step for step, _ in watcher._publishable(watcher._pending())]
+    # 400 is superseded by the newer 450 and is dropped before any export runs. it is the export,
+    # not the sweep, that writes a full model copy beside the checkpoint training is still saving.
+    assert selected == [350, 450], f"a superseded optional save survived selection: {selected}"
+    assert watcher.lifecycle.facts(400).discovered, "the skipped step was not claimed"
+    assert not watcher.lifecycle.facts(400).deployable_published, (
+        "a skipped step must gain no durability fact"
+    )
+
+    for step, checkpoint_dir in watcher._publishable(watcher._pending()):
+        watcher._publish(step, checkpoint_dir)
+
+    # `_should_publish` still governs what is actually exported: with required steps authored, only
+    # those get an artifact. selection bounds the disk; publication honours the authored contract.
+    assert published == [350], (
+        f"an optional save was exported alongside a required one: {published}"
+    )
+
+
 def test_the_opd_watcher_publishes_every_step_despite_the_sft_bound(monkeypatch, tmp_path):
     """opd keeps all pending retry states."""
     from flash.engine.worker.train.opd import failures as opd_failures
@@ -4965,3 +5121,129 @@ def test_sft_result_records_the_micro_batch_that_ran_not_the_one_requested():
     from flash.engine.worker import sft_train_runner
 
     assert "micro_batch" in sft_train_runner._SftChild.__dataclass_fields__
+
+
+def test_an_unuploadable_resume_checkpoint_does_not_fail_a_published_required_save(
+    monkeypatch, tmp_path
+):
+    """a required step whose adapter IS durable must survive a resume upload that cannot succeed.
+
+    the reproducer is a real one. verl saves the whole model state dict with no trainable-only
+    filtering, so a lora run of a 27.59B model writes ~55 GB into ONE `model_world_size_*.pt`, over
+    the artifact store's 50 GB per-file ceiling. the upload fails at every retry, deterministically.
+    before this fix that raised and killed a run whose two steps had converged and whose adapter was
+    already published -- destroying finished work over internal restart state nothing would read.
+
+    `uploaded=False` with `before_upload` having run is exactly that shape: the deployable landed,
+    the full-state member did not.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+    checkpoint_dir = local_dir / "global_step_1"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        worker,
+        "publish_deployable_checkpoint",
+        lambda adapter, step, **kwargs: f"sft/run/checkpoints/step-{step}/adapter",
+    )
+    # the adapter publishes, then the oversized full-state member is rejected.
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), False)[1],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(1,),
+    )
+
+    watcher._publish(1, str(checkpoint_dir))
+
+    # the product artifact is durable, so the run continues.
+    assert watcher.lifecycle.facts(1).deployable_published
+    assert watcher.lifecycle.missing_deployables(watcher.required_steps) == []
+    # and the loss of restart state is recorded rather than hidden.
+    assert watcher.lifecycle.facts(1).failed
+    assert not watcher.lifecycle.facts(1).resume_uploaded
+
+
+def test_a_required_save_whose_adapter_never_published_still_fails_the_run(monkeypatch, tmp_path):
+    """the guarantee that must NOT be weakened: no deployable adapter is still fatal.
+
+    the sibling test above stops a missing RESUME upload from failing the run. this one pins the
+    other half -- a required step that never became servable must still raise -- so that relaxation
+    can never be widened into "required saves are best effort" without turning this red.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    checkpoint_dir = local_dir / "global_step_1"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    # None is what the real transport returns when nothing was published.
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), True)[1],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(1,),
+    )
+    watcher._publish(1, str(checkpoint_dir))
+
+    assert watcher.lifecycle.missing_deployables(watcher.required_steps) == [1]
+    # stop() is where the run learns about it, and it must still raise.
+    watcher.start()
+    with pytest.raises(RuntimeError, match="required saves were not durably published"):
+        watcher.stop(require_complete=True)
+
+
+def test_resume_upload_unavailable_reports_the_oversized_member(tmp_path, capsys):
+    """the operator message must name the file that blew the limit, not just say "not uploaded".
+
+    without the size the log is indistinguishable from a transient network failure, and the real
+    cause -- one member over a hard per-file ceiling, which no retry can fix -- stays invisible.
+    """
+    from flash.engine.worker.verl.checkpoints import resume_upload_unavailable
+
+    ckpt = tmp_path / "global_step_1"
+    (ckpt / "nested").mkdir(parents=True)
+    (ckpt / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+    (ckpt / "nested" / "small.pt").write_bytes(b"x" * 8)
+
+    resume_upload_unavailable(1, str(ckpt), job_label="sft")
+
+    out = capsys.readouterr().out
+    assert "step 1 resume checkpoint was not confirmed uploaded" in out
+    assert "largest member" in out, "the size that caused the failure must be reported"
+    # the deepest file must be walked, not just the top level, or a sharded layout reports 0.
+    assert "0.0 GB" in out

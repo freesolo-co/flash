@@ -689,10 +689,10 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
             "provider": provider,
             "hourly_usd": handle.hourly_usd,
             "instance_id": handle.instance_id,
-            "started_ts": 0.0,
+            "started_ts": 1.0,
         },
-        start=0.0,
-        end=3600.0,
+        start=1.0,
+        end=3601.0,
     )
     assert realized is not None
     assert realized.realized_usd == pytest.approx(per_card * cards), (

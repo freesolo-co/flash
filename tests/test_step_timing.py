@@ -129,6 +129,21 @@ def test_non_step_and_validation_lines_do_not_consume_warmup() -> None:
     )
 
 
+def test_step_metrics_keep_numeric_census_fields_and_leave_exact_steps_for_terminal_notes() -> None:
+    state = _StepMetricState(sent_first_metrics=True)
+    state.host_census = {
+        "available": 1,
+        "peak_processes": 7,
+        "steps": [{"optimizer_step": 1, "processes": 7}],
+    }
+    _ingest_step_metrics(_line(1, 92.0), {"max_completion": 512}, state, dict)
+
+    metrics = state.metrics_last[-1]
+    assert metrics["host_census/available"] == 1
+    assert metrics["host_census/peak_processes"] == 7
+    assert "host_census/steps" not in metrics
+
+
 def test_first_usable_pace_is_forced_after_first_metrics_commit(monkeypatch) -> None:
     calls = []
 

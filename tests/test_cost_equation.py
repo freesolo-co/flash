@@ -6,8 +6,8 @@ from __future__ import annotations
 import dataclasses
 
 from flash.cost import RunConfig, estimate_cost
-from flash.cost.facts import gpu_hourly_usd
 from flash.cost.types import CostEstimate
+from flash.providers.base import GPU_INFO
 
 
 def test_no_output_multiplier_field():
@@ -23,12 +23,4 @@ def test_total_is_exactly_billable_train_hours_times_rate():
     assert e.total_usd == e.billable_hours * e.gpu_hourly_usd
     assert e.billable_hours == e.train_seconds / 3600.0
     assert e.total_usd < e.wall_clock_hours * e.gpu_hourly_usd
-    assert e.gpu_hourly_usd == gpu_hourly_usd(e.gpu)
-
-
-def test_prices_at_static_rate():
-    """Cost uses the static GPU registry rate directly."""
-    from flash.providers.base import GPU_INFO
-
-    for cls in ("RTX 5090", "A100 PCIe", "RTX 4090", "H100"):
-        assert gpu_hourly_usd(cls) == GPU_INFO[cls].hourly_usd
+    assert e.gpu_hourly_usd == GPU_INFO[e.gpu].hourly_usd

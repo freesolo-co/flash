@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.steps import (
     final_save_due,
@@ -13,7 +14,7 @@ from flash.engine.plan.steps import (
     sft_update_steps,
     validate_save_steps,
 )
-from flash.schema import ConfigError, spec_and_train_keys_from_file
+from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 
 _BASE_TOML = """
 model = "Qwen/Qwen3.5-0.8B"
@@ -172,11 +173,12 @@ def test_save_step_validation_rejects_unreachable_runtime_step():
 
 
 @pytest.mark.parametrize("interval", [0, -1, -20])
-def test_nonpositive_save_every_canonicalizes_to_the_unset_sentinel(interval):
-    # the public schema rejects these, but a persisted or internally built spec reaches TrainSpec
-    # directly. without canonicalization the horizon clamp reads a signed interval as one and
-    # checkpoints every optimizer step.
-    assert TrainSpec(save_every=interval).save_every is None
+def test_nonpositive_save_every_is_rejected(interval):
+    with pytest.raises(ValueError, match=r"train\.save_every must be positive"):
+        TrainSpec(save_every=interval)
+
+
+def test_positive_save_every_is_preserved():
     assert TrainSpec(save_every=20).save_every == 20
 
 
@@ -343,9 +345,9 @@ def test_from_dict_rejects_falsy_non_object_train(bad):
         JobSpec.from_dict({"train": bad})
 
 
-def test_from_dict_defaults_omitted_or_null_train_to_empty():
-    assert JobSpec.from_dict({}).seed == FIXED_SEED
-    assert JobSpec.from_dict({"train": None}).train.max_steps is None
+@pytest.mark.parametrize("payload", [{}, {"train": None}, {"train": {}}])
+def test_from_dict_defaults_missing_credit_assignment(payload):
+    assert JobSpec.from_dict(payload).train.credit_assignment == "per_episode"
 
 
 def test_from_dict_rejects_removed_legacy_train_seeds():
@@ -400,3 +402,38 @@ def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
     )
     with pytest.raises(ConfigError, match="platform-managed key"):
         spec_and_train_keys_from_file(str(path))
+
+
+def _spec_with_declared_secret(algorithm: str, secret: str) -> dict:
+    return {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": algorithm,
+        "environment": {"id": "owner/project/env", "secrets": [secret]},
+        "train": {"epochs": 1},
+    }
+
+
+@pytest.mark.parametrize("secret", GRPO_NATIVE_THREAD_ENV)
+@pytest.mark.parametrize("algorithm", ["sft", "opd"])
+def test_non_grpo_authoring_accepts_grpo_native_thread_secrets(algorithm, secret):
+    spec = spec_from_dict(_spec_with_declared_secret(algorithm, secret))
+
+    assert spec.environment.secrets == (secret,)
+
+
+@pytest.mark.parametrize("secret", GRPO_NATIVE_THREAD_ENV)
+def test_grpo_authoring_rejects_native_thread_secrets(secret):
+    with pytest.raises(
+        ConfigError,
+        match=rf"\[environment\] secrets must not include platform-managed key\(s\): {secret}",
+    ):
+        spec_from_dict(_spec_with_declared_secret("grpo", secret))
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "opd", "grpo"])
+def test_all_algorithms_reject_unconditional_control_plane_secrets(algorithm):
+    with pytest.raises(
+        ConfigError,
+        match=r"\[environment\] secrets must not include platform-managed key\(s\): SEED",
+    ):
+        spec_from_dict(_spec_with_declared_secret(algorithm, "SEED"))

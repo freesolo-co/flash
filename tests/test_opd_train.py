@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import importlib.metadata
@@ -1117,6 +1118,10 @@ def _resume_accounting(step=2):
         "aligned_sequences": 5,
         "empty_alignments": 2,
         "coverage_sum": 3.5,
+        # `accounting_snapshot` emits the alignment pair unconditionally, so a state without it is
+        # corrupt rather than merely older -- the resume contract requires both.
+        "align_group_sum": 7.5,
+        "align_group_n": 5,
     }
 
 
@@ -1508,6 +1513,12 @@ def test_bridge_granularity_survives_resume_without_reading_the_coverage_counter
     assert snapshot["align_group_sum"] == 6.0
     assert snapshot["align_group_n"] == 3
 
+    # a state carrying no alignment accumulators is rejected by the resume validator, so the
+    # bridge's zero default is reachable only on a fresh start. it must still restart granularity at
+    # zero rather than borrow the coverage quantity under the granularity name.
+    without_granularity = dict(_resume_accounting())
+    del without_granularity["align_group_sum"]
+    del without_granularity["align_group_n"]
     coverage_only = _TeacherAlignmentBridge(
         prompts=list(resumed.prompts),
         tokenizer=_BridgeTokenizer(),
@@ -1516,7 +1527,7 @@ def test_bridge_granularity_survives_resume_without_reading_the_coverage_counter
         eos_token_ids=frozenset({99}),
         stop_sequences=(),
         mutation_callback=lambda: None,
-        initial_state=_resume_accounting(),
+        initial_state=without_granularity,
     )
     # coverage_sum is 3.5 and aligned_sequences is 5 in that state; neither may seed granularity.
     assert coverage_only.align_group_sum == 0.0
@@ -2711,7 +2722,10 @@ class _RecordingEnv:
         self.recorded: list[str] = []
 
     def new_rollout_state(self, _example):
-        return {"messages": [{"role": "user", "content": "q"}], "prompt": None}
+        # both keys, as the real adapter emits them: `prompt` is the frozen initial prefix and
+        # `messages` starts as a copy of it that each turn appends to.
+        prompt = [{"role": "user", "content": "q"}]
+        return {"messages": [dict(message) for message in prompt], "prompt": prompt}
 
     def record_model_turn(self, state, content):
         if not content.strip():
@@ -2868,6 +2882,105 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
 
     assert env.recorded == ["A"]
     assert response["terminal"] is False
+
+
+def test_nested_model_eos_multiturn_response_reaches_teacher_scoring():
+    from flash.engine.worker.train.opd.gkd import _generation_eos_ids
+
+    nested_eos = 248044
+    tokenizer_eos = 248046
+
+    class _NestedEosTokenizer(_MultiTurnBridgeTokenizer):
+        eos_token_id = tokenizer_eos
+
+        def decode(self, token_ids, *, skip_special_tokens):
+            visible = [
+                token_id for token_id in token_ids if token_id not in {nested_eos, tokenizer_eos}
+            ]
+            text = super().decode(visible, skip_special_tokens=skip_special_tokens)
+            if skip_special_tokens:
+                return text
+            suffix = "".join(
+                "<eos>" for token_id in token_ids if token_id in {nested_eos, tokenizer_eos}
+            )
+            return text + suffix
+
+    class _Teacher:
+        def __init__(self):
+            self.items = []
+
+        def score_many(self, items):
+            self.items.extend(items)
+            return [
+                _teacher_score([TeacherToken(text="A", logprob=-0.4, start=0, end=1)])
+                for _item in items
+            ]
+
+    tokenizer = _NestedEosTokenizer()
+    eos_token_ids = _generation_eos_ids(
+        SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(eos_token_id=nested_eos),
+            )
+        ),
+        tokenizer,
+    )
+    assert eos_token_ids == frozenset({nested_eos, tokenizer_eos})
+
+    env = _RecordingEnv()
+    teacher = _Teacher()
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[{"role": "user", "content": "q"}],
+                teacher_messages=[{"role": "user", "content": "q"}],
+                prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
+                example=object(),
+            )
+        ],
+        tokenizer=tokenizer,
+        teacher=teacher,
+        thinking_prefill="",
+        eos_token_ids=eos_token_ids,
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+        active_env=env,
+        multi_turn=True,
+        max_turns=1,
+    )
+    bridge.start_multiturn(
+        index=0,
+        session_id="nested-eos",
+        prompt_ids=[10, 11],
+        raw_prompt=[{"role": "user", "content": "q"}],
+        image_count=0,
+    )
+
+    response = bridge.step_multiturn(
+        {
+            "session_id": "nested-eos",
+            "turn_ordinal": 0,
+            "accepted_prefix": [10, 11],
+            "image_count": 0,
+            "image_digests": [],
+            "raw_response_ids": [65, nested_eos],
+            "response_ids": [65, nested_eos],
+            "completion_text": "A",
+            "termination": "eos",
+            "stop_reason": "eos",
+            "truncated": False,
+            "skip_reason": "",
+        }
+    )
+    scored = bridge.score_multiturn("nested-eos")
+
+    assert response["terminal"] is True
+    assert env.recorded == ["A"]
+    assert bridge.truncated_rollouts == 0
+    assert teacher.items == [("User: q\nAssistant: ", "A")]
+    assert scored["turns"][0]["teacher_ids"] != [-1] * 4
 
 
 def test_terminal_reply_images_never_enter_actor_or_teacher_context(monkeypatch):
@@ -6082,6 +6195,7 @@ def _config(**overrides):
         "lora_rank": 32,
         "lora_alpha": 64,
         "target_modules": "all-linear",
+        "exclude_modules": None,
         "learning_rate": 1e-5,
         "local_dir": "/w/checkpoints",
         "save_freq": 20,
@@ -6323,6 +6437,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
             lora_rank=32,
             lora_alpha=64,
             target_modules="all-linear",
+            exclude_modules="text-export-policy",
             warmstart_adapter=None,
         ),
         runtime=SimpleNamespace(
@@ -6338,6 +6453,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
     )
 
     assert config["ulysses_sequence_parallel_size"] == 1
+    assert config["exclude_modules"] is None
     # every allocated card still trains: the cards move from sequence ranks to dp ranks, so capacity
     # is unchanged and 32k multi-card survives.
     assert config["n_gpus_per_node"] == gpu_count
@@ -6397,6 +6513,7 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
                 lora_rank=32,
                 lora_alpha=64,
                 target_modules="all-linear",
+                exclude_modules=None,
                 warmstart_adapter=None,
             ),
             runtime=SimpleNamespace(
@@ -7435,8 +7552,13 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
                 "run_id": "r-alloc",
                 "algorithm": "opd",
                 "model": "Qwen/Qwen3.5-4B",
-                "environment": {"repo": "x/y", "name": "e"},
-                "train": {"hf_repo": "a/b", "teacher_model": "", "max_examples": 1},
+                "environment": {"id": "org/env"},
+                "train": {
+                    "hf_repo": "a/b",
+                    "teacher_model": "",
+                    "max_examples": 1,
+                    "credit_assignment": "per_episode",
+                },
                 "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
             }
         )
@@ -7460,8 +7582,13 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             "run_id": "r-sft",
             "algorithm": "sft",
             "model": "Qwen/Qwen3.5-4B",
-            "environment": {"repo": "x/y", "name": "e"},
-            "train": {"hf_repo": "a/b", "teacher_model": "", "max_examples": 1},
+            "environment": {"id": "org/env"},
+            "train": {
+                "hf_repo": "a/b",
+                "teacher_model": "",
+                "max_examples": 1,
+                "credit_assignment": "per_episode",
+            },
             "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
         }
     )
@@ -7826,6 +7953,173 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
 
     with pytest.raises(RuntimeError, match="managed teacher control-panel transport is missing"):
         opd_mod.run_opd_train()
+
+
+@pytest.mark.parametrize(
+    ("thinking", "rendered_prompt", "expected_opened"),
+    [
+        (True, "<|im_start|>assistant\n<think>\n", True),
+        (True, "<|im_start|>assistant\n", False),
+        (False, "<|im_start|>assistant\n<think>\n", False),
+        (False, "<|im_start|>assistant\n", False),
+    ],
+)
+def test_opd_preparation_propagates_derived_thinking_semantics(
+    monkeypatch, thinking, rendered_prompt, expected_opened
+):
+    from flash.engine.worker import opd_train as opd_mod
+    from flash.engine.worker import opd_train_runner
+    from flash.engine.worker.model.decoding import prompt_opens_thinking
+    from flash.engine.worker.train.opd.state import _OpdRequest
+
+    class _Tokenizer:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+
+        def apply_chat_template(
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+        ):
+            assert messages == [{"role": "user", "content": "question"}]
+            assert add_generation_prompt is True
+            assert enable_thinking is thinking
+            return [10, 11] if tokenize else rendered_prompt
+
+    class _TeacherClient:
+        def __init__(self, capability, control_panel_url, teacher_model):
+            assert (capability, control_panel_url, teacher_model) == (
+                "capability",
+                "https://control.invalid",
+                "teacher",
+            )
+
+    env = SimpleNamespace(thinking=None, prompt_opens_thinking=None, package_root=None)
+    tokenizer = _Tokenizer()
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(
+            THINKING=thinking,
+            load_tokenizer=lambda model_id, revision: tokenizer,
+            prompt_opens_thinking=prompt_opens_thinking,
+        ),
+    )
+    monkeypatch.setattr(opd_mod, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(opd_mod, "clamp_engine_len", lambda requested, _limit: requested)
+    monkeypatch.setattr(opd_mod, "model_max_position_embeddings", lambda *_args: None)
+    monkeypatch.setattr(opd_mod, "validate_glue_template", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        opd_mod,
+        "liveness_heartbeat",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
+    )
+    import flash.engine.worker.teacher.client as teacher_client
+
+    monkeypatch.setattr(teacher_client, "TeacherClient", _TeacherClient)
+    request = _OpdRequest(
+        spec=None,
+        env=env,
+        multi_turn=True,
+        max_turns=2,
+        knobs=SimpleNamespace(
+            teacher_model="teacher",
+            max_length=128,
+            max_completion=8,
+        ),
+        model_id="model",
+        model_revision="revision",
+    )
+
+    state = opd_train_runner._prepare_prompts(
+        request,
+        [({}, [{"role": "user", "content": "question"}])],
+        False,
+        "capability",
+        "https://control.invalid",
+    )
+
+    assert len(state.prompts) == 1
+    assert env.thinking is thinking
+    assert env.prompt_opens_thinking is expected_opened
+
+
+def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch):
+    """a row dropped for length must not decide the run-level thinking flag.
+
+    the flag is run-level and latched once, and it drives `strip_think` during grading. deriving it
+    from a row the student never sees can grade a retained prompt-opened completion as if the model
+    had emitted its own `<think>`, returning the reasoning as the answer. grpo already derives it
+    from the first RETAINED prompt (`_build_grpo_prompts`); opd must match.
+    """
+    from flash.engine.worker import opd_train as opd_mod
+    from flash.engine.worker import opd_train_runner
+    from flash.engine.worker.model.decoding import prompt_opens_thinking
+    from flash.engine.worker.train.opd.state import _OpdRequest
+
+    # row 0 renders WITHOUT an open think tag and is over budget; row 1 renders WITH one and fits.
+    rows = {
+        "too-long": ("<|im_start|>assistant\n", list(range(4096))),
+        "kept": ("<|im_start|>assistant\n<think>\n", [10, 11]),
+    }
+
+    class _Tokenizer:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+
+        def apply_chat_template(
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+        ):
+            rendered, ids = rows[messages[0]["content"]]
+            return ids if tokenize else rendered
+
+    class _TeacherClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    env = SimpleNamespace(thinking=None, prompt_opens_thinking=None, package_root=None)
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(
+            THINKING=True,
+            load_tokenizer=lambda model_id, revision: _Tokenizer(),
+            prompt_opens_thinking=prompt_opens_thinking,
+        ),
+    )
+    monkeypatch.setattr(opd_mod, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(opd_mod, "clamp_engine_len", lambda requested, _limit: requested)
+    monkeypatch.setattr(opd_mod, "model_max_position_embeddings", lambda *_args: None)
+    monkeypatch.setattr(opd_mod, "validate_glue_template", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        opd_mod, "liveness_heartbeat", lambda *_args, **_kwargs: contextlib.nullcontext()
+    )
+    import flash.engine.worker.teacher.client as teacher_client
+
+    monkeypatch.setattr(teacher_client, "TeacherClient", _TeacherClient)
+    request = _OpdRequest(
+        spec=None,
+        env=env,
+        multi_turn=True,
+        max_turns=2,
+        knobs=SimpleNamespace(teacher_model="teacher", max_length=128, max_completion=8),
+        model_id="model",
+        model_revision="revision",
+    )
+
+    state = opd_train_runner._prepare_prompts(
+        request,
+        [
+            ({}, [{"role": "user", "content": "too-long"}]),
+            ({}, [{"role": "user", "content": "kept"}]),
+        ],
+        False,
+        "capability",
+        "https://control.invalid",
+    )
+
+    assert len(state.prompts) == 1, "the over-budget row must be dropped"
+    assert env.thinking is True
+    # the retained row opens thinking; the dropped one did not.
+    assert env.prompt_opens_thinking is True
 
 
 def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice():
@@ -8524,7 +8818,12 @@ class _StructuredImageEnv(_RecordingEnv):
         self.reply_contexts = []
 
     def new_rollout_state(self, _example):
-        return {"messages": self.initial_messages, "prompt": None}
+        # `prompt` carries the frozen initial prefix and `messages` its mutable copy, matching what
+        # the real adapter builds; the media checks read the prefix, not the growing transcript.
+        return {
+            "messages": [dict(message) for message in self.initial_messages],
+            "prompt": self.initial_messages,
+        }
 
     def env_reply(self, messages, _state):
         self.reply_contexts.append(messages)
@@ -8837,6 +9136,32 @@ def test_step_media_identity_requires_the_child_to_attest_its_media():
 
     with pytest.raises(ValueError, match="list of strings"):
         step_media_identity({"image_count": 1, "image_digests": [b"not-a-str"]})
+
+
+def test_normalize_initial_prompt_rejects_a_state_with_no_prompt():
+    """`prompt` and `messages` are not two spellings of one field.
+
+    `new_rollout_state` seeds `messages` with a COPY of `prompt` and appends each turn onto it, so
+    falling back to `messages` when `prompt` is absent normalizes the transcript-so-far against the
+    frozen prompt's media -- on any state past turn zero that carries model turns the prompt never
+    had. every producer sets `prompt`, so its absence is a corrupt state and must be named as one.
+    """
+    from flash.engine.worker.train.opd.multiturn_media import normalize_initial_prompt
+
+    class _Prompt:
+        image_descriptors = ()
+        image_digests = ()
+        example = {}  # noqa: RUF012
+        package_root = None
+
+    state = {
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ]
+    }
+    with pytest.raises(ValueError, match="environment initial prompt"):
+        normalize_initial_prompt(_Prompt(), state, None)
 
 
 def test_build_opd_overrides_sizes_the_rollout_memory_budget():

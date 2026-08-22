@@ -237,6 +237,15 @@ def _write_terminal_metadata(
             wandb_id=reward_runtime.wandb_link.get("wandb_id"),
             reward_bridge_batching=not inp["multi_turn"],
             gdn_boundary_resets=gdn_hybrid or None,
+            host_census=state.host_census,
+            rollout_identity_evidence=state.rollout_identity_evidence,
+            advantage_spread_history=state.adv_spread_history,
+            advantage_bounds=state.advantage_bounds_evidence,
+            multi_turn_accounting=(
+                reward_runtime.multi_turn_bridge.turn_accounting()
+                if reward_runtime.multi_turn_bridge is not None
+                else None
+            ),
         ),
     )
 
@@ -321,6 +330,29 @@ def _configure_rl_child(
         "setup_seconds": setup_seconds,
         "t_train": t_train,
     }
+
+
+def _shutdown_rl_runtime(resume_uploader, gpu_sampler, reward_runtime) -> float | None:
+    # drain before the reward server goes down: on a cancel or crash the last completed checkpoint
+    # is exactly the one a retry needs, so it is worth uploading on the way out.
+    if resume_uploader is not None:
+        with contextlib.suppress(Exception):
+            resume_uploader.stop()
+    device_peak_gpu_gb = None
+    with contextlib.suppress(Exception):
+        device_peak_gpu_gb = gpu_sampler.stop_gb()
+    # bridge first: the scoring thread is what the server's routes block on, so stopping the server
+    # before it would strand a scoring episode on an event nothing will ever set.
+    if reward_runtime.multi_turn_bridge is not None:
+        with contextlib.suppress(Exception):
+            reward_runtime.multi_turn_bridge.shutdown()
+    reward_runtime.server.shutdown()
+    # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions alone
+    # here, so a straggler an earlier teardown sigkilled but could not drain in time would otherwise
+    # be collected only by the next failing job.
+    with contextlib.suppress(Exception):
+        reap_stragglers()
+    return device_peak_gpu_gb
 
 
 def run_rl_train():
@@ -411,27 +443,16 @@ def run_rl_train():
                 files=files,
             )
         _validate_rl_child(
-            rc, state, files["resume_step"], expected_steps, resume_uploader, files=files
+            rc,
+            state,
+            files["resume_step"],
+            expected_steps,
+            resume_uploader,
+            files=files,
+            reward_runtime=reward_runtime,
         )
     finally:
-        # drain before the reward server goes down: on a cancel or crash the last completed
-        # checkpoint is exactly the one a retry needs, so it is worth uploading on the way out.
-        if resume_uploader is not None:
-            with contextlib.suppress(Exception):
-                resume_uploader.stop()
-        with contextlib.suppress(Exception):
-            device_peak_gpu_gb = gpu_sampler.stop_gb()
-        # bridge first: the scoring thread is what the server's routes block on, so stopping the
-        # server before it would strand a scoring episode on an event nothing will ever set.
-        if reward_runtime.multi_turn_bridge is not None:
-            with contextlib.suppress(Exception):
-                reward_runtime.multi_turn_bridge.shutdown()
-        reward_runtime.server.shutdown()
-        # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions
-        # alone here, so a straggler an earlier teardown SIGKILLed but could not drain in time would
-        # otherwise be collected only by the next failing job.
-        with contextlib.suppress(Exception):
-            reap_stragglers()
+        device_peak_gpu_gb = _shutdown_rl_runtime(resume_uploader, gpu_sampler, reward_runtime)
 
     actor_dir, adapter_dir, steps_run, train_wall = _prepare_final_adapter(
         files["local_dir"], configured["t_train"]

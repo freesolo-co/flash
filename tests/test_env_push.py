@@ -723,7 +723,7 @@ def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monke
     locally and raised ModuleNotFoundError once published. The alias rebinds sys.modules so both
     names give one module object rather than two copies of its state.
     """
-    env_dir = tmp_path / "legacy-env"
+    env_dir = tmp_path / "single-file-env"
     env_dir.mkdir()
     (env_dir / "custom.py").write_text(
         "SCORER = 'gold'\n\ndef load_environment(**k):\n    return None\n"
@@ -734,7 +734,10 @@ def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monke
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    assert cli.cmd_env_push(_args(env_dir, name="legacy-env")) == 0
+    # the exact .py file, which is the supported way to publish an entrypoint not named
+    # environment.py. that push still renames, so the alias is still what keeps `import custom`
+    # resolving to the same module object the runner loaded.
+    assert cli.cmd_env_push(_args(env_dir / "custom.py", name="single-file-env")) == 0
     files = _members(cap["package_b64"])
     assert "custom.py" in files
     # the published tree must import cleanly, with both names bound to ONE module object
@@ -761,23 +764,24 @@ def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monke
     assert result.stdout.strip() == "gold"
 
 
-def test_push_dir_infers_entrypoint_ignoring_the_evaluations_sidecar(monkeypatch, tmp_path):
-    # a legacy package whose sole module is custom.py resolved fine before evaluations.py
-    # existed. counting the sidecar as a candidate entrypoint makes adding one turn that
-    # directory into "multiple top-level .py modules" and reject it before either file loads.
-    env_dir = tmp_path / "legacy-env"
+def test_push_dir_without_the_canonical_entrypoint_is_refused(monkeypatch, tmp_path, capsys):
+    # a directory package names its entrypoint environment.py. inferring it from "the sole
+    # top-level module" made the answer depend on which OTHER files were present, so adding a
+    # second module turned a working push into a rejection. the directory is refused outright
+    # now, and the message names both fixes rather than leaving the user to guess.
+    env_dir = tmp_path / "no-entrypoint-env"
     env_dir.mkdir()
     (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")
     (env_dir / "evaluations.py").write_text("def load_evaluations(environment=None): return []\n")
-    cap: dict = {}
-    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
 
-    assert cli.cmd_env_push(_args(env_dir, name="legacy-env")) == 0
-    files = _members(cap["package_b64"])
-    # packaging canonicalizes the inferred entrypoint to environment.py, so the assertion is
-    # that custom.py was chosen and published at all -- before the fix this raised instead.
-    assert "return None" in files["environment.py"]
-    assert "evaluations.py" in files
+    assert cli.cmd_env_push(_args(env_dir, name="no-entrypoint-env")) == 1
+    # the message must name the canonical entrypoint AND the single-file escape hatch, or the
+    # user is told only that the push failed.
+    out = capsys.readouterr()
+    message = out.err + out.out
+    assert "environment.py" in message
+    assert ".py file" in message
 
 
 def test_push_dir_with_pyproject_uses_explicit_name(monkeypatch, tmp_path):
@@ -1693,13 +1697,13 @@ def test_push_single_py_ships_its_evaluations_sidecar(monkeypatch, tmp_path):
     assert "helper.py" not in files
 
 
-def test_push_directory_infers_its_entrypoint_past_an_evaluations_sidecar(monkeypatch, tmp_path):
-    # a directory whose only module is `custom.py` is a supported layout. counting evaluations.py as
-    # a second top-level module made adding one reject the directory outright, so the very sidecar
-    # that enables evaluation disabled the push and the eval alike.
+def test_push_directory_carries_an_evaluations_sidecar(monkeypatch, tmp_path):
+    # the sidecar rides along with the canonical entrypoint rather than being mistaken for a rival
+    # one. (a directory whose only module is `custom.py` is no longer a supported layout: see
+    # test_push_dir_without_the_canonical_entrypoint_is_refused.)
     env_dir = tmp_path / "env"
     env_dir.mkdir()
-    (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite\n"
         "class Suite(BaseEvalSuite):\n"
@@ -1713,9 +1717,7 @@ def test_push_directory_infers_its_entrypoint_past_an_evaluations_sidecar(monkey
     assert cli.cmd_env_push(_args(env_dir)) == 0
 
     files = _members(cap["package_b64"])
-    # custom.py was resolved as the entrypoint and published under the canonical name...
     assert "load_environment" in files["environment.py"]
-    # ...and the sidecar rode along rather than being mistaken for a rival entrypoint.
     assert "held-out" in files["evaluations.py"]
 
 

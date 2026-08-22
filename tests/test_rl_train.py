@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import hashlib
 import importlib
 import inspect
 import io
@@ -433,6 +434,8 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
 
     assert [entry[0] for entry in registered] == [
         "rank-device-assert",
+        "nonempty-response-mask",
+        "exact-rollout-identity",
         "reentrant-checkpointing",
         "entropy-quantile",
         "per-turn-credit",
@@ -444,7 +447,9 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
         "multi-turn-loop",
     ]
     assert registered[0][2] == "verl.single_controller.base.worker"
-    assert [entry[2] for entry in registered[4:7]] == [
+    assert registered[1][2] == "verl.trainer.ppo.rollout_corr_helper"
+    assert registered[1][3] is verl_patches.install_nonempty_response_mask
+    assert [entry[2] for entry in registered[6:9]] == [
         "verl.experimental.agent_loop.agent_loop",
         "verl.experimental.agent_loop.agent_loop",
         "verl.experimental.agent_loop.agent_loop",
@@ -500,11 +505,174 @@ def test_parent_and_child_share_required_patch_registry_and_preserve_zero_entrop
     assert installed == expected
     assert expected == [
         "rank-device-assert",
+        "nonempty-response-mask",
+        "exact-rollout-identity",
         "entropy-quantile",
         "multi-turn-loop",
         "lora-rollout-guard",
         "gdn-varlen",
     ]
+
+
+def _truncated_thinking_response_mask(monkeypatch):
+    monkeypatch.setenv("FLASH_VERL_MULTITURN_URL", "http://bridge.invalid")
+    monkeypatch.setenv("FLASH_VERL_MAX_TURNS", "1")
+    monkeypatch.setenv("FLASH_VERL_MAX_MODEL_LEN", "512")
+    monkeypatch.setenv("FLASH_VERL_MAX_COMPLETION_TOKENS", "32")
+    monkeypatch.setenv("FLASH_VERL_THINKING", "1")
+    settings = grpo_multiturn._EpisodeSettings()
+    episode = grpo_multiturn._EpisodeTranscript(
+        [7] * 53,
+        response_capacity=459,
+        max_model_len=512,
+    )
+    max_tokens = episode.turn_budget(settings.max_completion_tokens)
+    tokenizer = SimpleNamespace(decode=lambda ids, skip_special_tokens=False: "x" * len(ids))
+    turn = grpo_multiturn.prepare_assistant_turn(
+        tokenizer,
+        list(range(32)),
+        stop_reason="completed",
+        max_tokens=max_tokens,
+        eos_token_ids=frozenset(),
+        stop_sequences=(),
+    )
+    episode.append_model_turn(turn, [0.0] * 32)
+    padded_mask = episode.response_mask + [0] * (
+        episode.response_capacity - len(episode.response_mask)
+    )
+    return settings, episode, turn, np.asarray(padded_mask, dtype=np.int64)
+
+
+def test_thinking_rollout_at_the_authored_32_token_cap_is_fully_masked(monkeypatch):
+    settings, episode, turn, response_mask = _truncated_thinking_response_mask(monkeypatch)
+
+    assert settings.thinking is True
+    assert settings.max_completion_tokens == 32
+    assert episode.response_capacity == 459
+    assert turn["max_tokens"] == 32
+    assert turn["truncated"] is True
+    assert len(episode.response_ids) == 32
+    assert len(response_mask) == 459
+    assert not response_mask.any(), "truncated response tokens became trainable"
+
+
+def _install_rollout_corr_test_module(monkeypatch, original):
+    helper = types.ModuleType("verl.trainer.ppo.rollout_corr_helper")
+    helper.compute_rollout_correction_and_add_to_batch = original
+    ppo = types.ModuleType("verl.trainer.ppo")
+    ppo.rollout_corr_helper = helper
+    trainer = types.ModuleType("verl.trainer")
+    trainer.ppo = ppo
+    verl = types.ModuleType("verl")
+    verl.trainer = trainer
+    for name, module in {
+        "verl": verl,
+        "verl.trainer": trainer,
+        "verl.trainer.ppo": ppo,
+        "verl.trainer.ppo.rollout_corr_helper": helper,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return helper
+
+
+def test_nonempty_response_mask_guard_blocks_the_all_empty_batch_before_verl(monkeypatch):
+    calls = []
+
+    def poison_original(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("poison original was called")
+
+    helper = _install_rollout_corr_test_module(monkeypatch, poison_original)
+    _, _, _, empty = _truncated_thinking_response_mask(monkeypatch)
+    batch = SimpleNamespace(batch={"response_mask": np.stack([empty, empty])})
+    verl_patches.install_nonempty_response_mask()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        helper.compute_rollout_correction_and_add_to_batch(batch, {"rollout_is": "token"})
+
+    assert str(exc_info.value) == (
+        "flash: no trainable response tokens remain in this batch: every rollout was truncated or "
+        "unusable, so no optimizer update will run. increase train.max_completion_tokens or disable "
+        "thinking. child context: FLASH_VERL_THINKING=1, "
+        "FLASH_VERL_MAX_COMPLETION_TOKENS=32."
+    )
+    assert calls == []
+
+
+def test_nonempty_response_mask_guard_delegates_a_mixed_batch_exactly_once(monkeypatch):
+    calls = []
+    sentinel = object()
+
+    def original(batch, rollout_corr_config):
+        calls.append((batch, rollout_corr_config))
+        return sentinel
+
+    helper = _install_rollout_corr_test_module(monkeypatch, original)
+    _, _, _, empty = _truncated_thinking_response_mask(monkeypatch)
+    mixed = np.stack([empty, empty.copy()])
+    mixed[1, 31] = 1
+    batch = SimpleNamespace(batch={"response_mask": mixed})
+    config = {"rollout_is": "token"}
+    verl_patches.install_nonempty_response_mask()
+
+    result = helper.compute_rollout_correction_and_add_to_batch(batch, config)
+
+    assert result is sentinel
+    assert calls == [(batch, config)]
+
+
+def test_nonempty_response_mask_installer_is_idempotent(monkeypatch):
+    helper = _install_rollout_corr_test_module(monkeypatch, lambda batch, config: (batch, config))
+
+    verl_patches.install_nonempty_response_mask()
+    installed = helper.compute_rollout_correction_and_add_to_batch
+    verl_patches.install_nonempty_response_mask()
+
+    assert helper.compute_rollout_correction_and_add_to_batch is installed
+    assert installed._flash_nonempty_response_mask is True
+
+
+def test_nonempty_response_mask_patch_is_required_and_marker_wired(monkeypatch, tmp_path):
+    config = {
+        "marker_file": str(tmp_path / "markers"),
+        "dp_cards": 1,
+        "total_steps": 1,
+    }
+    registered = []
+
+    def register(name, marker_file, target, installer, *args, **kwargs):
+        registered.append((name, marker_file, target, installer, args, kwargs))
+
+    monkeypatch.setattr(child_runtime, "load_plugin_config_file", lambda _name: config)
+    monkeypatch.setattr(child_runtime, "install_deferred_required", register)
+    monkeypatch.setattr(child_runtime, "install_deferred_lora_rollout_guard", lambda _path: None)
+
+    grpo_plugin.install()
+
+    assert registered == [
+        (
+            "nonempty-response-mask",
+            config["marker_file"],
+            "verl.trainer.ppo.rollout_corr_helper",
+            verl_patches.install_nonempty_response_mask,
+            (),
+            {},
+        ),
+        (
+            "exact-rollout-identity",
+            config["marker_file"],
+            "verl.experimental.agent_loop.agent_loop",
+            verl_patches.install_exact_rollout_identity,
+            (),
+            {},
+        ),
+    ]
+    assert grpo_plugin.required_patch_names(config) == [
+        "nonempty-response-mask",
+        "exact-rollout-identity",
+        child_runtime.LORA_ROLLOUT_GUARD_SHIM,
+    ]
+    assert not Path(config["marker_file"]).exists()
 
 
 def _install_entropy_test_modules(monkeypatch, observed):
@@ -1059,6 +1227,7 @@ def _overrides_cfg(**over):
         "lora_rank": 32,
         "lora_alpha": 64,
         "target_modules": "all-linear",
+        "exclude_modules": None,
         "lr": 1e-5,
         "group_size": 8,
         "prompts_per_step": 16,
@@ -1233,6 +1402,7 @@ def test_build_verl_training_cfg_resolves_expert_targets_from_the_catalog_id():
         "mlp.experts.gate_up_proj",
         "mlp.experts.down_proj",
     ]
+    assert cfg["exclude_modules"] is None
 
 
 def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
@@ -1510,9 +1680,9 @@ def test_text_overrides_omit_every_multimodal_key():
         "data.image_key",
         "data.return_raw_chat",
         "data.return_multi_modal_inputs",
-        "data.dataloader_num_workers",
     ):
         assert not any(x.startswith(key) for x in o), key
+    assert "data.dataloader_num_workers=0" in o
 
 
 def test_build_verl_training_cfg_carries_the_multimodal_flag():
@@ -1765,7 +1935,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
     # and the override is scoped: an ordinary model keeps verl's own sleep/wake offload, which is
     # what lets a large rollout fit alongside the training weights.
     for key in ("free_cache_engine", "enable_sleep_mode"):
-        assert not [a for a in _argv("Qwen/Qwen3-4B") if key in a]
+        assert not [a for a in _argv("Qwen/Qwen3.5-4B") if key in a]
 
 
 def test_build_verl_training_cfg_derives_engine_len_and_budget():
@@ -1791,7 +1961,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "ppo_epochs": 1,
         "steps": 60,
         "warmstart_adapter": "",
-        "model_id": "Qwen/Qwen3-4B",
+        "model_id": "Qwen/Qwen3.5-4B",
         "verl_total_epochs": 2,
         "save_freq": 20,
         "ckpt_to_keep": 1,
@@ -2321,7 +2491,21 @@ def test_render_reward_module_accepts_exact_integral_index(monkeypatch, index):
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
         ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
         assert (
-            ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": index}) == 3.0
+            ns["compute_score"](
+                "flash_env",
+                "answer",
+                "unused",
+                extra_info={
+                    "index": index,
+                    "flash_rollout_identity": {
+                        "optimizer_step": 1,
+                        "sample_index": 1,
+                        "rollout_ordinal": 0,
+                        "validate": False,
+                    },
+                },
+            )
+            == 3.0
         )
         assert scored == [(1, "answer")]
     finally:
@@ -2348,7 +2532,23 @@ def test_a_slow_env_call_is_not_cut_off_by_a_client_deadline(monkeypatch):
 
         monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", urlopen_recording_deadline)
         ns["_URL"] = url
-        assert ns["compute_score"]("env", "answer", "unused", extra_info={"index": 0}) == 7.0
+        assert (
+            ns["compute_score"](
+                "env",
+                "answer",
+                "unused",
+                extra_info={
+                    "index": 0,
+                    "flash_rollout_identity": {
+                        "optimizer_step": 1,
+                        "sample_index": 0,
+                        "rollout_ordinal": 0,
+                        "validate": False,
+                    },
+                },
+            )
+            == 7.0
+        )
         assert waited == [0]
         assert seen == [((), {})], f"reward client still carries a deadline: {seen!r}"
     finally:
@@ -2380,7 +2580,20 @@ def test_concurrent_scorers_are_serialized_for_the_env():
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(
                 pool.map(
-                    lambda i: ns["compute_score"]("env", "a", "u", extra_info={"index": i}),
+                    lambda i: ns["compute_score"](
+                        "env",
+                        "a",
+                        "u",
+                        extra_info={
+                            "index": i,
+                            "flash_rollout_identity": {
+                                "optimizer_step": 1,
+                                "sample_index": i,
+                                "rollout_ordinal": 0,
+                                "validate": False,
+                            },
+                        },
+                    ),
                     range(8),
                 )
             )
@@ -2454,9 +2667,18 @@ class _RaisingEnv:
 
 @pytest.fixture
 def _identity_graded(monkeypatch):
-    monkeypatch.setattr(W, "graded_text", lambda text, prompt_opened_thinking=False: text)
-    monkeypatch.setattr(W, "thinking_text", lambda text, prompt_opened_thinking=False: "")
-    monkeypatch.setattr(W, "think_token_count", lambda text, tok, prompt_opened_thinking=False: 3)
+    # patch through the live proxy, not the module-level alias: a sibling test file that pops
+    # flash.engine.worker and re-imports it leaves that alias bound to the dead module object,
+    # so setattr would land somewhere the scorer never reads.
+    from flash.engine.worker.runtime.pkg_proxy import W as live_worker
+
+    worker = sys.modules["flash.engine.worker"]
+    monkeypatch.setattr(worker, "graded_text", lambda text, prompt_opened_thinking=False: text)
+    monkeypatch.setattr(worker, "thinking_text", lambda text, prompt_opened_thinking=False: "")
+    monkeypatch.setattr(
+        worker, "think_token_count", lambda text, tok, prompt_opened_thinking=False: 3
+    )
+    assert live_worker.think_token_count("x", None) == 3, "patch missed the live worker module"
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -2839,7 +3061,15 @@ def test_reward_bridge_lookup_failure_raises(monkeypatch):
                 "flash_env",
                 "answer",
                 "unused",
-                extra_info={"index": 99},
+                extra_info={
+                    "index": 99,
+                    "flash_rollout_identity": {
+                        "optimizer_step": 1,
+                        "sample_index": 99,
+                        "rollout_ordinal": 0,
+                        "validate": False,
+                    },
+                },
             )
     finally:
         server.shutdown()
@@ -2949,7 +3179,20 @@ def test_the_generated_single_turn_reward_module_surfaces_the_bridges_cause(monk
         monkeypatch.setenv("TEST_FLASH_VERL_REWARD_URL", url)
         ns = _rendered_reward_namespace("TEST_FLASH_VERL_REWARD_URL")
         with pytest.raises(RuntimeError) as exc_info:
-            ns["compute_score"]("flash_env", "answer", "unused", extra_info={"index": 0})
+            ns["compute_score"](
+                "flash_env",
+                "answer",
+                "unused",
+                extra_info={
+                    "index": 0,
+                    "flash_rollout_identity": {
+                        "optimizer_step": 1,
+                        "sample_index": 0,
+                        "rollout_ordinal": 0,
+                        "validate": False,
+                    },
+                },
+            )
         message = str(exc_info.value)
         assert "can't start new thread" in message, "the cause never reached the training loop"
         assert "could not serve" in message
@@ -3583,6 +3826,10 @@ def test_kl_ref_adapter_shim_refuses_to_run_without_a_snapshot():
     # would leave the reference on the bare base, and the run would look completely healthy while
     # training against the wrong anchor. they must raise, never fall back.
     pytest.importorskip("torch")
+    # `_load_kl_ref_engine` calls `install_kl_ref_adapter`, which imports peft. guarding only
+    # torch makes this test error instead of skip in an environment that has torch but not
+    # peft, so it must skip on both exactly like the sibling test above.
+    pytest.importorskip("peft")
     import torch
 
     engine_cls = _load_kl_ref_engine()
@@ -3883,9 +4130,13 @@ def test_run_rl_train_wires_the_gradient_check_into_the_publish_path():
     assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in verdict_source
     assert entry_source.index("_validate_rl_child(") < entry_source.index("_export_final_adapter(")
     assert "export_peft_adapter(" in export_source
-    # and that the spread series it passes is actually collected from the child's output.
-    assert 'parse_verl_metric(line, "critic/advantages/max")' in metrics_source
-    assert 'parse_verl_metric(line, "critic/advantages/min")' in metrics_source
+    # and that the spread series it passes is collected from the structured durable metrics row.
+    assert 'step_metrics.get("advantage_max")' in metrics_source
+    assert 'step_metrics.get("advantage_min")' in metrics_source
+    assert "_finalize_advantage_evidence(state, resume_step, expected_steps)" in verdict_source
+    assert verdict_source.index("_check_grpo_had_a_gradient(") < verdict_source.index(
+        "_finalize_advantage_evidence(state, resume_step, expected_steps)"
+    )
 
 
 def test_grpo_gradient_check_abstains_for_a_resumed_run():
@@ -3903,6 +4154,29 @@ def test_grpo_gradient_check_abstains_for_a_resumed_run():
     # about the resume boundary, not a weakening of the guard.
     with pytest.raises(RuntimeError, match="zero advantage spread"):
         rl_train._check_grpo_had_a_gradient([1.0], [0.0], resumed=False)
+
+
+def test_terminal_advantage_evidence_rejects_missing_nonfinite_and_zero_spread():
+    missing = rl_train._StepMetricState()
+    missing.reward_history[:] = [0.5, 0.5]
+    missing.adv_spread_history[:] = [1.0]
+    missing.advantage_bounds[1] = (-0.5, 0.5)
+    with pytest.raises(RuntimeError, match=r"missing=\[2\], extra=\[\]"):
+        rl_train._validate_rl_child(0, missing, 0, 2, None)
+
+    nonfinite = rl_train._StepMetricState()
+    nonfinite.reward_history.append(0.5)
+    nonfinite.adv_spread_history.append(1.0)
+    nonfinite.advantage_bounds[1] = (0.0, float("inf"))
+    with pytest.raises(RuntimeError, match="not finite and ordered"):
+        rl_train._validate_rl_child(0, nonfinite, 0, 1, None)
+
+    zero = rl_train._StepMetricState()
+    zero.reward_history.append(0.5)
+    zero.adv_spread_history.append(0.0)
+    zero.advantage_bounds[1] = (0.0, 0.0)
+    with pytest.raises(RuntimeError, match="zero advantage spread"):
+        rl_train._validate_rl_child(0, zero, 0, 1, None)
 
 
 def test_grpo_gradient_check_accepts_a_resume_that_is_already_complete():
@@ -4432,6 +4706,95 @@ def _notes_common():
     return {"steps_run": 3, "retained_prompts": 8, "reward_history": [0.5], "loss_curve": [0.1]}
 
 
+def _identity_summary(identities):
+    digest = hashlib.sha256()
+    for identity in sorted(
+        identities,
+        key=lambda value: (
+            value["optimizer_step"],
+            value["sample_index"],
+            value["rollout_ordinal"],
+            value["validate"],
+        ),
+    ):
+        digest.update(
+            (
+                f"{identity['optimizer_step']}:{identity['sample_index']}:"
+                f"{identity['rollout_ordinal']}:{int(identity['validate'])}\n"
+            ).encode("ascii")
+        )
+    return {"count": len(identities), "sha256": digest.hexdigest()}
+
+
+def test_successful_child_validation_publishes_exact_rollout_identity_evidence_in_notes():
+    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+
+    ledger = RolloutIdentityLedger(1, 2)
+    expected = [
+        {
+            "optimizer_step": 1,
+            "sample_index": 0,
+            "rollout_ordinal": ordinal,
+            "validate": False,
+        }
+        for ordinal in range(2)
+    ]
+    ledger.register(expected)
+    for identity in reversed(expected):
+        ledger.record(identity, 0)
+    ledger.seal(1)
+
+    state = rl_train._StepMetricState()
+    state.reward_history.append(0.5)
+    state.adv_spread_history.append(1.0)
+    state.advantage_bounds[1] = (-0.25, 0.75)
+    runtime = SimpleNamespace(identity_ledger=ledger)
+    rl_train._validate_rl_child(0, state, 0, 1, None, reward_runtime=runtime)
+
+    terminal_source = inspect.getsource(rl_train._write_terminal_metadata)
+    assert "rollout_identity_evidence=state.rollout_identity_evidence" in terminal_source
+    assert "advantage_spread_history=state.adv_spread_history" in terminal_source
+    assert "advantage_bounds=state.advantage_bounds_evidence" in terminal_source
+    notes = rl_train._build_verl_train_notes(
+        _notes_inp(),
+        **_notes_common(),
+        rollout_identity_evidence=state.rollout_identity_evidence,
+        advantage_spread_history=state.adv_spread_history,
+        advantage_bounds=state.advantage_bounds_evidence,
+    )
+    assert notes["rollout_identity_evidence"] == {
+        "steps": [
+            {
+                "optimizer_step": 1,
+                "registered": _identity_summary(expected),
+                "observed": _identity_summary(expected),
+            }
+        ],
+        "validation": [],
+    }
+    assert notes["advantage_spread_history"] == [1.0]
+    assert notes["advantage_bounds"] == [{"step": 1, "min": -0.25, "max": 0.75, "spread": 1.0}]
+
+
+def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
+    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+
+    state = rl_train._StepMetricState()
+    runtime = SimpleNamespace(identity_ledger=RolloutIdentityLedger(1, 2))
+    rl_train._validate_rl_child(0, state, 5, 5, None, reward_runtime=runtime)
+    assert state.rollout_identity_evidence == {"steps": [], "validation": []}
+    assert state.adv_spread_history == []
+    assert state.advantage_bounds_evidence == []
+    notes = rl_train._build_verl_train_notes(
+        _notes_inp(),
+        **_notes_common(),
+        advantage_spread_history=state.adv_spread_history,
+        advantage_bounds=state.advantage_bounds_evidence,
+    )
+    assert notes["advantage_spread_history"] == []
+    assert notes["advantage_bounds"] == []
+
+
 def test_train_notes_carry_the_trl_observability_fields():
     # the console is uploaded only on FAILURE, so a successful run's train_meta is the sole record
     # of how it ran. the retired trl path reported these; without them a verl run cannot be compared to a
@@ -4832,7 +5195,15 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
 
     adapter_dir = tmp_path / "warmstart"
     adapter_dir.mkdir()
-    (adapter_dir / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32}))
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 16,
+                "lora_alpha": 32,
+                "exclude_modules": r"^(?!model\.language_model(?:\.|$)).*$",
+            }
+        )
+    )
     monkeypatch.setattr(_adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
 
     inp = _capability_resolve(
@@ -4845,13 +5216,44 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
     assert inp["kl_coef"] == pytest.approx(0.1)
 
 
+def test_grpo_checks_warmstart_modality_after_resolving_image_prompts(monkeypatch, tmp_path):
+    import flash.engine.worker.model.adapter as adapter_mod
+
+    adapter_dir = tmp_path / "warmstart"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 16,
+                "lora_alpha": 32,
+                "exclude_modules": r"^(?!model\.language_model(?:\.|$)).*$",
+            }
+        )
+    )
+    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
+
+    with pytest.raises(ValueError, match="multimodal run cannot continue a text-only adapter"):
+        _capability_resolve(
+            monkeypatch,
+            _capability_env(image_uri=_capability_image_uri()),
+            train={"init_from_adapter": "org/text-only-adapter"},
+        )
+
+
 def test_35b_grpo_warm_start_requires_fused_expert_targets(monkeypatch, tmp_path):
     import flash.engine.worker.model.adapter as adapter_mod
 
     adapter_dir = tmp_path / "warmstart"
     adapter_dir.mkdir()
     (adapter_dir / "adapter_config.json").write_text(
-        json.dumps({"r": 32, "lora_alpha": 64}), encoding="utf-8"
+        json.dumps(
+            {
+                "r": 32,
+                "lora_alpha": 64,
+                "exclude_modules": r"^(?!model\.language_model(?:\.|$)).*$",
+            }
+        ),
+        encoding="utf-8",
     )
     monkeypatch.setattr(adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
 
@@ -6273,7 +6675,9 @@ def test_bridge_shutdown_stops_the_scoring_thread():
 def test_the_run_shuts_the_bridge_down_before_the_server_it_is_mounted_on():
     # ordering matters: the server's routes block on the scoring thread, so stopping the server
     # first would strand a scoring episode on an event nothing will ever set.
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    src = " ".join(inspect.getsource(rl_train._shutdown_rl_runtime).split())
+    assert "_shutdown_rl_runtime(resume_uploader, gpu_sampler, reward_runtime)" in entry
     assert "multi_turn_bridge.shutdown()" in src
     assert src.index("multi_turn_bridge.shutdown()") < src.index("server.shutdown()")
 
@@ -6415,6 +6819,8 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
         "tokenizer=tok",
         'per_turn_credit=bool(inp["per_turn_credit"])',
         "on_episode_scored=observability.record",
+        "parent_work=observability.parent_work",
+        "identity_ledger=identity_ledger",
     ):
         assert fragment in src
     assert 'if inp["multi_turn"] else None' in src
@@ -7145,7 +7551,11 @@ def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains
     # sample and the heartbeat describe the same generation.
     stdout_loop = " ".join(inspect.getsource(rl_train._execute_rl_child).split())
     stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = step_number') :]
+    assert 'reward_runtime.identity_ledger.seal(progress["step"])' in stdout_loop
     assert 'reward_runtime.observability.close_generation(progress["step"])' in stdout_loop
+    assert stdout_loop.index("identity_ledger.seal(") < stdout_loop.index(
+        "observability.close_generation("
+    )
     assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
         'samp = reward_runtime.observability.latest_for_step(progress["step"])'
     )
@@ -7493,6 +7903,8 @@ def _drive_multi_turn_episode(
     multi_modal_data=None,
     return_instance=False,
     raw_prompt=None,
+    identity_ledger=None,
+    rollout_ordinal=0,
     prompt_descriptors=None,
 ):
     """run the real child loop end to end against a real bridge, returning its agent loop output.
@@ -7551,6 +7963,7 @@ def _drive_multi_turn_episode(
         processor=processor,
         tokenizer=tokenizer,
         per_turn_credit=per_turn_credit,
+        identity_ledger=identity_ledger,
     )
     routes = bridge.routes()
 
@@ -7647,6 +8060,12 @@ def _drive_multi_turn_episode(
                 raw_prompt if raw_prompt is not None else [{"role": "user", "content": "go"}]
             ),
             index=0,
+            flash_rollout_identity={
+                "optimizer_step": 1,
+                "sample_index": 0,
+                "rollout_ordinal": rollout_ordinal,
+                "validate": False,
+            },
         )
 
     asyncio.run(_go())
@@ -7680,6 +8099,34 @@ class _SpanEnv:
         from flash.envs.base import RolloutReward
 
         return [RolloutReward(episode=1.0, turns=tuple(0.5 for _ in self.recorded)) for _ in items]
+
+
+def test_multi_turn_child_preserves_exact_identity_through_start_and_score(monkeypatch):
+    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+
+    ledger = RolloutIdentityLedger(1, 2)
+    ledger.register(
+        [
+            {
+                "optimizer_step": 1,
+                "sample_index": 0,
+                "rollout_ordinal": ordinal,
+                "validate": False,
+            }
+            for ordinal in range(2)
+        ]
+    )
+    for ordinal in range(2):
+        _drive_multi_turn_episode(
+            stop_reasons=[("answer", "completed")],
+            env=_SpanEnv(),
+            monkeypatch=monkeypatch,
+            max_turns=1,
+            identity_ledger=ledger,
+            rollout_ordinal=ordinal,
+        )
+    ledger.seal(1)
+    ledger.finalize({1})
 
 
 def test_an_image_prompt_reaches_media_extraction_and_the_rollout(monkeypatch):
@@ -8034,7 +8481,9 @@ def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(monke
             python_bin="python",
             overrides=[],
             env_for_verl=child,
-            inp={},
+            # this test is about the child env, but the process census still needs the step count
+            # it validates against; the production caller always supplies a fully resolved inp.
+            inp={"steps": 1},
             state=rl_train._StepMetricState(),
             reward_runtime=reward_runtime,
             _reward_observability=dict,
@@ -8093,6 +8542,7 @@ def _shim_files(tmp_path):
 def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_path):
     files = _shim_files(tmp_path)
     inp = {
+        "model_id": "Qwen/Qwen3.5-0.8B",
         # one card: the rank/device assertion renders empty, so it owes no marker here. the
         # multi-card case is pinned by the test below.
         "dp_cards": 1,
@@ -8113,7 +8563,10 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
     rl_train._write_rl_plugin_config(inp, files, gdn_reset_arch=None, loggers=[])
 
     assert files["expected_shims"] == [
+        "nonempty-response-mask",
+        "exact-rollout-identity",
         "reentrant-checkpointing",
+        "text-lora-targeting",
         "entropy-quantile",
         "stop-sequences",
         "exact-save-steps",
@@ -8130,12 +8583,14 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
     config = json.loads(Path(files["plugin_config_path"]).read_text())
     assert files["expected_shims"] == grpo_plugin.required_patch_names(config)
     assert config["gdn_model_type"] is None
+    assert config["lora_language_prefix"] == "model.language_model"
     assert config["kl_ref_adapter"] is True
 
 
 def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_cards(tmp_path):
     files = _shim_files(tmp_path)
     inp = {
+        "model_id": "Qwen/Qwen3.5-0.8B",
         "dp_cards": 2,
         "reentrant_checkpointing": True,
         "multimodal": False,
@@ -8154,7 +8609,10 @@ def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_card
 
     assert files["expected_shims"] == [
         "rank-device-assert",
+        "nonempty-response-mask",
+        "exact-rollout-identity",
         "reentrant-checkpointing",
+        "text-lora-targeting",
         "lora-rollout-guard",
     ]
     config = json.loads(Path(files["plugin_config_path"]).read_text())
@@ -8191,6 +8649,7 @@ def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
     state = rl_train._StepMetricState()
     state.reward_history.append(0.5)
     state.adv_spread_history.append(1.0)
+    state.advantage_bounds[1] = (-0.5, 0.5)
     marker = tmp_path / "applied_shims.txt"
     marker.write_text("entropy-quantile\n")
     # the complete set passes and falls through to the gradient verdict.
@@ -8254,3 +8713,406 @@ def test_the_fp8_kv_probe_reads_the_child_capability_probe_not_parent_cuda(monke
         settings = rl_train._resolve_training_settings(inp, caps)
         assert settings[0] == 4
         assert settings[-1] is cc_ok, caps
+
+
+def test_multi_turn_bridge_counts_turns_it_actually_ran():
+    """The bridge must report the turns it ran, so a collapse to single-turn is visible.
+
+    Every existing terminal gate -- finite gradients, nonzero adapter delta, complete artifacts --
+    stays green if a regression ends every episode after one turn, because a one-turn episode
+    still trains. These counters are the only evidence that separates "multi-turn ran" from
+    "multi-turn was configured". Driven through the real HTTP routes, not the bridge object, so
+    the transport the child actually uses is covered.
+    """
+    env = _BridgeEnv(done_after=3)
+    bridge = rl_train.MultiTurnBridge(
+        env,
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=5,
+        prompt_ids=[[1]],
+        tokenizer=_BridgeGlueTokenizer(),
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        assert bridge.turn_accounting() == {
+            "episodes_scored": 0,
+            "turn_records": 0,
+            "max_turns_observed": 0,
+            "mean_turns_per_episode": None,
+        }
+        _post(
+            "/multiturn/start",
+            {
+                "index": 0,
+                "session_id": "s",
+                "raw_prompt": [{"role": "user", "content": "a"}],
+                "prompt_ids": [1],
+                "image_count": 0,
+                "image_digests": [],
+            },
+        ).close()
+        prefix = [1]
+        for turn in range(3):
+            completion = str(turn)
+            response_ids = [ord(completion)]
+            response = json.load(
+                _post(
+                    "/multiturn/step",
+                    {
+                        "session_id": "s",
+                        "turn_ordinal": turn,
+                        "accepted_prefix": prefix,
+                        "response_ids": response_ids,
+                        "completion_text": completion,
+                        "image_count": 0,
+                        "image_digests": [],
+                    },
+                )
+            )
+            if response["terminal"]:
+                break
+            prefix.extend([*response_ids, *(ord(character) for character in "next")])
+        _post("/multiturn/score", {"session_id": "s", "turn_count": 3}).close()
+    finally:
+        bridge.shutdown()
+        server.shutdown()
+
+    accounting = bridge.turn_accounting()
+    assert accounting["episodes_scored"] == 1
+    assert accounting["turn_records"] == 3
+    assert accounting["max_turns_observed"] == 3
+    assert accounting["mean_turns_per_episode"] == 3.0
+    # the env really advanced: three assistant turns reached it, not one repeated.
+    assert env.recorded == ["0", "1", "2"]
+
+
+def test_single_turn_episode_is_reported_as_one_turn():
+    """A genuinely single-turn episode reports 1, so the counter is not merely 'nonzero'.
+
+    Without this, `turn_records >= 1` would pass for a run that collapsed to one turn per episode,
+    which is exactly the regression the accounting exists to catch.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(done_after=1),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=5,
+        prompt_ids=[[1]],
+        tokenizer=_BridgeGlueTokenizer(),
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        _post(
+            "/multiturn/start",
+            {
+                "index": 0,
+                "session_id": "s",
+                "raw_prompt": [{"role": "user", "content": "a"}],
+                "prompt_ids": [1],
+                "image_count": 0,
+                "image_digests": [],
+            },
+        ).close()
+        response = json.load(
+            _post(
+                "/multiturn/step",
+                {
+                    "session_id": "s",
+                    "turn_ordinal": 0,
+                    "accepted_prefix": [1],
+                    "response_ids": [ord("x")],
+                    "completion_text": "x",
+                    "image_count": 0,
+                    "image_digests": [],
+                },
+            )
+        )
+        assert response["terminal"] is True
+        _post("/multiturn/score", {"session_id": "s", "turn_count": 1}).close()
+    finally:
+        bridge.shutdown()
+        server.shutdown()
+
+    accounting = bridge.turn_accounting()
+    assert accounting["episodes_scored"] == 1
+    assert accounting["turn_records"] == 1
+    assert accounting["max_turns_observed"] == 1
+    assert accounting["mean_turns_per_episode"] == 1.0
+
+
+def test_turn_accounting_ignores_a_child_reported_turn_count():
+    """The counters must come from the parent's ordinal, not from the child's self-report.
+
+    These exist to prove the child's turn loop really iterated: a collapse to one turn per episode
+    keeps every other gate green. Deriving them from `turn_count` in the child's own `/score`
+    payload let the subject of the measurement supply the measurement -- a child that generated one
+    turn could claim five and the accounting would agree. `step` validates every ordinal against
+    `next_turn` before incrementing it, so the parent already knows the answer exactly.
+
+    The payload here claims 5 turns for an episode the parent watched generate 2.
+    """
+    bridge = rl_train.MultiTurnBridge(
+        _BridgeEnv(done_after=2),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=5,
+        prompt_ids=[[1]],
+        tokenizer=_BridgeGlueTokenizer(),
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        _post(
+            "/multiturn/start",
+            {
+                "index": 0,
+                "session_id": "s",
+                "raw_prompt": [{"role": "user", "content": "a"}],
+                "prompt_ids": [1],
+                "image_count": 0,
+                "image_digests": [],
+            },
+        ).close()
+        prefix = [1]
+        generated = 0
+        for turn in range(5):
+            completion = str(turn)
+            response_ids = [ord(completion)]
+            response = json.load(
+                _post(
+                    "/multiturn/step",
+                    {
+                        "session_id": "s",
+                        "turn_ordinal": turn,
+                        "accepted_prefix": prefix,
+                        "response_ids": response_ids,
+                        "completion_text": completion,
+                        "image_count": 0,
+                        "image_digests": [],
+                    },
+                )
+            )
+            generated += 1
+            if response["terminal"]:
+                break
+            prefix.extend([*response_ids, *(ord(character) for character in "next")])
+        assert generated == 2, "the env was configured to end the episode after two turns"
+        # the child claims more turns than it generated.
+        _post("/multiturn/score", {"session_id": "s", "turn_count": 5}).close()
+    finally:
+        bridge.shutdown()
+        server.shutdown()
+
+    accounting = bridge.turn_accounting()
+    assert accounting["episodes_scored"] == 1
+    assert accounting["turn_records"] == 2, "the child's inflated turn_count reached the accounting"
+    assert accounting["max_turns_observed"] == 2
+    assert accounting["mean_turns_per_episode"] == 2.0
+
+
+def test_a_failed_score_does_not_inflate_the_turn_accounting():
+    """Accounting must describe episodes that were really scored, not requests that arrived.
+
+    The counters were incremented on entry to `/multiturn/score`, before the scorer confirmed
+    anything. `turn_accounting()` is published from the runner's `finally` path, so a run whose
+    episodes failed to score still wrote turn totals into its durable notes -- inflated evidence
+    for exactly the collapsed-multi-turn regression the counters exist to detect.
+    """
+
+    class _Unscorable(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            raise RuntimeError("env scoring failed")
+
+    bridge = rl_train.MultiTurnBridge(
+        _Unscorable(done_after=1),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=5,
+        prompt_ids=[[1]],
+        tokenizer=_BridgeGlueTokenizer(),
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        _post(
+            "/multiturn/start",
+            {
+                "index": 0,
+                "session_id": "s",
+                "raw_prompt": [{"role": "user", "content": "a"}],
+                "prompt_ids": [1],
+                "image_count": 0,
+                "image_digests": [],
+            },
+        ).close()
+        _post(
+            "/multiturn/step",
+            {
+                "session_id": "s",
+                "turn_ordinal": 0,
+                "accepted_prefix": [1],
+                "response_ids": [ord("x")],
+                "completion_text": "x",
+                "image_count": 0,
+                "image_digests": [],
+            },
+        ).close()
+        with pytest.raises(urllib.error.HTTPError):
+            _post("/multiturn/score", {"session_id": "s", "turn_count": 4}).close()
+    finally:
+        bridge.shutdown()
+        server.shutdown()
+
+    accounting = bridge.turn_accounting()
+    assert accounting["episodes_scored"] == 0
+    assert accounting["turn_records"] == 0
+    assert accounting["max_turns_observed"] == 0
+    assert accounting["mean_turns_per_episode"] is None
+
+
+def test_turn_accounting_reaches_the_durable_notes_not_only_the_heartbeat():
+    """The counters have to land in `metrics.json` notes, which is what a terminal proof reads.
+
+    The heartbeat's `metrics_last` row is a live view that a completed run's artifact bundle does
+    not carry, so publishing there alone leaves the evidence unreadable after the fact. Assert both
+    that the terminal writer forwards the bridge totals and that the notes builder keeps them.
+    """
+    terminal_source = inspect.getsource(rl_train._write_terminal_metadata)
+    assert "multi_turn_accounting=(" in terminal_source
+    assert "reward_runtime.multi_turn_bridge.turn_accounting()" in terminal_source
+
+    accounting = {
+        "episodes_scored": 128,
+        "turn_records": 585,
+        "max_turns_observed": 5,
+        "mean_turns_per_episode": 4.5703125,
+    }
+    notes = rl_train._build_verl_train_notes(
+        _notes_inp(), **_notes_common(), multi_turn_accounting=accounting
+    )
+    assert notes["multi_turn_accounting"] == accounting
+    # a copy, so a later bridge update cannot retroactively rewrite a published record.
+    assert notes["multi_turn_accounting"] is not accounting
+
+
+def test_single_turn_run_records_multi_turn_accounting_as_an_explicit_none():
+    """Single-turn runs must record the key, so absence stays distinguishable from omission.
+
+    A terminal gate cannot tell "this run had no episode loop" from "the counters were never
+    wired" if the key is simply missing, and the second case is the one that hides a collapse.
+    """
+    notes = rl_train._build_verl_train_notes(_notes_inp(), **_notes_common())
+    assert "multi_turn_accounting" in notes
+    assert notes["multi_turn_accounting"] is None
+
+
+def _verl_step_line(step: int, *, adv_min: float, adv_max: float) -> str:
+    """one verl LocalLogger step line, in the exact shape the child prints."""
+    return (
+        f"step:{step} - critic/rewards/mean:1.0 - critic/rewards/max:1.0 - "
+        f"critic/rewards/min:1.0 - critic/advantages/mean:0.0 - "
+        f"critic/advantages/max:{adv_max} - critic/advantages/min:{adv_min} - "
+        "actor/pg_loss:0.0"
+    )
+
+
+def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
+    """A resumed child replays its resume step; those bounds belong to the previous attempt.
+
+    `child_io.append_step_metrics` documents the replay, and `_finalize_advantage_evidence`
+    requires exactly `resume_step + 1 .. horizon`. Admitting the replayed line therefore reports
+    the resume step as an `extra` step and fails a healthy resumed run at its terminal verdict.
+    """
+    from flash.engine.worker import rl_train_runner
+
+    state = rl_train._StepMetricState()
+    state.resume_step = 2
+    observability = dict
+
+    # the replayed line for the step the previous attempt already completed.
+    rl_train._ingest_step_metrics(
+        _verl_step_line(2, adv_min=-0.5, adv_max=0.5),
+        _notes_inp(),
+        state,
+        observability,
+    )
+    assert 2 not in state.advantage_bounds
+
+    # the first genuinely new step is recorded.
+    rl_train._ingest_step_metrics(
+        _verl_step_line(3, adv_min=-0.25, adv_max=0.75),
+        _notes_inp(),
+        state,
+        observability,
+    )
+    assert sorted(state.advantage_bounds) == [3]
+
+    # and the terminal verdict accepts the run instead of reporting step 2 as extra.
+    rl_train_runner._finalize_advantage_evidence(state, 2, 3)
+    assert state.advantage_bounds_evidence == [
+        {"step": 3, "min": -0.25, "max": 0.75, "spread": 1.0}
+    ]
+
+
+def test_resumed_grpo_seeds_the_dump_watermark_at_the_resume_boundary():
+    """The replayed step must not be sealed: only `resume_step + 1 ..` are ever registered.
+
+    The stream loop dumps a sample and seals identities whenever the step differs from
+    `last_dump_step`. Starting that watermark at -1 makes the replayed resume step look new, so
+    `RolloutIdentityLedger.seal` raises "has no registered rollout identity set" and kills a
+    resumed run at its first output line.
+    """
+    from flash.engine.worker import rl_train_runner
+
+    source = " ".join(inspect.getsource(rl_train_runner._execute_rl_child).split())
+    assert "if resume_step: last_dump_step[0] = resume_step" in source
+
+    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+
+    # the ledger a resumed run builds: registration starts after the resume boundary.
+    ledger = RolloutIdentityLedger(1, 2)
+    with pytest.raises(ValueError, match="no registered rollout identity set"):
+        ledger.seal(2)

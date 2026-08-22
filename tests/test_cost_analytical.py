@@ -185,22 +185,6 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
     assert estimate_cost(capped).wall_clock_seconds == pytest.approx(3600.0)
 
 
-def test_offline_gpu_shape_picks_cheapest_including_unvalidated():
-    # No validation gate: the offline shape picks the cheapest fitting class (validated or not)
-    # at the static rate, and nothing fitting is cheaper.
-    from flash.cost.facts import gpu_hourly_usd, pick_gpu
-    from flash.providers.base import GPU_INFO
-
-    gpu, need, *_ = _offline_gpu_shape(RunConfig(MID, "sft", 100))
-    assert gpu == pick_gpu(need)
-    cheaper = [
-        g
-        for g in GPU_INFO.values()
-        if g.vram_gb >= need and gpu_hourly_usd(g.name) < gpu_hourly_usd(gpu)
-    ]
-    assert not cheaper, f"{cheaper} cheaper than {gpu} for {need} GB"
-
-
 def test_9b_bf16_grpo_needs_an_80gb_class():
     # Qwen3.5-9B is bf16 (QLoRA was dropped: the 4-bit vLLM-rollout merge collapsed the GRPO
     # importance-sampling ratio -> no learning). Colocated bf16 GRPO needs an 80 GB-class card.

@@ -9,20 +9,32 @@ Split out of `flash.engine.worker.backend_common` to keep that module under the 
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
 import re
 import shutil
 import subprocess
+from collections.abc import Mapping
+from typing import Any
 
 from flash.adapters.fused_experts import (
-    has_complete_fused_expert_tensors,
+    fused_expert_lora_tensor_pairs,
+    is_non_language_lora_key,
     lora_target_parameters,
     normalize_verl_fused_expert_export,
     validate_fused_expert_adapter_config,
 )
-from flash.engine.worker.model.lora import _read_adapter_tensor_metadata
+from flash.adapters.lora_rank import (
+    _rank_for_module,
+    lora_tensor_rank_disagrees,
+    strict_declared_lora_ranks,
+)
+from flash.engine.worker.model.lora import (
+    _open_safetensors_numpy,
+    _read_adapter_tensor_metadata,
+)
 
 
 class MergeDiskHeadroomError(RuntimeError):
@@ -366,6 +378,62 @@ def stage_verl_resume(resume_dir: str, local_dir: str, *, job_label: str, world_
     return step
 
 
+def _largest_file_bytes(checkpoint_dir: str) -> int:
+    """the biggest single file under ``checkpoint_dir``, or 0 when it cannot be walked.
+
+    per-file, not total: the artifact store rejects an oversized MEMBER, and a checkpoint whose
+    bytes are spread across many shards uploads fine at any total size.
+    """
+    largest = 0
+    for root, _dirs, names in os.walk(checkpoint_dir):
+        for name in names:
+            try:
+                size = os.path.getsize(os.path.join(root, name))
+            except OSError:
+                # a file verl retention pruned mid-walk cannot be the reason an upload failed.
+                continue
+            largest = max(largest, size)
+    return largest
+
+
+def resume_upload_unavailable(step: int, checkpoint_dir: str, *, job_label: str) -> None:
+    """report that ``step``'s resume state could not be uploaded, without failing the run.
+
+    the resume checkpoint is internal restart convenience: it exists so a preempted attempt can
+    continue instead of replaying from step 0. the artifact a required save is OWED is the
+    deployable adapter, and that is published from this upload's ``before_upload`` callback -- it
+    raises ``RequiredSaveError`` on its own when a required adapter cannot be published, and
+    ``stop(require_complete=True)`` independently re-checks ``missing_deployables`` at the end of
+    the run. so the deployable guarantee is enforced twice and neither path runs through here.
+
+    raising here instead destroyed finished work: a lora run of a large model writes one
+    ``model_world_size_*_rank_*.pt`` holding every base parameter (verl saves the whole state dict,
+    with no trainable-only filtering), which for a 27.59B model is ~55 GB in ONE file and exceeds
+    the artifact store's 50 GB per-file ceiling. that upload can never succeed at any retry count,
+    so a run whose steps had all converged and whose adapter was already durably published was
+    failed for state nothing was going to read. the frozen base weights in it are recoverable from
+    the public base checkpoint anyway -- the next attempt re-downloads them regardless.
+
+    grpo already treats this same upload as non-fatal (``rl/checkpoints.py``, "resume uploads are
+    ungated internal retry state"); this makes sft and opd agree with it rather than inventing a
+    new policy. the step stays marked failed on the ledger, so the loss of restart state is
+    recorded rather than hidden.
+    """
+    largest = _largest_file_bytes(checkpoint_dir)
+    detail = f" largest member {largest / 1e9:.1f} GB." if largest else ""
+    # "not confirmed", not "not uploaded": the False this reports on is also returned when the
+    # folder commit landed and only the closing heartbeat exhausted its retries, so the restart
+    # state may well be present. the run is continued either way, and the next attempt re-checks
+    # what is actually in the repo rather than trusting this line.
+    print(
+        f"[{job_label}] step {step} resume checkpoint was not confirmed uploaded; continuing "
+        f"without relying on restart state for it.{detail} the deployable adapter is unaffected "
+        "and is enforced separately -- only a crash or preemption after this point would have to "
+        "replay from an earlier step.",
+        flush=True,
+    )
+
+
 def export_peft_adapter(
     ckpt_actor_dir: str,
     out_adapter_dir: str,
@@ -431,7 +499,248 @@ def export_peft_adapter(
         shutil.rmtree(merge_out, ignore_errors=True)
 
 
-def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision: str = "") -> None:
+# bare `lora_A.weight` only, deliberately. this validates the verl merger's output at the export
+# boundary, and that producer always strips the adapter name, so a namespaced key here means the
+# directory holds something the merger did not write. the fused validator accepts both because it
+# also runs at the warm-start boundary over previously published adapters.
+# collapse layer indexes so every layer of one stack shares a width bucket, while the vision and
+# language stacks stay distinct: `...layers.0.mlp.down_proj` and `...layers.31.mlp.down_proj` are
+# the same base module shape, `...visual.blocks.0.mlp.down_proj` is not.
+#
+# the collapse is not exhaustive, deliberately. `re.sub` is non-overlapping, so consecutive indexes
+# only partly collapse (`a.b.0.1.2.proj` -> `a.b.1.proj`), and a trailing index is left alone
+# (`a.proj.7`). both OVER-split. a partial bucket is always contained in a single fully-collapsed
+# bucket -- substitution only ever removes text, so two paths that survive to the same partial form
+# cannot separate under further passes -- so an unhandled shape can only invent EXTRA buckets. that
+# costs a missed catch and never a false reject of a healthy export, which is why leaving these
+# shapes unhandled is safe rather than merely untested. fused experts do collapse fully:
+# `layers.0.mlp.experts.3.down_proj` -> `layers.mlp.experts.down_proj`.
+_LAYER_INDEX_RE = re.compile(r"\.\d+\.")
+_TEXT_LORA_KEY_RE = re.compile(
+    r"^(?P<module>base_model\.model\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+)"
+    r"(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+))*)\.lora_(?P<factor>[AB])\.weight$"
+)
+
+
+def _pair_has_nonzero_delta(factor_a, factor_b, *, require_finite_scan: bool) -> bool:
+    """return whether B @ A is nonzero, checking every block when overflow is possible."""
+    import numpy as np
+
+    active = np.flatnonzero(np.any(factor_b != 0, axis=0) & np.any(factor_a != 0, axis=1))
+    if active.size == 0:
+        return False
+    factor_a = factor_a[active].astype(np.float32, copy=False)
+    factor_b = factor_b[:, active].astype(np.float32, copy=False)
+    found_nonzero = False
+    for row_start in range(0, factor_b.shape[0], 64):
+        row_block = factor_b[row_start : row_start + 64]
+        for column_start in range(0, factor_a.shape[1], 256):
+            delta = row_block @ factor_a[:, column_start : column_start + 256]
+            if not np.isfinite(delta).all():
+                raise RuntimeError("composed LoRA delta contains non-finite values")
+            if np.count_nonzero(delta):
+                found_nonzero = True
+                if not require_finite_scan:
+                    return True
+    return found_nonzero
+
+
+def _validate_adapter_tensor_values(
+    adapter_dir: str,
+    metadata: dict[str, tuple[int, ...]],
+    pairs: Mapping[Any, tuple[str, str]],
+    *,
+    label: str,
+    must_train: Mapping[Any, tuple[str, str]] | None = None,
+    must_train_subject: str = "",
+) -> None:
+    """validate finite payload values and require one nonzero composed LoRA delta.
+
+    every pair is shape- and finite-checked. `must_train` narrows which pairs may SATISFY the
+    nonzero requirement: a multimodal export passes its language subset, because "some pair moved"
+    is satisfied by a vision pair alone and would publish a run whose whole text stack is zero.
+    omitting it keeps the whole set eligible, which is what a text-only export wants.
+    """
+    import numpy as np
+
+    from flash.adapters.artifacts import loadable_adapter_weight_files
+
+    selected = loadable_adapter_weight_files(os.listdir(adapter_dir))
+    with contextlib.ExitStack() as stack:
+        sources = {}
+        for name in selected:
+            path = os.path.join(adapter_dir, name)
+            handle = stack.enter_context(_open_safetensors_numpy(path))
+            tensor_keys = handle.keys()
+            sources.update({key: (handle, key) for key in tensor_keys})
+        if sources.keys() != metadata.keys():
+            raise RuntimeError(f"{label} tensor sources disagree with their metadata")
+
+        def tensor(key: str):
+            source = sources[key]
+            return source[0].get_tensor(source[1])
+
+        for key in metadata:
+            if not np.isfinite(tensor(key)).all():
+                raise RuntimeError(f"{label} tensor {key!r} contains non-finite values")
+
+        eligible = {tuple(pair) for pair in (pairs if must_train is None else must_train).values()}
+        any_nonzero_delta = False
+        ordered_pairs = sorted(pairs.values(), key=lambda pair: metadata[pair[0]][0])
+        for a_key, b_key in ordered_pairs:
+            factor_a = tensor(a_key)
+            factor_b = tensor(b_key)
+            if factor_b.shape[1] != factor_a.shape[0]:
+                raise RuntimeError(f"{label} LoRA pair {a_key!r}, {b_key!r} cannot compose B @ A")
+            max_a = float(np.max(np.abs(factor_a.astype(np.float32, copy=False))))
+            max_b = float(np.max(np.abs(factor_b.astype(np.float32, copy=False))))
+            finite_bound = max_a * max_b * factor_a.shape[0]
+            require_finite_scan = finite_bound > np.finfo(np.float32).max
+            if any_nonzero_delta and not require_finite_scan:
+                continue
+            try:
+                pair_nonzero = _pair_has_nonzero_delta(
+                    factor_a, factor_b, require_finite_scan=require_finite_scan
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"{label} LoRA pair {a_key!r}, {b_key!r} has a non-finite composed delta"
+                ) from exc
+            # an ineligible pair is still composed above, because that is where a non-finite delta
+            # surfaces; it just cannot be the pair that discharges the requirement.
+            if pair_nonzero and (a_key, b_key) in eligible:
+                any_nonzero_delta = True
+        if not any_nonzero_delta:
+            subject = f" in its {must_train_subject}" if must_train_subject else ""
+            raise RuntimeError(f"{label} has no nonzero composed LoRA delta{subject}")
+
+
+def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal: bool) -> None:
+    """validate the actual non-moe LoRA payload before canonicalizing its config.
+
+    a text-only run carries `resolve_lora_targeting`'s exclude regex, so a vision tensor in the
+    artifact means the merger wrote something the run never targeted and the export is rejected. a
+    multimodal run targets `all-linear` with no exclusion on purpose, so its vision linears are
+    trained weights: they are validated like any other tensor rather than treated as contamination.
+    """
+    label = "exported multimodal adapter" if multimodal else "exported text adapter"
+    try:
+        metadata = _read_adapter_tensor_metadata(adapter_dir) or {}
+    except ValueError as exc:
+        raise RuntimeError(f"{label} tensor artifact is invalid") from exc
+
+    targets = config.get("target_modules")
+    if (
+        not isinstance(targets, list)
+        or not targets
+        or any(not isinstance(target, str) or not target for target in targets)
+    ):
+        raise RuntimeError(
+            f"{label} must declare the concrete non-empty target_modules list emitted "
+            "by the Verl merger"
+        )
+    try:
+        declared = strict_declared_lora_ranks(config)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    pairs: dict[str, dict[str, str]] = {}
+    language_pairs: dict[str, dict[str, str]] = {}
+    target_evidence: set[str] = set()
+    module_widths: dict[str, dict[str, int]] = {}
+    for key, shape in metadata.items():
+        non_language = is_non_language_lora_key(key)
+        if non_language and not multimodal:
+            raise RuntimeError(f"{label} contains non-language tensor {key!r}")
+        match = _TEXT_LORA_KEY_RE.fullmatch(key)
+        if match is None:
+            raise RuntimeError(f"{label} contains a non-canonical tensor key {key!r}")
+        module = match.group("module")
+        matched_targets = {
+            target for target in targets if module == target or module.endswith(f".{target}")
+        }
+        if not matched_targets:
+            raise RuntimeError(
+                f"{label} tensor module {module!r} is not declared in target_modules"
+            )
+        target_evidence.update(matched_targets)
+        if (
+            not isinstance(shape, (list, tuple))
+            or len(shape) != 2
+            or any(
+                not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0
+                for dimension in shape
+            )
+        ):
+            raise RuntimeError(f"{label} tensor {key!r} is not positive and 2-D")
+        if _rank_for_module(module, declared) is None:
+            raise RuntimeError(f"{label} tensor module {module!r} has no configured LoRA rank")
+        if lora_tensor_rank_disagrees(key, shape, declared):
+            raise RuntimeError(f"{label} tensor {key!r} disagrees with its configured LoRA rank")
+        pairs.setdefault(module, {})[match.group("factor")] = key
+        if not non_language:
+            language_pairs.setdefault(module, {})[match.group("factor")] = key
+        # the outer dimension is the base module's own width, so tensors on the same base module
+        # must agree on it. rank and mutual composability are checked above and neither constrains
+        # it: a correctly-ranked pair whose outer dim names a different module's width publishes
+        # here and only fails later, at peft or vllm load, with no provenance back to the export.
+        #
+        # keyed by the LAYER-STRIPPED module path, NOT the bare target suffix. a VL model's vision
+        # tower and language model legitimately share leaf names at different widths -- a
+        # multimodal run has no exclude regex, so `all-linear` covers both stacks and the merger
+        # writes `...language_model...mlp.down_proj` (text intermediate) alongside
+        # `...visual.blocks.N.mlp.down_proj` (vision intermediate). those are two different base
+        # modules, and requiring them to agree fails a HEALTHY image export at publish time, after
+        # the paid run has already finished.
+        stack = _LAYER_INDEX_RE.sub(".", module)
+        width = shape[1] if match.group("factor") == "A" else shape[0]
+        seen = module_widths.setdefault(stack, {}).setdefault(match.group("factor"), width)
+        if seen != width:
+            raise RuntimeError(
+                f"{label} tensor {key!r} has outer dimension {width} where module "
+                f"{stack!r} was already {seen}"
+            )
+
+    incomplete = sorted(module for module, factors in pairs.items() if set(factors) != {"A", "B"})
+    if not pairs or incomplete:
+        raise RuntimeError(
+            f"{label} must contain at least one complete LoRA A/B pair and no orphan "
+            f"factors; incomplete_modules={incomplete[:4]}"
+        )
+    # even a multimodal adapter must have trained the language stack: a run whose whole payload is
+    # vision would serve as a text model with no learned text delta at all.
+    if not language_pairs:
+        raise RuntimeError(f"{label} contains no language-stack LoRA pair")
+
+    pair_keys = {module: (factors["A"], factors["B"]) for module, factors in pairs.items()}
+    language_keys = {
+        module: (factors["A"], factors["B"]) for module, factors in language_pairs.items()
+    }
+    # the nonzero-delta requirement is discharged by the language subset. presence alone (checked
+    # above) does not mean the text stack trained: a vision-only delta would otherwise satisfy it
+    # and publish a paid run that serves as a text model with no learned text delta.
+    _validate_adapter_tensor_values(
+        adapter_dir,
+        metadata,
+        pair_keys,
+        label=label,
+        must_train=language_keys,
+        must_train_subject="language stack",
+    )
+    missing_targets = sorted(set(targets) - target_evidence)
+    if missing_targets:
+        raise RuntimeError(
+            f"{label} has no tensors for declared target_modules {missing_targets[:4]}"
+        )
+
+
+def stamp_adapter_dir_provenance(
+    adapter_dir: str,
+    model_id: str,
+    model_revision: str = "",
+    *,
+    exclude_modules: str | None,
+) -> None:
     """stamp the saved adapter's immutable base identity into adapter_config.json.
 
     dir-based analogue of the in-memory peft-model provenance stamp: same validation + fields,
@@ -440,7 +749,21 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
     also normalizes fused-expert targeting at the exporter boundary. this is the one call every
     export path (sft and rl, final publish and per-step staging) already funnels through, so every
     published adapter carries the current loadable config shape.
+
+    ``exclude_modules`` also names the run's modality. `resolve_lora_targeting` emits the language
+    prefix regex exactly when the run is text-only and leaves it None for a multimodal one, which
+    targets `all-linear` and trains vision linears on purpose. the tensor validation below reads it
+    that way: a vision tensor is contamination in a text-only export and a trained weight in a
+    multimodal one. it is required rather than defaulted so a new export path must state which.
     """
+    if exclude_modules is not None and not exclude_modules.strip():
+        # modality is read from this argument as `is None` and written below as `or None`. an empty
+        # string would validate as text-only and then persist as multimodal, so warm start would
+        # read back the opposite modality from the one the tensors were checked against. reject it
+        # rather than pick a side: `resolve_lora_targeting` never emits it, so it can only reach
+        # here from a new caller that has not stated a modality.
+        raise RuntimeError("exclude_modules must be a non-empty regex or None")
+    multimodal = exclude_modules is None
     cfg_path = os.path.join(adapter_dir, "adapter_config.json")
     with open(cfg_path) as f:
         cfg = json.load(f)
@@ -454,14 +777,60 @@ def stamp_adapter_dir_provenance(adapter_dir: str, model_id: str, model_revision
         raise RuntimeError("adapter base revision does not match the validated target commit")
     cfg["base_model_name_or_path"] = model_id
     cfg["revision"] = model_revision or None
+    # write the key in both directions because every warm-start artifact must state its modality.
+    # a present none means multimodal and a present regex means text-only. the empty string was
+    # rejected above, so this writes back exactly the value the validation below was keyed on.
+    cfg["exclude_modules"] = exclude_modules
     normalize_verl_fused_expert_export(cfg, model_id)
     validate_fused_expert_adapter_config(cfg, model_id)
     if lora_target_parameters(model_id):
-        tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
-        if not has_complete_fused_expert_tensors(tensors, cfg, model_id):
+        try:
+            tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
+        except ValueError as exc:
+            raise RuntimeError("exported fused-expert adapter tensor artifact is invalid") from exc
+        # a text-only run never targets non-language modules, while a multimodal run trains them
+        # under `all-linear` on purpose.
+        if not multimodal:
+            carried = {key for key in tensors if is_non_language_lora_key(key)}
+            if carried:
+                raise RuntimeError(
+                    f"exported text adapter contains non-language tensor {sorted(carried)[0]!r}"
+                )
+        pairs = fused_expert_lora_tensor_pairs(tensors, cfg, model_id)
+        if pairs is None:
             raise RuntimeError(
                 f"exported adapter for {model_id} does not contain complete fused expert LoRA "
                 "weights; refusing to stamp it as warm-start compatible"
             )
+        # a key the pair builder did not claim is neither paired nor value-checked below -- it is
+        # simply published. peft loads the saved state dict with `strict=False`, so a declared
+        # `modules_to_save` entry or a bare bias key whose name matches the base model is restored
+        # OVER the base weights at warm start and serve. the non-moe path rejects every key it does
+        # not recognize; require the same here rather than letting the fused topology be the one
+        # that carries unvalidated tensors.
+        claimed = {key for pair in pairs.values() for key in pair}
+        unclaimed = sorted(set(tensors) - claimed)
+        if unclaimed:
+            raise RuntimeError(
+                f"exported fused-expert adapter contains an unpaired tensor {unclaimed[0]!r}"
+            )
+        # same language-subset requirement as the non-moe path: this model is image-capable, so a
+        # multimodal export must not discharge "something trained" with a vision pair alone.
+        language_pairs = {
+            module: pair for module, pair in pairs.items() if not is_non_language_lora_key(module)
+        }
+        if not language_pairs:
+            raise RuntimeError("exported fused-expert adapter contains no language-stack LoRA pair")
+        _validate_adapter_tensor_values(
+            adapter_dir,
+            tensors,
+            pairs,
+            label="exported fused-expert adapter",
+            must_train=language_pairs,
+            must_train_subject="language stack",
+        )
+    else:
+        _validate_lora_adapter_tensors(adapter_dir, cfg, multimodal=multimodal)
+    cfg["target_modules"] = "all-linear"
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)

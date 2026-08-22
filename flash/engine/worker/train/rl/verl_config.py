@@ -9,9 +9,11 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 
+from flash.adapters.targets import resolve_lora_targeting
 from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.backend_common import (
@@ -209,6 +211,7 @@ def _data_overrides(cfg: dict) -> list[str]:
         # thread flash's thinking mode so the rollout sees the same prompt the retired trl path saw.
         f"+data.apply_chat_template_kwargs.enable_thinking={str(bool(cfg.get('thinking', False))).lower()}",
         f"data.seed={cfg['seed']}",
+        "data.dataloader_num_workers=0",
         # set the rollout seed through engine_kwargs: verl 0.8.0 has no RolloutConfig.seed, and
         # direct keys either fail hydra or the dataclass conversion. engine_kwargs is declared and
         # overrides verl's own vllm seed; `++` is required because this sub-key is absent.
@@ -226,8 +229,6 @@ def _data_overrides(cfg: dict) -> list[str]:
                 "data.return_multi_modal_inputs=false",
                 "data.filter_overlong_prompts=true",
                 "data.truncation=error",
-                # the processor's image loader is not fork-safe under verl's default workers.
-                "data.dataloader_num_workers=0",
                 "actor_rollout_ref.model.trust_remote_code=true",
             ]
             if cfg.get("multimodal")
@@ -243,6 +244,7 @@ def _actor_model_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
+        f"actor_rollout_ref.model.exclude_modules={_hydra_val(cfg.get('exclude_modules'))}",
         *(
             ["++actor_rollout_ref.model.target_parameters=" + _hydra_val(cfg["target_parameters"])]
             if cfg.get("target_parameters")
@@ -594,6 +596,9 @@ def _build_verl_training_cfg(
 ) -> dict:
     engine_len = int(inp["engine_len"])
     sleep_unsupported = rollout_sleep_unsupported(inp["model_id"])
+    targeting = resolve_lora_targeting(
+        inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
+    )
     return {
         "fused_ce_backend": ce_backend,
         "train_files": train_files,
@@ -601,11 +606,11 @@ def _build_verl_training_cfg(
         "model_path": model_path,
         "lora_rank": inp["lora_rank"],
         "lora_alpha": inp["lora_alpha"],
-        "target_modules": "all-linear",
-        # the catalog id, never model_path: lora_target_parameters matches an exact hf repo id, so a
-        # snapshot dir yields None and leaves the fused routed-expert parameters unadapted on a run
-        # that otherwise looks healthy.
-        "target_parameters": _w.lora_target_parameters(inp["model_id"]),
+        "target_modules": targeting.target_modules,
+        "exclude_modules": None,
+        # the catalog id, never model_path: fused routed-expert parameters are part of the same
+        # resolved target surface and must not be derived from the local snapshot path.
+        "target_parameters": targeting.target_parameters,
         "multimodal": bool(inp.get("multimodal")),
         "lr": inp["lr"],
         "group_size": inp["group_size"],
@@ -690,6 +695,11 @@ def _build_verl_train_notes(
     wandb_id: str | None = None,
     reward_bridge_batching: bool = False,
     gdn_boundary_resets: bool | None = None,
+    host_census: dict | None = None,
+    rollout_identity_evidence: dict | None = None,
+    advantage_spread_history: list[float] | None = None,
+    advantage_bounds: list[dict] | None = None,
+    multi_turn_accounting: dict | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -746,6 +756,17 @@ def _build_verl_train_notes(
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
         "reward_bridge_batching": bool(reward_bridge_batching),
+        "host_census": copy.deepcopy(host_census or {}),
+        "rollout_identity_evidence": copy.deepcopy(
+            rollout_identity_evidence or {"steps": [], "validation": []}
+        ),
+        "advantage_spread_history": list(advantage_spread_history or []),
+        "advantage_bounds": copy.deepcopy(advantage_bounds or []),
+        # episode and turn totals for a multi-turn run; None for single-turn, which has no
+        # episode loop to account for. published in the durable notes rather than only on the
+        # heartbeat because this is the evidence that separates "multi-turn was configured" from
+        # "multi-turn actually iterated", and a one-turn collapse passes every other gate.
+        "multi_turn_accounting": copy.deepcopy(multi_turn_accounting),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],

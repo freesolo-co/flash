@@ -22,15 +22,14 @@ from flash._internal.fileio import reject_duplicate_keys
 from flash._internal.logging import get_logger
 from flash.adapters.artifacts import (
     ADAPTER_SHARD_PREFIX,
-    ADAPTER_WEIGHT_INDEX_FILES,
-    ADAPTER_WEIGHT_SUFFIXES,
     has_loadable_adapter_weights,
     is_adapter_weight_filename,
 )
 from flash.adapters.lora_rank import (
     DeclaredLoraRanks,
-    declared_lora_ranks,
+    _rank_for_module,
     lora_tensor_rank_disagrees,
+    strict_declared_lora_ranks,
 )
 from flash.serve.deploy import ServingError
 
@@ -48,7 +47,6 @@ _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 # namespaces only for a nonzero LoRA-B contribution or an unrecognized non-LM tensor; inert entries
 # alone do not prove those modules were trained.
 _NON_LM_KEY_SEGMENTS = (".visual.", ".vision_tower.", ".multi_modal_projector.", ".mtp.")
-_LANGUAGE_MODEL_INFIX_BYTES = b".language_model."
 
 
 def _references_non_lm_modules(key: str) -> bool:
@@ -117,16 +115,15 @@ _json_object_without_duplicate_keys = reject_duplicate_keys(
 class _WeightScan:
     """One adapter weight file: its tensor keys, and whatever pins it to the multimodal namespace.
 
-    `header`/`data_start` are set for safetensors only, and are what tells the rewrite phase which
-    of the two file shapes it is replacing. A safetensors header is key metadata, so holding every
-    shard's is cheap; a `.bin` state dict is the tensors themselves, so none is held at all.
+    the safetensors header is key metadata, so holding every shard's header is cheap while the
+    tensor payload stays on disk until the rewrite copies it.
     """
 
     path: Path
-    keys: tuple[str, ...] = ()
+    keys: tuple[str, ...]
+    header: dict[str, object]
+    data_start: int
     live_non_lm_key: str | None = None
-    header: dict[str, object] | None = None
-    data_start: int = 0
 
 
 @contextlib.contextmanager
@@ -153,58 +150,23 @@ def _atomic_replacement(path: Path) -> Iterator[IO[bytes]]:
 
 
 def _adapter_weight_paths(adapter_dir: Path) -> list[Path]:
-    """The weight files peft will actually load, single-file or sharded.
-
-    peft binds exactly one representation: safetensors when it is present and `.bin` otherwise, and
-    within a suffix the single `adapter_model.<ext>` over its shards. The worker uploads a retry's
-    adapter on top of the previous attempt's without deleting what it no longer writes, so a stale
-    representation can survive beside the live one. Reading both as a single key namespace fails a
-    good export on a key that collides with itself, or lets a stale non-LM tensor pin live text-only
-    weights to the multimodal namespace. Normalizing exactly what peft loads is what makes the
-    exported adapter match the one the user runs.
-    """
+    """the safetensors weight files peft will actually load, single-file or sharded."""
     if not adapter_dir.is_dir():
         return []
-    files = sorted(
+    candidates = sorted(
         p for p in adapter_dir.rglob("*") if p.is_file() and is_adapter_weight_filename(p.name)
     )
-    for suffix in ADAPTER_WEIGHT_SUFFIXES:
-        candidates = [p for p in files if p.name.endswith(suffix)]
-        if not candidates:
-            continue
-        single = [p for p in candidates if not p.name.startswith(ADAPTER_SHARD_PREFIX)]
-        if single:
-            return single
-        # Sharded: the index names the CURRENT shard set. A retry that changed the shard count
-        # uploads over the previous attempt without deleting what it no longer writes (see
-        # flash/engine/worker/io/hf.py), so same-suffix shards from both attempts coexist on disk
-        # and only the index distinguishes them. Scanning the stale ones would let a dead visual
-        # tensor pin the live text-only shards to the multimodal namespace, or collide a key with
-        # its own previous copy and refuse a good export.
-        active = _index_referenced_shards(adapter_dir, suffix, candidates)
-        if active:
-            return active
-        # No index, or one that names nothing readable. Shards without an index are not a
-        # representation peft can discover, so exporting them all would ship weights it loads as a
-        # no-op. Falling through to the next suffix is what makes a stale orphan shard beside a
-        # complete `.bin` export correctly, and returning [] when neither suffix resolves makes
-        # `_normalize_adapter_key_namespace` refuse -- the export failing is the only signal the
-        # user ever gets, since peft's own answer to mismatched keys is a UserWarning.
-        continue
-    return []
+    single = [p for p in candidates if not p.name.startswith(ADAPTER_SHARD_PREFIX)]
+    if single:
+        return single
+    # the index names the current shard set. a retry can leave same-suffix shards from a previous
+    # attempt beside the live ones, so scanning every shard could bind stale keys or false collisions.
+    return _index_referenced_shards(adapter_dir, candidates)
 
 
-def _weight_suffix_of(path: Path) -> str:
-    """The accepted weight suffix this file carries (`.safetensors` / `.bin`)."""
-    for suffix in ADAPTER_WEIGHT_SUFFIXES:
-        if path.name.endswith(suffix):
-            return suffix
-    raise ValueError(f"{path.name}: not an adapter weight file")
-
-
-def _index_referenced_shards(adapter_dir: Path, suffix: str, candidates: list[Path]) -> list[Path]:
-    """The shards this suffix's index actually points at, or [] when it names none we can read."""
-    index_path = adapter_dir / f"adapter_model{suffix}.index.json"
+def _index_referenced_shards(adapter_dir: Path, candidates: list[Path]) -> list[Path]:
+    """the shards the safetensors index points at, or [] when it names none we can read."""
+    index_path = adapter_dir / "adapter_model.safetensors.index.json"
     if not index_path.is_file():
         return []
     try:
@@ -214,10 +176,11 @@ def _index_referenced_shards(adapter_dir: Path, suffix: str, candidates: list[Pa
             return []
         referenced = {str(shard) for shard in weight_map.values()}
     except (OSError, ValueError):
-        # an unreadable index is not evidence about which shards are live; fall back to the whole
-        # candidate set, which _scan_* will then fail closed on if it cannot be parsed either.
         return []
-    return [p for p in candidates if p.name in referenced]
+    by_name = {path.name: path for path in candidates}
+    if not referenced or not referenced <= by_name.keys():
+        return []
+    return [by_name[name] for name in sorted(referenced)]
 
 
 def _read_safetensors_header(path: Path) -> tuple[dict[str, object], int, int]:
@@ -263,70 +226,6 @@ def _scan_safetensors(path: Path) -> _WeightScan:
     )
 
 
-def _bin_may_carry_infixed_keys(path: Path) -> bool:
-    """Cheap pre-check: does this `.bin` mention the infix at all?
-
-    torch stores state-dict keys as uncompressed strings inside the archive, so a raw byte scan
-    answers "could this need rewriting?" without importing torch, which the control plane does not
-    install (it is a `gpu` extra, not a `server` one). A `.bin` that never mentions the infix
-    has nothing to strip, so it stays a pass-through instead of failing an export that is fine.
-    """
-    overlap = len(_LANGUAGE_MODEL_INFIX_BYTES) - 1
-    tail = b""
-    with path.open("rb") as source:
-        while chunk := source.read(1 << 20):
-            if _LANGUAGE_MODEL_INFIX_BYTES in tail + chunk:
-                return True
-            tail = chunk[-overlap:]
-    return False
-
-
-def _torch_for(path: Path):
-    try:
-        import torch
-    except ImportError as exc:
-        raise ValueError(
-            f"{path.name} carries '.language_model.' keys that vanilla peft cannot load, and "
-            "torch is not installed here to rewrite them; re-save the adapter as safetensors "
-            "or install torch alongside the control plane"
-        ) from exc
-    return torch
-
-
-def _load_bin_state(path: Path) -> dict:
-    """The `.bin`'s tensor state dict, validated as the plain PEFT shape both phases assume."""
-    torch = _torch_for(path)
-    state = torch.load(str(path), map_location="cpu", weights_only=True)
-    if not isinstance(state, dict):
-        raise ValueError(f"{path.name}: expected a tensor state dict, got {type(state).__name__}")
-    bad = [k for k, v in state.items() if not isinstance(k, str) or not isinstance(v, torch.Tensor)]
-    if bad:
-        raise ValueError(
-            f"{path.name}: contains non-tensor entries (e.g. {bad[:4]}); expected a plain PEFT "
-            "adapter state dict"
-        )
-    return state
-
-
-def _scan_bin(path: Path) -> _WeightScan:
-    """Keys and liveness only: the tensors are dropped so peak memory is one shard, not their sum.
-
-    Sharding exists precisely because the combined weights are large, so holding every shard's
-    payload until the last rewrite finishes is what would OOM the export. `_rewrite_bin_keys`
-    reloads the one shard it is about to replace.
-    """
-    state = _load_bin_state(path)
-    live = next((key for key, tensor in state.items() if _tensor_is_live_non_lm(key, tensor)), None)
-    return _WeightScan(path=path, keys=tuple(state), live_non_lm_key=live)
-
-
-def _tensor_is_live_non_lm(key: str, tensor: object) -> bool:
-    if not _references_non_lm_modules(key):
-        return False
-    decided = _non_lm_liveness_from_key(key)
-    return bool(tensor.any()) if decided is None else decided  # type: ignore[attr-defined]
-
-
 def _plan_key_renames(scans: list[_WeightScan]) -> dict[str, str]:
     """Map every infixed key to its stripped form, refusing a rename that would shadow another key.
 
@@ -351,7 +250,7 @@ def _plan_key_renames(scans: list[_WeightScan]) -> dict[str, str]:
 
 
 def _rewrite_safetensors_keys(scan: _WeightScan, renames: dict[str, str]) -> None:
-    header = scan.header or {}
+    header = scan.header
     normalized = {
         (key if key == "__metadata__" else renames.get(key, key)): value
         for key, value in header.items()
@@ -366,54 +265,27 @@ def _rewrite_safetensors_keys(scan: _WeightScan, renames: dict[str, str]) -> Non
             shutil.copyfileobj(source, destination)
 
 
-def _rewrite_bin_keys(scan: _WeightScan, renames: dict[str, str]) -> None:
-    torch = _torch_for(scan.path)
-    state = {renames.get(key, key): value for key, value in _load_bin_state(scan.path).items()}
-    with _atomic_replacement(scan.path) as destination:
-        torch.save(state, destination)
-
-
-def _rewrite_weight_index_keys(adapter_dir: Path, renames: dict[str, str], suffix: str) -> None:
-    """Keep the selected representation's shard index in step with the shards it points at.
-
-    Scoped to ``suffix`` because only that representation's shards were rewritten. Remapping the
-    other suffix's index too would leave it naming keys its own (untouched) shards do not contain,
-    which is the same index/payload disagreement this function exists to prevent.
-    """
-    for name in ADAPTER_WEIGHT_INDEX_FILES:
-        if not name.startswith(f"adapter_model{suffix}."):
-            continue
-        path = adapter_dir / name
-        if not path.is_file():
-            continue
-        index = json.loads(path.read_text(encoding="utf-8"))
-        weight_map = index.get("weight_map") if isinstance(index, dict) else None
-        if not isinstance(weight_map, dict):
-            raise ValueError(f"{name}: no weight_map object to normalize")
-        index["weight_map"] = {renames.get(key, key): value for key, value in weight_map.items()}
-        path.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+def _rewrite_weight_index_keys(adapter_dir: Path, renames: dict[str, str]) -> None:
+    """keep the safetensors shard index in step with the shards it points at."""
+    path = adapter_dir / "adapter_model.safetensors.index.json"
+    if not path.is_file():
+        return
+    index = json.loads(path.read_text(encoding="utf-8"))
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
+    if not isinstance(weight_map, dict):
+        raise ValueError(f"{path.name}: no weight_map object to normalize")
+    index["weight_map"] = {renames.get(key, key): value for key, value in weight_map.items()}
+    path.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
 
 
 def _normalize_adapter_key_namespace(adapter_dir: Path) -> str:
     paths = _adapter_weight_paths(adapter_dir)
     if not paths:
-        raise ValueError("no adapter_model weight file to normalize")
-    if paths[0].name.endswith(".safetensors"):
-        scans = [_scan_safetensors(path) for path in paths]
-        # before any rewrite: the shapes are what they are, and an adapter whose tensors contradict
-        # its own config is unloadable regardless of which key namespace it ends up in.
-        _verify_export_tensor_ranks(adapter_dir, scans)
-    elif any(_bin_may_carry_infixed_keys(path) for path in paths):
-        # one shard mentioning the infix commits every shard to a full scan. liveness and
-        # post-rename collisions are properties of the union of the shards, so a shard that never
-        # mentions the infix still holds keys and tensors the plan has to see: skipping it strips
-        # the language-model shard despite a live non-LM weight elsewhere, or misses a cross-shard
-        # collision and collapses entries in the rewritten index. below that bar nothing can be
-        # renamed at all, so the `.bin` files stay unread and torch stays unimported, which the
-        # control plane needs (torch is a `gpu` extra, not a `server` one).
-        scans = [_scan_bin(path) for path in paths]
-    else:
-        return "text_only"
+        raise ValueError("no adapter_model safetensors weight file to normalize")
+    scans = [_scan_safetensors(path) for path in paths]
+    # before any rewrite: the shapes are what they are, and an adapter whose tensors contradict
+    # its own config is unloadable regardless of which key namespace it ends up in.
+    _verify_export_tensor_ranks(adapter_dir, scans)
     pinned = next((scan for scan in scans if scan.live_non_lm_key), None)
     if pinned is not None:
         logger.info(
@@ -427,17 +299,25 @@ def _normalize_adapter_key_namespace(adapter_dir: Path) -> str:
     if not renames:
         return "text_only"
     for scan in scans:
-        if not any(key in renames for key in scan.keys):
-            continue
-        if scan.header is not None:
+        if any(key in renames for key in scan.keys):
             _rewrite_safetensors_keys(scan, renames)
-        else:
-            _rewrite_bin_keys(scan, renames)
-    _rewrite_weight_index_keys(adapter_dir, renames, _weight_suffix_of(paths[0]))
+    _rewrite_weight_index_keys(adapter_dir, renames)
     logger.info(
         "normalized %d exported adapter weight keys across %d file(s)", len(renames), len(paths)
     )
     return "text_only"
+
+
+def _normalize_export_targeting(adapter_dir: Path, namespace: str) -> None:
+    """drop the conditional-model exclusion after text keys enter the causal-lm namespace."""
+    if namespace != "text_only":
+        return
+    path = adapter_dir / "adapter_config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict) or "exclude_modules" not in config:
+        return
+    config.pop("exclude_modules")
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
 def _normalize_export_adapter_keys(adapter_dir: Path) -> str:
@@ -485,7 +365,12 @@ def _declared_export_ranks(adapter_dir: Path) -> DeclaredLoraRanks:
         config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return DeclaredLoraRanks()
-    return declared_lora_ranks(config) if isinstance(config, dict) else DeclaredLoraRanks()
+    if not isinstance(config, dict):
+        return DeclaredLoraRanks()
+    try:
+        return strict_declared_lora_ranks(config)
+    except ValueError as exc:
+        raise _AdapterRankMismatch(str(exc)) from exc
 
 
 def _verify_export_tensor_ranks(adapter_dir: Path, scans: list[_WeightScan]) -> None:
@@ -501,20 +386,27 @@ def _verify_export_tensor_ranks(adapter_dir: Path, scans: list[_WeightScan]) -> 
     `lora_tensor_rank_disagrees` resolves the rank PER MODULE the way PEFT does, so a
     `rank_pattern` override is judged against its own rank rather than a summary of the config.
 
-    Only safetensors headers are read, because they carry shapes as metadata and are already parsed
-    here. A `.bin` would have to be loaded through torch, which the control plane does not install,
-    and paying that cost is not warranted for a representation the trainer no longer writes.
+    safetensors headers carry the shapes as metadata and are already parsed here, so validation does
+    not materialize tensor payloads or require the worker's gpu dependencies.
     """
     declared = _declared_export_ranks(adapter_dir)
-    if not declared:
-        return
+
+    def rank_is_invalid(key: str, descriptor: object) -> bool:
+        if not isinstance(descriptor, dict):
+            return False
+        infix = ".lora_A." if ".lora_A." in key else ".lora_B." if ".lora_B." in key else None
+        if infix is None:
+            return False
+        module = key.partition(infix)[0]
+        return _rank_for_module(module, declared) is None or lora_tensor_rank_disagrees(
+            key, descriptor.get("shape"), declared
+        )
+
     mismatched = [
         f"{key} has shape {descriptor.get('shape')}"
         for scan in scans
-        for key, descriptor in (scan.header or {}).items()
-        if key != "__metadata__"
-        and isinstance(descriptor, dict)
-        and lora_tensor_rank_disagrees(key, descriptor.get("shape"), declared)
+        for key, descriptor in scan.header.items()
+        if key != "__metadata__" and rank_is_invalid(key, descriptor)
     ]
     if not mismatched:
         return
@@ -663,6 +555,7 @@ def export_adapter(
             )
         _repair_export_metadata(adapter_dir, base_model, base_model_revision)
         namespace = _normalize_export_adapter_keys(adapter_dir)
+        _normalize_export_targeting(adapter_dir, namespace)
         api = HfApi(token=dest_token)
         try:
             # Always create private first so the repo is never transiently exposed empty/partial.

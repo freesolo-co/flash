@@ -50,7 +50,10 @@ def validate_start_media(
 
 
 def normalize_initial_prompt(prompt, state: dict, processor) -> tuple[list[dict], tuple[str, ...]]:
-    initial_messages = state.get("prompt") or state.get("messages")
+    # the INITIAL prefix, so `prompt` only: `new_rollout_state` seeds `messages` with a copy of it
+    # and appends every turn, so falling back to `messages` normalizes the growing transcript
+    # against the frozen prompt's media and mismatches its digests once a turn lands.
+    initial_messages = state.get("prompt")
     if processor is not None or prompt.image_descriptors:
         normalized = normalize_prompt_images(
             prompt.example,

@@ -24,12 +24,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pytest
+from safetensors.numpy import save
 
 from flash.engine.worker import backend_common as vc
 from flash.engine.worker import rl_train
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
 from flash.engine.worker.train.core.child import runtime as child_runtime
+
+# the stamp reads the run's modality off `exclude_modules`: the language-prefix regex for a
+# text-only run, None for a multimodal one. these artifacts are text-only.
+_TEXT_ONLY_EXCLUDE = r"^(?!model\.language_model(?:\.|$)).*$"
 
 # several tests below drive real subprocesses that import flash from a checkout, not from the venv.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -290,20 +296,35 @@ def test_resolve_verl_loggers_treats_an_unanswerable_probe_as_no_wandb(monkeypat
 
 def test_stamp_adapter_dir_provenance_sets_base_and_revision(tmp_path):
     cfg = tmp_path / "adapter_config.json"
-    cfg.write_text(json.dumps({"base_model_name_or_path": None, "r": 16}))
-    vc.stamp_adapter_dir_provenance(str(tmp_path), "org/model", "deadbeef")
+    cfg.write_text(
+        json.dumps({"base_model_name_or_path": None, "r": 1, "target_modules": ["q_proj"]})
+    )
+    prefix = "base_model.model.layers.0.self_attn.q_proj"
+    (tmp_path / "adapter_model.safetensors").write_bytes(
+        save(
+            {
+                f"{prefix}.lora_A.weight": np.ones((1, 2), dtype=np.float16),
+                f"{prefix}.lora_B.weight": np.ones((2, 1), dtype=np.float16),
+            }
+        )
+    )
+    vc.stamp_adapter_dir_provenance(
+        str(tmp_path), "org/model", "deadbeef", exclude_modules=_TEXT_ONLY_EXCLUDE
+    )
     out = json.loads(cfg.read_text())
     assert out["base_model_name_or_path"] == "org/model"
     assert out["revision"] == "deadbeef"
     # untouched fields survive the stamp.
-    assert out["r"] == 16
+    assert out["r"] == 1
 
 
 def test_stamp_adapter_dir_provenance_rejects_base_mismatch(tmp_path):
     cfg = tmp_path / "adapter_config.json"
     cfg.write_text(json.dumps({"base_model_name_or_path": "org/other"}))
     with pytest.raises(RuntimeError, match="does not match validated target"):
-        vc.stamp_adapter_dir_provenance(str(tmp_path), "org/model")
+        vc.stamp_adapter_dir_provenance(
+            str(tmp_path), "org/model", exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
 
 
 def test_resolve_verl_python_prefers_preset(monkeypatch, tmp_path):
@@ -3257,9 +3278,11 @@ def test_the_grpo_success_path_drains_stragglers_too():
     """`kill_process_group` runs on exceptions alone in the grpo loop, so without a drain on the
     ordinary exit a worker whose later jobs all SUCCEED keeps a straggler zombie for life.
     """
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    finally_block = src[src.rindex("finally:") :]
-    assert "reap_stragglers()" in finally_block, (
+    entry = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    teardown = " ".join(inspect.getsource(rl_train._shutdown_rl_runtime).split())
+    finally_block = entry[entry.rindex("finally:") :]
+    assert "_shutdown_rl_runtime(" in finally_block
+    assert "reap_stragglers()" in teardown, (
         "the grpo teardown collects stragglers only when the run FAILS"
     )
 

@@ -119,6 +119,7 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         f"actor_rollout_ref.model.lora_rank={_hydra_val(config['lora_rank'])}",
         f"actor_rollout_ref.model.lora_alpha={_hydra_val(config['lora_alpha'])}",
         f"actor_rollout_ref.model.target_modules={_hydra_val(config['target_modules'])}",
+        f"actor_rollout_ref.model.exclude_modules={_hydra_val(config.get('exclude_modules'))}",
         *(
             [
                 "++actor_rollout_ref.model.target_parameters="
@@ -349,6 +350,7 @@ def _build_opd_plugin_config(
     total_steps: int,
     gdn_model_type: str | None,
     loggers,
+    lora_language_prefix: str = "",
 ) -> str:
     """serialize the non-secret OPD runtime patch configuration."""
     return json.dumps(
@@ -357,6 +359,7 @@ def _build_opd_plugin_config(
             "no_signal_attempts": OPD_NO_SIGNAL_ATTEMPTS,
             "save_at_steps": list(save_at_steps),
             "total_steps": int(total_steps),
+            **({"lora_language_prefix": lora_language_prefix} if lora_language_prefix else {}),
             "gdn_model_type": gdn_model_type,
             "wandb": "wandb" in loggers,
         },

@@ -324,7 +324,6 @@ _REWARD_METRIC_RESERVED_NAMES = frozenset(
         "learning_rate",
         "stage",
         "gpu",
-        "diag",
     }
 )
 _REWARD_METRIC_LIMIT = 12

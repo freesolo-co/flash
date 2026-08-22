@@ -15,7 +15,7 @@ import pytest
 from tests._helpers.runner import provisioned_status
 from tests._helpers.source_snapshot import valid_source_snapshot
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
@@ -104,6 +104,195 @@ def test_job_handle_roundtrip_and_rejects_legacy_shapes():
             JobHandle.from_dict(legacy)
     with pytest.raises(ValueError, match="attempt identity is invalid"):
         JobHandle.from_dict({**valid, "attempt": "2"})
+
+
+def test_strict_teardown_uses_valid_runpod_owner_without_inventory(monkeypatch):
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as runpod_api
+    from flash.runner.supervise import lifecycle
+
+    fingerprint = "rpk-" + "a" * 64
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep-direct",
+            "endpoint_name": "flash-direct",
+            "key_fingerprint": fingerprint,
+            "job_id": "job-direct",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", lambda value: "owner-key")
+    cancelled = []
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda endpoint_id, job_id, **_kwargs: (
+            cancelled.append((endpoint_id, job_id)) or {"id": job_id, "status": "CANCELLED"}
+        ),
+    )
+    deleted = []
+
+    def delete_endpoint(endpoint_id, owner):
+        deleted.append((endpoint_id, runpod_api._key_for_fingerprint(owner)))
+        return True
+
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
+    monkeypatch.setattr(
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: pytest.fail("valid owner must not inventory other accounts"),
+    )
+
+    assert lifecycle._strict_teardown_handle(handle, "run-direct") is True
+    assert cancelled == [("ep-direct", "job-direct")]
+    assert deleted == [("ep-direct", "owner-key")]
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    [
+        pytest.param("rpk-" + "a" * 12, id="legacy-16-character"),
+        pytest.param(None, id="missing"),
+        pytest.param("", id="empty"),
+        pytest.param("corrupt", id="corrupt"),
+    ],
+)
+def test_strict_teardown_discovers_runpod_owner_for_invalid_fingerprint(monkeypatch, fingerprint):
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as runpod_api
+    from flash.runner.supervise import lifecycle
+
+    owner_fingerprint = "rpk-" + "b" * 64
+    data = {
+        "provider": "runpod",
+        "endpoint_id": "ep-discovered",
+        "endpoint_name": "flash-discovered",
+        "job_id": "job-discovered",
+        "attempt": 0,
+        "started_ts": 1.0,
+    }
+    if fingerprint is not None:
+        data["key_fingerprint"] = fingerprint
+    handle = JobHandle.from_dict(data)
+
+    def resolve(value):
+        if value == owner_fingerprint:
+            return "discovered-owner-key"
+        raise runpod_api.RunpodApiError("unresolvable fingerprint")
+
+    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", resolve)
+    monkeypatch.setattr(
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: (
+            {owner_fingerprint: [{"id": "ep-discovered", "name": "flash-discovered"}]},
+            [],
+        ),
+    )
+    deleted = []
+
+    def delete_endpoint(endpoint_id, owner):
+        deleted.append((endpoint_id, runpod_api._key_for_fingerprint(owner)))
+        return True
+
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
+
+    assert lifecycle._strict_teardown_handle(handle, "run-discovered") is True
+    assert deleted == [("ep-discovered", "discovered-owner-key")]
+
+
+def test_strict_teardown_keeps_runpod_record_when_no_configured_account_owns_it(monkeypatch):
+    """An inventory over the CONFIGURED keys cannot prove an endpoint is gone.
+
+    this path runs only when the persisted fingerprint did not resolve, so the owning credential
+    may simply have been removed from `RUNPOD_API_KEY`. "none of my accounts list it" is then
+    indistinguishable from "it was deleted", and reporting deletion would let the caller drop the
+    cleanup record while an unreachable endpoint keeps billing. refuse instead, so the record
+    survives for a drain that may have the owning key configured again.
+    """
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as runpod_api
+    from flash.runner.supervise import lifecycle
+
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep-gone",
+            "endpoint_name": "flash-gone",
+            "key_fingerprint": "legacy-owner",
+            "job_id": "job-gone",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "_key_for_fingerprint",
+        lambda _value: (_ for _ in ()).throw(runpod_api.RunpodApiError("unresolvable")),
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: ({"rpk-" + "a" * 64: []}, []),
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *_args: pytest.fail("an absent endpoint must not be deleted blindly"),
+    )
+
+    with pytest.raises(RuntimeError, match="endpoint deletion could not be confirmed") as exc_info:
+        lifecycle._strict_teardown_handle(handle, "run-gone")
+    assert "no reachable owner account" in str(exc_info.value.__cause__)
+
+
+@pytest.mark.parametrize("mode", ["incomplete", "multiple-owners"])
+def test_strict_teardown_rejects_unconfirmed_runpod_owner_discovery(monkeypatch, mode):
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as runpod_api
+    from flash.runner.supervise import lifecycle
+
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep-ambiguous",
+            "endpoint_name": "flash-ambiguous",
+            "key_fingerprint": "legacy-owner",
+            "job_id": "job-ambiguous",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "_key_for_fingerprint",
+        lambda _value: (_ for _ in ()).throw(runpod_api.RunpodApiError("unresolvable")),
+    )
+    owner_a = "rpk-" + "a" * 64
+    owner_b = "rpk-" + "b" * 64
+    inventory = (
+        ({owner_a: []}, [owner_b])
+        if mode == "incomplete"
+        else (
+            {
+                owner_a: [{"id": "ep-ambiguous"}],
+                owner_b: [{"id": "ep-ambiguous"}],
+            },
+            [],
+        )
+    )
+    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", lambda **_kwargs: inventory)
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *_args: pytest.fail("ambiguous ownership must not delete"),
+    )
+
+    with pytest.raises(RuntimeError, match="endpoint deletion could not be confirmed") as exc_info:
+        lifecycle._strict_teardown_handle(handle, "run-ambiguous")
+    assert "cleanup unconfirmed" in str(exc_info.value.__cause__)
 
 
 def test_decode_output_success():
@@ -2952,6 +3141,10 @@ def _adapter_config(*, rank=32, alpha=64):
         "base_model_name_or_path": "Qwen/Qwen3.5-0.8B",
         "r": rank,
         "lora_alpha": alpha,
+        # peft>=0.19 writes this on every save, so a config without it is not a shape any supported
+        # writer produces -- and submit rejects an unmarked adapter outright. these cases are about
+        # ref/rank/pin handling, so they need the marker a real source adapter carries.
+        "exclude_modules": None,
     }
 
 
@@ -3608,6 +3801,7 @@ def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypa
                 effective_preparation={
                     "worker_spec": worker_spec.to_internal_dict(),
                     "adapter_identity": identity.to_dict(),
+                    "version": 1,
                     "preparation_digest": orch._preparation_digest(
                         public_spec, worker_spec, identity.to_dict()
                     ),
@@ -3702,6 +3896,7 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
                 effective_preparation={
                     "worker_spec": worker_spec.to_internal_dict(),
                     "adapter_identity": identity.to_dict(),
+                    "version": 1,
                     "preparation_digest": orch._preparation_digest(
                         public_spec, worker_spec, identity.to_dict()
                     ),
@@ -3790,6 +3985,7 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
                 effective_preparation={
                     "worker_spec": worker_dict,
                     "adapter_identity": original_identity,
+                    "version": 1,
                     "preparation_digest": orch._preparation_digest(
                         public_spec, worker_spec, original_identity
                     ),
@@ -4207,13 +4403,12 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         # the hourly rate. The two agree only when the step is compute-bound. This spec retains one
         # prompt, so the step is latency-bound and a faster card can finish it for less despite a
         # higher hourly rate; asserting sorted hourly rates would pin the wrong invariant.
-        from flash.cost.facts import gpu_hourly_usd
-        from flash.providers.base import _run_cost_key
+        from flash.providers.base import GPU_INFO, _run_cost_key
 
         cost_key = _run_cost_key(
             "Qwen/Qwen3.5-0.8B", "grpo", train={"epochs": 1, "max_examples": 1}
         )
-        step_costs = [cost_key(g, gpu_hourly_usd(g)) for g in gpus_seen]
+        step_costs = [cost_key(gpu, GPU_INFO[gpu].hourly_usd) for gpu in gpus_seen]
         assert step_costs == sorted(step_costs)
         # and the first attempt is the cheapest per step among the classes that fit.
         assert step_costs[0] == min(step_costs)
@@ -4737,6 +4932,7 @@ def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):
                 effective_preparation={
                     "worker_spec": worker_dict,
                     "adapter_identity": identity,
+                    "version": 1,
                     "preparation_digest": orch._preparation_digest(
                         public_spec, worker_spec, identity
                     ),

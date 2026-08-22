@@ -616,11 +616,18 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         assert captured.get("use_rslora") is False
         assert captured.get("revision") == "a" * 40
         assert "target_parameters" not in captured
+        assert captured["exclude_modules"] == r"^(?!model\.language_model(?:\.|$)).*$"
+
+    captured.clear()
+    worker.make_lora("Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=True)
+    assert captured["target_modules"] == "all-linear"
+    assert captured["exclude_modules"] is None
 
     captured.clear()
     worker.make_lora("Qwen/Qwen3.6-35B-A3B")
     assert captured["r"] == 32
     assert captured["target_modules"] == "all-linear"
+    assert captured["exclude_modules"] == r"^(?!model\.language_model(?:\.|$)).*$"
     assert captured["target_parameters"] == [
         "mlp.experts.gate_up_proj",
         "mlp.experts.down_proj",
@@ -1331,11 +1338,6 @@ def _compile_so(c_path, so_path, src):
     with open(c_path, "w") as f:
         f.write(src)
     return subprocess.run([cc, "-shared", "-fPIC", "-o", so_path, c_path]).returncode == 0
-
-
-def _maps_has(name):
-    with open("/proc/self/maps") as f:
-        return any(name in line for line in f)
 
 
 def test_find_real_libcudart_handles_bare_soname_without_crashing(monkeypatch):

@@ -287,6 +287,24 @@ def _episode_turn_rewards(score_payload, turn_spans):
     return None
 
 
+async def _score_episode(self, bridge_post, bridge_url, session_id, episode, identity):
+    score_payload = await run_executor_call(
+        self.loop,
+        lambda: bridge_post(
+            bridge_url,
+            "/multiturn/score",
+            # use the turns the env was told about, not generated turns: an aborted turn is never
+            # recorded into env state, so the env cannot return a reward for it.
+            {
+                "session_id": session_id,
+                "turn_count": len(episode.turn_spans),
+                "identity": dict(identity),
+            },
+        ),
+    )
+    return float(score_payload["score"]), _episode_turn_rewards(score_payload, episode.turn_spans)
+
+
 def _close_reply_images(images) -> None:
     for image in images:
         with contextlib.suppress(Exception):
@@ -409,6 +427,10 @@ async def _grpo_run(
     settings = _EpisodeSettings()
     bridge_url = settings.bridge_url
     example_index = int(kwargs["index"])
+    identity = kwargs.get("flash_rollout_identity")
+    if not isinstance(identity, dict):
+        raise RuntimeError("flash multi-turn rollout is missing its completion identity")
+    identity = dict(identity)
     glue_processor = EnvGlueProcessor(self, thinking=settings.thinking)
     session_id = uuid4().hex
 
@@ -433,6 +455,7 @@ async def _grpo_run(
                     "session_id": session_id,
                     "raw_prompt": prompt.structured_messages,
                     "prompt_ids": prompt_ids,
+                    "identity": dict(identity),
                     "image_count": prompt.image_count(),
                     "image_digests": list(prompt.image_digests),
                 },
@@ -452,20 +475,9 @@ async def _grpo_run(
             bridge_post=bridge_post,
             turn_limit=turn_limit,
         )
-        score_payload = await run_executor_call(
-            self.loop,
-            lambda: bridge_post(
-                bridge_url,
-                "/multiturn/score",
-                # the count the ENV was told about, not `turn_count`: an aborted turn is
-                # generated (and counted in num_turns) but never recorded into env state,
-                # so asking for a reward per generated turn would request one the env has
-                # no turn for. len(turn_spans) is the same quantity trl scores on.
-                {"session_id": session_id, "turn_count": len(episode.turn_spans)},
-            ),
+        reward_score, turn_rewards = await _score_episode(
+            self, bridge_post, bridge_url, session_id, episode, identity
         )
-        reward_score = float(score_payload["score"])
-        turn_rewards = _episode_turn_rewards(score_payload, episode.turn_spans)
     finally:
         if start_attempted:
             # best effort: a failing close would mask the real error from the body above,

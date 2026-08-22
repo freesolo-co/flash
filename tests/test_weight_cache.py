@@ -18,7 +18,7 @@ from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.source_snapshot import valid_source_snapshot
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
@@ -778,6 +778,7 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
                 effective_preparation={
                     "worker_spec": public.to_internal_dict(),  # committed WITH the shared cache
                     "adapter_identity": None,
+                    "version": 1,
                     "preparation_digest": "seed",
                 },
             )
@@ -816,6 +817,7 @@ def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
                 effective_preparation={
                     "worker_spec": committed.to_internal_dict(),  # committed WITH the custom volume
                     "adapter_identity": None,
+                    "version": 1,
                     "preparation_digest": "seed",
                 },
             )
