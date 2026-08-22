@@ -495,7 +495,7 @@ def export_peft_adapter(
         shutil.rmtree(merge_out, ignore_errors=True)
 
 
-# bare `lora_A.weight` ONLY, deliberately. this validates the verl merger's output at the export
+# bare `lora_A.weight` only, deliberately. this validates the verl merger's output at the export
 # boundary, and that producer always strips the adapter name, so a namespaced key here means the
 # directory holds something the merger did not write. the fused validator accepts both because it
 # also runs at the warm-start boundary over previously published adapters.
@@ -691,7 +691,7 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
     language_keys = {
         module: (factors["A"], factors["B"]) for module, factors in language_pairs.items()
     }
-    # the nonzero-delta requirement is discharged by the LANGUAGE subset. presence alone (checked
+    # the nonzero-delta requirement is discharged by the language subset. presence alone (checked
     # above) does not mean the text stack trained: a vision-only delta would otherwise satisfy it
     # and publish a paid run that serves as a text model with no learned text delta.
     _validate_adapter_tensor_values(
