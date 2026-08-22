@@ -503,14 +503,16 @@ def resolve_gpu_mem_util(
 ) -> float:
     """size vllm's colocated executor budget from this run's geometry.
 
-    ``gpu_memory_utilization`` covers the second bf16 weight copy plus kv pool. using
+    ``gpu_memory_utilization`` covers the second bf16 weight copy, lora adapter, and kv pool. using
     ``colocate_kv_util`` keeps worker allocation aligned with preflight admission.
 
-    for multi-gpu runs, vllm shards its bf16 weight copy and lora adapter across tensor-parallel
-    ranks. the kv term remains unsharded here because vllm can replicate kv heads when tensor
-    parallelism is wider than the model's kv-head count. the adapter shard is kept outside vllm's
-    reservation, and the result is explicitly capped at the old 0.5 constant, so this path can only
-    lower a rank's reservation and cannot create a new over-reservation.
+    for multi-gpu runs, vllm shards its bf16 weight copy across tensor-parallel ranks. its default
+    lora layout shards only one factor of each projection's a/b pair, so the rank-local adapter uses
+    the larger safe orientation from catalog geometry rather than dividing the full adapter evenly.
+    the kv term remains unsharded here because vllm can replicate kv heads when tensor parallelism is
+    wider than the model's kv-head count. the adapter lives inside vllm's reservation, and the result
+    is explicitly capped at the old 0.5 constant, so this path can only lower a rank's reservation
+    and cannot create a new over-reservation.
 
     the flat constant is kept where the model does not apply, because a wrong number is worse than
     a conservative one:
@@ -525,11 +527,7 @@ def resolve_gpu_mem_util(
         return _DEFAULT_GPU_MEM_UTIL
     try:
         from flash.core.catalog import MODELS
-        from flash.engine.plan.vram import (
-            _lora_weight_memory_gb,
-            colocate_kv_util,
-            resolve_params_b,
-        )
+        from flash.engine.plan.vram import colocate_kv_util, resolve_params_b
         from flash.providers.base import get_gpu_info
 
         total_vram_gb = float(get_gpu_info(gpu_type).vram_gb)
@@ -554,11 +552,6 @@ def resolve_gpu_mem_util(
         )
         if params_b <= 0:
             return _DEFAULT_GPU_MEM_UTIL
-        lora_adapter_gb = _lora_weight_memory_gb(int(inp["lora_rank"]), info)
-        if lora_adapter_gb is None:
-            # pinned and uncataloged models have no verified target geometry. preserve the current
-            # conservative budget rather than inventing an adapter footprint.
-            lora_adapter_gb = 0.0
         sized = colocate_kv_util(
             params_b,
             int(inp["engine_len"]),
@@ -574,7 +567,7 @@ def resolve_gpu_mem_util(
             model_info=info,
             preserve_legacy_floor=preserve_legacy_floor,
             tensor_parallel=n_gpus,
-            lora_adapter_gb=lora_adapter_gb,
+            lora_rank=int(inp["lora_rank"]),
         )
         # multi-rank sizing is strictly one-directional against the previous worker contract: it may
         # free memory but can never claim more than the flat reservation a working run already used.

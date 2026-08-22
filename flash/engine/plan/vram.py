@@ -129,21 +129,30 @@ def _legacy_lora_floor_gb(lora_rank: int, effective_params_b: float) -> float:
     return (lora_rank / 16.0) * (0.3 + 0.04 * effective_params_b)
 
 
-def _lora_parameter_count(lora_rank: int, model_info=None) -> int | None:
-    """exact trainable lora parameters from the catalog's concrete target geometry."""
+def _lora_parameter_count(
+    lora_rank: int, model_info=None, *, tensor_parallel: int = 1
+) -> int | None:
+    """lora parameters resident on one tensor-parallel rank from concrete target geometry."""
     shapes = tuple(getattr(model_info, "lora_target_shapes", ()) or ())
-    if not shapes or int(lora_rank) <= 0:
+    rank = int(lora_rank)
+    if not shapes or rank <= 0:
         return None
-    target_dims = sum(
-        (int(in_features) + int(out_features)) * int(count)
-        for in_features, out_features, count in shapes
+    tp_size = max(1, int(tensor_parallel))
+    if tp_size == 1:
+        return rank * sum((int(i) + int(o)) * int(count) for i, o, count in shapes)
+    # default tp partitions only one a/b factor. keep the larger factor replicated and shard the
+    # smaller one, taking the safe orientation and rounding each grouped shape up.
+    return sum(
+        math.ceil(rank * int(count) * (max(int(i), int(o)) + min(int(i), int(o)) / tp_size))
+        for i, o, count in shapes
     )
-    return int(lora_rank) * target_dims
 
 
-def _lora_weight_memory_gb(lora_rank: int, model_info=None) -> float | None:
-    """resident bf16 lora weights, or none when catalog target geometry is unavailable."""
-    params = _lora_parameter_count(lora_rank, model_info)
+def _lora_weight_memory_gb(
+    lora_rank: int, model_info=None, *, tensor_parallel: int = 1
+) -> float | None:
+    """rank-local resident bf16 lora weights, or none without catalog target geometry."""
+    params = _lora_parameter_count(lora_rank, model_info, tensor_parallel=tensor_parallel)
     return None if params is None else params * _BYTES_PER_PARAM["bf16"] / 1e9
 
 

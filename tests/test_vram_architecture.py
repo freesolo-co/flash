@@ -71,6 +71,20 @@ def test_qwen36_moe_lora_footprint_matches_fused_expert_geometry(
     assert _lora_weight_memory_gb(rank, info) == pytest.approx(expected_bf16_gb)
 
 
+def test_qwen36_moe_tp2_lora_footprint_keeps_one_projection_factor_replicated():
+    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    full_params = _lora_parameter_count(64, info)
+    rank_params = _lora_parameter_count(64, info, tensor_parallel=2)
+
+    # across the catalog shapes, 2.778560512b parameters belong to the larger projection factors and
+    # 1.034152448b to the smaller ones. vllm default tp keeps the former replicated and halves only
+    # the latter: 2.778560512b + 1.034152448b / 2 = 3.295636736b parameters on each rank.
+    assert full_params == 3_812_712_960
+    assert rank_params == 3_295_636_736
+    assert rank_params > full_params / 2
+    assert _lora_weight_memory_gb(64, info, tensor_parallel=2) == pytest.approx(6.591273472)
+
+
 @pytest.mark.parametrize("model_id", tuple(MODELS))
 def test_shape_sizing_keeps_the_measured_lora_floor(model_id: str):
     info = MODELS[model_id]

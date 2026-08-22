@@ -132,6 +132,26 @@ def _colocate_util_cap(weights_gb: float, total_vram_gb: float) -> float:
     return 0.55 if (big_weight_copy and leaves_room_for_trainer_copy) else 0.45
 
 
+def _capped_engine_util(
+    weights_gb: float,
+    adapter_gb: float,
+    requested_kv_gb: float,
+    total_vram_gb: float,
+    util_cap: float,
+) -> float:
+    """Fit weights, adapter, then KV into vllm's capped share of one card."""
+    card_gb = max(1.0, total_vram_gb)
+    max_engine_gb = util_cap * card_gb
+    # gpu_memory_utilization is vllm's whole allocation, and its lora weights live inside it. reserve
+    # weights plus adapter first; only a cap collision may reduce the requested kv pool. spelling out
+    # fitted_kv_gb makes that loss visible instead of incidentally subtracting adapter bytes from a
+    # weights-plus-kv fraction. if weights plus adapter alone exceed the cap, kv reaches zero and the
+    # returned cap truthfully exposes that this engine shape has no viable cache budget.
+    fitted_kv_gb = max(0.0, min(requested_kv_gb, max_engine_gb - weights_gb - adapter_gb))
+    fitted_engine_gb = weights_gb + adapter_gb + fitted_kv_gb
+    return min(util_cap, fitted_engine_gb / card_gb)
+
+
 def colocate_kv_util(
     params_b: float | None,
     vllm_max_len: int,
@@ -143,17 +163,19 @@ def colocate_kv_util(
     model_info=None,
     preserve_legacy_floor: bool = False,
     tensor_parallel: int = 1,
-    lora_adapter_gb: float = 0.0,
+    lora_rank: int = 0,
 ) -> float:
     """vllm_gpu_memory_utilization for one colocated rollout tensor-parallel rank.
 
-    budget the rank's weight shard plus a conservative full kv cache, then leave the rank's bf16
-    lora shard outside vllm's reservation. catalog models use geometry with measured overhead and an
-    8 gb floor; uncataloged models retain the legacy kv equation and no unverified adapter margin.
+    budget the rank's weight shard, rank-local bf16 lora footprint, and conservative full kv cache.
+    catalog models use geometry with measured overhead and an 8 gb floor; uncataloged models retain
+    the legacy kv equation and no unverified adapter margin.
     """
+    from flash.engine.plan.vram import _lora_weight_memory_gb
+
     total_weights_gb = max(0.5, float(params_b or 1.0)) * 2.0
     tp_size = max(1, int(tensor_parallel))
-    adapter_util = max(0.0, float(lora_adapter_gb or 0.0)) / tp_size / max(1.0, total_vram_gb)
+    adapter_gb = _lora_weight_memory_gb(lora_rank, model_info, tensor_parallel=tp_size) or 0.0
     # tensor parallelism shards vllm's bf16 weights, but kv heads can replicate when tp is wider than
     # the model's kv-head count. shard only the weight term and keep the full kv budget on every rank.
     weights_gb = total_weights_gb if tp_size == 1 else total_weights_gb / tp_size
@@ -165,7 +187,7 @@ def colocate_kv_util(
     # but not H200. `_NvidiaSmiPeakSampler` verifies runtime headroom.
     _util_cap = _colocate_util_cap(weights_gb, total_vram_gb)
     if not sleep_mode:
-        # `gpu_memory_utilization` covers weights plus KV, so budget both. scale KV with
+        # `gpu_memory_utilization` covers weights, adapter, and kv, so budget all three. scale kv with
         # context and group, floor at `_KV_CAP`, and keep the 0.45 cap aligned with
         # `estimate_vram_gb(..., sleep_offload=False)`.
         kv_gb = max(
@@ -179,8 +201,8 @@ def colocate_kv_util(
                 preserve_legacy_floor=preserve_legacy_floor,
             ),
         )
-        sized = min(_util_cap, (weights_gb + kv_gb) / max(1.0, total_vram_gb))
-        return max(_MIN_ENGINE_UTIL, sized - adapter_util)
+        sized = _capped_engine_util(weights_gb, adapter_gb, kv_gb, total_vram_gb, _util_cap)
+        return max(_MIN_ENGINE_UTIL, sized)
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
     # bigger rollout-phase KV does not compete with the training peak.
     kv_pool_gb = max(
@@ -195,7 +217,7 @@ def colocate_kv_util(
             preserve_legacy_floor=preserve_legacy_floor,
         ),
     )
-    sized = min(_util_cap, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb)) - adapter_util
+    sized = _capped_engine_util(weights_gb, adapter_gb, kv_pool_gb, total_vram_gb, _util_cap)
     # sharding the weight term can drive a small model's rank budget low enough that vllm has no
     # room left for its own runtime once the kv pool is carved out -- a 4B model on 2 cards prices
     # under this floor. single-rank sizing carries the whole weight copy and never gets that small,

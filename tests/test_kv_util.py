@@ -1,9 +1,9 @@
 """CPU test for ``colocate_kv_util`` — the need-based vLLM KV-pool utilization for colocated GRPO.
 
-``gpu_memory_utilization`` is vLLM's whole model-executor budget (weights + KV), so the helper budgets
-both, scales the KV with context + the generation group, and caps the utilization at 0.45 (lifted to
-0.55 only for the big-card + big-weight colocate regime, e.g. the 35B MoE on a 180 GB B200, where the
-flat 0.45 demonstrably starved the KV pool).
+``gpu_memory_utilization`` is vLLM's whole model-executor budget (weights + adapter + KV), so the
+helper budgets all three, scales the KV with context + the generation group, and caps utilization at
+0.45 (lifted to 0.55 only for the big-card + big-weight colocate regime, e.g. the 35B MoE on a 180 GB
+B200, where the flat 0.45 demonstrably starved the KV pool).
 """
 
 from __future__ import annotations
@@ -124,6 +124,56 @@ def test_non_sleep_kv_scales_with_long_context():
     assert long > short
 
 
+@pytest.mark.parametrize(("sleep_mode", "expected_kv_gb"), [(False, 8.0), (True, 12.0)])
+def test_lora_is_added_beside_the_requested_kv_pool_when_the_engine_fits(
+    sleep_mode: bool, expected_kv_gb: float
+):
+    from flash.engine.plan.vram import _lora_weight_memory_gb
+
+    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    adapter_gb = _lora_weight_memory_gb(64, info, tensor_parallel=2)
+    util = colocate_kv_util(
+        info.params_b,
+        2048,
+        180.0,
+        sleep_mode=sleep_mode,
+        num_generations=4,
+        active_params_b=info.active_params_b,
+        model_info=info,
+        tensor_parallel=2,
+        lora_rank=64,
+    )
+
+    assert adapter_gb == pytest.approx(6.591273472)
+    # the adapter lives inside vllm but beside, not instead of, its requested kv pool.
+    assert util * 180.0 == pytest.approx(35.0 + adapter_gb + expected_kv_gb)
+    assert util * 180.0 - 35.0 - adapter_gb == pytest.approx(expected_kv_gb)
+
+
+def test_lora_reduces_kv_only_when_the_explicit_engine_cap_binds():
+    from flash.engine.plan.vram import _lora_weight_memory_gb
+
+    info = MODELS["Qwen/Qwen3.5-4B"]
+    card_gb = 32.0
+    adapter_gb = _lora_weight_memory_gb(128, info)
+    requested_kv_gb = 12.0
+    util = colocate_kv_util(
+        info.params_b,
+        2048,
+        card_gb,
+        sleep_mode=True,
+        num_generations=8,
+        model_info=info,
+        lora_rank=128,
+    )
+
+    assert adapter_gb == pytest.approx(0.62390272)
+    assert util == 0.45
+    fitted_kv_gb = util * card_gb - info.params_b * 2.0 - adapter_gb
+    assert fitted_kv_gb == pytest.approx(0.45 * card_gb - 9.4 - adapter_gb)
+    assert 0.0 < fitted_kv_gb < requested_kv_gb
+
+
 def test_non_sleep_bigger_model_gets_a_bigger_budget():
     # the weight copy lives in the non-sleep budget too, so a bigger model gets more headroom.
     big = colocate_kv_util(4.0, 2048, 80.0, sleep_mode=False)
@@ -176,6 +226,20 @@ def test_grpo_kv_floor_searches_lifted_cap_transition():
 def test_robust_to_missing_params_and_zero_context():
     u = colocate_kv_util(None, 0, 80.0, sleep_mode=True, num_generations=8)
     assert 0.0 < u <= 0.45
+
+
+@pytest.mark.parametrize("sleep_mode", [False, True])
+def test_multirank_engine_util_keeps_the_minimum_floor(sleep_mode: bool):
+    util = colocate_kv_util(
+        0.8,
+        1,
+        1000.0,
+        sleep_mode=sleep_mode,
+        num_generations=1,
+        tensor_parallel=8,
+    )
+
+    assert util == 0.10
 
 
 def test_moe_sizes_kv_on_active_backbone_not_total():
