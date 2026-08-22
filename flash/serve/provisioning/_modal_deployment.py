@@ -101,6 +101,8 @@ def _create_resources(
     sdk: ModalSdk,
     inference_token: str,
     artifact_token: str | None,
+    *,
+    deadline_at: float,
     created: _CreatedResources | None = None,
 ) -> ExpectedResources:
     # each resource is marked before its create is issued, never after. an interrupt between two
@@ -108,17 +110,29 @@ def _create_resources(
     # return value never arrived is exactly the one that leaks. see `_CreatedResources`.
     record = created if created is not None else _CreatedResources()
     record.inference = True
-    inference = mutation(lambda: sdk.create_inference_secret(plan, inference_token))
+    inference = mutation(
+        lambda: sdk.create_inference_secret(
+            plan,
+            inference_token,
+            deadline_at=deadline_at,
+        )
+    )
     assert type(inference) is ModalNamedResource
     record.confirm(inference_secret_id=inference.id)
     artifact = None
     if artifact_token is not None:
         record.artifact = True
-        artifact = mutation(lambda: sdk.create_artifact_secret(plan, artifact_token))
+        artifact = mutation(
+            lambda: sdk.create_artifact_secret(
+                plan,
+                artifact_token,
+                deadline_at=deadline_at,
+            )
+        )
         assert type(artifact) is ModalNamedResource
         record.confirm(artifact_secret_id=artifact.id)
     record.volume = True
-    volume = mutation(lambda: sdk.create_volume(plan))
+    volume = mutation(lambda: sdk.create_volume(plan, deadline_at=deadline_at))
     assert type(volume) is ModalNamedResource
     record.confirm(volume_id=volume.id)
     return ExpectedResources(
@@ -151,7 +165,7 @@ def _deploy_once_then_wait(
         # already suppresses, so over-recording is safe and under-recording leaks a live gpu.
         if created is not None:
             created.app_deployed = True
-        deployed = mutation(lambda: sdk.deploy_app(plan))
+        deployed = mutation(lambda: sdk.deploy_app(plan, deadline_at=deadline_at))
         if type(deployed) is not str:
             raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True)
         deployed_app_id = deployed
@@ -193,12 +207,14 @@ def _start_fresh_deployment(
     clock: Clock,
     sleep: Sleeper,
 ) -> PhaseProof | DeploymentResult | None:
+    work_deadline = _work_deadline(deadline_at, clock)
     expected = _create_resources(
         create_plan,
         sdk,
         inference_token,
         artifact_token,
-        created,
+        deadline_at=work_deadline,
+        created=created,
     )
     try:
         return _deploy_once_then_wait(
@@ -208,7 +224,7 @@ def _start_fresh_deployment(
             expected,
             artifact_present=artifact_token is not None,
             transient_phases=(),
-            deadline_at=_work_deadline(deadline_at, clock),
+            deadline_at=work_deadline,
             probe=probe,
             clock=clock,
             sleep=sleep,
@@ -251,7 +267,13 @@ def _delete_artifact_and_confirm(
         artifact_secret_id=artifact.id,
     )
     try:
-        mutation(lambda: sdk.delete_secret(finalized_plan, artifact.id))
+        mutation(
+            lambda: sdk.delete_secret(
+                finalized_plan,
+                artifact.id,
+                deadline_at=deadline_at,
+            )
+        )
     except ModalSdkFailure as exc:
         if not exc.outcome_unknown:
             return failure_result(finalized_plan, from_sdk_failure(exc), handle=proof.handle)
@@ -376,6 +398,7 @@ def _adopt_uncleaned(
                 finalized_plan,
                 sdk,
                 app_id_hint=None if expected is None else expected.app_id,
+                deadline_at=deadline_at,
             ),
             TransientPhase(finalized_plan, False),
             expected,
@@ -446,7 +469,12 @@ def _adopt_bootstrap(
             sleep=sleep,
         )
     except ModalResourceConflict:
-        successor = observe(finalized_plan, sdk, app_id_hint=expected.app_id)
+        successor = observe(
+            finalized_plan,
+            sdk,
+            app_id_hint=expected.app_id,
+            deadline_at=deadline_at,
+        )
         with_artifact = TransientPhase(finalized_plan, True)
         if matches_transient(successor, with_artifact, expected):
             finalized = phase_proof(

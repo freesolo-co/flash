@@ -201,7 +201,12 @@ def wait_for_phase(
 
     app_id_hint = None if expected is None else expected.app_id
     while True:
-        observation = observe(plan, sdk, app_id_hint=app_id_hint)
+        observation = observe(
+            plan,
+            sdk,
+            app_id_hint=app_id_hint,
+            deadline_at=deadline_at,
+        )
         proof: PhaseProof | None = None
         if observation.resource_count:
             try:

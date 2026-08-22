@@ -2,24 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
-import subprocess
-import sys
+import time
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from flash.serve.control import ModalCredentials
 from flash.serve.provisioning._modal_plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
-from flash.serve.provisioning._modal_sdk import (
-    ModalSdkFailure,
-    PinnedModalSdk,
-    _call_mutation,
-    _call_read,
-    _sync_value,
-)
+from flash.serve.provisioning._modal_sdk import ModalSdkFailure, PinnedModalSdk
 from flash.serve.provisioning._modal_wrapper import launch_modal_server
 from tests.test_serve_provisioning_modal import (
     APP_ID,
@@ -35,52 +26,24 @@ from tests.test_serve_provisioning_modal import (
     _bundle,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
+
+class _AioCallable:
+    def __init__(self, operation) -> None:
+        self.operation = operation
+
+    def __call__(self, *args, **kwargs):
+        return self.operation(*args, **kwargs)
+
+    async def aio(self, *args, **kwargs):
+        return self.operation(*args, **kwargs)
 
 
-async def _never_resolves() -> None:
-    await asyncio.Event().wait()
+class _AioMethod:
+    def __init__(self, operation) -> None:
+        self.operation = operation
 
-
-async def _fast_value() -> str:
-    return "fast-modal-result"
-
-
-def test_modal_awaitable_is_abandoned_when_the_deadline_is_exhausted() -> None:
-    try:
-        _sync_value(_never_resolves(), deadline_at=10.0, clock=lambda: 10.0)
-    except TimeoutError:
-        pass
-    else:
-        pytest.fail("a never-resolving modal call outlived its deadline")
-
-
-def test_modal_mutation_timeout_is_ambiguous() -> None:
-    with pytest.raises(ModalSdkFailure) as exc_info:
-        _call_mutation(_never_resolves, deadline_at=10.0, clock=lambda: 10.0)
-    assert exc_info.value.code == "resource_ambiguous", (
-        "a timed-out mutation was treated as a definite failure"
-    )
-    assert exc_info.value.outcome_unknown is True, (
-        "a timed-out mutation lost its unknown provider outcome"
-    )
-
-
-def test_modal_read_timeout_is_a_definite_transport_failure() -> None:
-    with pytest.raises(ModalSdkFailure) as exc_info:
-        _call_read(_never_resolves, deadline_at=10.0, clock=lambda: 10.0)
-    assert exc_info.value.code == "transport_failed", (
-        "a timed-out read was treated as an ambiguous mutation"
-    )
-    assert exc_info.value.outcome_unknown is False, (
-        "a timed-out read incorrectly claimed provider state may have changed"
-    )
-
-
-def test_fast_modal_awaitable_is_unaffected_by_the_deadline() -> None:
-    result = _sync_value(_fast_value(), deadline_at=10.0, clock=lambda: 0.0)
-
-    assert result == "fast-modal-result", "a fast modal call was rejected before its deadline"
+    def __get__(self, instance, owner):
+        return _AioCallable(self.operation.__get__(instance, owner))
 
 
 class _NamedHandle:
@@ -100,6 +63,8 @@ class _NamedHandle:
             raise RuntimeError(PROVIDER_SECRET)
         return self
 
+    hydrate = _AioMethod(hydrate)
+
 
 class _FunctionHandle:
     def __init__(self, module, object_id: str) -> None:
@@ -111,8 +76,12 @@ class _FunctionHandle:
         self.module.calls["function_hydrate_client"] = client
         return self
 
+    hydrate = _AioMethod(hydrate)
+
     def get_web_url(self):
         return self.module.plan.expected_public_url
+
+    get_web_url = _AioMethod(get_web_url)
 
 
 class _Image:
@@ -129,6 +98,8 @@ class _LookupApp:
         assert client is self.module.client
         self.module.calls["get_tags_client"] = client
         return dict(self.module.deployed_tags)
+
+    get_tags = _AioMethod(get_tags)
 
 
 class _DeployedApp:
@@ -174,6 +145,8 @@ class _DeployedApp:
         self.module.deployed_apps = [SimpleNamespace(app_id=APP_ID, name=name, containers=0)]
         return self
 
+    deploy = _AioMethod(deploy)
+
 
 class _AppApi:
     def __init__(self, module) -> None:
@@ -198,6 +171,8 @@ class _AppApi:
             client,
         )
         return _LookupApp(self.module)
+
+    lookup = _AioMethod(lookup)
 
 
 class _SecretObjects:
@@ -236,6 +211,8 @@ class _SecretObjects:
                 },
             )
         )
+
+    create = _AioMethod(create)
 
     def list(self, *, environment_name: str, client):
         assert client is self.module.client
@@ -302,6 +279,8 @@ class _VolumeObjects:
                 },
             )
         )
+
+    create = _AioMethod(create)
 
     def list(self, *, environment_name: str, client):
         assert client is self.module.client
@@ -418,6 +397,8 @@ class _Client:
         if self.close_error:
             raise RuntimeError(PROVIDER_SECRET)
 
+    _close = _AioMethod(_close)
+
 
 class _Experimental:
     def __init__(self, module) -> None:
@@ -427,6 +408,8 @@ class _Experimental:
         assert client is self.module.client
         self.module.calls["list_deployed_apps"] = (environment_name, client)
         return list(self.module.deployed_apps)
+
+    list_deployed_apps = _AioMethod(list_deployed_apps)
 
     def get_app_objects(self, name: str, *, environment_name: str, client):
         assert client is self.module.client
@@ -438,10 +421,14 @@ class _Experimental:
             )
         }
 
+    get_app_objects = _AioMethod(get_app_objects)
+
     def get_app_lifecycle(self, app_id: str, *, client):
         assert client is self.module.client
         self.module.calls["get_app_lifecycle"] = (app_id, client)
         return SimpleNamespace(stopped_at=self.module.lifecycle_stopped_at)
+
+    get_app_lifecycle = _AioMethod(get_app_lifecycle)
 
     def stop_app(self, name: str, *, environment_name: str, client) -> None:
         assert client is self.module.client
@@ -472,9 +459,11 @@ class _ModalModule:
         self.environment_name = plan.placement.environment
         self.client = _Client(self)
         self.Secret = _SecretApi(self)
+        self.Secret.objects.list = _AioCallable(self.Secret.objects.list)
         self.Volume = _VolumeApi(self)
+        self.Volume.objects.list = _AioCallable(self.Volume.objects.list)
         self.experimental = _Experimental(self)
-        self.Client = SimpleNamespace(from_credentials=self._from_credentials)
+        self.Client = SimpleNamespace(from_credentials=_AioCallable(self._from_credentials))
         self.Workspace = SimpleNamespace(from_context=self._workspace)
         self.Environment = SimpleNamespace(from_name=self._environment)
         self.Image = SimpleNamespace(from_registry=self._image)
@@ -527,62 +516,43 @@ class _ModalModule:
         return decorate
 
 
-def _sdk(plan, modal: _ModalModule) -> PinnedModalSdk:
+def _sdk(
+    plan, modal: _ModalModule, *, deadline_at: float = 60.0, clock=lambda: 0.0
+) -> PinnedModalSdk:
     return PinnedModalSdk(
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         plan,
-        60.0,
-        lambda: 0.0,
+        deadline_at,
+        clock,
         module_loader=lambda: modal,
     )
 
 
-def test_lazy_loader_binds_pinned_experimental_surface_without_provider_calls() -> None:
-    program = r"""
-import importlib
-import importlib.metadata
-import socket
+def test_blocking_provider_wrapper_is_bypassed_for_deadline_bound_aio() -> None:
+    plan = build_modal_create_plan(_bundle())
+    modal = _ModalModule(plan)
 
-import modal
+    class _BlockingFromCredentials:
+        sync_calls = 0
 
-provider_calls = []
-network_calls = []
+        def __call__(self, _token_id: str, _token_secret: str):
+            self.sync_calls += 1
+            time.sleep(0.2)
+            return modal.client
 
+        async def aio(self, _token_id: str, _token_secret: str):
+            await __import__("asyncio").Event().wait()
 
-def forbidden_provider_call(*args, **kwargs):
-    provider_calls.append((args, kwargs))
-    raise AssertionError("provider operation attempted")
+    blocking = _BlockingFromCredentials()
+    modal.Client = SimpleNamespace(from_credentials=blocking)
+    started_at = time.monotonic()
 
+    with pytest.raises(ModalSdkFailure) as exc_info:
+        _sdk(plan, modal, deadline_at=started_at + 0.01, clock=time.monotonic)
 
-def forbidden_network_call(*args, **kwargs):
-    network_calls.append((args, kwargs))
-    raise AssertionError("network operation attempted")
-
-
-assert importlib.metadata.version("modal") == "1.5.4"
-assert not hasattr(modal, "experimental")
-modal.Client.from_credentials = forbidden_provider_call
-modal.Client.from_env = forbidden_provider_call
-socket.create_connection = forbidden_network_call
-
-from flash.serve.provisioning._modal_sdk import _load_modal_module
-
-loaded = _load_modal_module()
-assert loaded is modal
-assert loaded.experimental is importlib.import_module("modal.experimental")
-for name in ("list_deployed_apps", "get_app_objects", "get_app_lifecycle", "stop_app"):
-    assert callable(getattr(loaded.experimental, name))
-assert provider_calls == []
-assert network_calls == []
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", program],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
+    assert exc_info.value.code == "transport_failed"
+    assert time.monotonic() - started_at < 0.1
+    assert blocking.sync_calls == 0
 
 
 class _DeferredThread:
@@ -753,6 +723,22 @@ def test_client_closes_once_when_workspace_or_environment_binding_fails(failure:
     assert exc_info.value.code == "authentication_failed"
     assert modal.client.close_count == 1
     assert PROVIDER_SECRET not in str(exc_info.value) + repr(exc_info.value)
+
+
+def test_client_close_interruption_does_not_escape_cleanup() -> None:
+    plan = build_modal_create_plan(_bundle())
+    modal = _ModalModule(plan)
+    sdk = _sdk(plan, modal)
+
+    def interrupt_close() -> None:
+        modal.client.close_count += 1
+        raise KeyboardInterrupt
+
+    modal.client._close = _AioCallable(interrupt_close)
+
+    sdk.close()
+
+    assert modal.client.close_count == 1
 
 
 def test_pinned_sdk_deploys_exact_image_without_local_source_overlays() -> None:

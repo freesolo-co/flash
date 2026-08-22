@@ -5,9 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
-import inspect
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -102,21 +101,57 @@ class ModalSdk(Protocol):
         plan: ModalCreatePlan,
         *,
         app_id_hint: str | None = None,
+        deadline_at: float | None = None,
     ) -> ModalObservation: ...
 
-    def create_inference_secret(self, plan: ModalCreatePlan, value: str) -> ModalNamedResource: ...
+    def create_inference_secret(
+        self,
+        plan: ModalCreatePlan,
+        value: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> ModalNamedResource: ...
 
-    def create_artifact_secret(self, plan: ModalCreatePlan, value: str) -> ModalNamedResource: ...
+    def create_artifact_secret(
+        self,
+        plan: ModalCreatePlan,
+        value: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> ModalNamedResource: ...
 
-    def create_volume(self, plan: ModalCreatePlan) -> ModalNamedResource: ...
+    def create_volume(
+        self,
+        plan: ModalCreatePlan,
+        *,
+        deadline_at: float | None = None,
+    ) -> ModalNamedResource: ...
 
-    def deploy_app(self, plan: ModalCreatePlan) -> str: ...
+    def deploy_app(self, plan: ModalCreatePlan, *, deadline_at: float | None = None) -> str: ...
 
-    def stop_app(self, plan: ModalCreatePlan, app_id: str) -> None: ...
+    def stop_app(
+        self,
+        plan: ModalCreatePlan,
+        app_id: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> None: ...
 
-    def delete_secret(self, plan: ModalCreatePlan, secret_id: str) -> None: ...
+    def delete_secret(
+        self,
+        plan: ModalCreatePlan,
+        secret_id: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> None: ...
 
-    def delete_volume(self, plan: ModalCreatePlan, volume_id: str) -> None: ...
+    def delete_volume(
+        self,
+        plan: ModalCreatePlan,
+        volume_id: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> None: ...
 
     def close(self) -> None: ...
 
@@ -132,16 +167,43 @@ def _load_modal_module() -> object:
     return modal
 
 
+AsyncOperation = Callable[[], Awaitable[object]]
+
+
+async def _wait_for_operation(operation: AsyncOperation, timeout_seconds: float) -> object:
+    return await asyncio.wait_for(operation(), timeout=timeout_seconds)
+
+
+class _AsyncBridge:
+    """run every request-local modal async operation on one event loop."""
+
+    __slots__ = ("_clock", "_loop")
+
+    def __init__(self, clock: Clock) -> None:
+        self._clock = clock
+        self._loop = asyncio.new_event_loop()
+
+    def run(self, operation: AsyncOperation, *, deadline_at: float) -> object:
+        timeout_seconds = deadline_at - self._clock()
+        if timeout_seconds <= 0:
+            raise TimeoutError
+        return self._loop.run_until_complete(_wait_for_operation(operation, timeout_seconds))
+
+    def close(self) -> None:
+        self._loop.close()
+
+
 def _sync_value(
-    value: object,
+    operation: AsyncOperation,
     *,
     deadline_at: float,
     clock: Clock = time.monotonic,
 ) -> object:
-    if inspect.isawaitable(value):
-        timeout_seconds = max(0.0, deadline_at - clock())
-        return asyncio.run(asyncio.wait_for(value, timeout=timeout_seconds))
-    return value
+    bridge = _AsyncBridge(clock)
+    try:
+        return bridge.run(operation, deadline_at=deadline_at)
+    finally:
+        bridge.close()
 
 
 def _text(value: object, name: str) -> str:
@@ -164,14 +226,32 @@ def _resource(value: object, role: Literal["secret", "volume"]) -> ModalNamedRes
     )
 
 
+def _run_async(
+    operation: AsyncOperation,
+    *,
+    deadline_at: float,
+    clock: Clock,
+    bridge: _AsyncBridge | None,
+) -> object:
+    if bridge is not None:
+        return bridge.run(operation, deadline_at=deadline_at)
+    return _sync_value(operation, deadline_at=deadline_at, clock=clock)
+
+
 def _call_read(
-    operation: Callable[[], object],
+    operation: AsyncOperation,
     *,
     deadline_at: float,
     clock: Clock = time.monotonic,
+    bridge: _AsyncBridge | None = None,
 ) -> object:
     try:
-        return _sync_value(operation(), deadline_at=deadline_at, clock=clock)
+        return _run_async(
+            operation,
+            deadline_at=deadline_at,
+            clock=clock,
+            bridge=bridge,
+        )
     except ModalSdkFailure:
         raise
     except Exception:
@@ -179,13 +259,19 @@ def _call_read(
 
 
 def _call_mutation(
-    operation: Callable[[], object],
+    operation: AsyncOperation,
     *,
     deadline_at: float,
     clock: Clock = time.monotonic,
+    bridge: _AsyncBridge | None = None,
 ) -> object:
     try:
-        return _sync_value(operation(), deadline_at=deadline_at, clock=clock)
+        return _run_async(
+            operation,
+            deadline_at=deadline_at,
+            clock=clock,
+            bridge=bridge,
+        )
     except ModalSdkFailure:
         raise
     except Exception:
@@ -204,17 +290,24 @@ def _close_client(
     *,
     deadline_at: float,
     clock: Clock = time.monotonic,
+    bridge: _AsyncBridge | None = None,
 ) -> None:
-    close = getattr(client, "_close", None)
+    close = getattr(getattr(client, "_close", None), "aio", None)
     if callable(close):
-        with contextlib.suppress(Exception):
-            _sync_value(close(), deadline_at=deadline_at, clock=clock)
+        with contextlib.suppress(BaseException):
+            _run_async(
+                close,
+                deadline_at=deadline_at,
+                clock=clock,
+                bridge=bridge,
+            )
 
 
 class PinnedModalSdk:
     """request-scoped adapter for the locally pinned modal 1.5 sdk contract."""
 
     __slots__ = (
+        "_bridge",
         "_client",
         "_clock",
         "_deadline_at",
@@ -236,23 +329,27 @@ class PinnedModalSdk:
             raise ValueError("modal credentials must use the exact credential type")
         validate_modal_plan(plan)
         token_id, token_secret = credentials.reveal()
+        bridge = _AsyncBridge(clock)
         client: object | None = None
         try:
             modal = module_loader()
-            client = modal.Client.from_credentials(token_id, token_secret)
-            workspace = _sync_value(
-                modal.Workspace.from_context(client=client).hydrate(),
+            client = bridge.run(
+                lambda: modal.Client.from_credentials.aio(token_id, token_secret),
                 deadline_at=deadline_at,
-                clock=clock,
             )
-            environment = _sync_value(
-                modal.Environment.from_name(
-                    plan.placement.environment,
-                    create_if_missing=False,
-                    client=client,
-                ).hydrate(),
+            workspace_handle = modal.Workspace.from_context(client=client)
+            workspace = bridge.run(
+                workspace_handle.hydrate.aio,
                 deadline_at=deadline_at,
-                clock=clock,
+            )
+            environment_handle = modal.Environment.from_name(
+                plan.placement.environment,
+                create_if_missing=False,
+                client=client,
+            )
+            environment = bridge.run(
+                environment_handle.hydrate.aio,
+                deadline_at=deadline_at,
             )
             workspace_name = _text(getattr(workspace, "name", None), "modal workspace name")
             environment_name = _text(getattr(environment, "name", None), "modal environment name")
@@ -263,18 +360,27 @@ class PinnedModalSdk:
                 raise ModalSdkFailure("authentication_failed")
         except TimeoutError:
             if client is not None:
-                _close_client(client, deadline_at=deadline_at, clock=clock)
+                _close_client(client, deadline_at=deadline_at, clock=clock, bridge=bridge)
+            bridge.close()
             raise ModalSdkFailure("transport_failed") from None
         except ModalSdkFailure:
             if client is not None:
-                _close_client(client, deadline_at=deadline_at, clock=clock)
+                _close_client(client, deadline_at=deadline_at, clock=clock, bridge=bridge)
+            bridge.close()
             raise
         except Exception:
             if client is not None:
-                _close_client(client, deadline_at=deadline_at, clock=clock)
+                _close_client(client, deadline_at=deadline_at, clock=clock, bridge=bridge)
+            bridge.close()
             raise ModalSdkFailure("authentication_failed") from None
+        except BaseException:
+            if client is not None:
+                _close_client(client, deadline_at=deadline_at, clock=clock, bridge=bridge)
+            bridge.close()
+            raise
         self._modal = modal
         self._client = client
+        self._bridge = bridge
         self._deadline_at = deadline_at
         self._clock = clock
         self.workspace_name = workspace_name
@@ -283,71 +389,117 @@ class PinnedModalSdk:
     def __repr__(self) -> str:
         return "PinnedModalSdk(<request-scoped>)"
 
-    def _read(self, operation: Callable[[], object]) -> object:
-        return _call_read(operation, deadline_at=self._deadline_at, clock=self._clock)
+    def _operation_deadline(self, deadline_at: float | None) -> float:
+        return self._deadline_at if deadline_at is None else min(deadline_at, self._deadline_at)
 
-    def _mutate(self, operation: Callable[[], object]) -> object:
-        return _call_mutation(operation, deadline_at=self._deadline_at, clock=self._clock)
+    def _read(
+        self,
+        operation: AsyncOperation,
+        *,
+        deadline_at: float | None,
+    ) -> object:
+        return _call_read(
+            operation,
+            deadline_at=self._operation_deadline(deadline_at),
+            clock=self._clock,
+            bridge=self._bridge,
+        )
+
+    def _mutate(
+        self,
+        operation: AsyncOperation,
+        *,
+        deadline_at: float | None,
+    ) -> object:
+        return _call_mutation(
+            operation,
+            deadline_at=self._operation_deadline(deadline_at),
+            clock=self._clock,
+            bridge=self._bridge,
+        )
 
     def _list_named(
         self,
         manager: object,
         plan: ModalCreatePlan,
         role: Literal["secret", "volume"],
+        *,
+        deadline_at: float | None,
     ) -> tuple[ModalNamedResource, ...]:
         values = self._read(
-            lambda: manager.list(
+            lambda: manager.list.aio(
                 environment_name=plan.placement.environment,
                 client=self._client,
-            )
+            ),
+            deadline_at=deadline_at,
         )
         if type(values) is not list:
             raise ModalSdkFailure("transport_failed")
         return tuple(_resource(value, role) for value in values)
 
-    def _deployed_apps(self, plan: ModalCreatePlan) -> list[object]:
+    def _deployed_apps(
+        self,
+        plan: ModalCreatePlan,
+        *,
+        deadline_at: float | None,
+    ) -> list[object]:
         values = self._read(
-            lambda: self._modal.experimental.list_deployed_apps(
+            lambda: self._modal.experimental.list_deployed_apps.aio(
                 environment_name=plan.placement.environment,
                 client=self._client,
-            )
+            ),
+            deadline_at=deadline_at,
         )
         if type(values) is not list:
             raise ModalSdkFailure("transport_failed")
         return [value for value in values if getattr(value, "name", None) == plan.names.app_or_pod]
 
-    def _deployed_app(self, plan: ModalCreatePlan, value: object) -> ModalAppObservation:
+    def _deployed_app(
+        self,
+        plan: ModalCreatePlan,
+        value: object,
+        *,
+        deadline_at: float | None,
+    ) -> ModalAppObservation:
         app_id = _provider_id(getattr(value, "app_id", None), "app")
         containers = getattr(value, "containers", None)
         if type(containers) is not int or containers < 0:
             raise ModalSdkFailure("transport_failed")
         app = self._read(
-            lambda: self._modal.App.lookup(
+            lambda: self._modal.App.lookup.aio(
                 plan.names.app_or_pod,
                 client=self._client,
                 environment_name=plan.placement.environment,
                 create_if_missing=False,
-            )
+            ),
+            deadline_at=deadline_at,
         )
         if _provider_id(getattr(app, "app_id", None), "app") != app_id:
             raise ModalSdkFailure("transport_failed")
-        tags = self._read(lambda: app.get_tags(client=self._client))
+        tags = self._read(
+            lambda: app.get_tags.aio(client=self._client),
+            deadline_at=deadline_at,
+        )
         if type(tags) is not dict or any(
             type(key) is not str or type(item) is not str for key, item in tags.items()
         ):
             raise ModalSdkFailure("transport_failed")
         objects = self._read(
-            lambda: self._modal.experimental.get_app_objects(
+            lambda: self._modal.experimental.get_app_objects.aio(
                 plan.names.app_or_pod,
                 environment_name=plan.placement.environment,
                 client=self._client,
-            )
+            ),
+            deadline_at=deadline_at,
         )
         if type(objects) is not dict or len(objects) != 1 or plan.function_name not in objects:
             raise ModalSdkFailure("transport_failed")
-        function = self._read(lambda: objects[plan.function_name].hydrate(self._client))
+        function = self._read(
+            lambda: objects[plan.function_name].hydrate.aio(self._client),
+            deadline_at=deadline_at,
+        )
         function_id = _provider_id(getattr(function, "object_id", None), "function")
-        public_url = self._read(lambda: function.get_web_url())
+        public_url = self._read(function.get_web_url.aio, deadline_at=deadline_at)
         return ModalAppObservation(
             app_id=app_id,
             app_name=_text(getattr(value, "name", None), "modal app name"),
@@ -359,13 +511,20 @@ class PinnedModalSdk:
             public_url=validate_modal_public_url(public_url),
         )
 
-    def _lifecycle_app(self, plan: ModalCreatePlan, app_id: str) -> ModalAppObservation:
+    def _lifecycle_app(
+        self,
+        plan: ModalCreatePlan,
+        app_id: str,
+        *,
+        deadline_at: float | None,
+    ) -> ModalAppObservation:
         validated_app_id = _provider_id(app_id, "app")
         lifecycle = self._read(
-            lambda: self._modal.experimental.get_app_lifecycle(
+            lambda: self._modal.experimental.get_app_lifecycle.aio(
                 validated_app_id,
                 client=self._client,
-            )
+            ),
+            deadline_at=deadline_at,
         )
         stopped = getattr(lifecycle, "stopped_at", None) is not None
         return ModalAppObservation(
@@ -384,13 +543,27 @@ class PinnedModalSdk:
         plan: ModalCreatePlan,
         *,
         app_id_hint: str | None = None,
+        deadline_at: float | None = None,
     ) -> ModalObservation:
         validate_modal_plan(plan)
-        secrets = self._list_named(self._modal.Secret.objects, plan, "secret")
-        volumes = self._list_named(self._modal.Volume.objects, plan, "volume")
-        apps = tuple(self._deployed_app(plan, value) for value in self._deployed_apps(plan))
+        secrets = self._list_named(
+            self._modal.Secret.objects,
+            plan,
+            "secret",
+            deadline_at=deadline_at,
+        )
+        volumes = self._list_named(
+            self._modal.Volume.objects,
+            plan,
+            "volume",
+            deadline_at=deadline_at,
+        )
+        apps = tuple(
+            self._deployed_app(plan, value, deadline_at=deadline_at)
+            for value in self._deployed_apps(plan, deadline_at=deadline_at)
+        )
         if not apps and app_id_hint is not None:
-            apps = (self._lifecycle_app(plan, app_id_hint),)
+            apps = (self._lifecycle_app(plan, app_id_hint, deadline_at=deadline_at),)
         return ModalObservation(
             workspace_name=self.workspace_name,
             environment_name=self.environment_name,
@@ -410,64 +583,108 @@ class PinnedModalSdk:
         name: str,
         key: str,
         value: str,
+        *,
+        deadline_at: float | None,
     ) -> ModalNamedResource:
         self._mutate(
-            lambda: self._modal.Secret.objects.create(
+            lambda: self._modal.Secret.objects.create.aio(
                 name,
                 {key: value},
                 allow_existing=False,
                 environment_name=plan.placement.environment,
                 client=self._client,
-            )
+            ),
+            deadline_at=deadline_at,
         )
         handle = _post_mutation_read(
-            lambda: self._read(
-                lambda: self._modal.Secret.from_name(
-                    name,
-                    environment_name=plan.placement.environment,
-                    required_keys=[key],
-                    client=self._client,
-                ).hydrate()
+            lambda: self._modal.Secret.from_name(
+                name,
+                environment_name=plan.placement.environment,
+                required_keys=[key],
+                client=self._client,
             )
         )
-        resource = _post_mutation_read(lambda: _resource(handle, "secret"))
+        hydrated = _post_mutation_read(
+            lambda: self._read(
+                handle.hydrate.aio,
+                deadline_at=deadline_at,
+            )
+        )
+        resource = _post_mutation_read(lambda: _resource(hydrated, "secret"))
         if resource.name != name:
             raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True)
         return resource
 
-    def create_inference_secret(self, plan: ModalCreatePlan, value: str) -> ModalNamedResource:
+    def create_inference_secret(
+        self,
+        plan: ModalCreatePlan,
+        value: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> ModalNamedResource:
         return self._created_secret(
-            plan, plan.names.inference_secret, "FLASH_INFERENCE_TOKEN", value
+            plan,
+            plan.names.inference_secret,
+            "FLASH_INFERENCE_TOKEN",
+            value,
+            deadline_at=deadline_at,
         )
 
-    def create_artifact_secret(self, plan: ModalCreatePlan, value: str) -> ModalNamedResource:
-        return self._created_secret(plan, plan.names.artifact_secret, "FLASH_ARTIFACT_TOKEN", value)
+    def create_artifact_secret(
+        self,
+        plan: ModalCreatePlan,
+        value: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> ModalNamedResource:
+        return self._created_secret(
+            plan,
+            plan.names.artifact_secret,
+            "FLASH_ARTIFACT_TOKEN",
+            value,
+            deadline_at=deadline_at,
+        )
 
-    def create_volume(self, plan: ModalCreatePlan) -> ModalNamedResource:
+    def create_volume(
+        self,
+        plan: ModalCreatePlan,
+        *,
+        deadline_at: float | None = None,
+    ) -> ModalNamedResource:
         self._mutate(
-            lambda: self._modal.Volume.objects.create(
+            lambda: self._modal.Volume.objects.create.aio(
                 plan.names.volume,
                 allow_existing=False,
                 environment_name=plan.placement.environment,
                 client=self._client,
-            )
+            ),
+            deadline_at=deadline_at,
         )
         handle = _post_mutation_read(
-            lambda: self._read(
-                lambda: self._modal.Volume.from_name(
-                    plan.names.volume,
-                    environment_name=plan.placement.environment,
-                    create_if_missing=False,
-                    client=self._client,
-                ).hydrate()
+            lambda: self._modal.Volume.from_name(
+                plan.names.volume,
+                environment_name=plan.placement.environment,
+                create_if_missing=False,
+                client=self._client,
             )
         )
-        resource = _post_mutation_read(lambda: _resource(handle, "volume"))
+        hydrated = _post_mutation_read(
+            lambda: self._read(
+                handle.hydrate.aio,
+                deadline_at=deadline_at,
+            )
+        )
+        resource = _post_mutation_read(lambda: _resource(hydrated, "volume"))
         if resource.name != plan.names.volume:
             raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True)
         return resource
 
-    def deploy_app(self, plan: ModalCreatePlan) -> str:
+    def deploy_app(
+        self,
+        plan: ModalCreatePlan,
+        *,
+        deadline_at: float | None = None,
+    ) -> str:
         validate_modal_plan(plan)
         image = self._modal.Image.from_registry(plan.bundle.image.reference)
         volume = self._modal.Volume.from_name(
@@ -522,13 +739,14 @@ class PinnedModalSdk:
             include_source=False,
         )(web_function)
         deployed = self._mutate(
-            lambda: app.deploy(
+            lambda: app.deploy.aio(
                 name=plan.names.app_or_pod,
                 environment_name=plan.placement.environment,
                 tag=plan.deployment_tag,
                 client=self._client,
                 strategy="recreate",
-            )
+            ),
+            deadline_at=deadline_at,
         )
         return _post_mutation_read(lambda: _provider_id(getattr(deployed, "app_id", None), "app"))
 
@@ -536,6 +754,8 @@ class PinnedModalSdk:
         self,
         request_name: str,
         rpc_name: str,
+        *,
+        deadline_at: float | None,
         **fields: object,
     ) -> None:
         try:
@@ -549,32 +769,65 @@ class PinnedModalSdk:
             # name mutations can target a newer same-generation deployment after ownership proof.
             # if the pinned generated id rpc is unavailable, decline cleanup as ambiguous instead.
             raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True) from None
-        self._mutate(lambda: rpc(request))
+        self._mutate(lambda: rpc(request), deadline_at=deadline_at)
 
-    def stop_app(self, plan: ModalCreatePlan, app_id: str) -> None:
+    def stop_app(
+        self,
+        plan: ModalCreatePlan,
+        app_id: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> None:
         validate_modal_plan(plan)
-        self._id_mutation("AppStopRequest", "AppStop", app_id=_provider_id(app_id, "app"))
+        self._id_mutation(
+            "AppStopRequest",
+            "AppStop",
+            deadline_at=deadline_at,
+            app_id=_provider_id(app_id, "app"),
+        )
 
-    def delete_secret(self, plan: ModalCreatePlan, secret_id: str) -> None:
+    def delete_secret(
+        self,
+        plan: ModalCreatePlan,
+        secret_id: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> None:
         validate_modal_plan(plan)
         self._id_mutation(
             "SecretDeleteRequest",
             "SecretDelete",
+            deadline_at=deadline_at,
             secret_id=_provider_id(secret_id, "secret"),
         )
 
-    def delete_volume(self, plan: ModalCreatePlan, volume_id: str) -> None:
+    def delete_volume(
+        self,
+        plan: ModalCreatePlan,
+        volume_id: str,
+        *,
+        deadline_at: float | None = None,
+    ) -> None:
         validate_modal_plan(plan)
         self._id_mutation(
             "VolumeDeleteRequest",
             "VolumeDelete",
+            deadline_at=deadline_at,
             volume_id=_provider_id(volume_id, "volume"),
         )
 
     def close(self) -> None:
         client = self._client
         self._client = None
-        _close_client(client, deadline_at=self._deadline_at, clock=self._clock)
+        try:
+            _close_client(
+                client,
+                deadline_at=self._deadline_at,
+                clock=self._clock,
+                bridge=self._bridge,
+            )
+        finally:
+            self._bridge.close()
 
 
 def create_modal_sdk(

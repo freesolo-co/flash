@@ -75,9 +75,14 @@ def observe(
     sdk: ModalSdk,
     *,
     app_id_hint: str | None = None,
+    deadline_at: float | None = None,
 ) -> ModalObservation:
     try:
-        observation = sdk.observe(plan, app_id_hint=app_id_hint)
+        observation = sdk.observe(
+            plan,
+            app_id_hint=app_id_hint,
+            deadline_at=deadline_at,
+        )
     except ModalSdkFailure:
         raise
     except Exception:
