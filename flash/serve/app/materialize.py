@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -42,6 +43,11 @@ BASE_WEIGHTS_CACHE_DIRNAME = "hub"
 _DIRECTORY_FLAGS = (
     getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 )
+_UNSUPPORTED_DIRECTORY_SYNC = {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_AT_EMPTY_PATH = 0x1000
+_AT_STATX_FORCE_SYNC = 0x2000
+_STATX_BASIC_STATS = 0x7FF
 
 
 class MaterializationError(RuntimeError):
@@ -93,21 +99,9 @@ def _snapshot_matches_inventory(snapshot_path: object, recorded: str) -> bool:
 def _hydration_marker(
     cache_dir: str | os.PathLike[str], repo_id: str, revision: str | None
 ) -> Path:
-    """the file written only after one (repo, revision) finished downloading completely.
-
-    `snapshot_download(local_files_only=True)` cannot answer "is this complete?" when the revision
-    is an exact commit sha: it resolves the snapshot directory straight from the cache layout and
-    returns it even when only some files landed. (It raises only for a *branch* revision, which
-    needs a ref it has no way to resolve offline -- which is why this looks safe under a casual
-    test.) Every revision this app hydrates is a 40-hex sha, enforced by the manifest, so the
-    permissive path is the one that always runs. An interrupted download would therefore read back
-    as ready, skip rehydration while the bootstrap token is still available, and seal the engine
-    offline -- vllm then dies on the missing shard on every restart, with no token left to retry.
-
-    The marker lives in the same hub directory it vouches for, so it is keyed on the cache dir the
-    caller actually passed to the hub rather than on the cache root: hydration absolutizes its root
-    and readiness does not, and a marker written under one spelling must still be found under the
-    other. Co-locating it also means wiping the cache wipes the claim with it.
+    """locate proof that one exact hub snapshot finished downloading.
+    exact-sha offline resolution accepts partial snapshots, so readiness also needs this marker.
+    it is co-located with the cache it vouches for, preserving path spelling and wipe semantics.
     """
 
     digest = hashlib.sha256(f"{repo_id}@{revision or ''}".encode()).hexdigest()[:32]
@@ -153,12 +147,7 @@ def base_weights_are_cached(
             )
         except Exception:
             return False
-        # the marker surviving is not proof the snapshot did. `snapshot_download` resolves the
-        # directory for an exact commit sha even when only part of it is present, so a shard or
-        # symlink lost after the marker was written would otherwise read back as hydrated: the
-        # launcher skips rehydration, seals the hub offline, and -- with the artifact secret
-        # already removed from a finalized deployment -- vllm crash-loops on every restart with no
-        # token left to recover. compare against what was actually downloaded.
+        # the marker can outlive an evicted shard, so compare it with the current snapshot bytes.
         if not _snapshot_matches_inventory(snapshot_path, recorded):
             return False
     return True
@@ -215,14 +204,8 @@ def hydrate_base_weights(
                 # the repo id is manifest data and safe to name, but the exception can carry the
                 # request headers, so it is dropped rather than chained.
                 raise MaterializationError(f"base weight download failed for {repo_id}") from None
-            # only after the download returns: an interrupted one raises above and leaves no
-            # marker, so the next start rehydrates instead of sealing the engine against a
-            # half-populated snapshot.
-            #
-            # the marker records the snapshot it vouches for rather than merely existing. an empty
-            # marker only proves a download once finished; it cannot notice a shard or symlink
-            # going missing afterwards, and the readiness check would then seal the hub offline
-            # against an incomplete cache with the artifact token already gone.
+            # record exact bytes only after a complete download; interrupted or later-evicted
+            # snapshots must rehydrate while the bootstrap token still exists.
             marker = _hydration_marker(cache_dir, repo_id, revision)
             marker.write_text(_snapshot_inventory(snapshot_path), encoding="utf-8")
     finally:
@@ -342,6 +325,8 @@ def _materialize_adapter(
             except Exception:
                 raise MaterializationError("artifact download failed") from None
             _copy_declared_files(Path(snapshot), hf_cache, adapter, stage)
+            # settle child-entry metadata before validation captures its first directory identity.
+            _synchronize_directory(stage)
             validate_materialized_adapter(adapter, manifest, stage)
             try:
                 os.rename(stage, destination)
@@ -350,6 +335,10 @@ def _materialize_adapter(
                     validate_materialized_adapter(adapter, manifest, destination)
                 else:
                     raise
+            else:
+                # rename changes both the moved directory's inode metadata and its parent's entries.
+                _synchronize_directory(destination)
+                _synchronize_directory(destination.parent)
             validate_materialized_adapter(adapter, manifest, destination)
             return destination
         except BaseException:
@@ -577,55 +566,27 @@ def _validate_cache_ancestor_stat(
         raise MaterializationError(f"{name} is not a directory")
     owner = details.st_uid
     writable = bool(details.st_mode & 0o022)
-    # a root-owned shared directory is trusted even when it is world writable. /tmp is the sticky
-    # 1777 form of this; a provider's mounted volume is the non-sticky form. runpod mounts its
-    # network volume at /runpod-volume as root-owned 0777 with no sticky bit (measured on a live
-    # pod), which this rejected -- so every runpod deployment died here about two seconds into
-    # startup and was restarted forever. externally that is indistinguishable from a slow image
-    # pull: empty log, proxy 404, and an uptime that never climbs.
-    #
-    # only root can have created or replaced an entry in a root-owned directory tree, and the cache
-    # root and every directory and file inside it still go through _validate_trusted_directory_stat
-    # and _validate_regular_stat, which require our own uid. so the traversal below cannot be
-    # redirected by an unprivileged user; what the sticky bit adds here is only a restriction
-    # between non-root users, none of which own any part of this path.
-    #
-    # the mode half of those inner checks is conditional -- see _permission_bits_are_enforceable.
-    # on a filesystem that cannot store modes it is skipped, because it could never pass there. the
-    # integrity that actually protects the payload is content-addressed rather than mode-based:
-    # every adapter file is verified against the manifest's sha256 with a before/after identity
-    # check around the read, and base weights resolve through the hub's own digest-named cache.
+    # root-owned shared directories include sticky /tmp and runpod's non-sticky 0777 moosefs mount.
+    # only root can replace their entries, while every inner cache object must still be owned by us.
+    # filesystems that cannot store modes rely on the manifest digest and before/after identity
+    # checks instead; _permission_bits_are_enforceable distinguishes those mounts below.
     root_shared = owner == 0
     if owner not in {0, os.getuid()}:
         raise MaterializationError(f"{name} is owned by an untrusted uid")
     if not writable or root_shared:
         return
-    # the ancestor is ours and reads as writable. that is a real finding on a filesystem that stores
-    # modes, and unsatisfiable on one that does not -- the same distinction the inner checks make.
-    # probe only here, at the point of rejection, so the common path costs no syscalls: a mount that
-    # cannot express a mode reports one it never agreed to, and we would otherwise reject a
-    # deployment for a bit the kernel invented. a deployment running as non-root on such a mount
-    # sees this before it ever reaches the cache root's own check.
+    # probe only at rejection: a mode-preserving mount is unsafe, while a modeless mount reports a
+    # writable bit it cannot change and must rely on the content and identity checks instead.
     if directory_fd is not None and not _permission_bits_are_enforceable(directory_fd):
         return
     raise MaterializationError(f"{name} is group or world writable")
 
 
 def _permission_bits_are_enforceable(directory_fd: int) -> bool:
-    """report whether this filesystem can actually express a mode, by setting one and reading back.
+    """report whether this filesystem preserves a private mode on a probe directory.
 
-    the mode check below is a real defence on a filesystem that stores modes, and meaningless noise
-    on one that does not. rather than carve out a provider by name, ask the filesystem: create a
-    private directory, and see whether the bits survive.
-
-    runpod mounts its network volume from moosefs over fuse, which reports a fixed 0777 for every
-    directory and 0666 for every file. `mkdir -m 700` reads back as 777 and an explicit `chmod 700`
-    reads back as 777 (both measured on a live pod), so a mode assertion there can never be
-    satisfied -- it rejected every runpod deployment about two seconds into startup, forever.
-
-    this is deliberately a capability probe rather than a filesystem-type check: a `/proc/mounts`
-    match would go stale the moment a provider changes storage, and would answer a question about
-    naming rather than the one that matters.
+    runpod's moosefs mount reports fixed 0777/0666 modes, so a capability probe avoids an
+    unsatisfiable assertion without coupling the policy to a provider or filesystem name.
     """
 
     probe = f".flash-mode-probe-{os.getpid()}"
@@ -646,9 +607,7 @@ def _permission_bits_are_enforceable(directory_fd: int) -> bool:
         finally:
             os.close(probe_fd)
     finally:
-        # mkdir succeeded, so every exit past it has to remove the entry -- including the one
-        # where the open fails. a probe left behind adds an entry to a directory a caller may be
-        # about to compare against an exact manifest.
+        # every exit after mkdir must remove the entry before an exact-set validation.
         with contextlib.suppress(OSError):
             os.rmdir(probe, dir_fd=directory_fd)
 
@@ -749,6 +708,47 @@ def _copy_regular_file(source: Path, destination: Path) -> None:
         os.close(source_fd)
 
 
+def _synchronize_directory(path: Path) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | _DIRECTORY_FLAGS)
+        os.fsync(descriptor)
+    except OSError as exc:
+        # unsupported directory fsync is a filesystem capability; every other error may mean the
+        # populated cache was not persisted, so only the explicit capability errors are ignored.
+        if descriptor is None or exc.errno not in _UNSUPPORTED_DIRECTORY_SYNC:
+            raise MaterializationError("adapter cache directory could not be synchronized") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+# fuse fsync does not invalidate cached attrs, so force server-backed times at each identity read.
+def _forced_directory_times(descriptor: int) -> tuple[int, int] | None:
+    statx = getattr(_LIBC, "statx", None)
+    if statx is None:
+        return None
+    buffer = ctypes.create_string_buffer(256)
+    flags = _AT_EMPTY_PATH | _AT_STATX_FORCE_SYNC
+    if statx(descriptor, b"", flags, _STATX_BASIC_STATS, buffer) != 0:
+        error = ctypes.get_errno()
+        if error in _UNSUPPORTED_DIRECTORY_SYNC:
+            return None
+        raise MaterializationError("adapter cache directory metadata could not be synchronized")
+    # linux statx has fixed ctime and mtime timestamp offsets in its stable 256-byte abi.
+    ctime_seconds = ctypes.c_int64.from_buffer(buffer, 96).value
+    ctime_nanos = ctypes.c_uint32.from_buffer(buffer, 104).value
+    mtime_seconds = ctypes.c_int64.from_buffer(buffer, 112).value
+    mtime_nanos = ctypes.c_uint32.from_buffer(buffer, 120).value
+    return mtime_seconds * 1_000_000_000 + mtime_nanos, ctime_seconds * 1_000_000_000 + ctime_nanos
+
+
+def _open_directory_snapshot(descriptor: int) -> tuple[os.stat_result, tuple[int, ...]]:
+    forced_times = _forced_directory_times(descriptor)
+    details = os.fstat(descriptor)
+    return details, _stable_directory_identity(details, times=forced_times)
+
+
 def _read_exact_regular_files(
     directory: Path,
     declarations: tuple[ArtifactFile, ...],
@@ -760,11 +760,8 @@ def _read_exact_regular_files(
     except OSError as exc:
         raise MaterializationError("adapter cache entry is not a safe directory") from exc
     try:
-        directory_stat = os.fstat(directory_fd)
-        # probe the PARENT, not this directory: the entry's exact file set and mtime are both
-        # verified below, and a probe creates and removes a child, so probing here would change
-        # the thing under verification. the parent is the same filesystem, which is all the probe
-        # is asking about.
+        directory_stat, directory_identity = _open_directory_snapshot(directory_fd)
+        # probe the parent because probing here would mutate the exact entry set under validation.
         enforce_mode = _directory_enforces_permission_bits(directory.parent)
         _validate_trusted_directory_stat(
             directory_stat,
@@ -778,7 +775,7 @@ def _read_exact_regular_files(
             raise MaterializationError("adapter cache entry cannot be inspected") from exc
         if names != set(expected):
             raise MaterializationError("adapter cache file set does not exactly match the manifest")
-        snapshots: list[object] = [_stable_directory_identity(directory_stat)]
+        snapshots: list[object] = [directory_identity]
         contents: dict[str, bytes] = {}
         for declaration in declarations:
             snapshot, content = _read_declared_file(
@@ -789,7 +786,7 @@ def _read_exact_regular_files(
             snapshots.append(snapshot)
             if content is not None:
                 contents[declaration.path] = content
-        if _stable_directory_identity(os.fstat(directory_fd)) != snapshots[0]:
+        if _open_directory_snapshot(directory_fd)[1] != snapshots[0]:
             raise MaterializationError("adapter cache directory changed during validation")
         return tuple(snapshots), contents
     finally:
@@ -830,15 +827,20 @@ def _read_declared_file(
         os.close(fd)
 
 
-def _stable_directory_identity(details: os.stat_result) -> tuple[int, ...]:
+def _stable_directory_identity(
+    details: os.stat_result,
+    *,
+    times: tuple[int, int] | None = None,
+) -> tuple[int, ...]:
+    mtime_ns, ctime_ns = times or (details.st_mtime_ns, details.st_ctime_ns)
     return (
         details.st_dev,
         details.st_ino,
         details.st_mode,
         details.st_uid,
         details.st_nlink,
-        details.st_mtime_ns,
-        details.st_ctime_ns,
+        mtime_ns,
+        ctime_ns,
     )
 
 
@@ -970,11 +972,8 @@ def _directory_identity(path: Path) -> tuple[int, int]:
     _validate_trusted_directory_stat(
         details,
         "cache directory",
-        # probe the PARENT, not this directory, for the same reason _read_exact_regular_files does:
-        # a probe creates and removes a child, and one caller here is the staging directory whose
-        # exact entry set is compared against the manifest. a probe entry that outlives its own
-        # rmdir -- which is exactly what a fuse mount may do -- would fail that comparison and
-        # abort hydration. the parent is the same filesystem, which is all the probe asks about.
+        # probe the parent: probing a stage would mutate the exact entry set being validated, and a
+        # delayed fuse removal could then reject an otherwise valid adapter.
         enforce_mode=_directory_enforces_permission_bits(path.parent),
     )
     return details.st_dev, details.st_ino

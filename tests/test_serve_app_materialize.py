@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import save_file
 
+from flash.serve.app import materialize as materialize_module
 from flash.serve.app.manifest import ArtifactFile, build_serving_manifest
 from flash.serve.app.materialize import (
     MaterializationError,
@@ -102,6 +104,160 @@ def _token_fd() -> int:
     os.write(write_fd, TOKEN.encode())
     os.close(write_fd)
     return read_fd
+
+
+class _DirectoryTimestampStat:
+    def __init__(self, details: os.stat_result, *, offset: int) -> None:
+        self._details = details
+        self.st_mtime_ns = details.st_mtime_ns + offset
+        self.st_ctime_ns = details.st_ctime_ns + offset
+
+    def __getattr__(self, name: str):
+        return getattr(self._details, name)
+
+
+def _descriptor_path(descriptor: int) -> str:
+    return os.readlink(f"/proc/self/fd/{descriptor}")
+
+
+def test_hydration_synchronizes_directory_metadata_before_validation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+    real_fstat = os.fstat
+    real_fsync = os.fsync
+    fsynced: set[str] = set()
+    stale_reads: set[str] = set()
+    refreshed: set[str] = set()
+
+    def fsync(descriptor: int) -> None:
+        details = real_fstat(descriptor)
+        if stat.S_ISDIR(details.st_mode):
+            fsynced.add(_descriptor_path(descriptor))
+        real_fsync(descriptor)
+
+    def fstat(descriptor: int):
+        details = real_fstat(descriptor)
+        path = _descriptor_path(descriptor)
+        is_adapter = "/adapters/.stage-" in path or path.endswith(
+            manifest.adapters[0].aggregate_sha256
+        )
+        if stat.S_ISDIR(details.st_mode) and is_adapter and path not in stale_reads:
+            stale_reads.add(path)
+            return _DirectoryTimestampStat(details, offset=-1)
+        return details
+
+    def forced_times(descriptor: int) -> tuple[int, int]:
+        details = real_fstat(descriptor)
+        refreshed.add(_descriptor_path(descriptor))
+        return details.st_mtime_ns, details.st_ctime_ns
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "fstat", fstat)
+    monkeypatch.setattr(materialize_module, "_forced_directory_times", forced_times)
+
+    paths = hydrate_manifest(
+        manifest,
+        cache,
+        token_fd=_token_fd(),
+        snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+    )
+
+    destination = str(next(iter(paths.values())))
+    assert destination in stale_reads
+    assert destination in refreshed
+    assert destination in fsynced
+    assert str(Path(destination).parent) in fsynced
+
+
+def test_unsupported_directory_fsync_does_not_block_hydration(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    real_fstat = os.fstat
+    real_fsync = os.fsync
+
+    def fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(real_fstat(descriptor).st_mode):
+            raise OSError(errno.EINVAL, "directory fsync is unsupported")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(materialize_module, "_forced_directory_times", lambda _descriptor: None)
+
+    assert hydrate_manifest(
+        manifest,
+        tmp_path / "cache",
+        token_fd=_token_fd(),
+        snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+    )
+
+
+def test_directory_fsync_io_failure_blocks_hydration(monkeypatch, tmp_path: Path) -> None:
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    real_fstat = os.fstat
+    real_fsync = os.fsync
+
+    def fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(real_fstat(descriptor).st_mode):
+            raise OSError(errno.EIO, "directory fsync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+
+    with pytest.raises(MaterializationError, match="could not be synchronized"):
+        hydrate_manifest(
+            manifest,
+            tmp_path / "cache",
+            token_fd=_token_fd(),
+            snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+        )
+
+
+def test_transient_directory_mutation_during_validation_is_detected(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+    paths = hydrate_manifest(
+        manifest,
+        cache,
+        token_fd=_token_fd(),
+        snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+    )
+    destination = next(iter(paths.values()))
+    real_fstat = os.fstat
+    real_validate = materialize_module.validate_adapter_weight_structure
+    mutation_complete = False
+
+    def mutate_between_passes(*args, **kwargs) -> None:
+        nonlocal mutation_complete
+        real_validate(*args, **kwargs)
+        marker = destination / ".transient-entry"
+        marker.write_bytes(b"transient")
+        marker.unlink()
+        mutation_complete = True
+
+    def forced_times(descriptor: int) -> tuple[int, int]:
+        details = real_fstat(descriptor)
+        offset = int(mutation_complete and _descriptor_path(descriptor) == str(destination))
+        return details.st_mtime_ns + offset, details.st_ctime_ns + offset
+
+    monkeypatch.setattr(
+        materialize_module, "validate_adapter_weight_structure", mutate_between_passes
+    )
+    monkeypatch.setattr(materialize_module, "_forced_directory_times", forced_times)
+
+    with pytest.raises(MaterializationError, match="changed during validation"):
+        validate_manifest_cache(manifest, cache)
 
 
 def test_hydrate_forwards_exact_source_patterns_and_closes_token_fd(tmp_path: Path, capsys) -> None:
