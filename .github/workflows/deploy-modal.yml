@@ -205,7 +205,17 @@ jobs:
         run: |
           supabase_url="${SUPABASE_URL:-$NEXT_PUBLIC_SUPABASE_URL}"
           service_role_key="${SUPABASE_SERVICE_ROLE_KEY:-$SUPABASE_SECRET_KEY}"
-          endpoint="${supabase_url%/}/rest/v1/hosted_lora_adapters?select=id&limit=1"
+          # probe the columns the runtime actually reads, not `id` -- which is not even among them.
+          # selecting only `id` proved the TABLE exists while a schema still missing, say,
+          # `deployment_generation` passed this gate and then failed on every read after deploy.
+          # read the list from the source of truth so it cannot drift away from persistence.py.
+          if ! columns="$(python -c 'from flash.serving.src.persistence import _PERSISTED_COLUMNS; print(_PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
+            # failing closed matters here: an empty list would degrade the query back to a bare
+            # existence check and this gate would pass while proving nothing.
+            echo "::error::Could not read _PERSISTED_COLUMNS; refusing to deploy against an unverified schema."
+            exit 1
+          fi
+          endpoint="${supabase_url%/}/rest/v1/hosted_lora_adapters?select=${columns}&limit=1"
           deadline=$((SECONDS + 300))
 
           while true; do
@@ -252,7 +262,9 @@ jobs:
                 echo "::error::Production Supabase schema readiness check was rejected with HTTP ${status}."
                 exit 1
                 ;;
-              000|404|406|5??)
+              000|400|404|406|5??)
+                # 400 is postgrest rejecting an unknown column: the migration that adds it has not
+                # landed yet. that is precisely the condition this gate exists to wait through.
                 echo "Production Supabase schema is not ready yet (HTTP ${status}); retrying."
                 ;;
               *)
