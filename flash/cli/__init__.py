@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import difflib
 import math
-import re
 import shlex
 import sys
-from collections.abc import Iterable
 from typing import NoReturn
 
 from flash import __version__
@@ -57,6 +54,14 @@ from flash.cli.commands.traces import (
     RAW_EXPORT_PATH,
     RECORDS_FORMAT,
     cmd_traces_export,
+)
+
+# `_ThemedParser.error` calls all three below, and re-exporting them here is also how the CLI error
+# tests reach the suggestion logic as `cli._friendly_message`.
+from flash.cli.errors import (
+    _friendly_message,
+    _parser_options,
+    _root_only_options,
 )
 from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
@@ -171,59 +176,6 @@ def _gpu_count_override(value: str) -> str:
         raise argparse.ArgumentTypeError(f"expected a number of gpus, got {value!r}") from None
 
 
-def _friendly_message(message: str, options: Iterable[str] = ()) -> str:
-    """Shorten argparse's verbose errors into concise suggestions on the styled path.
-
-    An ``invalid choice: 'x' (choose from a, b, c, ...)`` becomes ``unknown command 'x' (did you
-    mean 'y'?)`` instead of dumping the whole list. An ``unrecognized arguments: --flag value``
-    suggests the closest option registered on the parser that rejected it. Other messages pass
-    through untouched. The machine path keeps argparse's exact text for scripts and error tests.
-    """
-    m = re.search(r"invalid choice: '([^']*)'(?: \(choose from (.*)\))?", message)
-    if m:
-        bad, raw_choices = m.group(1), m.group(2) or ""
-        choices = [c.strip().strip("'\"") for c in raw_choices.split(",") if c.strip()]
-        near = difflib.get_close_matches(bad, choices, n=1)
-        return f"unknown command '{bad}'" + (f" (did you mean '{near[0]}'?)" if near else "")
-
-    prefix = "unrecognized arguments: "
-    if not message.startswith(prefix):
-        return message
-    bad = next(
-        (
-            token.split("=", 1)[0]
-            for token in message[len(prefix) :].split()
-            if token.startswith("-")
-        ),
-        None,
-    )
-    if bad is None:
-        return message
-    # the candidate pool spans every subcommand's flags, so a flag that is real SOMEWHERE else
-    # reaches this suggestion: `flash login --repository X` would otherwise answer "did you mean
-    # '--repository'?" -- echoing the token the user just typed as its own correction. dropping the
-    # exact token keeps the suggestion to flags that differ from what was rejected.
-    candidates = [option for option in options if option != bad]
-    near = difflib.get_close_matches(bad, candidates, n=1)
-    if not near:
-        return message
-    return f"unrecognized argument '{bad}' (did you mean '{near[0]}'?)"
-
-
-def _parser_options(parser: argparse.ArgumentParser) -> Iterable[str]:
-    """Yield option strings registered on a parser and its subparsers.
-
-    argparse returns a subparser's unknown tokens to the root, which raises the final
-    ``unrecognized arguments`` error. Walking descendants keeps that root error aware of the
-    selected command's real flags without maintaining a second option registry.
-    """
-    for action in parser._actions:
-        yield from action.option_strings
-        if isinstance(action, argparse._SubParsersAction):
-            for subparser in action.choices.values():
-                yield from _parser_options(subparser)
-
-
 class _ThemedParser(argparse.ArgumentParser):
     """Base parser whose usage errors match the rest of the themed CLI.
 
@@ -243,7 +195,12 @@ class _ThemedParser(argparse.ArgumentParser):
         # themed twin: the red ✗ error line (same idiom as main()'s catch-all and `flash login`),
         # then a dimmed pointer at this parser's own --help instead of the raw usage block. unknown
         # commands and flags get a short "did you mean" suggestion (see _friendly_message).
-        print(render.error(_friendly_message(message, _parser_options(self))), file=sys.stderr)
+        print(
+            render.error(
+                _friendly_message(message, _parser_options(self), _root_only_options(self))
+            ),
+            file=sys.stderr,
+        )
         # dimmed pointer at THIS parser's own --help (argparse sets prog per parser: `flash --help`
         # for the root, `flash <cmd> --help` for a subcommand) instead of the raw usage block.
         print(render.arrow(f"run `{self.prog} --help` for usage"), file=sys.stderr)

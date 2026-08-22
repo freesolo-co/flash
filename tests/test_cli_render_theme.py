@@ -518,6 +518,38 @@ def test_flag_valid_on_another_command_is_not_suggested_to_itself(monkeypatch, c
     assert "did you mean '--repository'" not in err
 
 
+def test_a_root_flag_suggestion_says_where_the_flag_goes(monkeypatch, capsys) -> None:
+    """A correction the user cannot follow is not a correction.
+
+    Root flags parse only before the subcommand, so `flash login --verbos` -> "did you mean
+    '--verbose'?" sends the user to `flash login --verbose`, which fails identically. The suggestion
+    has to carry the position, since that is the actual difference between working and not.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", "--verbos"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "did you mean '--verbose'" in err
+    assert "it goes before the command" in err
+    assert "flash --verbose <command>" in err
+
+
+def test_a_subcommand_flag_suggestion_is_not_given_a_reposition_hint(monkeypatch, capsys) -> None:
+    """Only root-only flags need repositioning; a subcommand's own flag is already in place."""
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["runs", "log", "flash-1", "--folow"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "did you mean '--follow'" in err
+    assert "it goes before the command" not in err
+
+
 def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("COLORTERM", "truecolor")
