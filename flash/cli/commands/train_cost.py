@@ -233,8 +233,13 @@ def _print_reasoning_loss_warning(status: object) -> None:
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
-def _print_published_sft_environment_note(status: object) -> None:
-    """Attribute SFT preview counts to the exact published environment that produced them."""
+def _print_published_sft_environment_note(status: object, spec=None) -> None:
+    """Attribute SFT preview counts to whatever actually produced them.
+
+    Which is not always the published package: inline `[environment.params] records` are read from
+    the request body instead, and telling that user to publish local files would send them to fix
+    something the counts never came from.
+    """
     profile = status.get("workload_profile") if isinstance(status, dict) else None
     if not isinstance(profile, dict):
         return
@@ -245,7 +250,7 @@ def _print_published_sft_environment_note(status: object) -> None:
     if not isinstance(revision, str) or not revision.strip():
         return
 
-    from flash.envs.identity import is_managed_environment_slug
+    from flash.envs.identity import is_github_environment_ref, is_managed_environment_slug
 
     source = profile.get("source_examples")
     source_suffix = (
@@ -255,6 +260,17 @@ def _print_published_sft_environment_note(status: object) -> None:
     )
     environment_id = environment_id.strip()
     revision = revision.strip()
+    params = getattr(getattr(spec, "environment", None), "params", None)
+    if isinstance(params, dict) and params.get("records") is not None:
+        # the rows were submitted inline, so the resolved package supplied the environment but not
+        # the dataset. naming the published copy as their source would be simply wrong.
+        message = (
+            f"environment: {environment_id} @ {revision[:12]}{source_suffix}. SFT dataset counts "
+            "come from the inline [environment.params] records in this config, not from the "
+            "published environment's dataset files."
+        )
+        print(render.note(message) if render.styled() else message, file=sys.stderr)
+        return
     message = (
         f"published environment: {environment_id} @ {revision[:12]}{source_suffix}. "
         "SFT dataset counts come from this resolved published copy, not local files."
@@ -263,6 +279,15 @@ def _print_published_sft_environment_note(status: object) -> None:
         message += (
             f" For this managed id, that copy is the last successful `{_commands().CLI_NAME} env "
             "push`; push again after local dataset edits."
+        )
+    elif is_github_environment_ref(environment_id):
+        # the plane resolves this ref from the REMOTE repository, so a local commit is invisible to
+        # it until pushed. for a branch ref the id does not change at all, which is why "update the
+        # id" was the wrong instruction: it is unnecessary here and, if taken as pinning a new sha,
+        # names a commit the remote does not have yet.
+        message += (
+            " Push the commit to the remote branch this ref resolves, then update [environment] id "
+            "only to pin a different ref."
         )
     else:
         message += " Commit local dataset edits and update [environment] id before relying on them."
@@ -285,7 +310,7 @@ def _print_sft_cost(status: dict, spec) -> None:
             if value is not None:
                 print(f"{key.ljust(8)}: {value}")
         print(f"{'TOTAL'.ljust(8)}: ${float(total):.2f}")
-    _print_published_sft_environment_note(status)
+    _print_published_sft_environment_note(status, spec)
     print(
         "tokens, retained rows, truncation, and optimizer steps are estimated from packaged "
         "input/output fields plus contract_text, contract_path, or TRAINING_CONTRACT.md. other "

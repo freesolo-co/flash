@@ -1351,6 +1351,62 @@ def test_train_dry_run_attributes_sft_counts_to_the_published_environment(
     assert "flash env push" in captured.err
 
 
+def test_inline_records_are_not_attributed_to_the_published_dataset(monkeypatch, capsys) -> None:
+    """Inline `records` are read from the request body, not the resolved package.
+
+    Reporting them as the published copy's counts sends the user to publish dataset files that had
+    no part in producing the numbers they are looking at.
+    """
+    from types import SimpleNamespace
+
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    status = {
+        "workload_profile": {
+            "environment_id": "owner/project/env",
+            "environment_revision": "a" * 40,
+            "source_examples": 3,
+        }
+    }
+    spec = SimpleNamespace(environment=SimpleNamespace(params={"records": [{"input": "x"}]}))
+
+    train_cost._print_published_sft_environment_note(status, spec)
+
+    err = capsys.readouterr().err
+    assert "inline [environment.params] records" in err
+    assert "not from the published environment's dataset files" in err
+    assert "env push" not in err
+
+
+def test_a_github_ref_is_told_to_push_not_to_edit_its_id(monkeypatch, capsys) -> None:
+    """The plane resolves a `github:` ref from the REMOTE, so a local commit is invisible until pushed.
+
+    For a branch ref the id does not change at all, so "update [environment] id" was both
+    unnecessary and, read as pinning a new sha, a commit the remote does not yet have.
+    """
+    from types import SimpleNamespace
+
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    status = {
+        "workload_profile": {
+            "environment_id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+            "environment_revision": "b" * 40,
+            "source_examples": 12,
+        }
+    }
+
+    train_cost._print_published_sft_environment_note(
+        status, SimpleNamespace(environment=SimpleNamespace(params={}))
+    )
+
+    err = capsys.readouterr().err
+    assert "Push the commit to the remote branch this ref resolves" in err
+    assert "only to pin a different ref" in err
+
+
 def test_train_dry_run_sends_declared_runtime_secrets(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:
