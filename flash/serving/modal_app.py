@@ -152,23 +152,35 @@ TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
 BUFFER_CONTAINERS = 0
 
 
-def _runtime_secret() -> modal.Secret | None:
+# the single shared internal key + backend url. FREESOLO_INTERNAL_KEY guards /adapters,
+# authenticates serving's calls to the backend (metering + POST /api/serving/authorize), and is the
+# trusted-caller bypass for always-enforced external chat. both must be set so the usage reporter
+# and the chat authorizer are wired.
+#
+# router only. nothing reachable from the engine class reads either one: `.internal_key` and
+# `.backend_url` are read in src/context.py (request auth) and in the router-side helpers below,
+# and lora_engine never imports context. the engines run with trust_remote_code=True, so shipping
+# the trusted-caller bypass credential into a container that executes model code would hand it to
+# code that has no use for it.
+_ROUTER_ONLY_NAMES = ("PLATFORM_BACKEND_URL", "FREESOLO_INTERNAL_KEY")
+
+
+def _runtime_values() -> dict[str, str]:
     names = (
         "HF_API_KEY",
         "HF_TOKEN",
         "SERVING_DEPLOYMENT_MODE",
         "SERVING_CUSTOM_DOMAIN",
-        # The single shared internal key + backend URL. FREESOLO_INTERNAL_KEY guards /adapters,
-        # authenticates serving's calls to the backend (metering + POST /api/serving/authorize), and
-        # is the trusted-caller bypass for always-enforced external chat. Both MUST be set so the
-        # usage reporter and the chat authorizer are wired.
-        "PLATFORM_BACKEND_URL",
-        "FREESOLO_INTERNAL_KEY",
+        *_ROUTER_ONLY_NAMES,
         # immutable deployment provenance and attempt identity used by the public readiness endpoint.
         "FREESOLO_DEPLOYMENT_SHA",
         "FREESOLO_DEPLOYMENT_ID",
         "SUPABASE_PROJECT_REF",
         "SUPABASE_PROJECT_REF_DEV",
+        # the engine needs these too, not just the router: _load hydrates its adapter registry at
+        # cold start through _load_adapters_for_base -> persistence.load_adapters, which returns an
+        # empty list when `has_supabase` is false. dropping them from the engine would not raise,
+        # it would silently serve an engine that knows about no adapters.
         "SUPABASE_URL",
         "SUPABASE_SERVICE_ROLE_KEY",
         # Only credentials/wiring are forwarded. All autoscaling/container config (min/max/buffer
@@ -188,11 +200,26 @@ def _runtime_secret() -> modal.Secret | None:
         values["SUPABASE_SERVICE_ROLE_KEY"] = k
     if "HF_TOKEN" not in values and (token := values.get("HF_API_KEY")):
         values["HF_TOKEN"] = token
+    return values
+
+
+def _secret_from(values: dict[str, str]) -> modal.Secret | None:
     return modal.Secret.from_dict(values) if values else None
+
+
+def _runtime_secret() -> modal.Secret | None:
+    return _secret_from(_runtime_values())
+
+
+def _engine_secret() -> modal.Secret | None:
+    return _secret_from({k: v for k, v in _runtime_values().items() if k not in _ROUTER_ONLY_NAMES})
 
 
 runtime_secret = _runtime_secret()
 runtime_secrets = [runtime_secret] if runtime_secret is not None else []
+
+engine_secret = _engine_secret()
+engine_secrets = [engine_secret] if engine_secret is not None else []
 
 image = (
     # cuda 13, not 12.8: `serve-runtime` below pins vllm 0.23.0, which requires torch 2.11.0, whose
@@ -394,7 +421,7 @@ def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int
     globals()[class_name] = _Engine
     engine = app.cls(
         gpu=gpu,
-        secrets=runtime_secrets,
+        secrets=engine_secrets,
         volumes={HOSTING_CACHE_MOUNT: hf_cache_volume},
         scaledown_window=scaledown_window_for(gpu),
         startup_timeout=STARTUP_TIMEOUT_SECONDS,
