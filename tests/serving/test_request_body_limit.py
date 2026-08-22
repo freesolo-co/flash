@@ -8,15 +8,20 @@ from flash.serving.src.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.router import AdapterRouter, build_serving_app
 
 
-def _scope(headers: list[tuple[bytes, bytes]]) -> dict[str, Any]:
+def _scope(
+    headers: list[tuple[bytes, bytes]],
+    *,
+    method: str = "POST",
+    path: str = "/v1/chat/completions",
+) -> dict[str, Any]:
     return {
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
-        "method": "POST",
+        "method": method,
         "scheme": "https",
-        "path": "/v1/chat/completions",
-        "raw_path": b"/v1/chat/completions",
+        "path": path,
+        "raw_path": path.encode("ascii"),
         "query_string": b"",
         "root_path": "",
         "headers": headers,
@@ -59,6 +64,35 @@ def test_hosted_app_rejects_declared_oversize_before_reading_body() -> None:
     response_start = _response_start(sent)
     assert response_start["status"] == 413
     _assert_connection_close(response_start)
+
+
+def test_hosted_healthz_dispatches_without_consuming_chunked_body() -> None:
+    app = build_serving_app(object(), AdapterRouter(), internal_key="synthetic-internal-key")
+    sent: list[dict[str, Any]] = []
+    receive_calls = 0
+
+    async def receive() -> dict[str, Any]:
+        nonlocal receive_calls
+        receive_calls += 1
+        raise AssertionError("healthz body must not be consumed")
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    asyncio.run(
+        app(
+            _scope(
+                [(b"transfer-encoding", b"chunked")],
+                method="GET",
+                path="/healthz",
+            ),
+            receive,
+            send,
+        )
+    )
+
+    assert receive_calls == 0
+    assert _response_start(sent)["status"] == 200
 
 
 def test_hosted_app_caps_chunked_body_without_reading_past_rejection(monkeypatch) -> None:

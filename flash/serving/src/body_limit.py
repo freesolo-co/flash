@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from collections import deque
+from contextlib import suppress
 from typing import Any
 
 from fastapi.responses import JSONResponse
+
+
+class _RequestBodyTooLarge(Exception):
+    pass
 
 
 class RequestBodyLimitMiddleware:
@@ -21,26 +25,33 @@ class RequestBodyLimitMiddleware:
             await _too_large_response(scope, receive, send)
             return
 
-        buffered: deque[dict[str, Any]] = deque()
         observed = 0
-        while True:
+        overflowed = False
+        rejection_sent = False
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal observed, overflowed
             message = await receive()
-            buffered.append(message)
-            if message["type"] != "http.request":
-                break
-            observed += len(message.get("body", b""))
-            if observed > self.max_bytes:
-                await _too_large_response(scope, receive, send)
+            if message["type"] == "http.request":
+                observed += len(message.get("body", b""))
+                if observed > self.max_bytes:
+                    overflowed = True
+                    raise _RequestBodyTooLarge
+            return message
+
+        async def limited_send(message: dict[str, Any]) -> None:
+            nonlocal rejection_sent
+            if not overflowed:
+                await send(message)
                 return
-            if not message.get("more_body", False):
-                break
+            if not rejection_sent:
+                rejection_sent = True
+                await _too_large_response(scope, receive, send)
 
-        async def replay_receive() -> dict[str, Any]:
-            if buffered:
-                return buffered.popleft()
-            return await receive()
-
-        await self.app(scope, replay_receive, send)
+        with suppress(_RequestBodyTooLarge):
+            await self.app(scope, limited_receive, limited_send)
+        if overflowed and not rejection_sent:
+            await _too_large_response(scope, receive, send)
 
 
 def _declared_oversize(headers: list[tuple[bytes, bytes]], max_bytes: int) -> bool:
