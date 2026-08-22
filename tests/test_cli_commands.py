@@ -1531,31 +1531,54 @@ def test_log_reads_no_status_when_there_are_no_artifacts_to_label(
     assert calls == []
 
 
-def test_log_labels_artifacts_against_a_retry_that_starts_mid_command(
+def test_log_reads_no_status_and_prints_nothing_when_all_artifacts_are_empty(
     fake_client, capsys, monkeypatch
 ) -> None:
-    """The attempt is resolved after the artifacts, so a retry landing between them is reflected.
+    """Empty artifact values are not printable sections and must not trigger a status read."""
+    fake_client.log_text = ""
+    calls: list[str] = []
 
-    The worker endpoint returns the highest UPLOADED attempt, which during a retry is the attempt
-    that just died. Resolving the live attempt BEFORE fetching them would pin attempt 0 and then
-    label attempt-0 wreckage as current, which is exactly the confusion these headings exist to end.
-    """
-    attempts = iter([0, 1])
+    def get_run(_run_id):
+        calls.append("get_run")
+        return {"run_id": "flash-1", "state": "running", "remote": {"attempt": 1}}
 
-    def get_worker_output(_run_id):
-        # the retry begins here: after the caller asked for artifacts, before the heading resolves.
-        next(attempts)
-        return {"error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n"}
-
-    monkeypatch.setattr(fake_client, "get_worker_output", get_worker_output)
+    monkeypatch.setattr(fake_client, "get_run", get_run)
     monkeypatch.setattr(
         fake_client,
-        "get_run",
-        lambda _run_id: {"run_id": "flash-1", "state": "running", "remote": {"attempt": 1}},
+        "get_worker_output",
+        lambda _run_id: {
+            "console_rl_attempt1.txt": "",
+            "error_rl_attempt1.txt": "",
+        },
     )
 
     assert _run(["runs", "log", "flash-1"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert calls == []
+
+
+def test_log_labels_artifacts_against_a_retry_that_starts_mid_command(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """Artifact acquisition must precede the status snapshot used for its heading."""
+    events: list[str] = []
+
+    def get_worker_output(_run_id):
+        events.append("artifacts")
+        return {"error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n"}
+
+    def get_run(_run_id):
+        events.append("status")
+        return {"run_id": "flash-1", "state": "running", "remote": {"attempt": 1}}
+
+    monkeypatch.setattr(fake_client, "get_worker_output", get_worker_output)
+    monkeypatch.setattr(fake_client, "get_run", get_run)
+
+    assert _run(["runs", "log", "flash-1"]) == 0
     out = capsys.readouterr().out
+    assert events == ["artifacts", "status"]
     assert (
         "----- error_rl_attempt0.txt (attempt=0, previous attempt; current attempt=1) -----" in out
     )
@@ -1711,6 +1734,21 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
     assert "following logs for flash-spin (queued)" in err
     assert "\r" in err
     assert err.endswith("\r")
+
+
+def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> None:
+    class _AttemptClient(_FakeClient):
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
+
+        def get_run(self, run_id: str) -> dict:
+            return {"run_id": run_id, "state": "done", "remote": {"attempt": 1}}
+
+    result = cli.commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
+
+    assert result == cli.commands._LogPollResult("done", False, 1)
+    assert result.live_attempt == 1
+    assert capsys.readouterr().out == ""
 
 
 def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys) -> None:
