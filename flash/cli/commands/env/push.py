@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Literal, TypeAlias
 from flash._internal.channel import CLI_NAME
 from flash.cli.ui import render
 from flash.cli.ui.tty import TtyStatusLine
+from flash.envs.package.limits import ARCHIVE_MEMBER_LIMIT as _ENV_PUSH_MAX_FILES
 
 if TYPE_CHECKING:
     from flash.client.http import ProgressCallback
@@ -335,11 +336,6 @@ _ENV_PUSH_SECRET_PATTERNS = (
 # to catch backup variants (credentials_backup, id_rsa_backup) without eating code or packages.
 _ENV_PUSH_CODE_SUFFIXES = frozenset({".py", ".pyi"})
 _ENV_PUSH_MAX_TOTAL_BYTES = 256 * 1024 * 1024
-
-try:
-    from flash.envs.package.limits import ARCHIVE_MEMBER_LIMIT as _ENV_PUSH_MAX_FILES
-except ImportError:
-    _ENV_PUSH_MAX_FILES = 5000
 
 
 def _normalize_env_name(raw: str) -> str | None:
