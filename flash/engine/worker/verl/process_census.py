@@ -91,8 +91,13 @@ def _stable_children(identity: _ProcessIdentity) -> set[int] | _VanishedProcess 
         task_children = _read_task_children(identity.pid, task_id)
         if task_children is None:
             # a rollout tree churns threads, so one task listed by `_list_task_ids` can exit
-            # before its `children` file is read while the process itself stays alive. that
-            # thread's descendants left with it, so skipping it is exact rather than lossy.
+            # before its `children` file is read while the process itself stays alive. the
+            # departed thread's children do NOT leave with it -- linux reparents them within the
+            # same thread group, so they resurface under a sibling task's `children` and this walk
+            # still counts them. skipping the unreadable task can undercount only if every
+            # remaining sibling is also read before the reparent lands, which costs one low
+            # census sample of a metric, never a wrong decision: `host_census/*` is published as
+            # step telemetry (rl_train_runner) and gates nothing.
             # only a thread that is STILL PRESENT and unreadable makes the walk unusable.
             if not _task_present(identity.pid, task_id):
                 continue
