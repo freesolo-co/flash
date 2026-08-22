@@ -115,7 +115,7 @@ def _client_train_schema(authored_train_keys: frozenset[str]) -> dict:
 
 
 def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
-    """Rows describing the packaged-dataset estimate behind an SFT quote.
+    """Rows describing the published packaged-dataset estimate behind an SFT quote.
 
     Only aggregates the server actually returned are shown. A field that is absent is dropped
     rather than defaulted, so the panel never reports a count the profile did not compute.
@@ -125,19 +125,29 @@ def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
         value = profile.get(key)
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
+    def text(key: str) -> str:
+        value = profile.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
     steps = count("authoritative_steps")
+    source = count("source_examples")
     retained, selected = count("retained_examples"), count("selected_examples")
     dropped = count("dropped_examples")
     compute, supervised = (
         count("authoritative_compute_tokens"),
         count("authoritative_supervised_tokens"),
     )
-    packing = str(profile.get("packing_mode") or "")
-    architecture = str(profile.get("architecture_mode") or "")
-    digest = str(profile.get("content_digest") or "")
+    packing = text("packing_mode")
+    architecture = text("architecture_mode")
+    environment_id = text("environment_id")
+    environment_revision = text("environment_revision")
+    digest = text("content_digest")
     examples = None
     if retained is not None and selected is not None:
-        examples = f"{retained:,} trained of {selected:,} selected"
+        examples = f"{retained:,} trained of {selected:,} selected from "
+        examples += (
+            f"{source:,} source rows in published copy" if source is not None else "published copy"
+        )
         if dropped:
             examples += f" ({dropped:,} dropped)"
     tokens = None
@@ -147,10 +157,15 @@ def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
             tokens += f", {supervised:,} supervised"
     return [
         ("run", f"{spec.model}  [SFT{f', {steps} steps' if steps is not None else ''}]"),
+        ("env", f"published environment {environment_id}" if environment_id else None),
+        (
+            "revision",
+            f"{environment_revision[:12]} (published commit)" if environment_revision else None,
+        ),
         ("workload", f"{packing} ({architecture})" if packing and architecture else None),
         ("examples", examples),
         ("tokens", tokens),
-        ("profile", digest[:12] or None),
+        ("digest", digest[:12] or None),
     ]
 
 
@@ -218,6 +233,42 @@ def _print_reasoning_loss_warning(status: object) -> None:
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
+def _print_published_sft_environment_note(status: object) -> None:
+    """Attribute SFT preview counts to the exact published environment that produced them."""
+    profile = status.get("workload_profile") if isinstance(status, dict) else None
+    if not isinstance(profile, dict):
+        return
+    environment_id = profile.get("environment_id")
+    revision = profile.get("environment_revision")
+    if not isinstance(environment_id, str) or not environment_id.strip():
+        return
+    if not isinstance(revision, str) or not revision.strip():
+        return
+
+    from flash.envs.identity import is_managed_environment_slug
+
+    source = profile.get("source_examples")
+    source_suffix = (
+        f" ({source:,} source rows)"
+        if isinstance(source, int) and not isinstance(source, bool)
+        else ""
+    )
+    environment_id = environment_id.strip()
+    revision = revision.strip()
+    message = (
+        f"published environment: {environment_id} @ {revision[:12]}{source_suffix}. "
+        "SFT dataset counts come from this resolved published copy, not local files."
+    )
+    if is_managed_environment_slug(environment_id):
+        message += (
+            f" For this managed id, that copy is the last successful `{_commands().CLI_NAME} env "
+            "push`; push again after local dataset edits."
+        )
+    else:
+        message += " Commit local dataset edits and update [environment] id before relying on them."
+    print(render.note(message) if render.styled() else message, file=sys.stderr)
+
+
 def _print_sft_cost(status: dict, spec) -> None:
     total = status.get("estimated_cost_usd") if isinstance(status, dict) else None
     if not isinstance(total, (int, float)) or isinstance(total, bool):
@@ -234,6 +285,7 @@ def _print_sft_cost(status: dict, spec) -> None:
             if value is not None:
                 print(f"{key.ljust(8)}: {value}")
         print(f"{'TOTAL'.ljust(8)}: ${float(total):.2f}")
+    _print_published_sft_environment_note(status)
     print(
         "tokens, retained rows, truncation, and optimizer steps are estimated from packaged "
         "input/output fields plus contract_text, contract_path, or TRAINING_CONTRACT.md. other "

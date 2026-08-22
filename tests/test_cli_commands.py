@@ -1322,6 +1322,35 @@ def test_train_dry_run_keeps_compatibility_on_stderr(
     assert call[1]["train"] == {"epochs": 1, "max_examples": 2}
 
 
+def test_train_dry_run_attributes_sft_counts_to_the_published_environment(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    original_create_run = fake_client.create_run
+
+    def create_run_with_profile(*args, **kwargs):
+        response = original_create_run(*args, **kwargs)
+        response["workload_profile"] = {
+            "environment_id": "owner/project/env",
+            "environment_revision": "a" * 40,
+            "source_examples": 125,
+        }
+        return response
+
+    monkeypatch.setattr(fake_client, "create_run", create_run_with_profile)
+
+    assert _run(["train", str(_train_config(tmp_path)), "--dry-run"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["workload_profile"]["environment_id"] == "owner/project/env"
+    assert payload["workload_profile"]["environment_revision"] == "a" * 40
+    assert (
+        "published environment: owner/project/env @ aaaaaaaaaaaa (125 source rows)" in captured.err
+    )
+    assert "dataset counts come from this resolved published copy, not local files" in captured.err
+    assert "flash env push" in captured.err
+
+
 def test_train_dry_run_sends_declared_runtime_secrets(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:

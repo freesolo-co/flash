@@ -424,6 +424,8 @@ def cmd_train(args) -> int:
             )
         else:
             print(json.dumps(status, indent=2))
+        if spec.algorithm == "sft":
+            _print_published_sft_environment_note(status)
         _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
         print_status_prompt_budget_warning(status)
         _print_reasoning_loss_warning(status)
@@ -953,6 +955,7 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _cmd_train_cost,
     _cmd_train_cost_offline,
     _cmd_train_cost_sft,
+    _print_published_sft_environment_note,
     _print_reasoning_loss_warning,
     _print_sft_cost,
     _print_train_schema_compatibility,
