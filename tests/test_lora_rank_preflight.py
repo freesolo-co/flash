@@ -47,6 +47,11 @@ def _config(**overrides):
         "base_model_name_or_path": "Qwen/Qwen3.5-4B",
         "r": 16,
         "lora_alpha": 32,
+        # every peft>=0.19 save carries this key, null for a multimodal run, so a config without it
+        # is not a shape any supported writer produces. present here because submit rejects an
+        # unmarked adapter outright: omitting it would make these rank/alpha cases exercise that
+        # rejection instead of what they are about.
+        "exclude_modules": None,
     }
     config.update(overrides)
     return config
@@ -620,6 +625,28 @@ def test_submit_rejects_fused_config_before_rank_preflight(monkeypatch):
         preparation._prepare_init_from_adapter_inner(target_spec)
 
     assert events == [("load", config), ("validate", config)]
+
+
+def test_submit_rejects_an_unmarked_adapter_before_any_gpu_is_allocated(monkeypatch):
+    """An adapter with no modality marker must fail at submit, not on the rented GPU.
+
+    The marker decides which module surface the run trains, so an unmarked source is unusable by
+    every algorithm -- the answer never depends on anything only the worker knows. The worker still
+    re-checks the bytes it downloads; what this pins is that the control plane, which already holds
+    this exact config, does not defer a decision it can make for free into a paid allocation.
+    """
+    config = _config()
+    del config["exclude_modules"]
+    preparation, target_spec, events = _patch_fused_submit_preflight(
+        monkeypatch, config, reject_config=False
+    )
+
+    with pytest.raises(ValueError, match="required exclude_modules modality marker"):
+        preparation._prepare_init_from_adapter_inner(target_spec)
+
+    # rejected on the loaded config alone: nothing downstream ran, so no later stage can be what
+    # caught it and no allocation could have happened first.
+    assert events == [("load", config)]
 
 
 def test_submit_passes_the_loaded_config_to_validation_then_rank_preflight(monkeypatch):

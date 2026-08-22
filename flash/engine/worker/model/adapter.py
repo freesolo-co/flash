@@ -14,7 +14,7 @@ from flash.adapters.fused_experts import (
     validate_fused_expert_adapter_config,
 )
 from flash.adapters.lora_rank import resolve_adapter_ref
-from flash.adapters.targets import LoraTargeting, resolve_lora_targeting
+from flash.adapters.targets import LoraTargeting, require_modality_marker, resolve_lora_targeting
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.worker.io.hf import (
     RetriableInfraError,
@@ -40,11 +40,10 @@ def validate_warmstart_adapter(
     targeting: LoraTargeting | None = None,
 ) -> None:
     """Validate a downloaded warm-start adapter without changing its config or files."""
-    if "exclude_modules" not in config:
-        raise ValueError(
-            "warm-start adapter is missing the required exclude_modules modality marker; "
-            "unmarked artifacts are unsupported"
-        )
+    # the same rejection the control plane already made at submit time, repeated on the bytes this
+    # worker actually downloaded. not redundant: the two never share a call stack, so only this
+    # call sees the config the trainer will load.
+    require_modality_marker(config, source="warm-start adapter")
     tensors: Mapping[str, tuple[int, ...]] | None = None
     source_is_multimodal = config.get("exclude_modules") is None
     if targeting is not None:

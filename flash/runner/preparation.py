@@ -173,6 +173,7 @@ def _prepare_init_from_adapter_inner(
         preflight_init_adapter_lora_rank,
         resolve_hf_dataset_revision,
     )
+    from flash.adapters.targets import require_modality_marker
     from flash.runner.results.checkpoints import CheckpointListingError, adapter_artifact_exists
     from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
 
@@ -249,6 +250,10 @@ def _prepare_init_from_adapter_inner(
         ),
     )
     config = load_hf_adapter_config(storage, token, revision)
+    # here rather than only in the worker: this is the same config the worker will re-download and
+    # re-check, and an unmarked adapter is unusable by every algorithm, so deciding it now turns a
+    # post-allocation worker failure into a submit-time error and spends no GPU on a doomed run.
+    require_modality_marker(config, source=f"train.init_from_adapter source {ref!r}")
     validate_fused_expert_adapter_config(config, spec.model)
     metadata = preflight_init_adapter_lora_rank(
         worker_spec, token=token, config_loader=lambda _ref, _token, _revision: config
