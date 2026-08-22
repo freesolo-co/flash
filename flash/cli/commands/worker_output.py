@@ -42,15 +42,19 @@ def _worker_section_name(name: str, current_attempt: int | None) -> str:
     return f"{name} (attempt={attempt}, current attempt)"
 
 
-def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:
+def _print_worker_output(
+    client: ApiClient, run_id: str, *, printed_any: bool = False, current_attempt: int | None = None
+) -> bool:
+    """Print each worker artifact under a heading naming the attempt that produced it.
+
+    `current_attempt` is supplied by the caller rather than fetched here: the follow loop already
+    reads a status every tick, so fetching another inside the printer would both duplicate a request
+    and consume a status that loop is pacing itself against. None means the caller could not
+    establish it, and each section is then labelled with its own attempt alone.
+    """
     worker_output = client.get_worker_output(run_id) or {}
     if not worker_output:
         return printed_any
-    try:
-        current_attempt = render.live_attempt(client.get_run(run_id) or {})
-    except Exception:
-        # artifact text is best-effort diagnostic output; a status refresh failure must not hide it.
-        current_attempt = None
     for name, text in worker_output.items():
         if not text:
             continue

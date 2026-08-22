@@ -73,11 +73,11 @@ def test_follow_run_returns_success_and_failure_codes(monkeypatch, capsys) -> No
     """Following a run must print its final state and preserve terminal success semantics."""
     client = _Client(run={"run_id": "flash-1", "state": "done"})
     monkeypatch.setattr(commands, "_render_status", lambda status: f"final:{status['state']}")
-    monkeypatch.setattr(commands, "_poll_logs", lambda *args, **kwargs: ("done", False))
+    monkeypatch.setattr(commands, "_poll_logs", lambda *args, **kwargs: ("done", False, None))
     assert commands._follow_run(client, "flash-1") == 0
     assert capsys.readouterr().out == "final:done\n"
 
-    monkeypatch.setattr(commands, "_poll_logs", lambda *args, **kwargs: ("failed", False))
+    monkeypatch.setattr(commands, "_poll_logs", lambda *args, **kwargs: ("failed", False, None))
     assert commands._follow_run(client, "flash-1") == 1
     assert capsys.readouterr().out == "final:done\n"
 

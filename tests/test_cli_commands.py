@@ -1413,13 +1413,16 @@ def test_status_runs_and_log_command(fake_client, capsys, monkeypatch) -> None:
             {"run_id": "flash-1", "state": "done"},
         ]
     )
-    monkeypatch.setattr(fake_client, "get_run", lambda _run_id: next(statuses))
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
-    assert _run(["runs", "status", "flash-1", "--follow", "--json"]) == 0
-    assert [json.loads(line)["state"] for line in capsys.readouterr().out.splitlines()] == [
-        "running",
-        "done",
-    ]
+    with monkeypatch.context() as patched:
+        # scoped: this iterator holds exactly the two statuses this one assertion consumes, so
+        # letting it stay installed would starve every later command of a status it needs.
+        patched.setattr(fake_client, "get_run", lambda _run_id: next(statuses))
+        patched.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+        assert _run(["runs", "status", "flash-1", "--follow", "--json"]) == 0
+        assert [json.loads(line)["state"] for line in capsys.readouterr().out.splitlines()] == [
+            "running",
+            "done",
+        ]
 
     assert _run(["runs", "log", "flash-1"]) == 0
     out = capsys.readouterr().out
@@ -1481,6 +1484,33 @@ def test_log_labels_previous_attempt_artifacts_after_the_live_attempt_log(
     )
     assert out.index(live_line) < out.index(previous_header)
     assert 'HEARTBEAT {"stage":"rl_step","step":0,"attempt":0' in out
+
+
+def test_log_still_prints_artifacts_when_the_attempt_lookup_fails(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """A failed status read costs the heading, never the artifacts.
+
+    The artifacts hold the traceback the user ran this command to read. Losing them to a lookup
+    that only decorates a section header would hide the failure behind an unrelated one.
+    """
+    from flash.client import ClientError
+
+    def unavailable(_run_id):
+        raise ClientError("freesolo is unreachable")
+
+    monkeypatch.setattr(fake_client, "get_run", unavailable)
+    monkeypatch.setattr(
+        fake_client,
+        "get_worker_output",
+        lambda _run_id: {"error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n"},
+    )
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    out = capsys.readouterr().out
+    assert "torch.OutOfMemoryError: CUDA OOM" in out
+    # unlabelled against a live attempt, since none could be established -- but still attributed.
+    assert "----- error_rl_attempt0.txt (attempt=0) -----" in out
 
 
 def test_log_prints_partial_log_line_with_newline(fake_client, capsys) -> None:
@@ -1624,7 +1654,7 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
     monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
+    state, printed_any, _ = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
 
     assert state == "done"
     assert printed_any is True
@@ -1671,7 +1701,7 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
     monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any = cli.commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
+    state, printed_any, _ = cli.commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
 
     assert state == "done"
     assert printed_any is False
@@ -1744,7 +1774,7 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
 
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any = cli.commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
+    state, printed_any, _ = cli.commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
 
     assert state == "done"
     assert printed_any is False

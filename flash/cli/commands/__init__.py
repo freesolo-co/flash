@@ -599,12 +599,15 @@ def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
     return rows
 
 
-def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bool]:
+def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bool, int | None]:
     """Stream offset-paged logs until the run reaches a terminal state.
 
-    Returns (terminal state, whether any log bytes were printed)."""
+    Returns (terminal state, whether any log bytes were printed, the final live attempt). The
+    attempt rides along because this loop already reads the status that carries it; the caller
+    labels the worker-artifact sections with it rather than issuing another request."""
     offset = 0
     printed_any = False
+    attempt: int | None = None
     last_progress: str | None = None
     seen_metric_steps: set = set()
     spinner = _LogFollowSpinner(run_id)
@@ -620,6 +623,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bo
             # from the run status endpoint. The log page's embedded state is only a fallback for
             # older servers or test doubles.
             status = client.get_run(run_id)
+            attempt = render.live_attempt(status) if isinstance(status, dict) else attempt
             state, progress = _log_follow_progress(status, str(page.get("state") or ""))
             metric_rows = _log_follow_metric_rows(status, seen_metric_steps)
             if metric_rows:
@@ -628,7 +632,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bo
                     print(row, file=sys.stderr, flush=True)
             if state in _CLI_DONE_STATES:
                 spinner.clear()
-                return state, printed_any
+                return state, printed_any, attempt
             if not spinner.enabled and progress != last_progress:
                 print(f"status: {progress}", file=sys.stderr, flush=True)
                 last_progress = progress
@@ -677,7 +681,7 @@ def _print_detached_note(run_id: str) -> None:
 def _follow_run(client: ApiClient, run_id: str) -> int:
     """Poll logs until the run reaches a terminal state, then print the final status."""
     try:
-        state, _ = _poll_logs(client, run_id, interval=2.0)
+        state, _, _ = _poll_logs(client, run_id, interval=2.0)
     except KeyboardInterrupt:
         _print_detached_note(run_id)
         return 130
@@ -710,16 +714,24 @@ def cmd_log(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
         try:
-            state, printed_any = _poll_logs(client, args.run_id, interval=2.0)
+            state, printed_any, attempt = _poll_logs(client, args.run_id, interval=2.0)
         except KeyboardInterrupt:
             _print_detached_note(args.run_id)
             return 130
-        _print_worker_output(client, args.run_id, printed_any=printed_any)
+        _print_worker_output(client, args.run_id, printed_any=printed_any, current_attempt=attempt)
         return 0 if state in _OK_STATES else 1
     text = str(client.get_logs(args.run_id, offset=0).get("logs") or "")
     if text:
         print(text, end="" if text.endswith("\n") else "\n")
-    _print_worker_output(client, args.run_id, printed_any=bool(text))
+    try:
+        # only the heading depends on this. a failed lookup must not cost the user the artifacts,
+        # which carry the traceback that explains the failure they ran this command to read.
+        current_attempt = render.live_attempt(client.get_run(args.run_id) or {})
+    except ClientError:
+        current_attempt = None
+    _print_worker_output(
+        client, args.run_id, printed_any=bool(text), current_attempt=current_attempt
+    )
     return 0
 
 
