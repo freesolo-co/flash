@@ -558,16 +558,7 @@ def resolve_gpu_mem_util(
             # the backward. crediting an offload that never happens would size the pool against a
             # peak the run does not have.
             sleep_mode=not sleep_unsupported,
-            # the concurrent rollout is `prompts_per_step * group_size` (verl's
-            # `data.train_batch_size` x `rollout.n`), not one group. sizing the kv pool for a single
-            # group budgets 8 sequences where the default recipe issues 512, and the shortfall does
-            # not fail -- it queues on the cache, throttling the async rollout invisibly. that only
-            # became reachable here when multi-gpu runs stopped taking the flat reservation.
-            #
-            # `prompts_per_step` is defaulted rather than indexed: this whole block falls back to the
-            # flat reservation on ANY exception, so a missing key would not raise here -- it would
-            # silently switch sizing off and hand back the constant this change exists to replace.
-            num_generations=int(inp["group_size"]) * max(1, int(inp.get("prompts_per_step") or 1)),
+            num_generations=int(inp["group_size"]),
             active_params_b=float(getattr(info, "active_params_b", 0.0) or 0.0) or None,
             fp8_kv=fp8_kv,
             model_info=info,
