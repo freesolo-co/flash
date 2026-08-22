@@ -512,45 +512,42 @@ def adopt_existing_generation(
     clock: Clock,
     sleep: Sleeper,
 ) -> DeploymentResult | None:
-    """adopt a resource generation that may be only partly visible.
+    """adopt a resource generation that may not be visible yet.
 
-    runpod listings are eventually consistent, so a newly created resource can be invisible while
-    its siblings are already listed. A partial observation is an ordinary mid-create state, so once
-    any resource is seen this polls for the complete set. A genuinely empty account falls through
-    after the first observation without spending the discovery window.
+    runpod listings are eventually consistent, so both a partial and a fully empty observation can
+    be an ordinary mid-create state. Poll one discovery window before deciding the resources are
+    absent. A genuinely fresh create therefore waits through that bounded window, which prevents an
+    invisible existing pod from being mistaken for permission to rent a second one.
     """
 
-    observation = observe(plan)
-    saw_resource = observation.resource_count > 0
-    try:
-        complete = complete_resource_set(plan, observation)
-    except RunPodResourceConflict:
-        return failure_result(plan, LifecycleFailure("conflict"))
-    while saw_resource and not complete and sleep_until_poll(discovery_deadline_at, clock, sleep):
+    saw_resource = False
+    while True:
         observation = observe(plan)
         saw_resource = saw_resource or observation.resource_count > 0
         try:
             complete = complete_resource_set(plan, observation)
         except RunPodResourceConflict:
             return failure_result(plan, LifecycleFailure("conflict"))
-    if complete:
-        return await_ready_and_reclaim(
-            plan,
-            observe,
-            patch_template,
-            patch_pod,
-            delete_secret,
-            inference_token,
-            observation.artifact_secrets[0] if observation.artifact_secrets else None,
-            # adoption owns resources it did not create and has no ledger to undo, so an unproven
-            # pod is reported unknown rather than failed. see `read_only_reconcile`.
-            unproven_is_failure=False,
-            absent_after_deadline=False,
-            deadline_at=deadline_at,
-            probe=probe,
-            clock=clock,
-            sleep=sleep,
-        )
+        if complete:
+            return await_ready_and_reclaim(
+                plan,
+                observe,
+                patch_template,
+                patch_pod,
+                delete_secret,
+                inference_token,
+                observation.artifact_secrets[0] if observation.artifact_secrets else None,
+                # adoption owns resources it did not create and has no ledger to undo, so an unproven
+                # pod is reported unknown rather than failed. see `read_only_reconcile`.
+                unproven_is_failure=False,
+                absent_after_deadline=False,
+                deadline_at=deadline_at,
+                probe=probe,
+                clock=clock,
+                sleep=sleep,
+            )
+        if not sleep_until_poll(discovery_deadline_at, clock, sleep):
+            break
     if saw_resource:
         return unknown_result(plan, reason="readiness_deadline_unproven")
     return None

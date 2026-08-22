@@ -485,9 +485,10 @@ class _LateVisibleAmbiguousVolumeTransport(_FakeTransport):
 
 
 class _PartialThenCompleteTransport(_FakeTransport):
-    def __init__(self, *, post_create: bool = False) -> None:
+    def __init__(self, *, post_create: bool = False, fully_empty: bool = False) -> None:
         super().__init__()
         self.post_create = post_create
+        self.fully_empty = fully_empty
         self.observation_number = 0
         self.delete_observations: list[int] = []
 
@@ -511,7 +512,11 @@ class _PartialThenCompleteTransport(_FakeTransport):
     def _list(self, path: str) -> list[dict[str, object]]:
         rows = super()._list(path)
         if self._hide_first_observation():
-            rows = [] if self.post_create or path in {"/networkvolumes", "/pods"} else rows
+            rows = (
+                []
+                if self.post_create or self.fully_empty or path in {"/networkvolumes", "/pods"}
+                else rows
+            )
         if path == "/pods" and (not self.post_create or self.mutation_count >= 5):
             self.observation_number += 1
         return rows
@@ -1099,6 +1104,32 @@ def test_partial_adoption_waits_for_the_complete_resource_set() -> None:
     assert transport.observation_number >= 2
     assert _mutation_calls(transport) == []
     assert len(probe.calls) == 1
+
+
+def test_empty_then_complete_adoption_never_creates_a_duplicate_pod() -> None:
+    bundle = _bundle()
+    transport = _PartialThenCompleteTransport(fully_empty=True)
+    handle = _seed_exact(transport, bundle)
+    transport.calls.clear()
+
+    result, _factory, probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "ready"
+    assert result.handle == handle
+    assert transport.observation_number >= 2
+    assert _mutation_calls(transport) == [], "an invisible existing pod triggered a second create"
+    assert len(probe.calls) == 1
+
+
+def test_genuinely_empty_account_creates_after_the_discovery_window() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+
+    result, _factory, _probe = _provision(bundle, transport)
+
+    assert result.status == "ready"
+    assert transport.clock.now == 30.0
+    assert len([call for call in _mutation_calls(transport) if call[1] == "POST /pods"]) == 1
 
 
 def test_fresh_create_waits_through_an_empty_first_readiness_observation() -> None:
@@ -1883,7 +1914,7 @@ def test_initial_readiness_transient_observation_failure_uses_the_remaining_budg
     assert result.status == "ready"
     assert result.handle is not None
     assert result.handle.pod_id == POD_ID
-    assert transport.clock.now == 4.0, "a transient readiness read did not retry"
+    assert transport.clock.now == 34.0, "discovery and the transient readiness read did not retry"
     assert len(probe.calls) == 3
 
 
@@ -1927,7 +1958,7 @@ def test_post_ready_transient_observation_failure_uses_the_remaining_budget() ->
     assert result.status == "ready"
     assert result.handle is not None
     assert result.handle.pod_id == POD_ID
-    assert transport.clock.now == 2.0, "a transient read did not retry on the next poll"
+    assert transport.clock.now == 32.0, "discovery and the transient read did not retry"
     assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
 
 
@@ -2667,7 +2698,7 @@ def test_artifact_template_patch_ambiguity_retries_within_deadline() -> None:
 
     assert result.status == "ready"
     assert result.handle is not None
-    assert transport.clock.now == 2.0
+    assert transport.clock.now == 32.0
     assert transport.mutation_count == 9
     mutations = [call[1] for call in _mutation_calls(transport)]
     assert mutations.count("PATCH /templates/template01") == 2
@@ -3231,7 +3262,7 @@ def test_terminal_create_waits_for_eventual_cleanup_absence() -> None:
     assert result.status == "failed"
     assert result.error_code == "readiness_failed"
     assert result.error_reason == "readiness_terminal"
-    assert transport.clock.now == 2.0
+    assert transport.clock.now == 32.0
     assert transport.pods == []
     assert transport.templates == []
     assert transport.volumes == []
@@ -3290,11 +3321,13 @@ def test_a_create_whose_pod_never_proves_readiness_is_still_torn_down() -> None:
 
 
 def test_a_create_deadline_shorter_than_the_cleanup_reserve_still_creates_and_cleans_up() -> None:
-    """the reserve is a share of the budget, not a fixed subtraction from it.
+    """every window is a share of the budget, not a fixed subtraction from it.
 
     Holding back a flat 30s from a deadline shorter than that would leave readiness starting
     already expired -- the create would fail its first call and no pod would ever exist. Halving
-    the remaining budget instead gives both phases room at any deadline.
+    the remaining budget instead gives both phases room at any deadline. Adoption's discovery
+    window takes its share the same way, so confirming absence can never consume the whole budget
+    and leave a short-deadline deploy structurally unable to provision.
     """
 
     bundle = _bundle()
@@ -3313,7 +3346,7 @@ def test_a_create_deadline_shorter_than_the_cleanup_reserve_still_creates_and_cl
     )
 
     created = [call[1] for call in _mutation_calls(transport) if "POST" in call[1]]
-    assert "POST /pods" in created, "the create never ran: the reserve consumed the whole budget"
+    assert "POST /pods" in created, "the create never ran: a window consumed the whole budget"
     assert transport.pods == [], "the pod outlived a create with a deadline under the reserve"
     assert transport.volumes == []
     assert transport.secrets == []

@@ -113,6 +113,19 @@ def _work_deadline(deadline_at: float, clock: Clock) -> float:
     return deadline_at - min(_CLEANUP_RESERVE_SECONDS, remaining_seconds / 2.0)
 
 
+def _discovery_deadline(deadline_at: float, clock: Clock) -> float:
+    """bound the window that proves an empty listing really is an empty account.
+
+    a share of the budget rather than a flat cap, for the same reason `_work_deadline` takes one:
+    a caller whose whole deadline is shorter than the reserve would otherwise spend all of it
+    confirming absence and have nothing left to create with, so a short-deadline deploy could never
+    provision at all. half the budget leaves both phases room at any deadline.
+    """
+
+    remaining_seconds = max(0.0, deadline_at - clock())
+    return min(deadline_at, clock() + min(_CLEANUP_RESERVE_SECONDS, remaining_seconds / 2.0))
+
+
 def _observe(
     plan: RunPodCreatePlan,
     transport: RunPodTransport,
@@ -608,7 +621,7 @@ def provision_runpod_deployment(
 
     try:
         transport = open_transport(transport_factory, credentials)
-        discovery_deadline_at = min(deadline_at, clock() + _CLEANUP_RESERVE_SECONDS)
+        discovery_deadline_at = _discovery_deadline(deadline_at, clock)
         adopted = adopt_existing_generation(
             plan,
             _bind_observe(transport, deadline_at=deadline_at),
