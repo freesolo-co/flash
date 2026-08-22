@@ -435,9 +435,11 @@ def test_plan_is_complete_secret_free_and_binds_pinned_image() -> None:
         secret not in rendered
         for secret in (PROVIDER_ID, PROVIDER_SECRET, INFERENCE_SECRET, ARTIFACT_SECRET)
     )
-    expected_image_tag = base64.urlsafe_b64encode(
-        bytes.fromhex(bundle.image.digest.removeprefix("sha256:"))
-    ).decode("ascii").rstrip("=")
+    expected_image_tag = (
+        base64.urlsafe_b64encode(bytes.fromhex(bundle.image.digest.removeprefix("sha256:")))
+        .decode("ascii")
+        .rstrip("=")
+    )
     assert dict(plan.tags)["flash-image"] == expected_image_tag
     assert plan.bundle.spec.engine.image_digest == bundle.image.digest
 
