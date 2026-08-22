@@ -78,7 +78,7 @@ def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAICha
     stream = payload.get("stream", False)
     if type(stream) is not bool:
         raise OpenAIRequestError("stream must be a boolean")
-    include_usage = _parse_stream_options(payload.get("stream_options"), stream)
+    include_usage = parse_stream_options(payload.get("stream_options"), stream)
     structured = _structured_override(payload)
     generation = GenerationRequest(
         adapter_id=resolved.adapter_revision,
@@ -135,7 +135,7 @@ def _response_format(value: object) -> dict[str, Any]:
     return {"json": schema}
 
 
-def _parse_stream_options(value: object, stream: bool) -> bool:
+def parse_stream_options(value: object, stream: bool) -> bool:
     if value is None:
         return False
     if not stream:

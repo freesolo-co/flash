@@ -17,12 +17,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from flash.serve.app.openai import OpenAIRequestError, parse_stream_options
 from flash.serving.src.context import ServingContext
-from flash.serving.src.responses import (
-    openai_chat_completion,
-    openai_generate_fields,
-    openai_include_usage,
-)
+from flash.serving.src.responses import openai_chat_completion, openai_generate_fields
 from flash.serving.src.schemas import GenerateRequest
 from flash.serving.src.serving_io import (
     _expected_checkpoint,
@@ -114,6 +111,10 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     stream = payload.get("stream", False)
     if type(stream) is not bool:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "stream must be a boolean")
+    try:
+        include_usage = parse_stream_options(payload.get("stream_options"), stream)
+    except OpenAIRequestError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     caller_org = await context.authorize_inference(request, adapter_id)
     requested, target = await context.lookup.resolve(adapter_id)
     try:
@@ -126,7 +127,6 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     await _prepare_generate_request(req, target)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
-    include_usage = openai_include_usage(payload)
     if stream:
         return await _stream_chat_completion(
             context,

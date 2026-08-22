@@ -225,8 +225,3 @@ def openai_generate_fields(payload: dict[str, Any], adapter_id: str) -> dict[str
         # GenerateRequest's validator normalizes it (consistent 422s).
         "structured_outputs": _openai_structured_outputs(payload),
     }
-
-
-def openai_include_usage(payload: dict[str, Any]) -> bool:
-    stream_options = payload.get("stream_options") or {}
-    return isinstance(stream_options, dict) and stream_options.get("include_usage") is True
