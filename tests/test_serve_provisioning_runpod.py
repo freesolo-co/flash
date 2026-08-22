@@ -1406,23 +1406,104 @@ def test_artifact_environment_patch_failure_exhausts_the_deadline() -> None:
     assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
 
 
-def test_lost_artifact_patch_response_is_reobserved_before_retry() -> None:
+def test_lost_artifact_pod_patch_response_is_confirmed_before_secret_delete() -> None:
+    events: list[str] = []
+
+    class _OrderedProbe(_Probe):
+        def __call__(
+            self,
+            url: str,
+            token: str,
+            bundle: DeploymentBundle,
+            timeout_seconds: float,
+        ) -> bool:
+            accepted = super().__call__(url, token, bundle, timeout_seconds)
+            events.append("probe")
+            return accepted
+
+    class _SecretDeleteOrderingTransport(_FakeTransport):
+        def graphql(
+            self,
+            document: str,
+            variables: dict[str, object],
+            *,
+            mutation: bool,
+            deadline_at: float,
+        ) -> object:
+            if mutation and "secretDelete" in document:
+                events.append("secretDelete")
+            return super().graphql(
+                document,
+                variables,
+                mutation=mutation,
+                deadline_at=deadline_at,
+            )
+
     bundle = _bundle()
     plan = build_runpod_create_plan(bundle)
-    transport = _FakeTransport()
+    transport = _SecretDeleteOrderingTransport()
     handle = _seed_exact(transport, bundle, artifact_secret=True)
     transport.templates[0]["env"] = dict(plan.environment_without_artifact)
     transport.fail_mutation_at = 1
     transport.failure_mode = "ambiguous_after"
     transport.calls.clear()
+    probe = _OrderedProbe()
 
-    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+    result, _factory, _probe = _provision(
+        bundle,
+        transport,
+        artifact_token=None,
+        probe=probe,
+    )
 
     assert result.status == "ready"
     assert result.handle == handle
     assert transport.clock.now == 2.0
+    assert events == ["probe", "probe", "secretDelete"]
     assert [call[1] for call in _mutation_calls(transport)] == [
         f"PATCH /pods/{POD_ID}",
+        "secretDelete",
+    ]
+    assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
+
+
+def test_lost_artifact_template_patch_response_is_confirmed_without_endpoint_probe() -> None:
+    bundle = _bundle()
+    plan = build_runpod_create_plan(bundle)
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, artifact_secret=True)
+    transport.pods[0]["env"] = dict(plan.environment_without_artifact)
+    transport.fail_mutation_at = 1
+    transport.failure_mode = "ambiguous_after"
+    transport.calls.clear()
+    probe = _Probe()
+
+    result, _factory, _probe = _provision(
+        bundle,
+        transport,
+        artifact_token=None,
+        probe=probe,
+    )
+
+    assert result.status == "ready"
+    assert result.handle == handle
+    assert transport.clock.now == 2.0
+    assert len(probe.calls) == 1, "a template-only patch must not trigger an endpoint probe"
+    patch_index = next(
+        index
+        for index, call in enumerate(transport.calls)
+        if call[1] == "PATCH /templates/template01"
+    )
+    delete_index = next(
+        index for index, call in enumerate(transport.calls) if call[1] == "secretDelete"
+    )
+    assert [
+        call[1]
+        for call in transport.calls[patch_index + 1 : delete_index]
+        if call[1] == "GET /pods"
+    ] == ["GET /pods", "GET /pods"]
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "PATCH /templates/template01",
         "secretDelete",
     ]
     assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)

@@ -379,6 +379,8 @@ def delete_artifact_and_confirm(
     # the template and live pod must stop referring to the one-shot secret before it is deleted.
     # the stored value is only a named secret reference, not the credential itself, but observing
     # both stripped environments proves no dangling artifact entry remains on a later restart.
+    template_patch_attempted = False
+    pod_patch_attempted = False
     while True:
         try:
             _secret, template, _volume, pod = exact_core_resources(plan, observe(plan))
@@ -400,8 +402,10 @@ def delete_artifact_and_confirm(
         needs_pod_patch = not _pod_environment_is_stripped(plan, pod)
         try:
             if needs_template_patch:
+                template_patch_attempted = True
                 patch_template(template.id, plan.template_payload(False))
             if needs_pod_patch:
+                pod_patch_attempted = True
                 # the payload carries only flash-authored entries. if runpod replaces rather than merges
                 # the map, provider-added values such as PUBLIC_KEY are dropped; the serving workload does
                 # not consume them. if runpod retains them, the subset check below deliberately allows it.
@@ -415,7 +419,7 @@ def delete_artifact_and_confirm(
                 handle=handle,
             )
         break
-    if needs_template_patch or needs_pod_patch:
+    if template_patch_attempted or pod_patch_attempted:
         # the endpoint probe authenticates with the inference token, not the artifact token. prove
         # the restarted workload before deleting the artifact secret so an unproven transition
         # remains recoverable, while the stripped references prevent the restarted pod using it.
@@ -426,7 +430,7 @@ def delete_artifact_and_confirm(
             pod.id,
             handle,
             inference_token,
-            require_endpoint_probe=needs_pod_patch,
+            require_endpoint_probe=pod_patch_attempted,
             deadline_at=deadline_at,
             probe=probe,
             clock=clock,
