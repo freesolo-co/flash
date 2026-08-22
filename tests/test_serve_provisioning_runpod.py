@@ -3950,6 +3950,32 @@ def test_no_capacity_500_is_a_definite_rejection_not_an_ambiguous_outcome() -> N
     assert exc_info.value.outcome_unknown is False
 
 
+def test_no_matching_machine_500_is_a_definite_rejection_not_an_ambiguous_outcome() -> None:
+    """`POST /pods` states the same capacity shortfall in different words, and it must classify alike.
+
+    measured live in US-KS-2 against the real account:
+    `{"error":"create pod: could not find any pods with required specifications","status":500}`.
+    the pod was never created -- the instrumented run showed the volume and template that preceded
+    it being deleted cleanly -- yet the deploy reported `mutation_outcome_unknown` and told the
+    user to go hunt resources that provably did not exist. matching only the `no instances
+    currently available` wording left this second phrasing in the ambiguous bucket.
+    """
+    body = (
+        b'{"error":"create pod: could not find any pods with required specifications","status":500}'
+    )
+
+    def opener(_request, *, timeout: float):
+        raise urllib.error.HTTPError(
+            "https://rest.runpod.io/v1/pods", 500, "sanitized", None, io.BytesIO(body)
+        )
+
+    transport = StdlibRunPodTransport(PROVIDER_SECRET, opener=opener, clock=lambda: 0.0)
+    with pytest.raises(RunPodTransportFailure) as exc_info:
+        transport.rest("POST", "/pods", {}, mutation=True, deadline_at=10.0)
+    assert exc_info.value.code == "capacity_unavailable"
+    assert exc_info.value.outcome_unknown is False
+
+
 def test_unsupported_datacenter_500_is_a_definite_rejection_not_an_ambiguous_outcome() -> None:
     """an unsupported datacenter is a config error runpod also reports as a 500.
 

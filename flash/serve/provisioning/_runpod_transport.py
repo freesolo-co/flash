@@ -31,6 +31,13 @@ _ERROR_BODY_BYTES = 4096
 _DEFINITE_5XX: tuple[tuple[re.Pattern[str], DeploymentErrorCode], ...] = (
     # "the gpu you asked for is not available right now", where runpod uses 402/429 elsewhere.
     (re.compile(r"no instances currently available", re.IGNORECASE), "capacity_unavailable"),
+    # the same refusal in the words `POST /pods` uses: runpod looked for a machine matching the
+    # requested gpu, count, and datacenter, found none, and created nothing. observed live as
+    # `create pod: could not find any pods with required specifications`.
+    (
+        re.compile(r"could not find any pods with required specifications", re.IGNORECASE),
+        "capacity_unavailable",
+    ),
     # an unsupported datacenter for the requested resource. the body names the valid ones, so this
     # is an actionable config error, not a transient one worth retrying.
     (
