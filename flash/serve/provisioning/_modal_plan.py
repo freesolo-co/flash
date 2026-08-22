@@ -14,10 +14,10 @@ from flash.serve.control import ModalPlacement
 from ._common import (
     DeploymentBundle,
     ServingResourceNames,
-    _resource_name,
     base64url_identity,
     encode_manifest_environment,
     reject_unreachable_registry,
+    serving_resource_names,
 )
 
 MODAL_VOLUME_MOUNT = "/modal-volume"
@@ -104,23 +104,6 @@ def _deployment_tag(phase: str, topology: str) -> str:
     if len(tag) > MODAL_DEPLOYMENT_TAG_LIMIT or not tag.startswith(prefix):
         raise ValueError("modal deployment tag does not fit modal's tag limit")
     return tag
-
-
-def _modal_resource_names(bundle: DeploymentBundle) -> ServingResourceNames:
-    payload = b"\0".join(
-        (
-            bundle.spec.deployment_id.encode("utf-8"),
-            str(bundle.spec.generation).encode("ascii"),
-            bundle.spec.engine.engine_id.encode("ascii"),
-        )
-    )
-    return ServingResourceNames(
-        app_or_pod=_resource_name(payload, "app", 63),
-        volume=_resource_name(payload, "volume", 63),
-        template=_resource_name(payload, "template", 63),
-        inference_secret=_resource_name(payload, "inference-secret", 63),
-        artifact_secret=_resource_name(payload, "artifact-secret", 63),
-    )
 
 
 def _url_source(placement: ModalPlacement) -> str:
@@ -291,7 +274,12 @@ def build_modal_create_plan(
     reject_unreachable_registry(bundle.image)
     placement = bundle.spec.placement
     _validate_placement(placement)
-    names = _modal_resource_names(bundle)
+    names = serving_resource_names(
+        bundle.spec.deployment_id,
+        bundle.spec.generation,
+        bundle.spec.engine.engine_id,
+        workload_role="app",
+    )
     encoded_manifest = encode_manifest_environment(bundle.manifest)
     endpoint_label = _endpoint_label(bundle, placement)
     tags = _tags(bundle, placement, names, endpoint_label, phase)

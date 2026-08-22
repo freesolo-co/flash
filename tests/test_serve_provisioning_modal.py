@@ -28,6 +28,7 @@ from flash.serve.provisioning import (
     InterruptedProvisioning,
     ServingImage,
     ServingRuntimeSecrets,
+    serving_resource_names,
 )
 from flash.serve.provisioning._modal_plan import (
     MODAL_APP_TAG_LIMIT,
@@ -422,6 +423,12 @@ def test_plan_is_complete_secret_free_and_binds_pinned_image() -> None:
     assert dict(plan.tags)["flash-phase"] == "finalized"
     assert dict(bootstrap.tags)["flash-phase"] == "bootstrap"
     assert plan.names == bootstrap.names
+    assert plan.names == serving_resource_names(
+        bundle.spec.deployment_id,
+        bundle.spec.generation,
+        bundle.spec.engine.engine_id,
+        workload_role="app",
+    )
     assert plan.gpu_request == "B200:1"
     assert plan.expected_public_url == (f"https://workspace--{plan.endpoint_label}.modal.run")
     assert plan.include_source is False
