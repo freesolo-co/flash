@@ -79,11 +79,13 @@ def test_engine_config_rejects_runtime_owned_engine_args() -> None:
 
 
 def test_engine_config_uses_first_class_exact_revisions() -> None:
-    legacy_positional = EngineConfig("model", "served/model", "tokenizer/model")
-    assert legacy_positional.model_revision is None
-    assert legacy_positional.tokenizer_revision is None
-    assert legacy_positional.effective_served_model == "served/model"
-    assert legacy_positional.effective_tokenizer_model == "tokenizer/model"
+    # revisions are keyword-only in practice, so a config built without them pins nothing and
+    # the effective names still come from the model overrides.
+    unpinned = EngineConfig("model", "served/model", "tokenizer/model")
+    assert unpinned.model_revision is None
+    assert unpinned.tokenizer_revision is None
+    assert unpinned.effective_served_model == "served/model"
+    assert unpinned.effective_tokenizer_model == "tokenizer/model"
 
     pinned = EngineConfig(
         model="model",
