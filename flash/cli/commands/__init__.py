@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -470,16 +471,10 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     parts = [state]
     heartbeat = status.get("last_heartbeat") if isinstance(status, dict) else None
     # retries rewind steps while state remains running, so surface the 0-based attempt identity.
-    # prefer live `remote.attempt`; the heartbeat may belong to the superseded worker. fall back only
-    # when `remote` is absent, not explicitly null: null marks the allocation window after teardown,
-    # when the new attempt is unknown and the attached heartbeat is stale.
-    from flash.providers._lifecycle.poll import _attempt_int
-
-    remote = status.get("remote")
-    remote_cleared = "remote" in status and remote is None
-    attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
-    if attempt is None and not remote_cleared and isinstance(heartbeat, dict):
-        attempt = _attempt_int(heartbeat.get("attempt"))
+    # `live_attempt` owns the provenance order (live `remote.attempt` first, heartbeat only when
+    # `remote` is absent rather than cleared at teardown) and is shared with the worker-artifact
+    # labelling below, so the spinner and the appended sections name the same current attempt.
+    attempt = render.live_attempt(status)
     if isinstance(heartbeat, dict):
         heartbeat_age_seconds = render._heartbeat_age_seconds(heartbeat.get("ts"))
         # stage and step come from the heartbeat, attempt from `remote` below. during the relaunch
@@ -712,15 +707,48 @@ def _follow_status(
         return 130
 
 
+def _artifact_attempt(name: str) -> int | None:
+    """Return the bounded attempt encoded by a worker artifact name."""
+    from flash.providers._lifecycle.poll import _attempt_int
+
+    match = re.search(r"_attempt(\d+)\.txt$", name)
+    return _attempt_int(int(match.group(1))) if match else None
+
+
+def _worker_section_name(name: str, current_attempt: int | None) -> str:
+    """Label an attempt-scoped artifact and identify superseded output."""
+    attempt = _artifact_attempt(name)
+    if attempt is None:
+        return name
+    if current_attempt is None:
+        return f"{name} (attempt={attempt})"
+    if attempt != current_attempt:
+        return f"{name} (attempt={attempt}, previous attempt; current attempt={current_attempt})"
+    return f"{name} (attempt={attempt}, current attempt)"
+
+
 def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:
-    for name, text in (client.get_worker_output(run_id) or {}).items():
+    worker_output = client.get_worker_output(run_id) or {}
+    if not worker_output:
+        return printed_any
+    try:
+        current_attempt = render.live_attempt(client.get_run(run_id) or {})
+    except Exception:
+        # artifact text is best-effort diagnostic output; a status refresh failure must not hide it.
+        current_attempt = None
+    for name, text in worker_output.items():
         if not text:
             continue
+        # the primary run log is printed first and worker artifacts are appended afterwards, so their
+        # position is not chronological. the highest uploaded artifact can still belong to a worker
+        # that was torn down while its replacement has not uploaded a console yet; label provenance
+        # from the filename rather than letting the final section masquerade as the live attempt.
+        section_name = _worker_section_name(name, current_attempt)
         sep = "\n" if printed_any else ""
         if render.styled():
-            print(f"{sep}{render.log_section(name)}")
+            print(f"{sep}{render.log_section(section_name)}")
         else:
-            print(f"{sep}----- {name} -----")
+            print(f"{sep}----- {section_name} -----")
         print(text, end="" if text.endswith("\n") else "\n")
         printed_any = True
     return printed_any
