@@ -1717,6 +1717,135 @@ class _InterruptingProbe(_Probe):
         raise KeyboardInterrupt
 
 
+class _DelayedAbortSdk(_FakeSdk):
+    """modal acknowledges stop before the app releases its volume mount."""
+
+    def __init__(self, plan) -> None:
+        super().__init__(plan)
+        self.terminal_polls = 0
+
+    def stop_app(self, plan) -> None:
+        self.calls.append(("stop_app", None))
+        app = self.apps[0]
+        self.apps = [
+            replace(
+                app,
+                state="lifecycle_pending",
+                running_containers=None,
+                tags=(),
+                function_id=None,
+                function_name=None,
+                public_url=None,
+            )
+        ]
+
+    def observe(self, plan, *, app_id_hint=None) -> ModalObservation:
+        if app_id_hint is not None and self.apps[0].state == "lifecycle_pending":
+            self.terminal_polls += 1
+            if self.terminal_polls >= 2:
+                self.apps = [replace(self.apps[0], state="stopped", running_containers=0)]
+        observation = super().observe(plan, app_id_hint=app_id_hint)
+        if app_id_hint is None and self.apps and self.apps[0].state != "deployed":
+            return replace(observation, apps=())
+        return observation
+
+    def delete_volume(self, plan) -> None:
+        self.calls.append(("delete_volume", None))
+        if self.apps and self.apps[0].state != "stopped":
+            return
+        self.volumes.clear()
+
+
+def test_abort_does_not_report_confirmed_cleanup_while_the_volume_remains() -> None:
+    class _RetainedVolumeSdk(_FakeSdk):
+        def deploy_app(self, plan) -> str:
+            super().deploy_app(plan)
+            raise ModalSdkFailure("provider_rejected")
+
+        def delete_volume(self, plan) -> None:
+            self.calls.append(("delete_volume", None))
+
+    factory = _Factory()
+    factory.sdk_class = _RetainedVolumeSdk
+    result, _probe = _provision(_bundle(), factory)
+
+    sdk = factory.sdk
+    assert sdk is not None
+    assert result.status == "outcome_unknown", (
+        "abort reported a definite failure after trusting the volume delete acknowledgement"
+    )
+    assert result.error_code == "resource_ambiguous"
+    assert sdk.volumes, "the test did not retain the volume it is meant to detect"
+    assert [name for name, _value in sdk.calls].count("observe") >= 3
+
+
+def test_abort_waits_for_terminal_state_and_confirms_absence_before_success() -> None:
+    factory = _Factory()
+    factory.sdk_class = _DelayedAbortSdk
+    clock = _Clock()
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        provision_modal_deployment(
+            _bundle(),
+            ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+            ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
+            deadline_at=100.0,
+            sdk_factory=factory,
+            probe=_InterruptingProbe(),
+            clock=clock,
+            sleep=clock.sleep,
+        )
+
+    sdk = factory.sdk
+    assert sdk is not None
+    assert not isinstance(raised.value, InterruptedProvisioning)
+    assert sdk.terminal_polls == 2, "abort deleted before modal reported a terminal app"
+    assert clock.now == 2.0
+    assert sdk.volumes == []
+    operations = [name for name, _value in sdk.calls]
+    assert operations.index("delete_volume") < len(operations) - 1
+    assert operations[-1] == "observe", "abort trusted delete acknowledgement without re-observing"
+
+
+def test_provision_succeeds_after_abort_reclaims_the_delayed_volume() -> None:
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _DelayedAbortSdk(plan)
+
+    def factory(credentials, received_plan):
+        assert credentials.reveal() == (PROVIDER_ID, PROVIDER_SECRET)
+        assert received_plan.names == plan.names
+        return sdk
+
+    clock = _Clock()
+    with pytest.raises(KeyboardInterrupt):
+        provision_modal_deployment(
+            bundle,
+            ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+            ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
+            deadline_at=100.0,
+            sdk_factory=factory,
+            probe=_InterruptingProbe(),
+            clock=clock,
+            sleep=clock.sleep,
+        )
+
+    assert sdk.volumes == []
+    result = provision_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
+        deadline_at=100.0,
+        sdk_factory=factory,
+        probe=_Probe(),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "ready", "a leftover abort volume blocked the next provision"
+    assert [name for name, _value in sdk.calls].count("create_volume") == 2
+
+
 def test_interrupting_a_slow_modal_readiness_poll_cleans_up_created_resources() -> None:
     """Ctrl-C after the creates succeed must not strand a live, billable Modal deployment.
 
@@ -1938,8 +2067,10 @@ def test_a_failed_abort_delete_reports_that_cleanup_was_not_confirmed() -> None:
                 "observe",
                 "create_inference",
                 "create_artifact",
+                "observe",
                 "delete_artifact",
                 "delete_inference",
+                "observe",
             ],
         ),
         (
@@ -1949,9 +2080,11 @@ def test_a_failed_abort_delete_reports_that_cleanup_was_not_confirmed() -> None:
                 "create_inference",
                 "create_artifact",
                 "create_volume",
+                "observe",
                 "delete_artifact",
                 "delete_inference",
                 "delete_volume",
+                "observe",
             ],
         ),
         # the deploy itself, which is the expensive one: by the time it fails the gpu app is live
@@ -1966,10 +2099,13 @@ def test_a_failed_abort_delete_reports_that_cleanup_was_not_confirmed() -> None:
                 "create_artifact",
                 "create_volume",
                 "deploy_app",
+                "observe",
                 "stop_app",
+                "observe",
                 "delete_artifact",
                 "delete_inference",
                 "delete_volume",
+                "observe",
             ],
         ),
     ],

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from flash.serve.control import (
@@ -41,7 +40,6 @@ from ._modal_readiness import (
     from_sdk_failure,
     matches_transient,
     phase_proof,
-    sleep_until_poll,
     unknown_result,
     wait_for_phase,
 )
@@ -58,6 +56,12 @@ from ._modal_sdk import (
     ModalSdkFactory,
     ModalSdkFailure,
     create_modal_sdk,
+)
+from ._modal_teardown import (
+    confirm_teardown_absence,
+    delete_teardown_resources,
+    suppressed,
+    wait_for_terminal_app,
 )
 
 _DEFAULT_ENDPOINT_PROBE = ModalEndpointProbe()
@@ -650,7 +654,14 @@ def provision_modal_deployment(
             and sdk is not None
             and created.any_created
             and not reached_ready
-            and not _abort_created_resources(finalized_plan, sdk, created)
+            and not _abort_created_resources(
+                create_plan,
+                sdk,
+                created,
+                deadline_at=deadline_at,
+                clock=clock,
+                sleep=sleep,
+            )
         ):
             return unknown_result(finalized_plan)
         return failure_result(finalized_plan, from_sdk_failure(exc))
@@ -665,7 +676,14 @@ def provision_modal_deployment(
             sdk is not None
             and created.any_created
             and not reached_ready
-            and not _abort_created_resources(finalized_plan, sdk, created)
+            and not _abort_created_resources(
+                create_plan,
+                sdk,
+                created,
+                deadline_at=deadline_at,
+                clock=clock,
+                sleep=sleep,
+            )
         ):
             # a step failed and was suppressed, so resources may still be live and billing.
             # replacing the interrupt with this carrier is the only way the cli can say so:
@@ -769,75 +787,96 @@ def resize_modal_volume(
     return failed_deployment_result(plan.bundle.spec, "invalid_request", handle=handle)
 
 
-def _wait_for_terminal_app(
+def _abort_created_resources(
     plan: ModalCreatePlan,
     sdk: ModalSdk,
-    handle: ModalProviderHandle,
+    created: _CreatedResources,
     *,
     deadline_at: float,
     clock: Clock,
     sleep: Sleeper,
-) -> ModalObservation | None:
-    while True:
-        observation = observe(plan, sdk, app_id_hint=handle.app_id)
-        app, _volume, _inference, _artifact = exact_teardown_resources(
-            plan,
-            handle,
-            observation,
-        )
-        if app is not None and app.state in {"stopped", "failed"}:
-            return observation if app.running_containers == 0 else None
-        if not sleep_until_poll(deadline_at, clock, sleep):
-            return None
-
-
-def _suppressed(step: Callable[[], object]) -> bool:
-    """run one teardown step, reporting whether it succeeded instead of hiding that.
-
-    `Exception` rather than `BaseException`, so a second Ctrl-C during cleanup still gets out.
-    """
+) -> bool:
+    """best-effort teardown of a half-built deployment, with observed absence as proof."""
 
     try:
-        step()
-    except Exception:
+        initial = observe(plan, sdk)
+        ensure_unique_resources(initial)
+    except (ModalResourceConflict, ModalSdkFailure):
         return False
-    return True
 
+    if initial.apps:
+        try:
+            proof = phase_proof(
+                plan,
+                initial,
+                artifact_present=plan.phase == "bootstrap",
+                expected=None,
+            )
+        except ModalResourceConflict:
+            return False
+        # stop acknowledgement is not terminal proof. modal may retain the mount until lifecycle
+        # observation reaches a zero-container terminal state, so use the same wait as teardown.
+        suppressed(lambda: mutation(lambda: sdk.stop_app(plan)))
+        try:
+            terminal = wait_for_terminal_app(
+                plan,
+                sdk,
+                proof.handle,
+                deadline_at=deadline_at,
+                clock=clock,
+                sleep=sleep,
+            )
+        except (ModalResourceConflict, ModalSdkFailure):
+            return False
+        if terminal is None:
+            return False
+        try:
+            _app, volume, inference, artifact = exact_teardown_resources(
+                plan,
+                proof.handle,
+                terminal,
+            )
+        except ModalResourceConflict:
+            return False
+        # cleanup runs inside an interrupt handler. attempt every independent delete even if one
+        # raises, then let the authoritative observation below decide whether anything remains.
+        delete_teardown_resources(
+            plan,
+            sdk,
+            volume,
+            inference,
+            artifact,
+            suppress_failures=True,
+        )
+        try:
+            return confirm_teardown_absence(plan, sdk, proof.handle)
+        except (ModalResourceConflict, ModalSdkFailure):
+            return False
 
-def _abort_created_resources(
-    plan: ModalCreatePlan, sdk: ModalSdk, created: _CreatedResources
-) -> bool:
-    """best-effort teardown of a half-built deployment, stopping compute first.
-
-    Every step is suppressed individually. This runs from an interrupt handler, so a failure here
-    must neither replace the exception that brought us in -- the user pressed Ctrl-C, and a
-    `ModalSdkFailure` surfacing instead would read as an unrelated provider bug -- nor stop the
-    remaining deletes from being attempted. `Exception` rather than `BaseException`, so a second
-    Ctrl-C during cleanup still gets out.
-    """
-
-    confirmed = True
     if created.app_deployed:
-        # the app is the billable gpu deployment and it starts charging when `deploy_app` returns,
-        # long before the readiness probe the user is waiting on. it also holds the volume mount,
-        # and modal refuses to delete a volume an app still has attached, so stopping it first is
-        # what makes the deletes below able to succeed at all. canonical teardown uses this order
-        # for the same reason.
-        confirmed &= _suppressed(lambda: mutation(lambda: sdk.stop_app(plan)))
-    # the plan's names, not names read back off a create response: an attempted create whose
-    # handle never arrived still has to be deletable, and `allow_missing=True` makes deleting one
-    # that was never made a no-op.
+        # the deploy call may have failed before returning an id. stop by the deterministic name,
+        # but never treat that mutation acknowledgement as proof that no app remains.
+        suppressed(lambda: mutation(lambda: sdk.stop_app(plan)))
+    # handles may never have reached the caller for these creates, so names from the plan are the
+    # only cleanup keys. allow_missing makes an attempted create that never landed a safe no-op.
     for attempted, name in (
         (created.artifact, plan.names.artifact_secret),
         (created.inference, plan.names.inference_secret),
     ):
         if attempted:
-            confirmed &= _suppressed(
-                lambda name=name: mutation(lambda: sdk.delete_secret(plan, name))
-            )
+            suppressed(lambda name=name: mutation(lambda: sdk.delete_secret(plan, name)))
     if created.volume:
-        confirmed &= _suppressed(lambda: mutation(lambda: sdk.delete_volume(plan)))
-    return confirmed
+        suppressed(lambda: mutation(lambda: sdk.delete_volume(plan)))
+    try:
+        final = observe(plan, sdk)
+        # a deploy was attempted but no app id was observable, so no lifecycle read can prove the
+        # app terminal. named-resource absence alone must not erase that uncertainty.
+        return not created.app_deployed and resources_are_absent(
+            final,
+            allow_terminal_app=False,
+        )
+    except (ModalResourceConflict, ModalSdkFailure):
+        return False
 
 
 def _teardown_plan(
@@ -852,21 +891,6 @@ def _teardown_plan(
         exact_teardown_resources(bootstrap_plan, handle, observation)
         return bootstrap_plan
     return finalized_plan
-
-
-def _delete_teardown_resources(
-    plan: ModalCreatePlan,
-    sdk: ModalSdk,
-    volume: ModalNamedResource | None,
-    inference: ModalNamedResource | None,
-    artifact: ModalNamedResource | None,
-) -> None:
-    if artifact is not None:
-        mutation(lambda: sdk.delete_secret(plan, artifact.name))
-    if inference is not None:
-        mutation(lambda: sdk.delete_secret(plan, inference.name))
-    if volume is not None:
-        mutation(lambda: sdk.delete_volume(plan))
 
 
 def teardown_modal_deployment(
@@ -903,7 +927,7 @@ def teardown_modal_deployment(
             except ModalSdkFailure as exc:
                 if not exc.outcome_unknown:
                     return failure_result(plan, from_sdk_failure(exc), handle=handle)
-        terminal = _wait_for_terminal_app(
+        terminal = wait_for_terminal_app(
             plan,
             sdk,
             handle,
@@ -916,10 +940,8 @@ def teardown_modal_deployment(
         _app, volume, inference, artifact = exact_teardown_resources(plan, handle, terminal)
         if any(resource is not None for resource in (volume, inference, artifact)):
             mutation_attempted = True
-        _delete_teardown_resources(plan, sdk, volume, inference, artifact)
-        final = observe(plan, sdk, app_id_hint=handle.app_id)
-        exact_teardown_resources(plan, handle, final)
-        if resources_are_absent(final, allow_terminal_app=True):
+        delete_teardown_resources(plan, sdk, volume, inference, artifact)
+        if confirm_teardown_absence(plan, sdk, handle):
             return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
         return unknown_result(plan, handle=handle)
     except ModalResourceConflict:
