@@ -183,6 +183,24 @@ def _require_finite_number(value: Any, name: str) -> float:
     return normalized
 
 
+def validate_generation_max_tokens(value: Any) -> int:
+    return _require_int(value, "max_tokens", minimum=1)
+
+
+def validate_generation_temperature(value: Any) -> float:
+    temperature = _require_finite_number(value, "temperature")
+    if temperature < 0:
+        raise RuntimeConfigurationError("temperature must be non-negative")
+    return temperature
+
+
+def validate_generation_top_p(value: Any) -> float:
+    top_p = _require_finite_number(value, "top_p")
+    if not 0 < top_p <= 1:
+        raise RuntimeConfigurationError("top_p must be greater than zero and at most one")
+    return top_p
+
+
 @dataclass(frozen=True, slots=True)
 class EngineConfig:
     """all model-local mechanics needed to construct one vllm engine."""
@@ -379,19 +397,13 @@ class GenerationRequest:
             if not messages:
                 raise RuntimeConfigurationError("messages must not be empty")
             object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "max_tokens", validate_generation_max_tokens(self.max_tokens))
         object.__setattr__(
             self,
-            "max_tokens",
-            _require_int(self.max_tokens, "max_tokens", minimum=1),
+            "temperature",
+            validate_generation_temperature(self.temperature),
         )
-        temperature = _require_finite_number(self.temperature, "temperature")
-        if temperature < 0:
-            raise RuntimeConfigurationError("temperature must be non-negative")
-        object.__setattr__(self, "temperature", temperature)
-        top_p = _require_finite_number(self.top_p, "top_p")
-        if not 0 < top_p <= 1:
-            raise RuntimeConfigurationError("top_p must be greater than zero and at most one")
-        object.__setattr__(self, "top_p", top_p)
+        object.__setattr__(self, "top_p", validate_generation_top_p(self.top_p))
         object.__setattr__(
             self,
             "thinking",

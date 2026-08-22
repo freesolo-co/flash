@@ -123,3 +123,31 @@ def test_persisted_alias_id_must_equal_run_id() -> None:
 def test_generate_request_rejects_whitespace_adapter_id() -> None:
     with pytest.raises(ValidationError, match="adapter_id must not be empty"):
         GenerateRequest.model_validate({"adapter_id": "   ", "prompt": "hi"})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_tokens", 0),
+        ("max_tokens", -1),
+        ("max_tokens", True),
+        ("max_tokens", "1"),
+        ("temperature", -0.1),
+        ("temperature", float("nan")),
+        ("temperature", float("inf")),
+        ("temperature", True),
+        ("temperature", "0"),
+        ("top_p", 0),
+        ("top_p", -0.1),
+        ("top_p", 1.1),
+        ("top_p", float("nan")),
+        ("top_p", float("inf")),
+        ("top_p", True),
+        ("top_p", "1"),
+    ],
+)
+def test_generate_request_rejects_sampling_outside_runtime_contract(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        GenerateRequest.model_validate({"adapter_id": "a", "prompt": "hi", field: value})

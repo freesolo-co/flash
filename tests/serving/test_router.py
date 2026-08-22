@@ -1068,6 +1068,28 @@ def test_per_adapter_generate_bad_payload_is_422_not_500(app_setup):
     assert pool.generated == []
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/generate", {"adapter_id": "qb", "prompt": "hi", "max_tokens": 0}),
+        ("/adapters/qb/generate", {"prompt": "hi", "temperature": -0.1}),
+        (
+            "/v1/chat/completions",
+            {"model": "qb", "messages": [{"role": "user", "content": "hi"}], "top_p": 0},
+        ),
+    ],
+)
+def test_inference_routes_reject_invalid_sampling_before_engine_dispatch(
+    app_setup, path: str, payload: dict[str, object]
+) -> None:
+    client, pool, _ = app_setup
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 422
+    assert pool.generated == []
+
+
 def test_per_adapter_generate_endpoint_routes(app_setup):
     client, pool, _ = app_setup
     assert client.post("/adapters/qb/generate", json={"prompt": "hi"}).status_code == 200

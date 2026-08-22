@@ -14,6 +14,11 @@ from pydantic import (
     model_validator,
 )
 
+from flash.serve.runtime.types import (
+    validate_generation_max_tokens,
+    validate_generation_temperature,
+    validate_generation_top_p,
+)
 from flash.serving.src.model_config import reasoning_parser_for
 from flash.serving.src.structured_outputs import normalize_structured_outputs
 
@@ -396,6 +401,21 @@ class GenerateRequest(BaseModel):
     # as an accepted field, and pydantic drops undeclared keys silently, so an undeclared `stop`
     # would be accepted and then ignored -- billing the caller for tokens it asked to stop before.
     stop: str | list[str] | None = Field(default=None)
+
+    @field_validator("max_tokens", mode="before")
+    @classmethod
+    def validate_max_tokens(cls, value: Any) -> int:
+        return validate_generation_max_tokens(value)
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def validate_temperature(cls, value: Any) -> float:
+        return validate_generation_temperature(value)
+
+    @field_validator("top_p", mode="before")
+    @classmethod
+    def validate_top_p(cls, value: Any) -> float:
+        return validate_generation_top_p(value)
 
     @field_validator("stop", mode="before")
     @classmethod
