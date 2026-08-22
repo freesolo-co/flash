@@ -397,9 +397,10 @@ def parse_pods(value: object, *, keep_name: str | None = None) -> tuple[RunPodPo
 
     `keep_name` filters by pod name before every provider-specific field below. the customer's
     account can hold cpu-only or otherwise unrelated pods that legitimately omit gpu and disk
-    fields flash requires, and one such row raising would blank this deployment's whole
-    observation. that is not hypothetical: a real account returned `env` as a list on two
-    foreign pods, so the observation came back empty and the deploy ended resource_ambiguous.
+    fields flash requires, and one such row raising would fail this deployment's whole
+    observation: `read_call` turns any parser exception into `transport_failed`, so a foreign
+    pod could block flash from observing, and therefore from tearing down, its own pod.
+    `parse_templates` already filters this way.
     """
 
     parsed = []
