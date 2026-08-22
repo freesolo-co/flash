@@ -12,8 +12,10 @@ import pytest
 
 from flash.cli.commands import serve_deploy
 from flash.cli.commands.serve_deploy import cmd_serve_deploy
+from flash.cli.commands.serve_identity import encode_deployment_identity
 from flash.cli.serve_parser import _add_serve_commands
 from flash.serve.profiles import get_profile, placement_for
+from flash.serve.provisioning import InterruptedProvisioning
 
 DIGEST = "sha256:" + "a" * 64
 IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{DIGEST}"
@@ -322,6 +324,38 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     assert "outcome_unknown" in captured.out
     assert "flash serve status" in captured.err
     assert "flash serve undeploy" in captured.err
+
+
+def test_interrupted_deploy_prints_recovery_identity_without_masking_interrupt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    identities: list[str] = []
+
+    def _interrupted(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        identities.append(encode_deployment_identity(bundle))
+        raise InterruptedProvisioning("modal")
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _interrupted)
+
+    with pytest.raises(InterruptedProvisioning):
+        cmd_serve_deploy(_args())
+
+    captured = capsys.readouterr()
+    assert captured.out.startswith("identity    ")
+    assert captured.out == f"identity    {identities[0]}\n"
+    assert "flash serve status" in captured.err
+    assert "flash serve undeploy" in captured.err
+
+    def _encoding_fails(_bundle):
+        raise RuntimeError("encoding failed")
+
+    monkeypatch.setattr(
+        "flash.cli.commands.serve_identity.encode_deployment_identity", _encoding_fails
+    )
+    with pytest.raises(InterruptedProvisioning):
+        cmd_serve_deploy(_args())
 
 
 def _deploy_help(parser: argparse.ArgumentParser) -> str:
