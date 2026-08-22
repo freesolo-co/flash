@@ -707,7 +707,6 @@ def test_deployment_result_requires_an_exact_spec_and_matching_handle_provenance
         ("failed", True, "provider_rejected"),
         ("outcome_unknown", False, "resource_ambiguous"),
         ("outcome_unknown", True, "resource_ambiguous"),
-        ("tearing_down", True, None),
         ("absent", False, None),
     ],
 )
@@ -735,7 +734,6 @@ def test_deployment_result_accepts_complete_lifecycle_matrix(
         ("provisioning", False, "conflict"),
         ("failed", False, None),
         ("outcome_unknown", True, None),
-        ("tearing_down", False, None),
         ("absent", True, None),
         ("absent", False, "not_found"),
     ],

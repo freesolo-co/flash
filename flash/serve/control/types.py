@@ -23,7 +23,6 @@ DeploymentStatus: TypeAlias = Literal[
     "provisioning",
     "failed",
     "outcome_unknown",
-    "tearing_down",
     "absent",
 ]
 DeploymentErrorCode: TypeAlias = Literal[
@@ -38,9 +37,7 @@ DeploymentErrorCode: TypeAlias = Literal[
     "transport_failed",
 ]
 
-_DEPLOYMENT_STATUSES = frozenset(
-    {"ready", "provisioning", "failed", "outcome_unknown", "tearing_down", "absent"}
-)
+_DEPLOYMENT_STATUSES = frozenset({"ready", "provisioning", "failed", "outcome_unknown", "absent"})
 _DEPLOYMENT_ERROR_CODES = frozenset(
     {
         "authentication_failed",
@@ -793,8 +790,8 @@ def validate_deployment_result(result: DeploymentResult) -> None:
     ):
         raise ValueError("error_code is not an allowlisted deployment error")
 
-    if result.status in {"ready", "tearing_down"} and result.handle is None:
-        raise ValueError(f"{result.status} deployment results require a sanitized provider handle")
+    if result.status == "ready" and result.handle is None:
+        raise ValueError("ready deployment results require a sanitized provider handle")
     if result.status == "absent" and result.handle is not None:
         raise ValueError("absent deployment results cannot carry a provider handle")
     if result.status in {"failed", "outcome_unknown"}:
