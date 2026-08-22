@@ -262,21 +262,25 @@ def _format_heartbeat(hb: dict) -> str:
         for name, value in reward_metrics.items():
             if isinstance(value, (int, float)):
                 msg += f" {name}={value:.3f}"
-    # a failure stage's cause, rendered last so it reads as prose after the numeric fields. the
-    # metric loop above formats a fixed key list, so a stage that carries an explanation instead of a
-    # measurement would otherwise commit the cause to the payload and print only the stage name --
-    # the failure is reported and its reason is dropped in the same line.
-    # neutralized like child output and sampled completions on the same line: this text is an
-    # exception message from an environment hook or a provider response, so it is not ours, and a
-    # `\x1b[2J` or `\r` in it would clear or overwrite the log the user is reading the failure in.
-    # unlike those multiline fields, these values are appended to the single-line summary, so escape
-    # preserved newlines too or an exception can forge a second `worker:` record.
-    for key in ("failure_stage", "error"):
-        value = hb.get(key)
-        if isinstance(value, str) and value.strip():
-            rendered = neutralize_control_chars(value.strip()).replace("\n", "\\n")
-            msg += f" {key}={rendered}"
+    error = hb.get("error")
+    if isinstance(error, str) and error.strip():
+        msg += f" error={error.strip()}"
+    checkpoint_failure = hb.get("checkpoint_failure")
+    if isinstance(checkpoint_failure, dict):
+        failure_step = checkpoint_failure.get("step")
+        if isinstance(failure_step, (int, float)) and not isinstance(failure_step, bool):
+            msg += f" checkpoint_failure_step={int(failure_step)}"
+        operation = checkpoint_failure.get("operation")
+        if isinstance(operation, str) and operation.strip():
+            msg += f" checkpoint_failure_stage={operation.strip()}"
+        checkpoint_error = checkpoint_failure.get("error")
+        if isinstance(checkpoint_error, str) and checkpoint_error.strip():
+            msg += f" checkpoint_error={checkpoint_error.strip()}"
     msg += format_gpu_status(hb.get("gpu"))
+    # everything above is one summary record, including untrusted stage, error, and gpu fallback text.
+    # sanitize it once at that boundary so no field can forge a second worker record. the deliberately
+    # multiline sample and child-output sections are appended below and retain their line breaks.
+    msg = neutralize_control_chars(msg).replace("\n", "\\n")
     sample_lines: list[str] = []
     rendered_samples = 0
     samples = hb.get("sampled_completions")

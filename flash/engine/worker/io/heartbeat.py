@@ -78,9 +78,14 @@ _HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_st
 # right after a download that has been pinging throughout, so the throttle would almost always
 # swallow it. the wrap that follows re-emits with liveness=True and stays throttled.
 _HB_MODEL_LOAD_STAGES = frozenset({"sft_model_load", "opd_model_load"})
-_HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
+_HB_SUCCESS_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
+
+
+def _is_terminal_stage(stage: str) -> bool:
+    """return whether this stage ends the worker attempt."""
+    return stage in _HB_SUCCESS_TERMINAL_STAGES or stage.startswith("error_")
 
 
 def _is_critical_stage(stage: str) -> bool:
@@ -93,7 +98,7 @@ def _is_critical_stage(stage: str) -> bool:
     unforced ping is dropped -- so the one report of the failure would be discarded exactly in the
     case that produces it.
     """
-    return stage in _HB_TERMINAL_STAGES or stage.startswith("error_") or stage.endswith("_failed")
+    return _is_terminal_stage(stage) or stage.endswith("_failed")
 
 
 # Guards throttle bookkeeping; slow HF commit runs outside this lock so heartbeat and liveness
@@ -218,21 +223,16 @@ def heartbeat(
     genuine_progress = not liveness
     with _HB_LOCK:
         if stage == "checkpoint_upload_failed":
-            failure = {
-                key: value
-                for key in ("failure_stage", "error")
-                if isinstance((value := kw.get(key)), str) and value.strip()
-            }
-            if failure:
-                _w._HB_PENDING_CHECKPOINT_FAILURE = failure
+            failure = kw.get("checkpoint_failure")
+            if isinstance(failure, dict):
+                _w._HB_PENDING_CHECKPOINT_FAILURE = dict(failure)
         elif stage == "checkpoint_uploaded":
-            # a later checkpoint landed, so the earlier failure is history rather than the run's
-            # outcome. leaving it latched would stamp `done` with a cause the run recovered from,
-            # which reads as "finished, but your checkpoint is missing" for a run that has one.
+            # a later full resume checkpoint landed, so the earlier failure no longer describes the
+            # run's outcome. deployable or final adapter publication cannot clear this because neither
+            # restores the missing full resume state.
             _w._HB_PENDING_CHECKPOINT_FAILURE = None
-        elif stage in _HB_TERMINAL_STAGES and _w._HB_PENDING_CHECKPOINT_FAILURE:
-            for key, value in _w._HB_PENDING_CHECKPOINT_FAILURE.items():
-                kw.setdefault(key, value)
+        elif _is_terminal_stage(stage) and _w._HB_PENDING_CHECKPOINT_FAILURE:
+            kw.setdefault("checkpoint_failure", dict(_w._HB_PENDING_CHECKPOINT_FAILURE))
         ts = time.time()
         if genuine_progress:
             _w._HB_LAST_PROGRESS_TS = ts

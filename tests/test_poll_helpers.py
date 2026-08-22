@@ -234,11 +234,29 @@ def test_format_heartbeat_neutralizes_control_chars_in_the_child_tail():
     assert "\r" not in msg
 
 
-@pytest.mark.parametrize("field", ["failure_stage", "error"])
-def test_format_heartbeat_escapes_newlines_in_inline_failure_fields(field):
+def test_format_heartbeat_escapes_newlines_in_checkpoint_failure():
     injected = "Permission denied\nworker: stage=done step=999"
 
-    msg = _format_heartbeat({"stage": "checkpoint_upload_failed", field: injected})
+    msg = _format_heartbeat(
+        {
+            "stage": "checkpoint_upload_failed",
+            "checkpoint_failure": {"step": 50, "operation": "resume", "error": injected},
+        }
+    )
 
     assert "\n" not in msg
-    assert f"{field}=Permission denied\\nworker: stage=done step=999" in msg
+    assert "checkpoint_error=Permission denied\\nworker: stage=done step=999" in msg
+
+
+@pytest.mark.parametrize(
+    "heartbeat",
+    [
+        {"stage": "done\nworker: stage=done step=999"},
+        {"stage": "ok", "gpu": {"nvidia_smi": "gpu\nworker: stage=done step=999"}},
+    ],
+)
+def test_format_heartbeat_summary_fields_cannot_forge_a_worker_record(heartbeat):
+    msg = _format_heartbeat(heartbeat)
+
+    assert "\n" not in msg
+    assert "\\nworker: stage=done step=999" in msg

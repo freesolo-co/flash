@@ -558,8 +558,11 @@ def upload_resume_checkpoint(
                                 _w.heartbeat(
                                     "checkpoint_upload_failed",
                                     step=step,
-                                    error=sanitize_diagnostic(e, limit=300),
-                                    failure_stage=failure_stage,
+                                    checkpoint_failure={
+                                        "step": step,
+                                        "operation": failure_stage,
+                                        "error": sanitize_diagnostic(e, limit=300),
+                                    },
                                 )
                         if failure_stage in {"before", "after"}:
                             raise

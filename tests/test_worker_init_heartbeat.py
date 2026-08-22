@@ -470,6 +470,73 @@ def _reset_console_heartbeat_state(monkeypatch, worker) -> None:
     monkeypatch.setattr(worker, "_HB_LAST_PROGRESS_TS", 0.0)
     monkeypatch.setattr(worker, "_HB_PROGRESS_SEQ", 0)
     monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+    monkeypatch.setattr(worker, "_HB_PENDING_CHECKPOINT_FAILURE", None)
+
+
+def _capture_heartbeat_payloads(monkeypatch, worker) -> list[dict]:
+    import json
+
+    committed: list[dict] = []
+
+    def capture(path, destination, **_kwargs):
+        if destination == "heartbeat.json":
+            with open(path) as file:
+                committed.append(json.load(file))
+        return True
+
+    _reset_console_heartbeat_state(monkeypatch, worker)
+    monkeypatch.setattr(worker, "hf_upload_file", capture)
+    return committed
+
+
+def test_fatal_heartbeat_preserves_checkpoint_failure_and_terminal_error(monkeypatch):
+    import flash.engine.worker as worker
+
+    committed = _capture_heartbeat_payloads(monkeypatch, worker)
+    failure = {"step": 50, "operation": "resume", "error": "quota denied"}
+
+    worker.heartbeat("checkpoint_upload_failed", step=50, checkpoint_failure=failure)
+    worker.heartbeat("error_sft", error="watcher failed")
+
+    assert committed[-1]["stage"] == "error_sft"
+    assert committed[-1]["error"] == "watcher failed"
+    assert committed[-1]["checkpoint_failure"] == failure
+
+
+def test_finalize_preserves_failed_checkpoint_identity(monkeypatch):
+    import flash.engine.worker as worker
+    from flash.engine.result.accounting import RunMetrics
+
+    committed = _capture_heartbeat_payloads(monkeypatch, worker)
+    monkeypatch.setattr(worker, "gpu_diagnostics", dict)
+    failure = {"step": 50, "operation": "resume", "error": "quota denied"}
+
+    worker.heartbeat("checkpoint_upload_failed", step=50, checkpoint_failure=failure)
+    worker._finalize(RunMetrics(phase="sft", step=100))
+
+    assert committed[-1]["stage"] == "done"
+    assert committed[-1]["step"] == 100
+    assert committed[-1]["checkpoint_failure"] == failure
+
+
+@pytest.mark.parametrize("terminal_stage", ["done", "error_sft"])
+def test_successful_checkpoint_clears_failure_before_any_terminal(monkeypatch, terminal_stage):
+    import flash.engine.worker as worker
+    from flash.engine.result.accounting import RunMetrics
+
+    committed = _capture_heartbeat_payloads(monkeypatch, worker)
+    failure = {"step": 50, "operation": "resume", "error": "quota denied"}
+
+    worker.heartbeat("checkpoint_upload_failed", step=50, checkpoint_failure=failure)
+    worker.heartbeat("checkpoint_uploaded", step=75)
+    if terminal_stage == "done":
+        monkeypatch.setattr(worker, "gpu_diagnostics", dict)
+        worker._finalize(RunMetrics(phase="sft", step=100))
+    else:
+        worker.heartbeat(terminal_stage, step=100, error="later fatal")
+
+    assert committed[-1]["stage"] == terminal_stage
+    assert "checkpoint_failure" not in committed[-1]
 
 
 @pytest.mark.parametrize(

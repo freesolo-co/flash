@@ -240,11 +240,13 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
     assert calls == worker_hf._CKPT_UPLOAD_RETRIES
     assert len(failed) == 1
     assert failed[0]["step"] == 50
-    assert failed[0]["failure_stage"] == "resume"
-    assert failed[0]["error"].startswith("PermissionError: hf quota refused")
-    assert "<redacted>" in failed[0]["error"]
-    assert secret not in failed[0]["error"]
-    assert len(failed[0]["error"]) <= 300
+    failure = failed[0]["checkpoint_failure"]
+    assert failure["step"] == 50
+    assert failure["operation"] == "resume"
+    assert failure["error"].startswith("PermissionError: hf quota refused")
+    assert "<redacted>" in failure["error"]
+    assert secret not in failure["error"]
+    assert len(failure["error"]) <= 300
 
 
 @pytest.mark.parametrize("failure_stage", ["before", "after"])
@@ -281,8 +283,10 @@ def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path,
     assert calls["companion"] == worker_hf._CKPT_UPLOAD_RETRIES
     assert calls["resume"] == (0 if failure_stage == "before" else 1)
     assert len(failed) == 1
-    assert failed[0]["failure_stage"] == failure_stage
-    assert f"{failure_stage} companion failed" in failed[0]["error"]
+    failure = failed[0]["checkpoint_failure"]
+    assert failure["step"] == 50
+    assert failure["operation"] == failure_stage
+    assert f"{failure_stage} companion failed" in failure["error"]
 
 
 def test_upload_failure_cause_reaches_the_rendered_run_log():
@@ -297,15 +301,19 @@ def test_upload_failure_cause_reaches_the_rendered_run_log():
         {
             "stage": "checkpoint_upload_failed",
             "step": 50,
-            "failure_stage": "resume",
-            "error": "PermissionError: hf quota refused credential <redacted>",
+            "checkpoint_failure": {
+                "step": 50,
+                "operation": "resume",
+                "error": "PermissionError: hf quota refused credential <redacted>",
+            },
         }
     )
 
     assert "stage=checkpoint_upload_failed" in line
     assert "step=50" in line
-    assert "failure_stage=resume" in line
-    assert "error=PermissionError: hf quota refused credential <redacted>" in line
+    assert "checkpoint_failure_step=50" in line
+    assert "checkpoint_failure_stage=resume" in line
+    assert "checkpoint_error=PermissionError: hf quota refused credential <redacted>" in line
 
 
 def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
@@ -321,20 +329,26 @@ def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
         {
             "stage": "checkpoint_upload_failed",
             "step": 50,
-            "error": "boom\x1b[2Jwiped\roverwrite",
+            "checkpoint_failure": {
+                "step": 50,
+                "operation": "resume",
+                "error": "boom\x1b[2Jwiped\roverwrite",
+            },
         }
     )
 
     assert "\x1b" not in line
     assert "\r" not in line
-    assert "error=boom\\x1b[2Jwiped\\x0doverwrite" in line
+    assert "checkpoint_error=boom\\x1b[2Jwiped\\x0doverwrite" in line
 
 
 def test_a_heartbeat_without_a_failure_cause_is_unchanged():
     """The failure fields are additive: an ordinary step line must not grow an empty `error=`."""
     from flash.providers._lifecycle.poll import _format_heartbeat
 
-    line = _format_heartbeat({"stage": "sft_step", "step": 12, "error": "   ", "failure_stage": ""})
+    line = _format_heartbeat(
+        {"stage": "sft_step", "step": 12, "error": "   ", "checkpoint_failure": {}}
+    )
 
     assert line == "worker: stage=sft_step step=12"
 
@@ -346,10 +360,13 @@ def test_an_upload_failure_is_critical_so_an_in_flight_commit_cannot_drop_it():
     stage returns not-due immediately. The failure is reported once and nothing restates it, so the
     one case that produces this heartbeat is the case that would discard it.
     """
-    from flash.engine.worker.io.heartbeat import _is_critical_stage
+    from flash.engine.worker.io.heartbeat import _is_critical_stage, _is_terminal_stage
 
     assert _is_critical_stage("checkpoint_upload_failed")
-    # the existing classes still hold, and an ordinary training step stays throttled.
+    # criticality and checkpoint carry use one terminal predicate.
+    assert _is_terminal_stage("done")
+    assert _is_terminal_stage("error_oom")
+    assert not _is_terminal_stage("checkpoint_upload_failed")
     assert _is_critical_stage("done")
     assert _is_critical_stage("error_oom")
     assert not _is_critical_stage("sft_step")

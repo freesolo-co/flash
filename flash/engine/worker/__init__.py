@@ -145,9 +145,9 @@ _HB_LAST_PROGRESS_TS = 0.0
 # per-step heartbeat past the provider's stall window, killing a healthy run.
 _HB_PROGRESS_SEQ = 0
 _HB_PROGRESS_UPLOADED_SEQ = 0
-# a replace-in-place failure heartbeat can be overwritten before the provider polls it. retain its
-# inline cause so the terminal heartbeat carries the failure too.
-_HB_PENDING_CHECKPOINT_FAILURE: dict[str, str] | None = None
+# a replace-in-place failure heartbeat can be overwritten before the provider polls it. retain the
+# failed checkpoint identity and cause so every terminal heartbeat carries the same structured state.
+_HB_PENDING_CHECKPOINT_FAILURE: dict[str, int | str] | None = None
 # Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
 # per-repo commit cap while staying under the provider poller's training stall window
 # (STALL_AFTER_S=1500s in flash/providers/_lifecycle/poll.py).
