@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 
@@ -37,20 +38,23 @@ def realized_cost_for_remote(
     if provider in INSTANCE_PROVIDERS:
         # Both instance-billed providers: realized COGS == wall-clock x the instance's flat $/hr
         # (Vast's $/hr is the offer's live rate stamped on the handle as ``hourly_usd``).
-        return _instance_realized_cost(
-            remote, start=start, end=run_end if run_end is not None else end
-        )
+        return _instance_realized_cost(remote, end=run_end if run_end is not None else end)
     return None
 
 
-def _instance_realized_cost(remote: dict, *, start: float, end: float) -> RealizedCost | None:
+def _instance_realized_cost(remote: dict, *, end: float) -> RealizedCost | None:
     """Realized COGS for an instance-billed provider: wall-clock x flat $/hr."""
     rate = remote.get("hourly_usd")
     rid = remote.get("instance_id")
     if not rate or not rid:
         return None
-    launch = remote.get("started_ts") or start
-    wall = max(0.0, float(end) - float(launch))
+    launch = remote.get("started_ts")
+    if isinstance(launch, bool) or not isinstance(launch, (int, float)):
+        return None
+    launch = float(launch)
+    if not math.isfinite(launch) or launch <= 0:
+        return None
+    wall = max(0.0, float(end) - launch)
     usd = round(wall / 3600.0 * float(rate), 6)
     return RealizedCost(
         provider=str(remote.get("provider")),

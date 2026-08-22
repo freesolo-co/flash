@@ -938,7 +938,7 @@ def test_allocate_never_selects_below_matrix_need():
 
     grid = [
         ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
-        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 32768, "group_size": 16}),
+        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 32768, "group_size": 8}),
         # chunked-nll qwen sft cases across short and long contexts.
         ("Qwen/Qwen3.5-0.8B", "sft", {"max_context_tokens": 1024}),
         ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 1536}),

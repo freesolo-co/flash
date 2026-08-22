@@ -60,12 +60,10 @@ def _report(body: dict) -> bool:
 
 
 def _terminal_ts(status: runner.RunStatus) -> float:
-    """The run's training-teardown time, used for both billing and eligibility.
-
-    Prefer immutable `finished_at`; deploys and late updates move `updated_at` and distort settle
-    delay and window. Fall back for pre-feature runs, preserving `finished_at == 0.0`.
-    """
-    return float(status.finished_at if status.finished_at is not None else status.updated_at)
+    """Return the immutable training-teardown time used for billing and eligibility."""
+    if status.finished_at is None:
+        raise ValueError(f"run {status.run_id} is missing finished_at")
+    return float(status.finished_at)
 
 
 def _due(status: runner.RunStatus, now: float) -> bool:
@@ -74,7 +72,7 @@ def _due(status: runner.RunStatus, now: float) -> bool:
     past the settle delay, still within the window, and carrying a provider handle."""
     if status.state not in _RECONCILABLE_STATES:
         return False
-    if status.reconciled_at:
+    if status.reconciled_at or status.finished_at is None:
         return False
     age = now - _terminal_ts(
         status
@@ -91,9 +89,9 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     now = time.time() if now is None else now
     remote = status.remote or {}
     spec = status.spec or {}
-    # raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
-    # unknown launch rather than the epoch; falling back to created_at prevents inflated flat-rate
-    # instance billing.
+    # runpod's billing query needs a lower bound even though its endpoint invoice is authoritative.
+    # instance cost attribution independently requires a valid persisted started_ts and returns none
+    # when it is absent or malformed rather than substituting this bound.
     start = float(remote.get("started_ts") or status.created_at)
     # The run's true terminal time (~teardown / billing stop); see _terminal_ts for why this is
     # the frozen finished_at rather than the mutable updated_at (which deploy/heartbeat move past

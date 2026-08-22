@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from flash.content.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
+from flash.core.grpo import GRPO_CONTROL_PLANE_OWNED_ENV_KEYS
 from flash.core.spec import (
     CONTROL_PLANE_OWNED_ENV_KEYS,
     CREDIT_ASSIGNMENTS,
@@ -392,7 +393,7 @@ def _environment_pip(raw: Any) -> tuple[str, ...]:
     return tuple(requirements)
 
 
-def _environment_secrets(raw: Any) -> tuple[str, ...]:
+def _environment_secrets(raw: Any, algorithm: str) -> tuple[str, ...]:
     """Parse [environment].secrets as declared worker env-var secret names."""
     if raw is None:
         return ()
@@ -406,7 +407,10 @@ def _environment_secrets(raw: Any) -> tuple[str, ...]:
     # tests ownership on the UPPERCASED name, so a declared `flash_secret_env_keys` would pass this
     # check and then be silently dropped from the worker env, launching the job without the secret
     # it declared as required. reserving the whole case-space keeps parse and dispatch agreed.
-    reserved = sorted(k for k in secrets if k.upper() in _RESERVED_ENVIRONMENT_SECRET_KEYS)
+    reserved_keys = _RESERVED_ENVIRONMENT_SECRET_KEYS
+    if algorithm == "grpo":
+        reserved_keys |= GRPO_CONTROL_PLANE_OWNED_ENV_KEYS
+    reserved = sorted(k for k in secrets if k.upper() in reserved_keys)
     if reserved:
         raise ConfigError(
             f"[environment] secrets must not include platform-managed key(s): {', '.join(reserved)}"

@@ -9,6 +9,11 @@ import flash.runner as runner
 from flash.core.spec import JobSpec
 from flash.runner import RunStatus
 
+# the provider-allocated identifier that names the billable resource itself, per provider handle
+# above: runpod carries `endpoint_id`, lambda and vast carry `instance_id`. a record holding one of
+# these still has something to delete even when the rest of it fails strict validation.
+_RESOURCE_ID_FIELDS = ("endpoint_id", "instance_id")
+
 
 def _remote_resource_identity(remote: object) -> tuple | None:
     """Return the exact strict provider resource identity used for compare-and-clear."""
@@ -124,12 +129,11 @@ def _compare_and_fail_remote(
             return False
         if not runner._expected_remote_matches(status.remote, expected_remote):
             return False
-        previous_updated_at = status.updated_at
         status.state = "failed"
         status.error = error
         status.updated_at = time.time()
         if status.finished_at is None:
-            status.finished_at = status.updated_at or previous_updated_at
+            status.finished_at = status.updated_at
         runner._save_status_unlocked(status)
         report_status = status
     confirmed = runner.get_status(run_id)
@@ -252,15 +256,32 @@ def _snapshot_cleanup_remotes(run_id: str) -> list[dict]:
 
 
 def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bool:
-    expected_key = runner._cleanup_remote_key(expected_remote)
+    expected_key = _teardown_removal_key(expected_remote)
     if expected_key is None:
         return False
     with runner._status_guard(run_id):
         raw = runner._load_status_json(run_id)
-        records = runner._cleanup_remotes_from_raw(raw)
-        remaining = [
-            record for record in records if runner._cleanup_remote_key(record) != expected_key
-        ]
+        try:
+            records = runner._cleanup_remotes_from_raw(raw)
+        except Exception:
+            # the strict reader raises on the FIRST record it cannot canonicalize, and the drain
+            # suppresses that -- so one bad sibling made every CONFIRMED-DELETED record undeletable,
+            # and each sweep retried a resource that is already gone, forever. removing one record
+            # does not require understanding the others: keep the ones that cannot be parsed exactly
+            # as they are on disk, drop only the record whose teardown was confirmed. nothing is
+            # silently discarded, and the strict reader still guards every other write path.
+            value = raw.get(runner._CLEANUP_REMOTES_KEY, [])
+            if not isinstance(value, list):
+                return False
+            remaining = [item for item in value if _teardown_removal_key(item) != expected_key]
+            if len(remaining) == len(value):
+                return False
+            runner._save_status_unlocked(
+                runner._runstatus_from_json(raw),
+                _cleanup_remotes=remaining or None,
+            )
+            return True
+        remaining = [record for record in records if _teardown_removal_key(record) != expected_key]
         if len(remaining) == len(records):
             return False
         runner._save_status_unlocked(
@@ -270,9 +291,92 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
     return True
 
 
+def _uncanonical_teardown_record(item: object) -> dict | None:
+    """Return a record that names a deletable resource but fails strict canonicalization."""
+    if not isinstance(item, dict):
+        return None
+    provider = item.get("provider")
+    if not isinstance(provider, str) or not provider:
+        return None
+    if not any(isinstance(item.get(field), str) and item[field] for field in _RESOURCE_ID_FIELDS):
+        return None
+    return dict(item)
+
+
+def _uncanonical_cleanup_remote_key(record: object) -> tuple | None:
+    """Dedupe key for a record the strict reader cannot canonicalize."""
+    if not isinstance(record, dict):
+        return None
+    identity = tuple(record.get(field) for field in _RESOURCE_ID_FIELDS)
+    if not any(identity):
+        return None
+    return (record.get("provider"), record.get("attempt"), identity)
+
+
+def _teardown_removal_key(record: object) -> tuple | None:
+    """The identity the teardown path selects a record by, strict when possible.
+
+    THE single derivation shared by the drain and the compare-and-remove that clears what the drain
+    confirmed deleted. It has to be one function: the drain admits uncanonical records so a resource
+    that fails strict validation still gets deleted, and if removal derived its key strictly instead
+    it would return `None` for exactly those records and clear nothing -- so a confirmed-deleted
+    resource would stay on disk and every later sweep would tear down something already gone,
+    forever. That is the failure the lenient branch below exists to prevent, reintroduced through
+    the key rather than through the reader.
+
+    The two shapes cannot be confused for each other: the strict key is the 2-tuple
+    `(identity, attempt)` and the lenient one is a 3-tuple, so they never compare equal and a record
+    that canonicalizes is matched by its strict key on both sides.
+    """
+    return runner._cleanup_remote_key(record) or _uncanonical_cleanup_remote_key(record)
+
+
+def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
+    """Every cleanup record that yields a teardown handle, skipping the ones that cannot.
+
+    Only for the teardown path. Unlike the strict reader this never raises on a bad record, because
+    raising would strand every well-formed sibling that is still billing.
+
+    A record that fails canonicalization is still yielded verbatim when it names a resource. It is
+    NOT true that such a record has nothing to delete: `key_fingerprint` is validated at exactly 68
+    chars, while a deployed release writes the 16-char form, so every endpoint created by that
+    release fails `from_dict` here. `_delete_runpod_endpoint` resolves precisely that case through
+    `resolve_prefix_key_fingerprint`, and the teardown loop builds a base `JobHandle`, which
+    validates only `provider`. Dropping these records here is what strands them -- a live RunPod
+    endpoint then bills forever with nothing left to tear it down.
+    """
+    with runner._status_guard(run_id):
+        try:
+            raw = runner._load_status_json(run_id)
+        except FileNotFoundError:
+            return []
+    value = raw.get(runner._CLEANUP_REMOTES_KEY, [])
+    if not isinstance(value, list):
+        return []
+    records: list[dict] = []
+    seen = set()
+    for item in value:
+        record = runner._canonical_cleanup_remote(item)
+        if record is None:
+            record = _uncanonical_teardown_record(item)
+        key = _teardown_removal_key(record)
+        if record is None or key is None or key in seen:
+            continue
+        records.append(record)
+        seen.add(key)
+    return records
+
+
 def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     """Teardown every tracked resource independently, removing only confirmed exact records."""
-    records = runner._snapshot_cleanup_remotes(run_id)
+    # the strict snapshot raises on the FIRST record it cannot canonicalize, which strands every
+    # other tracked resource behind it. teardown is per-resource, so read the records leniently
+    # here. the strict reader stays in place for the write paths, where a malformed record must
+    # not be silently dropped from the file.
+    try:
+        records = runner._snapshot_cleanup_remotes(run_id)
+    except Exception:
+        records = _drainable_cleanup_remotes(run_id)
     attempted = set()
     if not records:
         return attempted
@@ -280,7 +384,12 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     for record in records:
-        identity = runner._remote_resource_identity(record)
+        # a record that fails strict canonicalization still names a billable resource; the base
+        # JobHandle validates only `provider`, and the runpod teardown resolves the deployed
+        # 16-char fingerprint itself. skipping it here would leave that resource billing forever.
+        identity = runner._remote_resource_identity(record) or _uncanonical_cleanup_remote_key(
+            record
+        )
         if identity is None:
             continue
         attempted.add(identity)

@@ -975,6 +975,35 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
         assert response.json()["state"] == "dry_run"
 
 
+def test_grpo_rollout_shape_rejects_before_secrets_persistence_or_submission(
+    api, monkeypatch
+) -> None:
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        runs_route, "_runtime_secrets", lambda *_a, **_k: pytest.fail("secrets inspected")
+    )
+    monkeypatch.setattr(runs_route.db, "record_run", lambda *_a, **_k: pytest.fail("run persisted"))
+    monkeypatch.setattr(
+        runs_route._app, "submit_job", lambda *_a, **_k: pytest.fail("job submitted")
+    )
+    spec = {
+        **SPEC,
+        "train": {
+            **SPEC["train"],
+            "prompts_per_step": 65,
+            "group_size": 8,
+        },
+    }
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": False},
+    )
+    assert response.status_code == 400
+    assert "prompts_per_step * train.group_size must be <= 512" in response.json()["detail"]
+
+
 def test_unknown_authored_train_key_enriches_parser_rejection_once(api, monkeypatch) -> None:
     import flash.server.routes.runs as runs_route
     from flash.schema import train_schema_metadata
@@ -3162,41 +3191,8 @@ def test_internal_owned_run_still_requires_matching_org_for_deployment_managemen
     assert calls == {"deploy": 1, "undeploy": 1}
 
 
-def test_deploy_rejects_revision_pinned_base_model(api):
-    import flash.runner as runner
-
-    key = _login()
-    run_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    status = runner.get_status(run_id)
-    status.spec["model_revision"] = "a" * 40
-    runner._save_status(status)
-
-    response = api.post(
-        f"/v1/runs/{run_id}/deploy",
-        json={"dry_run": True},
-        headers=_bearer(key),
-    )
-
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert "legacy revision-pinned base model" in detail
-    assert "flash models export" in detail
-
-
 def test_deploy_allows_runner_assigned_revision_pin(api):
-    """An SFT run pinned BY THE RUNNER stays deployable.
-
-    `runner.submit.prepare_job` calls `_resolve_model_revision(required=True)` for every SFT run,
-    so its stored spec always carries a revision the user never authored and cannot opt out of.
-    Rejecting it made every SFT run -- and every adapter warm-started from one -- permanently
-    undeployable, which also blocks `flash models chat` and `flash env eval`.
-
-    The paired control is `test_deploy_rejects_revision_pinned_base_model` above: same route, same
-    revision value, marker absent -> still 400. Only the marker differs, so a pass here with a pass
-    there isolates the change to who chose the pin.
-    """
+    """An SFT run pinned by the runner stays deployable."""
     import flash.runner as runner
     from flash.core.spec import JobSpec
 
@@ -3242,24 +3238,7 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
 
 
 def test_deploy_rejects_a_forged_auto_pin_marker(api):
-    """A marker written into the snapshot without re-digesting must not buy deploy privileges.
-
-    The marker is excluded from `_validate_effective_spec`'s structural compare (the public half
-    reads False by construction), so nothing there can catch a forged one. Deploy reads it to
-    decide whether to waive the authored-pin rejection, which makes it a privilege decision taken
-    on an otherwise unverified value -- and the waiver is not the only cost: a run pinned to a
-    revision it never trained on deploys against those base weights.
-
-    The paired control is `test_deploy_allows_runner_assigned_revision_pin` above. Same forged
-    marker, same snapshot surface; the only difference is that the control re-digests the way
-    submit does. It passes, so this test is not merely rejecting everything -- it isolates the
-    forgery from the auto-pin shape itself.
-
-    The revision is written to BOTH halves here so the structural compare cannot be what rejects
-    it: equal values pass that check, and the marker is excluded from it. Verified against the
-    unfixed head -- without the digest check in `effective_spec_from_status` this deploy returns
-    200. That is also the pre-fix on-disk shape, when to_dict() still emitted a runner pin.
-    """
+    """A worker-only pin written without re-digesting fails integrity validation."""
     import flash.runner as runner
 
     key = _login()
@@ -3270,7 +3249,6 @@ def test_deploy_rejects_a_forged_auto_pin_marker(api):
     snapshot = status.effective_preparation
     assert isinstance(snapshot, dict), snapshot
     digest_before = snapshot["preparation_digest"]
-    status.spec["model_revision"] = "a" * 40
     snapshot["worker_spec"]["model_revision"] = "a" * 40
     snapshot["worker_spec"]["model_revision_auto"] = True
     assert snapshot["preparation_digest"] == digest_before  # forged: no re-digest
@@ -3284,6 +3262,31 @@ def test_deploy_rejects_a_forged_auto_pin_marker(api):
 
     assert response.status_code == 409, response.json()
     assert "integrity validation" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+        ("deploy", {"dry_run": True}),
+        ("export", {"repository": "owner/adapter", "hf_token": "hf-test"}),
+        ("chat", {"messages": [{"role": "user", "content": "hello"}]}),
+    ],
+)
+def test_serving_routes_map_leaked_revision_decode_failures_to_conflict(api, route, payload):
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.spec["model_revision"] = "abc123"
+    runner._save_status(status)
+
+    response = api.post(f"/v1/runs/{run_id}/{route}", json=payload, headers=_bearer(key))
+
+    assert response.status_code == 409, response.text
+    assert "platform-managed model revision key" in response.json()["detail"]
 
 
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
@@ -3382,6 +3385,7 @@ def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
     status.effective_preparation = {
         "worker_spec": worker_spec,
         "adapter_identity": identity,
+        "version": 1,
         "preparation_digest": runner._preparation_digest(
             runner.JobSpec.from_dict(public_spec),
             runner.JobSpec.from_dict(worker_spec),
@@ -8077,103 +8081,6 @@ def test_mark_checkpoint_deployed_refuses_dry_run(monkeypatch, tmp_path):
     assert out.deployment is None
 
 
-def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monkeypatch, tmp_path):
-    # The legacy finished_at backfill (for runs that went `done` before finished_at existed) must
-    # run ONLY on the done->deployed transition, where updated_at == training teardown. On an
-    # already-`deployed` run (the CAS finalization with expect_state="deployed"), updated_at is the
-    # DEPLOY time, so stamping finished_at from it would reintroduce the instance over-billing this
-    # whole change fixes.
-    import flash.runner as runner
-
-    importlib.reload(runner)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-
-    spec = {
-        "model": "Qwen/Qwen3.5-4B",
-        "project": "11111111-1111-4111-8111-111111111111",
-        "algorithm": "grpo",
-        "run_id": "dep-leg",
-    }
-
-    # (1) done -> deployed: legacy run, finished_at=None, updated_at == teardown -> backfilled.
-    teardown = 1_000.0
-    runner._save_status(
-        runner.RunStatus(
-            run_id="dep-leg",
-            state="done",
-            spec=spec,
-            remote=None,
-            updated_at=teardown,
-            finished_at=None,
-        )
-    )
-    out = runner.mark_deployed(
-        "dep-leg",
-        {
-            "state": "ready",
-            "endpoint_name": "e",
-            "adapter_revision": "dep-leg@final." + "a" * 40,
-        },
-        verification_generation=runner.verified_adapter_revision_generation("dep-leg"),
-    )
-    assert out.state == "deployed"
-    assert out.finished_at == teardown  # frozen to the real teardown time
-    assert out.updated_at > teardown  # the deploy bumped updated_at past teardown
-
-    # (2) already-`deployed` legacy run whose finished_at was never backfilled: a CAS-finalization
-    # re-call must NOT turn the deploy-time updated_at into finished_at.
-    deploy_time = 5_000.0
-    runner._save_status(
-        runner.RunStatus(
-            run_id="dep-leg2",
-            state="deployed",
-            spec={**spec, "run_id": "dep-leg2"},
-            remote=None,
-            updated_at=deploy_time,
-            finished_at=None,
-            deployment={"endpoint_name": "e"},
-        )
-    )
-    out2 = runner.mark_deployed(
-        "dep-leg2",
-        {
-            "state": "ready",
-            "endpoint_name": "e2",
-            "adapter_revision": "dep-leg2@final." + "b" * 40,
-        },
-        expect_state="deployed",
-        verification_generation=runner.verified_adapter_revision_generation("dep-leg2"),
-    )
-    assert out2.state == "deployed"
-    assert out2.finished_at is None  # NOT stamped from the deploy-time updated_at
-
-    # (3) reconciled-then-deployed legacy `done` run: record_realized_cost bumped updated_at to the
-    # reconcile time, so the backfill must NOT freeze that (later) stamp as teardown.
-    runner._save_status(
-        runner.RunStatus(
-            run_id="dep-leg3",
-            state="done",
-            spec={**spec, "run_id": "dep-leg3"},
-            remote=None,
-            updated_at=9_000.0,  # reconcile-time bump, well after teardown
-            finished_at=None,
-            reconciled_at=8_500.0,
-        )
-    )
-    out3 = runner.mark_deployed(
-        "dep-leg3",
-        {
-            "state": "ready",
-            "endpoint_name": "e3",
-            "adapter_revision": "dep-leg3@final." + "c" * 40,
-        },
-        verification_generation=runner.verified_adapter_revision_generation("dep-leg3"),
-    )
-    assert out3.state == "deployed"
-    assert out3.finished_at is None  # not frozen from the reconcile-bumped updated_at
-
-
 def test_deploy_lock_is_usable_and_weakly_cleaned():
     # threading.Lock() isn't weak-referenceable, so the per-run lock must be a wrapper that
     # both works as a context manager AND can live in the WeakValueDictionary (the raw lock
@@ -8847,6 +8754,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
             effective_preparation={
                 "worker_spec": worker_spec,
                 "adapter_identity": identity.to_dict(),
+                "version": 1,
                 "preparation_digest": runner._preparation_digest(
                     public_job, worker_job, identity.to_dict()
                 ),
@@ -8928,6 +8836,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
             effective_preparation={
                 "worker_spec": worker_spec,
                 "adapter_identity": original_identity,
+                "version": 1,
                 "preparation_digest": runner._preparation_digest(
                     public_job, worker_job, original_identity
                 ),

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
-from flash.core.spec_persistence import VersionedPersistedSpecEnvelope
+from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 from flash.teacher.retry_contract import OPD_RETRY_CONTRACT_VERSION
 
 logger = logging.getLogger(__name__)
@@ -201,17 +201,26 @@ def _effective_preparation_snapshot(
     worker_spec: JobSpec,
     adapter_identity: dict | None,
     *,
-    persisted: VersionedPersistedSpecEnvelope | None = None,
+    stored_public: object = None,
 ) -> dict:
-    """Build the one versioned snapshot shape used by initial and repeat persistence."""
-    persisted = persisted or VersionedPersistedSpecEnvelope()
+    """Build the current versioned snapshot shape.
+
+    `stored_public` is the public spec as it is ALREADY persisted, and it belongs on every path
+    that REWRITES an existing record. The digest is recomputed here, and `_preparation_digest`
+    reproduces a pre-1.1.35 run only by replaying the `lora_alpha` omission it reads from the
+    stored spec -- but a rewrite reconstructs `public_spec` via `JobSpec.from_dict(status.spec)`,
+    whose `to_dict()` re-MATERIALIZES the key. Omitting the argument therefore stamps a digest
+    over bytes the stored spec still lacks, and since the rewrite never updates `status.spec`,
+    the two halves disagree from that moment on. The create path passes nothing because it
+    writes both halves from the same object, so it has no omission to replay.
+    """
     return {
-        "version": persisted.version,
+        "version": PREPARATION_ENVELOPE_VERSION,
         "worker_spec": worker_spec.to_internal_dict(),
         "workload_profile": worker_spec.workload_profile or None,
         "adapter_identity": adapter_identity,
         "preparation_digest": _runner()._preparation_digest(
-            public_spec, worker_spec, adapter_identity, persisted=persisted
+            public_spec, worker_spec, adapter_identity, stored_public=stored_public
         ),
         "backend": _runner().TRAINER_BACKEND,
     }
@@ -235,20 +244,8 @@ def _persist_effective_worker_spec(
         adapter_identity = None
     _reject_managed_volume_removal(snapshot, worker_spec)
     _runner()._validate_effective_spec(public_spec, worker_spec)
-    # status.spec is never rewritten, so a pre-upgrade run keeps its dropped keys for life and every
-    # later read rehashes with them restored. re-persisting (quote refresh, realloc) has to hash the
-    # same way or the digest it writes now is one the next integrity check cannot reproduce.
-    raw_public = status.spec if isinstance(status.spec, dict) else {}
-    # only the public half is replayed here, so no worker payload is read: the worker half is
-    # rewritten right below, so its stored bytes already match what is hashed. `status.spec` is
-    # never rewritten, so a legacy run keeps its old spelling for life and every read replays it --
-    # hashing without that replay writes a digest the next integrity check cannot reproduce, and the
-    # run recovers until its first quote refresh or realloc and fails afterwards.
-    persisted_envelope = VersionedPersistedSpecEnvelope.read(
-        snapshot, raw_public, include_worker=False
-    )
     effective_preparation = _effective_preparation_snapshot(
-        public_spec, worker_spec, adapter_identity, persisted=persisted_envelope
+        public_spec, worker_spec, adapter_identity, stored_public=status.spec
     )
     fields = {"effective_preparation": effective_preparation}
     if estimated_cost_usd is not None:

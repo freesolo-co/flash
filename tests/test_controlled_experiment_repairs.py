@@ -7,36 +7,20 @@ from types import SimpleNamespace
 import pytest
 
 
-def _prepared_spec(*, revision: str = "main", resolves_to: str = "a" * 40):
-    """An sft spec authored with a mutable ``revision``, ready for the profile-first gate.
-
-    ``resolves_to`` is the sha the stubbed hub returns. sft preparation profiles the workload before
-    it will quote, and the profile is keyed on the *resolved* revision, so the artifact has to be
-    built against the identity resolution will produce rather than the authored ref. The environment
-    is pinned for the same reason the model is: an unpinned env id would send preparation to github,
-    and an absent one fails the gate outright.
-    """
-    from dataclasses import replace
-
+def _prepared_spec(*, revision: str = "a" * 40):
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
     from tests._helpers.profile import attach_sft_profile
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        model_revision=resolves_to,
+        model_revision=revision,
+        model_revision_auto=True,
         algorithm="sft",
         environment=EnvironmentSpec(id="freesolo/example-project/gsm8k", resolved_sha="e" * 40),
         train=TrainSpec(epochs=1, max_examples=1),
         run_id="revision-preflight",
     )
-    return replace(attach_sft_profile(spec), model_revision=revision)
-
-
-def _resolved_profile_spec(*, resolves_to: str = "a" * 40):
-    """``_prepared_spec`` as preparation will see it: model_revision already resolved to a sha."""
-    from dataclasses import replace
-
-    return replace(_prepared_spec(resolves_to=resolves_to), model_revision=resolves_to)
+    return attach_sft_profile(spec)
 
 
 def _stub_prepare_dependencies(monkeypatch, spec=None):
@@ -110,37 +94,6 @@ def test_spec_parsers_accept_valid_spec_without_execution_controls():
     assert JobSpec.from_dict(raw).model == raw["model"]
 
 
-def test_prepare_job_resolves_ref_to_sha_with_operator_token(monkeypatch):
-    import huggingface_hub
-
-    import flash.runner as runner
-
-    _stub_prepare_dependencies(monkeypatch, _resolved_profile_spec())
-    seen = {}
-    sha = "a" * 40
-
-    class Api:
-        def __init__(self, *, token):
-            seen["token"] = token
-
-        def model_info(self, model, *, revision):
-            seen.update(model=model, revision=revision)
-            return SimpleNamespace(sha=sha)
-
-    monkeypatch.setenv("HF_TOKEN", "operator-token")
-    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
-
-    prepared = runner.prepare_job(_prepared_spec())
-
-    assert seen == {
-        "token": "operator-token",
-        "model": "Qwen/Qwen3.5-0.8B",
-        "revision": "main",
-    }
-    assert prepared.public_spec.model_revision == sha
-    assert prepared.worker_spec.model_revision == sha
-
-
 def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monkeypatch):
     import huggingface_hub
 
@@ -149,7 +102,7 @@ def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monke
 
     exact = "d" * 40
     moving_head = "e" * 40
-    _stub_prepare_dependencies(monkeypatch, _resolved_profile_spec(resolves_to=exact))
+    _stub_prepare_dependencies(monkeypatch, _prepared_spec(revision=exact))
     seen = []
 
     class Api:
@@ -161,7 +114,7 @@ def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monke
             return SimpleNamespace(sha=moving_head if revision is None else revision)
 
     monkeypatch.setattr(huggingface_hub, "HfApi", Api)
-    internal = _prepared_spec(revision=exact, resolves_to=exact).to_internal_dict()
+    internal = _prepared_spec(revision=exact).to_internal_dict()
     internal.update(model_revision_auto=True, model_revision_force_pin=True)
 
     prepared = runner.prepare_job(JobSpec.from_dict(internal))
@@ -173,51 +126,6 @@ def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monke
         assert spec.model_revision_force_pin is False
     assert "model_revision_force_pin" not in prepared.public_spec.to_dict()
     assert prepared.worker_spec.to_internal_dict()["model_revision_force_pin"] is False
-
-
-def test_prepare_job_revision_failure_precedes_persistence_and_provider_submit(monkeypatch):
-    import huggingface_hub
-
-    import flash.runner as runner
-
-    class Api:
-        def __init__(self, *, token):
-            pass
-
-        def model_info(self, model, *, revision):
-            raise RuntimeError("private provider detail")
-
-    writes = []
-    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
-    monkeypatch.setattr(runner, "_save_status", lambda *args, **kwargs: writes.append(args))
-
-    with pytest.raises(ValueError, match="could not resolve model_revision") as exc_info:
-        runner.submit_job(_prepared_spec(), dry_run=True)
-
-    assert "private provider detail" not in str(exc_info.value)
-    assert writes == []
-
-
-def test_prepare_job_moving_ref_persists_first_resolved_commit(monkeypatch):
-    import huggingface_hub
-
-    import flash.runner as runner
-
-    _stub_prepare_dependencies(monkeypatch, _resolved_profile_spec(resolves_to="b" * 40))
-    shas = iter(("b" * 40, "c" * 40))
-
-    class Api:
-        def __init__(self, *, token):
-            pass
-
-        def model_info(self, model, *, revision):
-            return SimpleNamespace(sha=next(shas))
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
-    prepared = runner.prepare_job(_prepared_spec(revision="moving-tag", resolves_to="b" * 40))
-
-    assert prepared.public_spec.model_revision == "b" * 40
-    assert prepared.worker_spec.model_revision == "b" * 40
 
 
 def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(monkeypatch, tmp_path):
@@ -481,6 +389,7 @@ def _structured_opd_spec(structured_outputs: str):
     return JobSpec(
         model="Qwen/Qwen3.5-0.8B",
         model_revision="a" * 40,
+        model_revision_auto=True,
         algorithm="opd",
         environment=EnvironmentSpec(id="freesolo/example-project/gsm8k", resolved_sha="e" * 40),
         train=TrainSpec(

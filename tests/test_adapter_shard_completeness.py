@@ -118,15 +118,16 @@ def test_a_single_file_adapter_wins_over_leftover_shards():
     assert loadable_adapter_weight_files(names) == ["adapter_model.safetensors"]
 
 
-def test_safetensors_is_preferred_over_a_stale_bin():
+def test_bin_adapter_weights_are_rejected_beside_safetensors():
     names = ["adapter_model.safetensors", "adapter_model.bin"]
+    assert not is_adapter_weight_filename("adapter_model.bin")
     assert loadable_adapter_weight_files(names) == ["adapter_model.safetensors"]
 
 
-def test_an_orphan_safetensors_shard_falls_through_to_a_complete_bin():
-    """an unloadable representation must not mask the loadable one in the other suffix."""
+def test_an_orphan_safetensors_shard_does_not_fall_through_to_bin():
     names = [_SHARDS[0], "adapter_model.bin"]
-    assert loadable_adapter_weight_files(names) == ["adapter_model.bin"]
+    assert not has_loadable_adapter_weights(names)
+    assert loadable_adapter_weight_files(names) == []
 
 
 def test_paths_are_matched_by_basename():
@@ -359,7 +360,8 @@ def test_warmstart_identity_binds_every_shard(monkeypatch):
                     path=f"sft/run/adapter/{name}",
                     blob_id=None,
                     size=123,
-                    lfs={"sha256": oids[name], "size": 123},
+                    # attribute-style `BlobLfsInfo`, the only shape `list_repo_tree` produces.
+                    lfs=SimpleNamespace(sha256=oids[name], size=123),
                 )
                 for name in (*_SHARDS, _INDEX)
             ]

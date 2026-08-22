@@ -17,6 +17,7 @@ def _spec() -> JobSpec:
     return JobSpec(
         model="Qwen/Qwen3.5-0.8B",
         model_revision="a" * 40,
+        model_revision_auto=True,
         algorithm="sft",
         environment=EnvironmentSpec(
             id="team/example",

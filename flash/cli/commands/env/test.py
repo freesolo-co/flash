@@ -270,7 +270,11 @@ def _drive_single_turn(env, example: dict, record: dict, *, force_echo: bool = F
 
 def _new_multi_turn_replay_state(env, example: dict, record: dict) -> dict:
     state = env.new_rollout_state(example)
-    record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
+    # `prompt` only, never `messages`: the two are not spellings of one field. `new_rollout_state`
+    # seeds `messages` with a COPY of `prompt` and appends each turn onto it, so falling back to it
+    # records the growing transcript where the frozen initial prefix belongs. every producer sets
+    # both, so an absent `prompt` is a corrupt state and `_check_messages` rejects it by name.
+    record["prompt"] = _check_messages(state.get("prompt"), "prompt")
     _normalize_prompt_images(env, example, record["prompt"])
     return state
 

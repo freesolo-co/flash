@@ -213,6 +213,9 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
             "rank_pattern": {"module": 64},
             "lora_alpha": 64,
             "alpha_pattern": {"module": 128},
+            # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
+            # these cases are about rank/revision/identity, not modality.
+            "exclude_modules": None,
         }
 
     monkeypatch.setattr(rank_mod, "load_hf_adapter_config", load_config)
@@ -250,7 +253,7 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
         {
             "run_id": "source-run",
             "model": "Qwen/Qwen3.5-4B",
-            "model_revision": "source-revision",
+            "model_revision": "a" * 40,
             "model_revision_auto": True,
             "algorithm": "sft",
             "train": {"hf_repo": "owner/source-runs"},
@@ -261,7 +264,8 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
         {
             "run_id": "child-run",
             "model": "Qwen/Qwen3.5-4B",
-            "model_revision": "target-revision",
+            "model_revision": "b" * 40,
+            "model_revision_auto": True,
             "algorithm": "grpo",
             "train": {"init_from_adapter": "source-run"},
         }
@@ -276,88 +280,23 @@ class _ReachedArtifactResolution(Exception):
     """Sentinel: execution got past the warm-start revision check."""
 
 
-def test_warm_start_inherits_an_authored_source_revision(monkeypatch):
-    """A child inherits an authored source pin without laundering its deploy provenance."""
-    from fastapi import HTTPException
-
-    import flash.runner as R
-    import flash.server.routes.serving as serving
+def test_unmanaged_source_revision_is_rejected_during_decode():
     from flash.core.spec import JobSpec
 
-    source = JobSpec.from_dict(
-        {
-            "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
-            "model_revision": _REVISION,
-            "algorithm": "grpo",
-            "train": {"hf_repo": "owner/source-runs"},
-        }
-    )
-    stored_public = source.to_dict()
-    source_status = R.RunStatus(
-        state="done",
-        run_id=source.run_id,
-        spec=stored_public,
-        effective_preparation={
-            "worker_spec": source.to_internal_dict(),
-            "preparation_digest": R._preparation_digest(
-                JobSpec.from_dict(stored_public), source, None
-            ),
-        },
-    )
-    child = JobSpec.from_dict(
-        {
-            "run_id": "child-run",
-            "model": source.model,
-            "algorithm": "opd",
-            "train": {"init_from_adapter": source.run_id},
-        }
-    )
-    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
-
-    inherited = R._inherit_warmstart_revision(child)
-    assert inherited.model_revision == _REVISION
-    assert inherited.model_revision_auto is False
-
-    monkeypatch.setattr(
-        "flash.adapters.lora_rank.resolve_hf_dataset_revision",
-        lambda *_a, **_kw: "rev",
-    )
-    monkeypatch.setattr(
-        "flash.runner.results.checkpoints.adapter_artifact_exists",
-        lambda *_a, **_kw: (_ for _ in ()).throw(_ReachedArtifactResolution()),
-        raising=False,
-    )
-    with pytest.raises(_ReachedArtifactResolution):
-        R._prepare_init_from_adapter_inner(child, token="token")
-
-    deploy_status = R.RunStatus(
-        state="done",
-        run_id=inherited.run_id,
-        spec=inherited.to_dict(),
-        effective_preparation={"worker_spec": inherited.to_internal_dict()},
-    )
-    with pytest.raises(HTTPException, match="legacy revision-pinned base model"):
-        serving._validate_deploy_request(
-            inherited.run_id,
-            deploy_status,
-            JobSpec.from_dict(deploy_status.spec),
-            {},
-            True,
+    with pytest.raises(ValueError, match="model_revision requires model_revision_auto=True"):
+        JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-4B",
+                "model_revision": _REVISION,
+                "algorithm": "sft",
+                "train": {"hf_repo": "owner/source-runs"},
+            }
         )
 
 
 def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
-    """A GRPO child warm-starting off SFT inherits the parent's auto pin AND its provenance.
-
-    SFT is always force-pinned by the runner, and this check demands the child's revision equal the
-    source's. Before this, satisfying it meant the AUTHOR writing the sha into rl.toml -- which made
-    the child's pin author-supplied, which deploy refuses. So a warm start off SFT could pass this
-    check or be deployable, never both.
-
-    The paired mismatch control is `test_prepare_init_adapter_requires_exact_model_revision_match`
-    above: an already-pinned child is never overwritten, so a different target revision still raises.
-    """
+    """A GRPO child warm-starting from SFT inherits the source's runner-managed pin."""
     import flash.runner as R
     from flash.core.spec import JobSpec
 
@@ -469,6 +408,9 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
             "base_model_name_or_path": "Qwen/Qwen3.5-4B",
             "r": 64,
             "lora_alpha": 128,
+            # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
+            # these cases are about rank/revision/identity, not modality.
+            "exclude_modules": None,
         },
     )
     monkeypatch.setattr(
@@ -659,6 +601,9 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
             "base_model_name_or_path": "Qwen/Qwen3.5-4B",
             "r": 64,
             "lora_alpha": 128,
+            # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
+            # these cases are about rank/revision/identity, not modality.
+            "exclude_modules": None,
         },
     )
     monkeypatch.setattr(
@@ -725,6 +670,7 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
         effective_preparation={
             "worker_spec": worker.to_internal_dict(),
             "adapter_identity": identity,
+            "version": 1,
             "preparation_digest": R._preparation_digest(public, worker, identity),
         },
     )
@@ -882,6 +828,7 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
             effective_preparation={
                 "worker_spec": worker.to_internal_dict(),
                 "adapter_identity": identity,
+                "version": 1,
                 "preparation_digest": R._preparation_digest(public, worker, identity),
             },
         )
@@ -943,6 +890,7 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
         effective_preparation={
             "worker_spec": worker.to_internal_dict(),
             "adapter_identity": identity.to_dict(),
+            "version": 1,
             "preparation_digest": R._preparation_digest(public, worker, identity.to_dict()),
         },
     )
@@ -956,6 +904,9 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
             "base_model_name_or_path": public.model,
             "r": 64 if revision == _REVISION else 8,
             "lora_alpha": 128 if revision == _REVISION else 16,
+            # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
+            # these cases are about rank/revision/identity, not modality.
+            "exclude_modules": None,
         }
 
     monkeypatch.setattr(rank_mod, "load_hf_adapter_config", load_config)
@@ -1008,6 +959,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
     snapshot = {
         "worker_spec": copy.deepcopy(worker.to_internal_dict()),
         "adapter_identity": identity,
+        "version": 1,
         "preparation_digest": R._preparation_digest(public, worker, identity),
     }
     target = snapshot["worker_spec"]
@@ -1249,6 +1201,9 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
             "base_model_name_or_path": source.model,
             "r": 64,
             "lora_alpha": 128,
+            # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
+            # these cases are about rank/revision/identity, not modality.
+            "exclude_modules": None,
         },
     )
     monkeypatch.setattr(
@@ -1267,8 +1222,6 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
     # the tokenizer the profile digest keys on is the base the adapter was actually trained against
     assert profiled == [_REVISION], profiled
     assert prepared.worker_spec.model_revision == _REVISION
-    # runner-assigned, not authored: deploy refuses an authored pin, so a self-resolved one would
-    # leave every warm-started sft run undeployable.
     assert prepared.worker_spec.model_revision_auto is True
     # source metadata stays authoritative for rank/alpha on this path too
     assert prepared.worker_spec.train.lora_rank == 64
@@ -1278,9 +1231,8 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
 def test_inherited_sft_pin_survives_the_force_pin_when_the_hub_tip_moved(monkeypatch):
     """The source's sha must outlive `_resolve_model_revision`, not just `_inherit_warmstart_revision`.
 
-    SFT is force-pinned (`required=True`), and an inherited pin is marked runner-assigned, so it
-    reads as unauthored -- which sends the lookup at `revision=None` to the CURRENT hub tip. If the
-    resolver overwrites the inherited sha with that tip, warm start breaks the moment the base model
+    sft is force-pinned (`required=True`), but an inherited runner-managed pin is already resolved.
+    if the resolver overwrites that sha with the current hub tip, warm start breaks when the base model
     moves, and `_adopted_warmstart_revision` cannot repair it because the pin is already set. Stubbing
     the resolver would hide exactly that, so this test drives the real one over a moved hub.
     """
@@ -1352,3 +1304,260 @@ def test_force_pin_still_pins_a_fresh_sft_run_to_the_hub_tip(monkeypatch):
 
     assert resolved.model_revision == tip
     assert resolved.model_revision_auto is True
+
+
+def test_recovery_reproduces_a_digest_taken_before_lora_alpha_was_public(monkeypatch, tmp_path):
+    """A run prepared before 1.1.35 stored no public `lora_alpha`; its digest must still verify.
+
+    `to_dict()` now MATERIALIZES alpha (defaulting to 2 * lora_rank), so rehashing such a run with
+    today's serialization hashes bytes it never had. `workload_profile` predates the change
+    (1.1.32), so the digest branch is genuinely reachable for runs in that window -- and
+    `reallocation_spec_from_status` is what the retry path calls, so a mismatch marks a live run
+    `unrecoverable` rather than retrying it.
+    """
+    import hashlib
+
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+    from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
+
+    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    public = JobSpec.from_dict(
+        {
+            "run_id": "pre-alpha-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "gpu": {"type": "RTX 4090"},
+            "train": {"lora_rank": 32},
+        }
+    )
+    # the stored public spec as an older build wrote it: no `lora_alpha` key at all.
+    stored_public = public.to_dict()
+    stored_public["train"].pop("lora_alpha", None)
+    assert "lora_alpha" not in stored_public["train"]
+
+    worker_dict = public.to_internal_dict()
+    worker_dict["workload_profile"] = {"tokens": 128}
+    worker = JobSpec.from_dict(worker_dict)
+    # the digest the ORIGINAL build computed, hashed HERE rather than through the function under
+    # test: deriving it from `_preparation_digest` would move with the code and pass either way.
+    # that build normalized too -- falsy managed keys and an empty `environment.pip` were omitted --
+    # so the fixture has to reproduce THAT shape, not this build's raw serialization. `pip` is
+    # already absent from `stored_public` because `to_dict()` emits an empty tuple here.
+    original_worker = worker.to_internal_dict()
+    for key in (
+        "model_revision_auto",
+        "model_revision_force_pin",
+        "gpu_count_auto",
+        "workload_profile_input_digest",
+        "workload_profile_producer_version",
+        "workload_profile",
+    ):
+        if not original_worker.get(key):
+            original_worker.pop(key, None)
+    original_public = {**stored_public, "environment": dict(stored_public["environment"])}
+    if not original_public["environment"].get("pip"):
+        original_public["environment"].pop("pip", None)
+    original_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "version": PREPARATION_ENVELOPE_VERSION,
+                "public_spec": original_public,
+                "worker_spec": original_worker,
+                "adapter_identity": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    R._save_status(
+        R.RunStatus(
+            run_id=public.run_id,
+            state="provisioning",
+            spec=stored_public,
+            effective_preparation={
+                "worker_spec": worker.to_internal_dict(),
+                "adapter_identity": None,
+                "version": 1,
+                "workload_profile": worker.workload_profile or None,
+                "preparation_digest": original_digest,
+            },
+        )
+    )
+
+    recovered = R.effective_spec_from_status(R.get_status(public.run_id))
+    assert recovered.train.lora_rank == 32
+
+
+def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(monkeypatch, tmp_path):
+    """Rewriting the snapshot must replay the same `lora_alpha` omission recovery replays.
+
+    `_persist_effective_worker_spec` runs on the ATTACH and RESUBMIT paths (`supervise/attach.py`,
+    `supervise/seed_submission.py`), rebuilding `public_spec` from `status.spec` -- whose
+    `to_dict()` re-materializes an alpha the stored record never had -- and it never updates
+    `status.spec` to match. So a pre-1.1.35 run that recovers once is retired on its NEXT attach:
+    `server/platform/runtime.py` marks it `unrecoverable` when `reallocation_spec_from_status`
+    raises. The trigger gate is `workload_profile or model_revision_auto`, and auto-pinning is the
+    default, so this is the ordinary case rather than a corner.
+    """
+    from dataclasses import replace
+
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    public = replace(
+        JobSpec.from_dict(
+            {
+                "run_id": "pre-alpha-persist",
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "sft",
+                "gpu": {"type": "RTX 4090"},
+                "train": {"lora_rank": 32},
+            }
+        ),
+        model_revision="a" * 40,
+        model_revision_auto=True,
+    )
+    stored_public = public.to_dict()
+    stored_public["train"].pop("lora_alpha", None)
+    assert "lora_alpha" not in stored_public["train"]
+
+    R._save_status(
+        R.RunStatus(
+            run_id=public.run_id,
+            state="provisioning",
+            spec=stored_public,
+            effective_preparation={
+                "worker_spec": public.to_internal_dict(),
+                "adapter_identity": None,
+                "version": 1,
+                "workload_profile": None,
+                "preparation_digest": R._preparation_digest(
+                    public, public, None, stored_public=stored_public
+                ),
+            },
+        )
+    )
+    # the record recovers BEFORE the rewrite -- so a failure after it is caused by the rewrite
+    # itself, not by a fixture that was never valid.
+    assert R.reallocation_spec_from_status(R.get_status(public.run_id)).train.lora_rank == 32
+
+    assert R._persist_effective_worker_spec(public)
+
+    # the run survives its own attach: the rewritten digest is still reproducible from the stored
+    # public spec, which the rewrite left untouched.
+    recovered = R.reallocation_spec_from_status(R.get_status(public.run_id))
+    assert recovered.train.lora_rank == 32
+
+
+def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_path):
+    """The digest must hash the canonical shape `dev` writes TODAY, not this build's raw dict.
+
+    `_preparation_digest` omits falsy managed keys and an empty `environment.pip`. That is
+    NORMALIZATION, not a legacy replay: it is unconditional, reads nothing off the stored record,
+    and defines the digest the currently deployed release (1.2.88) computes for every run it
+    prepares. Dropping it would make the digest depend on which build wrote the record, so a
+    snapshot written by production stops verifying here -- and `reallocation_spec_from_status` is
+    the retry path, which `server/platform/runtime.py` turns into `unrecoverable`.
+
+    The expected digest is hashed HERE over dev's canonical bytes rather than taken from the
+    function under test, so it cannot move with the code.
+    """
+    import hashlib
+    from dataclasses import replace
+
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+    from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
+
+    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = replace(
+        JobSpec.from_dict(
+            {
+                "run_id": "canonical-digest-run",
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "sft",
+                "gpu": {"type": "RTX 4090"},
+                "train": {"lora_rank": 32},
+            }
+        ),
+        model_revision="a" * 40,
+        model_revision_auto=True,
+    )
+
+    public_payload = spec.to_dict()
+    worker_payload = spec.to_internal_dict()
+    if not public_payload["environment"].get("pip"):
+        public_payload["environment"].pop("pip", None)
+    stripped = []
+    for key in (
+        "model_revision_auto",
+        "model_revision_force_pin",
+        "gpu_count_auto",
+        "workload_profile_input_digest",
+        "workload_profile_producer_version",
+        "workload_profile",
+    ):
+        if not worker_payload.get(key):
+            worker_payload.pop(key, None)
+            stripped.append(key)
+    # the fixture is only meaningful if this spec actually carries keys the normalization drops.
+    assert stripped, "spec must exercise at least one omitted managed key"
+
+    canonical_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "version": PREPARATION_ENVELOPE_VERSION,
+                "public_spec": public_payload,
+                "worker_spec": worker_payload,
+                "adapter_identity": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert R._preparation_digest(spec, spec, None, stored_public=spec.to_dict()) == canonical_digest
+
+    # and a record carrying that digest -- the shape production writes -- recovers on the retry path.
+    R._save_status(
+        R.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            effective_preparation={
+                "worker_spec": spec.to_internal_dict(),
+                "adapter_identity": None,
+                "version": PREPARATION_ENVELOPE_VERSION,
+                "workload_profile": None,
+                "preparation_digest": canonical_digest,
+            },
+        )
+    )
+    assert R.reallocation_spec_from_status(R.get_status(spec.run_id)).train.lora_rank == 32
+
+
+def test_a_snapshot_written_before_the_version_key_still_recovers(monkeypatch, tmp_path):
+    """The `version` stamp landed in 1.2.59; runs prepared by an older build are still in flight.
+
+    Rejecting an ABSENT version makes `reallocation_spec_from_status` raise on the retry path,
+    which marks a live run `unrecoverable` instead of retrying it. A malformed value is still
+    rejected -- absence is a known shape, a bad type is not.
+    """
+    from flash.core.spec_persistence import (
+        PREPARATION_ENVELOPE_VERSION,
+        validate_persisted_spec_envelope,
+    )
+
+    assert (
+        validate_persisted_spec_envelope({"worker_spec": {}, "preparation_digest": "d"})
+        == PREPARATION_ENVELOPE_VERSION
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        validate_persisted_spec_envelope({"version": "1"})
+    with pytest.raises(ValueError, match="unsupported persisted preparation envelope version"):
+        validate_persisted_spec_envelope({"version": PREPARATION_ENVELOPE_VERSION + 1})

@@ -5,6 +5,8 @@ Offline -- the provider HTTP calls and backend POST are stubbed, so nothing touc
 
 from __future__ import annotations
 
+import pytest
+
 from flash import runner
 from flash.providers import realized
 from flash.providers.runpod.cost import shape_endpoint_cost
@@ -59,6 +61,8 @@ def test_dispatch_none_when_no_handle_or_unknown_provider():
 def _status(**kw) -> runner.RunStatus:
     base = {"run_id": "r1", "state": "done", "spec": {}, "created_at": 0.0, "updated_at": 0.0}
     base.update(kw)
+    if "finished_at" not in base:
+        base["finished_at"] = base["updated_at"]
     return runner.RunStatus(**base)
 
 
@@ -165,35 +169,41 @@ def test_instance_realized_cost_bills_launch_to_run_end_not_padded_end():
     assert rc.realized_usd == 2.0  # 1h x $2/hr
 
 
-def test_reconcile_run_falls_back_to_created_at_when_started_ts_missing_or_zero(monkeypatch):
-    """raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
-    unknown launch rather than the epoch; falling back to status.created_at prevents inflated
-    flat-rate instance billing."""
-    captured: dict = {}
+@pytest.mark.parametrize(
+    "started_ts",
+    [pytest.param(None, id="missing"), 0.0, -1.0, float("inf"), float("nan"), True],
+)
+def test_instance_realized_cost_rejects_invalid_launch_timestamp(started_ts):
+    remote = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29}
+    if started_ts is not None:
+        remote["started_ts"] = started_ts
 
-    def fake_realized(remote, **kw):
-        captured.update(kw)
-        return realized.RealizedCost(provider="lambda", realized_usd=1.0, by_resource={})
+    assert realized.realized_cost_for_remote(remote, start=100.0, end=4600.0) is None
 
-    monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
-    monkeypatch.setattr(reconcile, "_report", lambda body: True)
-    monkeypatch.setattr(runner, "record_realized_cost", lambda *a, **k: None)
+
+def test_reconcile_leaves_invalid_instance_launch_unsettled_and_due(monkeypatch):
     now = 1_000_000.0
-    created = now - 9000.0
-    for started in (0.0, None):  # explicit zero and absent values both fall back
-        captured.clear()
-        remote = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29}
-        if started is not None:
-            remote["started_ts"] = started
-        status = _status(
-            run_id="r-leg",
-            created_at=created,
-            updated_at=now - 7200,
-            finished_at=now - 7200,
-            remote=remote,
-        )
-        assert reconcile.reconcile_run(status, now=now) is True
-        assert captured["start"] == created, started  # NOT 0.0 / the 1970 epoch
+    status = _status(
+        run_id="r-invalid-launch",
+        created_at=now - 10_000.0,
+        updated_at=now - 7200.0,
+        finished_at=now - 7200.0,
+        remote={"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29},
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "_report",
+        lambda _body: pytest.fail("unattributable cost must not be reported"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "record_realized_cost",
+        lambda *_args, **_kwargs: pytest.fail("unattributable cost must remain unsettled"),
+    )
+
+    assert reconcile.reconcile_run(status, now=now) is False
+    assert status.reconciled_at is None
+    assert reconcile._due(status, now) is True
 
 
 def test_reconcile_uses_finished_at_not_deploy_bumped_updated_at_for_instance(monkeypatch):
@@ -229,32 +239,26 @@ def test_reconcile_uses_finished_at_not_deploy_bumped_updated_at_for_instance(mo
     assert captured["run_end"] != deploy_t
 
 
-def test_reconcile_falls_back_to_updated_at_when_no_finished_at(monkeypatch):
-    """Pre-feature runs (finished_at is None) keep the old behavior: run_end == updated_at."""
-    now = 1_000_000.0
-    captured: dict = {}
-
-    def fake_realized(remote, *, start, end, run_end=None):
-        captured.update(run_end=run_end)
-        return realized.RealizedCost(provider="lambda", realized_usd=1.0)
-
-    monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
-    monkeypatch.setattr(reconcile, "_report", lambda body: True)
-    monkeypatch.setattr(runner, "record_realized_cost", lambda run_id, **kw: None)
-
+def test_reconcile_rejects_a_run_without_finished_at(monkeypatch):
+    monkeypatch.setattr(
+        reconcile,
+        "realized_cost_for_remote",
+        lambda *args, **kwargs: pytest.fail("provider billing must not run without finished_at"),
+    )
     status = _status(
         state="done",
-        updated_at=now - 7200.0,
+        updated_at=1_000_000.0,
         finished_at=None,
         remote={
             "provider": "lambda",
             "instance_id": "i-1",
             "hourly_usd": 1.29,
-            "started_ts": now - 9000,
+            "started_ts": 999_000.0,
         },
     )
-    assert reconcile.reconcile_run(status, now=now) is True
-    assert captured["run_end"] == now - 7200.0
+
+    with pytest.raises(ValueError, match="missing finished_at"):
+        reconcile.reconcile_run(status, now=1_000_000.0)
 
 
 def test_reconcile_run_skips_zero_and_unreported(monkeypatch):
@@ -305,7 +309,7 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
         "provider": "runpod",
         "endpoint_id": "ep-1",
         "endpoint_name": "flash-r-adv-a0",
-        "key_fingerprint": "rpk-0123456789ab",
+        "key_fingerprint": "rpk-" + "0" * 64,
         "job_id": "job-1",
         "attempt": 0,
         "started_ts": created_at + 100.0,

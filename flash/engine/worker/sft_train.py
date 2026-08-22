@@ -54,7 +54,11 @@ def _cached_model_path(model_id: str, model_revision: str) -> str:
 
 
 def _warmstart_adapter_path(
-    model_id: str, model_revision: str, expected_rank: int, expected_alpha: int
+    model_id: str,
+    model_revision: str,
+    expected_rank: int,
+    expected_alpha: int,
+    targeting=None,
 ) -> str | None:
     """Stage and verify this run's warm-start source adapter; None when it is not a warm start.
 
@@ -88,7 +92,10 @@ def _warmstart_adapter_path(
             f"warm-start adapter alpha {alpha} does not match the prepared train.lora_alpha "
             f"{expected_alpha}; alpha changes are not supported"
         )
-    _w.validate_warmstart_adapter(config, model_id, adapter_dir)
+    if targeting is None:
+        _w.validate_warmstart_adapter(config, model_id, adapter_dir)
+    else:
+        _w.validate_warmstart_adapter(config, model_id, adapter_dir, targeting)
     base = str(config.get("base_model_name_or_path") or "").strip()
     if base and base != model_id:
         raise ValueError("warm-start adapter base model does not match the target model")
@@ -643,6 +650,7 @@ def run_sft_train(spec=None) -> None:
             adapter_dir,
             model_id=options.model_id,
             model_revision=options.model_revision,
+            exclude_modules=model.exclude_modules,
             python_bin=child.python_bin,
             preprocessor=data.processor,
         )

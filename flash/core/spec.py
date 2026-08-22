@@ -7,8 +7,8 @@ they are told apart:
   `JobSpec.from_dict`; the two are not interchangeable.
 - public representation -- `to_dict()`, deliberately lossy: it strips every platform-managed field
   so the result re-validates through the authored parser.
-- persisted recovery record -- `from_dict()`, tolerant of historical spellings. its decoding rules
-  live in `flash.core.spec_persistence`.
+- persisted recovery record -- `from_dict()`, strict about the current internal shape. its decoding
+  helpers live in `flash.core.spec_persistence`.
 - resolved worker payload -- `to_internal_dict()` / `to_json()`, complete, including every managed
   and resolved field the GPU worker needs.
 
@@ -28,10 +28,6 @@ from uuid import UUID
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
 from flash.core.spec_persistence import (
-    DROPPED_TOP_LEVEL_KEYS,
-    REMOVED_PERSISTED_TRAIN_KEYS,
-    announce_dropped_keys,
-    migrated_optimizer_batch,
     opt_float,
     opt_int,
     str_tuple,
@@ -57,16 +53,9 @@ CREDIT_ASSIGNMENTS: tuple[CreditAssignment, ...] = (
 
 
 def _coerce_credit_assignment(value: Any) -> CreditAssignment:
-    """coerce credit assignment to a known mode and reject malformed payloads.
-
-    missing or blank uses the default; unknown internal/persisted values must not silently downgrade.
-    """
-    if value is None:
-        return DEFAULT_CREDIT_ASSIGNMENT
+    """coerce persisted credit assignment to a known explicit mode."""
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if not normalized:
-            return DEFAULT_CREDIT_ASSIGNMENT
         for mode in CREDIT_ASSIGNMENTS:
             if normalized == mode:
                 return mode
@@ -428,12 +417,11 @@ class TrainSpec:
         save_at_steps = parse_positive_int_tuple(self.save_at_steps, name="train.save_at_steps")
         object.__setattr__(self, "max_steps", max_steps)
         object.__setattr__(self, "save_at_steps", save_at_steps)
-        # a nonpositive interval is not a cadence. the public schema already rejects one, but a
-        # persisted or internally built spec reaches this dataclass directly, so canonicalize it to
-        # the unset sentinel every save_freq site already resolves to its algorithm default. leaving
-        # it signed would make the horizon clamp read it as an interval of one and checkpoint every
-        # single step.
-        object.__setattr__(self, "save_every", parse_max_steps(self.save_every))
+        if self.save_every is not None:
+            if isinstance(self.save_every, bool) or not isinstance(self.save_every, int):
+                raise TypeError("train.save_every must be an integer or null")
+            if self.save_every <= 0:
+                raise ValueError("train.save_every must be positive")
         effective_max_steps = max_steps or 0
         if save_at_steps and effective_max_steps <= 0:
             raise ValueError("train.save_at_steps requires positive train.max_steps")
@@ -507,18 +495,12 @@ MANAGED_GPU_KEYS = frozenset(
 # contract: `_preparation_digest` hashes the public payload, so moving a name in or out of this set
 # invalidates the stored digest of every warm-start and workload-profile run in flight.
 #
-# not reused by `_validate_effective_spec`, which keeps its own near-identical list. the difference
-# is one name -- `model_revision` -- and it is deliberate there: the validator excludes it only
-# conditionally, so a historical authored pin stays structurally compared between the two halves.
-# substituting this set would widen that exclusion to every run and drop a real integrity check.
 MANAGED_TOP_LEVEL_KEYS = frozenset(
     {
         # server-assigned identity -- never authored in a config.
         "run_id",
-        # runner-managed, and no longer part of the public config or status spec. internal round
-        # trips keep the value and marker through to_internal_dict(). historical public specs that
-        # emitted these are replayed only while verifying a stored preparation digest, from the
-        # exact persisted bytes.
+        # runner-managed and absent from the public config and status spec. internal round trips
+        # keep the value and markers through to_internal_dict().
         "model_revision",
         "model_revision_auto",
         "model_revision_force_pin",
@@ -571,16 +553,8 @@ class JobSpec:
     # persisted and worker specs keep it for exact model loading, profiling, geometry validation, and
     # warm-start equality checks.
     model_revision: str = ""
-    # platform-managed marker: True when the runner resolved model_revision for a spec whose public
-    # input carried no pin (SFT, where `_resolve_model_revision(required=True)` pins the base so
-    # workload profiling keys on an immutable commit). An AUTHORED pin can still exist on a persisted
-    # pre-removal run and stays rejected at deploy; rejecting the auto-assigned one made every SFT run
-    # and every adapter warm-started from one permanently undeployable, unservable, and unscoreable by
-    # `flash env eval`.
-    #
-    # stripped by to_dict() like the other platform-managed carriers. Deploy reads the provenance
-    # from the internal worker spec under `effective_preparation` instead (see
-    # `_internal_spec_from_status`), which carries it verbatim.
+    # platform-managed marker for a runner-resolved immutable model revision. stripped by to_dict()
+    # like the other platform-managed carriers and retained in the internal worker spec.
     model_revision_auto: bool = False
     # transient internal request for the runner to verify an exact auto-managed immutable pin instead
     # of resolving the model's current default head. preparation clears it after successful
@@ -736,25 +710,20 @@ class JobSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
-        """Decode a PERSISTED or internal job spec. This is not the authored-config parser.
+        """Decode a current persisted or internal job spec.
 
-        Authored configuration goes through ``flash.schema.spec_from_dict``, which is strict because
-        an unknown key there is a typo the author can still fix. This one reads bytes that were
-        already written -- by an older Flash, for a run that may still be training -- so it tolerates
-        the historical spellings registered in ``flash.core.spec_persistence``. The two are NOT
-        interchangeable: decoding a user's config here would silently accept platform-managed fields
-        that the public parser exists to reject.
+        Authored configuration goes through ``flash.schema.spec_from_dict``. This parser accepts
+        platform-managed fields but rejects keys outside the current internal schema.
         """
         if not isinstance(data, dict):
             raise TypeError("job spec must be an object")
         allowed_top_level = {item.name for item in fields(cls)}
-        unknown_top_level = sorted(set(data) - allowed_top_level - DROPPED_TOP_LEVEL_KEYS)
+        unknown_top_level = sorted(set(data) - allowed_top_level)
         if unknown_top_level:
             raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
-        announce_dropped_keys(data)
-        env = data.get("environment") or {}
-        if not isinstance(env, dict):
-            raise TypeError("environment must be an object")
+        env = validated_section(
+            data, "environment", {item.name for item in fields(EnvironmentSpec)}
+        )
         raw_package = env.get("package")
         if raw_package is not None and not isinstance(raw_package, dict):
             raise TypeError("environment.package must be an object")
@@ -774,17 +743,11 @@ class JobSpec:
             if raw_package is not None
             else None
         )
-        # reject stale payloads carrying a local `path`; worker only runs published env ids.
-        if env.get("path"):
-            raise ValueError(
-                "local environment paths are no longer supported; the worker only runs "
-                "published Freesolo environment ids"
-            )
-        train = validated_section(
-            data,
-            "train",
-            {item.name for item in fields(TrainSpec)},
-            removed=REMOVED_PERSISTED_TRAIN_KEYS,
+        train = validated_section(data, "train", {item.name for item in fields(TrainSpec)})
+        credit_assignment = (
+            _coerce_credit_assignment(train["credit_assignment"])
+            if "credit_assignment" in train
+            else DEFAULT_CREDIT_ASSIGNMENT
         )
         gpu = validated_section(data, "gpu", {item.name for item in fields(GpuSpec)})
         gpu_type, gpu_type_fallbacks = _parse_persisted_gpu_types(gpu)
@@ -793,13 +756,25 @@ class JobSpec:
         if not isinstance(project_raw, str):
             raise TypeError("project must be a string")
         project = require_project_id(project_raw) if project_raw.strip() else ""
+        model_revision = _model_revision(data.get("model_revision", cls.model_revision))
+        model_revision_auto = coerce_bool(data.get("model_revision_auto", False))
+        if model_revision and not model_revision_auto:
+            raise ValueError("model_revision requires model_revision_auto=True")
         algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
-        # one reading of the optimizer batch for both keys: the rollout spelling changed in 1.1.43
-        # and a persisted spec can still carry the old one.
-        batch_size, prompts_per_step = migrated_optimizer_batch(train, algorithm)
+        if algorithm in {"grpo", "opd"} and train.get("batch_size") is not None:
+            raise ValueError(
+                f"train.batch_size does not apply to {algorithm}; use train.prompts_per_step"
+            )
+        if algorithm == "grpo":
+            for name, value in (
+                ("prompts_per_step", train.get("prompts_per_step")),
+                ("group_size", train.get("group_size")),
+            ):
+                if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                    raise TypeError(f"train.{name} must be an integer or omitted for GRPO")
         return cls(
             model=data.get("model", cls.model),
-            model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
+            model_revision=model_revision,
             algorithm=algorithm,
             environment=EnvironmentSpec(
                 id=env.get("id", ""),
@@ -823,8 +798,8 @@ class JobSpec:
                 init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=opt_float(train.get("learning_rate")),
-                batch_size=batch_size,
-                prompts_per_step=prompts_per_step,
+                batch_size=opt_int(train.get("batch_size")),
+                prompts_per_step=opt_int(train.get("prompts_per_step")),
                 max_context_tokens=opt_int(train.get("max_context_tokens")),
                 save_every=opt_int(train.get("save_every")),
                 max_steps=parse_max_steps(train.get("max_steps")),
@@ -839,7 +814,7 @@ class JobSpec:
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
-                credit_assignment=_coerce_credit_assignment(train.get("credit_assignment")),
+                credit_assignment=credit_assignment,
             ),
             gpu=GpuSpec(
                 type=gpu_type,
@@ -860,7 +835,7 @@ class JobSpec:
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
-            model_revision_auto=coerce_bool(data.get("model_revision_auto", False)),
+            model_revision_auto=model_revision_auto,
             model_revision_force_pin=coerce_bool(data.get("model_revision_force_pin", False)),
             gpu_count_auto=coerce_bool(data.get("gpu_count_auto", False)),
             workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),

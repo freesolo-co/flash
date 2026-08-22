@@ -11,6 +11,7 @@ from typing import Any
 
 from flash._internal.channel import CLI_NAME
 from flash.core.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.core.grpo import resolve_grpo_rollout_shape
 from flash.core.spec import (
     FIXED_SEED,
     MANAGED_ENVIRONMENT_KEYS,
@@ -240,10 +241,6 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
 _TOP_LEVEL_KEYS = (
     frozenset(item.name for item in dataclass_fields(JobSpec)) - MANAGED_TOP_LEVEL_KEYS
 )
-# keys that WERE user-authorable and are now rejected with their own targeted error. they are absent
-# from _TOP_LEVEL_KEYS, so the unknown-key check below would otherwise report them as a typo and bury
-# the explanation of why they went away.
-_REMOVED_TOP_LEVEL_KEYS = frozenset({"model_revision"})
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
@@ -328,15 +325,7 @@ def _validate_top_level(
     raw: dict[str, Any], project_required: bool
 ) -> tuple[str, str, str, str, bool]:
     """Validate the top-level config section."""
-    if "model_revision" in raw:
-        raise ConfigError(
-            "config key `model_revision` was removed because Flash-managed serving loads a "
-            "pre-quantized FP8 checkpoint resolved per base model, so it cannot honor an arbitrary "
-            "upstream commit and an authored pin made the run undeployable. Remove the key. "
-            f"`{CLI_NAME} models export` publishes the adapter, but for a fresh GRPO or OPD run it "
-            "does not turn the moving upstream default into a fixed base revision."
-        )
-    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS - _REMOVED_TOP_LEVEL_KEYS)
+    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
         if {"grpo", "sft", "opd"} & set(unknown):
@@ -384,7 +373,7 @@ def _validate_top_level(
 
 
 def _validate_environment_section(
-    raw: dict[str, Any],
+    raw: dict[str, Any], algorithm: str
 ) -> tuple[dict[str, Any], tuple[str, ...], tuple[str, ...]]:
     """Validate the environment section, returning it with the parsed pip and secrets tuples."""
     # use `is none` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
@@ -405,7 +394,7 @@ def _validate_environment_section(
     if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
         raise ConfigError("[environment] params must be a table")
     environment_pip = _environment_pip(env_raw.get("pip"))
-    environment_secrets = _environment_secrets(env_raw.get("secrets"))
+    environment_secrets = _environment_secrets(env_raw.get("secrets"), algorithm)
     return env_raw, environment_pip, environment_secrets
 
 
@@ -591,8 +580,16 @@ def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
 ) -> JobSpec:
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
-    env_raw, environment_pip, environment_secrets = _validate_environment_section(raw)
+    env_raw, environment_pip, environment_secrets = _validate_environment_section(raw, algorithm)
     train_raw = _validate_train_section(raw, algorithm)
+    if algorithm == "grpo":
+        try:
+            resolve_grpo_rollout_shape(
+                train_raw.get("prompts_per_step"),
+                train_raw.get("group_size"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(str(exc)) from exc
     gpu_spec, gpu_count_auto = _validate_gpu_section(
         raw,
         model=model,
@@ -757,12 +754,11 @@ def _reject_inapplicable_train_knobs(spec: JobSpec) -> None:
 
 
 def _validate_grpo(spec: JobSpec) -> None:
-    """validate the grpo group-size and prompt-budget constraints."""
-    if spec.train.group_size is not None and spec.train.group_size < 2:
-        raise ConfigError(
-            "train.group_size must be >= 2 for GRPO (advantages are group-relative, so a "
-            "prompt needs at least two generations to compare against)"
-        )
+    """validate the grpo rollout shape and prompt-budget constraints."""
+    try:
+        resolve_grpo_rollout_shape(spec.train.prompts_per_step, spec.train.group_size)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
     _validate_on_policy_prompt_budget(spec, "grpo")
 
 

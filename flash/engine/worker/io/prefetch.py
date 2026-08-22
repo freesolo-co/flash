@@ -50,13 +50,10 @@ def _shared_weight_cache_dir() -> str | None:
 
 
 def _repo_folder_name(model_id: str) -> str:
-    """HF cache folder for a model repo (``models--org--name``), preferring the library helper."""
-    try:
-        from huggingface_hub.file_download import repo_folder_name
+    """HF cache folder for a model repo (``models--org--name``), from the library helper."""
+    from huggingface_hub.file_download import repo_folder_name
 
-        return repo_folder_name(repo_id=model_id, repo_type="model")
-    except Exception:  # older/newer hub layout — the format is stable, so fall back to it
-        return "models--" + model_id.replace("/", "--")
+    return repo_folder_name(repo_id=model_id, repo_type="model")
 
 
 def _link_base_model_into_ephemeral_cache(model_id: str, shared_hub: str) -> None:

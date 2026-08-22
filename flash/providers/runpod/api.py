@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+import urllib.error
 from typing import Any
 
 from flash._internal.logging import get_logger
@@ -18,17 +19,60 @@ QUEUE_BASE = "https://api.runpod.ai/v2"
 
 
 def key_fingerprint(key: str) -> str:
-    """Stable non-secret identifier for a pool key — safe to log; never the raw credential."""
-    return "rpk-" + hashlib.sha256(key.encode()).hexdigest()[:12]
+    """Stable non-secret owner identity for a pool key; safe to log, never the raw credential."""
+    return "rpk-" + hashlib.sha256(key.encode()).hexdigest()
+
+
+def _is_valid_key_fingerprint(fingerprint: object) -> bool:
+    return (
+        isinstance(fingerprint, str)
+        and len(fingerprint) == 68
+        and fingerprint.startswith("rpk-")
+        and all(char in "0123456789abcdef" for char in fingerprint[4:])
+    )
+
+
+def _is_prefix_key_fingerprint(fingerprint: object) -> bool:
+    """The 12-hex-digit prefix form, which is what DEPLOYED `dev` persists right now.
+
+    Deliberately not called "legacy": `dev`'s `key_fingerprint` is
+    `sha256(...).hexdigest()[:12]` today, so every endpoint any currently deployed release
+    creates carries this shape. Only this branch widened it to the full digest. Naming it
+    legacy already caused one wrong deletion of the resolver below (it was removed as dead
+    compatibility, then restored a day later) -- and a RunPod endpoint whose owner cannot be
+    resolved bills forever with nothing able to tear it down.
+    """
+    return (
+        isinstance(fingerprint, str)
+        and len(fingerprint) == 16
+        and fingerprint.startswith("rpk-")
+        and all(char in "0123456789abcdef" for char in fingerprint[4:])
+    )
+
+
+def _unique_matching_key(matches: list[str], message: str) -> str:
+    """The sole distinct credential among fingerprint matches.
+
+    Uniqueness is counted over distinct key VALUES, not pool entries: an operator who repeats
+    the same credential in the comma-separated ``RUNPOD_API_KEY`` still has unambiguous
+    ownership, and refusing to resolve it would strand submission, polling, cancellation and
+    endpoint deletion on a benign configuration typo.
+    """
+    distinct = set(matches)
+    if len(distinct) != 1:
+        raise RunpodApiError(message)
+    return next(iter(distinct))
 
 
 def _key_for_fingerprint(fingerprint: str) -> str:
-    """Resolve a key_fingerprint back to its raw pool key."""
-    pool = _keys.keys()
-    for key in pool:
-        if key_fingerprint(key) == fingerprint:
-            return key
-    raise RunpodApiError(f"no RunPod pool key matches fingerprint {fingerprint}")
+    """Resolve a full key fingerprint back to its unique raw pool key."""
+    if not _is_valid_key_fingerprint(fingerprint):
+        raise RunpodApiError("persisted RunPod key fingerprint is invalid")
+    configured_keys = _keys.keys()
+    matches = [key for key in configured_keys if key_fingerprint(key) == fingerprint]
+    return _unique_matching_key(
+        matches, "expected exactly one RunPod pool key for the persisted fingerprint"
+    )
 
 
 class RunpodApiError(RuntimeError):
@@ -86,6 +130,84 @@ def list_endpoints(*, deadline_at: float | None = None) -> list[dict]:
     return all_endpoints
 
 
+def _list_endpoints_for_key(
+    key: str,
+    *,
+    deadline_at: float | None = None,
+) -> list[dict]:
+    out = _CLIENT.request_with_retries_for_key(
+        key,
+        f"{REST_BASE}/endpoints",
+        retries=2,
+        deadline_at=deadline_at,
+    )
+    if not isinstance(out, list):
+        raise RunpodApiError(
+            f"unexpected /endpoints response for a pool key (got {type(out).__name__}, want list)"
+        )
+    return out
+
+
+def resolve_prefix_key_fingerprint(endpoint_id: str, fingerprint: str) -> str:
+    """Widen a persisted prefix only after its sole matching key proves endpoint ownership.
+
+    Required by CURRENTLY DEPLOYED releases, not by history: see `_is_prefix_key_fingerprint`.
+    """
+    if not _is_prefix_key_fingerprint(fingerprint):
+        raise RunpodApiError("persisted RunPod key fingerprint prefix is invalid")
+    configured_keys = _keys.keys()
+    matches = [
+        (key, full_fingerprint)
+        for key in configured_keys
+        if (full_fingerprint := key_fingerprint(key)).startswith(fingerprint)
+    ]
+    key = _unique_matching_key(
+        [match_key for match_key, _ in matches],
+        "expected exactly one RunPod pool key matching the persisted fingerprint prefix",
+    )
+    full_fingerprint = key_fingerprint(key)
+    try:
+        endpoints = _list_endpoints_for_key(key)
+    except Exception:
+        raise RunpodApiError(
+            f"runpod endpoint ownership lookup failed for {endpoint_id}; owner unconfirmed"
+        ) from None
+    if not any(
+        isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id for endpoint in endpoints
+    ):
+        # absence from this key's listing is not proof of foreign ownership: a process that died
+        # between deleting the endpoint and clearing its cleanup record leaves exactly this state,
+        # and refusing the upgrade would strand that record forever. but it is not proof of
+        # deletion either, and neither available signal settles it alone -- a 404 under the matching
+        # key means "invisible to this credential", which RunPod also answers for an endpoint alive
+        # under another account, while the pool listing cannot see an owner outside the pool at all.
+        # so require BOTH to agree it is gone: binding a record to the wrong credential is worse
+        # than stranding it, because teardown would then read 404, report success, and leave the
+        # real endpoint billing.
+        _confirm_deleted(endpoint_id, full_fingerprint)
+    return full_fingerprint
+
+
+def _confirm_deleted(endpoint_id: str, fingerprint: str) -> None:
+    """Raise unless both the pool-wide listing and the owner's own lookup agree it is gone."""
+    try:
+        fleet = list_endpoints()
+    except Exception:
+        raise RunpodApiError(
+            f"runpod endpoint ownership lookup failed for {endpoint_id}; owner unconfirmed"
+        ) from None
+    foreign = f"runpod endpoint {endpoint_id} is not owned by the fingerprint prefix match"
+    if any(isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id for endpoint in fleet):
+        raise RunpodApiError(foreign)
+    try:
+        # raises unless the lookup 404s, so a still-live endpoint can never read as deleted here.
+        absent = endpoint_absent_for_fingerprint(endpoint_id, fingerprint)
+    except RunpodApiError:
+        raise RunpodApiError(foreign) from None
+    if not absent:
+        raise RunpodApiError(foreign)
+
+
 def list_endpoints_by_key(
     *,
     deadline_at: float | None = None,
@@ -106,19 +228,9 @@ def list_endpoints_by_key(
     for key in pool:
         fp = key_fingerprint(key)
         try:
-            out = _CLIENT.request_with_retries_for_key(
-                key,
-                f"{REST_BASE}/endpoints",
-                retries=2,
-                deadline_at=deadline_at,
-            )
+            by_fingerprint[fp] = _list_endpoints_for_key(key, deadline_at=deadline_at)
         except RunpodApiError:
             failed.append(fp)
-            continue
-        if not isinstance(out, list):
-            failed.append(fp)
-            continue
-        by_fingerprint[fp] = out
     return by_fingerprint, failed
 
 
@@ -150,6 +262,25 @@ def endpoint_health_for_key(
 def delete_endpoint_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
     """delete_endpoint_for_key addressed by fingerprint; raw key resolved internally."""
     return delete_endpoint_for_key(endpoint_id, _key_for_fingerprint(fingerprint))
+
+
+def endpoint_absent_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
+    """Confirm absence only from an exact owner-authenticated endpoint lookup returning 404."""
+    key = _key_for_fingerprint(fingerprint)
+    try:
+        _CLIENT.request_with_retries_for_key(
+            key,
+            f"{REST_BASE}/endpoints/{endpoint_id}",
+            retries=2,
+        )
+    except Exception as exc:
+        cause = getattr(exc, "__cause__", None)
+        if isinstance(cause, urllib.error.HTTPError) and cause.code == 404:
+            return True
+        raise RunpodApiError(
+            f"runpod endpoint lookup failed for {endpoint_id}; cleanup unconfirmed"
+        ) from None
+    raise RunpodApiError(f"runpod endpoint {endpoint_id} still exists; cleanup unconfirmed")
 
 
 def endpoint_health_for_fingerprint(
@@ -252,9 +383,9 @@ def submit_job(
         retries=0,
         deadline_at=deadline_at,
     )
-    job_id = out.get("id")
-    if not job_id:
-        raise RunpodApiError(f"submit_job: no job id in response: {out}")
+    job_id = out.get("id") if isinstance(out, dict) else None
+    if not isinstance(job_id, str) or not job_id:
+        raise RunpodApiError("submit_job: response did not contain a valid job id")
     return job_id
 
 

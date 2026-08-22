@@ -381,6 +381,10 @@ EXACT_PROFILE = {
     "authoritative_supervised_tokens": 2048,
     "packing_mode": "packed",
     "architecture_mode": "pure-attention",
+    "authored_reasoning_turns": 0,
+    "rendered_reasoning_spans": 0,
+    "truncated_reasoning_spans": 0,
+    "reasoning_rows": 8,
     "content_digest": "b" * 64,
 }
 
@@ -609,6 +613,42 @@ def test_sft_cost_warns_the_client_that_the_template_dropped_reasoning(
     assert "K single-turn rows" in err
 
 
+def test_a_quote_still_renders_when_the_plane_omits_the_reasoning_counts(
+    tmp_path, monkeypatch, capsys
+):
+    """A field this build expects can be absent from an OLDER plane's reply, and that is not fatal.
+
+    The CLI does not ship with the control plane, so during a rolling upgrade a quote can arrive
+    from a producer that predates `truncated_reasoning_spans` / `reasoning_rows`. This is one
+    advisory warning line and its call sites are unwrapped, so indexing the profile strictly would
+    abort `train --cost` and the SFT dry run AFTER the server already returned a valid quote --
+    trading a missing warning for a failed command.
+    """
+    profile = {key: value for key, value in EXACT_PROFILE.items() if key != "reasoning_rows"}
+    profile.pop("truncated_reasoning_spans", None)
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 1.25,
+                "workload_profile": {
+                    **profile,
+                    "authored_reasoning_turns": 4,
+                    "rendered_reasoning_spans": 1,
+                },
+            }
+        ),
+    )
+
+    rc = cmd_train(_sft_args(tmp_path))
+    out = capsys.readouterr()
+
+    assert rc == 0, "an older plane's profile must not fail the quote it arrived on"
+    assert "1.25" in out.out
+    # the warning is what degrades, not the command.
+    assert "authored reasoning blocks" not in out.err
+
+
 def test_the_client_warning_counts_rows_over_the_same_horizon_as_the_counts(
     tmp_path, monkeypatch, capsys
 ):
@@ -646,74 +686,61 @@ def test_the_client_warning_counts_rows_over_the_same_horizon_as_the_counts(
     assert "across 8 SFT rows" not in err
 
 
-def test_the_client_warning_falls_back_to_retained_rows_without_horizon_fields(
-    tmp_path, monkeypatch, capsys
+@pytest.mark.parametrize(
+    "absent",
+    [
+        "authored_reasoning_turns",
+        "rendered_reasoning_spans",
+        "truncated_reasoning_spans",
+        "reasoning_rows",
+    ],
+)
+def test_sft_cost_survives_any_single_missing_reasoning_count(
+    tmp_path, monkeypatch, absent, capsys
 ):
-    """A profile from a producer that predates the horizon fields is still reported correctly.
+    """No single absent count may fail the quote it arrived on.
 
-    Those counts were measured over every retained row, so the matching denominator is the retained
-    count. Defaulting the missing horizon to zero instead would divide by zero rows and report a
-    loss against a population the profile never described.
+    This deliberately replaces a `pytest.raises(KeyError)` contract of my own: requiring a complete
+    profile here is right for the in-process producer and wrong for this reader, which parses the
+    reply of a control plane the CLI does not ship with. A newer CLI routinely talks to an older
+    plane, and the strict version turned that into a failed command rather than a missing advisory
+    line.
+    """
+    profile = dict(EXACT_PROFILE)
+    profile.pop(absent)
+    _use_client(
+        monkeypatch,
+        _QuotingClient({"estimated_cost_usd": 1.25, "workload_profile": profile}),
+    )
+
+    assert cmd_train(_sft_args(tmp_path)) == 0
+    assert "1.25" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "authored_reasoning_turns",
+        "rendered_reasoning_spans",
+        "truncated_reasoning_spans",
+        "reasoning_rows",
+    ],
+)
+def test_sft_cost_survives_a_malformed_reasoning_count(tmp_path, monkeypatch, malformed, capsys):
+    """A malformed count degrades the same way an absent one does, for the same reason.
+
+    A peer that sends `null` is no more actionable to the user than one that omits the key, and the
+    remedy is identical: skip the advisory line, keep the quote.
     """
     _use_client(
         monkeypatch,
         _QuotingClient(
-            {
-                "estimated_cost_usd": 1.25,
-                "workload_profile": {
-                    # EXACT_PROFILE carries no examples_per_update, which is the old-producer shape
-                    **EXACT_PROFILE,
-                    "authored_reasoning_turns": 4,
-                    "rendered_reasoning_spans": 1,
-                },
-            }
+            {"estimated_cost_usd": 1.25, "workload_profile": {**EXACT_PROFILE, malformed: None}}
         ),
     )
 
-    rc = cmd_train(_sft_args(tmp_path))
-    err = capsys.readouterr().err
-
-    assert rc == 0
-    assert "dropped 3 of 4 authored reasoning blocks" in err
-    assert "across 8 SFT rows" in err
-
-
-def test_unbounded_counts_are_not_divided_by_a_horizon_they_never_used(
-    tmp_path, monkeypatch, capsys
-):
-    """A profile can carry a binding horizon AND counts that predate the bounding.
-
-    The horizon inputs are present on both shapes, so deriving the denominator from them cannot
-    tell the two apart: it would divide whole-dataset counts by the 2 rows the horizon reaches and
-    claim 4 authored blocks across 2 rows -- more blocks than those rows can hold, since the counts
-    are per turn within a row. The denominator travels with the counts instead, and its absence
-    means unbounded.
-    """
-    _use_client(
-        monkeypatch,
-        _QuotingClient(
-            {
-                "estimated_cost_usd": 1.25,
-                "workload_profile": {
-                    **EXACT_PROFILE,
-                    # a horizon that reaches 2 of the 8 retained rows...
-                    "authoritative_steps": 1,
-                    "examples_per_update": 2,
-                    # ...but counts measured over every retained row, and no `reasoning_rows`
-                    "authored_reasoning_turns": 4,
-                    "rendered_reasoning_spans": 1,
-                },
-            }
-        ),
-    )
-
-    rc = cmd_train(_sft_args(tmp_path))
-    err = capsys.readouterr().err
-
-    assert rc == 0
-    assert "dropped 3 of 4 authored reasoning blocks" in err
-    assert "across 8 SFT rows" in err
-    assert "across 2 SFT rows" not in err
+    assert cmd_train(_sft_args(tmp_path)) == 0
+    assert "1.25" in capsys.readouterr().out
 
 
 def test_a_real_sft_submit_warns_about_dropped_reasoning_before_the_run_starts(
@@ -745,6 +772,40 @@ def test_a_real_sft_submit_warns_about_dropped_reasoning_before_the_run_starts(
     assert "dropped 3 of 4 authored reasoning blocks" in err
 
 
+def test_a_real_submit_reports_its_run_id_even_when_the_profile_is_malformed(
+    tmp_path, monkeypatch, capsys
+):
+    """The run is already created and billing here, so a bad profile must not take the id with it.
+
+    the quote and dry-run paths reject a malformed profile loudly, which is where nothing has been
+    allocated yet. past this line the money is spent, and a user who never sees the run id cannot
+    name it to cancel.
+    """
+    _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "run_id": "run-malformed-profile",
+                "workload_profile": {
+                    **{k: v for k, v in EXACT_PROFILE.items() if k != "reasoning_rows"},
+                    "authored_reasoning_turns": 4,
+                    "rendered_reasoning_spans": 1,
+                },
+            }
+        ),
+    )
+
+    args = _sft_args(tmp_path)
+    args.cost = False
+    args.background = True
+
+    rc = cmd_train(args)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "run-malformed-profile" in out
+
+
 def test_sft_cost_stays_quiet_when_every_authored_block_survives(tmp_path, monkeypatch, capsys):
     """A dataset the template renders whole must not be told to restructure itself."""
     _use_client(
@@ -772,7 +833,18 @@ def test_sft_cost_omits_aggregates_the_profile_did_not_report(tmp_path, monkeypa
     """A partial profile drops rows rather than defaulting them to zero."""
     _use_client(
         monkeypatch,
-        _QuotingClient({"estimated_cost_usd": 0.5, "workload_profile": {"authoritative_steps": 3}}),
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 0.5,
+                "workload_profile": {
+                    "authoritative_steps": 3,
+                    "authored_reasoning_turns": 0,
+                    "rendered_reasoning_spans": 0,
+                    "truncated_reasoning_spans": 0,
+                    "reasoning_rows": 0,
+                },
+            }
+        ),
     )
 
     rc = cmd_train(_sft_args(tmp_path))

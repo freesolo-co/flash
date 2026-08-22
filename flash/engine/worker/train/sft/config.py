@@ -114,6 +114,7 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         f"model.lora_rank={_hydra_val(cfg['lora_rank'])}",
         f"model.lora_alpha={_hydra_val(cfg['lora_alpha'])}",
         f"model.target_modules={_hydra_val(cfg['target_modules'])}",
+        f"model.exclude_modules={_hydra_val(cfg.get('exclude_modules'))}",
         *(
             [f"++model.target_parameters={_hydra_val(cfg['target_parameters'])}"]
             if cfg.get("target_parameters")

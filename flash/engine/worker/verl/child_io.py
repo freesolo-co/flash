@@ -292,6 +292,8 @@ _VERL_METRIC_FIELDS = (
     ("response_length/mean", "mean_completion_tokens"),
     ("response_length/clip_ratio", "truncation_rate"),
 )
+_ADVANTAGE_MIN_KEY = "critic/advantages/min"
+_ADVANTAGE_MAX_KEY = "critic/advantages/max"
 
 # verl reduces most metrics with np.mean and formats them through pprint, so under numpy>=2 a value
 # prints as "np.float32(1.25)" rather than "1.25". verl's own requirements pin numpy<2, but the
@@ -351,6 +353,13 @@ def parse_verl_step_metrics(line: str) -> dict | None:
         value = parse_verl_metric(line, verl_key)
         if value is not None:
             metrics[flash_key] = value
+    advantage_min = parse_verl_metric(line, _ADVANTAGE_MIN_KEY)
+    advantage_max = parse_verl_metric(line, _ADVANTAGE_MAX_KEY)
+    if advantage_min is not None and advantage_max is not None:
+        spread = advantage_max - advantage_min
+        if math.isfinite(spread) and spread >= 0.0:
+            metrics["advantage_min"] = advantage_min
+            metrics["advantage_max"] = advantage_max
     if not metrics:
         return None
     return {"step": int(match.group(1)), **metrics}

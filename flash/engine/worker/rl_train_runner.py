@@ -6,13 +6,18 @@ Split out of ``flash.engine.worker.rl_train`` to keep that module under the file
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
+from flash.adapters.targets import resolve_lora_targeting
+from flash.core.catalog import get_model
+from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.result.rollout_samples import sample_completion_text, sanitize_rollout_text
 from flash.engine.worker.backend_common import (
@@ -38,6 +43,7 @@ from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.train.core.step_timing import StepTiming
 from flash.engine.worker.train.rl.child.plugin import required_patch_names
+from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
 from flash.engine.worker.train.rl.multi_turn import (
     MultiTurnBridge,
     copy_grpo_child_modules,
@@ -46,6 +52,7 @@ from flash.engine.worker.train.rl.multi_turn import (
 )
 from flash.engine.worker.train.rl.reward_module import render_reward_module
 from flash.engine.worker.train.rl.single_turn import score_single_turn, score_single_turn_batch
+from flash.engine.worker.verl.process_census import GrpoProcessCensus
 
 
 def _rl_train():
@@ -62,9 +69,19 @@ class _StepMetricState:
     resp_len_history: list[float] = field(default_factory=list)
     loss_curve: list[float] = field(default_factory=list)
     adv_spread_history: list[float] = field(default_factory=list)
+    advantage_bounds: dict[int, tuple[float, float]] = field(default_factory=dict)
+    # the last step a previous attempt already completed; 0 for a fresh run. a resumed verl child
+    # replays this step's metrics line, which belongs to the earlier attempt, so its bounds are not
+    # evidence for the steps THIS attempt executed.
+    resume_step: int = 0
+    advantage_bounds_evidence: list[dict[str, int | float]] = field(default_factory=list)
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
     metrics_last: list[dict] = field(default_factory=list)
     step_timing: StepTiming = field(default_factory=StepTiming)
+    host_census: dict[str, Any] = field(default_factory=dict)
+    rollout_identity_evidence: dict[str, list] = field(
+        default_factory=lambda: {"steps": [], "validation": []}
+    )
     sent_first_metrics: bool = False
     sent_first_timing: bool = False
 
@@ -72,6 +89,7 @@ class _StepMetricState:
 @dataclass
 class _RewardRuntime:
     observability: RewardObservabilityBuffer
+    identity_ledger: RolloutIdentityLedger
     wandb_link: dict[str, str | None]
     multi_turn_bridge: object
     server: object
@@ -196,6 +214,9 @@ def _write_rl_shim(inp, files) -> None:
 
 def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) -> None:
     """serialize the final GRPO plugin configuration after capability resolution."""
+    targeting = resolve_lora_targeting(
+        inp["model_id"], algorithm="grpo", multimodal=bool(inp["multimodal"])
+    )
     config = {
         "marker_file": files["shim_markers"],
         "dp_cards": int(inp["dp_cards"]),
@@ -210,6 +231,9 @@ def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
         "total_steps": int(inp["steps"]),
         "kl_ref_adapter": bool(inp["warmstart_adapter"]) and float(inp["kl_coef"]) > 0,
         "multi_turn": bool(inp["multi_turn"]),
+        "lora_language_prefix": (
+            get_model(inp["model_id"]).lora_language_prefix if targeting.exclude_modules else ""
+        ),
         "gdn_model_type": gdn_reset_arch,
         "wandb": "wandb" in loggers,
     }
@@ -234,6 +258,10 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
     # data.
     observability = RewardObservabilityBuffer(
         generation_size=int(inp["prompts_per_step"]) * int(inp["group_size"]),
+    )
+    identity_ledger = RolloutIdentityLedger(
+        int(inp["prompts_per_step"]),
+        int(inp["group_size"]),
     )
 
     def _score_batch(requests: list[tuple[int, str]]) -> list[float]:
@@ -284,6 +312,7 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
             per_turn_credit=bool(inp["per_turn_credit"]),
             on_episode_scored=observability.record,
             parent_work=observability.parent_work,
+            identity_ledger=identity_ledger,
         )
         if inp["multi_turn"]
         else None
@@ -294,9 +323,11 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
         multi_turn_bridge=multi_turn_bridge,
         rollout_batch=int(inp["prompts_per_step"]) * int(inp["group_size"]),
         score_batch=None if inp["multi_turn"] else _score_batch,
+        identity_ledger=identity_ledger,
     )
     return _RewardRuntime(
         observability=observability,
+        identity_ledger=identity_ledger,
         # filled from the child's marker line; stays empty when wandb is off.
         wandb_link={},
         multi_turn_bridge=multi_turn_bridge,
@@ -344,6 +375,9 @@ def _announce_training(t_start: float, cfg) -> tuple[float, float]:
 def _start_resume_uploader(
     *, local_dir, resume_step, inp, workdir, python_bin, preprocessor, adv_spread_history
 ):
+    targeting = resolve_lora_targeting(
+        inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
+    )
     resume_uploader = _rl_train()._VerlResumeUploader(
         local_dir,
         resume_step=resume_step,
@@ -352,6 +386,7 @@ def _start_resume_uploader(
         python_bin=python_bin,
         model_id=inp["model_id"],
         model_revision=inp["model_revision"],
+        exclude_modules=targeting.exclude_modules,
         preprocessor=preprocessor,
         # a resumed run's restored weights already carry the earlier steps' updates, so this
         # worker's own spread history cannot speak for them; let it publish as before and leave
@@ -388,6 +423,7 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
         env_for_verl.update(
             multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_w.THINKING))
         )
+    env_for_verl.update(GRPO_NATIVE_THREAD_ENV)
     return env_for_verl
 
 
@@ -411,6 +447,13 @@ def _ingest_step_metrics(
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]
+        step_metrics.update(
+            {
+                f"host_census/{key}": value
+                for key, value in state.host_census.items()
+                if isinstance(value, int)
+            }
+        )
         append_step_metrics(state.metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT)
         # the worker's error path reads this global, so a run that dies mid-training
         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
@@ -446,13 +489,26 @@ def _ingest_step_metrics(
             value = parse_verl_metric(line, verl_key)
             if value is not None:
                 sink.append(value)
-        # advantages/max and /min are emitted for every step outside verl's
-        # use_critic branch (trainer/ppo/metric_utils.py), so they are present under
-        # grpo even though the key is namespaced critic/.
-        adv_max = parse_verl_metric(line, "critic/advantages/max")
-        adv_min = parse_verl_metric(line, "critic/advantages/min")
-        if adv_max is not None and adv_min is not None:
-            state.adv_spread_history.append(adv_max - adv_min)
+        # the structured parser admits advantage bounds only as a complete finite ordered pair.
+        # key them by optimizer step so replayed lines replace rather than duplicate terminal proof.
+        adv_min = step_metrics.get("advantage_min")
+        adv_max = step_metrics.get("advantage_max")
+        step_number = int(step_metrics["step"])
+        # a resumed child replays its resume step before producing the first new one. that line
+        # describes the PREVIOUS attempt's step, and `_finalize_advantage_evidence` expects exactly
+        # `resume_step + 1 .. horizon`, so admitting it reports the resume step as an extra step.
+        if (
+            isinstance(adv_min, float)
+            and isinstance(adv_max, float)
+            and step_number > state.resume_step
+        ):
+            state.advantage_bounds[step_number] = (adv_min, adv_max)
+            state.adv_spread_history[:] = [
+                maximum - minimum
+                for minimum, maximum in (
+                    state.advantage_bounds[step] for step in sorted(state.advantage_bounds)
+                )
+            ]
 
 
 def _execute_rl_child(
@@ -470,14 +526,24 @@ def _execute_rl_child(
     # reaped at teardown. this process is not pid 1 (the runpod handler is), so without it
     # every wait answers ChildProcessError for a zombie nobody will collect.
     adopt_orphaned_descendants()
-    proc = subprocess.Popen(
-        [python_bin, "-m", "flash_grpo_entry", *overrides],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env_for_verl,
-        start_new_session=True,
-    )
+    resume_step = int((files or {}).get("resume_step", 0))
+    state.resume_step = resume_step
+    census = GrpoProcessCensus(
+        os.getpid(),
+        expected_steps=range(resume_step + 1, int(inp["steps"]) + 1),
+    ).start()
+    try:
+        proc = subprocess.Popen(
+            [python_bin, "-m", "flash_grpo_entry", *overrides],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env_for_verl,
+            start_new_session=True,
+        )
+    except BaseException:
+        state.host_census = census.stop()
+        raise
     child_tail = _rl_train().ChildOutputTail()
     silence_watchdog = _rl_train().VerlChildSilenceWatchdog(
         child_tail,
@@ -490,6 +556,14 @@ def _execute_rl_child(
         silence_watchdog=silence_watchdog,
     )
     progress, last_dump_step = state.progress, state.last_dump_step
+    # verl replays its resume step's metrics line before producing the first NEW step
+    # (`child_io.append_step_metrics` documents the same replay). the identity ledger only
+    # registers steps `resume_step + 1 ..` horizon, so sealing the replayed step would raise
+    # "no registered rollout identity set" and kill a resumed run at its first output line.
+    # seeding the watermark at the resume boundary makes the replay a repeat of an
+    # already-dumped step, which this loop skips, exactly as it skips any other repeat.
+    if resume_step:
+        last_dump_step[0] = resume_step
     shim_markers = (files or {}).get("shim_markers")
     expected_shims = (files or {}).get("expected_shims", ())
     shims_verified = shim_markers is None
@@ -512,17 +586,19 @@ def _execute_rl_child(
                     shims_verified = True
                 # dump one sample completion per new step to the flash log (#607).
                 if progress["step"] != last_dump_step[0]:
+                    census.sample_step(progress["step"])
+                    state.host_census = census.summary()
                     # the generation boundary: verl logs this line once its step is scored, so
                     # everything the reward bridge buffered since the last one is that step's
-                    # complete output. seal it before the preview reads `latest`, so both the log
-                    # line and the heartbeat describe the same generation.
+                    # complete output. seal exact identities before publishing any step output.
+                    reward_runtime.identity_ledger.seal(progress["step"])
                     reward_runtime.observability.close_generation(progress["step"])
+                    last_dump_step[0] = progress["step"]
                     # asks for THIS step's rows, not merely the newest: when the line is spent on a
                     # generation the queue already dropped, nothing is published and the previous
                     # generation's text would print under this step.
                     samp = reward_runtime.observability.latest_for_step(progress["step"])
                     if samp:
-                        last_dump_step[0] = progress["step"]
                         _, completion, reward = samp
                         text = sanitize_rollout_text(sample_completion_text(completion))
                         preview = " ".join(text[:300].split())
@@ -541,9 +617,72 @@ def _execute_rl_child(
         # for every later job on a reusable worker.
         child_stream.terminate()
         raise
+    finally:
+        state.host_census = census.stop()
+        if state.metrics_last:
+            state.metrics_last[-1].update(
+                {
+                    f"host_census/{key}": value
+                    for key, value in state.host_census.items()
+                    if isinstance(value, int)
+                }
+            )
+            # multi-turn totals ride the same final metrics row. published in `finally` so a run
+            # that dies mid-stream still reports the turns it did execute.
+            bridge = getattr(reward_runtime, "multi_turn_bridge", None)
+            accounting = bridge.turn_accounting() if bridge is not None else {}
+            state.metrics_last[-1].update(
+                {
+                    f"multi_turn/{key}": value
+                    for key, value in accounting.items()
+                    if value is not None
+                }
+            )
+            LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
 
 
-def _validate_rl_child(rc, state, resume_step, expected_steps, resume_uploader, *, files=None):
+def _finalize_advantage_evidence(state, resume_step: int, expected_steps: int) -> None:
+    expected = tuple(range(int(resume_step) + 1, int(expected_steps) + 1))
+    actual = tuple(sorted(state.advantage_bounds))
+    if actual != expected:
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        raise RuntimeError(
+            "GRPO advantage bounds do not cover the executed optimizer steps: "
+            f"missing={missing}, extra={extra}"
+        )
+    rows: list[dict[str, int | float]] = []
+    spreads: list[float] = []
+    for step in expected:
+        minimum, maximum = state.advantage_bounds[step]
+        spread = maximum - minimum
+        if not all(math.isfinite(value) for value in (minimum, maximum, spread)) or spread < 0.0:
+            raise RuntimeError(f"GRPO advantage bounds for step {step} are not finite and ordered")
+        row: dict[str, int | float] = {
+            "step": step,
+            "min": minimum,
+            "max": maximum,
+            "spread": spread,
+        }
+        if maximum - minimum != spread:
+            raise RuntimeError(f"GRPO advantage spread for step {step} does not match its bounds")
+        rows.append(row)
+        spreads.append(spread)
+    if state.adv_spread_history != spreads:
+        raise RuntimeError("GRPO advantage spread history does not match the exact per-step bounds")
+    state.advantage_bounds_evidence = rows
+
+
+def _validate_rl_child(
+    rc,
+    state,
+    resume_step,
+    expected_steps,
+    resume_uploader,
+    *,
+    files=None,
+    reward_runtime=None,
+):
     if rc == SHIM_FRAGMENT_FAILED_EXIT_CODE:
         # the wrapped fragment printed its traceback and named itself before exiting; classify
         # this as permanent, not retriable infra: the same interpreter fails identically on
@@ -557,6 +696,11 @@ def _validate_rl_child(rc, state, resume_step, expected_steps, resume_uploader, 
     if rc != 0:
         raise RuntimeError(
             f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback"
+        )
+    rollout_identity_evidence = None
+    if reward_runtime is not None:
+        rollout_identity_evidence = reward_runtime.identity_ledger.finalize(
+            range(int(resume_step) + 1, int(expected_steps) + 1)
         )
     # belt and braces behind the first-step check in _execute_rl_child: a run that exits 0 without
     # printing a step line (a resume already at the horizon) still may not pass unverified.
@@ -576,6 +720,7 @@ def _validate_rl_child(rc, state, resume_step, expected_steps, resume_uploader, 
         # expected_steps, so this cannot excuse a run that stopped short.
         already_complete=bool(resume_step) and resume_step >= expected_steps,
     )
+    _finalize_advantage_evidence(state, resume_step, expected_steps)
     # training finished cleanly, so a missing required save is a real defect rather than a
     # side effect of a crash. stop here (not in finally, which suppresses) to surface it.
     # only when exact saves were requested: without them the drain stays best-effort, and
@@ -583,6 +728,8 @@ def _validate_rl_child(rc, state, resume_step, expected_steps, resume_uploader, 
     if resume_uploader is not None and resume_uploader.required_steps:
         resume_uploader.stop()
         resume_uploader.raise_if_incomplete()
+    if rollout_identity_evidence is not None:
+        state.rollout_identity_evidence = rollout_identity_evidence
 
 
 def _prepare_final_adapter(local_dir: str, t_train: float):
@@ -604,5 +751,13 @@ def _export_final_adapter(actor_dir, adapter_dir, inp, python_bin):
     parent.export_peft_adapter(
         actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
     )
-    parent.stamp_adapter_dir_provenance(adapter_dir, inp["model_id"], inp["model_revision"])
+    targeting = resolve_lora_targeting(
+        inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
+    )
+    parent.stamp_adapter_dir_provenance(
+        adapter_dir,
+        inp["model_id"],
+        inp["model_revision"],
+        exclude_modules=targeting.exclude_modules,
+    )
     _w.write_base_model_provenance(adapter_dir, inp["model_id"], inp["model_revision"])

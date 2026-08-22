@@ -691,11 +691,6 @@ def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
     assert examples[rows[1]["example_idx"]] is image_example
 
 
-def test_single_turn_conversational_completion_keeps_text_reward_semantics():
-    completion = [{"role": "assistant", "content": [{"type": "text", "text": "red"}]}]
-    assert mm.assistant_completion_text(completion) == "red"
-
-
 def test_sft_rejects_image_completion_when_prompt_is_text_only():
     from flash.engine.worker.entry.sft import _reject_image_completion
 

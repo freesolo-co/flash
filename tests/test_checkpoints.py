@@ -165,7 +165,7 @@ def test_publish_deployable_checkpoint_with_empty_model_writes_no_provenance(tmp
     assert len(rec.uploads) == 1
 
 
-def test_publish_deployable_checkpoint_accepts_legacy_bin_weights(tmp_path, monkeypatch):
+def test_publish_deployable_checkpoint_rejects_bin_weights(tmp_path, monkeypatch):
     import flash.engine.worker as worker
 
     rec = _RecordingHfApi()
@@ -175,10 +175,8 @@ def test_publish_deployable_checkpoint_accepts_legacy_bin_weights(tmp_path, monk
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.bin").write_bytes(b"weights")
 
-    subfolder = worker.publish_deployable_checkpoint(str(ckpt), 80)
-
-    assert subfolder == "rl/flash-ckpt-1/checkpoints/step-80/adapter"
-    assert len(rec.uploads) == 1
+    assert worker.publish_deployable_checkpoint(str(ckpt), 80) is None
+    assert rec.uploads == []
 
 
 def test_publish_deployable_checkpoint_skips_without_adapter(tmp_path, monkeypatch):
@@ -321,7 +319,7 @@ def test_list_checkpoints_parses_and_sorts(monkeypatch):
     assert out[1]["step"] == 80
 
 
-def test_list_checkpoints_accepts_legacy_bin_weights(monkeypatch):
+def test_list_checkpoints_rejects_bin_weights(monkeypatch):
     base = "rl/flash-ckpt-1"
     files = [
         f"{base}/checkpoints/step-40/adapter/adapter_config.json",
@@ -329,7 +327,7 @@ def test_list_checkpoints_accepts_legacy_bin_weights(monkeypatch):
     ]
     _patch_hf_files(monkeypatch, files)
 
-    assert [c["step"] for c in list_checkpoints(_spec())] == [40]
+    assert list_checkpoints(_spec()) == []
 
 
 def test_list_checkpoints_skips_step_without_weights(monkeypatch):
@@ -379,7 +377,7 @@ def test_final_adapter_artifact_exists_requires_config_and_weights(monkeypatch):
     assert adapter_artifact_exists(_spec(), step=None) is True
 
 
-def test_final_adapter_artifact_exists_accepts_legacy_bin_weights(monkeypatch):
+def test_final_adapter_artifact_exists_rejects_bin_weights(monkeypatch):
     base = "rl/flash-ckpt-1"
     _patch_hf_files(
         monkeypatch,
@@ -389,7 +387,7 @@ def test_final_adapter_artifact_exists_accepts_legacy_bin_weights(monkeypatch):
         ],
     )
 
-    assert adapter_artifact_exists(_spec(), step=None) is True
+    assert adapter_artifact_exists(_spec(), step=None) is False
 
 
 def test_final_adapter_artifact_exists_rejects_incomplete_or_nested_files(monkeypatch):

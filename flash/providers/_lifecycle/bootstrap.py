@@ -47,7 +47,6 @@ _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
 _CONSOLE_UPLOAD_REAP_RESERVE_S = 2 * _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S
-_HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
 _TERMINAL_MARKER_GRACE_S = 0.25
@@ -138,7 +137,10 @@ def load_payload() -> dict:
 
 
 def _arm(payload: dict) -> str:
-    return str(payload.get("flash_arm") or "instance")
+    arm = payload.get("flash_arm")
+    if not isinstance(arm, str) or not arm:
+        raise ValueError("bootstrap payload is missing flash_arm")
+    return arm
 
 
 def _source_descriptor(payload: dict):
@@ -183,14 +185,13 @@ def _hf_retry_after(exc: BaseException) -> float | None:
     return min(_HF_RETRY_AFTER_MAX_S, max(0.0, seconds))
 
 
-def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dict | None = None):
+def _hf_call(call, label: str, *, deadline_at: float, secrets: dict | None = None):
     """``secrets`` must carry the run's payload secrets whenever the wrapped call takes a payload
     credential (the retried error message can echo it, and it is absent from ``os.environ``)."""
     for attempt in range(len(_HF_RETRY_DELAYS_S) + 1):
-        if deadline_at is not None:
-            remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
-            if remaining <= 0:
-                raise TimeoutError(f"{label} exceeded the run wall deadline")
+        remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
+        if remaining <= 0:
+            raise TimeoutError(f"{label} exceeded the run wall deadline")
         try:
             return call()
         except Exception as exc:
@@ -200,11 +201,10 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dic
                 raise
             retry_after = _hf_retry_after(exc)
             delay = retry_after if retry_after is not None else _HF_RETRY_DELAYS_S[attempt]
-            if deadline_at is not None:
-                remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
-                if remaining <= 0:
-                    raise TimeoutError(f"{label} exceeded the run wall deadline") from None
-                delay = min(delay, remaining)
+            remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
+            if remaining <= 0:
+                raise TimeoutError(f"{label} exceeded the run wall deadline") from None
+            delay = min(delay, remaining)
             print(
                 f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
                 f"{_safe_detail(exc, 500, secrets=secrets)}",
@@ -226,7 +226,7 @@ def hf_upload(
     try:
         from huggingface_hub import HfApi
 
-        if enforce_deadline and "deadline_at" in payload:
+        if enforce_deadline:
             require_deadline_at(payload)
         HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
             path_or_fileobj=local_path,
@@ -472,8 +472,7 @@ def hf_file_exists(payload: dict, repo_subpath: str) -> bool:
     """True iff ``<hf_prefix>/<repo_subpath>`` exists in the run's HF dataset repo. Raises on API error."""
     from huggingface_hub import HfApi
 
-    if "deadline_at" in payload:
-        require_deadline_at(payload)
+    require_deadline_at(payload)
     api = HfApi(token=(payload.get("env") or {}).get("HF_TOKEN"))
     return api.file_exists(
         repo_id=payload["hf_repo"],

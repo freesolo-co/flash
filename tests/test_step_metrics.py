@@ -12,18 +12,21 @@ import ast
 import inspect
 import textwrap
 
+from flash.engine.worker import rl_train_runner
 from flash.engine.worker.backend_common import (
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
     verl_step_number,
 )
+from flash.engine.worker.rl_train_runner import _ingest_step_metrics, _StepMetricState
 
 # a realistic verl step line: ray tags worker stdout with a pid prefix, and reduce_metrics returns
 # numpy scalars that pprint renders as np.float64(...) under numpy>=2.
 _RAY_PREFIX = "(TaskRunner pid=3125) "
 _STEP_LINE = (
-    "step:7 - critic/rewards/mean:0.625 - actor/pg_loss:-0.0134 - actor/grad_norm:1.5 - "
+    "step:7 - critic/rewards/mean:0.625 - critic/advantages/min:-0.25 - "
+    "critic/advantages/max:0.75 - actor/pg_loss:-0.0134 - actor/grad_norm:1.5 - "
     "actor/kl_loss:0.002 - actor/entropy:0.91 - response_length/mean:213.5 - "
     "response_length/clip_ratio:0.125"
 )
@@ -35,6 +38,8 @@ def test_parses_every_rendered_field_from_a_step_line():
     assert metrics == {
         "step": 7,
         "reward": 0.625,
+        "advantage_min": -0.25,
+        "advantage_max": 0.75,
         "grad_norm": 1.5,
         "kl": 0.002,
         "entropy": 0.91,
@@ -48,7 +53,9 @@ def test_parses_ray_prefixed_numpy2_line():
     # prefix (so an anchored regex parses nothing) and numpy>=2's np.float64(...) repr (so a
     # plain-float regex drops the column). both are live in the shipped worker image.
     line = _RAY_PREFIX + (
-        "step:12 - critic/rewards/mean:np.float64(0.4) - actor/grad_norm:np.float32(2.25) - "
+        "step:12 - critic/rewards/mean:np.float64(0.4) - "
+        "critic/advantages/min:np.float32(-0.5) - "
+        "critic/advantages/max:np.float64(1.25) - actor/grad_norm:np.float32(2.25) - "
         "response_length/mean:np.float64(180.0)"
     )
 
@@ -57,6 +64,8 @@ def test_parses_ray_prefixed_numpy2_line():
     assert metrics == {
         "step": 12,
         "reward": 0.4,
+        "advantage_min": -0.5,
+        "advantage_max": 1.25,
         "grad_norm": 2.25,
         "mean_completion_tokens": 180.0,
     }
@@ -65,11 +74,24 @@ def test_parses_ray_prefixed_numpy2_line():
 def test_non_finite_metric_is_dropped_without_losing_its_siblings():
     # a diverged run prints nan; rendering it as a column is meaningless and it can poison the json
     # payload downstream, so drop that field only -- the step and the healthy fields must survive.
-    line = "step:3 - critic/rewards/mean:nan - actor/grad_norm:inf - actor/entropy:0.5"
+    line = (
+        "step:3 - critic/rewards/mean:nan - critic/advantages/min:-0.5 - "
+        "critic/advantages/max:inf - actor/grad_norm:inf - actor/entropy:0.5"
+    )
 
     metrics = parse_verl_step_metrics(line)
 
     assert metrics == {"step": 3, "entropy": 0.5}
+
+
+def test_incomplete_or_reversed_advantage_bounds_are_rejected_as_a_pair():
+    for line in (
+        "step:3 - critic/rewards/mean:0.5 - critic/advantages/min:-0.5",
+        "step:3 - critic/rewards/mean:0.5 - critic/advantages/min:1.0 - critic/advantages/max:0.0",
+        "step:3 - critic/rewards/mean:0.5 - critic/advantages/min:-1e308 - critic/advantages/max:1e308",
+    ):
+        metrics = parse_verl_step_metrics(line)
+        assert metrics == {"step": 3, "reward": 0.5}
 
 
 def test_missing_metrics_are_absent_rather_than_zero():
@@ -171,6 +193,51 @@ def test_backlog_is_mutated_in_place_for_the_heartbeat_reader():
 
     assert alias is backlog
     assert alias == [{"step": 3}, {"step": 4}, {"step": 5}]
+
+
+def test_exact_advantage_bounds_are_retained_in_the_forced_step_heartbeat(monkeypatch):
+    calls = []
+    outcomes = iter((False, True))
+
+    def heartbeat(stage, **fields):
+        calls.append((stage, fields))
+        return next(outcomes)
+
+    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    for step, minimum, maximum in ((1, -0.25, 0.75), (2, -0.5, 1.5)):
+        _ingest_step_metrics(
+            f"step:{step} - critic/rewards/mean:0.5 - "
+            f"critic/advantages/min:{minimum} - critic/advantages/max:{maximum}",
+            {"max_completion": 512},
+            state,
+            dict,
+        )
+
+    assert len(calls) == 2
+    assert calls[-1][1]["metrics_last"] == [
+        {
+            "step": 1,
+            "reward": 0.5,
+            "advantage_min": -0.25,
+            "advantage_max": 0.75,
+            "max_completion_tokens": 512,
+        },
+        {
+            "step": 2,
+            "reward": 0.5,
+            "advantage_min": -0.5,
+            "advantage_max": 1.5,
+            "max_completion_tokens": 512,
+        },
+    ]
+    assert state.adv_spread_history == [1.0, 2.0]
+    rl_train_runner._validate_rl_child(0, state, 0, 2, None)
+    assert state.advantage_bounds_evidence == [
+        {"step": 1, "min": -0.25, "max": 0.75, "spread": 1.0},
+        {"step": 2, "min": -0.5, "max": 1.5, "spread": 2.0},
+    ]
 
 
 def _verl_rl_tree() -> ast.Module:

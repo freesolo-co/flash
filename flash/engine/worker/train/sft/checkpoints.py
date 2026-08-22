@@ -24,7 +24,11 @@ from flash.engine.worker.backend_common import (
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.train.core.checkpoint_lifecycle import CheckpointLedger
-from flash.engine.worker.verl.checkpoints import MergeDiskExhaustedError, MergeDiskHeadroomError
+from flash.engine.worker.verl.checkpoints import (
+    MergeDiskExhaustedError,
+    MergeDiskHeadroomError,
+    resume_upload_unavailable,
+)
 
 
 def _sft_train():
@@ -71,6 +75,7 @@ def _export_checkpoint_adapter(
     model_id: str,
     model_revision: str,
     python_bin: str,
+    exclude_modules: str | None = None,
     preprocessor=None,
 ) -> None:
     shutil.rmtree(adapter_dir, ignore_errors=True)
@@ -83,7 +88,9 @@ def _export_checkpoint_adapter(
     _copy_processing_sidecars(actor_dir, adapter_dir)
     if preprocessor is not None:
         preprocessor.save_pretrained(adapter_dir)
-    stamp_adapter_dir_provenance(adapter_dir, model_id, model_revision)
+    stamp_adapter_dir_provenance(
+        adapter_dir, model_id, model_revision, exclude_modules=exclude_modules
+    )
     _w.write_base_model_provenance(adapter_dir, model_id, model_revision)
 
 
@@ -99,6 +106,7 @@ class _VerlCheckpointWatcher:
         model_id: str,
         model_revision: str,
         required_steps: tuple[int, ...],
+        exclude_modules: str | None = None,
         preprocessor=None,
     ) -> None:
         self.local_dir = local_dir
@@ -109,6 +117,7 @@ class _VerlCheckpointWatcher:
         self.python_bin = python_bin
         self.model_id = model_id
         self.model_revision = model_revision
+        self.exclude_modules = exclude_modules
         self.preprocessor = preprocessor
         self.required_steps = frozenset(required_steps)
         self.lifecycle = CheckpointLedger()
@@ -155,21 +164,43 @@ class _VerlCheckpointWatcher:
         return not self.required_steps or step in self.required_steps
 
     def _publishable(self, pending: list[tuple[int, str]]) -> list[tuple[int, str]]:
-        """coalesce only an optional multi-checkpoint backlog to its newest save."""
-        if self.required_steps or len(pending) <= 1:
+        """coalesce a superseded OPTIONAL backlog to its newest save, required steps kept.
+
+        the coalescing exists because each export writes a full model copy to the container disk,
+        and the publisher runs on its own thread while training writes the next checkpoint. gating
+        the whole thing on `self.required_steps` being empty disabled it for exactly the runs that
+        need it most: `save_at_steps` makes every step required, so a backlog kept every optional
+        step too and the disk held several full copies at once.
+
+        a required step is still never dropped -- it is owed a durable artifact. only steps that
+        `_should_publish` would skip anyway are coalesced away, so this changes no authored
+        contract; it just stops claiming them one sweep later than it has to.
+        """
+        if len(pending) <= 1:
             return pending
-        superseded = pending[:-1]
+        # a required step is owed a durable artifact and is never coalesced away. an optional step is
+        # only worth publishing when it is the newest save in the backlog; anything older than that
+        # is superseded by weights this same sweep is about to publish.
+        keep = [
+            entry
+            for index, entry in enumerate(pending)
+            if entry[0] in self.required_steps or index == len(pending) - 1
+        ]
+        superseded = [entry for entry in pending if entry not in keep]
+        if not superseded:
+            return pending
         # discovered only: these are claimed so the next sweep skips them, and deliberately gain no
         # durability fact. nothing was published for them, and the ledger has to say so.
         for step, _ in superseded:
             self.lifecycle.mark_discovered(step)
         print(
-            f"[ckpt] publishing step {pending[-1][0]} and skipping superseded periodic "
-            f"checkpoint(s) {', '.join(str(step) for step, _ in superseded)}: the publisher is "
-            "behind training, and each export writes a full model copy to the same disk",
+            f"[ckpt] publishing step(s) {', '.join(str(step) for step, _ in keep)} and skipping "
+            f"superseded periodic checkpoint(s) {', '.join(str(step) for step, _ in superseded)}: "
+            "the publisher is behind training, and each export writes a full model copy to the "
+            "same disk",
             flush=True,
         )
-        return pending[-1:]
+        return keep
 
     def _staged_source(self, step: int, checkpoint_dir: str) -> str:
         """hardlink a completed checkpoint before verl retention can prune it.
@@ -239,14 +270,15 @@ class _VerlCheckpointWatcher:
         # the rl uploader republishes from its staged adapters on subsequent sweeps, and the opd
         # watcher hands `adapter_dir` to `_stage_retry_contract`. sft is done with it inside this call.
         try:
-            export_kwargs = {
-                "model_id": self.model_id,
-                "model_revision": self.model_revision,
-                "python_bin": self.python_bin,
-            }
-            if self.preprocessor is not None:
-                export_kwargs["preprocessor"] = self.preprocessor
-            _sft_train()._export_checkpoint_adapter(actor_dir, adapter_dir, **export_kwargs)
+            _sft_train()._export_checkpoint_adapter(
+                actor_dir,
+                adapter_dir,
+                model_id=self.model_id,
+                model_revision=self.model_revision,
+                exclude_modules=self.exclude_modules,
+                python_bin=self.python_bin,
+                preprocessor=self.preprocessor,
+            )
             self.lifecycle.mark_staged(step)
             uploaded = _w.upload_resume_checkpoint(
                 step,
@@ -259,7 +291,7 @@ class _VerlCheckpointWatcher:
             shutil.rmtree(adapter_dir, ignore_errors=True)
         if step in self.required_steps and not uploaded:
             self.lifecycle.mark_failed(step)
-            raise RuntimeError(f"required save step {step} full-state checkpoint was not published")
+            resume_upload_unavailable(step, checkpoint_dir, job_label="sft")
 
     def _run(self) -> None:
         try:

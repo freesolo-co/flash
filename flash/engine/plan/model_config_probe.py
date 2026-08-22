@@ -40,12 +40,10 @@ def _config_mismatches(info, params_b, vocab, hidden, layers, heads) -> list[str
     return mismatches
 
 
-# Shared because `allocate()` sizes the run (validating this geometry) and THEN asks for the head
+# shared because `allocate()` sizes the run (validating this geometry) and then asks for the head
 # cap: an unshared second lookup let a blip between the two narrow a valid eight-card run to four.
-# Storable is narrower than "succeeded": persisted pre-removal specs can still carry a mutable REF,
-# and a read is incomplete when the hub omits `safetensors.total` -- hub metadata, not
-# commit-immutable config geometry, so caching that None keeps a valid pin rejected until restart.
-# Failures likewise.
+# a read is incomplete when the hub omits `safetensors.total`, which is hub metadata rather than
+# commit-immutable config geometry. caching that result would keep a valid pin rejected until restart.
 _CONFIG_PROBE_MEMO: dict[tuple[str, str], tuple] = {}
 
 

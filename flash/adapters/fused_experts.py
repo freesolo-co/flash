@@ -9,8 +9,8 @@ from typing import Any
 
 from flash.adapters.lora_rank import (
     _rank_for_module,
-    declared_lora_ranks,
     lora_tensor_rank_disagrees,
+    strict_declared_lora_ranks,
 )
 from flash.core.catalog import get_model
 
@@ -31,10 +31,23 @@ _QWEN36_FUSED_TARGET_RUNGS = {
 }
 _FUSED_EXPERT_SYNTHETIC_MODULES = frozenset({"experts", "base_layer"})
 _FUSED_EXPERT_WRAPPER_MODULES = ("mlp.experts", "mlp.experts.base_layer")
+_NON_LANGUAGE_LORA_SEGMENTS = frozenset(
+    {
+        "mtp",
+        "multi_modal_projector",
+        "patch_embed",
+        "visual",
+        "vision",
+        "vision_encoder",
+        "vision_model",
+        "vision_tower",
+    }
+)
 _INVALID_FUSED_LOCATION = object()
 
 _LoraTensor = tuple[str, str, str, tuple[int, ...]]
 _LoraPair = tuple[tuple[int, ...], tuple[int, ...]]
+_LoraPairKeys = tuple[str, str]
 
 
 def lora_target_parameters(model_id: str | None) -> list[str] | None:
@@ -67,9 +80,7 @@ def validate_fused_expert_adapter_config(config: Mapping[str, Any], model_id: st
             f"adapter for {model_id} must declare exactly the fused expert targets {required}"
         )
 
-    rank_pattern = config.get("rank_pattern")
-    _validate_rank_pattern(rank_pattern, model_id)
-    declared = declared_lora_ranks(config)
+    declared = strict_declared_lora_ranks(config, source=f"adapter for {model_id}")
     unresolved = [target for target in required if _rank_for_module(target, declared) is None]
     if unresolved:
         raise ValueError(
@@ -109,31 +120,6 @@ def validate_fused_expert_adapter_config(config: Mapping[str, Any], model_id: st
         )
 
 
-def _validate_rank_pattern(rank_pattern: Any, model_id: str) -> None:
-    """Validate positive ranks and PEFT's anchored regex pattern syntax."""
-    message = (
-        f"adapter for {model_id} rank_pattern must map valid non-empty string patterns "
-        "to positive integer ranks"
-    )
-    if rank_pattern is None:
-        return
-    if not isinstance(rank_pattern, Mapping):
-        raise ValueError(message)
-    for pattern, rank in rank_pattern.items():
-        if (
-            not isinstance(pattern, str)
-            or not pattern.strip()
-            or not isinstance(rank, int)
-            or isinstance(rank, bool)
-            or rank <= 0
-        ):
-            raise ValueError(message)
-        try:
-            re.compile(rf"(.*\.)?({pattern})$")
-        except re.error as exc:
-            raise ValueError(message) from exc
-
-
 def _targets_fused_expert_wrapper(module: str) -> bool:
     """Return whether PEFT suffix matching binds this target to an expert wrapper."""
     return any(
@@ -159,6 +145,33 @@ def normalize_verl_fused_expert_export(config: dict[str, Any], model_id: str) ->
             for module in modules
             if not isinstance(module, str) or module not in _FUSED_EXPERT_SYNTHETIC_MODULES
         ]
+
+
+def is_non_language_lora_key(key: str) -> bool:
+    """whether a LoRA tensor key names a non-language (vision, projector, mtp) module."""
+    return bool(set(key.lower().split(".")) & _NON_LANGUAGE_LORA_SEGMENTS)
+
+
+def fused_expert_lora_tensor_pairs(
+    tensors: Mapping[str, tuple[int, ...]], config: Mapping[str, Any], model_id: str
+) -> dict[str, _LoraPairKeys] | None:
+    """Return complete canonical pair keys when fused and ordinary topology is exact."""
+    expected = _expected_fused_expert_rungs(config, model_id)
+    if expected is None:
+        return None
+    lora_keys = {key: shape for key, shape in tensors.items() if _LORA_FACTOR_PATTERN.search(key)}
+    parsed = [
+        tensor
+        for key, shape in lora_keys.items()
+        if (tensor := _parse_lora_tensor(key, shape)) is not None
+    ]
+    if not parsed or len(parsed) != len(lora_keys):
+        return None
+    if not _has_complete_fused_rungs(parsed, expected, model_id) or not _has_ordinary_evidence(
+        parsed, config, expected
+    ):
+        return None
+    return _complete_lora_pair_keys(parsed)
 
 
 def has_complete_fused_expert_tensors(
@@ -225,7 +238,7 @@ def _expected_fused_expert_rungs(
     if catalog_dimensions != Counter(_QWEN36_FUSED_TARGET_DIMENSIONS.values()):
         return None
 
-    declared = declared_lora_ranks(config)
+    declared = strict_declared_lora_ranks(config)
     expected: dict[str, dict[str, _LoraPair]] = {}
     for target in targets:
         rank = _rank_for_module(target, declared)
@@ -315,15 +328,17 @@ def _has_ordinary_evidence(
     for module_path, factor, key, shape in tensors:
         if _is_fused_rung(module_path, fused_rungs):
             continue
+        if not module_path.startswith("base_model.model."):
+            return False
         matched = tuple(target for target in targets if _anchored_suffix_match(module_path, target))
         if not all_linear and not matched:
-            continue
+            return False
         evidence.update(matched)
         groups.setdefault(module_path, {})[factor] = (key, shape)
     if not groups or (not all_linear and evidence != set(targets)):
         return False
 
-    declared = declared_lora_ranks(config)
+    declared = strict_declared_lora_ranks(config)
     for module_path, factors in groups.items():
         if _rank_for_module(module_path, declared) is None:
             return False
@@ -333,6 +348,21 @@ def _has_ordinary_evidence(
             if not _is_positive_2d(shape) or lora_tensor_rank_disagrees(key, shape, declared):
                 return False
     return True
+
+
+def _complete_lora_pair_keys(
+    tensors: list[_LoraTensor],
+) -> dict[str, _LoraPairKeys] | None:
+    """Return every canonical module pair without orphan factors."""
+    groups: dict[str, dict[str, str]] = {}
+    for module_path, factor, key, _shape in tensors:
+        factors = groups.setdefault(module_path, {})
+        if factor in factors:
+            return None
+        factors[factor] = key
+    if not groups or any(set(factors) != {"A", "B"} for factors in groups.values()):
+        return None
+    return {module_path: (factors["A"], factors["B"]) for module_path, factors in groups.items()}
 
 
 def _is_fused_rung(module_path: str, fused_rungs: Mapping[str, Mapping[str, _LoraPair]]) -> bool:

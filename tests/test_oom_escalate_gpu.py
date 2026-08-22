@@ -503,7 +503,7 @@ def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
         "job_status",
         lambda _eid, _jid, **_kw: {"status": "FAILED", "error": "x"},
     )
-    handle = jobs.JobHandle("ep", "name", "rpk-0123456789ab", "job", 2, 1.0)
+    handle = jobs.JobHandle("ep", "name", "rpk-" + "0" * 64, "job", 2, 1.0)
 
     res = jobs.poll_job(
         handle,
