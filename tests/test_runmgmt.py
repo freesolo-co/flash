@@ -1553,6 +1553,13 @@ def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
         "the billable endpoint was never deleted"
     )
     assert any("endpoint-legacy" in repr(item) for item in attempted)
+    # and the confirmed-deleted record must actually leave the file. removal derives its key from
+    # the same record the drain admitted, so a strict-only derivation would return None here and
+    # clear nothing -- leaving every later sweep to tear down an endpoint that is already gone.
+    with open(path) as f:
+        assert not _json.load(f).get(runner._CLEANUP_REMOTES_KEY), (
+            "the confirmed-deleted record survived, so every later sweep retries a deleted endpoint"
+        )
 
 
 def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypatch, tmp_path):

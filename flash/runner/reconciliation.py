@@ -256,7 +256,7 @@ def _snapshot_cleanup_remotes(run_id: str) -> list[dict]:
 
 
 def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bool:
-    expected_key = runner._cleanup_remote_key(expected_remote)
+    expected_key = _teardown_removal_key(expected_remote)
     if expected_key is None:
         return False
     with runner._status_guard(run_id):
@@ -273,12 +273,7 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
             value = raw.get(runner._CLEANUP_REMOTES_KEY, [])
             if not isinstance(value, list):
                 return False
-            remaining = [
-                item
-                for item in value
-                if runner._cleanup_remote_key(runner._canonical_cleanup_remote(item))
-                != expected_key
-            ]
+            remaining = [item for item in value if _teardown_removal_key(item) != expected_key]
             if len(remaining) == len(value):
                 return False
             runner._save_status_unlocked(
@@ -286,9 +281,7 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
                 _cleanup_remotes=remaining or None,
             )
             return True
-        remaining = [
-            record for record in records if runner._cleanup_remote_key(record) != expected_key
-        ]
+        remaining = [record for record in records if _teardown_removal_key(record) != expected_key]
         if len(remaining) == len(records):
             return False
         runner._save_status_unlocked(
@@ -320,6 +313,24 @@ def _uncanonical_cleanup_remote_key(record: object) -> tuple | None:
     return (record.get("provider"), record.get("attempt"), identity)
 
 
+def _teardown_removal_key(record: object) -> tuple | None:
+    """The identity the teardown path selects a record by, strict when possible.
+
+    THE single derivation shared by the drain and the compare-and-remove that clears what the drain
+    confirmed deleted. It has to be one function: the drain admits uncanonical records so a resource
+    that fails strict validation still gets deleted, and if removal derived its key strictly instead
+    it would return `None` for exactly those records and clear nothing -- so a confirmed-deleted
+    resource would stay on disk and every later sweep would tear down something already gone,
+    forever. That is the failure the lenient branch below exists to prevent, reintroduced through
+    the key rather than through the reader.
+
+    The two shapes cannot be confused for each other: the strict key is the 2-tuple
+    `(identity, attempt)` and the lenient one is a 3-tuple, so they never compare equal and a record
+    that canonicalizes is matched by its strict key on both sides.
+    """
+    return runner._cleanup_remote_key(record) or _uncanonical_cleanup_remote_key(record)
+
+
 def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
     """Every cleanup record that yields a teardown handle, skipping the ones that cannot.
 
@@ -348,7 +359,7 @@ def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
         record = runner._canonical_cleanup_remote(item)
         if record is None:
             record = _uncanonical_teardown_record(item)
-        key = runner._cleanup_remote_key(record) or _uncanonical_cleanup_remote_key(record)
+        key = _teardown_removal_key(record)
         if record is None or key is None or key in seen:
             continue
         records.append(record)
