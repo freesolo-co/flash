@@ -154,6 +154,17 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction) -> None:
     deploy.set_defaults(func=cmd_serve_deploy)
 
 
+def _add_existing_deployment_identity(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--deployment-identity",
+        default="",
+        help=(
+            "immutable identity printed by deploy; avoids Hub resolution when checking or removing "
+            "an existing deployment"
+        ),
+    )
+
+
 def _add_serve_status(serve_sub: argparse._SubParsersAction) -> None:
     """`serve status`: read and prove one exact deployment without provider mutation."""
 
@@ -162,6 +173,7 @@ def _add_serve_status(serve_sub: argparse._SubParsersAction) -> None:
         help="show the proved state of one deployment in your provider account",
     )
     _add_deployment_arguments(status)
+    _add_existing_deployment_identity(status)
     from flash.cli.commands.serve_status import cmd_serve_status
 
     status.set_defaults(func=cmd_serve_status)
@@ -180,6 +192,7 @@ def _add_serve_undeploy(serve_sub: argparse._SubParsersAction) -> None:
         help="tear down one deployment and prove its resources are absent",
     )
     _add_deployment_arguments(undeploy)
+    _add_existing_deployment_identity(undeploy)
     undeploy.add_argument("--modal-app-id", default="", help="modal app id printed by deploy")
     undeploy.add_argument("--modal-volume-id", default="", help="modal volume id printed by deploy")
     undeploy.add_argument(

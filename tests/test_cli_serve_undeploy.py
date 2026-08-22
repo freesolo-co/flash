@@ -13,6 +13,7 @@ from flash.cli.commands.serve_deploy import cmd_serve_deploy
 from flash.cli.commands.serve_undeploy import cmd_serve_undeploy
 from flash.cli.serve_parser import _add_serve_commands
 from flash.serve.control import DeploymentResult
+from flash.serve.resolve import ResolveError
 from tests.test_cli_serve_deploy import IMAGE, MODEL, _stub_resolution
 
 
@@ -95,6 +96,142 @@ def _result(bundle, status: str, error_code: str | None = None) -> DeploymentRes
     return DeploymentResult.from_spec(bundle.spec, status=status, error_code=error_code)
 
 
+def _deployment_identity(monkeypatch: pytest.MonkeyPatch, args: argparse.Namespace) -> str:
+    from flash.cli.commands.serve_identity import encode_deployment_identity
+
+    _stub_resolution(monkeypatch)
+    bundle = serve_deploy._deployment_bundle(args)
+    return encode_deployment_identity(bundle)
+
+
+def _args_with_identity(
+    monkeypatch: pytest.MonkeyPatch, provider: str = "modal"
+) -> argparse.Namespace:
+    args = _args(provider)
+    args.deployment_identity = _deployment_identity(monkeypatch, args)
+    return args
+
+
+def _fail_hub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _base_failure(*_args, **_kwargs):
+        raise ResolveError("could not resolve the commit for unavailable/model")
+
+    def _adapter_failure(*_args, **_kwargs):
+        raise ResolveError("could not resolve the revision for unavailable/artifact")
+
+    monkeypatch.setattr("flash.serve.resolve.resolve_base_revision", _base_failure)
+    monkeypatch.setattr("flash.serve.resolve.resolve_adapter", _adapter_failure)
+
+
+@pytest.mark.parametrize(
+    ("provider", "handle_field", "expected_id"),
+    [
+        ("modal", "app_id", "ap-" + "1" * 22),
+        ("runpod", "pod_id", "pod1234567890"),
+    ],
+)
+def test_undeploy_uses_supplied_identity_when_hub_resolution_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    handle_field: str,
+    expected_id: str,
+) -> None:
+    calls: list[str] = []
+    args = _args(provider)
+    args.deployment_identity = _deployment_identity(monkeypatch, args)
+    _fail_hub_resolution(monkeypatch)
+    _stub_credentials(monkeypatch)
+
+    def _teardown(bundle, handle, credentials, *, deadline_at, **_kwargs):
+        calls.append(getattr(handle, handle_field))
+        return _result(bundle, "absent")
+
+    monkeypatch.setattr(
+        f"flash.serve.provisioning.{provider}.teardown_{provider}_deployment", _teardown
+    )
+
+    assert cmd_serve_undeploy(args) == 0
+    assert calls == [expected_id]
+
+
+def test_undeploy_uses_deploy_time_names_after_the_model_tip_advances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flash.serve.provisioning._modal_plan import build_modal_create_plan
+
+    args = _args()
+    args.deployment_identity = _deployment_identity(monkeypatch, args)
+    deployed = serve_deploy._deployment_bundle(args)
+    deployed_name = build_modal_create_plan(deployed).names.app_or_pod
+
+    monkeypatch.setattr("flash.serve.resolve.resolve_base_revision", lambda *_a, **_k: "e" * 40)
+    current_tip = serve_deploy._deployment_bundle(args)
+    current_name = build_modal_create_plan(current_tip).names.app_or_pod
+    assert current_name != deployed_name
+    _stub_credentials(monkeypatch)
+    seen: list[tuple[str, str]] = []
+
+    def _teardown(bundle, handle, credentials, *, deadline_at, **_kwargs):
+        seen.append((build_modal_create_plan(bundle).names.app_or_pod, handle.app_name))
+        return _result(bundle, "absent")
+
+    monkeypatch.setattr("flash.serve.provisioning.modal.teardown_modal_deployment", _teardown)
+
+    assert cmd_serve_undeploy(args) == 0
+    assert seen == [(deployed_name, deployed_name)]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("generation", "does not match --generation"),
+        ("provider_id", "does not match the pinned provider contract"),
+    ],
+)
+def test_undeploy_identity_rejects_mismatched_destructive_input(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+    message: str,
+) -> None:
+    args = _args()
+    args.deployment_identity = _deployment_identity(monkeypatch, args)
+    _fail_hub_resolution(monkeypatch)
+    _stub_credentials(monkeypatch)
+    if mutation == "generation":
+        args.generation = 2
+    else:
+        args.modal_app_id = "wrong-provider-id"
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("teardown ran with mismatched provider identity")
+
+    monkeypatch.setattr("flash.serve.provisioning.modal.teardown_modal_deployment", _explode)
+
+    assert cmd_serve_undeploy(args) == 1
+    assert message in capsys.readouterr().err
+
+
+def test_undeploy_hub_failure_requires_the_printed_identity_before_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = _args()
+    _fail_hub_resolution(monkeypatch)
+    _stub_credentials(monkeypatch)
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("teardown ran without a validated deployment identity")
+
+    monkeypatch.setattr("flash.serve.provisioning.modal.teardown_modal_deployment", _explode)
+
+    assert cmd_serve_undeploy(args) == 1
+    captured = capsys.readouterr()
+    assert "--deployment-identity is required" in captured.err
+    assert "pass the value printed by `flash serve deploy`" in captured.err
+    assert "Traceback" not in captured.err
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -109,11 +246,11 @@ def test_undeploy_rejects_mismatched_handle_input_without_a_traceback(
     value: object,
     message: str,
 ) -> None:
-    _stub_resolution(monkeypatch)
     _stub_credentials(monkeypatch)
     args = _args()
     if field == "generation":
         args.generation = 2
+    args.deployment_identity = _deployment_identity(monkeypatch, args)
     original_provider_handle = serve_undeploy._provider_handle
 
     def _mismatched_handle(parsed_args, bundle):
@@ -143,13 +280,14 @@ def test_undeploy_routes_to_the_named_provider(monkeypatch: pytest.MonkeyPatch) 
         calls.append(("runpod", handle.pod_id))
         return _result(bundle, "absent")
 
-    _stub_resolution(monkeypatch)
     _stub_credentials(monkeypatch)
+    modal_args = _args_with_identity(monkeypatch, "modal")
+    runpod_args = _args_with_identity(monkeypatch, "runpod")
     monkeypatch.setattr("flash.serve.provisioning.modal.teardown_modal_deployment", _modal)
     monkeypatch.setattr("flash.serve.provisioning.runpod.teardown_runpod_deployment", _runpod)
 
-    assert cmd_serve_undeploy(_args("modal")) == 0
-    assert cmd_serve_undeploy(_args("runpod")) == 0
+    assert cmd_serve_undeploy(modal_args) == 0
+    assert cmd_serve_undeploy(runpod_args) == 0
     assert calls == [("modal", "ap-" + "1" * 22), ("runpod", "pod1234567890")]
 
 
@@ -166,11 +304,11 @@ def test_unproved_undeploy_is_a_clear_nonzero_error(
     def _unproved(bundle, handle, credentials, *, deadline_at, **_kwargs):
         return _result(bundle, status, error_code)
 
-    _stub_resolution(monkeypatch)
     _stub_credentials(monkeypatch)
+    args = _args_with_identity(monkeypatch)
     monkeypatch.setattr("flash.serve.provisioning.modal.teardown_modal_deployment", _unproved)
 
-    assert cmd_serve_undeploy(_args()) == 1
+    assert cmd_serve_undeploy(args) == 1
     captured = capsys.readouterr()
     assert f"status      {status}" in captured.out
     assert "resource absence could not be proved" in captured.err
@@ -190,13 +328,13 @@ def test_credentials_never_enter_argv_output_or_persisted_artifacts(
             pickle.dumps(credentials)
         return _result(bundle, "absent")
 
-    _stub_resolution(monkeypatch)
     secrets = _stub_credentials(monkeypatch)
+    args = _args_with_identity(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["flash", "serve", "undeploy"])
     monkeypatch.setattr("flash.serve.provisioning.modal.teardown_modal_deployment", _capture)
 
-    assert cmd_serve_undeploy(_args()) == 0
+    assert cmd_serve_undeploy(args) == 0
     captured = capsys.readouterr()
     exposed = "\n".join((*sys.argv, captured.out, captured.err, *seen_repr))
     assert all(secret not in exposed for secret in secrets)
@@ -224,6 +362,7 @@ def test_deploy_output_exposes_exact_ids_needed_by_undeploy(
     assert "app id      ap-" in output
     assert "volume id   vo-" in output
     assert "secret id   st-" in output
+    assert "identity    " in output
 
 
 def test_parser_wires_serve_undeploy_without_credential_flags() -> None:

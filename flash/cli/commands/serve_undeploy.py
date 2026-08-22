@@ -10,7 +10,8 @@ from __future__ import annotations
 import sys
 import time
 
-from flash.cli.commands.serve_deploy import _credentials, _deployment_bundle, _err
+from flash.cli.commands.serve_deploy import _credentials, _err
+from flash.cli.commands.serve_identity import existing_deployment_bundle
 
 
 def _required_arg(args, name: str) -> str:
@@ -109,7 +110,7 @@ def _report_undeploy(result) -> int:
 def cmd_serve_undeploy(args) -> int:
     provider = args.provider
     try:
-        bundle = _deployment_bundle(args)
+        bundle = existing_deployment_bundle(args)
         handle = _provider_handle(args, bundle)
         if provider == "modal":
             from flash.serve.provisioning._modal_plan import build_modal_create_plan

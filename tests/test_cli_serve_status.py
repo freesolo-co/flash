@@ -66,6 +66,17 @@ def _args(provider: str = "modal") -> argparse.Namespace:
     return _parse(base)
 
 
+def _args_with_identity(
+    monkeypatch: pytest.MonkeyPatch, provider: str = "modal"
+) -> argparse.Namespace:
+    from flash.cli.commands.serve_identity import encode_deployment_identity
+
+    args = _args(provider)
+    _stub_resolution(monkeypatch)
+    args.deployment_identity = encode_deployment_identity(serve_deploy._deployment_bundle(args))
+    return args
+
+
 def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, str, str, str]:
     values = (
         "modal-token-id-do-not-print",
@@ -103,9 +114,8 @@ def test_status_rejects_provider_invalid_placement_without_a_traceback(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    args = _args()
+    args = _args_with_identity(monkeypatch)
     args.modal_workspace = "UPPER"
 
     assert cmd_serve_status(args) == 1
@@ -115,9 +125,10 @@ def test_status_rejects_provider_invalid_placement_without_a_traceback(
 
 
 def test_status_bundle_failure_is_not_mislabeled_as_credentials(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    args = _args()
+    args = _args_with_identity(monkeypatch)
     args.model = "not-a-catalog-model"
 
     assert cmd_serve_status(args) == 1
@@ -130,16 +141,46 @@ def test_status_credential_failure_keeps_request_scoped_guidance(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _stub_resolution(monkeypatch)
+    args = _args_with_identity(monkeypatch)
     monkeypatch.delenv(serve_deploy.MODAL_TOKEN_ID_ENV, raising=False)
     monkeypatch.delenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, raising=False)
 
-    assert cmd_serve_status(_args()) == 1
+    assert cmd_serve_status(args) == 1
     captured = capsys.readouterr()
     assert (
         "credentials are read from the environment for this one request and are never stored"
         in (captured.err)
     )
+
+
+def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flash.cli.commands.serve_identity import encode_deployment_identity
+    from flash.serve.provisioning._modal_plan import build_modal_create_plan
+
+    args = _args()
+    _stub_resolution(monkeypatch)
+    deployed = serve_deploy._deployment_bundle(args)
+    args.deployment_identity = encode_deployment_identity(deployed)
+    deployed_name = build_modal_create_plan(deployed).names.app_or_pod
+
+    monkeypatch.setattr("flash.serve.resolve.resolve_base_revision", lambda *_a, **_k: "e" * 40)
+    current_tip = serve_deploy._deployment_bundle(args)
+    current_name = build_modal_create_plan(current_tip).names.app_or_pod
+    assert current_name != deployed_name
+
+    seen: list[str] = []
+
+    def _reconcile(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        seen.append(build_modal_create_plan(bundle).names.app_or_pod)
+        return _result(bundle, "absent")
+
+    _stub_environment(monkeypatch)
+    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _reconcile)
+
+    assert cmd_serve_status(args) == 0
+    assert seen == [deployed_name]
 
 
 def test_status_routes_to_the_named_read_only_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -153,13 +194,14 @@ def test_status_routes_to_the_named_read_only_provider(monkeypatch: pytest.Monke
         calls.append("runpod")
         return _result(bundle, "ready")
 
-    _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
+    modal_args = _args_with_identity(monkeypatch, "modal")
+    runpod_args = _args_with_identity(monkeypatch, "runpod")
     monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _modal)
     monkeypatch.setattr("flash.serve.provisioning.runpod.reconcile_runpod_deployment", _runpod)
 
-    assert cmd_serve_status(_args("modal")) == 0
-    assert cmd_serve_status(_args("runpod")) == 0
+    assert cmd_serve_status(modal_args) == 0
+    assert cmd_serve_status(runpod_args) == 0
     assert calls == ["modal", "runpod"]
 
 
@@ -184,11 +226,11 @@ def test_status_surfaces_every_outcome_distinctly(
     def _reconcile(bundle, credentials, secrets, *, deadline_at, **_kwargs):
         return _result(bundle, status)
 
-    _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
+    args = _args_with_identity(monkeypatch)
     monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _reconcile)
 
-    assert cmd_serve_status(_args()) == expected_code
+    assert cmd_serve_status(args) == expected_code
     captured = capsys.readouterr()
     assert f"status      {status}" in captured.out
     assert message in getattr(captured, stream)
@@ -204,11 +246,11 @@ def test_non_ready_status_never_prints_ready(
     def _reconcile(bundle, credentials, secrets, *, deadline_at, **_kwargs):
         return _result(bundle, status)
 
-    _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
+    args = _args_with_identity(monkeypatch)
     monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _reconcile)
 
-    cmd_serve_status(_args())
+    cmd_serve_status(args)
     output = capsys.readouterr().out
     assert "status      ready" not in output
     assert "endpoint readiness proved" not in output
@@ -229,13 +271,13 @@ def test_status_credentials_never_enter_argv_output_or_artifacts(
                 pickle.dumps(value)
         return _result(bundle, "ready")
 
-    _stub_resolution(monkeypatch)
     secret_values = _stub_environment(monkeypatch)
+    args = _args_with_identity(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["flash", "serve", "status"])
     monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _capture)
 
-    assert cmd_serve_status(_args()) == 0
+    assert cmd_serve_status(args) == 0
     captured = capsys.readouterr()
     exposed = "\n".join((*sys.argv, captured.out, captured.err, *seen_repr))
     assert all(secret not in exposed for secret in secret_values)

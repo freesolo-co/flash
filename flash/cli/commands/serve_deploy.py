@@ -91,7 +91,9 @@ def _report_handle(handle, *, endpoint: bool = True) -> None:
         print(f"secret id   {handle.inference_secret_id}")
 
 
-def _report(result) -> int:
+def _report(result, bundle) -> int:
+    from flash.cli.commands.serve_identity import encode_deployment_identity
+
     print(f"deployment  {result.deployment_id} generation {result.generation}")
     print(f"provider    {result.provider}")
     print(f"engine      {result.engine_id}")
@@ -100,6 +102,7 @@ def _report(result) -> int:
     handle = result.handle
     if handle is not None:
         _report_handle(handle)
+        print(f"identity    {encode_deployment_identity(bundle)}")
     if result.status == "ready":
         return 0
     if result.error_code:
@@ -272,7 +275,7 @@ def cmd_serve_deploy(args) -> int:
         # and here something was: cleanup ran and could not confirm the resources are gone.
         _warn_unconfirmed_cleanup(interrupted.provider, args.deployment_id)
         raise
-    return _report(result)
+    return _report(result, bundle)
 
 
 def _warn_unconfirmed_cleanup(provider: str, deployment_id: str) -> None:

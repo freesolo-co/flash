@@ -13,11 +13,11 @@ import time
 from flash.cli.commands.serve_deploy import (
     _build_provider_plan,
     _credentials,
-    _deployment_bundle,
     _err,
     _report_handle,
     _runtime_secrets,
 )
+from flash.cli.commands.serve_identity import existing_deployment_bundle
 
 
 def _report_status(result) -> int:
@@ -57,7 +57,7 @@ def _report_status(result) -> int:
 def cmd_serve_status(args) -> int:
     provider = args.provider
     try:
-        bundle = _deployment_bundle(args)
+        bundle = existing_deployment_bundle(args)
         # bundle construction only validates the generic placement type. the provider plan applies
         # the exact hostname contract before reconciliation can contact the provider.
         _build_provider_plan(provider, bundle)
