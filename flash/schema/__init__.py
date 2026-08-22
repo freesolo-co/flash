@@ -51,10 +51,9 @@ from flash.schema.fields import (
 )
 
 # the smallest rank the parser accepts, and so the smallest a source adapter can turn out to have.
-# an unresolved warm start is sized and priced here rather than at the serialization default: the
-# client cannot read the source adapter, and this is the one value that is a true lower bound rather
-# than a guess. it must stay the floor `lora_rank` is parsed against, or a check derived from it
-# would admit shapes the parser rejects.
+# unresolved warm starts use it instead of the serialization default for permissive client-side
+# sizing. it is a vram lower bound, not a dollar lower bound because cost-ranked hardware selection
+# is non-monotonic across shapes. keep it aligned with the `lora_rank` parser floor.
 MIN_LORA_RANK = 1
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
@@ -444,6 +443,7 @@ def _validate_gpu_section(
     model_revision: str,
     algorithm: str,
     train_raw: dict[str, Any],
+    init_from_adapter: str,
     thinking: bool,
 ) -> tuple[GpuSpec, bool]:
     """Validate the GPU section and return its canonical spec plus auto-sizing provenance."""
@@ -490,12 +490,7 @@ def _validate_gpu_section(
         # provider preferences are soft; configured unnamed providers remain eligible.
 
     requested_gpu_count = authored_gpu_ceiling(gpu_spec.type, gpu_count)
-    init_from_adapter = train_raw.get("init_from_adapter")
-    unresolved_warmstart_rank = (
-        isinstance(init_from_adapter, str)
-        and bool(init_from_adapter.strip())
-        and "lora_rank" not in train_raw
-    )
+    unresolved_warmstart_rank = bool(init_from_adapter) and "lora_rank" not in train_raw
     # the client cannot resolve a run id to the source adapter metadata, so rank 32 is only a
     # serialization placeholder here. keep geometry checks and reject shapes that cannot fit even at
     # the minimum valid rank; the server replaces this value from adapter_config.json before its
@@ -516,8 +511,8 @@ def _validate_gpu_section(
             from flash.providers.allocator import required_vram_gb
 
             # sized from `preflight_train`, so an unresolved warm start is measured at rank 1 rather
-            # than at the placeholder. that is a true LOWER bound: no source adapter can need less.
-            # a card rejected here therefore cannot fit at any rank the source could turn out to
+            # than at the placeholder. that is a true vram lower bound: no source adapter can need
+            # less. a card rejected here therefore cannot fit at any rank the source could turn out to
             # have, which keeps an impossible pin (an 80 GB A100 for a run needing 180 GB at rank 1)
             # rejected at parse time. relaxing the rank is not the same as dropping the check --
             # dropping it would let the authored `gpu.type` go unvalidated entirely.
@@ -555,7 +550,12 @@ def _validate_gpu_section(
 
 
 def _validate_algorithm_model_consistency(
-    model: str, algorithm: str, thinking: bool, train_raw: dict[str, Any]
+    model: str,
+    algorithm: str,
+    thinking: bool,
+    train_raw: dict[str, Any],
+    *,
+    init_from_adapter: str,
 ) -> tuple[str, int, int]:
     """Validate algorithm and model-info consistency."""
     try:
@@ -573,7 +573,6 @@ def _validate_algorithm_model_consistency(
             f"{model} always emits <think> reasoning and cannot run with thinking "
             f"disabled; set thinking = true"
         )
-    init_from_adapter = _init_from_adapter_ref(train_raw)
     if init_from_adapter and "lora_rank" in train_raw:
         raise ConfigError(
             "train.lora_rank cannot be set with train.init_from_adapter because source adapter "
@@ -616,16 +615,22 @@ def spec_from_dict(
             )
         except (TypeError, ValueError) as exc:
             raise ConfigError(str(exc)) from exc
+    init_from_adapter = _init_from_adapter_ref(train_raw)
     gpu_spec, gpu_count_auto = _validate_gpu_section(
         raw,
         model=model,
         model_revision=model_revision,
         algorithm=algorithm,
         train_raw=train_raw,
+        init_from_adapter=init_from_adapter,
         thinking=thinking,
     )
     init_from_adapter, lora_rank, lora_alpha = _validate_algorithm_model_consistency(
-        model, algorithm, thinking, train_raw
+        model,
+        algorithm,
+        thinking,
+        train_raw,
+        init_from_adapter=init_from_adapter,
     )
     wandb_spec = _validate_wandb_section(raw)
 

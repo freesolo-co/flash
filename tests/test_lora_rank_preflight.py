@@ -666,7 +666,7 @@ def test_submit_passes_the_loaded_config_to_validation_then_rank_preflight(monke
     ]
 
 
-def test_submit_resolves_source_rank_before_authoritative_vram_sizing(monkeypatch):
+def test_preparation_returns_source_rank_for_authoritative_vram_sizing(monkeypatch):
     from flash.providers.allocator import required_vram_gb
 
     config = _config(target_parameters=list(_FUSED_TARGETS))

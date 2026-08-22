@@ -73,16 +73,15 @@ def _cmd_train_cost_offline(spec) -> int:
         # authored rank to quote at. stderr keeps stdout clean for machine-readable callers.
         #
         # quote at rank 1 rather than at the serialization placeholder. the placeholder is not a
-        # measurement of anything, and `estimate_cost` reads the rank for BOTH the price and the
-        # exact-card fit -- so pricing at 32 refused the very configuration the parser now
-        # accepts, with advice (`--gpus 2`) for a shortfall the real source rank may not have.
-        # rank 1 is the true lower bound, which makes the quote a floor the run cannot come in
-        # under, and withholds it only when no source rank could fit at all.
+        # measurement of anything, and `estimate_cost` reads the rank for both the exact-card fit and
+        # cost-ranked hardware selection. rank 1 is a vram lower bound, but not a dollar lower bound:
+        # a higher source rank can move the run onto a cheaper multi-card shape.
         config = replace(config, lora_rank=MIN_LORA_RANK)
         print(
-            "warning: warm-start (train.init_from_adapter) cost is estimated at the minimum "
-            "LoRA rank because the source adapter's rank is resolved server-side, so treat it "
-            "as a lower bound: a higher source rank costs more.",
+            "warning: warm-start (train.init_from_adapter) cost is a provisional rank-1 estimate. "
+            "The authoritative source adapter rank is resolved server-side and can change the "
+            "selected hardware and cost in either direction. Run "
+            f"`{_commands().CLI_NAME} train --dry-run` for a quote using the resolved source rank.",
             file=sys.stderr,
         )
     estimate = estimate_cost(config)

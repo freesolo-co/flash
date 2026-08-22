@@ -476,6 +476,22 @@ def test_warmstart_accepts_omitted_child_rank_with_internal_placeholder() -> Non
     assert spec.train.lora_rank == 32
 
 
+def test_gpu_sizing_consumes_the_canonical_warmstart_reference() -> None:
+    """An invalid reference must not be approximated as an unresolved warm start.
+
+    This intentionally pins the only error-order change from sharing the canonical parse: the bad
+    reference is reported before rank-dependent gpu sizing can reinterpret its non-empty text.
+    """
+    raw = _raw(
+        model="Qwen/Qwen3.6-35B-A3B",
+        **{"gpu.type": "A100 PCIe", "train.init_from_adapter": "not/a/checkpoint/ref"},
+    )
+    raw["train"].pop("lora_rank")
+
+    with pytest.raises(ConfigError, match=r"train\.init_from_adapter must be `<run_id>`"):
+        spec_from_dict(raw)
+
+
 def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200() -> None:
     from flash.providers.allocator import required_vram_gb
 
@@ -543,7 +559,7 @@ def test_warmstart_still_validates_the_authored_card_at_the_minimum_rank() -> No
 
     That gate is the only parse-time check of an authored `gpu.type`; skipping it let a pin that
     cannot hold the run at ANY rank parse, because the fallback search ranks the whole pool rather
-    than the pinned class. Rank 1 is a true lower bound, so a card rejected against it cannot fit
+    than the pinned class. rank 1 is a true vram lower bound, so a card rejected against it cannot fit
     whatever rank the source turns out to have.
     """
     raw = _raw(

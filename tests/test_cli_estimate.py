@@ -941,8 +941,8 @@ def test_sft_cost_warns_when_an_env_key_shadows_the_saved_login(tmp_path, monkey
 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "opd"])
-def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
-    """grpo/opd keep the local analytical quote until PR2 profiles their rollouts.
+def test_warm_start_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
+    """warm-start grpo/opd keep the local analytical quote until PR2 profiles their rollouts.
 
     Asserted by making the client constructor itself fatal: a passing quote then proves no
     authenticated request was possible, not merely that none was observed.
@@ -965,44 +965,42 @@ def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
     captured = capsys.readouterr()
     assert "TOTAL" in captured.out
     assert "shadowed!" not in captured.err
-    # no `lora_rank` is authored here, so the quote is the minimum-rank lower bound rather than a
-    # figure derived from the placeholder.
     assert (
-        "warning: warm-start (train.init_from_adapter) cost is estimated at the minimum LoRA rank "
-        "because the source adapter's rank is resolved server-side, so treat it as a lower bound: "
-        "a higher source rank costs more.\n" in captured.err
+        "warning: warm-start (train.init_from_adapter) cost is a provisional rank-1 estimate. "
+        "The authoritative source adapter rank is resolved server-side and can change the selected "
+        "hardware and cost in either direction. Run `flash train --dry-run` for a quote using the "
+        "resolved source rank.\n" in captured.err
     )
 
 
-def test_an_authored_rank_never_reaches_the_warm_start_quote(tmp_path, capsys, monkeypatch):
-    """The parser settles this, so the quote has no authored rank to price against.
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_plain_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
+    """Ordinary grpo/opd quotes stay local independently of the warm-start branch."""
+    from flash.cli import commands
 
-    `lora_rank` alongside `init_from_adapter` is rejected before the cost path runs, because the
-    source adapter's rank is authoritative. A second branch in the quote for an authored rank would
-    therefore be unreachable -- this pins the rejection that makes it so.
-    """
+    monkeypatch.setattr(
+        commands,
+        "client_from_config",
+        lambda *_a, **_kw: pytest.fail(f"{algorithm} --cost must not contact the control plane"),
+    )
     monkeypatch.setenv("FLASH_STYLE", "0")
-    body = SFT_TOML.replace('algorithm = "sft"', 'algorithm = "grpo"').replace(
-        "batch_size = 8\n",
-        "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
-        'init_from_adapter = "source-run"\nlora_rank = 64\n',
+    body = SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"').replace(
+        "batch_size = 8\n", "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
     )
 
-    from flash.schema.fields import ConfigError
-
-    with pytest.raises(
-        ConfigError, match=r"train\.lora_rank cannot be set with train\.init_from_adapter"
-    ):
-        cmd_train(_sft_args(tmp_path, body))
-    assert capsys.readouterr().out == ""
+    assert cmd_train(_sft_args(tmp_path, body)) == 0
+    captured = capsys.readouterr()
+    assert "TOTAL" in captured.out
+    assert "warm-start" not in captured.err
 
 
 def test_warm_start_cost_quotes_the_card_the_parser_accepts(tmp_path, capsys, monkeypatch):
     """The quote must not refuse the exact configuration the parser now admits.
 
     `estimate_cost` reads the rank for both the price and the exact-card fit, so quoting at the
-    serialization placeholder rejected a single B200 as needing 199 GB and advised `--gpus 2` -- a
-    shortfall the real source rank may not have. Sized at the rank-1 lower bound it fits in 180 GB.
+    serialization placeholder rejected a single B200 as needing 199 GB and advised `--gpus 2`, a
+    shortfall the real source rank may not have. Sized at the rank-1 vram lower bound it fits in 180
+    GB, while the warning accurately labels the dollars as provisional.
     """
     from flash.cli import commands
 
@@ -1024,7 +1022,48 @@ def test_warm_start_cost_quotes_the_card_the_parser_accepts(tmp_path, capsys, mo
     captured = capsys.readouterr()
     assert "TOTAL" in captured.out
     assert "--gpus 2" not in captured.err
-    assert "lower bound" in captured.err
+    assert (
+        "warning: warm-start (train.init_from_adapter) cost is a provisional rank-1 estimate. "
+        "The authoritative source adapter rank is resolved server-side and can change the selected "
+        "hardware and cost in either direction. Run `flash train --dry-run` for a quote using the "
+        "resolved source rank.\n" in captured.err
+    )
+
+
+def test_higher_warm_start_rank_can_select_cheaper_hardware():
+    """Rank-1 dollars are not a lower bound when the estimator cost-ranks hardware shapes.
+
+    Catalog geometry requires 180 GB at rank 1, which fits one 180 GB B200 exactly. Rank 8 requires
+    182 GB, so it moves to two 141 GB H200s. The current RunPod snapshot prices B200 at $5.89/hour
+    and H200 at $4.39/hour per card, while the estimator's sharded step model makes the H200 pair
+    cheaper for this workload. Pricing may legitimately change, so pin the ordering and selected
+    shapes rather than exact dollar totals.
+    """
+    from dataclasses import replace
+
+    from flash.cost import estimate_cost
+    from flash.cost.spec import runconfig_from_spec
+    from flash.providers.base import GPU_INFO
+
+    spec = spec_from_dict(
+        {
+            "project": "00000000-0000-0000-0000-000000000001",
+            "model": "Qwen/Qwen3.6-35B-A3B",
+            "algorithm": "grpo",
+            "environment": {"id": "my-org/my-proj/my-env"},
+            "train": {"prompts_per_step": 8, "max_examples": 40, "group_size": 2},
+        }
+    )
+    config = runconfig_from_spec(spec)
+
+    rank_1 = estimate_cost(replace(config, lora_rank=1))
+    rank_8 = estimate_cost(replace(config, lora_rank=8))
+
+    assert GPU_INFO["B200"].vram_gb == 180
+    assert GPU_INFO["H200"].vram_gb == 141
+    assert (rank_1.required_vram_gb, rank_1.gpu_count, rank_1.gpu) == (180, 1, "B200")
+    assert (rank_8.required_vram_gb, rank_8.gpu_count, rank_8.gpu) == (182, 2, "H200")
+    assert rank_8.total_usd < rank_1.total_usd
 
 
 def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
