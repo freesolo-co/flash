@@ -49,16 +49,14 @@ from flash.schema.fields import (
     _train_teacher,
     _wandb_spec,
 )
+from flash.serve.contract import ADAPTER_REVISION_PATTERN
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 # canonical short checkpoint references name a run alias or a saved checkpoint. immutable adapter
 # revisions additionally lock that checkpoint identity to the exact hugging face commit.
 _CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d{{1,18}}))?$")
-_ADAPTER_REVISION_RE = re.compile(
-    rf"^(?P<run_id>{_RUN_ID_RE})@(?:final|step-(?P<step>0|[1-9]\d{{0,17}}))\."
-    r"(?P<hf_revision>[0-9a-f]{40})$"
-)
+_ADAPTER_REVISION_RE = re.compile(ADAPTER_REVISION_PATTERN)
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(

@@ -12,6 +12,65 @@ import shlex
 
 import pytest
 
+PLACEHOLDER_HF_REVISION = "0" * 40
+
+
+def _positive_finite_seconds(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError:
+        raise pytest.UsageError(
+            f"--conformance-ready-timeout must be a number, got {raw!r}"
+        ) from None
+    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        raise pytest.UsageError(
+            f"--conformance-ready-timeout must be a positive, finite number of seconds, got {raw!r}"
+        )
+    return value
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("serving conformance")
+    group.addoption(
+        "--serving-url",
+        default=None,
+        help="serving backend control root to run the contract against; skips the suite when unset",
+    )
+    group.addoption(
+        "--conformance-repo",
+        default=None,
+        help="HuggingFace repo holding the adapter to register (default: $FLASH_CONFORMANCE_REPO)",
+    )
+    group.addoption(
+        "--conformance-subfolder",
+        default=None,
+        help="path to the adapter inside the repo",
+    )
+    group.addoption(
+        "--conformance-base-model",
+        default=None,
+        help="base model the adapter was trained on; must match what the backend serves",
+    )
+    group.addoption(
+        "--conformance-hf-revision",
+        default=None,
+        help="40-char commit sha the adapter is pinned to; required, and part of the revision id",
+    )
+    group.addoption(
+        "--conformance-repo-type",
+        default=None,
+        help="repo_type sent at registration (default: dataset, matching flash)",
+    )
+    group.addoption(
+        "--conformance-ready-timeout",
+        type=_positive_finite_seconds,
+        default=None,
+        help=(
+            "seconds to wait for a revision to reach ready "
+            "(default: flash's own deploy budget for the base model under test)"
+        ),
+    )
+
 
 def _temp_root_lever(config) -> str:
     """How to move pytest's temp root, in the same precedence pytest itself resolves it.

@@ -1,0 +1,352 @@
+name: Deploy serving Modal app
+
+# auto-deploys the serving modal app to the production modal workspace on every push to main.
+# automatic production serving deploys and migration pushes both source main, preventing persistent
+# branch drift between schema-dependent serving code and the production database. the app only
+# re-deploys when serving files or this workflow changes.
+#
+# required GitHub Actions secrets (Settings -> Secrets and variables -> Actions):
+#   MODAL_TOKEN_ID, MODAL_TOKEN_SECRET   - Modal CLI auth for the prod workspace
+#   HF_TOKEN                              - private Hugging Face adapter access
+#   FREESOLO_INTERNAL_KEY                - shared platform internal key (backend + serving)
+#   PLATFORM_BACKEND_URL                 - platform backend base URL
+#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY - serving startup hydration (durable adapter registry)
+# modal_app.py reads these from the environment (load_dotenv only supplements os.environ), so no
+# .env file is written in CI. the "Verify required runtime secrets" step below hard-fails the deploy
+# if a required secret is absent, preventing a broken production config with external chat failures,
+# disabled billing, or adapters disappearing after a clean stop or redeploy.
+# remaining optional secrets resolve to empty and are omitted, matching a local deploy with an absent
+# variable.
+
+on:
+  push:
+    branches:
+      - main
+    # deliberately no trigger-level ``paths`` filter. github evaluates path filters against only the
+    # first 300 changed files of a push, so a large merge to main that touches serving/ beyond that
+    # window would not start the workflow and prod would silently drift. the in-job deploy gate uses
+    # a full ``git diff`` (fetch-depth: 0), so it cannot miss a relevant change; an irrelevant push
+    # just runs the cheap gate and skips the deploy.
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy serving Modal app
+    # prod safety: `modal deploy` always targets the fixed freesolo-lora-serving production app, and
+    # workflow_dispatch can be launched from any branch via the "run workflow" dropdown. restrict the
+    # whole job to main so a manual dispatch from dev or a feature branch cannot overwrite the live
+    # production app with code that never merged to main. the push trigger is already main-only, so
+    # this only constrains manual dispatches; a non-main dispatch skips without running `modal deploy`.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # the job's own bounded waits are two 300s readiness polls plus the remote image build; 30
+    # minutes clears that with room while keeping a wedged deploy from holding the runner for
+    # GitHub's 6-hour default.
+    timeout-minutes: 30
+    # serialize serving deploys across runs because each deploy mutates the live app.
+    concurrency:
+      group: deploy-modal-serving
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    defaults:
+      run:
+        # every step runs from the repo root: modal_app.py imports `flash.serving.src...`, which only
+        # resolves with the repo root on sys.path. it derives its own paths from __file__, so cwd is
+        # free. (in freesolo the app WAS the root of its own tree and used cwd-relative imports.)
+        working-directory: .
+    env:
+      # Modal CLI auth (read from the environment by `modal`).
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      # runtime secrets forwarded into the serving app's Modal secret at deploy time.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      FREESOLO_INTERNAL_KEY: ${{ secrets.FREESOLO_INTERNAL_KEY }}
+      PLATFORM_BACKEND_URL: ${{ secrets.PLATFORM_BACKEND_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      # Branded prod serving domain. modal_app.py attaches a Modal custom_domain only when this is set
+      # (empty => default *.modal.run url), so non-prod/fork/local workspaces stay deployable. This
+      # domain is verified in the production Modal workspace, so prod keeps serving on serve.freesolo.co.
+      SERVING_CUSTOM_DOMAIN: serve.freesolo.co
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Need history so the change check can diff this push against its predecessor.
+          fetch-depth: 0
+
+      - name: Decide whether to deploy serving
+        id: gate
+        working-directory: .
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          deploy=false
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            deploy=true
+          elif [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            # Brand-new branch / no comparable predecessor: deploy to be safe.
+            deploy=true
+          elif ! changed="$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" 2>/dev/null)"; then
+            # before sha not reachable (e.g. force push): deploy to be safe.
+            deploy=true
+          # any `flash/` change, not just `flash/serving/`: the image ships the whole package via
+          # `add_local_python_source("flash")`, so a change anywhere under flash/ can alter what runs
+          # in the container. narrowing this to flash/serving/ would let the deployed app drift from
+          # the merged source. pyproject/uv.lock gate the image's dependency bounds.
+          elif grep -qE "^(flash/|pyproject\.toml$|uv\.lock$|\.github/workflows/deploy-modal\.yml$)" <<< "$changed"; then
+            deploy=true
+          fi
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+          echo "Deploy serving: $deploy"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        if: steps.gate.outputs.deploy == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install Modal client
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          # `modal deploy` only needs the modal client locally - the app image (vllm / torch /
+          # transformers) is built remotely by Modal - so install just the deploy-time deps
+          # instead of the full `uv sync`, keeping CI fast and small.
+          #
+          # flash itself is deliberately NOT installed: modal's CLI puts the working directory on
+          # sys.path before importing the app file, so running this job from the repo root (see the
+          # `working-directory` default) is what makes `from flash.serving.src...` resolve at deploy
+          # time. Installing flash here would instead risk importing a DIFFERENT copy than the one
+          # `add_local_python_source("flash")` ships to the container.
+          python -m pip install --upgrade pip
+          # pinned to the exact client pyproject declares and the provisioning path was validated
+          # against: deploy behaviour (app lifecycle, tags, lookup) is client-version sensitive, so
+          # an unbounded range lets a future release change deploys with no diff here.
+          python -m pip install "modal==1.5.4" "python-dotenv>=1.0.0"
+
+      - name: Verify Modal auth is configured
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET secrets are not set; cannot deploy serving."
+            exit 1
+          fi
+
+      - name: Verify required serving runtime secrets
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          # a production deploy with a missing required runtime secret would overwrite the live app
+          # with a broken config rather than fail. serving needs the internal key and backend url for
+          # external chat auth and usage billing, plus the durable Supabase adapter registry so a clean
+          # Modal stop or redeploy does not drop in-memory adapter routing. fail before `modal deploy`.
+          missing=""
+          # the internal key must use the canonical FREESOLO_INTERNAL_KEY name.
+          if [ -z "$HF_TOKEN" ]; then
+            missing="$missing HF_TOKEN"
+          fi
+          if [ -z "$SUPABASE_URL" ]; then
+            missing="$missing SUPABASE_URL"
+          fi
+          if [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+            missing="$missing SUPABASE_SERVICE_ROLE_KEY"
+          fi
+          required="FREESOLO_INTERNAL_KEY PLATFORM_BACKEND_URL"
+          for name in $required; do
+            # indirect expansion: the secrets are exported into the env via the job-level `env:` block.
+            if [ -z "${!name}" ]; then
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Refusing to deploy serving to prod: missing required secret(s):${missing}. Set them in repo Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "All required serving runtime secrets are present."
+
+      - name: Wait for production adapter schema readiness
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          supabase_url="$SUPABASE_URL"
+          service_role_key="$SUPABASE_SERVICE_ROLE_KEY"
+          if [[ "$service_role_key" != sb_secret_* ]]; then
+            echo "::error::SUPABASE_SERVICE_ROLE_KEY must use the sb_secret_ format."
+            exit 1
+          fi
+          # probe the columns the runtime actually reads, not `id` -- which is not even among them.
+          # selecting only `id` proved the TABLE exists while a schema still missing, say,
+          # `deployment_generation` passed this gate and then failed on every read after deploy.
+          # read the list from the source of truth so it cannot drift away from persistence.py.
+          # import the constants module, not persistence.py: this job installs only modal and
+          # python-dotenv, while persistence.py imports httpx at module scope, so importing it
+          # would raise ModuleNotFoundError and the guard below would block every prod deploy.
+          if ! columns="$(python -c 'from flash.serving.src.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
+            # failing closed matters here: an empty list would degrade the query back to a bare
+            # existence check and this gate would pass while proving nothing.
+            echo "::error::Could not read PERSISTED_COLUMNS; refusing to deploy against an unverified schema."
+            exit 1
+          fi
+          endpoint="${supabase_url%/}/rest/v1/hosted_lora_adapters?select=${columns}&limit=1"
+          deadline=$((SECONDS + 300))
+
+          while true; do
+            remaining=$((deadline - SECONDS))
+            if (( remaining <= 0 )); then
+              echo "::error::Production Supabase flash.hosted_lora_adapters did not become queryable within 300 seconds."
+              exit 1
+            fi
+
+            request_timeout=10
+            if (( remaining < request_timeout )); then
+              request_timeout=$remaining
+            fi
+
+            headers=(
+              --header "apikey: $service_role_key"
+              --header "Accept-Profile: flash"
+            )
+
+            if response_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --connect-timeout 5 \
+              --max-time "$request_timeout" \
+              "${headers[@]}" \
+              "$endpoint")"; then
+              curl_exit=0
+            else
+              curl_exit=$?
+            fi
+
+            status="000"
+            if (( curl_exit == 0 )) || [[ "$response_status" = "401" || "$response_status" = "403" ]]; then
+              status="$response_status"
+            fi
+
+            case "$status" in
+              200)
+                echo "Production Supabase flash.hosted_lora_adapters is queryable."
+                break
+                ;;
+              401|403)
+                echo "::error::Production Supabase schema readiness check was rejected with HTTP ${status}."
+                exit 1
+                ;;
+              000|400|404|406|5??)
+                # 400 is postgrest rejecting an unknown column: the migration that adds it has not
+                # landed yet. that is precisely the condition this gate exists to wait through.
+                echo "Production Supabase schema is not ready yet (HTTP ${status}); retrying."
+                ;;
+              *)
+                echo "::error::Production Supabase schema readiness check failed with HTTP ${status}."
+                exit 1
+                ;;
+            esac
+
+            remaining=$((deadline - SECONDS))
+            if (( remaining <= 0 )); then
+              continue
+            fi
+            sleep_seconds=10
+            if (( remaining < sleep_seconds )); then
+              sleep_seconds=$remaining
+            fi
+            sleep "$sleep_seconds"
+          done
+
+      - name: Deploy serving
+        if: steps.gate.outputs.deploy == 'true'
+        env:
+          FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
+          FREESOLO_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: modal deploy flash/serving/modal_app.py
+
+      - name: Wait for production serving readiness
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          endpoint="https://serve.freesolo.co/healthz"
+          expected_deployment_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          deadline=$((SECONDS + 300))
+
+          while true; do
+            remaining=$((deadline - SECONDS))
+            if (( remaining <= 0 )); then
+              echo "::error::Production serving health check did not become ready within 300 seconds."
+              exit 1
+            fi
+
+            request_timeout=10
+            if (( remaining < request_timeout )); then
+              request_timeout=$remaining
+            fi
+
+            response_status=""
+            if response_status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+              --connect-timeout 5 \
+              --max-time "$request_timeout" \
+              "$endpoint")"; then
+              curl_exit=0
+            else
+              curl_exit=$?
+            fi
+
+            status="000"
+            if (( curl_exit == 0 )); then
+              status="$response_status"
+            fi
+
+            if [[ "$status" = "200" ]]; then
+              if python - "$response_file" "$GITHUB_SHA" "$expected_deployment_id" <<'PY'
+          import json
+          import sys
+
+
+          def reject_constant(_value: str) -> None:
+              raise ValueError
+
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as response:
+                  payload = json.load(response, parse_constant=reject_constant)
+          except (OSError, UnicodeDecodeError, ValueError):
+              sys.exit(1)
+
+          ready = (
+              isinstance(payload, dict)
+              and payload.get("ok") is True
+              and payload.get("deployment_sha") == sys.argv[2]
+              and payload.get("deployment_id") == sys.argv[3]
+          )
+          sys.exit(0 if ready else 1)
+          PY
+              then
+                echo "Production serving router is ready for deployment ${GITHUB_SHA} (${expected_deployment_id})."
+                break
+              fi
+              echo "Production serving health check returned malformed, unhealthy, or stale deployment JSON; retrying."
+            elif [[ "$status" = "000" ]]; then
+              echo "Production serving health check had a transport error; retrying."
+            else
+              echo "Production serving health check returned HTTP ${status}; retrying."
+            fi
+
+            remaining=$((deadline - SECONDS))
+            if (( remaining <= 0 )); then
+              continue
+            fi
+            sleep_seconds=10
+            if (( remaining < sleep_seconds )); then
+              sleep_seconds=$remaining
+            fi
+            sleep "$sleep_seconds"
+          done
+
+      - name: Nothing to deploy
+        if: steps.gate.outputs.deploy != 'true'
+        run: echo "No serving changes in this push; skipping deploy."

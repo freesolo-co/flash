@@ -3519,6 +3519,26 @@ def test_the_vision_hook_unwraps_a_peft_model_to_find_the_vision_tower():
     assert len(base.patch_embed.hooks) == 1
 
 
+@contextlib.contextmanager
+def _stubbed_modules(stubs: dict[str, types.ModuleType]):
+    """Install worker-image module stubs, then RESTORE whatever was there before.
+
+    Popping unconditionally is wrong: names such as `vllm` are also stubbed process-wide by
+    tests/serving/conftest.py, so a pop here deletes that stub for every test the same xdist worker
+    runs afterwards, and their `import vllm` raises ModuleNotFoundError.
+    """
+    saved = {name: sys.modules.get(name) for name in stubs}
+    sys.modules.update(stubs)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
+
+
 def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alone():
     # execute the rendered source against a stand-in engine: asserting on the string alone would not
     # catch a patch that never runs, or one that turns checkpointing ON for a model verl left off.
@@ -3553,11 +3573,9 @@ def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alon
         "verl.workers.engine",
         "verl.workers.engine.fsdp",
     ]
-    saved = {name: sys.modules.get(name) for name in [*parents, module_stub.__name__]}
-    try:
-        for name in parents:
-            sys.modules.setdefault(name, types.ModuleType(name))
-        sys.modules[module_stub.__name__] = module_stub
+    stubs = {name: types.ModuleType(name) for name in parents}
+    stubs[module_stub.__name__] = module_stub
+    with _stubbed_modules(stubs):
         verl_patches.install_reentrant_checkpointing(multimodal=False)
         # checkpointing on -> the flag is put back to reentrant, and the lora-frozen embeddings
         # get input grads so the checkpointed segment actually produces a backward (GRAD-001)
@@ -3570,12 +3588,6 @@ def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alon
         off_built = off._build_module()
         assert off_built.kwargs is None
         assert off_built.input_grads is False
-    finally:
-        for name, value in saved.items():
-            if value is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = value
 
 
 def test_entropy_quantile_overrides_enable_verl_entropy_and_stay_off_by_default():
@@ -3603,7 +3615,6 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
     # strings or the image-pad ban missing with no error. executing both is the only way to catch
     # that: the sources look correct in isolation either way.
     import asyncio
-    import sys
     from types import ModuleType
 
     seen: dict = {}
@@ -3625,15 +3636,10 @@ def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
         "verl.experimental.agent_loop": package,
         "verl.experimental.agent_loop.agent_loop": agent_loop_module,
     }
-    for name, module in stubs.items():
-        sys.modules[name] = module
-    try:
+    with _stubbed_modules(stubs):
         verl_patches.install_stop_sequences(("</answer>",))
         verl_patches.install_image_pad_ban(151655)
         asyncio.run(_AgentLoopWorker()._run_agent_loop({"temperature": 1.0}))
-    finally:
-        for name in stubs:
-            sys.modules.pop(name, None)
 
     assert seen["stop"] == ["</answer>"]
     assert seen["logit_bias"] == {151655: -100.0}
@@ -3648,7 +3654,6 @@ def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
     keyword-only; the wrapper must also preserve ``**kwargs``.
     """
     import asyncio
-    import sys
     from types import ModuleType
 
     seen: dict = {}
@@ -3688,9 +3693,7 @@ def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
         "vllm": vllm_module,
         "vllm.sampling_params": sampling_params_module,
     }
-    for name, module in stubs.items():
-        sys.modules[name] = module
-    try:
+    with _stubbed_modules(stubs):
         verl_patches.install_stop_sequences(("</answer>",))
         verl_patches.install_image_pad_ban(151655)
         verl_patches.install_structured_outputs({"json": {"type": "object"}})
@@ -3700,9 +3703,6 @@ def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
                 {"temperature": 1.0}, {"step": 0}, agent_name="tool_agent", trace=False
             )
         )
-    finally:
-        for name in stubs:
-            sys.modules.pop(name, None)
 
     # the arguments the shims do not own must arrive untouched.
     assert seen["trajectory"] == {"step": 0}
@@ -3733,7 +3733,6 @@ def _load_kl_ref_engine():
     the shim rebinds FSDPEngine._build_lora_module and .disable_adapter on import, so a stub that
     stands in for verl's real class is enough to exercise both halves without a gpu.
     """
-    import sys
     from types import ModuleType
 
     class _FSDPEngine:
@@ -3757,13 +3756,8 @@ def _load_kl_ref_engine():
         "verl.workers.engine.fsdp": fsdp_pkg,
         "verl.workers.engine.fsdp.transformer_impl": impl,
     }
-    for name, module in stubs.items():
-        sys.modules[name] = module
-    try:
+    with _stubbed_modules(stubs):
         verl_patches.install_kl_ref_adapter()
-    finally:
-        for name in stubs:
-            sys.modules.pop(name, None)
     return impl.FSDPEngine
 
 
@@ -7644,7 +7638,6 @@ def _run_per_turn_shim(rows, uids, episode_advantages, response_mask=None):
     is to replace a module-global that verl calls by name, and a string assertion would pass just
     as happily on a shim that never installed itself.
     """
-    import sys
     from types import ModuleType, SimpleNamespace
 
     batch_size = len(uids)
@@ -7678,15 +7671,10 @@ def _run_per_turn_shim(rows, uids, episode_advantages, response_mask=None):
         "verl.trainer.ppo": ppo,
         "verl.trainer.ppo.ray_trainer": ray_trainer,
     }
-    for name, module in stubs.items():
-        sys.modules[name] = module
-    try:
+    with _stubbed_modules(stubs):
         verl_patches.install_per_turn_credit()
         # call the module global by name, exactly as ray_trainer.fit does at its call site.
         out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
-    finally:
-        for name in stubs:
-            sys.modules.pop(name, None)
     return out.batch["advantages"]
 
 
@@ -7822,7 +7810,6 @@ def test_per_turn_credit_shim_passes_through_a_batch_without_per_turn_metadata()
     # validation batches and any single-turn rollout carry no spans. the shim must return stock
     # grpo's tensor untouched rather than zeroing a batch it cannot credit.
     pytest.importorskip("torch")
-    import sys
     from types import ModuleType, SimpleNamespace
 
     import torch
@@ -7842,14 +7829,9 @@ def test_per_turn_credit_shim_passes_through_a_batch_without_per_turn_metadata()
         "verl.trainer.ppo": ppo,
         "verl.trainer.ppo.ray_trainer": ray_trainer,
     }
-    for name, module in stubs.items():
-        sys.modules[name] = module
-    try:
+    with _stubbed_modules(stubs):
         verl_patches.install_per_turn_credit()
         out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
-    finally:
-        for name in stubs:
-            sys.modules.pop(name, None)
     assert torch.equal(out.batch["advantages"], episode)
 
 

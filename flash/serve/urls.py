@@ -82,6 +82,64 @@ def openai_base_url(control_url: str) -> str:
     return f"{control}/v1" if control else ""
 
 
+PROD_FREESOLO_SERVING_URL = "https://serve.freesolo.co"
+DEV_FREESOLO_SERVING_URL = "https://serve-dev.freesolo.co"
+
+
+def default_serving_url(channel: str | None = None) -> str:
+    """Default serving control root for the given release channel.
+
+    Serving and control planes use separate per-channel databases; mixing them causes org FK 23503.
+    Dev serving is ``serve-dev.freesolo.co``.
+    """
+    from flash._internal.channel import CHANNEL
+
+    return DEV_FREESOLO_SERVING_URL if (channel or CHANNEL) == "dev" else PROD_FREESOLO_SERVING_URL
+
+
+def serving_base_url() -> str:
+    """Env-overridable serving control root.
+
+    Standalone planes must target a backend they operate because every request carries the plane's
+    ``FREESOLO_INTERNAL_KEY``. Reject hosted URLs whether supplied explicitly or by fallback.
+
+    Lives here rather than in ``flash.serve.deploy`` so that reading it costs nothing: deploy
+    imports httpx at module scope, and ``[project].dependencies`` is empty so the client CLI runs on
+    a bare install. A command that only needs to resolve the configured URL must not be the reason
+    a user has to install an extra -- and this guard is security-relevant, so the alternative of
+    duplicating it into each caller would be worse than the move.
+    """
+    import os
+
+    from flash.serve.errors import ServingError
+
+    # imported lazily: flash.serve is the CLIENT side, and a module-level import would pull
+    # flash.server into every CLI invocation.
+    from flash.server.platform.auth import standalone
+
+    configured = (os.environ.get("FREESOLO_SERVING_URL") or "").strip()
+    if standalone() and (not configured or is_freesolo_hosted_url(configured)):
+        raise ServingError(
+            f"FREESOLO_SERVING_URL is {'not set' if not configured else 'a Freesolo-hosted URL'}. "
+            "A standalone plane has no serving backend of its own, and using the hosted one would "
+            "send FREESOLO_INTERNAL_KEY - the key that controls this plane - to a service you do "
+            "not operate. Point FREESOLO_SERVING_URL at your own multi-LoRA deployment, or export "
+            "the adapter and serve it yourself (see SELF_HOSTING.md). Training does not require "
+            "this."
+        )
+    return serving_control_url(configured or default_serving_url())
+
+
+def internal_key_header() -> dict[str, str]:
+    """The header every serving request carries, or nothing when no key is configured."""
+    import os
+
+    # strip exactly as authenticate does: newlines are invalid headers and spaces change the key.
+    # blank values omit the header.
+    key = (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
+    return {"X-Freesolo-Internal-Key": key} if key else {}
+
+
 def public_deployment(deployment: dict) -> dict:
     """Return a public copy without private rollback state."""
     out = dict(deployment)
