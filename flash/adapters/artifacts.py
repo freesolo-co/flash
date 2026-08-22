@@ -12,7 +12,6 @@ ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors",)
 # beside an `adapter_model.<ext>.index.json` mapping every tensor key to the shard holding it.
 ADAPTER_SHARD_PREFIX = "adapter_model-"
 ADAPTER_WEIGHT_SUFFIXES = (".safetensors",)
-ADAPTER_WEIGHT_INDEX_FILES = tuple(f"{name}.index.json" for name in ADAPTER_WEIGHT_FILES)
 
 
 def is_adapter_weight_filename(filename: str) -> bool:
