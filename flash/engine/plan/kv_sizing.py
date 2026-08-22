@@ -143,14 +143,17 @@ def colocate_kv_util(
     model_info=None,
     preserve_legacy_floor: bool = False,
     tensor_parallel: int = 1,
+    lora_adapter_gb: float = 0.0,
 ) -> float:
     """vllm_gpu_memory_utilization for one colocated rollout tensor-parallel rank.
 
-    Budget the rank's weight shard plus a conservative full KV cache. Catalog models use geometry
-    with measured overhead and an 8 GB floor; uncataloged models retain the legacy KV equation.
+    budget the rank's weight shard plus a conservative full kv cache, then leave the rank's bf16
+    lora shard outside vllm's reservation. catalog models use geometry with measured overhead and an
+    8 gb floor; uncataloged models retain the legacy kv equation and no unverified adapter margin.
     """
     total_weights_gb = max(0.5, float(params_b or 1.0)) * 2.0
     tp_size = max(1, int(tensor_parallel))
+    adapter_util = max(0.0, float(lora_adapter_gb or 0.0)) / tp_size / max(1.0, total_vram_gb)
     # tensor parallelism shards vllm's bf16 weights, but kv heads can replicate when tp is wider than
     # the model's kv-head count. shard only the weight term and keep the full kv budget on every rank.
     weights_gb = total_weights_gb if tp_size == 1 else total_weights_gb / tp_size
@@ -176,7 +179,8 @@ def colocate_kv_util(
                 preserve_legacy_floor=preserve_legacy_floor,
             ),
         )
-        return max(_MIN_ENGINE_UTIL, min(_util_cap, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
+        sized = min(_util_cap, (weights_gb + kv_gb) / max(1.0, total_vram_gb))
+        return max(_MIN_ENGINE_UTIL, sized - adapter_util)
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
     # bigger rollout-phase KV does not compete with the training peak.
     kv_pool_gb = max(
@@ -191,7 +195,7 @@ def colocate_kv_util(
             preserve_legacy_floor=preserve_legacy_floor,
         ),
     )
-    sized = min(_util_cap, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
+    sized = min(_util_cap, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb)) - adapter_util
     # sharding the weight term can drive a small model's rank budget low enough that vllm has no
     # room left for its own runtime once the kv pool is carved out -- a 4B model on 2 cards prices
     # under this floor. single-rank sizing carries the whole weight copy and never gets that small,

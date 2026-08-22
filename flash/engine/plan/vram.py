@@ -129,6 +129,24 @@ def _legacy_lora_floor_gb(lora_rank: int, effective_params_b: float) -> float:
     return (lora_rank / 16.0) * (0.3 + 0.04 * effective_params_b)
 
 
+def _lora_parameter_count(lora_rank: int, model_info=None) -> int | None:
+    """exact trainable lora parameters from the catalog's concrete target geometry."""
+    shapes = tuple(getattr(model_info, "lora_target_shapes", ()) or ())
+    if not shapes or int(lora_rank) <= 0:
+        return None
+    target_dims = sum(
+        (int(in_features) + int(out_features)) * int(count)
+        for in_features, out_features, count in shapes
+    )
+    return int(lora_rank) * target_dims
+
+
+def _lora_weight_memory_gb(lora_rank: int, model_info=None) -> float | None:
+    """resident bf16 lora weights, or none when catalog target geometry is unavailable."""
+    params = _lora_parameter_count(lora_rank, model_info)
+    return None if params is None else params * _BYTES_PER_PARAM["bf16"] / 1e9
+
+
 def _lora_memory_gb(
     lora_rank: int,
     effective_params_b: float,
@@ -137,14 +155,9 @@ def _lora_memory_gb(
 ) -> float:
     """Adapter, gradient, and optimizer memory for the actual PEFT all-linear targets."""
     floor = _legacy_lora_floor_gb(lora_rank, effective_params_b)
-    shapes = tuple(getattr(model_info, "lora_target_shapes", ()) or ())
-    if not shapes:
+    trainable_params = _lora_parameter_count(lora_rank, model_info)
+    if trainable_params is None:
         return floor
-    target_dims = sum(
-        (int(in_features) + int(out_features)) * int(count)
-        for in_features, out_features, count in shapes
-    )
-    trainable_params = max(1, int(lora_rank)) * target_dims
     bytes_per_param = (
         _LORA_PAGED_BYTES_PER_PARAM
         if (algorithm or "").lower() in ("grpo", "rl")
