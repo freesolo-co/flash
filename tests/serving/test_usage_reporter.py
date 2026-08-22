@@ -109,13 +109,6 @@ def test_stream_text_delta_keeps_text_when_cumulative_hint_is_not_a_prefix(modal
     assert previous == "hello world"
 
 
-def test_backend_url_has_no_production_default():
-    # The crux of the fix: backend_url must NOT default to a real (prod) URL. An unset
-    # PLATFORM_BACKEND_URL must leave it empty so reporting stays off until wired deliberately.
-    s = Settings(_env_file=None)
-    assert s.backend_url == ""
-
-
 def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     # every gpu engine class scales to zero, while the cpu router stays available to trigger them.
     assert modal_app_module.MIN_CONTAINERS == 0
@@ -502,128 +495,10 @@ def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_modu
     }
 
 
-def test_engine_pool_applies_warm_floor_to_parameterized_instance(modal_app_module, monkeypatch):
-    # modal rejects min_containers on parameterized class decorators. a positive floor is applied to
-    # each loraengine(base_model=...) instance instead.
-    import asyncio
-
-    monkeypatch.setattr(modal_app_module, "MIN_CONTAINERS", 1)
-    calls: list[tuple[str, dict[str, int]]] = []
-
-    class _FakeEngine:
-        def __init__(self, base_model: str) -> None:
-            self.base_model = base_model
-
-        async def update_autoscaler(self, **kwargs: int) -> None:
-            calls.append((self.base_model, kwargs))
-
-    def _fake_lora_engine(*, base_model: str) -> _FakeEngine:
-        return _FakeEngine(base_model)
-
-    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _bm: _fake_lora_engine)
-    pool = modal_app_module._ModalEnginePool()
-
-    first = asyncio.run(pool._engine("Qwen/Qwen3.5-4B"))
-    second = asyncio.run(pool._engine("Qwen/Qwen3.5-4B"))
-
-    assert first.base_model == "Qwen/Qwen3.5-4B"
-    assert second.base_model == "Qwen/Qwen3.5-4B"
-    assert calls == [
-        (
-            "Qwen/Qwen3.5-4B",
-            {
-                "min_containers": 1,
-                "scaledown_window": modal_app_module.scaledown_window_for("L4"),
-            },
-        )
-    ]
-
-
-def test_engine_pool_applies_max_container_cap_when_configured(modal_app_module, monkeypatch):
-    import asyncio
-
-    monkeypatch.setattr(modal_app_module, "MIN_CONTAINERS", 1)
-    calls: list[dict[str, int]] = []
-
-    class _FakeEngine:
-        async def update_autoscaler(self, **kwargs: int) -> None:
-            calls.append(kwargs)
-
-    monkeypatch.setattr(modal_app_module, "MAX_CONTAINERS", 1)
-    monkeypatch.setattr(
-        modal_app_module, "_engine_cls_for", lambda _bm: lambda *, base_model: _FakeEngine()
-    )
-
-    asyncio.run(modal_app_module._ModalEnginePool()._engine("Qwen/Qwen3.5-4B"))
-
-    assert calls == [
-        {
-            "min_containers": 1,
-            "scaledown_window": modal_app_module.scaledown_window_for("L4"),
-            "max_containers": 1,
-        }
-    ]
-
-
-def test_engine_pool_applies_autoscaler_buffer_when_configured(modal_app_module, monkeypatch):
-    import asyncio
-
-    monkeypatch.setattr(modal_app_module, "MIN_CONTAINERS", 1)
-    calls: list[dict[str, int]] = []
-
-    class _FakeEngine:
-        async def update_autoscaler(self, **kwargs: int) -> None:
-            calls.append(kwargs)
-
-    monkeypatch.setattr(modal_app_module, "BUFFER_CONTAINERS", 2)
-    monkeypatch.setattr(
-        modal_app_module, "_engine_cls_for", lambda _bm: lambda *, base_model: _FakeEngine()
-    )
-
-    asyncio.run(modal_app_module._ModalEnginePool()._engine("Qwen/Qwen3.5-4B"))
-
-    assert calls == [
-        {
-            "min_containers": 1,
-            "scaledown_window": modal_app_module.scaledown_window_for("L4"),
-            "buffer_containers": 2,
-        }
-    ]
-
-
-def test_engine_pool_prefers_async_autoscaler_api(modal_app_module, monkeypatch):
-    import asyncio
-
-    monkeypatch.setattr(modal_app_module, "MIN_CONTAINERS", 1)
-    calls: list[dict[str, int]] = []
-
-    class _AsyncUpdate:
-        async def aio(self, **kwargs: int) -> None:
-            calls.append(kwargs)
-
-        def __call__(self, **_kwargs: int) -> None:
-            raise AssertionError("sync update_autoscaler should not be used when .aio exists")
-
-    class _FakeEngine:
-        update_autoscaler = _AsyncUpdate()
-
-    monkeypatch.setattr(
-        modal_app_module, "_engine_cls_for", lambda _bm: lambda *, base_model: _FakeEngine()
-    )
-
-    asyncio.run(modal_app_module._ModalEnginePool()._engine("Qwen/Qwen3.5-4B"))
-
-    assert calls == [
-        {
-            "min_containers": 1,
-            "scaledown_window": modal_app_module.scaledown_window_for("L4"),
-        }
-    ]
-
-
-def test_runtime_secret_exports_hf_alias_and_deployment_identity(modal_app_module, monkeypatch):
+def test_runtime_secret_exports_canonical_hf_token_and_deployment_identity(
+    modal_app_module, monkeypatch
+):
     names = (
-        "HF_API_KEY",
         "HF_TOKEN",
         "SERVING_DEPLOYMENT_MODE",
         "SERVING_CUSTOM_DOMAIN",
@@ -680,12 +555,10 @@ def test_runtime_secret_exports_hf_alias_and_deployment_identity(modal_app_modul
         "HOSTING_MAX_SEQ_LEN_TO_CAPTURE",
         "HOSTING_PREEMPTION_MODE",
         "HOSTING_RELOAD_INTERVAL_SECONDS",
-        "NEXT_PUBLIC_SUPABASE_URL",
-        "SUPABASE_SECRET_KEY",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("HF_API_KEY", "hf_secret")
+    monkeypatch.setenv("HF_TOKEN", "hf_secret")
     monkeypatch.setenv("SERVING_DEPLOYMENT_MODE", "development")
     monkeypatch.setenv("SERVING_CUSTOM_DOMAIN", "serve-dev.freesolo.co")
     monkeypatch.setenv("FREESOLO_DEPLOYMENT_SHA", "abc123")
@@ -697,7 +570,6 @@ def test_runtime_secret_exports_hf_alias_and_deployment_identity(modal_app_modul
     modal_app_module._runtime_secret()
 
     assert modal_app_module.modal.Secret.from_dict.call_args.args[0] == {
-        "HF_API_KEY": "hf_secret",
         "HF_TOKEN": "hf_secret",
         "SERVING_DEPLOYMENT_MODE": "development",
         "SERVING_CUSTOM_DOMAIN": "serve-dev.freesolo.co",

@@ -1111,32 +1111,6 @@ def test_health_reports_exact_capabilities(setup) -> None:
     ]
 
 
-def _assert_flash_deploy_smoke_accepts(
-    body: dict[str, Any], headers: Any, *, adapter_revision: str, checkpoint: str
-) -> None:
-    # mirror of flash's control-plane _smoke_provenance so this test proves the deploy handshake
-    # would accept the serving response (it raised "smoke response omitted immutable revision
-    # provenance" before this fix). raises on any mismatch, exactly like flash.
-    content = str((body["choices"][0].get("message") or {}).get("content") or "")
-    assert content.strip(), "smoke generation returned no content"
-    provenance = body.get("freesolo")
-    assert isinstance(provenance, dict), "smoke response omitted immutable revision provenance"
-    assert provenance.get("adapter_revision") == adapter_revision
-    assert provenance.get("checkpoint") == checkpoint
-    hf_revision = adapter_revision.rsplit(".", 1)[-1]
-    assert provenance.get("hf_revision") == hf_revision
-    smoke_headers = {
-        "adapter_revision": headers.get("X-Freesolo-Adapter-Revision"),
-        "checkpoint": headers.get("X-Freesolo-Checkpoint"),
-        "hf_revision": headers.get("X-Freesolo-HF-Revision"),
-    }
-    assert smoke_headers == {
-        "adapter_revision": adapter_revision,
-        "checkpoint": checkpoint,
-        "hf_revision": hf_revision,
-    }
-
-
 def test_chat_completion_against_revision_emits_provenance(setup) -> None:
     # this is the exact deploy-smoke path: flash chats the immutable revision id and verifies the
     # response carries revision provenance before flipping the run alias.
@@ -1150,6 +1124,7 @@ def test_chat_completion_against_revision_emits_provenance(setup) -> None:
     )
     assert response.status_code == 200
     body = response.json()
+    assert body["choices"][0]["message"]["content"].strip()
     assert body["freesolo"] == {
         "adapter_revision": REVISION_A,
         "checkpoint": checkpoint,
@@ -1158,9 +1133,6 @@ def test_chat_completion_against_revision_emits_provenance(setup) -> None:
     assert response.headers["X-Freesolo-Adapter-Revision"] == REVISION_A
     assert response.headers["X-Freesolo-Checkpoint"] == checkpoint
     assert response.headers["X-Freesolo-HF-Revision"] == SHA_A
-    _assert_flash_deploy_smoke_accepts(
-        body, response.headers, adapter_revision=REVISION_A, checkpoint=checkpoint
-    )
 
 
 def test_chat_completion_via_run_alias_reports_active_revision(setup) -> None:

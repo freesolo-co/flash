@@ -28,7 +28,6 @@ jobs:
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-      HF_API_KEY: ${{ secrets.HF_API_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       FREESOLO_INTERNAL_KEY: ${{ secrets.FREESOLO_INTERNAL_KEY }}
       SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
@@ -94,14 +93,11 @@ jobs:
         run: |
           set -euo pipefail
           missing=""
-          for name in MODAL_TOKEN_ID MODAL_TOKEN_SECRET FREESOLO_INTERNAL_KEY SUPABASE_ACCESS_TOKEN SUPABASE_PROJECT_REF SUPABASE_PROJECT_REF_DEV; do
+          for name in MODAL_TOKEN_ID MODAL_TOKEN_SECRET HF_TOKEN FREESOLO_INTERNAL_KEY SUPABASE_ACCESS_TOKEN SUPABASE_PROJECT_REF SUPABASE_PROJECT_REF_DEV; do
             if [ -z "${!name}" ]; then
               missing="$missing $name"
             fi
           done
-          if [ -z "$HF_API_KEY" ] && [ -z "$HF_TOKEN" ]; then
-            missing="$missing HF_API_KEY(or-HF_TOKEN)"
-          fi
           if [ -n "$missing" ]; then
             echo "::error::Refusing to deploy development serving: missing required secret(s):${missing}."
             exit 1

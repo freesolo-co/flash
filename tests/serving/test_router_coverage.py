@@ -186,24 +186,8 @@ class FakePool:
 
 
 # --------------------------------------------------------------------------------------------
-# router lifespan: startup-task cancel + aclose-error swallow on shutdown
+# router lifespan: client close errors are swallowed on shutdown
 # --------------------------------------------------------------------------------------------
-
-
-def test_startup_task_is_cancelled_on_shutdown_without_blocking_readiness():
-    """A slow on_startup runs as a background task: readiness is immediate, and a still-running
-    startup task is cancelled cleanly on shutdown (the CancelledError is swallowed)."""
-    import asyncio
-
-    async def _hang():
-        await asyncio.Event().wait()  # never completes -> still running at shutdown
-
-    router = AdapterRouter([_rec("qa")])
-    app = build_serving_app(FakePool(), router, chat_authorizer=_allow, on_startup=_hang)
-    with TestClient(app) as client:
-        # Readiness is not blocked by the hanging startup task.
-        assert client.get("/healthz").status_code == 200
-    # Exiting the context ran shutdown, cancelling the startup task without raising.
 
 
 def test_shutdown_swallows_client_aclose_errors():

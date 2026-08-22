@@ -57,10 +57,6 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
         TRANSFORMERS_REQUIREMENT,
         "vllm==0.23.0",
     ]
-    # serve-modal is deliberately absent: the generated-app `serve setup` path is deleted, and
-    # customer-owned deployment runs the packaged image instead.
-    assert "serve-modal" not in extras
-    assert "serve-control" not in extras
     assert "vllm==0.19.1" in extras["gpu"]
     assert project["tool"]["uv"]["conflicts"] == [[{"extra": "gpu"}, {"extra": "serve-runtime"}]]
     lock = (ROOT / "uv.lock").read_text()

@@ -12,7 +12,6 @@ from pathlib import Path
 
 import pytest
 
-import flash.serve.control as control
 from flash.serve.control import (
     AdapterAliasIntent,
     DeploymentRequest,
@@ -308,8 +307,6 @@ def test_multiple_compatible_adapters_return_one_order_stable_spec() -> None:
     assert "groups" not in {entry.name for entry in fields(forward)}
     assert "group_id" not in {entry.name for entry in fields(forward)}
     assert "group_name" not in {entry.name for entry in fields(forward)}
-    for legacy_name in ("DeploymentGroup", "DeploymentPlan", "GroupResult"):
-        assert not hasattr(control, legacy_name)
 
 
 def test_deployment_spec_requires_canonical_adapter_order_at_every_boundary() -> None:

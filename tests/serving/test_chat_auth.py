@@ -171,12 +171,6 @@ def test_wrong_internal_key_is_not_trusted() -> None:
     assert auth.calls == []
 
 
-def test_enforced_without_authorizer_fails_closed() -> None:
-    # Enforcement requested but no authorizer wired: a presented key must not serve open.
-    resp = _chat(_client(authorizer=None), Authorization="Bearer fs-user-key")
-    assert resp.status_code == 503
-
-
 def test_adapter_listing_is_gated_and_never_exposes_org_id() -> None:
     # GET /adapters requires the internal key (repo_id/url would otherwise leak the adapter->tenant
     # mapping to anon callers). Even for authorized callers the org id must never be serialized

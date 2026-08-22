@@ -7,12 +7,10 @@ name: Deploy serving Modal app
 #
 # required GitHub Actions secrets (Settings -> Secrets and variables -> Actions):
 #   MODAL_TOKEN_ID, MODAL_TOKEN_SECRET   - Modal CLI auth for the prod workspace
-#   HF_API_KEY (or legacy HF_TOKEN)      - private Hugging Face adapter access
+#   HF_TOKEN                              - private Hugging Face adapter access
 #   FREESOLO_INTERNAL_KEY                - shared platform internal key (backend + serving)
 #   PLATFORM_BACKEND_URL                 - platform backend base URL
 #   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY - serving startup hydration (durable adapter registry)
-#     the serving app also accepts the repo/frontend aliases NEXT_PUBLIC_SUPABASE_URL and
-#     SUPABASE_SECRET_KEY, but production deploys must have one URL + one service-role key.
 # modal_app.py reads these from the environment (load_dotenv only supplements os.environ), so no
 # .env file is written in CI. the "Verify required runtime secrets" step below hard-fails the deploy
 # if a required secret is absent, preventing a broken production config with external chat failures,
@@ -30,18 +28,10 @@ on:
     # a full ``git diff`` (fetch-depth: 0), so it cannot miss a relevant change; an irrelevant push
     # just runs the cheap gate and skips the deploy.
   workflow_dispatch:
-    inputs:
-      app:
-        description: "Which Modal app to deploy"
-        type: choice
-        default: all
-        options:
-          - all
-          - serving
 
 jobs:
   deploy:
-    name: Deploy ${{ matrix.app }} Modal app
+    name: Deploy serving Modal app
     # prod safety: `modal deploy` always targets the fixed freesolo-lora-serving production app, and
     # workflow_dispatch can be launched from any branch via the "run workflow" dropdown. restrict the
     # whole job to main so a manual dispatch from dev or a feature branch cannot overwrite the live
@@ -53,14 +43,9 @@ jobs:
     # minutes clears that with room while keeping a wedged deploy from holding the runner for
     # GitHub's 6-hour default.
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        app:
-          - serving
     # serialize serving deploys across runs because each deploy mutates the live app.
     concurrency:
-      group: deploy-modal-${{ matrix.app }}
+      group: deploy-modal-serving
       cancel-in-progress: false
     permissions:
       contents: read
@@ -75,15 +60,11 @@ jobs:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       # runtime secrets forwarded into the serving app's Modal secret at deploy time.
-      HF_API_KEY: ${{ secrets.HF_API_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       FREESOLO_INTERNAL_KEY: ${{ secrets.FREESOLO_INTERNAL_KEY }}
       PLATFORM_BACKEND_URL: ${{ secrets.PLATFORM_BACKEND_URL }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      # Repo/frontend aliases supported by serving/modal_app.py for the durable adapter registry.
-      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
-      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
       # Branded prod serving domain. modal_app.py attaches a Modal custom_domain only when this is set
       # (empty => default *.modal.run url), so non-prod/fork/local workspaces stay deployable. This
       # domain is verified in the production Modal workspace, so prod keeps serving on serve.freesolo.co.
@@ -95,22 +76,17 @@ jobs:
           # Need history so the change check can diff this push against its predecessor.
           fetch-depth: 0
 
-      - name: Decide whether to deploy ${{ matrix.app }}
+      - name: Decide whether to deploy serving
         id: gate
         working-directory: .
         env:
-          APP: ${{ matrix.app }}
           EVENT: ${{ github.event_name }}
-          DISPATCH_APP: ${{ github.event.inputs.app }}
           BEFORE_SHA: ${{ github.event.before }}
           CURRENT_SHA: ${{ github.sha }}
         run: |
           deploy=false
           if [ "$EVENT" = "workflow_dispatch" ]; then
-            # manual run: deploy serving when "all" or "serving" is selected.
-            if [ "$DISPATCH_APP" = "all" ] || [ "$DISPATCH_APP" = "$APP" ]; then
-              deploy=true
-            fi
+            deploy=true
           elif [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
             # Brand-new branch / no comparable predecessor: deploy to be safe.
             deploy=true
@@ -125,7 +101,7 @@ jobs:
             deploy=true
           fi
           echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
-          echo "Deploy ${APP}: $deploy"
+          echo "Deploy serving: $deploy"
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         if: steps.gate.outputs.deploy == 'true'
@@ -156,15 +132,13 @@ jobs:
         working-directory: .
         run: |
           if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
-            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET secrets are not set; cannot deploy ${{ matrix.app }}."
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET secrets are not set; cannot deploy serving."
             exit 1
           fi
 
-      - name: Verify required runtime secrets for ${{ matrix.app }}
+      - name: Verify required serving runtime secrets
         if: steps.gate.outputs.deploy == 'true'
         working-directory: .
-        env:
-          APP: ${{ matrix.app }}
         run: |
           # a production deploy with a missing required runtime secret would overwrite the live app
           # with a broken config rather than fail. serving needs the internal key and backend url for
@@ -172,21 +146,16 @@ jobs:
           # Modal stop or redeploy does not drop in-memory adapter routing. fail before `modal deploy`.
           missing=""
           # the internal key must use the canonical FREESOLO_INTERNAL_KEY name.
-          if [ -z "$HF_API_KEY" ] && [ -z "$HF_TOKEN" ]; then
-            missing="$missing HF_API_KEY(or-HF_TOKEN)"
+          if [ -z "$HF_TOKEN" ]; then
+            missing="$missing HF_TOKEN"
           fi
-          case "$APP" in
-            serving)
-              if [ -z "$SUPABASE_URL" ] && [ -z "$NEXT_PUBLIC_SUPABASE_URL" ]; then
-                missing="$missing SUPABASE_URL(or-NEXT_PUBLIC_SUPABASE_URL)"
-              fi
-              if [ -z "$SUPABASE_SERVICE_ROLE_KEY" ] && [ -z "$SUPABASE_SECRET_KEY" ]; then
-                missing="$missing SUPABASE_SERVICE_ROLE_KEY(or-SUPABASE_SECRET_KEY)"
-              fi
-              required="FREESOLO_INTERNAL_KEY PLATFORM_BACKEND_URL"
-              ;;
-            *) required="" ;;
-          esac
+          if [ -z "$SUPABASE_URL" ]; then
+            missing="$missing SUPABASE_URL"
+          fi
+          if [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+            missing="$missing SUPABASE_SERVICE_ROLE_KEY"
+          fi
+          required="FREESOLO_INTERNAL_KEY PLATFORM_BACKEND_URL"
           for name in $required; do
             # indirect expansion: the secrets are exported into the env via the job-level `env:` block.
             if [ -z "${!name}" ]; then
@@ -194,17 +163,17 @@ jobs:
             fi
           done
           if [ -n "$missing" ]; then
-            echo "::error::Refusing to deploy ${APP} to prod: missing required secret(s):${missing}. Set them in repo Settings -> Secrets and variables -> Actions."
+            echo "::error::Refusing to deploy serving to prod: missing required secret(s):${missing}. Set them in repo Settings -> Secrets and variables -> Actions."
             exit 1
           fi
-          echo "All required ${APP} runtime secrets are present."
+          echo "All required serving runtime secrets are present."
 
       - name: Wait for production adapter schema readiness
-        if: steps.gate.outputs.deploy == 'true' && matrix.app == 'serving'
+        if: steps.gate.outputs.deploy == 'true'
         working-directory: .
         run: |
-          supabase_url="${SUPABASE_URL:-$NEXT_PUBLIC_SUPABASE_URL}"
-          service_role_key="${SUPABASE_SERVICE_ROLE_KEY:-$SUPABASE_SECRET_KEY}"
+          supabase_url="$SUPABASE_URL"
+          service_role_key="$SUPABASE_SERVICE_ROLE_KEY"
           # probe the columns the runtime actually reads, not `id` -- which is not even among them.
           # selecting only `id` proved the TABLE exists while a schema still missing, say,
           # `deployment_generation` passed this gate and then failed on every read after deploy.
@@ -287,7 +256,7 @@ jobs:
             sleep "$sleep_seconds"
           done
 
-      - name: Deploy ${{ matrix.app }}
+      - name: Deploy serving
         if: steps.gate.outputs.deploy == 'true'
         env:
           FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
@@ -295,7 +264,7 @@ jobs:
         run: modal deploy flash/serving/modal_app.py
 
       - name: Wait for production serving readiness
-        if: steps.gate.outputs.deploy == 'true' && matrix.app == 'serving'
+        if: steps.gate.outputs.deploy == 'true'
         working-directory: .
         run: |
           endpoint="https://serve.freesolo.co/healthz"
@@ -379,4 +348,4 @@ jobs:
 
       - name: Nothing to deploy
         if: steps.gate.outputs.deploy != 'true'
-        run: echo "No ${{ matrix.app }} changes in this push; skipping deploy."
+        run: echo "No serving changes in this push; skipping deploy."

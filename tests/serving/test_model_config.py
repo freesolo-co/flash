@@ -13,7 +13,6 @@ from flash.serving.src.model_config import (
     is_supported_base_model,
     reasoning_parser_for,
     serve_model_for,
-    should_warm,
     supports_image_input,
 )
 
@@ -118,15 +117,6 @@ def test_no_bitsandbytes_anywhere() -> None:
     for entry in SERVING_MODELS:
         assert entry.get("quantization") != "bitsandbytes"
         assert entry.get("load_format") != "bitsandbytes"
-
-
-def test_catalog_models_are_eligible_for_explicit_warming() -> None:
-    # every validated tier can participate if a positive global warm floor is explicitly enabled.
-    for bm in base_models():
-        assert should_warm(bm) is True, bm
-    # unknown models are rejected before they can allocate a default-tier engine.
-    with pytest.raises(ValueError, match="Unsupported base model"):
-        should_warm("some/unlisted-model")
 
 
 def test_4b_has_l4_rank128_serving_overrides() -> None:

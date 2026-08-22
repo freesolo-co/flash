@@ -14,18 +14,18 @@ starts the matching GPU container when none is running. Inference similarly star
 through its remote generation method. Uncataloged base models are rejected instead of falling
 onto the default L4 tier.
 
-GPU engines use `MIN_CONTAINERS = 0` and scale down after up to 30 idle minutes. The router startup hook
-still calls `_ModalEnginePool.warm_all`, but the existing zero-floor guard makes it a no-op, so a
-normal deploy does not boot every model. The product chat route allows 30 minutes and gives
+GPU engines use `MIN_CONTAINERS = 0` and scale down after up to 30 idle minutes. A normal deploy does
+not boot any GPU model; registration or inference starts the matching engine on demand. The product
+chat route allows 30 minutes and gives
 first-party serving a 1,700-second request budget, leaving frontend headroom. Adapter undeploy
 returns after durable routing state is disabled, while
 best-effort gpu eviction continues as response background work. The `start_all` entrypoint (`uv run
-modal run modal_app.py`) remains an explicit manual diagnostic that boots engines and blocks until
+modal run flash/serving/modal_app.py`) remains an explicit manual diagnostic that boots engines and blocks until
 each reports healthy. Pass `--base-model ...` to check one model.
 
 The routing layer (`src/router.py`) carries no `modal`/`vllm` imports and is exhaustively
-unit-tested in `tests/test_router.py` (multi-base-model dispatch, shared-GPU multi-LoRA,
-register-routing, OpenAI shape, auth, 404s) — run with `pytest tests/`.
+unit-tested in `tests/serving/test_router.py` (multi-base-model dispatch, shared-GPU multi-LoRA,
+register-routing, OpenAI shape, auth, 404s) — run with `uv run pytest tests/serving/`.
 
 Persistence is only for hydration and recovery. On startup each base model's engine loads
 _its_ ready adapters from the `hosted_lora_adapters` Supabase table; `POST /adapters`
@@ -41,7 +41,7 @@ engine behavior.
 
 Both environments keep `MIN_CONTAINERS = 0`, so every GPU engine scales to zero and starts on demand.
 The CPU router remains warm. The shared hardcoded settings remain `MAX_CONTAINERS = None`,
-`BUFFER_CONTAINERS = 0`, `SCALEDOWN_WINDOW_SECONDS = 1800`, and `MAX_INPUTS = 64` with
+`SCALEDOWN_WINDOW_SECONDS = 1800`, and `MAX_INPUTS = 64` with
 `TARGET_INPUTS = 48`.
 
 ### Production
@@ -58,7 +58,7 @@ set -a && source .env && set +a
 uv run modal deploy flash/serving/modal_app.py
 ```
 
-Required production wiring is `HF_API_KEY` or `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
+Required production wiring is `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
 `PLATFORM_BACKEND_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and
 `SERVING_CUSTOM_DOMAIN=serve.freesolo.co`.
 
@@ -100,7 +100,7 @@ export SUPABASE_PROJECT_REF_DEV="replace-with-development-project-ref"
 export SUPABASE_URL=https://${SUPABASE_PROJECT_REF_DEV}.supabase.co
 export SUPABASE_SERVICE_ROLE_KEY="replace-with-development-server-key"
 export FREESOLO_INTERNAL_KEY="replace-with-shared-internal-key"
-export HF_API_KEY="replace-with-hugging-face-token"
+export HF_TOKEN="replace-with-hugging-face-token"
 uv run modal deploy --env dev flash/serving/modal_app.py
 ```
 
@@ -217,7 +217,7 @@ The one-off quantization job that produced them is not kept in this repo.
 
 - `GET /healthz` — `{ok, base_models: [...], unsupported_base_models?: [...], gpus: <count>, gpu_by_model: {base: tier}, gpu_tiers: [...], adapters: <count>}` (`gpu*` fields cover supported catalog base models; unsupported hydrated models are listed separately)
 - `GET /adapters`
-- `POST /adapters` with `X-Freesolo-Internal-Key`, a cataloged `base_model`, and required boolean `thinking` (optional `structured_outputs` default — see below)
+- `POST /adapters` with `X-Freesolo-Internal-Key` and an immutable revision registration (optional `structured_outputs` default — see below)
 - `POST /generate` with `adapter_id`
 - `POST /adapters/{adapter_id}/generate`
 - `POST /v1/chat/completions` where `model` is the adapter id
@@ -285,11 +285,20 @@ open `<think>` block for generation to close.
 
 ```json
 {
-  "adapter_id": "people-search-lora",
+  "adapter_id": "people-search@step-20.8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f",
   "repo_id": "Freesolo-Co/people-search-lora",
+  "repo_type": "model",
   "base_model": "Qwen/Qwen3.5-0.8B",
+  "checkpoint": "people-search/step-20",
+  "org_id": "org-id",
+  "private": true,
   "thinking": false,
-  "status": "ready"
+  "metadata": {
+    "record_type": "revision",
+    "run_id": "people-search",
+    "checkpoint_step": 20,
+    "hf_revision": "8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f"
+  }
 }
 ```
 

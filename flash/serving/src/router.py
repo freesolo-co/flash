@@ -10,7 +10,6 @@ through ``ServingContext``, which this builder attaches to ``app.state``.
 # Do NOT add `from __future__ import annotations`: the FastAPI handlers use closure-local body
 # models as annotations, which the future import turns into unresolvable strings -> silent 422.
 
-import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -49,7 +48,6 @@ def build_serving_app(
     reload_interval_seconds: float = 30.0,
     usage_reporter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,
-    on_startup: Callable[[], Awaitable[None]] | None = None,
 ):
     """Front-door FastAPI app. ``reload_records`` re-reads persisted ready adapters so a router
     that missed a (un)registration on another container still resolves it: reload once on a miss
@@ -67,10 +65,6 @@ def build_serving_app(
     It returns the caller's org id, which bills a base-model serve to the caller (no adapter owner).
     Trusted server-to-server callers presenting the shared internal key bypass it. If no
     ``chat_authorizer`` is wired, a non-internal request fails closed (503) — prod always wires it.
-
-    ``on_startup`` (optional) runs once as a background task without blocking readiness. Serving wires
-    the optional warm-floor hook here; at the production zero floor it returns without starting gpu
-    engines. Failures are swallowed and the task is cancelled on shutdown if still running.
     """
     context = ServingContext(
         pool,
@@ -89,7 +83,7 @@ def build_serving_app(
     api = FastAPI(
         title="Freesolo LoRA Serving (multi base model)",
         version="0.2.0",
-        lifespan=_lifespan_for(context, on_startup, usage_reporter, chat_authorizer),
+        lifespan=_lifespan_for(context, usage_reporter, chat_authorizer),
     )
     setattr(api.state, APP_STATE_ATTR, context)
     # fastapi resolves body parameters before handlers run, so cap the raw receive channel first.
@@ -111,36 +105,14 @@ def build_serving_app(
 
 def _lifespan_for(
     context: ServingContext,
-    on_startup: Callable[[], Awaitable[None]] | None,
     usage_reporter: Any,
     chat_authorizer: Any,
 ):
-    """Build the app's lifespan: optional non-blocking startup, then an ordered shutdown."""
+    """Build the app's ordered shutdown lifespan."""
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: "FastAPI"):
-        # run optional startup work without blocking router readiness. the cpu router must accept
-        # traffic immediately, and any background startup failure must not crash it.
-        startup_task = None
-        if on_startup is not None:
-
-            async def _run_startup() -> None:
-                # startup work is best-effort and must never crash the router
-                with contextlib.suppress(Exception):
-                    await on_startup()
-
-            startup_task = asyncio.create_task(_run_startup())
         yield
-        if startup_task is not None and not startup_task.done():
-            startup_task.cancel()
-            try:
-                await startup_task
-            except asyncio.CancelledError:
-                # shutdown raced our own cancel of the startup task — expected when the
-                # container is told to stop mid-startup; nothing to clean up, so swallow it.
-                pass
-            except Exception:  # best-effort cleanup must not fail shutdown
-                pass
         # drain detached usage reports before closing their shared client.
         await context.usage.drain()
 

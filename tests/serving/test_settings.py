@@ -19,7 +19,7 @@ def test_settings_holds_only_runtime_wiring() -> None:
     assert set(type(s).model_fields) == allowed
 
 
-def test_hf_token_alias() -> None:
+def test_hf_token_is_canonical() -> None:
     assert Settings(_env_file=None, HF_TOKEN="hf_secret").hf_api_key == "hf_secret"
 
 

@@ -1866,37 +1866,6 @@ def test_usage_reporter_client_closed_on_shutdown():
     assert closed["v"] is True
 
 
-def test_on_startup_is_invoked_in_background_on_app_start():
-    """The optional startup callback runs through the FastAPI lifespan without blocking readiness."""
-    import threading
-
-    router = _router_for("qa", QWEN)
-    called = threading.Event()
-
-    async def _startup() -> None:
-        called.set()
-
-    with _serve(FakePool(), router, on_startup=_startup):
-        assert called.wait(timeout=5), "on_startup was not invoked on app startup"
-
-
-def test_on_startup_failure_does_not_crash_the_router():
-    """A best-effort startup callback cannot prevent the router from serving traffic."""
-    import threading
-
-    router = _router_for("qa", QWEN)
-    ran = threading.Event()
-
-    async def _boom() -> None:
-        ran.set()
-        raise RuntimeError("warm exploded")
-
-    with _serve(FakePool(), router, internal_key="sekret", on_startup=_boom) as client:
-        assert ran.wait(timeout=5)
-        # the router is unaffected by the startup failure; health and routing still work.
-        assert client.get("/healthz").json()["ok"] is True
-
-
 def test_concurrent_misses_hydrate_in_order_without_stampeding():
     """Two concurrent misses must not hydrate out of order or stampede shared storage.
 

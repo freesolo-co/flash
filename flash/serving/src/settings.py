@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import AliasChoices, Field
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 HOSTING_CACHE_DIR = Path("/vol/hosting-cache")
@@ -76,10 +76,7 @@ def vllm_engine_kwargs() -> dict[str, Any]:
 class Settings(BaseSettings):
     """Runtime credentials, endpoints, and deployment identity; never tuning knobs."""
 
-    hf_api_key: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("HF_API_KEY", "HF_TOKEN"),
-    )
+    hf_api_key: str | None = Field(default=None, validation_alias="HF_TOKEN")
     # The single shared platform internal key. Serving uses it for every trusted-infra purpose:
     # authenticating adapter (un)registration on POST/DELETE /adapters, bypassing external chat auth
     # for trusted server-to-server callers, and authenticating serving's own calls back to the

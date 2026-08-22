@@ -33,14 +33,15 @@ Which header carries it depends on who owns the deployment, because the two are 
 
 Run the conformance suite with the same credential the backend was deployed with.
 
-The suite checks the dynamic-registration contract on this page, so it applies to the generated
-backend and to the Freesolo-hosted one. It does NOT apply to a `flash serve deploy` deployment: that
+The suite checks the dynamic-registration contract on this page, so it applies to the
+Freesolo-hosted backend and custom backends that implement this registration surface. It does NOT
+apply to a `flash serve deploy` deployment: that
 app receives its adapters in an immutable manifest and registers them at boot, so it serves
 `/healthz`, `/v1/models`, and `/v1/chat/completions` and has no `/adapters` surface at all. Pointing
 the suite at one fails every registration, activation, and alias test against a perfectly healthy
 deployment. Verify a customer-owned deployment through those three endpoints instead.
-The generated backend requires `FLASH_SERVING_KEY` and `HF_TOKEN` in its Modal secret. It fails
-closed when the key is absent. A custom backend may intentionally be keyless.
+A custom dynamic-registration backend may intentionally be keyless; advertise that through
+`requires_key: false`.
 `GET /healthz` must answer without loading the model:
 
 ```json
@@ -172,7 +173,7 @@ Warm residents are unloaded later using the exact revision incarnation.
 
 ## Conformance
 
-Run against a generated or hosted backend you own, because the suite registers, activates, chats,
+Run against a dynamic-registration backend you own, because the suite registers, activates, chats,
 and deletes real state. A `flash serve deploy` deployment is not a valid target: it has no
 `/adapters` surface (see "Authentication and health" above).
 

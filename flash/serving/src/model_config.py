@@ -255,13 +255,3 @@ def reasoning_parser_for(base_model: str) -> str | None:
     """The model-scoped vLLM reasoning parser, or None when parsing is disabled."""
     parser = (_config_for(base_model).get("engine") or {}).get("reasoning_parser")
     return str(parser) if parser else None
-
-
-def should_warm(base_model: str) -> bool:
-    """Whether ``base_model`` participates when a positive warm floor is explicitly enabled.
-
-    The production zero floor bypasses this policy. A future catalog entry can set ``warm: False`` to
-    remain scale-to-zero even under an enabled global floor. Unknown models are rejected before they
-    can allocate a default-tier engine.
-    """
-    return bool(_config_for(base_model).get("warm", True))
