@@ -15,6 +15,8 @@ from fastapi.testclient import TestClient
 from modal.exception import ExecutionError, FunctionTimeoutError
 from test_router import QWEN, _allow, _router_for
 
+from flash.client.http import ClientError
+from flash.serve.streaming import _openai_stream_content
 from flash.serving.src.router import build_serving_app
 
 
@@ -71,6 +73,12 @@ class _FailingPool:
 
     async def unregister(self, base_model, adapter_id, expected_generation=None):
         return None
+
+
+class _CleanlyTruncatedPool(_FailingPool):
+    async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
+        yield {"type": "ready", "checkpoint": "run-a/step-1", "thinking": False}
+        yield {"type": "delta", "text": "partial"}
 
 
 class _SyncRaisingStreamPool(_FailingPool):
@@ -174,6 +182,18 @@ def test_midstream_router_side_bug_is_not_reported_as_an_engine_failure() -> Non
     resp = _chat(_client(RuntimeError("router-side bug"), mid_stream=True), stream=True)
     assert "engine_error" not in resp.text
     assert "[DONE]" not in resp.text  # no fabricated clean termination for a router-side defect
+
+
+def test_clean_iterator_end_without_final_is_a_consumer_visible_error() -> None:
+    response = _chat(
+        _client(RuntimeError("unused"), pool_cls=_CleanlyTruncatedPool),
+        stream=True,
+    )
+    stream = _openai_stream_content(iter(response.text.splitlines()), thinking=False)
+
+    assert next(stream) == "partial"
+    with pytest.raises(ClientError, match="ended without a terminal event"):
+        next(stream)
 
 
 def test_midstream_failure_terminates_the_stream_with_an_error_event() -> None:

@@ -331,6 +331,27 @@ def test_health_auth_models_and_no_model_fallback() -> None:
     assert AUTH_TOKEN not in models.text + missing.text
 
 
+def test_chat_auth_rejection_closes_the_connection_before_reading_the_body(monkeypatch) -> None:
+    owner, _ = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+
+    async def fail_if_read(_request):
+        pytest.fail("unauthorized request body was read")
+
+    monkeypatch.setattr(http_module, "_read_request_body", fail_if_read)
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            content=b"an unread upload",
+        )
+    )
+
+    assert response.status_code == 401
+    assert response.headers["connection"] == "close"
+
+
 def test_bearer_scheme_is_case_insensitive_and_duplicate_or_malformed_headers_fail() -> None:
     owner, _ = _published_owner()
     app = create_app(owner, bearer_token=AUTH_TOKEN)

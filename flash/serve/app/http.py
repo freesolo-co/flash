@@ -225,7 +225,7 @@ def _authorize(request: Request, state: _HttpState) -> JSONResponse | None:
     return JSONResponse(
         {"error": {"message": "authentication required", "type": "authentication_error"}},
         status_code=401,
-        headers={"WWW-Authenticate": "Bearer"},
+        headers={"WWW-Authenticate": "Bearer", "Connection": "close"},
     )
 
 

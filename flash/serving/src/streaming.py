@@ -110,8 +110,20 @@ async def _produce_openai_chat_stream(
                 }
             )
 
+        def _error_chunk(message: str, code: int) -> bytes:
+            return _sse(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": adapter_id,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                    "error": {"message": message, "type": "engine_error", "code": code},
+                }
+            )
+
         splitter = _ReasoningStreamSplitter(thinking)
-        final: dict[str, Any] = {}
+        final: dict[str, Any] | None = None
         latest_usage: dict[str, Any] = {}
         guarded_events = terminating_on_engine_error(router, events, adapter_id)
         disconnect_wait = asyncio.create_task(disconnected.wait())
@@ -159,22 +171,7 @@ async def _produce_openai_chat_stream(
                     # truncated stream with no error and no [done], indistinguishable from a short
                     # completion. emit the error into the stream and then close the protocol normally
                     # so the failure is detectable by an unmodified openai client.
-                    await emit(
-                        _sse(
-                            {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": adapter_id,
-                                "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
-                                "error": {
-                                    "message": event["message"],
-                                    "type": "engine_error",
-                                    "code": event["code"],
-                                },
-                            }
-                        )
-                    )
+                    await emit(_error_chunk(event["message"], event["code"]))
                     await emit(_sse("[DONE]"))
                     return
         finally:
@@ -196,6 +193,11 @@ async def _produce_openai_chat_stream(
         trailing = splitter.flush()
         if trailing:
             await emit(_delta_chunk({"reasoning_content": trailing}))
+
+        if final is None or final.get("finish_reason") is None:
+            await emit(_error_chunk("The serving engine ended without a terminal event.", 502))
+            await emit(_sse("[DONE]"))
+            return
 
         done_chunk: dict[str, Any] = {
             "id": completion_id,

@@ -75,6 +75,19 @@ def test_json_strings_reject_non_finite_constants(value):
         normalize_structured_outputs(value)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"type": "number", "minimum": float("nan")},
+        {"json": {"type": "number", "maximum": float("inf")}},
+    ],
+    ids=["raw-schema", "canonical-json"],
+)
+def test_decoded_dicts_reject_nested_non_finite_constants(value):
+    with pytest.raises(StructuredOutputsError, match="json does not define"):
+        normalize_structured_outputs(value)
+
+
 @pytest.mark.parametrize("s", ["[1, 2]", "42", "null", '"json-ish"'])
 def test_json_string_must_decode_to_an_object(s):
     with pytest.raises(StructuredOutputsError, match="decode to an object"):

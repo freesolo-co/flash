@@ -126,9 +126,9 @@ def _normalize_dict(value: dict[str, Any]) -> dict[str, Any]:
     if any(k in CONSTRAINT_KEYS or k in _CONSTRAINT_ALIASES or k in OPTION_KEYS for k in data):
         return _normalize_canonical(data)
     # No constraint keys: treat the whole dict as a raw JSON schema (e.g.
-    # {"type": "object", "properties": ...}). Wrap the ORIGINAL dict, not the null-stripped copy:
+    # {"type": "object", "properties": ...}). Validate the ORIGINAL dict, not the null-stripped copy:
     # null values inside a schema (e.g. ``"default": null``) are schema content, not spec keys to drop.
-    return {"json": value}
+    return {"json": _coerce_json_schema(value, key="json")}
 
 
 def _normalize_canonical(data: dict[str, Any]) -> dict[str, Any]:
@@ -210,6 +210,12 @@ def _validate_option(key: str, value: Any) -> Any:
 def _coerce_json_schema(value: Any, *, key: str) -> dict[str, Any]:
     """A JSON schema given as a dict, or as a string that parses to one."""
     if isinstance(value, dict):
+        try:
+            _decode_json(json.dumps(value))
+        except ValueError as exc:
+            raise StructuredOutputsError(
+                f"structured outputs {key!r} is not valid JSON: {exc}"
+            ) from exc
         return value
     if isinstance(value, str):
         try:
