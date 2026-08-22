@@ -59,19 +59,23 @@ def base_weights_cache_path(cache_root: str | os.PathLike[str]) -> Path:
     return Path(cache_root) / BASE_WEIGHTS_CACHE_DIRNAME
 
 
-def _snapshot_inventory(snapshot_path: object) -> str:
-    """one stable line per file in the snapshot: relative path and byte size.
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as file:
+        return hashlib.file_digest(file, "sha256").hexdigest()
 
-    sorted so the same snapshot always produces the same text, and sized so a truncated or
-    replaced file is caught as well as a deleted one. paths are relative to the snapshot root, so
-    the record survives the cache being mounted at a different absolute path.
+
+def _snapshot_inventory(snapshot_path: object) -> str:
+    """one stable line per file: relative path, byte size, and sha-256 digest.
+
+    this intentionally reads every byte. path and metadata checks cannot detect same-size content
+    replacement, and this cache volume does not expose a trusted filesystem content digest.
     """
 
     root = Path(str(snapshot_path))
     entries = [
-        f"{path.relative_to(root).as_posix()}\t{path.stat().st_size}"
+        f"{path.relative_to(root).as_posix()}\t{path.stat().st_size}\t{_file_sha256(path)}"
         for path in sorted(root.rglob("*"))
-        if path.is_file() or (path.is_symlink() and path.exists())
+        if path.is_file()
     ]
     return "\n".join(entries)
 

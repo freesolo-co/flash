@@ -73,6 +73,7 @@ _ERROR_CODES = frozenset(
         "not_found",
         "provider_rejected",
         "readiness_failed",
+        "readiness_timeout",
         "resource_ambiguous",
         "transport_failed",
     }
@@ -85,6 +86,7 @@ _ERROR_MESSAGES = {
     "not_found": "provider resource was not found",
     "provider_rejected": "provider rejected the operation",
     "readiness_failed": "provider resource did not become ready",
+    "readiness_timeout": "provider resource readiness deadline was exceeded",
     "resource_ambiguous": "provider resource outcome is ambiguous",
     "transport_failed": "provider transport failed",
 }

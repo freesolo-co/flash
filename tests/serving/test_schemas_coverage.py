@@ -6,6 +6,7 @@ Each assertion uses public Pydantic validation so failures match the API-facing 
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -123,6 +124,40 @@ def test_persisted_alias_id_must_equal_run_id() -> None:
 def test_generate_request_rejects_whitespace_adapter_id() -> None:
     with pytest.raises(ValidationError, match="adapter_id must not be empty"):
         GenerateRequest.model_validate({"adapter_id": "   ", "prompt": "hi"})
+
+
+@pytest.mark.parametrize(
+    "sources",
+    [
+        {},
+        {"prompt": "   "},
+        {"messages": []},
+        {"prompt": "hi", "messages": []},
+        {"prompt": "   ", "messages": [{"role": "user", "content": "hello"}]},
+        {"prompt": "hi", "messages": [{"role": "user", "content": "hello"}]},
+    ],
+)
+def test_generate_request_requires_exactly_one_nonempty_prompt_source(
+    sources: dict[str, object],
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match="exactly one nonempty prompt or messages source is required",
+    ):
+        GenerateRequest.model_validate({"adapter_id": "a", **sources})
+
+
+def test_serving_readme_uses_generate_request_field_names() -> None:
+    readme = Path(__file__).parents[2] / "flash" / "serving" / "README.md"
+    text = readme.read_text()
+
+    assert "`POST /generate` with `adapter_id`" in text
+    assert '"adapter_id": "people-search-lora"' in text
+    assert '"max_tokens": 512' in text
+    assert '"structured_outputs": {' in text
+    assert "adapterId" not in text
+    assert "maxTokens" not in text
+    assert "structuredOutputs" not in text
 
 
 @pytest.mark.parametrize(

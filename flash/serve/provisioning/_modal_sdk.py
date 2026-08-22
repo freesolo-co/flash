@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import importlib
 import inspect
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -14,6 +15,7 @@ from flash.serve.control import DeploymentErrorCode, ModalCredentials
 from flash.serve.control._urls import validate_modal_public_url
 from flash.serve.control.types import validate_modal_provider_id
 
+from ._common import Clock
 from ._modal_plan import MODAL_VOLUME_MOUNT, ModalCreatePlan, validate_modal_plan
 
 ModalAppState = Literal["deployed", "lifecycle_pending", "stopped", "failed"]
@@ -119,7 +121,7 @@ class ModalSdk(Protocol):
     def close(self) -> None: ...
 
 
-ModalSdkFactory = Callable[[ModalCredentials, ModalCreatePlan], ModalSdk]
+ModalSdkFactory = Callable[[ModalCredentials, ModalCreatePlan, float, Clock], ModalSdk]
 ModuleLoader = Callable[[], object]
 
 
@@ -130,9 +132,15 @@ def _load_modal_module() -> object:
     return modal
 
 
-def _sync_value(value: object) -> object:
+def _sync_value(
+    value: object,
+    *,
+    deadline_at: float,
+    clock: Clock = time.monotonic,
+) -> object:
     if inspect.isawaitable(value):
-        return asyncio.run(value)
+        timeout_seconds = max(0.0, deadline_at - clock())
+        return asyncio.run(asyncio.wait_for(value, timeout=timeout_seconds))
     return value
 
 
@@ -156,18 +164,28 @@ def _resource(value: object, role: Literal["secret", "volume"]) -> ModalNamedRes
     )
 
 
-def _call_read(operation: Callable[[], object]) -> object:
+def _call_read(
+    operation: Callable[[], object],
+    *,
+    deadline_at: float,
+    clock: Clock = time.monotonic,
+) -> object:
     try:
-        return _sync_value(operation())
+        return _sync_value(operation(), deadline_at=deadline_at, clock=clock)
     except ModalSdkFailure:
         raise
     except Exception:
         raise ModalSdkFailure("transport_failed") from None
 
 
-def _call_mutation(operation: Callable[[], object]) -> object:
+def _call_mutation(
+    operation: Callable[[], object],
+    *,
+    deadline_at: float,
+    clock: Clock = time.monotonic,
+) -> object:
     try:
-        return _sync_value(operation())
+        return _sync_value(operation(), deadline_at=deadline_at, clock=clock)
     except ModalSdkFailure:
         raise
     except Exception:
@@ -181,22 +199,36 @@ def _post_mutation_read(operation: Callable[[], object]) -> object:
         raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True) from None
 
 
-def _close_client(client: object) -> None:
+def _close_client(
+    client: object,
+    *,
+    deadline_at: float,
+    clock: Clock = time.monotonic,
+) -> None:
     close = getattr(client, "_close", None)
     if callable(close):
         with contextlib.suppress(Exception):
-            _sync_value(close())
+            _sync_value(close(), deadline_at=deadline_at, clock=clock)
 
 
 class PinnedModalSdk:
     """request-scoped adapter for the locally pinned modal 1.5 sdk contract."""
 
-    __slots__ = ("_client", "_modal", "environment_name", "workspace_name")
+    __slots__ = (
+        "_client",
+        "_clock",
+        "_deadline_at",
+        "_modal",
+        "environment_name",
+        "workspace_name",
+    )
 
     def __init__(
         self,
         credentials: ModalCredentials,
         plan: ModalCreatePlan,
+        deadline_at: float,
+        clock: Clock = time.monotonic,
         *,
         module_loader: ModuleLoader = _load_modal_module,
     ) -> None:
@@ -208,12 +240,20 @@ class PinnedModalSdk:
         try:
             modal = module_loader()
             client = modal.Client.from_credentials(token_id, token_secret)
-            workspace = modal.Workspace.from_context(client=client).hydrate()
-            environment = modal.Environment.from_name(
-                plan.placement.environment,
-                create_if_missing=False,
-                client=client,
-            ).hydrate()
+            workspace = _sync_value(
+                modal.Workspace.from_context(client=client).hydrate(),
+                deadline_at=deadline_at,
+                clock=clock,
+            )
+            environment = _sync_value(
+                modal.Environment.from_name(
+                    plan.placement.environment,
+                    create_if_missing=False,
+                    client=client,
+                ).hydrate(),
+                deadline_at=deadline_at,
+                clock=clock,
+            )
             workspace_name = _text(getattr(workspace, "name", None), "modal workspace name")
             environment_name = _text(getattr(environment, "name", None), "modal environment name")
             if (
@@ -221,17 +261,33 @@ class PinnedModalSdk:
                 or environment_name != plan.placement.environment
             ):
                 raise ModalSdkFailure("authentication_failed")
+        except TimeoutError:
+            if client is not None:
+                _close_client(client, deadline_at=deadline_at, clock=clock)
+            raise ModalSdkFailure("transport_failed") from None
+        except ModalSdkFailure:
+            if client is not None:
+                _close_client(client, deadline_at=deadline_at, clock=clock)
+            raise
         except Exception:
             if client is not None:
-                _close_client(client)
+                _close_client(client, deadline_at=deadline_at, clock=clock)
             raise ModalSdkFailure("authentication_failed") from None
         self._modal = modal
         self._client = client
+        self._deadline_at = deadline_at
+        self._clock = clock
         self.workspace_name = workspace_name
         self.environment_name = environment_name
 
     def __repr__(self) -> str:
         return "PinnedModalSdk(<request-scoped>)"
+
+    def _read(self, operation: Callable[[], object]) -> object:
+        return _call_read(operation, deadline_at=self._deadline_at, clock=self._clock)
+
+    def _mutate(self, operation: Callable[[], object]) -> object:
+        return _call_mutation(operation, deadline_at=self._deadline_at, clock=self._clock)
 
     def _list_named(
         self,
@@ -239,7 +295,7 @@ class PinnedModalSdk:
         plan: ModalCreatePlan,
         role: Literal["secret", "volume"],
     ) -> tuple[ModalNamedResource, ...]:
-        values = _call_read(
+        values = self._read(
             lambda: manager.list(
                 environment_name=plan.placement.environment,
                 client=self._client,
@@ -250,7 +306,7 @@ class PinnedModalSdk:
         return tuple(_resource(value, role) for value in values)
 
     def _deployed_apps(self, plan: ModalCreatePlan) -> list[object]:
-        values = _call_read(
+        values = self._read(
             lambda: self._modal.experimental.list_deployed_apps(
                 environment_name=plan.placement.environment,
                 client=self._client,
@@ -265,7 +321,7 @@ class PinnedModalSdk:
         containers = getattr(value, "containers", None)
         if type(containers) is not int or containers < 0:
             raise ModalSdkFailure("transport_failed")
-        app = _call_read(
+        app = self._read(
             lambda: self._modal.App.lookup(
                 plan.names.app_or_pod,
                 client=self._client,
@@ -275,12 +331,12 @@ class PinnedModalSdk:
         )
         if _provider_id(getattr(app, "app_id", None), "app") != app_id:
             raise ModalSdkFailure("transport_failed")
-        tags = _call_read(lambda: app.get_tags(client=self._client))
+        tags = self._read(lambda: app.get_tags(client=self._client))
         if type(tags) is not dict or any(
             type(key) is not str or type(item) is not str for key, item in tags.items()
         ):
             raise ModalSdkFailure("transport_failed")
-        objects = _call_read(
+        objects = self._read(
             lambda: self._modal.experimental.get_app_objects(
                 plan.names.app_or_pod,
                 environment_name=plan.placement.environment,
@@ -289,9 +345,9 @@ class PinnedModalSdk:
         )
         if type(objects) is not dict or len(objects) != 1 or plan.function_name not in objects:
             raise ModalSdkFailure("transport_failed")
-        function = _call_read(lambda: objects[plan.function_name].hydrate(self._client))
+        function = self._read(lambda: objects[plan.function_name].hydrate(self._client))
         function_id = _provider_id(getattr(function, "object_id", None), "function")
-        public_url = _call_read(lambda: function.get_web_url())
+        public_url = self._read(lambda: function.get_web_url())
         return ModalAppObservation(
             app_id=app_id,
             app_name=_text(getattr(value, "name", None), "modal app name"),
@@ -305,7 +361,7 @@ class PinnedModalSdk:
 
     def _lifecycle_app(self, plan: ModalCreatePlan, app_id: str) -> ModalAppObservation:
         validated_app_id = _provider_id(app_id, "app")
-        lifecycle = _call_read(
+        lifecycle = self._read(
             lambda: self._modal.experimental.get_app_lifecycle(
                 validated_app_id,
                 client=self._client,
@@ -355,7 +411,7 @@ class PinnedModalSdk:
         key: str,
         value: str,
     ) -> ModalNamedResource:
-        _call_mutation(
+        self._mutate(
             lambda: self._modal.Secret.objects.create(
                 name,
                 {key: value},
@@ -365,7 +421,7 @@ class PinnedModalSdk:
             )
         )
         handle = _post_mutation_read(
-            lambda: _call_read(
+            lambda: self._read(
                 lambda: self._modal.Secret.from_name(
                     name,
                     environment_name=plan.placement.environment,
@@ -388,7 +444,7 @@ class PinnedModalSdk:
         return self._created_secret(plan, plan.names.artifact_secret, "FLASH_ARTIFACT_TOKEN", value)
 
     def create_volume(self, plan: ModalCreatePlan) -> ModalNamedResource:
-        _call_mutation(
+        self._mutate(
             lambda: self._modal.Volume.objects.create(
                 plan.names.volume,
                 allow_existing=False,
@@ -397,7 +453,7 @@ class PinnedModalSdk:
             )
         )
         handle = _post_mutation_read(
-            lambda: _call_read(
+            lambda: self._read(
                 lambda: self._modal.Volume.from_name(
                     plan.names.volume,
                     environment_name=plan.placement.environment,
@@ -465,7 +521,7 @@ class PinnedModalSdk:
             region=plan.placement.region,
             include_source=False,
         )(web_function)
-        deployed = _call_mutation(
+        deployed = self._mutate(
             lambda: app.deploy(
                 name=plan.names.app_or_pod,
                 environment_name=plan.placement.environment,
@@ -493,7 +549,7 @@ class PinnedModalSdk:
             # name mutations can target a newer same-generation deployment after ownership proof.
             # if the pinned generated id rpc is unavailable, decline cleanup as ambiguous instead.
             raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True) from None
-        _call_mutation(lambda: rpc(request))
+        self._mutate(lambda: rpc(request))
 
     def stop_app(self, plan: ModalCreatePlan, app_id: str) -> None:
         validate_modal_plan(plan)
@@ -518,10 +574,15 @@ class PinnedModalSdk:
     def close(self) -> None:
         client = self._client
         self._client = None
-        _close_client(client)
+        _close_client(client, deadline_at=self._deadline_at, clock=self._clock)
 
 
-def create_modal_sdk(credentials: ModalCredentials, plan: ModalCreatePlan) -> ModalSdk:
+def create_modal_sdk(
+    credentials: ModalCredentials,
+    plan: ModalCreatePlan,
+    deadline_at: float,
+    clock: Clock = time.monotonic,
+) -> ModalSdk:
     """construct one request-local pinned modal sdk adapter after plan validation."""
 
-    return PinnedModalSdk(credentials, plan)
+    return PinnedModalSdk(credentials, plan, deadline_at, clock)

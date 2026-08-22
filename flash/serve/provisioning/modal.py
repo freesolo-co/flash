@@ -141,7 +141,7 @@ def provision_modal_deployment(
     created = _CreatedResources()
     reached_ready = False
     try:
-        sdk = open_sdk(sdk_factory, credentials, finalized_plan)
+        sdk = open_sdk(sdk_factory, credentials, finalized_plan, deadline_at, clock)
         observation = observe(finalized_plan, sdk)
         ensure_unique_resources(observation)
         inference_token, artifact_token = runtime_secrets._reveal_for_launch()
@@ -281,7 +281,7 @@ def reconcile_modal_deployment(
     finalized_plan = build_modal_create_plan(bundle, phase="finalized")
     sdk: ModalSdk | None = None
     try:
-        sdk = open_sdk(sdk_factory, credentials, finalized_plan)
+        sdk = open_sdk(sdk_factory, credentials, finalized_plan, deadline_at, clock)
         initial = observe(finalized_plan, sdk)
         ensure_unique_resources(initial)
         if initial.resource_count == 0:
@@ -456,7 +456,7 @@ def teardown_modal_deployment(
     sdk: ModalSdk | None = None
     mutation_attempted = False
     try:
-        sdk = open_sdk(sdk_factory, credentials, plan)
+        sdk = open_sdk(sdk_factory, credentials, plan, deadline_at, clock)
         observation = observe(plan, sdk, app_id_hint=handle.app_id)
         if observation.apps and observation.apps[0].state == "deployed":
             plan = _teardown_plan(finalized_plan, bootstrap_plan, handle, observation)

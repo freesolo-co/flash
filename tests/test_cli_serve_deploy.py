@@ -29,6 +29,27 @@ def _parse(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _required_deploy_argv() -> list[str]:
+    return [
+        "serve",
+        "deploy",
+        "--provider",
+        "modal",
+        "--model",
+        MODEL,
+        "--run",
+        "run1",
+        "--deployment-id",
+        "deployment1",
+        "--image",
+        IMAGE,
+        "--artifact-repo",
+        "Freesolo-Co/artifacts",
+        "--artifact-subfolder",
+        "adapter",
+    ]
+
+
 def _args(**overrides) -> argparse.Namespace:
     base = [
         "serve",
@@ -337,6 +358,46 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     )
     assert cmd_serve_deploy(_args()) == 1
     assert "outcome_unknown" in capsys.readouterr().out
+
+
+def test_identity_reporting_does_not_swallow_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _interrupted(_bundle):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "flash.cli.commands.serve_identity.encode_deployment_identity", _interrupted
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        serve_deploy._report_identity(object())
+
+
+def test_readiness_timeout_names_the_pod_and_points_to_teardown(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from flash.serve.control import DeploymentResult
+
+    def _timed_out(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        ready = _result(bundle)
+        return DeploymentResult.from_spec(
+            bundle.spec,
+            status="failed",
+            handle=ready.handle,
+            error_code="readiness_timeout",
+        )
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setattr("flash.serve.provisioning.runpod.provision_runpod_deployment", _timed_out)
+
+    assert cmd_serve_deploy(_args(provider="runpod")) == 1
+    captured = capsys.readouterr()
+    assert "readiness did not prove within the deadline" in captured.err
+    assert "pod pod1234567890" in captured.err
+    assert "flash serve undeploy" in captured.err
+    assert "outcome could not be confirmed" not in captured.err
 
 
 def test_interrupted_deploy_prints_recovery_identity_without_masking_interrupt(
@@ -708,28 +769,36 @@ def test_a_generation_that_cannot_order_deployments_is_rejected_at_parse(bad: st
 def test_a_positive_generation_is_accepted() -> None:
     # parsed, not set post-hoc: _args assigns attributes after parsing, which would skip the
     # argparse type entirely and pass no matter what the type does.
-    args = _parse(
+    args = _parse([*_required_deploy_argv(), "--lora-rank", "32", "--generation", "3"])
+    assert args.generation == 3
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_a_nonpositive_lora_rank_is_rejected_at_parse(bad: str) -> None:
+    with pytest.raises(SystemExit):
+        _parse([*_required_deploy_argv(), "--lora-rank", bad])
+
+
+@pytest.mark.parametrize("bad", ["-1", "-999"])
+def test_checkpoint_step_zero_is_accepted_but_negatives_are_rejected_at_parse(bad: str) -> None:
+    accepted = _parse(
         [
-            "serve",
-            "deploy",
-            "--provider",
-            "modal",
-            "--model",
-            MODEL,
-            "--run",
-            "run1",
-            "--deployment-id",
-            "deployment1",
-            "--image",
-            IMAGE,
-            "--artifact-repo",
-            "Freesolo-Co/artifacts",
-            "--artifact-subfolder",
-            "adapter",
+            *_required_deploy_argv(),
             "--lora-rank",
             "32",
-            "--generation",
-            "3",
+            "--checkpoint-step",
+            "0",
         ]
     )
-    assert args.generation == 3
+    assert accepted.checkpoint_step == 0
+
+    with pytest.raises(SystemExit):
+        _parse(
+            [
+                *_required_deploy_argv(),
+                "--lora-rank",
+                "32",
+                "--checkpoint-step",
+                bad,
+            ]
+        )

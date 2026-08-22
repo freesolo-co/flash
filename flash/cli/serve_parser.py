@@ -28,17 +28,23 @@ def _positive_finite_seconds(raw: str) -> float:
 
 
 def _positive_int(raw: str) -> int:
-    """Reject a generation that cannot order one deployment after another.
+    """reject a nonpositive integer before deployment input resolution.
 
-    Same reasoning as `_positive_finite_seconds`, one step earlier: a bare `type=int` accepts `0`
-    and negatives, and `_require_positive_int` does not see the value until `DeploymentRequest` is
-    built -- which is after `resolve_adapter` has already resolved and downloaded the Hub inputs.
-    The error it eventually produces is a clean one, so this is wasted work rather than a crash,
-    but a value argparse can reject outright should not cost a Hub round trip first.
+    a bare `type=int` accepts `0` and negatives, while downstream validation runs only after
+    `resolve_adapter` has already resolved and downloaded the hub inputs. argparse can reject these
+    values before they cost a hub round trip.
     """
     value = int(raw)
     if value <= 0:
         raise argparse.ArgumentTypeError(f"must be a positive integer, not {raw!r}")
+    return value
+
+
+def _non_negative_int(raw: str) -> int:
+    """reject an integer below zero while preserving checkpoint step zero."""
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be a non-negative integer, not {raw!r}")
     return value
 
 
@@ -88,10 +94,12 @@ def _add_deployment_arguments(command: argparse.ArgumentParser) -> None:
         default="dataset",
         help="hub repo type holding the adapter (default: dataset, as flash runs publish)",
     )
-    command.add_argument("--lora-rank", type=int, required=True, help="the adapter's lora rank")
+    command.add_argument(
+        "--lora-rank", type=_positive_int, required=True, help="the adapter's lora rank"
+    )
     command.add_argument(
         "--checkpoint-step",
-        type=int,
+        type=_non_negative_int,
         default=None,
         help="serve one saved step instead of the final adapter",
     )

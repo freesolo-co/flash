@@ -15,6 +15,7 @@ tests drive it without a transport.
 from __future__ import annotations
 
 from collections.abc import Callable
+from enum import Enum, auto
 
 from flash.serve.control import DeploymentResult, RunPodProviderHandle
 
@@ -41,6 +42,12 @@ Observe = Callable[[RunPodCreatePlan], RunPodObservation]
 PatchTemplate = Callable[[str, dict[str, object]], None]
 PatchPod = Callable[[str, dict[str, object]], None]
 DeleteSecret = Callable[[str], None]
+
+
+class _Confirmation(Enum):
+    CONFIRMED = auto()
+    TIMED_OUT = auto()
+    AMBIGUOUS = auto()
 
 
 class EndpointProbe:
@@ -127,7 +134,12 @@ def read_only_reconcile(
 ) -> DeploymentResult:
     last_handle: RunPodProviderHandle | None = None
     while True:
-        observation = observe(plan)
+        try:
+            observation = observe(plan)
+        except RunPodTransportFailure:
+            if not sleep_until_poll(deadline_at, clock, sleep):
+                raise
+            continue
         if observation.resource_count == 0:
             return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
         try:
@@ -197,7 +209,7 @@ def confirm_artifact_absence(
     deadline_at: float,
     clock: Clock,
     sleep: Sleeper,
-) -> bool:
+) -> _Confirmation:
     """confirm the artifact is gone *and* the deployment it belonged to is still there.
 
     Checking only the artifact made a vanished deployment indistinguishable from a cleaned-up one:
@@ -209,16 +221,20 @@ def confirm_artifact_absence(
     """
 
     while True:
-        observation = observe(plan)
         try:
+            observation = observe(plan)
             ensure_unique_resources(observation)
             exact_core_resources(plan, observation)
+        except RunPodTransportFailure:
+            if not sleep_until_poll(deadline_at, clock, sleep):
+                return _Confirmation.AMBIGUOUS
+            continue
         except RunPodResourceConflict:
-            return False
+            return _Confirmation.AMBIGUOUS
         if not observation.artifact_secrets:
-            return True
+            return _Confirmation.CONFIRMED
         if not sleep_until_poll(deadline_at, clock, sleep):
-            return False
+            return _Confirmation.TIMED_OUT
 
 
 def _pod_environment_is_stripped(plan: RunPodCreatePlan, pod: RunPodPodObservation) -> bool:
@@ -241,19 +257,23 @@ def _await_stripped_resources(
     probe: EndpointProbe,
     clock: Clock,
     sleep: Sleeper,
-) -> bool:
+) -> _Confirmation:
     """wait until both artifact references are absent and a restarted pod serves again."""
 
     while True:
         try:
             _secret, template, _volume, pod = exact_core_resources(plan, observe(plan))
-        except (RunPodResourceConflict, RunPodTransportFailure):
-            return False
+        except RunPodTransportFailure:
+            if not sleep_until_poll(deadline_at, clock, sleep):
+                return _Confirmation.AMBIGUOUS
+            continue
+        except RunPodResourceConflict:
+            return _Confirmation.AMBIGUOUS
         # a successful patch response is not proof that the next read still names the resources we
         # patched. deterministic names can be reused after replacement, so ids bind cleanup to the
         # exact template and pod whose artifact reference was present before the transition.
         if template.id != template_id or pod.id != pod_id:
-            return False
+            return _Confirmation.AMBIGUOUS
         resources_are_stripped = (
             template.environment == plan.environment_without_artifact
             and _pod_environment_is_stripped(plan, pod)
@@ -272,9 +292,19 @@ def _await_stripped_resources(
                 )
             )
         ):
-            return True
+            return _Confirmation.CONFIRMED
         if not sleep_until_poll(deadline_at, clock, sleep):
-            return False
+            return _Confirmation.TIMED_OUT
+
+
+def _unconfirmed_cleanup_result(
+    plan: RunPodCreatePlan,
+    confirmation: _Confirmation,
+    handle: RunPodProviderHandle,
+) -> DeploymentResult:
+    if confirmation is _Confirmation.TIMED_OUT:
+        return failure_result(plan, LifecycleFailure("readiness_timeout"), handle=handle)
+    return unknown_result(plan, handle=handle)
 
 
 def delete_artifact_and_confirm(
@@ -295,10 +325,16 @@ def delete_artifact_and_confirm(
     # the template and live pod must stop referring to the one-shot secret before it is deleted.
     # the stored value is only a named secret reference, not the credential itself, but observing
     # both stripped environments proves no dangling artifact entry remains on a later restart.
-    try:
-        _secret, template, _volume, pod = exact_core_resources(plan, observe(plan))
-    except (RunPodResourceConflict, RunPodTransportFailure):
-        return unknown_result(plan, handle=handle)
+    while True:
+        try:
+            _secret, template, _volume, pod = exact_core_resources(plan, observe(plan))
+        except RunPodTransportFailure:
+            if not sleep_until_poll(deadline_at, clock, sleep):
+                return unknown_result(plan, handle=handle)
+            continue
+        except RunPodResourceConflict:
+            return unknown_result(plan, handle=handle)
+        break
     needs_template_patch = template.environment != plan.environment_without_artifact
     needs_pod_patch = not _pod_environment_is_stripped(plan, pod)
     if needs_template_patch or needs_pod_patch:
@@ -315,7 +351,7 @@ def delete_artifact_and_confirm(
         # the endpoint probe authenticates with the inference token, not the artifact token. prove
         # the restarted workload before deleting the artifact secret so an unproven transition
         # remains recoverable, while the stripped references prevent the restarted pod using it.
-        if not _await_stripped_resources(
+        confirmation = _await_stripped_resources(
             plan,
             observe,
             template.id,
@@ -327,24 +363,22 @@ def delete_artifact_and_confirm(
             probe=probe,
             clock=clock,
             sleep=sleep,
-        ):
-            return unknown_result(plan, handle=handle)
+        )
+        if confirmation is not _Confirmation.CONFIRMED:
+            return _unconfirmed_cleanup_result(plan, confirmation, handle)
     try:
         delete_secret(artifact.id)
     except RunPodTransportFailure:
         return unknown_result(plan, handle=handle)
-    try:
-        absent = confirm_artifact_absence(
-            plan,
-            observe,
-            deadline_at=deadline_at,
-            clock=clock,
-            sleep=sleep,
-        )
-    except RunPodTransportFailure:
-        return unknown_result(plan, handle=handle)
-    if not absent:
-        return unknown_result(plan, handle=handle)
+    confirmation = confirm_artifact_absence(
+        plan,
+        observe,
+        deadline_at=deadline_at,
+        clock=clock,
+        sleep=sleep,
+    )
+    if confirmation is not _Confirmation.CONFIRMED:
+        return _unconfirmed_cleanup_result(plan, confirmation, handle)
     return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
 
 

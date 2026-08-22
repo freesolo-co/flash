@@ -59,11 +59,13 @@ class AdapterLookup:
             self._last_reload["fetched_at"] = fetch_started
             self._last_reload["at"] = time.monotonic()
 
-    async def _reload_safe(self) -> None:
+    async def _reload_safe(self) -> bool:
         try:
             await self.reload()
-        except Exception as exc:  # background refresh cannot fail a cached hit
-            print(f"adapter background refresh skipped: {exc!r}", flush=True)
+        except Exception as exc:  # a refresh cannot fail a cached hit
+            print(f"adapter refresh skipped: {exc!r}", flush=True)
+            return False
+        return True
 
     def _schedule_reload(self) -> None:
         task = self._last_reload.get("task")
@@ -80,8 +82,12 @@ class AdapterLookup:
         resolved = self._router.resolve(adapter_id)
         stale = resolved is not None and self._is_stale()
         if stale and self._reload_records is not None:
-            self._schedule_reload()
-        if resolved is None and self._reload_records is not None:
+            if resolved[0].is_alias:
+                if await self._reload_safe():
+                    resolved = self._router.resolve(adapter_id)
+            else:
+                self._schedule_reload()
+        elif resolved is None and self._reload_records is not None:
             await self.reload()
             resolved = self._router.resolve(adapter_id)
         if resolved is None:

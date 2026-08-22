@@ -890,3 +890,34 @@ def test_a_shard_lost_after_hydration_is_not_reported_as_cached(tmp_path: Path) 
     served.unlink()
 
     assert not base_weights_are_cached(manifest, cache, snapshot_download_fn=offline)
+
+
+def test_same_length_shard_corruption_is_not_reported_as_cached(tmp_path: Path) -> None:
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    cache = tmp_path / "cache"
+    files = {"config.json": b"{}", "model-00001.safetensors": b"x" * 64}
+
+    hydrate_base_weights(
+        manifest,
+        cache,
+        token_fd=_token_fd(),
+        snapshot_download_fn=_materializing_stub([], files),
+    )
+
+    def offline(**kwargs):
+        return str(Path(kwargs["cache_dir"]) / "snapshot" / kwargs["repo_id"].replace("/", "--"))
+
+    assert base_weights_are_cached(manifest, cache, snapshot_download_fn=offline)
+
+    served = (
+        base_weights_cache_path(cache)
+        / "snapshot"
+        / "flash-owned--served-checkpoint"
+        / "model-00001.safetensors"
+    )
+    original_size = served.stat().st_size
+    served.write_bytes(b"y" * original_size)
+    assert served.stat().st_size == original_size
+
+    assert not base_weights_are_cached(manifest, cache, snapshot_download_fn=offline)

@@ -105,7 +105,17 @@ def _report(result, bundle) -> int:
         return 0
     if result.error_code:
         print(f"error       {result.error_code}", file=sys.stderr)
-    if result.status == "outcome_unknown":
+    if (
+        result.error_code == "readiness_timeout"
+        and handle is not None
+        and handle.provider == "runpod"
+    ):
+        print(
+            f"\nreadiness did not prove within the deadline for pod {handle.pod_id}. run `flash serve "
+            "undeploy` to tear it down and stop billing before retrying.",
+            file=sys.stderr,
+        )
+    elif result.status == "outcome_unknown":
         # the provider may or may not hold live resources. saying "failed" here would invite a
         # retry that double-provisions and bills twice.
         print(
@@ -124,7 +134,7 @@ def _report_identity(bundle) -> None:
         from flash.cli.commands.serve_identity import encode_deployment_identity
 
         print(f"identity    {encode_deployment_identity(bundle)}")
-    except BaseException:
+    except Exception:
         return
 
 

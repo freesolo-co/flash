@@ -63,6 +63,18 @@ def test_unparseable_string_is_an_error():
         normalize_structured_outputs("not json {")
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        '{"type": "number", "minimum": NaN}',
+        {"json": '{"type": "number", "minimum": Infinity}'},
+    ],
+)
+def test_json_strings_reject_non_finite_constants(value):
+    with pytest.raises(StructuredOutputsError, match="json does not define"):
+        normalize_structured_outputs(value)
+
+
 @pytest.mark.parametrize("s", ["[1, 2]", "42", "null", '"json-ish"'])
 def test_json_string_must_decode_to_an_object(s):
     with pytest.raises(StructuredOutputsError, match="decode to an object"):

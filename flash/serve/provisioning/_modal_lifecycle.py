@@ -44,6 +44,8 @@ def open_sdk(
     factory: ModalSdkFactory,
     credentials: ModalCredentials,
     plan: ModalCreatePlan,
+    deadline_at: float,
+    clock: Clock,
 ) -> ModalSdk:
     """open one sdk proven to be pointed at the workspace and environment the plan names.
 
@@ -52,7 +54,7 @@ def open_sdk(
     """
 
     try:
-        sdk = factory(credentials, plan)
+        sdk = factory(credentials, plan, deadline_at, clock)
     except ModalSdkFailure:
         raise
     except Exception:

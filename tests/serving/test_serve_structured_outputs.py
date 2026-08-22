@@ -228,7 +228,10 @@ def _engine(
 
 def _generate(eng: Any, **payload_extra: Any) -> Any:
     """Run _generate and return the SamplingParams the (fake) vLLM engine received."""
-    payload = {"adapter_id": "r1", "prompt": "hi", **payload_extra}
+    payload = {"adapter_id": "r1"}
+    if "messages" not in payload_extra:
+        payload["prompt"] = "hi"
+    payload.update(payload_extra)
     result = asyncio.run(eng._generate(payload))
     assert result["ok"] is True
     return eng.engine.sampling_params[-1]
@@ -407,7 +410,7 @@ def test_thinking_constraint_rejects_empty_messages_before_vllm(
             return await anext(eng._stream_generate(payload))
         return await eng._generate(payload)
 
-    with pytest.raises(ValueError, match="require messages"):
+    with pytest.raises(ValueError, match="exactly one nonempty prompt or messages"):
         asyncio.run(run_request())
     assert eng.engine.sampling_params == []
 

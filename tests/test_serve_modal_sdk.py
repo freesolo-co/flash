@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 from dataclasses import replace
@@ -12,7 +13,13 @@ import pytest
 
 from flash.serve.control import ModalCredentials
 from flash.serve.provisioning._modal_plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
-from flash.serve.provisioning._modal_sdk import ModalSdkFailure, PinnedModalSdk
+from flash.serve.provisioning._modal_sdk import (
+    ModalSdkFailure,
+    PinnedModalSdk,
+    _call_mutation,
+    _call_read,
+    _sync_value,
+)
 from flash.serve.provisioning._modal_wrapper import launch_modal_server
 from tests.test_serve_provisioning_modal import (
     APP_ID,
@@ -29,6 +36,51 @@ from tests.test_serve_provisioning_modal import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+async def _never_resolves() -> None:
+    await asyncio.Event().wait()
+
+
+async def _fast_value() -> str:
+    return "fast-modal-result"
+
+
+def test_modal_awaitable_is_abandoned_when_the_deadline_is_exhausted() -> None:
+    try:
+        _sync_value(_never_resolves(), deadline_at=10.0, clock=lambda: 10.0)
+    except TimeoutError:
+        pass
+    else:
+        pytest.fail("a never-resolving modal call outlived its deadline")
+
+
+def test_modal_mutation_timeout_is_ambiguous() -> None:
+    with pytest.raises(ModalSdkFailure) as exc_info:
+        _call_mutation(_never_resolves, deadline_at=10.0, clock=lambda: 10.0)
+    assert exc_info.value.code == "resource_ambiguous", (
+        "a timed-out mutation was treated as a definite failure"
+    )
+    assert exc_info.value.outcome_unknown is True, (
+        "a timed-out mutation lost its unknown provider outcome"
+    )
+
+
+def test_modal_read_timeout_is_a_definite_transport_failure() -> None:
+    with pytest.raises(ModalSdkFailure) as exc_info:
+        _call_read(_never_resolves, deadline_at=10.0, clock=lambda: 10.0)
+    assert exc_info.value.code == "transport_failed", (
+        "a timed-out read was treated as an ambiguous mutation"
+    )
+    assert exc_info.value.outcome_unknown is False, (
+        "a timed-out read incorrectly claimed provider state may have changed"
+    )
+
+
+def test_fast_modal_awaitable_is_unaffected_by_the_deadline() -> None:
+    result = _sync_value(_fast_value(), deadline_at=10.0, clock=lambda: 0.0)
+
+    assert result == "fast-modal-result", "a fast modal call was rejected before its deadline"
 
 
 class _NamedHandle:
@@ -479,6 +531,8 @@ def _sdk(plan, modal: _ModalModule) -> PinnedModalSdk:
     return PinnedModalSdk(
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         plan,
+        60.0,
+        lambda: 0.0,
         module_loader=lambda: modal,
     )
 

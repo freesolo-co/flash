@@ -496,6 +496,181 @@ class _AmbiguousAbortDeleteTransport(_FakeTransport):
         super()._delete(path)
 
 
+class _IgnoredPostReadyPodPatchTransport(_FakeTransport):
+    def rest(
+        self,
+        method,
+        path,
+        payload,
+        *,
+        mutation: bool,
+        deadline_at: float,
+        query=None,
+    ):
+        if method == "PATCH" and path == f"/pods/{POD_ID}":
+            original = dict(self.pods[0])
+            response = super().rest(
+                method,
+                path,
+                payload,
+                mutation=mutation,
+                deadline_at=deadline_at,
+                query=query,
+            )
+            self.pods[0] = original
+            return response
+        return super().rest(
+            method,
+            path,
+            payload,
+            mutation=mutation,
+            deadline_at=deadline_at,
+            query=query,
+        )
+
+
+class _PostReadyObservationFailureTransport(_FakeTransport):
+    def __init__(self, failures: int | None = None) -> None:
+        super().__init__()
+        self.fail_observation = False
+        self.failures = failures
+
+    def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
+        if self.fail_observation and not mutation:
+            if self.failures is None:
+                raise RunPodTransportFailure("transport_failed")
+            if self.failures > 0:
+                self.failures -= 1
+                raise RunPodTransportFailure("transport_failed")
+        return super().graphql(
+            document,
+            variables,
+            mutation=mutation,
+            deadline_at=deadline_at,
+        )
+
+    def rest(
+        self,
+        method,
+        path,
+        payload,
+        *,
+        mutation: bool,
+        deadline_at: float,
+        query=None,
+    ):
+        response = super().rest(
+            method,
+            path,
+            payload,
+            mutation=mutation,
+            deadline_at=deadline_at,
+            query=query,
+        )
+        if method == "PATCH" and path == f"/pods/{POD_ID}":
+            self.fail_observation = True
+        return response
+
+
+class _PostReadyIdentityDriftTransport(_FakeTransport):
+    def rest(
+        self,
+        method,
+        path,
+        payload,
+        *,
+        mutation: bool,
+        deadline_at: float,
+        query=None,
+    ):
+        response = super().rest(
+            method,
+            path,
+            payload,
+            mutation=mutation,
+            deadline_at=deadline_at,
+            query=query,
+        )
+        if method == "PATCH" and path == f"/pods/{POD_ID}":
+            self.templates[0]["id"] = "template02"
+            self.pods[0]["templateId"] = "template02"
+        return response
+
+
+class _PostReadyResourceConflictTransport(_FakeTransport):
+    def rest(
+        self,
+        method,
+        path,
+        payload,
+        *,
+        mutation: bool,
+        deadline_at: float,
+        query=None,
+    ):
+        response = super().rest(
+            method,
+            path,
+            payload,
+            mutation=mutation,
+            deadline_at=deadline_at,
+            query=query,
+        )
+        if method == "PATCH" and path == f"/pods/{POD_ID}":
+            self.pods.append(dict(self.pods[0]))
+        return response
+
+
+class _PostDeleteObservationFailureTransport(_FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_observation = False
+
+    def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
+        if self.fail_observation and not mutation:
+            raise RunPodTransportFailure("transport_failed")
+        response = super().graphql(
+            document,
+            variables,
+            mutation=mutation,
+            deadline_at=deadline_at,
+        )
+        if mutation and "secretDelete" in document:
+            self.fail_observation = True
+        return response
+
+
+class _PostDeleteResourceConflictTransport(_FakeTransport):
+    def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
+        response = super().graphql(
+            document,
+            variables,
+            mutation=mutation,
+            deadline_at=deadline_at,
+        )
+        if mutation and "secretDelete" in document:
+            self.pods.append(dict(self.pods[0]))
+        return response
+
+
+class _PersistentArtifactAfterDeleteTransport(_FakeTransport):
+    def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
+        response = super().graphql(
+            document,
+            variables,
+            mutation=mutation,
+            deadline_at=deadline_at,
+        )
+        if mutation and "secretDelete" in document:
+            self.secrets.append(
+                {
+                    "id": variables["id"],
+                    "name": _names(_bundle()).artifact_secret,
+                }
+            )
+        return response
+
+
 def _seed_exact(
     transport: _FakeTransport,
     bundle: DeploymentBundle,
@@ -1198,7 +1373,8 @@ def test_artifact_secret_survives_until_a_patched_pod_is_running_again() -> None
         sleep=transport.clock.sleep,
     )
 
-    assert result.status == "outcome_unknown"
+    assert result.status == "failed"
+    assert result.error_code == "readiness_timeout"
     assert result.handle == handle
     assert [call[1] for call in _mutation_calls(transport)] == [
         "PATCH /templates/template01",
@@ -1228,9 +1404,10 @@ def test_patched_running_pod_is_not_ready_until_its_endpoint_serves_again() -> N
     )
 
     assert transport.pods[0]["desiredStatus"] == "RUNNING"
-    assert result.status == "outcome_unknown", (
+    assert result.status == "failed", (
         "desiredStatus RUNNING was accepted without post-restart endpoint proof"
     )
+    assert result.error_code == "readiness_timeout"
     assert result.handle == handle
     assert len(probe.calls) == 2, "the endpoint was not re-probed after the pod patch"
     assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
@@ -1259,28 +1436,83 @@ def test_patched_pod_is_ready_after_its_endpoint_serves_again() -> None:
     assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
 
 
-def test_post_restart_probe_stops_at_the_deadline_when_endpoint_never_serves() -> None:
+def test_initial_readiness_transient_observation_failure_uses_the_remaining_budget() -> None:
     bundle = _bundle()
-    transport = _FakeTransport()
-    handle = _seed_exact(transport, bundle, artifact_secret=True)
-    probe = _SequenceProbe(True, False)
+    transport = _PostReadyObservationFailureTransport(failures=1)
 
-    result = provision_runpod_deployment(
+    class _FailOneReadWhileLoading(_SequenceProbe):
+        def __call__(self, url, token, probed_bundle, timeout_seconds):
+            accepted = super().__call__(url, token, probed_bundle, timeout_seconds)
+            if len(self.calls) == 1:
+                transport.fail_observation = True
+            return accepted
+
+    result, _factory, probe = _provision(
         bundle,
-        RunPodCredentials(PROVIDER_SECRET),
-        ServingRuntimeSecrets(INFERENCE_SECRET),
-        deadline_at=5.0,
-        transport_factory=_Factory(transport),
-        probe=probe,
-        clock=transport.clock,
-        sleep=transport.clock.sleep,
+        transport,
+        probe=_FailOneReadWhileLoading(False, True),
     )
 
-    assert result.status == "outcome_unknown"
-    assert result.handle == handle
-    assert transport.clock.now == 5.0, "the post-restart wait exceeded its deadline"
-    assert len(probe.calls) == 4, "the bounded poll count changed or the wait did not terminate"
-    assert all(call[3] <= 5.0 - index * 2.0 for index, call in enumerate(probe.calls[1:]))
+    assert result.status == "ready"
+    assert result.handle is not None
+    assert result.handle.pod_id == POD_ID
+    assert transport.clock.now == 4.0, "a transient readiness read did not retry"
+    assert len(probe.calls) == 3
+
+
+def test_post_ready_cleanup_deadline_is_definite_without_weakening_ambiguity() -> None:
+    bundle = _bundle()
+    transport = _IgnoredPostReadyPodPatchTransport()
+    result, _factory, probe = _provision(bundle, transport, probe=_Probe(True))
+
+    assert result.status == "failed"
+    assert result.error_code == "readiness_timeout"
+    assert result.handle is not None
+    assert result.handle.pod_id == POD_ID
+    assert transport.clock.now == 70.0, "the post-ready wait exceeded its work deadline"
+    assert len(probe.calls) == 1, "an unstripped pod must not be endpoint-probed"
+    assert transport.pods, "a tracked ready pod must remain available for explicit teardown"
+    assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
+
+    for ambiguous_transport in (
+        _PostReadyObservationFailureTransport(),
+        _PostReadyResourceConflictTransport(),
+        _PostReadyIdentityDriftTransport(),
+        _PostDeleteObservationFailureTransport(),
+        _PostDeleteResourceConflictTransport(),
+    ):
+        ambiguous, _factory, _probe = _provision(bundle, ambiguous_transport)
+        assert ambiguous.status == "outcome_unknown"
+        assert ambiguous.error_code == "resource_ambiguous"
+        assert ambiguous.handle is not None
+        assert ambiguous.handle.pod_id == POD_ID
+
+
+def test_post_ready_transient_observation_failure_uses_the_remaining_budget() -> None:
+    bundle = _bundle()
+    transport = _PostReadyObservationFailureTransport(failures=1)
+
+    result, _factory, _probe = _provision(bundle, transport, probe=_Probe(True))
+
+    assert result.status == "ready"
+    assert result.handle is not None
+    assert result.handle.pod_id == POD_ID
+    assert transport.clock.now == 2.0, "a transient read did not retry on the next poll"
+    assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
+
+
+def test_artifact_absence_deadline_is_definite_and_keeps_the_handle() -> None:
+    bundle = _bundle()
+    transport = _PersistentArtifactAfterDeleteTransport()
+
+    result, _factory, _probe = _provision(bundle, transport, probe=_Probe(True))
+
+    assert result.status == "failed"
+    assert result.error_code == "readiness_timeout"
+    assert result.handle is not None
+    assert result.handle.pod_id == POD_ID
+    assert transport.clock.now == 70.0, "artifact confirmation exceeded its work deadline"
+    assert transport.pods, "the observable pod must remain available for explicit teardown"
     assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
 
 
@@ -1469,7 +1701,8 @@ def test_artifact_secret_survives_if_template_reference_returns_during_pod_patch
         sleep=transport.clock.sleep,
     )
 
-    assert result.status == "outcome_unknown"
+    assert result.status == "failed"
+    assert result.error_code == "readiness_timeout"
     assert "FLASH_ARTIFACT_TOKEN" in transport.templates[0]["env"]
     assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
     assert [call[1] for call in _mutation_calls(transport)] == [
@@ -1533,10 +1766,11 @@ def test_artifact_secret_survives_until_the_template_patch_is_observed() -> None
         [call[1] for call in _mutation_calls(transport)],
         [item["name"] for item in transport.secrets],
     ) == (
-        "outcome_unknown",
+        "failed",
         ["PATCH /templates/template01", f"PATCH /pods/{POD_ID}"],
         [_names(bundle).inference_secret, _names(bundle).artifact_secret],
     )
+    assert result.error_code == "readiness_timeout"
 
 
 def test_artifact_secret_survives_until_the_pod_patch_is_observed() -> None:
@@ -1597,10 +1831,11 @@ def test_artifact_secret_survives_until_the_pod_patch_is_observed() -> None:
         [call[1] for call in _mutation_calls(transport)],
         [item["name"] for item in transport.secrets],
     ) == (
-        "outcome_unknown",
+        "failed",
         ["PATCH /templates/template01", f"PATCH /pods/{POD_ID}"],
         [_names(bundle).inference_secret, _names(bundle).artifact_secret],
     )
+    assert result.error_code == "readiness_timeout"
 
 
 def test_artifact_cleanup_does_not_patch_a_template_that_drifted_after_readiness() -> None:

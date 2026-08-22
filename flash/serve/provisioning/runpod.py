@@ -641,6 +641,8 @@ def provision_runpod_deployment(
         )
         if ready.status == "ready":
             return ready
+        if ready.error_code == "readiness_timeout":
+            return ready
         if ready.status == "failed":
             return _failure_after_create_attempt(
                 plan,

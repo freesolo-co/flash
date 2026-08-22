@@ -301,7 +301,13 @@ class _Factory:
         # reimplementing the factory's credential assertions.
         self.sdk_class: type[_FakeSdk] = _FakeSdk
 
-    def __call__(self, credentials: ModalCredentials, plan) -> _FakeSdk:
+    def __call__(
+        self,
+        credentials: ModalCredentials,
+        plan,
+        _deadline_at: float,
+        _clock,
+    ) -> _FakeSdk:
         token_id, token_secret = credentials.reveal()
         self.calls.append((token_id == PROVIDER_ID, token_secret == PROVIDER_SECRET))
         sdk = self.sdk_class(plan)
@@ -568,7 +574,7 @@ def test_adoption_waits_out_a_cold_container_instead_of_probing_once() -> None:
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=600.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=probe,
         clock=clock,
         sleep=clock.sleep,
@@ -602,7 +608,7 @@ def test_adoption_of_an_uncleaned_deployment_probes_instead_of_burning_the_deadl
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=probe,
         clock=clock,
         sleep=clock.sleep,
@@ -653,7 +659,7 @@ def test_adoption_of_a_cold_bootstrap_app_waits_instead_of_probing_once() -> Non
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
         deadline_at=600.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=probe,
         clock=clock,
         sleep=clock.sleep,
@@ -830,7 +836,7 @@ def test_adoption_keeps_the_artifact_when_readiness_is_never_proven() -> None:
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(False),
         clock=clock,
         sleep=clock.sleep,
@@ -892,7 +898,7 @@ def test_adoption_tolerates_a_concurrent_artifact_reclaim_while_waiting() -> Non
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=600.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=probe,
         clock=clock,
         sleep=clock.sleep,
@@ -911,7 +917,7 @@ def test_exact_adoption_requires_authenticated_endpoint_provenance() -> None:
     sdk = _FakeSdk(plan)
     handle = _seed_exact(sdk)
 
-    def seeded_factory(credentials, received_plan):
+    def seeded_factory(credentials, received_plan, _deadline_at, _clock):
         assert received_plan == plan
         return sdk
 
@@ -959,7 +965,7 @@ def test_existing_bootstrap_is_finalized_by_the_sole_retry() -> None:
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=clock,
         sleep=clock.sleep,
@@ -995,7 +1001,7 @@ def test_adoption_accepts_a_pinned_concurrent_finalized_successor(artifact_prese
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=clock,
         sleep=clock.sleep,
@@ -1070,7 +1076,7 @@ def test_adoption_tolerates_the_artifact_flickering_back_in_a_cleaned_wait() -> 
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
         deadline_at=600.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=probe,
         clock=clock,
         sleep=clock.sleep,
@@ -1107,7 +1113,7 @@ def test_adoption_rejects_identity_drift_during_a_concurrent_transition() -> Non
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=clock,
         sleep=clock.sleep,
@@ -1130,7 +1136,7 @@ def test_opaque_secret_or_name_only_resources_are_refused_without_mutation() -> 
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=_Clock(),
         sleep=lambda _seconds: None,
@@ -1171,7 +1177,7 @@ def test_duplicate_and_mismatched_resources_fail_closed(mutate) -> None:
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=_Clock(),
         sleep=lambda _seconds: None,
@@ -1202,8 +1208,8 @@ def test_ambiguous_high_level_mutation_is_called_once_and_never_retried() -> Non
     bundle = _bundle()
     factory = _Factory()
 
-    def failing_factory(credentials, plan):
-        sdk = factory(credentials, plan)
+    def failing_factory(credentials, plan, _deadline_at, _clock):
+        sdk = factory(credentials, plan, _deadline_at, _clock)
         sdk.fail_operation = "create_volume"
         return sdk
 
@@ -1241,7 +1247,7 @@ def test_reconcile_is_read_only_for_ready_absent_and_lingering_artifact() -> Non
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=clock,
         sleep=clock.sleep,
@@ -1258,7 +1264,7 @@ def test_reconcile_is_read_only_for_ready_absent_and_lingering_artifact() -> Non
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=4.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=clock,
         sleep=clock.sleep,
@@ -1278,7 +1284,7 @@ def test_reconcile_is_read_only_for_ready_absent_and_lingering_artifact() -> Non
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=clock,
         sleep=clock.sleep,
@@ -1291,8 +1297,8 @@ def test_artifact_cleanup_ambiguity_keeps_handle_and_never_retries() -> None:
     bundle = _bundle()
     factory = _Factory()
 
-    def failing_factory(credentials, plan):
-        sdk = factory(credentials, plan)
+    def failing_factory(credentials, plan, _deadline_at, _clock):
+        sdk = factory(credentials, plan, _deadline_at, _clock)
         sdk.fail_operation = "delete_artifact"
         sdk.fail_with_sdk = True
         return sdk
@@ -1319,8 +1325,8 @@ def test_finalization_ambiguity_is_reconciled_read_only_without_artifact_deletio
     bundle = _bundle()
     factory = _Factory()
 
-    def failing_factory(credentials, plan):
-        sdk = factory(credentials, plan)
+    def failing_factory(credentials, plan, _deadline_at, _clock):
+        sdk = factory(credentials, plan, _deadline_at, _clock)
         sdk.fail_operation = "deploy_finalized"
         sdk.fail_with_sdk = True
         return sdk
@@ -1354,7 +1360,7 @@ def test_post_cleanup_core_resource_drift_is_outcome_unknown() -> None:
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=_Clock(),
         sleep=lambda _seconds: None,
@@ -1367,8 +1373,8 @@ def test_teardown_stops_bootstrap_app_and_deletes_every_attached_resource() -> N
     bundle = _bundle()
     factory = _Factory()
 
-    def failing_factory(credentials, plan):
-        sdk = factory(credentials, plan)
+    def failing_factory(credentials, plan, _deadline_at, _clock):
+        sdk = factory(credentials, plan, _deadline_at, _clock)
         sdk.fail_operation = "deploy_finalized"
         sdk.fail_with_sdk = True
         return sdk
@@ -1388,7 +1394,7 @@ def test_teardown_stops_bootstrap_app_and_deletes_every_attached_resource() -> N
         provisioned.handle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         clock=clock,
         sleep=clock.sleep,
     )
@@ -1418,7 +1424,7 @@ def test_teardown_stops_before_secret_and_volume_deletion_then_confirms_absence(
         handle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         clock=clock,
         sleep=clock.sleep,
     )
@@ -1443,7 +1449,7 @@ def test_teardown_stops_before_secret_and_volume_deletion_then_confirms_absence(
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=4.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=clock,
         sleep=clock.sleep,
@@ -1459,7 +1465,7 @@ def test_teardown_stops_before_secret_and_volume_deletion_then_confirms_absence(
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),
         clock=clock,
         sleep=clock.sleep,
@@ -1491,6 +1497,9 @@ def test_teardown_deletes_resources_after_lifecycle_only_stopped_app_observation
             assert client is self._client
             return SimpleNamespace(stopped_at=object())
 
+        def _read(self, operation):
+            return operation()
+
         def stop_app(self, received_plan, app_id: str) -> None:
             self.calls.append(("stop_app", None))
             self._fail("stop_app")
@@ -1519,7 +1528,7 @@ def test_teardown_deletes_resources_after_lifecycle_only_stopped_app_observation
         handle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         clock=clock,
         sleep=clock.sleep,
     )
@@ -1549,7 +1558,7 @@ def test_teardown_post_stop_observation_failure_is_outcome_unknown() -> None:
         handle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         clock=_Clock(),
         sleep=lambda _seconds: None,
     )
@@ -1586,7 +1595,7 @@ def test_teardown_never_deletes_resources_without_explicit_terminal_app_proof() 
         handle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         deadline_at=4.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         clock=clock,
         sleep=clock.sleep,
     )
@@ -1602,7 +1611,7 @@ def test_teardown_never_deletes_resources_without_explicit_terminal_app_proof() 
         handle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         clock=_Clock(),
         sleep=lambda _seconds: None,
     )
@@ -1636,7 +1645,7 @@ def test_teardown_accepts_terminal_app_with_retained_finalized_tags() -> None:
         handle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         clock=_Clock(),
         sleep=lambda _seconds: None,
     )
@@ -1678,7 +1687,7 @@ def test_teardown_accepts_terminal_zero_container_app_states_without_second_stop
         handle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
         deadline_at=100.0,
-        sdk_factory=lambda _credentials, _plan: sdk,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         clock=_Clock(),
         sleep=lambda _seconds: None,
     )
@@ -1693,7 +1702,7 @@ def test_teardown_wrong_generation_handle_fails_before_client_construction() -> 
     handle = _seed_exact(sdk)
     calls = 0
 
-    def factory(_credentials, _plan):
+    def factory(_credentials, _plan, _deadline_at, _clock):
         nonlocal calls
         calls += 1
         return sdk
@@ -1715,8 +1724,8 @@ def test_provider_error_reprs_and_results_never_leak_credential_sentinels() -> N
     bundle = _bundle()
     factory = _Factory()
 
-    def failing_factory(credentials, plan):
-        sdk = factory(credentials, plan)
+    def failing_factory(credentials, plan, _deadline_at, _clock):
+        sdk = factory(credentials, plan, _deadline_at, _clock)
         sdk.fail_operation = "deploy_finalized"
         return sdk
 
@@ -2170,7 +2179,7 @@ def test_provision_succeeds_after_abort_reclaims_the_delayed_volume() -> None:
     plan = build_modal_create_plan(bundle)
     sdk = _DelayedAbortSdk(plan)
 
-    def factory(credentials, received_plan):
+    def factory(credentials, received_plan, _deadline_at, _clock):
         assert credentials.reveal() == (PROVIDER_ID, PROVIDER_SECRET)
         assert received_plan.names == plan.names
         return sdk

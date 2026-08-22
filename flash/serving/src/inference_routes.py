@@ -111,6 +111,9 @@ def _openai_model_id(payload: dict[str, Any]) -> str:
 async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     context = ServingContext.of(request)
     adapter_id = _openai_model_id(payload)
+    stream = payload.get("stream", False)
+    if type(stream) is not bool:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "stream must be a boolean")
     caller_org = await context.authorize_inference(request, adapter_id)
     requested, target = await context.lookup.resolve(adapter_id)
     try:
@@ -124,7 +127,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     include_usage = openai_include_usage(payload)
-    if payload.get("stream") is True:
+    if stream:
         return await _stream_chat_completion(
             context,
             request,

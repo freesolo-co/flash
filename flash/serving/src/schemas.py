@@ -445,6 +445,18 @@ class GenerateRequest(BaseModel):
         # normalizer's message intact — no manual re-raise needed.
         return normalize_structured_outputs(value)
 
+    @model_validator(mode="after")
+    def validate_prompt_source(self) -> GenerateRequest:
+        # an omitted source and a present-but-empty source are both "no source": messages=[]
+        # must fail here rather than reaching the engine as a zero-turn conversation.
+        invalid_prompt = self.prompt is not None and not self.prompt.strip()
+        invalid_messages = self.messages is not None and not self.messages
+        has_prompt = self.prompt is not None
+        has_messages = self.messages is not None
+        if invalid_prompt or invalid_messages or has_prompt == has_messages:
+            raise ValueError("exactly one nonempty prompt or messages source is required")
+        return self
+
     @field_validator("adapter_id")
     @classmethod
     def strip_adapter_id(cls, value: str) -> str:

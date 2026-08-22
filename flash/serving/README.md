@@ -157,7 +157,7 @@ max_lora_rank`, regardless of how many adapters load. Both are linear levers. **
   limit equals `MAX_CPU_LORAS`.
 
 > The base model is no longer a single app-wide setting — it comes from each adapter's
-> `baseModel`, and Modal provisions a GPU per distinct value. `HOSTING_BASE_MODEL` is
+> `base_model`, and Modal provisions a GPU per distinct value. `HOSTING_BASE_MODEL` is
 > unused in the multi-base-model app.
 
 ### GPU tiers
@@ -215,18 +215,18 @@ The one-off quantization job that produced them is not kept in this repo.
 
 ## Endpoints
 
-- `GET /healthz` — `{ok, baseModels: [...], unsupportedBaseModels?: [...], gpus: <count>, gpuByModel: {base: tier}, gpuTiers: [...], adapters: <count>}` (`gpu*` fields cover supported catalog base models; unsupported hydrated models are listed separately)
+- `GET /healthz` — `{ok, base_models: [...], unsupported_base_models?: [...], gpus: <count>, gpu_by_model: {base: tier}, gpu_tiers: [...], adapters: <count>}` (`gpu*` fields cover supported catalog base models; unsupported hydrated models are listed separately)
 - `GET /adapters`
-- `POST /adapters` with `X-Freesolo-Internal-Key`, a cataloged `baseModel`, and required boolean `thinking` (optional `structuredOutputs` default — see below)
-- `POST /generate` with `adapterId`
-- `POST /adapters/{adapterId}/generate`
+- `POST /adapters` with `X-Freesolo-Internal-Key`, a cataloged `base_model`, and required boolean `thinking` (optional `structured_outputs` default — see below)
+- `POST /generate` with `adapter_id`
+- `POST /adapters/{adapter_id}/generate`
 - `POST /v1/chat/completions` where `model` is the adapter id
 
 ### Checkpoint headers (all three inference endpoints)
 
 Concurrent checkpoint deploys mutate the single serving surface for an adapter
 id (a redeploy overwrites the record's checkpoint), so every inference endpoint
-(`/generate`, `/adapters/{adapterId}/generate`, `/v1/chat/completions`,
+(`/generate`, `/adapters/{adapter_id}/generate`, `/v1/chat/completions`,
 streaming included) supports a checkpoint contract:
 
 - **`X-Freesolo-Checkpoint` (response header)** — echoes the checkpoint that
@@ -249,7 +249,7 @@ default, so callers cannot flip a thinking/no-thinking adapter at sampling time.
 Every inference endpoint supports structured outputs (vLLM guided decoding via
 `StructuredOutputsParams`) through these request forms:
 
-- **`structuredOutputs`** (all endpoints; also accepted as `structured_outputs`) — takes a
+- **`structured_outputs`** (all endpoints) — takes a
   canonical constraint dict with **exactly one** of `json` (a JSON schema, or a raw JSON-schema
   dict/string directly), `regex`, `choice` (list of strings), or `json_object: true`, plus
   optional `disable_any_whitespace`, `disable_additional_properties`, `whitespace_pattern`.
@@ -259,13 +259,13 @@ Every inference endpoint supports structured outputs (vLLM guided decoding via
   accepted so an OpenAI-SDK client works unchanged: `{"type": "json_object"}`, `{"type":
 "json_schema", "json_schema": {"schema": {...}}}` (or the flattened `{"type": "json_schema",
 "schema": {...}}`), and `{"type": "text"}` (unconstrained). Translated to the canonical form at
-  that endpoint; `structuredOutputs` takes precedence when both are sent.
+  that endpoint; `structured_outputs` takes precedence when both are sent.
 
 The spec normalizes to the canonical form at the router (a bad spec is a 422 naming the problem),
 and streaming works unchanged. Structured outputs are entirely optional: omit the field to
 generate freeform, unconstrained text.
 
-**Per-adapter default.** `POST /adapters` accepts an optional `structuredOutputs` field (same
+**Per-adapter default.** `POST /adapters` accepts an optional `structured_outputs` field (same
 forms) that is persisted with the record and applied whenever a request doesn't carry its own
 spec — e.g. register a JSON-only extraction adapter once and every client gets schema-constrained
 output. A per-call spec replaces the default for that call, and an explicit "off" value (`false`,
@@ -285,9 +285,9 @@ open `<think>` block for generation to close.
 
 ```json
 {
-  "adapterId": "people-search-lora",
-  "repoId": "Freesolo-Co/people-search-lora",
-  "baseModel": "Qwen/Qwen3.5-0.8B",
+  "adapter_id": "people-search-lora",
+  "repo_id": "Freesolo-Co/people-search-lora",
+  "base_model": "Qwen/Qwen3.5-0.8B",
   "thinking": false,
   "status": "ready"
 }
@@ -297,13 +297,13 @@ open `<think>` block for generation to close.
 
 ```json
 {
-  "adapterId": "people-search-lora",
+  "adapter_id": "people-search-lora",
   "messages": [
     { "role": "user", "content": "Find senior search engineers in SF" }
   ],
-  "maxTokens": 512,
+  "max_tokens": 512,
   "temperature": 0,
-  "structuredOutputs": {
+  "structured_outputs": {
     "json": {
       "type": "object",
       "properties": {

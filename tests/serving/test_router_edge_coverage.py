@@ -179,7 +179,11 @@ def test_stream_replay_derives_checkpoint_and_skips_empty_delta(
     with client.stream(
         "POST",
         "/v1/chat/completions",
-        json={"model": record.adapter_id, "messages": [], "stream": True},
+        json={
+            "model": record.adapter_id,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
     ) as response:
         assert response.status_code == 200
         body = response.read().decode()
@@ -262,7 +266,7 @@ def test_stream_first_event_value_error_is_translated() -> None:
     alias = _alias(revision)
     response = _client(_RaisingStreamPool(), AdapterRouter([revision, alias])).post(
         "/v1/chat/completions",
-        json={"model": "qa", "messages": [], "stream": True},
+        json={"model": "qa", "messages": [{"role": "user", "content": "hi"}], "stream": True},
     )
 
     assert response.status_code == 409

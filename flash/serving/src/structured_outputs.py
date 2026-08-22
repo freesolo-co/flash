@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from flash.serve.contract import reject_non_finite_json_constant
+
 # The vLLM ``StructuredOutputsParams`` constraint fields we support — exactly ONE must be set (its
 # __post_init__ raises ValueError otherwise), which normalization enforces up front.
 CONSTRAINT_KEYS = ("json", "regex", "choice", "json_object")
@@ -45,6 +47,10 @@ _ALLOWED_KEYS_HINT = (
 class StructuredOutputsError(ValueError):
     """Invalid structured-outputs spec. A ``ValueError`` subclass so pydantic validators surface
     it as a 422 with the message intact."""
+
+
+def _decode_json(value: str) -> Any:
+    return json.loads(value, parse_constant=reject_non_finite_json_constant)
 
 
 def normalize_structured_outputs(value: Any) -> dict[str, Any] | None:
@@ -85,7 +91,7 @@ def _normalize_str(value: str) -> dict[str, Any]:
     # Any other string must be a JSON document describing a dict form (a schema or a spec dict) —
     # convenient for callers whose transport can only carry strings.
     try:
-        parsed = json.loads(value)
+        parsed = _decode_json(value)
     except ValueError as exc:
         raise StructuredOutputsError(
             "structured outputs string must be 'json'/'json_object', an off marker "
@@ -207,7 +213,7 @@ def _coerce_json_schema(value: Any, *, key: str) -> dict[str, Any]:
         return value
     if isinstance(value, str):
         try:
-            parsed = json.loads(value)
+            parsed = _decode_json(value)
         except ValueError as exc:
             raise StructuredOutputsError(
                 f"structured outputs {key!r} string is not valid JSON: {exc}"

@@ -87,7 +87,7 @@ jobs:
           elif ! changed="$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" 2>/dev/null)"; then
             # before sha unreachable (e.g. force push): publish to be safe.
             publish=true
-          elif printf '%s\n' "$changed" | grep -qE "^(flash/|Dockerfile\.serve$|\.dockerignore$|serve_launch\.py$|pyproject\.toml$|uv\.lock$|README\.md$|LICENSE$|NOTICE$|\.github/workflows/publish-serving-image\.yml$)"; then
+          elif grep -qE "^(flash/|Dockerfile\.serve$|\.dockerignore$|serve_launch\.py$|pyproject\.toml$|uv\.lock$|README\.md$|LICENSE$|NOTICE$|\.github/workflows/publish-serving-image\.yml$)" <<< "$changed"; then
             publish=true
           fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"

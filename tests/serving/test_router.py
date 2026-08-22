@@ -1074,6 +1074,30 @@ def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
     assert headers.get("cache-control") == "no-cache"
 
 
+@pytest.mark.parametrize("stream", [1, "true"])
+def test_openai_chat_rejects_non_boolean_stream_before_authorization(stream):
+    authorizations: list[str] = []
+
+    async def _authorize(_token: str, adapter_id: str) -> None:
+        authorizations.append(adapter_id)
+
+    pool = FakePool()
+    client = _serve(pool, _router_for("qa", QWEN), chat_authorizer=_authorize)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "qa",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": stream,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "stream must be a boolean"
+    assert authorizations == []
+    assert pool.generated == []
+
+
 def test_openai_chat_completions_bad_payload_is_422_not_500(app_setup):
     # A non-numeric top_p (and likewise a malformed messages shape) makes the in-handler
     # GenerateRequest validation raise a Pydantic ValidationError. It must surface as a 4xx
@@ -1139,16 +1163,15 @@ def test_unknown_adapter_is_404_not_misrouted(app_setup):
 
 
 def test_engine_valueerror_is_400_when_adapter_still_ready(app_setup):
-    # The engine raises ValueError for a genuine bad payload (e.g. missing prompt) while the
-    # router still has the adapter ready -> 400, not 404.
+    # An engine ValueError while the router still has the adapter ready maps to 400, not 404.
     _, pool, router = app_setup
 
     async def boom(base_model, payload, record, **_kwargs):
-        raise ValueError("prompt or messages is required")
+        raise ValueError("invalid generated request")
 
     pool.generate = boom
     client = _serve(pool, router, internal_key="sekret")
-    assert client.post("/generate", json={"adapter_id": "qa"}).status_code == 400
+    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 400
 
 
 def test_raced_undeploy_engine_valueerror_is_404(app_setup):
@@ -1671,10 +1694,41 @@ def test_generate_miss_reloads_from_shared_storage():
     assert client.post("/generate", json={"adapter_id": "ghost", "prompt": "hi"}).status_code == 404
 
 
+def test_first_request_after_alias_move_routes_to_new_revision():
+    old_revision = _rec("qa", QWEN)
+    new_sha = "f" * 40
+    new_revision = old_revision.model_copy(
+        deep=True,
+        update={
+            "adapter_id": f"qa@step-1.{new_sha}",
+            "checkpoint": "qa/step-1",
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "qa",
+                "checkpoint_step": 1,
+                "hf_revision": new_sha,
+            },
+        },
+    )
+    shared = [new_revision, _alias(new_revision)]
+    pool = FakePool()
+    client = _serve(
+        pool,
+        AdapterRouter([old_revision, _alias(old_revision)]),
+        reload_records=lambda: list(shared),
+        reload_interval_seconds=0.0,
+    )
+
+    response = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"})
+
+    assert response.status_code == 200
+    assert pool.generated_records[-1].adapter_id == new_revision.adapter_id
+
+
 def test_stale_ready_record_refreshes_in_background():
-    # Cross-container undeploy: this router still caches a ready row for an adapter another
-    # container undeployed. With the TTL elapsed, a hit should not block on shared storage; it
-    # serves the cached row, refreshes in the background, then stops routing it on later requests.
+    # Immutable revisions refresh in the background because their target cannot drift. Mutable
+    # aliases synchronously refresh after the ttl so an alias moved or undeployed by another
+    # container is authoritative on the first post-change request.
     import asyncio
 
     from httpx import ASGITransport, AsyncClient
@@ -1739,30 +1793,17 @@ def test_stale_ready_record_refreshes_in_background():
                 f"the engine was handed material other than the record storage returned: "
                 f"{pool.generated_records}"
             )
-            # another container undeploys qa: it drops out of the status=ready reload.
+            # another container undeploys qa: it drops out of the status=ready reload. unlike the
+            # immutable revision hit above, a mutable alias must synchronously refresh before routing
+            # because its target can drift. the first post-undeploy alias request therefore sees the
+            # new authoritative state instead of serving the cached revision once more.
             shared["rows"] = []
-            # this hit is stale, but still cached: serve it and schedule the refresh. it is the
-            # request this whole test characterizes, so what the engine is handed for it matters
-            # more than the status code -- serving the cached row is only correct if the row
-            # served is the one storage returned.
             served = len(pool.generated_records)
-            assert await _generate("qa") == 200
-            assert pool.generated_records[served:] == [material], (
-                f"the stale cached hit was served from other material: "
-                f"{pool.generated_records[served:]}"
-            )
-            undeploy_refresh = lookup._last_reload["task"]
-            assert undeploy_refresh is not None, "the undeploy refresh was not scheduled"
-            assert undeploy_refresh is not first_refresh, "the stale hit reused the settled refresh"
-            await undeploy_refresh
-            assert not router.has("qa"), "the undeploy never landed"
-            # a genuinely later refresh did the work, not the one that had already settled.
-            assert reloads["count"] > settled, "the ttl window stopped refreshing after the first"
-            # after the background refresh, neither id is routed here. the immutable id is the one
-            # that matters: `resolve` answers a ready revision directly, so anything that holds one
-            # past its undeploy keeps serving an adapter that no longer exists -- invisible to the
-            # alias, and invisible to the registry if the staleness lives downstream of it.
             assert await _generate("qa") == 404
+            assert pool.generated_records[served:] == []
+            assert not router.has("qa"), "the synchronous alias refresh did not land"
+            assert reloads["count"] > settled, "the stale alias did not synchronously refresh"
+            # the immutable id was removed by that authoritative refresh as well.
             assert await _generate(_revision_id("qa")) == 404
 
     asyncio.run(_scenario())
@@ -1782,12 +1823,15 @@ def test_hit_refresh_failure_serves_cached_adapter():
     pool = FakePool()
     router = _router_for("qa", QWEN)
     client = _serve(pool, router, reload_records=_reload, reload_interval_seconds=0.0)
-    # Warm the cache (TTL=0 -> every subsequent hit triggers a refresh).
+    # Warm the cache through the mutable alias, then exercise the immutable revision. Immutable
+    # records keep the background-refresh fallback because their target cannot drift.
     assert client.post("/generate", json={"adapter_id": "qa", "prompt": "x"}).status_code == 200
-    # Now refresh fails: the cached ready "qa" is still served.
     state["fail"] = True
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "x"}).status_code == 200
-    assert pool.generated[-1] == (QWEN, _revision_id("qa"))
+    revision_id = _revision_id("qa")
+    assert (
+        client.post("/generate", json={"adapter_id": revision_id, "prompt": "x"}).status_code == 200
+    )
+    assert pool.generated[-1] == (QWEN, revision_id)
 
 
 def test_miss_refresh_failure_propagates():
