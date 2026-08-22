@@ -601,8 +601,18 @@ def provision_modal_deployment(
                 sleep=sleep,
                 created=created,
             )
-        except (ModalResourceConflict, ModalSdkFailure):
+        except ModalResourceConflict:
             return unknown_result(finalized_plan)
+        except ModalSdkFailure as exc:
+            # a definite failure here is terminal, and the secrets, volume and possibly the app are
+            # already created and billing. returning from this catch would report the failure with
+            # those resources left standing, because the outer handler that calls
+            # `_abort_created_resources` never runs. only an ambiguous outcome stops here: the
+            # mutation may have landed, so deleting by the deterministic names could destroy a
+            # concurrent deployment.
+            if exc.outcome_unknown:
+                return unknown_result(finalized_plan)
+            raise
         if phase is None:
             return unknown_result(finalized_plan)
         # the app is deployed and has answered the readiness probe. from here the only remaining

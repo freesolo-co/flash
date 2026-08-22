@@ -1954,6 +1954,24 @@ def test_a_failed_abort_delete_reports_that_cleanup_was_not_confirmed() -> None:
                 "delete_volume",
             ],
         ),
+        # the deploy itself, which is the expensive one: by the time it fails the gpu app is live
+        # and billing, so the abort has to stop compute before it can delete the volume the app
+        # still has mounted. this case ran inside the create's own `except`, which returned the
+        # failure directly and never let the aborting handler see it.
+        (
+            "deploy_app",
+            [
+                "observe",
+                "create_inference",
+                "create_artifact",
+                "create_volume",
+                "deploy_app",
+                "stop_app",
+                "delete_artifact",
+                "delete_inference",
+                "delete_volume",
+            ],
+        ),
     ],
 )
 def test_a_definite_create_failure_after_acceptance_tears_down_created_resources(

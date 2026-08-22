@@ -96,17 +96,25 @@ async def disable_matched(
                 if current.updated_at is None:
                     break
 
-            committed = await _replace_stored_cas(
-                current.model_copy(update={"status": "disabled"}),
-                expected_updated_at=current.updated_at,
-            )
+            try:
+                committed = await _replace_stored_cas(
+                    current.model_copy(update={"status": "disabled"}),
+                    expected_updated_at=current.updated_at,
+                )
+            except HTTPException as exc:
+                if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
+                    raise
+                storage_unavailable = True
+                break
             if committed is not None:
                 current = committed
                 converged = True
                 break
             try:
-                current = await _get_stored(candidate.adapter_id)
-            except PersistenceRecordError:
+                current = await get_authoritative(candidate.adapter_id)
+            except HTTPException as exc:
+                if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
+                    raise
                 storage_unavailable = True
                 break
             if current is None or current.status != "ready":

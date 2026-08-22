@@ -86,6 +86,7 @@ class MemoryPersistence:
         self.concurrent_disable_once: set[str] = set()
         self.concurrent_redeploy_once: dict[str, str] = {}
         self.get_failure_ids: set[str] = set()
+        self.replace_failure_ids: set[str] = set()
         self._clock = itertools.count(1)
 
     def _stamp(self, record: AdapterRecord) -> AdapterRecord:
@@ -120,6 +121,8 @@ class MemoryPersistence:
         settings: object,
     ) -> AdapterRecord | None:
         del settings
+        if record.adapter_id in self.replace_failure_ids:
+            raise PersistenceRecordError("storage unavailable")
         current = self.rows.get(record.adapter_id)
         redeployed_generation = self.concurrent_redeploy_once.pop(record.adapter_id, None)
         if redeployed_generation is not None and current is not None:
@@ -795,7 +798,7 @@ def test_delete_repeated_cas_miss_returns_conflict(setup) -> None:
     assert pool.unregistered == []
 
 
-@pytest.mark.parametrize("failure_path", ["missing_timestamp", "cas_loser"])
+@pytest.mark.parametrize("failure_path", ["missing_timestamp", "cas_loser", "cas_write"])
 def test_delete_storage_failure_tears_down_rows_that_already_converged(
     setup, failure_path: str
 ) -> None:
@@ -808,11 +811,19 @@ def test_delete_storage_failure_tears_down_rows_that_already_converged(
         ).status_code
         == 200
     )
-    persistence.get_failure_ids.add(REVISION_A)
     if failure_path == "missing_timestamp":
+        persistence.get_failure_ids.add(REVISION_A)
         router.upsert(persistence.rows[REVISION_A].model_copy(update={"updated_at": None}))
-    else:
+    elif failure_path == "cas_loser":
+        persistence.get_failure_ids.add(REVISION_A)
         persistence.force_replace_miss_ids.add(REVISION_A)
+    else:
+        # the outage hits the compare-and-swap write itself rather than a read around it. that
+        # raises the same 503 from a call that sat outside either recovery block, so the whole
+        # cascade unwound and the run alias -- already disabled and unregistered above -- was
+        # dropped from the teardown list while its row stayed disabled: a live gpu with no record
+        # left to reconcile it.
+        persistence.replace_failure_ids.add(REVISION_A)
 
     response = client.delete(f"/adapters/{RUN_ID}")
 
