@@ -56,6 +56,24 @@ def deployed_app_matches(plan: ModalCreatePlan, app: ModalAppObservation) -> boo
     )
 
 
+def teardown_deployed_app_matches(
+    plan: ModalCreatePlan,
+    handle: ModalProviderHandle,
+    app: ModalAppObservation,
+) -> bool:
+    return (
+        _valid_provider_id(app.app_id, "app")
+        and app.app_id == handle.app_id
+        and app.app_name == plan.names.app_or_pod
+        and app.state == "deployed"
+        and type(app.running_containers) is int
+        and 0 <= app.running_containers <= plan.max_containers
+        and app.tags == plan.tags
+        and _valid_provider_id(app.function_id, "function")
+        and app.function_name == plan.function_name
+    )
+
+
 def terminal_app_matches(
     plan: ModalCreatePlan,
     handle: ModalProviderHandle,
@@ -166,7 +184,7 @@ def exact_teardown_resources(
     artifact = observation.artifact_secrets[0] if observation.artifact_secrets else None
     if app is not None:
         if app.state == "deployed":
-            if app.app_id != handle.app_id or not deployed_app_matches(plan, app):
+            if not teardown_deployed_app_matches(plan, handle, app):
                 raise ModalResourceConflict("modal app does not match the exact handle")
         elif app.state == "lifecycle_pending":
             if not lifecycle_pending_app_matches(plan, handle, app):
