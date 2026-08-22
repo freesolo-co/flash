@@ -308,6 +308,28 @@ def test_upload_failure_cause_reaches_the_rendered_run_log():
     assert "error=PermissionError: hf quota refused credential <redacted>" in line
 
 
+def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
+    """This text is an exception message, so it is not ours: a hook or provider response wrote it.
+
+    The same line already neutralizes child output and sampled completions. Surfacing the cause
+    raw would let a `\\x1b[2J` clear the screen or a `\\r` overwrite the line the user is reading
+    the failure in -- and the failure report is exactly when the log has to stay legible.
+    """
+    from flash.providers._lifecycle.poll import _format_heartbeat
+
+    line = _format_heartbeat(
+        {
+            "stage": "checkpoint_upload_failed",
+            "step": 50,
+            "error": "boom\x1b[2Jwiped\roverwrite",
+        }
+    )
+
+    assert "\x1b" not in line
+    assert "\r" not in line
+    assert "error=boom\\x1b[2Jwiped\\x0doverwrite" in line
+
+
 def test_a_heartbeat_without_a_failure_cause_is_unchanged():
     """The failure fields are additive: an ordinary step line must not grow an empty `error=`."""
     from flash.providers._lifecycle.poll import _format_heartbeat

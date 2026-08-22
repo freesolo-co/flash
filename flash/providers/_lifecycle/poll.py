@@ -266,10 +266,13 @@ def _format_heartbeat(hb: dict) -> str:
     # metric loop above formats a fixed key list, so a stage that carries an explanation instead of a
     # measurement would otherwise commit the cause to the payload and print only the stage name --
     # the failure is reported and its reason is dropped in the same line.
+    # neutralized like child output and sampled completions on the same line: this text is an
+    # exception message from an environment hook or a provider response, so it is not ours, and a
+    # `\x1b[2J` or `\r` in it would clear or overwrite the log the user is reading the failure in.
     for key in ("failure_stage", "error"):
         value = hb.get(key)
         if isinstance(value, str) and value.strip():
-            msg += f" {key}={value.strip()}"
+            msg += f" {key}={neutralize_control_chars(value.strip())}"
     msg += format_gpu_status(hb.get("gpu"))
     sample_lines: list[str] = []
     rendered_samples = 0
