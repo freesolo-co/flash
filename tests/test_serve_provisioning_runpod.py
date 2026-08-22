@@ -2797,6 +2797,41 @@ def test_pod_observation_accepts_an_empty_environment_value() -> None:
     assert pod[0].environment == (("NORMAL_VAR", "populated"), ("PUBLIC_KEY", ""))
 
 
+def test_a_foreign_empty_env_pod_does_not_fail_the_account_observation() -> None:
+    # the whole account pod list is parsed during the pre-create observe, so a single unrelated
+    # pod carrying an empty env value used to raise and surface as transport_failed, failing the
+    # deploy before anything was provisioned. parsing one pod in isolation cannot catch that:
+    # the property is that a foreign pod never removes ours from the observation.
+    pods = parse_pods(
+        [
+            {
+                "id": "foreignpod1234",
+                "name": "chalk-hive-sm80",
+                "desiredStatus": "EXITED",
+                "imageName": "pytorch/pytorch:2.6.0",
+                "gpuCount": 1,
+                "containerDiskInGb": 60,
+                "ports": "8000/http",
+                "env": {"PUBLIC_KEY": ""},
+                "machine": {"gpuTypeId": "NVIDIA H100", "dataCenterId": "US-KS-2"},
+            },
+            {
+                "id": "ourpod98765432",
+                "name": "flash-owned-pod",
+                "desiredStatus": "RUNNING",
+                "imageName": "ghcr.io/x/y@sha256:" + "a" * 64,
+                "gpuCount": 1,
+                "containerDiskInGb": 60,
+                "ports": "8000/http",
+                "env": {"REAL": "value"},
+                "machine": {"gpuTypeId": "NVIDIA H100", "dataCenterId": "US-KS-2"},
+            },
+        ]
+    )
+
+    assert [pod.name for pod in pods] == ["chalk-hive-sm80", "flash-owned-pod"]
+
+
 def test_template_observation_preserves_opaque_environment_values() -> None:
     template = parse_templates(
         [
