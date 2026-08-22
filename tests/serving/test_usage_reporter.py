@@ -1027,6 +1027,31 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
     assert engine._cached_lora_request_locked(_rec("a", "org/a"), Path("/tmp/a")) is req_a
 
 
+def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_module, monkeypatch):
+    from flash.serving.src import registry as registry_mod
+
+    monkeypatch.setattr(registry_mod, "lora_int_id", lambda _adapter_id: 42)
+
+    class _Request:
+        lora_int_id = 42
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.removed: list[int] = []
+
+        async def remove_lora(self, int_id: int) -> None:
+            self.removed.append(int_id)
+
+    engine = object.__new__(modal_app_module._LoraEngineImpl)
+    engine.engine = _Engine()
+    engine._lora_requests = {"tenant-b": (("org/b", "model", "sha", None), _Request())}
+
+    asyncio.run(engine._evict_loaded_lora("tenant-a"))
+
+    assert engine.engine.removed == []
+    assert "tenant-b" in engine._lora_requests
+
+
 def test_reporter_disabled_when_only_internal_key_is_set(modal_app_module):
     # The exact bug: a non-prod deployment has FREESOLO_INTERNAL_KEY but never set
     # PLATFORM_BACKEND_URL. With the prod default gone, reporting must be DISABLED (None), not

@@ -210,15 +210,14 @@ class _LoraEngineImpl:
         # Best-effort: drop this id's LoRA from the engine (vLLM caches by int id, so a redeploy
         # under the same id must evict the old one). Caller holds the per-adapter lock.
         try:
-            from flash.serving.src.registry import lora_int_id
-
+            cached = self._lora_requests.get(adapter_id)
+            if cached is None:
+                return
             remove = getattr(self.engine, "remove_lora", None)
             if remove is not None:
-                # Use the int id this adapter was actually loaded with (collision-probing may have
-                # shifted it off the raw lora_int_id), falling back to the raw hash when it was never
-                # cached. Otherwise a probed adapter's LoRA never frees its engine slot.
-                cached = self._lora_requests.get(adapter_id)
-                int_id = cached[1].lora_int_id if cached is not None else lora_int_id(adapter_id)
+                # use only the int id this adapter actually loaded with. recomputing an uncached
+                # alias's hash could remove another tenant's adapter that owns the colliding id.
+                int_id = cached[1].lora_int_id
                 # remove_lora is a coroutine in vllm>=0.11 — must await or it never frees the slot.
                 result = remove(int_id)
                 if inspect.isawaitable(result):
