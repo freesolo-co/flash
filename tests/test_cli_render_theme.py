@@ -598,6 +598,46 @@ def test_a_correctly_spelled_root_flag_is_repositioned_not_respelled(monkeypatch
     assert "--version" not in err
 
 
+def test_nested_flag_typo_is_scoped_to_parser_at_its_position(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["runs", "--folow", "log", "flash-1"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --folow" in err
+    assert "--follow" not in err
+    assert "did you mean" not in err
+
+
+def test_repeated_short_root_flag_is_repositioned_without_downgrading(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", "-vv"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized argument '-vv'" in err
+    assert "it goes before the command" in err
+    assert "flash -vv <command>" in err
+    assert "flash -v <command>" not in err
+
+
+def test_flag_typo_after_option_terminator_has_no_unusable_suggestion(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["runs", "log", "flash-1", "--", "--folow"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --folow" in err
+    assert "--follow" not in err
+    assert "did you mean" not in err
+
+
 def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("COLORTERM", "truecolor")

@@ -4,15 +4,14 @@ argparse reports a mistyped flag by printing the whole usage block, which buries
 was actually wrong. These helpers reduce that to a single line naming the token and, where one
 exists, the closest real alternative.
 
-The hard part is making the suggestion one the user can actually follow, and both difficulties come
-from where argparse raises. A subcommand's unknown tokens are handed back to the ROOT parser to
-report, so the error has to know about flags it does not own -- but drawing candidates from the
-whole tree offers flags belonging to unrelated commands, which fail exactly like the original typo.
-The pool is therefore the SELECTED command's options plus the root's, resolved from the invocation.
+The hard part is making the suggestion one the user can actually follow. A subcommand's unknown
+tokens are handed back to the root parser to report, so candidate options must be recovered from the
+parser in effect at the rejected token's argv position. Looking only at the final selected command
+crosses nested command boundaries, while looking through the whole tree offers unrelated flags.
 
-Root flags are also positional here (`flash --debug login`, never `flash login --debug`), so a
-suggestion can name a real flag that still fails where the user typed it. Those carry their
-position, and a correctly spelled one is repositioned rather than respelled.
+Root flags are also positional here (`flash --debug login`, never `flash login --debug`), and `--`
+stops option parsing. The suggestion context therefore carries both boundaries, plus the original
+spelling of a repeated short root flag that must be moved without changing its count.
 """
 
 from __future__ import annotations
@@ -21,8 +20,17 @@ import argparse
 import difflib
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from flash._internal.channel import CLI_NAME
+
+
+@dataclass(frozen=True)
+class _SuggestionContext:
+    options: tuple[str, ...]
+    root_only: frozenset[str]
+    reposition: str | None = None
+    after_terminator: bool = False
 
 
 def friendly_error(
@@ -36,17 +44,14 @@ def friendly_error(
     would put policy in a hook that exists to print.
     """
     if argv is None:
-        # a subparser raising its own error: it IS the selected parser, and it holds no argv stash.
-        selected, root_only = parser, frozenset()
+        # a subparser raising its own error is already the parser in effect at the rejected token.
+        context = _SuggestionContext(tuple(sorted(_direct_options(parser))), frozenset())
     else:
-        selected, root_only = _selected_parser(parser, argv), _root_only_options(parser)
-    candidates = sorted({*_parser_options(selected), *root_only})
-    return _friendly_message(message, candidates, root_only)
+        context = _suggestion_context(message, parser, tuple(argv))
+    return _friendly_message(message, context)
 
 
-def _friendly_message(
-    message: str, options: Iterable[str] = (), root_only: frozenset[str] = frozenset()
-) -> str:
+def _friendly_message(message: str, context: _SuggestionContext) -> str:
     """Shorten argparse's verbose errors into concise suggestions on the styled path.
 
     An ``invalid choice: 'x' (choose from a, b, c, ...)`` becomes ``unknown command 'x' (did you
@@ -74,23 +79,22 @@ def _friendly_message(
     )
     if bad is None:
         return message
-    # a correctly spelled ROOT flag in the wrong position is not a typo, so there is nothing to
-    # correct it to: the fix is to move it. this has to be answered before the exact-token
-    # exclusion below, which would otherwise drop `--verbose` from the pool and let the nearest
-    # sibling stand in -- `flash train x.toml --verbose` answered "did you mean '--version'?",
-    # pointing at a different flag with a different meaning.
-    if bad in root_only:
+    if context.after_terminator:
+        return message
+    # a root flag in the wrong position is a placement error, not a typo. repeatable short flags
+    # retain the complete spelling so moving `-vv` never downgrades it to one `-v`.
+    if context.reposition is not None:
+        return _reposition_message(context.reposition)
+    if bad in context.root_only:
         return _reposition_message(bad)
-    # the candidate pool spans the selected command's flags plus the root's, so a flag that is real
-    # SOMEWHERE else can still reach this suggestion: `flash login --repository X` would otherwise
-    # answer "did you mean '--repository'?" -- echoing the token the user just typed as its own
-    # correction. dropping the exact token keeps the suggestion to flags that differ from it.
-    candidates = [option for option in options if option != bad]
+    # the position-scoped pool can still include an exact spelling shared with the root. dropping it
+    # keeps a rejected token from being echoed back as its own correction.
+    candidates = [option for option in context.options if option != bad]
     near = difflib.get_close_matches(bad, candidates, n=1)
     if not near:
         return message
     suggestion = near[0]
-    if suggestion in root_only:
+    if suggestion in context.root_only:
         # a root flag only parses before the subcommand, so naming it alone hands back a correction
         # that fails the same way. say where it goes, or the second attempt is the first error again.
         return (
@@ -107,48 +111,105 @@ def _reposition_message(flag: str) -> str:
     )
 
 
-def _parser_options(parser: argparse.ArgumentParser) -> Iterable[str]:
-    """Yield option strings registered on a parser and its subparsers.
+def _suggestion_context(
+    message: str, root: argparse.ArgumentParser, argv: tuple[str, ...]
+) -> _SuggestionContext:
+    root_only = _root_only_options(root)
+    bad = _unrecognized_option(message)
+    if bad is None:
+        return _SuggestionContext((), root_only)
+    location = _option_location(root, argv, bad)
+    if location is None:
+        return _SuggestionContext((), root_only)
+    current, after_terminator = location
+    reposition = bad if _is_repeated_root_short_option(root, bad, root_only) else None
+    options = tuple(sorted({*_direct_options(current), *root_only}))
+    return _SuggestionContext(options, root_only, reposition, after_terminator)
 
-    argparse returns a subparser's unknown tokens to the root, which raises the final
-    ``unrecognized arguments`` error. Walking descendants keeps that root error aware of the
-    selected command's real flags without maintaining a second option registry.
-    """
-    for action in parser._actions:
-        yield from action.option_strings
-        if isinstance(action, argparse._SubParsersAction):
-            for subparser in action.choices.values():
-                yield from _parser_options(subparser)
+
+def _unrecognized_option(message: str) -> str | None:
+    prefix = "unrecognized arguments: "
+    if not message.startswith(prefix):
+        return None
+    return next(
+        (
+            token.split("=", 1)[0]
+            for token in message[len(prefix) :].split()
+            if token.startswith("-")
+        ),
+        None,
+    )
 
 
-def _selected_parser(
-    parser: argparse.ArgumentParser, argv: Iterable[str]
-) -> argparse.ArgumentParser:
-    """Walk the subcommand path in ``argv`` to the parser that owns the invocation.
+def _option_location(
+    root: argparse.ArgumentParser, argv: tuple[str, ...], bad: str
+) -> tuple[argparse.ArgumentParser, bool] | None:
+    """Return the parser and terminator state at the rejected token's argv position."""
+    current = root
+    path_open = True
+    after_terminator = False
+    fallback: tuple[argparse.ArgumentParser, bool] | None = None
 
-    The whole-tree pool is what makes a suggestion reachable at all -- argparse reports a
-    subcommand's unknown tokens from the ROOT parser -- but drawing candidates from the whole tree
-    means an unrelated command's flag can be offered: `flash login --folow` answered '--follow',
-    and `flash runs log ID --api-ke` answered '--api-key'. Both corrections are rejected again,
-    because those flags belong to other commands. Narrowing to the parser actually selected keeps
-    the candidates to flags that would work where the user typed them.
-    """
-    current = parser
     for token in argv:
-        if token.startswith("-"):
+        if token == "--":
+            after_terminator = True
+            path_open = False
+            continue
+        if token.split("=", 1)[0] == bad:
+            location = (current, after_terminator)
+            fallback = location
+            # repeated spellings can include one accepted root occurrence and one rejected
+            # subcommand occurrence. choose the occurrence argparse could not consume here.
+            if after_terminator or len(current._get_option_tuples(token)) != 1:
+                return location
+        if after_terminator or token.startswith("-") or not path_open:
             continue
         subparsers = next(
             (a for a in current._actions if isinstance(a, argparse._SubParsersAction)), None
         )
         if subparsers is None:
-            break
+            path_open = False
+            continue
         nxt = subparsers.choices.get(token)
         if nxt is None:
-            # not a command name, so it is a positional argument (a config path, a run id) and the
-            # command path has ended. anything after it cannot name a deeper subparser.
-            break
+            path_open = False
+            continue
         current = nxt
-    return current
+
+    return fallback
+
+
+def _is_repeated_root_short_option(
+    root: argparse.ArgumentParser, token: str, root_only: frozenset[str]
+) -> bool:
+    """Whether token is a compact repeat of a count-style root option, such as ``-vv``."""
+    if not token.startswith("-") or token.startswith("--"):
+        return False
+    parsed = root._parse_optional(token)
+    if parsed is None:
+        return False
+    action, option, separator, explicit = parsed
+    return (
+        isinstance(action, argparse._CountAction)
+        and option in root_only
+        and separator == ""
+        and explicit is not None
+        and token == option + option[-1] * len(explicit)
+    )
+
+
+def _direct_options(parser: argparse.ArgumentParser) -> Iterable[str]:
+    for action in parser._actions:
+        yield from action.option_strings
+
+
+def _parser_options(parser: argparse.ArgumentParser) -> Iterable[str]:
+    """Yield option strings registered on a parser and its subparsers."""
+    yield from _direct_options(parser)
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for subparser in action.choices.values():
+                yield from _parser_options(subparser)
 
 
 def _root_only_options(parser: argparse.ArgumentParser) -> frozenset[str]:
