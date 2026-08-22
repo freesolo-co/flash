@@ -170,7 +170,7 @@ def test_non_finite_adapter_config_constants_are_not_strict_json(constant: str) 
     raw = f'{{"peft_type":"LORA","r":16,"lora_alpha":{constant}}}'.encode()
 
     with pytest.raises(
-        MaterializationError, match="adapter_config.json is not strict utf-8 json"
+        MaterializationError, match=r"adapter_config\.json is not strict utf-8 json"
     ):
         _load_strict_config(raw)
 

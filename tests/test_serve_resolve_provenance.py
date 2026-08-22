@@ -365,12 +365,11 @@ def test_non_finite_adapter_config_constants_are_not_readable_json(
 ) -> None:
     config_path = tmp_path / ADAPTER_CONFIG
     config_path.write_text(
-        f'{{"peft_type":"LORA","r":32,"lora_alpha":{constant},'
-        f'"base_model_name_or_path":"{BASE}"}}',
+        f'{{"peft_type":"LORA","r":32,"lora_alpha":{constant},"base_model_name_or_path":"{BASE}"}}',
         encoding="utf-8",
     )
 
-    with pytest.raises(ResolveError, match="adapter_config.json is not readable json"):
+    with pytest.raises(ResolveError, match=r"adapter_config\.json is not readable json"):
         resolve_module._declared_provenance(str(config_path))
 
 
