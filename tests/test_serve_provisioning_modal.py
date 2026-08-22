@@ -47,10 +47,8 @@ from flash.serve.provisioning._modal_sdk import (
 from flash.serve.provisioning.modal import (
     _abort_created_resources,
     _CreatedResources,
-    confirm_modal_absence,
     provision_modal_deployment,
     reconcile_modal_deployment,
-    resize_modal_volume,
     teardown_modal_deployment,
 )
 from tests.test_serve_app_manifest import _spec_and_inputs
@@ -1186,31 +1184,6 @@ def test_post_cleanup_core_resource_drift_is_outcome_unknown() -> None:
     assert [name for name, _value in sdk.calls].count("delete_artifact") == 1
 
 
-def test_modal_resize_is_fixed_invalid_request_before_sdk_construction() -> None:
-    bundle = _bundle()
-    plan = build_modal_create_plan(bundle)
-    sdk = _FakeSdk(plan)
-    handle = _seed_exact(sdk)
-    calls = 0
-
-    def forbidden_factory(_credentials, _plan):
-        nonlocal calls
-        calls += 1
-        raise AssertionError("modal resize must not construct a client")
-
-    for size in (1, 100, 10_000):
-        result = resize_modal_volume(
-            bundle,
-            handle,
-            ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
-            size,
-            sdk_factory=forbidden_factory,
-        )
-        assert result.status == "failed"
-        assert result.error_code == "invalid_request"
-    assert calls == 0
-
-
 def test_teardown_stops_bootstrap_app_and_deletes_every_attached_resource() -> None:
     bundle = _bundle()
     factory = _Factory()
@@ -1285,26 +1258,34 @@ def test_teardown_stops_before_secret_and_volume_deletion_then_confirms_absence(
     assert sdk.artifact == []
 
     sdk.calls.clear()
-    confirmed = confirm_modal_absence(
+    clock.now = 0.0
+    reconciled = reconcile_modal_deployment(
         bundle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
-        deadline_at=100.0,
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=4.0,
         sdk_factory=lambda _credentials, _plan: sdk,
+        probe=_Probe(True),
         clock=clock,
+        sleep=clock.sleep,
     )
-    assert confirmed.status == "failed"
-    assert confirmed.error_code == "conflict"
+    assert reconciled.status == "failed"
+    assert reconciled.error_code == "conflict"
 
     sdk.apps.clear()
     sdk.calls.clear()
-    confirmed = confirm_modal_absence(
+    clock.now = 0.0
+    reconciled = reconcile_modal_deployment(
         bundle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=100.0,
         sdk_factory=lambda _credentials, _plan: sdk,
+        probe=_Probe(True),
         clock=clock,
+        sleep=clock.sleep,
     )
-    assert confirmed.status == "absent"
+    assert reconciled.status == "absent"
     assert all(name == "observe" for name, _value in sdk.calls)
 
 

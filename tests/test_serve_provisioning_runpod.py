@@ -38,10 +38,7 @@ from flash.serve.provisioning._runpod_protocol import (
     parse_pods,
     parse_templates,
 )
-from flash.serve.provisioning._runpod_resources import (
-    RunPodResourceConflict,
-    pod_identity_matches,
-)
+from flash.serve.provisioning._runpod_resources import pod_identity_matches
 from flash.serve.provisioning._runpod_transport import (
     GRAPHQL_URL,
     REST_BASE_URL,
@@ -51,8 +48,6 @@ from flash.serve.provisioning._runpod_transport import (
     build_no_redirect_opener,
 )
 from flash.serve.provisioning.runpod import (
-    confirm_runpod_absence,
-    grow_runpod_volume,
     provision_runpod_deployment,
     reconcile_runpod_deployment,
     teardown_runpod_deployment,
@@ -1677,60 +1672,6 @@ def test_ambiguous_adoption_artifact_cleanup_is_outcome_unknown() -> None:
     ]
 
 
-def test_volume_resize_only_grows_and_mutates_once() -> None:
-    bundle = _bundle()
-    transport = _FakeTransport()
-    handle = _seed_exact(transport, bundle)
-    factory = _Factory(transport)
-    clock = transport.clock
-    transport.calls.clear()
-
-    grown = grow_runpod_volume(
-        bundle,
-        handle,
-        RunPodCredentials(PROVIDER_SECRET),
-        150,
-        deadline_at=100.0,
-        transport_factory=factory,
-        clock=clock,
-        sleep=clock.sleep,
-    )
-    assert grown.status == "ready"
-    assert transport.volumes[0]["size"] == 150
-    patches = [call for call in _mutation_calls(transport) if call[1].startswith("PATCH ")]
-    assert len(patches) == 1
-    assert patches[0][3] == {"size": 150}
-
-    fresh_factory = _Factory(transport)
-    with pytest.raises(ValueError, match="cannot shrink"):
-        grow_runpod_volume(
-            bundle,
-            handle,
-            RunPodCredentials(PROVIDER_SECRET),
-            99,
-            deadline_at=100.0,
-            transport_factory=fresh_factory,
-            clock=clock,
-            sleep=clock.sleep,
-        )
-    assert fresh_factory.accepted_keys == []
-
-    transport.calls.clear()
-    shrink = grow_runpod_volume(
-        bundle,
-        handle,
-        RunPodCredentials(PROVIDER_SECRET),
-        125,
-        deadline_at=100.0,
-        transport_factory=factory,
-        clock=clock,
-        sleep=clock.sleep,
-    )
-    assert shrink.status == "failed"
-    assert shrink.error_code == "invalid_request"
-    assert _mutation_calls(transport) == []
-
-
 def test_teardown_deletes_pod_before_attached_volume_and_confirms_absence() -> None:
     bundle = _bundle()
     transport = _FakeTransport()
@@ -1763,14 +1704,17 @@ def test_teardown_deletes_pod_before_attached_volume_and_confirms_absence() -> N
     assert transport.secrets == []
 
     transport.calls.clear()
-    confirmed = confirm_runpod_absence(
+    reconciled = reconcile_runpod_deployment(
         bundle,
         RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=100.0,
         transport_factory=factory,
+        probe=_Probe(True),
         clock=clock,
+        sleep=clock.sleep,
     )
-    assert confirmed.status == "absent"
+    assert reconciled.status == "absent"
     assert _mutation_calls(transport) == []
 
 
@@ -3041,18 +2985,21 @@ def test_observation_survives_a_foreign_template_in_the_customers_account() -> N
     )
     clock = transport.clock
 
-    confirmed = confirm_runpod_absence(
+    reconciled = reconcile_runpod_deployment(
         bundle,
         RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
         deadline_at=100.0,
         transport_factory=_Factory(transport),
+        probe=_Probe(True),
         clock=clock,
+        sleep=clock.sleep,
     )
 
     # absent, not transport_failed: flash owns nothing here, and the foreign row is not flash's
     # business to validate.
-    assert confirmed.status == "absent"
-    assert confirmed.error_code is None
+    assert reconciled.status == "absent"
+    assert reconciled.error_code is None
 
 
 class _InterruptingProbe:
@@ -3275,84 +3222,3 @@ def test_runpod_readiness_requires_the_same_exact_provenance_as_modal() -> None:
     wrong = json.loads(json.dumps(exact))
     wrong["data"][0]["flash_provenance"]["requested_model"] = "someone-elses-model"
     assert not _provenance_matches(wrong, bundle)
-
-
-class _VolumeVanishesAfterPatchTransport(_FakeTransport):
-    """runpod accepts the resize PATCH, then answers the confirming observation with a 409.
-
-    The failure has to be a *definite* one. A `RunPodTransportFailure` carrying
-    `outcome_unknown=True` already propagates as unknown through `_from_transport_failure`, so it
-    cannot distinguish the fixed build from the broken one. `RunPodResourceConflict` is what the
-    old code turned into a flat `failed`, and it is realistic here: runpod rejects reads against a
-    volume that is mid-resize.
-
-    `_observe` also opens with `graphql` rather than `rest`, so a rest-only override never reaches
-    the post-mutation poll at all. Both entry points are overridden for that reason.
-    """
-
-    patched = False
-
-    def rest(self, method, path, payload, *, mutation, deadline_at, query=None):
-        if method == "PATCH" and path.startswith("/networkvolumes/"):
-            pre_patch_size = self.volumes[0]["size"]
-            result = super().rest(
-                method, path, payload, mutation=mutation, deadline_at=deadline_at, query=query
-            )
-            # runpod resizes asynchronously, so the volume still lists its old size right after the
-            # PATCH is accepted. restoring it matters for more than realism: leaving the fake's
-            # instant resize in place lets the very first poll see the target size and return
-            # `ready` before any confirming read is attempted, so the failure under test never
-            # happens and the test passes against a deliberately broken build.
-            self.volumes[0]["size"] = pre_patch_size
-            self.patched = True
-            return result
-        if self.patched:
-            raise RunPodResourceConflict("volume is busy resizing")
-        return super().rest(
-            method, path, payload, mutation=mutation, deadline_at=deadline_at, query=query
-        )
-
-    def graphql(self, query, variables, *, mutation, deadline_at):
-        if self.patched:
-            raise RunPodResourceConflict("volume is busy resizing")
-        return super().graphql(query, variables, mutation=mutation, deadline_at=deadline_at)
-
-
-def test_a_resize_that_fails_after_the_patch_is_unknown_not_failed() -> None:
-    """once the PATCH is issued, `failed` is a lie about a mutation that may have landed.
-
-    This is the same defect already fixed in `teardown_runpod_deployment`: `failed` reads as
-    "nothing changed" and suppresses the cli's reconcile warning, so the operator retries a resize
-    that may already be in flight against a volume they are paying for. The resize path was left
-    returning a plain failure from both of its handlers, so it contradicted the invariant its own
-    sibling establishes.
-
-    Asserted together with the pre-PATCH cases in `test_volume_resize_only_grows_and_mutates_once`,
-    which still expect `failed`/`invalid_request` -- the fix must narrow ambiguity to genuinely
-    post-mutation failures rather than blanket every rejection as unknown.
-    """
-
-    bundle = _bundle()
-    transport = _VolumeVanishesAfterPatchTransport()
-    handle = _seed_exact(transport, bundle)
-    factory = _Factory(transport)
-    clock = transport.clock
-    transport.calls.clear()
-
-    result = grow_runpod_volume(
-        bundle,
-        handle,
-        RunPodCredentials(PROVIDER_SECRET),
-        150,
-        deadline_at=100.0,
-        transport_factory=factory,
-        clock=clock,
-        sleep=clock.sleep,
-    )
-
-    patches = [call for call in _mutation_calls(transport) if call[1].startswith("PATCH ")]
-    assert len(patches) == 1, "the mutation must actually have been issued for this to be the case"
-    assert result.status == "outcome_unknown", (
-        f"a failure after the resize PATCH was reported as {result.status}; the volume may already "
-        "have been resized, so the outcome is unknown rather than a confirmed failure"
-    )

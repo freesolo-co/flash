@@ -41,6 +41,12 @@ def _environment(tmp_path: Path, *, artifact: bool = True) -> dict[str, str]:
     return environment
 
 
+def _run_with_environment(environment: dict[str, str]) -> None:
+    inference_token = environment.pop("FLASH_INFERENCE_TOKEN")
+    artifact_token = environment.pop("FLASH_ARTIFACT_TOKEN", None)
+    launch.run_launcher_with_secrets(inference_token, [artifact_token], environment=environment)
+
+
 @pytest.fixture(autouse=True)
 def _base_weights_present(monkeypatch):
     """treat the base weights as already on the volume unless a test says otherwise.
@@ -92,7 +98,7 @@ def test_launcher_uses_cache_first_without_reading_artifact_token(
     monkeypatch.setattr(launch, "hydrate_manifest", hydrate)
     monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
 
-    launch.run_launcher(environment)
+    _run_with_environment(environment)
 
     assert calls == ["validate"]
     assert captured["inference_token"] == INFERENCE_TOKEN
@@ -101,30 +107,6 @@ def test_launcher_uses_cache_first_without_reading_artifact_token(
     assert (tmp_path / "cache" / "serving-manifest.json").read_text() == (
         _manifest().canonical_json()
     )
-
-
-def test_direct_launcher_installs_signal_guard_before_secret_access(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    environment = _environment(tmp_path, artifact=False)
-    real_pop = launch._pop_runtime_secrets
-    observed = False
-
-    def pop_with_signal_assertion(selected_environment):
-        nonlocal observed
-        handler = launch.signal.getsignal(launch.signal.SIGTERM)
-        assert getattr(handler, "__self__", None).__class__ is launch._StartupSignalGuard
-        observed = True
-        return real_pop(selected_environment)
-
-    monkeypatch.setattr(launch, "_pop_runtime_secrets", pop_with_signal_assertion)
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "_serve", _successful_serve({}))
-
-    launch.run_launcher(environment)
-
-    assert observed is True
 
 
 def test_bootstrap_handoff_installs_inner_guard_before_restoring_outer(
@@ -172,7 +154,7 @@ def test_launcher_streams_secret_values_larger_than_pipe_capacity(
     monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
     monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
 
-    launch.run_launcher(environment)
+    _run_with_environment(environment)
 
     assert captured["inference_token"] == large_token
 
@@ -195,7 +177,7 @@ def test_launcher_cache_miss_requires_artifact_token_before_serving(
     monkeypatch.setattr(launch, "_serve", serve)
 
     with pytest.raises(launch.LaunchError, match="artifact token is required") as exc_info:
-        launch.run_launcher(environment)
+        _run_with_environment(environment)
 
     assert serve_calls == 0
     assert INFERENCE_TOKEN not in str(exc_info.value)
@@ -221,7 +203,7 @@ def test_launcher_hydrates_missing_cache_through_closed_descriptor(
     monkeypatch.setattr(launch, "hydrate_manifest", hydrate)
     monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
 
-    launch.run_launcher(environment)
+    _run_with_environment(environment)
 
     assert captured["artifact_token"] == ARTIFACT_TOKEN
     assert captured["inference_token"] == INFERENCE_TOKEN
@@ -280,7 +262,6 @@ def _secret_reachability_probe(fingerprint: bytes, expected_frames: set[str]):
 
         assert expected_frames <= frames.keys(), frames.keys()
         assert "_run_with_secrets" not in frames
-        assert "_prepare_from_environment" not in frames
         assert "_prepare_explicit_secrets" not in frames
         for name, active in frames.items():
             for local_name, value in active.f_locals.items():
@@ -300,22 +281,6 @@ def _secret_reachability_probe(fingerprint: bytes, expected_frames: set[str]):
 def _unpredictable_artifact_token() -> tuple[str, bytes]:
     token = f"artifact-{uuid.uuid4().hex}"
     return token, hashlib.sha256(token.encode()).digest()
-
-
-def test_direct_launcher_drops_the_artifact_token_before_the_server_loop(
-    monkeypatch, tmp_path: Path
-) -> None:
-    artifact_token, fingerprint = _unpredictable_artifact_token()
-    environment = _environment(tmp_path)
-    environment["FLASH_ARTIFACT_TOKEN"] = artifact_token
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(
-        launch,
-        "_serve",
-        _secret_reachability_probe(fingerprint, {"run_launcher", "_run_prepared"}),
-    )
-
-    launch.run_launcher(environment)
 
 
 def test_explicit_launcher_drops_the_artifact_token_before_the_server_loop(
@@ -384,7 +349,7 @@ def test_bootstrap_hydrates_base_weights_while_the_artifact_token_still_exists(
     monkeypatch.setattr(launch, "hydrate_base_weights", hydrate_weights)
     monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
 
-    launch.run_launcher(environment)
+    _run_with_environment(environment)
 
     assert captured["weights_token"] == ARTIFACT_TOKEN
 
@@ -408,7 +373,7 @@ def test_missing_base_weights_without_a_token_fail_before_the_engine_starts(
     monkeypatch.setattr(launch, "_serve", serve)
 
     with pytest.raises(launch.LaunchError, match="artifact token is required"):
-        launch.run_launcher(environment)
+        _run_with_environment(environment)
 
     assert serve_calls == 0
 
@@ -431,7 +396,7 @@ def test_cached_base_weights_are_not_downloaded_again_on_a_warm_restart(
     )
     monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
 
-    launch.run_launcher(environment)
+    _run_with_environment(environment)
 
     assert captured["inference_token"] == INFERENCE_TOKEN
 
@@ -452,7 +417,7 @@ def test_hub_cache_is_bound_to_the_volume_for_the_engine_child(
     monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
     monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
 
-    launch.run_launcher(environment)
+    _run_with_environment(environment)
 
     assert environment["HF_HOME"] == cache_root
     assert environment["HF_HUB_CACHE"] == str(launch.base_weights_cache_path(cache_root))
@@ -478,7 +443,7 @@ def test_engine_runtime_environment_is_applied_on_every_provider(
     monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
     monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
 
-    launch.run_launcher(environment)
+    _run_with_environment(environment)
 
     # the engine runs in this process, so the live environment is what actually decides the start
     # method. asserting only the child mapping would pass while the real path still forked.
@@ -501,7 +466,7 @@ def test_engine_runtime_environment_overrides_a_conflicting_inherited_value(
     monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
     monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
 
-    launch.run_launcher(environment)
+    _run_with_environment(environment)
 
     assert environment["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
     assert launch._scrub_child_environment(environment)["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
@@ -522,7 +487,7 @@ def test_compile_cache_is_bound_to_the_volume_on_every_provider(
     monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
     monkeypatch.delenv("VLLM_CACHE_ROOT", raising=False)
 
-    launch.run_launcher(environment)
+    _run_with_environment(environment)
 
     expected = str(Path(environment["FLASH_SERVING_CACHE_ROOT"]) / "vllm")
     # under the cache root, so the graphs land on the persistent volume rather than in the
@@ -569,7 +534,7 @@ def test_engine_start_is_sealed_offline_only_after_hydration(
     monkeypatch.setattr(launch, "hydrate_manifest", hydrate)
     monkeypatch.setattr(launch, "_serve", serve)
 
-    launch.run_launcher(environment)
+    _run_with_environment(environment)
 
     assert order == ["hydrate", "serve"]
     assert captured["constant"] is True
@@ -603,7 +568,7 @@ def test_sigterm_during_hydration_aborts_and_closes_startup_state(
     monkeypatch.setattr(launch, "_serve", serve)
 
     with pytest.raises(launch.StartupTerminated, match="startup was terminated") as exc_info:
-        launch.run_launcher(environment)
+        _run_with_environment(environment)
 
     assert exc_info.value.exit_code == 128 + launch.signal.SIGTERM
     assert serve_calls == 0
@@ -638,7 +603,7 @@ def test_sigint_during_bootstrap_closes_inference_descriptor(
     monkeypatch.setattr(launch, "_serve", terminate_during_bootstrap)
 
     with pytest.raises(launch.StartupTerminated, match="startup was terminated") as exc_info:
-        launch.run_launcher(environment)
+        _run_with_environment(environment)
 
     assert exc_info.value.exit_code == 128 + launch.signal.SIGINT
     assert captured_fd is not None
@@ -688,7 +653,9 @@ launch.hydrate_manifest = terminate
 launch.base_weights_are_cached = lambda *_a, **_k: True
 launch._serve = serve
 try:
-    launch.run_launcher(environment)
+    inference_token = environment.pop("FLASH_INFERENCE_TOKEN")
+    artifact_token = environment.pop("FLASH_ARTIFACT_TOKEN", None)
+    launch.run_launcher_with_secrets(inference_token, [artifact_token], environment=environment)
 except launch.StartupTerminated:
     pass
 else:
@@ -755,7 +722,9 @@ app_main.bootstrap_serving = bootstrap
 app_main.create_app = create_app
 launch._serve = app_main._serve
 try:
-    launch.run_launcher(environment)
+    inference_token = environment.pop("FLASH_INFERENCE_TOKEN")
+    artifact_token = environment.pop("FLASH_ARTIFACT_TOKEN", None)
+    launch.run_launcher_with_secrets(inference_token, [artifact_token], environment=environment)
 except launch.StartupTerminated as exc:
     assert exc.exit_code == 128 + launch.signal.SIGTERM
 else:
@@ -801,7 +770,7 @@ def test_launcher_does_not_rehydrate_a_present_corrupt_cache(monkeypatch, tmp_pa
     monkeypatch.setattr(launch, "hydrate_manifest", hydrate)
 
     with pytest.raises(launch.LaunchError, match="cache validation failed"):
-        launch.run_launcher(environment)
+        _run_with_environment(environment)
     assert hydrate_calls == 0
 
 
@@ -818,7 +787,7 @@ def test_launcher_rejects_external_binding_before_cache_or_serving(
     )
 
     with pytest.raises(launch.LaunchError, match="external binding"):
-        launch.run_launcher(environment)
+        _run_with_environment(environment)
     assert not (tmp_path / "cache").exists()
 
 
@@ -1012,7 +981,10 @@ def test_secret_source_conflict_closes_every_inherited_descriptor(tmp_path: Path
     environment["FLASH_ARTIFACT_TOKEN_FD"] = str(artifact_read)
 
     with pytest.raises(launch.LaunchError, match="multiple sources"):
-        launch.run_launcher(environment)
+        launch.start_launcher_process(
+            environment,
+            popen_factory=lambda *_args, **_kwargs: pytest.fail("must reject before process start"),
+        )
 
     for fd in (inference_read, artifact_read):
         with pytest.raises(OSError, match="Bad file descriptor"):
@@ -1027,7 +999,7 @@ def test_launcher_errors_and_output_never_include_plaintext_secrets(
     environment["FLASH_SERVING_MANIFEST"] = "not-base64"
 
     with pytest.raises(launch.LaunchError, match="encoded serving manifest is invalid") as exc_info:
-        launch.run_launcher(environment)
+        _run_with_environment(environment)
 
     captured = capsys.readouterr()
     rendered = str(exc_info.value) + repr(exc_info.value) + captured.out + captured.err

@@ -511,13 +511,6 @@ def _run_with_secrets(
     return inference_token, args, manifest
 
 
-def _prepare_from_environment(
-    environment: MutableMapping[str, str],
-) -> tuple[str, SimpleNamespace, Any]:
-    raw_inference, raw_artifact = _pop_runtime_secrets(environment)
-    return _run_with_secrets(environment, raw_inference, raw_artifact)
-
-
 def _prepare_explicit_secrets(
     environment: MutableMapping[str, str],
     inference_token: str,
@@ -542,15 +535,6 @@ def _run_prepared(
                 on_signals_installed=startup_signals.release_for_handoff,
             )
         )
-
-
-def run_launcher(environment: MutableMapping[str, str] | None = None) -> None:
-    """validate, hydrate if missing, and own the serving process in pid 1."""
-
-    environment = os.environ if environment is None else environment
-    with _StartupSignalGuard() as startup_signals:
-        prepared = _prepare_from_environment(environment)
-        _run_prepared(prepared, startup_signals)
 
 
 def run_launcher_with_secrets(

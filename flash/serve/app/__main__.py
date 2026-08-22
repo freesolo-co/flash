@@ -8,29 +8,13 @@ import os
 import signal
 from collections.abc import Callable
 from contextlib import contextmanager
-from pathlib import Path
 
 from .bootstrap import bootstrap_serving
 from .http import create_app
-from .manifest import ServingManifest, load_serving_manifest
+from .manifest import ServingManifest
 from .materialize import read_artifact_token_fd
 
-_MANIFEST_ENV = "FLASH_SERVING_MANIFEST"
-_MANIFEST_ID_ENV = "FLASH_SERVING_MANIFEST_ID"
-_IMAGE_DIGEST_ENV = "FLASH_SERVING_IMAGE_DIGEST"
-_CACHE_ROOT_ENV = "FLASH_SERVING_CACHE_ROOT"
 _INFERENCE_TOKEN_FD_ENV = "FLASH_INFERENCE_TOKEN_FD"
-
-
-def _bound_manifest(path: str) -> ServingManifest:
-    manifest = load_serving_manifest(Path(path).read_bytes())
-    expected_manifest = os.environ.get(_MANIFEST_ID_ENV)
-    expected_image = os.environ.get(_IMAGE_DIGEST_ENV)
-    if expected_manifest != manifest.manifest_id:
-        raise RuntimeError("serving manifest id does not match its external binding")
-    if expected_image != manifest.expected_oci_digest:
-        raise RuntimeError("serving image digest does not match its external binding")
-    return manifest
 
 
 def _read_inference_token(fd: int | None = None) -> str:

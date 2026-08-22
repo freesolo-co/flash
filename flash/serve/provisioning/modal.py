@@ -20,7 +20,6 @@ from ._common import (
     LifecycleFailure,
     ServingRuntimeSecrets,
     Sleeper,
-    failed_deployment_result,
 )
 from ._modal_lifecycle import (
     mutation,
@@ -47,7 +46,6 @@ from ._modal_resources import (
     ModalResourceConflict,
     ensure_unique_resources,
     exact_teardown_resources,
-    resources_are_absent,
 )
 from ._modal_sdk import (
     ModalNamedResource,
@@ -774,27 +772,6 @@ def _validate_handle(plan: ModalCreatePlan, handle: ModalProviderHandle) -> None
         raise ValueError("modal handle does not match the exact deployment generation")
 
 
-def resize_modal_volume(
-    bundle: DeploymentBundle,
-    handle: ModalProviderHandle,
-    credentials: ModalCredentials,
-    target_size_gb: int,
-    *,
-    sdk_factory: ModalSdkFactory = create_modal_sdk,
-) -> DeploymentResult:
-    """reject modal volume resizing locally because modal exposes no size api."""
-
-    if type(credentials) is not ModalCredentials:
-        raise ValueError("modal credentials must use the exact credential type")
-    if type(target_size_gb) is not int or target_size_gb <= 0:
-        raise ValueError("target_size_gb must be a positive integer")
-    plan = build_modal_create_plan(bundle)
-    _validate_handle(plan, handle)
-    if sdk_factory is None:
-        raise ValueError("sdk_factory must be callable")
-    return failed_deployment_result(plan.bundle.spec, "invalid_request", handle=handle)
-
-
 def _abort_created_resources(
     plan: ModalCreatePlan,
     sdk: ModalSdk,
@@ -956,34 +933,6 @@ def teardown_modal_deployment(
         if mutation_attempted:
             return unknown_result(plan, handle=handle)
         return failure_result(plan, from_sdk_failure(exc), handle=handle)
-    finally:
-        if sdk is not None:
-            sdk.close()
-
-
-def confirm_modal_absence(
-    bundle: DeploymentBundle,
-    credentials: ModalCredentials,
-    *,
-    deadline_at: float,
-    sdk_factory: ModalSdkFactory = create_modal_sdk,
-    clock: Clock = time.monotonic,
-) -> DeploymentResult:
-    """report absent only after authoritative workspace resource confirmation."""
-
-    validate_control_inputs(credentials, deadline_at, clock)
-    plan = build_modal_create_plan(bundle, phase="finalized")
-    sdk: ModalSdk | None = None
-    try:
-        sdk = open_sdk(sdk_factory, credentials, plan)
-        observation = observe(plan, sdk)
-        if resources_are_absent(observation, allow_terminal_app=False):
-            return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
-        return failure_result(plan, LifecycleFailure("conflict"))
-    except (ModalResourceConflict, ModalSdkFailure) as exc:
-        if isinstance(exc, ModalSdkFailure):
-            return failure_result(plan, from_sdk_failure(exc))
-        return failure_result(plan, LifecycleFailure("conflict"))
     finally:
         if sdk is not None:
             sdk.close()

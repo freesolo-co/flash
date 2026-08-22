@@ -692,77 +692,6 @@ def _validate_handle(plan: RunPodCreatePlan, handle: RunPodProviderHandle) -> No
         raise ValueError("runpod handle does not match the exact deployment generation")
 
 
-def grow_runpod_volume(
-    bundle: DeploymentBundle,
-    handle: RunPodProviderHandle,
-    credentials: RunPodCredentials,
-    target_size_gb: int,
-    *,
-    deadline_at: float,
-    transport_factory: TransportFactory = StdlibRunPodTransport,
-    clock: Clock = time.monotonic,
-    sleep: Sleeper = time.sleep,
-) -> DeploymentResult:
-    """grow the exact generation volume once and confirm its authoritative size."""
-
-    validate_control_inputs(credentials, deadline_at, clock)
-    plan = build_runpod_create_plan(bundle)
-    _validate_handle(plan, handle)
-    if type(target_size_gb) is not int or target_size_gb < plan.placement.volume_size_gb:
-        raise ValueError("target volume size cannot shrink the planned volume")
-    mutation_attempted = False
-    try:
-        transport = open_transport(transport_factory, credentials)
-        observation = _observe(plan, transport, deadline_at=deadline_at)
-        _secret, _template, volume, _pod = exact_core_resources(plan, observation)
-        if volume.id != handle.network_volume_id:
-            return failure_result(plan, LifecycleFailure("conflict"), handle=handle)
-        if target_size_gb < volume.size_gb:
-            return failure_result(plan, LifecycleFailure("invalid_request"), handle=handle)
-        if target_size_gb == volume.size_gb:
-            return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
-        # reads above are honest as `failed`; past the PATCH it is not. `failed` means "nothing
-        # changed", so it hides the reconcile warning and invites a retry of an in-flight resize.
-        mutation_attempted = True
-        resized = mutation_call(
-            lambda: transport.rest(
-                "PATCH",
-                f"/networkvolumes/{volume.id}",
-                {"size": target_size_gb},
-                mutation=True,
-                deadline_at=deadline_at,
-            ),
-            parse_created_volume,
-        )
-        assert type(resized) is RunPodVolumeObservation
-        if (
-            resized.id != volume.id
-            or resized.name != volume.name
-            or resized.data_center_id != volume.data_center_id
-            or resized.size_gb != target_size_gb
-        ):
-            raise RunPodTransportFailure("resource_ambiguous", outcome_unknown=True)
-        while True:
-            current = _observe(plan, transport, deadline_at=deadline_at)
-            _current_secret, _current_template, current_volume, _current_pod = exact_core_resources(
-                plan, current
-            )
-            if current_volume.size_gb == target_size_gb:
-                return DeploymentResult.from_spec(plan.bundle.spec, status="ready", handle=handle)
-            if current_volume.size_gb > target_size_gb:
-                return failure_result(plan, LifecycleFailure("conflict"), handle=handle)
-            if not sleep_until_poll(deadline_at, clock, sleep):
-                return unknown_result(plan, handle=handle)
-    except RunPodResourceConflict:
-        if mutation_attempted:
-            return unknown_result(plan, handle=handle)
-        return failure_result(plan, LifecycleFailure("conflict"), handle=handle)
-    except RunPodTransportFailure as exc:
-        if mutation_attempted:
-            return unknown_result(plan, handle=handle)
-        return failure_result(plan, _from_transport_failure(exc), handle=handle)
-
-
 def teardown_runpod_deployment(
     bundle: DeploymentBundle,
     handle: RunPodProviderHandle,
@@ -828,25 +757,3 @@ def teardown_runpod_deployment(
         if mutation_attempted:
             return unknown_result(plan, handle=handle)
         return failure_result(plan, _from_transport_failure(exc), handle=handle)
-
-
-def confirm_runpod_absence(
-    bundle: DeploymentBundle,
-    credentials: RunPodCredentials,
-    *,
-    deadline_at: float,
-    transport_factory: TransportFactory = StdlibRunPodTransport,
-    clock: Clock = time.monotonic,
-) -> DeploymentResult:
-    """report absent only after authoritative account-scoped list confirmation."""
-
-    validate_control_inputs(credentials, deadline_at, clock)
-    plan = build_runpod_create_plan(bundle)
-    try:
-        transport = open_transport(transport_factory, credentials)
-        observation = _observe(plan, transport, deadline_at=deadline_at)
-        if observation.resource_count == 0:
-            return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
-        return failure_result(plan, LifecycleFailure("conflict"))
-    except RunPodTransportFailure as exc:
-        return failure_result(plan, _from_transport_failure(exc))

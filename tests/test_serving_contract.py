@@ -8,7 +8,7 @@ import pytest
 
 from flash.serve.contract import (
     ADAPTER_REVISION_PATTERN,
-    REFERENCE_SERVING_CAPABILITIES,
+    PREFERRED_SERVING_CAPABILITIES,
     REQUIRED_SERVING_CAPABILITIES,
     ServingHealthError,
     parse_serving_health,
@@ -39,7 +39,9 @@ def test_dependency_light_health_parser_normalizes_the_serving_contract():
             "ok": True,
             "requires_key": False,
             "base_models": ["Qwen/Qwen3.5-4B"],
-            "capabilities": list(REFERENCE_SERVING_CAPABILITIES),
+            "capabilities": sorted(
+                REQUIRED_SERVING_CAPABILITIES | PREFERRED_SERVING_CAPABILITIES
+            ),
         }
     )
     assert health.ok is True

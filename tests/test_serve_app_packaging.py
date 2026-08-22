@@ -11,10 +11,6 @@ from pathlib import Path
 
 import pytest
 
-from flash.serve.app.__main__ import _bound_manifest
-from flash.serve.app.manifest import build_serving_manifest
-from tests.test_serve_app_manifest import _spec_and_inputs
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -169,21 +165,6 @@ assert artifact not in repr(observed)
         check=False,
     )
     assert result.returncode == 0, result.stderr
-
-
-def test_manifest_requires_external_manifest_and_image_bindings(
-    monkeypatch, tmp_path: Path
-) -> None:
-    manifest = build_serving_manifest(*_spec_and_inputs())
-    path = tmp_path / "manifest.json"
-    path.write_text(manifest.canonical_json())
-    monkeypatch.setenv("FLASH_SERVING_MANIFEST_ID", manifest.manifest_id)
-    monkeypatch.setenv("FLASH_SERVING_IMAGE_DIGEST", manifest.expected_oci_digest)
-    assert _bound_manifest(str(path)) == manifest
-
-    monkeypatch.setenv("FLASH_SERVING_MANIFEST_ID", "0" * 64)
-    with pytest.raises(RuntimeError, match="external binding"):
-        _bound_manifest(str(path))
 
 
 def test_dockerfile_serve_uses_existing_cuda_family_and_frozen_lock() -> None:
