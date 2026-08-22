@@ -228,6 +228,13 @@ def _docker_start_cmd(value: object) -> str:
 
 
 def _environment(value: object) -> tuple[tuple[str, str], ...]:
+    # runpod sends json null rather than an empty object for a resource with no overrides, exactly
+    # as it does for `ports` and `dockerStartCmd` above. every account resource is parsed before the
+    # name filter, so rejecting null failed the whole observation pass on the first foreign env-less
+    # pod or template -- blocking provision, readiness, and artifact cleanup for a deployment that
+    # never owned it. no overrides is the same observation as an empty map.
+    if value is None:
+        return ()
     if type(value) is dict:
         items = list(value.items())
     elif type(value) is list:

@@ -2538,6 +2538,66 @@ def test_observation_survives_a_resource_that_exposes_no_ports() -> None:
             )
 
 
+def test_observation_survives_a_resource_that_sets_no_environment() -> None:
+    # runpod sends `env: null` for a resource with no overrides rather than an empty object, the
+    # same shape `ports` and `dockerStartCmd` already had to accept. every account resource is
+    # parsed before the name filter, so rejecting null collapsed the whole listing into an opaque
+    # transport failure -- one foreign env-less pod blocked provision, readiness, and artifact
+    # cleanup for a deployment that never owned it.
+    pod = parse_pods(
+        [
+            {
+                "id": "abc123def45690",
+                "name": "envless",
+                "desiredStatus": "RUNNING",
+                "imageName": "pytorch/pytorch:2.6.0",
+                "gpuCount": 1,
+                "containerDiskInGb": 60,
+                "ports": "8000/http",
+                "env": None,
+                "machine": {"gpuTypeId": "NVIDIA H200", "dataCenterId": "EUR-IS-4"},
+            }
+        ]
+    )
+    assert pod[0].environment == ()
+
+    template = parse_templates(
+        [
+            {
+                "id": "tpl0000010",
+                "name": "envless-template",
+                "imageName": "pytorch/pytorch:2.6.0",
+                "dockerStartCmd": ["sleep", "infinity"],
+                "containerDiskInGb": 60,
+                "volumeMountPath": "/workspace",
+                "ports": "8000/http",
+                "env": None,
+            }
+        ]
+    )
+    assert template[0].environment == ()
+
+    # absence must stay absence rather than becoming a wildcard that lets any env shape through: a
+    # genuinely malformed value is still rejected, so this cannot mask a real schema change.
+    for malformed in (0, 12.5, "FOO=bar", True):
+        with pytest.raises(ValueError, match="template env must be an object or list"):
+            parse_pods(
+                [
+                    {
+                        "id": "abc123def45691",
+                        "name": "malformed-env",
+                        "desiredStatus": "RUNNING",
+                        "imageName": "pytorch/pytorch:2.6.0",
+                        "gpuCount": 1,
+                        "containerDiskInGb": 60,
+                        "ports": "8000/http",
+                        "env": malformed,
+                        "machine": {"gpuTypeId": "NVIDIA L4", "dataCenterId": "US-KS-2"},
+                    }
+                ]
+            )
+
+
 def test_template_observation_reads_argv_and_omitted_defaults() -> None:
     # dockerStartCmd comes back as argv and volumeInGb / isServerless are omitted at their
     # defaults rather than returned as 0 / false. demanding a string and a present key failed on
