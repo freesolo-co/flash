@@ -1698,6 +1698,9 @@ def _mem_util_inp(**over):
         "model_revision": "",
         "engine_len": 2048,
         "group_size": 8,
+        # a real rollout issues `prompts_per_step * group_size` sequences concurrently, and the kv
+        # pool is sized for all of them.
+        "prompts_per_step": 8,
     }
     inp.update(over)
     return inp
@@ -1722,7 +1725,8 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
         2048,
         float(get_gpu_info("H100").vram_gb),
         sleep_mode=True,
-        num_generations=8,
+        # the whole concurrent rollout: `prompts_per_step * group_size` from `_mem_util_inp`.
+        num_generations=8 * 8,
         active_params_b=None,
         fp8_kv=False,
         model_info=info,
@@ -1735,14 +1739,16 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
         2048,
         float(get_gpu_info("H100").vram_gb),
         sleep_mode=True,
-        num_generations=8,
+        num_generations=8 * 8,
         active_params_b=None,
         fp8_kv=False,
         model_info=info,
         tensor_parallel=1,
     )
     assert got == want == explicit_tp_one
-    assert got.hex() == "0x1.11eb851eb851ep-2"
+    # pinned exactly, and deliberately not recomputed from the model: a recomputed expectation is
+    # satisfied by whatever the code produces, which is what let a flat constant look intended.
+    assert got.hex() == "0x1.ccccccccccccdp-2"
     # and it is genuinely NOT the old constant, so the test cannot pass on an unwired build.
     assert got != rl_train._DEFAULT_GPU_MEM_UTIL
     assert got < rl_train._DEFAULT_GPU_MEM_UTIL
@@ -1793,14 +1799,60 @@ def test_gpu_mem_util_sizing_reaches_the_launch_config():
         gpu_type="H100",
         n_gpus=1,
     )
+    # the same `prompts_per_step` the cfg above was built with: the kv pool is sized for the whole
+    # concurrent rollout (`prompts_per_step * group_size`), so an expectation computed without it
+    # would size a different run than the one under test and pass only by coincidence.
     want = rl_train.resolve_gpu_mem_util(
-        _mem_util_inp(), gpu_type="H100", n_gpus=1, fp8_kv=False, sleep_unsupported=False
+        _mem_util_inp(prompts_per_step=16),
+        gpu_type="H100",
+        n_gpus=1,
+        fp8_kv=False,
+        sleep_unsupported=False,
     )
     assert cfg["gpu_mem_util"] == want
     assert (
         f"actor_rollout_ref.rollout.gpu_memory_utilization={want}"
         in rl_train.build_verl_overrides(cfg)
     )
+
+
+def test_kv_pool_is_sized_for_the_whole_rollout_not_one_group():
+    """`prompts_per_step * group_size` sequences are in flight, not `group_size`.
+
+    Sizing for one group budgets 8 sequences where the default 64-by-8 recipe issues 512. The
+    shortfall never raises -- it queues on the kv cache and throttles the async rollout invisibly.
+    """
+    one_group = rl_train.resolve_gpu_mem_util(
+        _mem_util_inp(model_id="Qwen/Qwen3.6-35B-A3B", group_size=8, prompts_per_step=1),
+        gpu_type="H100",
+        n_gpus=1,
+        fp8_kv=False,
+        sleep_unsupported=False,
+    )
+    full_rollout = rl_train.resolve_gpu_mem_util(
+        _mem_util_inp(model_id="Qwen/Qwen3.6-35B-A3B", group_size=8, prompts_per_step=64),
+        gpu_type="H100",
+        n_gpus=1,
+        fp8_kv=False,
+        sleep_unsupported=False,
+    )
+    assert full_rollout >= one_group
+
+
+def test_a_missing_prompt_count_does_not_silently_disable_sizing():
+    """Sizing is wrapped in a bare except that falls back to the flat constant.
+
+    So an indexing error on a key the caller omits would not surface as a failure -- it would hand
+    back exactly the reservation this sizing exists to replace, and read as "sizing ran".
+    """
+    inp = _mem_util_inp(model_id="Qwen/Qwen3.6-35B-A3B")
+    inp.pop("prompts_per_step")
+
+    got = rl_train.resolve_gpu_mem_util(
+        inp, gpu_type="B200", n_gpus=2, fp8_kv=False, sleep_unsupported=True
+    )
+
+    assert got != rl_train._DEFAULT_GPU_MEM_UTIL
 
 
 def test_multigpu_gpu_mem_util_shards_only_weights_and_frees_the_observed_shortfall():
