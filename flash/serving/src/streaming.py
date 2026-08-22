@@ -276,6 +276,7 @@ async def prepare_stream(
     expected_checkpoint: str | None,
 ) -> tuple[AsyncIterator[dict[str, Any]], dict[str, str], bool]:
     engine_payload = payload.model_copy(update={"adapter_id": target.adapter_id})
+    events: AsyncIterator[dict[str, Any]] | None = None
     try:
         # construction is inside the try with the first advance: ``EnginePool.stream_generate``
         # is declared as an ordinary method returning an AsyncIterator, so a conforming pool may
@@ -289,8 +290,16 @@ async def prepare_stream(
             expected_checkpoint=expected_checkpoint,
         )
         first = await anext(events)
-    except Exception as exc:
-        raise_if_engine_error(router, requested.adapter_id, exc)
+    except BaseException as exc:
+        # cancellation while waiting for the first engine event must still enter the pool iterator's
+        # finally block, which aborts the remote generation. ordinary dispatch failures need the same
+        # release before their existing http error mapping runs.
+        if events is not None:
+            with contextlib.suppress(Exception):
+                await _close_async_iterator(events)
+        if isinstance(exc, Exception):
+            raise_if_engine_error(router, requested.adapter_id, exc)
+        raise
     if first.get("type") == "ready":
         active_checkpoint = first.get("checkpoint")
         provenance = _revision_provenance(target, active_checkpoint)

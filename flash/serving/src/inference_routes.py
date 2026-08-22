@@ -7,6 +7,7 @@ Every route here is gated by ``ServingContext.authorize_inference``, which requi
 key unless the caller presents the shared internal key.
 """
 
+import asyncio
 import re
 import time
 import uuid
@@ -30,6 +31,7 @@ from flash.serving.src.serving_io import (
     _provenance_headers,
     _revision_provenance,
 )
+from flash.serving.src.streaming import _close_async_iterator
 from flash.serving.src.structured_outputs import StructuredOutputsError
 
 _FLASH_CHECKPOINT_MODEL_RE = re.compile(
@@ -154,6 +156,32 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     return JSONResponse(response, headers=response_headers)
 
 
+async def _wait_for_disconnect(request: Request) -> None:
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
+
+
+async def _discard_prepared_stream(
+    context: ServingContext,
+    requested: Any,
+    caller_org: str | None,
+    events: Any,
+) -> None:
+    try:
+        # prepare_stream always returns a replay iterator whose first advance is already-resolved.
+        # advancing it activates the wrapper's finally block and preserves billing for first-output
+        # work that won the race with a disconnect, without waiting for another engine event.
+        first = await anext(events)
+        if first.get("prompt_tokens") is not None and first.get("completion_tokens") is not None:
+            context.schedule_usage(requested, first, caller_org)
+    except StopAsyncIteration:
+        pass
+    finally:
+        await _close_async_iterator(events)
+
+
 async def _stream_chat_completion(
     context: ServingContext,
     request: Request,
@@ -167,30 +195,55 @@ async def _stream_chat_completion(
     include_usage: bool,
     caller_org: str | None,
 ) -> StreamingResponse:
-    events, checkpoint_headers, thinking = await context.prepare_stream(
-        req,
-        requested,
-        target,
-        expected_checkpoint=_expected_checkpoint(request),
+    preparation = asyncio.create_task(
+        context.prepare_stream(
+            req,
+            requested,
+            target,
+            expected_checkpoint=_expected_checkpoint(request),
+        )
     )
-    return StreamingResponse(
-        context.chat_stream(
-            record=requested,
-            events=events,
-            adapter_id=adapter_id,
-            completion_id=completion_id,
-            created=created,
-            include_usage=include_usage,
-            caller_org=caller_org,
-            thinking=thinking,
-        ),
-        media_type="text/event-stream",
-        # Disable proxy and CDN buffering so each SSE chunk reaches the client immediately.
-        # Without X-Accel-Buffering, Nginx accumulates tokens until its output buffer fills,
-        # adding 100+ ms of hidden TTFT for small completions.
-        headers={
-            "X-Accel-Buffering": "no",
-            "Cache-Control": "no-cache",
-            **checkpoint_headers,
-        },
-    )
+    disconnect = asyncio.create_task(_wait_for_disconnect(request))
+    prepared = None
+    transferred = False
+    try:
+        done, _ = await asyncio.wait({preparation, disconnect}, return_when=asyncio.FIRST_COMPLETED)
+        if disconnect in done:
+            disconnect.result()
+            raise asyncio.CancelledError
+        prepared = preparation.result()
+        events, checkpoint_headers, thinking = prepared
+        response = StreamingResponse(
+            context.chat_stream(
+                record=requested,
+                events=events,
+                adapter_id=adapter_id,
+                completion_id=completion_id,
+                created=created,
+                include_usage=include_usage,
+                caller_org=caller_org,
+                thinking=thinking,
+            ),
+            media_type="text/event-stream",
+            # Disable proxy and CDN buffering so each SSE chunk reaches the client immediately.
+            # Without X-Accel-Buffering, Nginx accumulates tokens until its output buffer fills,
+            # adding 100+ ms of hidden TTFT for small completions.
+            headers={
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache",
+                **checkpoint_headers,
+            },
+        )
+        transferred = True
+        return response
+    finally:
+        disconnect.cancel()
+        if not preparation.done():
+            preparation.cancel()
+        preparation_result, _ = await asyncio.gather(
+            preparation, disconnect, return_exceptions=True
+        )
+        if prepared is None and isinstance(preparation_result, tuple):
+            prepared = preparation_result
+        if prepared is not None and not transferred:
+            await _discard_prepared_stream(context, requested, caller_org, prepared[0])
