@@ -457,6 +457,41 @@ class _FakeTransport:
             raise AssertionError("unexpected fake delete path")
 
 
+class _AmbiguousAbortDeleteTransport(_FakeTransport):
+    def __init__(self, resource_kind: str, *, delete_lands: bool) -> None:
+        super().__init__()
+        self.resource_kind = resource_kind
+        self.delete_lands = delete_lands
+
+    def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
+        if mutation and "secretDelete" in document and self.resource_kind == "secret":
+            if self.delete_lands:
+                super().graphql(
+                    document,
+                    variables,
+                    mutation=mutation,
+                    deadline_at=deadline_at,
+                )
+            else:
+                self._honour_deadline(deadline_at)
+                self._record("graphql", "secretDelete", True, dict(variables))
+                self._begin_mutation()
+            raise RunPodTransportFailure("resource_ambiguous", outcome_unknown=True)
+        return super().graphql(
+            document,
+            variables,
+            mutation=mutation,
+            deadline_at=deadline_at,
+        )
+
+    def _delete(self, path: str) -> None:
+        if self.resource_kind == "template" and path == "/templates/template01":
+            if self.delete_lands:
+                super()._delete(path)
+            raise RunPodTransportFailure("resource_ambiguous", outcome_unknown=True)
+        super()._delete(path)
+
+
 def _seed_exact(
     transport: _FakeTransport,
     bundle: DeploymentBundle,
@@ -818,6 +853,44 @@ def test_create_failure_boundaries_reclaim_only_fully_confirmed_resources(
         assert not any(
             call[1] == "secretDelete" or "DELETE" in call[1] for call in _mutation_calls(transport)
         )
+
+
+@pytest.mark.parametrize(("resource_kind", "failure_boundary"), [("template", 4), ("secret", 2)])
+def test_abort_uses_observed_absence_after_ambiguous_delete(
+    resource_kind: str,
+    failure_boundary: int,
+) -> None:
+    bundle = _bundle()
+    transport = _AmbiguousAbortDeleteTransport(resource_kind, delete_lands=True)
+    transport.fail_mutation_at = failure_boundary
+    transport.failure_mode = "definite_before"
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "failed"
+    assert result.error_code == "provider_rejected"
+    assert transport.secrets == []
+    assert transport.templates == []
+    assert transport.volumes == []
+    assert transport.pods == []
+
+
+@pytest.mark.parametrize(("resource_kind", "failure_boundary"), [("template", 4), ("secret", 2)])
+def test_abort_stays_unknown_when_ambiguous_delete_leaves_resource_present(
+    resource_kind: str,
+    failure_boundary: int,
+) -> None:
+    bundle = _bundle()
+    transport = _AmbiguousAbortDeleteTransport(resource_kind, delete_lands=False)
+    transport.fail_mutation_at = failure_boundary
+    transport.failure_mode = "definite_before"
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "resource_ambiguous"
+    remaining = transport.templates if resource_kind == "template" else transport.secrets
+    assert len(remaining) == 1
 
 
 def test_malformed_success_id_binds_no_invalid_proxy_url() -> None:

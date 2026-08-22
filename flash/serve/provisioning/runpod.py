@@ -486,7 +486,11 @@ def _abort_created_resources(
         artifact = observation.artifact_secrets[0] if observation.artifact_secrets else None
         inference = observation.inference_secrets[0] if observation.inference_secrets else None
         if pod is not None:
-            _delete_rest_once(transport, f"/pods/{pod.id}", deadline_at=deadline_at)
+            try:
+                _delete_rest_once(transport, f"/pods/{pod.id}", deadline_at=deadline_at)
+            except RunPodTransportFailure as exc:
+                if not exc.outcome_unknown:
+                    raise
             if not _wait_for_pod_absence(
                 plan,
                 transport,
@@ -496,17 +500,33 @@ def _abort_created_resources(
             ):
                 return False
         if template is not None:
-            _delete_rest_once(transport, f"/templates/{template.id}", deadline_at=deadline_at)
+            try:
+                _delete_rest_once(transport, f"/templates/{template.id}", deadline_at=deadline_at)
+            except RunPodTransportFailure as exc:
+                if not exc.outcome_unknown:
+                    raise
         if volume is not None:
-            _delete_rest_once(
-                transport,
-                f"/networkvolumes/{volume.id}",
-                deadline_at=deadline_at,
-            )
+            try:
+                _delete_rest_once(
+                    transport,
+                    f"/networkvolumes/{volume.id}",
+                    deadline_at=deadline_at,
+                )
+            except RunPodTransportFailure as exc:
+                if not exc.outcome_unknown:
+                    raise
         if artifact is not None:
-            _delete_secret_once(transport, artifact.id, deadline_at=deadline_at)
+            try:
+                _delete_secret_once(transport, artifact.id, deadline_at=deadline_at)
+            except RunPodTransportFailure as exc:
+                if not exc.outcome_unknown:
+                    raise
         if inference is not None:
-            _delete_secret_once(transport, inference.id, deadline_at=deadline_at)
+            try:
+                _delete_secret_once(transport, inference.id, deadline_at=deadline_at)
+            except RunPodTransportFailure as exc:
+                if not exc.outcome_unknown:
+                    raise
         return _observe(plan, transport, deadline_at=deadline_at).resource_count == 0
     except (RunPodResourceConflict, RunPodTransportFailure):
         return False
