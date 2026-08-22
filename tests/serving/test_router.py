@@ -756,6 +756,38 @@ def _metered_chat_stream(events, reports):
     )
 
 
+def test_disconnect_after_role_chunk_preserves_ready_usage():
+    async def scenario():
+        reports = []
+        never = asyncio.Event()
+
+        async def events():
+            await asyncio.sleep(0.01)
+            yield {
+                "type": "ready",
+                "prompt_tokens": 11,
+                "completion_tokens": 1,
+                "request_id": "req-role-disconnect",
+            }
+            await never.wait()
+
+        stream = _metered_chat_stream(events(), reports)
+        role_chunk = await anext(stream)
+        await stream.aclose()
+        return role_chunk, reports
+
+    role_chunk, reports = asyncio.run(scenario())
+    assert b'"role":"assistant"' in role_chunk
+    assert reports == [
+        {
+            "type": "ready",
+            "prompt_tokens": 11,
+            "completion_tokens": 1,
+            "request_id": "req-role-disconnect",
+        }
+    ]
+
+
 def test_stream_disconnect_closes_engine_and_schedules_partial_usage_once():
     async def scenario():
         release_final = asyncio.Event()

@@ -66,6 +66,18 @@ async def _await_producer_shutdown(producer: asyncio.Task[None]) -> None:
         raise asyncio.CancelledError
 
 
+def _assistant_role_chunk(completion_id: str, created: int, adapter_id: str) -> bytes:
+    return _sse(
+        {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": adapter_id,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+    )
+
+
 async def _produce_openai_chat_stream(
     router: AdapterRouter,
     schedule_usage: Callable[[AdapterRecord, dict[str, Any], str | None], None],
@@ -86,23 +98,6 @@ async def _produce_openai_chat_stream(
             await output.put((chunk, error))
 
     try:
-        await emit(
-            _sse(
-                {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": adapter_id,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-            )
-        )
 
         def _delta_chunk(delta: dict[str, Any]) -> bytes:
             return _sse(
@@ -121,6 +116,18 @@ async def _produce_openai_chat_stream(
         guarded_events = terminating_on_engine_error(router, events, adapter_id)
         disconnect_wait = asyncio.create_task(disconnected.wait())
         try:
+            try:
+                first = await _next_event_or_disconnect(guarded_events, disconnect_wait)
+            except StopAsyncIteration:
+                first = None
+            if first is not None:
+                if (
+                    first.get("prompt_tokens") is not None
+                    and first.get("completion_tokens") is not None
+                ):
+                    latest_usage = first
+                guarded_events = _replay_first_event(first, guarded_events)
+            await emit(_assistant_role_chunk(completion_id, created, adapter_id))
             while True:
                 try:
                     event = await _next_event_or_disconnect(guarded_events, disconnect_wait)
