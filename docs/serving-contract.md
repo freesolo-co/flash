@@ -85,9 +85,10 @@ closed when the key is absent. A custom backend may intentionally be keyless.
 }
 ```
 
-Unknown top-level fields must not break registration. The backend owns `status` and
-`metadata.record_type`. Metadata must agree with the revision id, and `hf_revision` must be a full
-commit sha.
+Registration is a closed schema: an unknown top-level field is rejected with `422`. The backend
+owns `status` and `metadata.record_type`, so a client must omit them rather than send its own --
+sending `status` is itself an unknown field and fails the whole request. Metadata must agree with
+the revision id, and `hf_revision` must be a full commit sha.
 Return `200` or `202`. An identical retry must succeed, including while the first load is pending.
 Different identity under the same revision returns `409` or `422`.
 `GET /adapters/{id}` returns a bare record or `{"adapter": {...}}`. Echo every identity field. The
