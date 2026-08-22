@@ -480,8 +480,9 @@ def _run_with_secrets(
     environment: MutableMapping[str, str],
     raw_inference: str,
     raw_artifact: str | None,
-    startup_signals: _StartupSignalGuard,
-) -> None:
+) -> tuple[str, SimpleNamespace, Any]:
+    """hydrate while the artifact credential exists, then return only serving inputs."""
+
     _load_project_boundaries()
     try:
         secrets = ServingRuntimeSecrets(raw_inference, raw_artifact)
@@ -507,6 +508,31 @@ def _run_with_secrets(
         host=environment.get(_HOST_ENV, _DEFAULT_HOST),
         port=_port(environment),
     )
+    return inference_token, args, manifest
+
+
+def _prepare_from_environment(
+    environment: MutableMapping[str, str],
+) -> tuple[str, SimpleNamespace, Any]:
+    raw_inference, raw_artifact = _pop_runtime_secrets(environment)
+    return _run_with_secrets(environment, raw_inference, raw_artifact)
+
+
+def _prepare_explicit_secrets(
+    environment: MutableMapping[str, str],
+    inference_token: str,
+    artifact_token: str | None,
+) -> tuple[str, SimpleNamespace, Any]:
+    inference = _validate_secret(inference_token, "inference token")
+    artifact = _validate_secret(artifact_token, "artifact token", optional=True)
+    assert inference is not None
+    return _run_with_secrets(environment, inference, artifact)
+
+
+def _run_prepared(
+    prepared: tuple[str, SimpleNamespace, Any], startup_signals: _StartupSignalGuard
+) -> None:
+    inference_token, args, manifest = prepared
     with _secret_descriptor(inference_token) as inference_fd:
         asyncio.run(
             _serve(
@@ -523,13 +549,13 @@ def run_launcher(environment: MutableMapping[str, str] | None = None) -> None:
 
     environment = os.environ if environment is None else environment
     with _StartupSignalGuard() as startup_signals:
-        raw_inference, raw_artifact = _pop_runtime_secrets(environment)
-        _run_with_secrets(environment, raw_inference, raw_artifact, startup_signals)
+        prepared = _prepare_from_environment(environment)
+        _run_prepared(prepared, startup_signals)
 
 
 def run_launcher_with_secrets(
     inference_token: str,
-    artifact_token: str | None,
+    artifact_token_holder: list[str | None],
     *,
     environment: MutableMapping[str, str] | None = None,
     previous_signal_guard: _SignalGuardHandoff | None = None,
@@ -540,10 +566,14 @@ def run_launcher_with_secrets(
     with _StartupSignalGuard() as startup_signals:
         if previous_signal_guard is not None:
             startup_signals.adopt_previous(previous_signal_guard)
-        inference = _validate_secret(inference_token, "inference token")
-        artifact = _validate_secret(artifact_token, "artifact token", optional=True)
-        assert inference is not None
-        _run_with_secrets(environment, inference, artifact, startup_signals)
+        if type(artifact_token_holder) is not list or len(artifact_token_holder) != 1:
+            raise LaunchError("artifact token holder is invalid")
+        artifact_token = artifact_token_holder.pop()
+        prepared = _prepare_explicit_secrets(environment, inference_token, artifact_token)
+        # strings cannot be zeroed, so the only meaningful boundary is removing the last live
+        # reference after hydration returns and before the long-lived server frame exists.
+        del artifact_token
+        _run_prepared(prepared, startup_signals)
 
 
 def _scrub_child_environment(environment: MutableMapping[str, str]) -> dict[str, str]:

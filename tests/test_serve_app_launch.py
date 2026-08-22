@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import os
 import subprocess
 import sys
+import types
+import uuid
 from pathlib import Path
 
 import pytest
@@ -149,7 +153,7 @@ def test_bootstrap_handoff_installs_inner_guard_before_restoring_outer(
 
     launch.run_launcher_with_secrets(
         INFERENCE_TOKEN,
-        None,
+        [None],
         environment=environment,
         previous_signal_guard=PreviousGuard(),
     )
@@ -224,6 +228,136 @@ def test_launcher_hydrates_missing_cache_through_closed_descriptor(
     for key in ("artifact_fd", "inference_fd"):
         with pytest.raises(OSError, match="Bad file descriptor"):
             os.fstat(captured[key])
+
+
+def _value_contains_secret(value: object, fingerprint: bytes, seen: set[int]) -> bool:
+    if isinstance(value, str):
+        return hashlib.sha256(value.encode()).digest() == fingerprint
+    if value is None or isinstance(value, (bool, int, float, bytes)):
+        return False
+    identity = id(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    if isinstance(value, dict):
+        return any(
+            _value_contains_secret(item, fingerprint, seen)
+            for pair in value.items()
+            for item in pair
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_value_contains_secret(item, fingerprint, seen) for item in value)
+    if isinstance(value, (types.ModuleType, types.FunctionType, types.MethodType, type)):
+        return False
+    namespace = getattr(value, "__dict__", None)
+    if isinstance(namespace, dict) and _value_contains_secret(namespace, fingerprint, seen):
+        return True
+    for cls in type(value).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            try:
+                child = getattr(value, slot)
+            except (AttributeError, TypeError):
+                continue
+            if _value_contains_secret(child, fingerprint, seen):
+                return True
+    return False
+
+
+def _secret_reachability_probe(fingerprint: bytes, expected_frames: set[str]):
+    async def serve(_args, _manifest, *, inference_token_fd: int, on_signals_installed):
+        assert read_artifact_token_fd(inference_token_fd) == INFERENCE_TOKEN
+        frames: dict[str, object] = {}
+        frame = inspect.currentframe()
+        while frame is not None:
+            if frame.f_code.co_filename.endswith(
+                ("/flash/serve/app/launch.py", "/serve_launch.py")
+            ):
+                frames[frame.f_code.co_name] = frame
+            frame = frame.f_back
+
+        assert expected_frames <= frames.keys(), frames.keys()
+        assert "_run_with_secrets" not in frames
+        assert "_prepare_from_environment" not in frames
+        assert "_prepare_explicit_secrets" not in frames
+        for name, active in frames.items():
+            for local_name, value in active.f_locals.items():
+                assert not _value_contains_secret(value, fingerprint, set()), (
+                    f"artifact token remains reachable from {name}.{local_name}"
+                )
+
+        for signum in (launch.signal.SIGTERM, launch.signal.SIGINT):
+            launch.signal.signal(signum, lambda *_args: None)
+        restore_handlers = on_signals_installed()
+        for signum, handler in restore_handlers.items():
+            launch.signal.signal(signum, handler)
+
+    return serve
+
+
+def _unpredictable_artifact_token() -> tuple[str, bytes]:
+    token = f"artifact-{uuid.uuid4().hex}"
+    return token, hashlib.sha256(token.encode()).digest()
+
+
+def test_direct_launcher_drops_the_artifact_token_before_the_server_loop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    artifact_token, fingerprint = _unpredictable_artifact_token()
+    environment = _environment(tmp_path)
+    environment["FLASH_ARTIFACT_TOKEN"] = artifact_token
+    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(
+        launch,
+        "_serve",
+        _secret_reachability_probe(fingerprint, {"run_launcher", "_run_prepared"}),
+    )
+
+    launch.run_launcher(environment)
+
+
+def test_explicit_launcher_drops_the_artifact_token_before_the_server_loop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    artifact_token, fingerprint = _unpredictable_artifact_token()
+    environment = _environment(tmp_path, artifact=False)
+    environment.pop("FLASH_INFERENCE_TOKEN")
+    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(
+        launch,
+        "_serve",
+        _secret_reachability_probe(fingerprint, {"run_launcher_with_secrets", "_run_prepared"}),
+    )
+
+    holder = [artifact_token]
+    del artifact_token
+    launch.run_launcher_with_secrets(INFERENCE_TOKEN, holder, environment=environment)
+
+
+def test_root_bootstrap_drops_the_artifact_token_before_the_server_loop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import runpy
+
+    artifact_token, fingerprint = _unpredictable_artifact_token()
+    environment = _environment(tmp_path)
+    environment["FLASH_ARTIFACT_TOKEN"] = artifact_token
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(
+        launch,
+        "_serve",
+        _secret_reachability_probe(fingerprint, {"_run", "_run_prepared"}),
+    )
+    bootstrap = runpy.run_path(
+        Path(__file__).resolve().parents[1] / "serve_launch.py",
+        run_name="serve_launch_retention_probe",
+    )
+
+    bootstrap["_run"]()
 
 
 def test_bootstrap_hydrates_base_weights_while_the_artifact_token_still_exists(

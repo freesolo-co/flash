@@ -117,9 +117,11 @@ def _run() -> None:
         from flash.serve.app import launch
 
         try:
+            artifact_token_holder = [artifact_token]
+            del artifact_token
             launch.run_launcher_with_secrets(
                 inference_token,
-                artifact_token,
+                artifact_token_holder,
                 environment=os.environ,
                 previous_signal_guard=bootstrap_signals,
             )
