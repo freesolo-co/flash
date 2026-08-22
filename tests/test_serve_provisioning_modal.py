@@ -36,6 +36,7 @@ from flash.serve.provisioning._modal_plan import (
     build_modal_create_plan,
 )
 from flash.serve.provisioning._modal_probe import ModalEndpointProbe, _provenance_matches
+from flash.serve.provisioning._modal_readiness import ExpectedResources
 from flash.serve.provisioning._modal_sdk import (
     ModalAppObservation,
     ModalNamedResource,
@@ -44,6 +45,8 @@ from flash.serve.provisioning._modal_sdk import (
     PinnedModalSdk,
 )
 from flash.serve.provisioning.modal import (
+    _abort_created_resources,
+    _CreatedResources,
     confirm_modal_absence,
     provision_modal_deployment,
     reconcile_modal_deployment,
@@ -57,6 +60,7 @@ PROVIDER_SECRET = "provider-secret-sentinel"
 INFERENCE_SECRET = "inference-secret-sentinel"
 ARTIFACT_SECRET = "artifact-secret-sentinel"
 APP_ID = "ap-" + "A" * 22
+OTHER_APP_ID = "ap-" + "R" * 22
 FUNCTION_ID = "fu-" + "F" * 22
 INFERENCE_SECRET_ID = "st-" + "I" * 22
 ARTIFACT_SECRET_ID = "st-" + "A" * 22
@@ -1749,27 +1753,142 @@ class _DelayedAbortSdk(_FakeSdk):
         self.volumes.clear()
 
 
+def test_abort_declines_a_plan_identical_app_with_a_different_confirmed_id() -> None:
+    plan = build_modal_create_plan(_bundle(), phase="bootstrap")
+    sdk = _FakeSdk(plan)
+    _seed_exact(sdk, artifact=True)
+    sdk.apps = [replace(sdk.apps[0], app_id=OTHER_APP_ID)]
+    expected = ExpectedResources(
+        app_id=APP_ID,
+        volume_id=VOLUME_ID,
+        inference_secret_id=INFERENCE_SECRET_ID,
+        artifact_secret_id=ARTIFACT_SECRET_ID,
+    )
+    created = _CreatedResources(
+        inference=True,
+        artifact=True,
+        volume=True,
+        app_deployed=True,
+        confirmed=expected,
+    )
+    clock = _Clock()
+
+    absent = _abort_created_resources(
+        plan,
+        sdk,
+        created,
+        expected=expected,
+        deadline_at=100.0,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert absent is False
+    operations = [name for name, _value in sdk.calls]
+    assert operations == ["observe"], "abort mutated a plan-identical concurrent app"
+    assert sdk.apps[0].state == "deployed"
+    assert sdk.volumes
+    assert sdk.inference
+    assert sdk.artifact
+
+
+def test_abort_with_confirmed_ids_stops_waits_deletes_and_confirms_absence() -> None:
+    plan = build_modal_create_plan(_bundle(), phase="bootstrap")
+    sdk = _DelayedAbortSdk(plan)
+    _seed_exact(sdk, artifact=True)
+    expected = ExpectedResources(
+        app_id=APP_ID,
+        volume_id=VOLUME_ID,
+        inference_secret_id=INFERENCE_SECRET_ID,
+        artifact_secret_id=ARTIFACT_SECRET_ID,
+    )
+    created = _CreatedResources(
+        inference=True,
+        artifact=True,
+        volume=True,
+        app_deployed=True,
+        confirmed=expected,
+    )
+    clock = _Clock()
+
+    absent = _abort_created_resources(
+        plan,
+        sdk,
+        created,
+        expected=expected,
+        deadline_at=100.0,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert absent is True
+    operations = [name for name, _value in sdk.calls]
+    assert operations == [
+        "observe",
+        "stop_app",
+        "observe",
+        "observe",
+        "delete_artifact",
+        "delete_inference",
+        "delete_volume",
+        "observe",
+    ]
+    assert sdk.apps[0].state == "stopped"
+    assert sdk.volumes == []
+    assert sdk.inference == []
+    assert sdk.artifact == []
+
+
+def test_interrupt_before_create_returns_declines_race_winner_teardown() -> None:
+    class _InterruptBeforeCreateReturnsSdk(_FakeSdk):
+        def create_inference_secret(self, plan, value: str) -> ModalNamedResource:
+            assert value == INFERENCE_SECRET
+            self.plan = plan
+            _seed_exact(self, artifact=True)
+            raise KeyboardInterrupt
+
+    factory = _Factory()
+    factory.sdk_class = _InterruptBeforeCreateReturnsSdk
+
+    interruption: KeyboardInterrupt | None = None
+    try:
+        _provision(_bundle(), factory)
+    except KeyboardInterrupt as exc:
+        interruption = exc
+    except Exception as exc:
+        pytest.fail(f"abort crashed before handling missing ownership evidence: {exc!r}")
+    else:
+        pytest.fail("the injected interrupt did not propagate")
+
+    sdk = factory.sdk
+    assert sdk is not None
+    operations = [name for name, _value in sdk.calls]
+    assert operations == ["observe"], "abort mutated without confirmed provider ids"
+    assert isinstance(interruption, InterruptedProvisioning)
+    assert sdk.apps[0].state == "deployed"
+    assert sdk.volumes
+    assert sdk.inference
+    assert sdk.artifact
+
+
 def test_abort_does_not_report_confirmed_cleanup_while_the_volume_remains() -> None:
     class _RetainedVolumeSdk(_FakeSdk):
-        def deploy_app(self, plan) -> str:
-            super().deploy_app(plan)
-            raise ModalSdkFailure("provider_rejected")
-
         def delete_volume(self, plan) -> None:
             self.calls.append(("delete_volume", None))
 
     factory = _Factory()
     factory.sdk_class = _RetainedVolumeSdk
-    result, _probe = _provision(_bundle(), factory)
+
+    with pytest.raises(InterruptedProvisioning):
+        _provision(_bundle(), factory, probe=_InterruptingProbe())
 
     sdk = factory.sdk
     assert sdk is not None
-    assert result.status == "outcome_unknown", (
-        "abort reported a definite failure after trusting the volume delete acknowledgement"
-    )
-    assert result.error_code == "resource_ambiguous"
     assert sdk.volumes, "the test did not retain the volume it is meant to detect"
-    assert [name for name, _value in sdk.calls].count("observe") >= 3
+    operations = [name for name, _value in sdk.calls]
+    assert operations.count("observe") >= 3
+    assert "stop_app" in operations
+    assert "delete_volume" in operations
 
 
 def test_abort_waits_for_terminal_state_and_confirms_absence_before_success() -> None:
@@ -2073,27 +2192,6 @@ def test_a_failed_abort_delete_reports_that_cleanup_was_not_confirmed() -> None:
                 "create_inference",
                 "create_artifact",
                 "create_volume",
-                "observe",
-                "delete_artifact",
-                "delete_inference",
-                "delete_volume",
-                "observe",
-            ],
-        ),
-        # the deploy itself, which is the expensive one: by the time it fails the gpu app is live
-        # and billing, so the abort has to stop compute before it can delete the volume the app
-        # still has mounted. this case ran inside the create's own `except`, which returned the
-        # failure directly and never let the aborting handler see it.
-        (
-            "deploy_app",
-            [
-                "observe",
-                "create_inference",
-                "create_artifact",
-                "create_volume",
-                "deploy_app",
-                "observe",
-                "stop_app",
                 "observe",
                 "delete_artifact",
                 "delete_inference",

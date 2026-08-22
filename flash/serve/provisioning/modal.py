@@ -81,9 +81,9 @@ class _CreatedResources:
     Marking first inverts the error: the worst case is deleting a resource that was never made,
     and every delete here is name-addressed with `allow_missing=True`, so that case is a no-op.
 
-    Flags rather than handles because nothing needs the ids. Deletes address secrets and the volume
-    by their plan-derived names, which are known before any call is issued -- which is also what
-    makes marking-before-the-call able to clean up a resource whose handle was never seen.
+    The flags remain separate from `confirmed`: an attempted create is enough to try a name-addressed
+    delete only while no app is observable, but it cannot prove ownership of an observed resource.
+    provider ids enter `confirmed` only after the mutation return reaches this invocation.
 
     `app_deployed` is the expensive one. The secrets and the volume are cheap storage; the app is
     the live GPU deployment, and it starts billing the moment `deploy_app` returns, which is well
@@ -95,6 +95,7 @@ class _CreatedResources:
     artifact: bool = False
     volume: bool = False
     app_deployed: bool = False
+    confirmed: ExpectedResources | None = None
 
     @property
     def any_created(self) -> bool:
@@ -123,12 +124,14 @@ def _create_resources(
     assert type(inference) is ModalNamedResource
     assert artifact is None or type(artifact) is ModalNamedResource
     assert type(volume) is ModalNamedResource
-    return ExpectedResources(
+    expected = ExpectedResources(
         app_id=None,
         volume_id=volume.id,
         inference_secret_id=inference.id,
         artifact_secret_id=None if artifact is None else artifact.id,
     )
+    record.confirmed = expected
+    return expected
 
 
 def _deploy_once_then_wait(
@@ -166,6 +169,8 @@ def _deploy_once_then_wait(
         inference_secret_id=expected.inference_secret_id,
         artifact_secret_id=expected.artifact_secret_id,
     )
+    if created is not None:
+        created.confirmed = expected_after_deploy
     return wait_for_phase(
         plan,
         sdk,
@@ -565,6 +570,7 @@ def provision_modal_deployment(
     finalized_plan = build_modal_create_plan(bundle, phase="finalized")
     sdk: ModalSdk | None = None
     created = _CreatedResources()
+    expected: ExpectedResources | None = None
     reached_ready = False
     try:
         sdk = open_sdk(sdk_factory, credentials, finalized_plan)
@@ -658,6 +664,7 @@ def provision_modal_deployment(
                 create_plan,
                 sdk,
                 created,
+                expected=created.confirmed or expected,
                 deadline_at=deadline_at,
                 clock=clock,
                 sleep=sleep,
@@ -680,6 +687,7 @@ def provision_modal_deployment(
                 create_plan,
                 sdk,
                 created,
+                expected=created.confirmed or expected,
                 deadline_at=deadline_at,
                 clock=clock,
                 sleep=sleep,
@@ -792,6 +800,7 @@ def _abort_created_resources(
     sdk: ModalSdk,
     created: _CreatedResources,
     *,
+    expected: ExpectedResources | None,
     deadline_at: float,
     clock: Clock,
     sleep: Sleeper,
@@ -805,12 +814,19 @@ def _abort_created_resources(
         return False
 
     if initial.apps:
+        if expected is None or expected.app_id is None:
+            # plan identity cannot distinguish this invocation from a concurrent deploy of the same
+            # generation: both callers produce byte-identical names, tags, and app identity. an
+            # attempted deploy therefore proves nothing about the observed app. refusing teardown
+            # may leave our own ambiguous create for later proof-based reclaim, while stopping a
+            # race winner destroys a live deployment and cannot be recovered. ambiguity stays live.
+            return False
         try:
             proof = phase_proof(
                 plan,
                 initial,
                 artifact_present=plan.phase == "bootstrap",
-                expected=None,
+                expected=expected,
             )
         except ModalResourceConflict:
             return False
