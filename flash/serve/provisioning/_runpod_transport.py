@@ -22,9 +22,22 @@ USER_AGENT = "flash-serving"
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 # enough to reach the message in runpod's error envelope without buffering a large body.
 _ERROR_BODY_BYTES = 4096
-# runpod's own wording for "the gpu you asked for is not available right now", returned as a
-# 500 rather than the 402/429 it uses elsewhere for the same condition.
-_NO_CAPACITY_RE = re.compile(r"no instances currently available", re.IGNORECASE)
+# runpod answers several *definite* rejections with a 500 whose body states the reason. a 5xx is
+# ambiguous by default because the mutation may have landed, but for these the provider is telling
+# us it refused before creating anything -- so reporting them as unknown would send the user to
+# `serve status` and `serve undeploy` for resources that never existed, and would bury the one
+# sentence that says how to fix the request. each pattern must be specific enough that no
+# genuinely-ambiguous 5xx can match it.
+_DEFINITE_5XX: tuple[tuple[re.Pattern[str], DeploymentErrorCode], ...] = (
+    # "the gpu you asked for is not available right now", where runpod uses 402/429 elsewhere.
+    (re.compile(r"no instances currently available", re.IGNORECASE), "capacity_unavailable"),
+    # an unsupported datacenter for the requested resource. the body names the valid ones, so this
+    # is an actionable config error, not a transient one worth retrying.
+    (
+        re.compile(r"not found or does not support network volumes", re.IGNORECASE),
+        "provider_rejected",
+    ),
+)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -255,12 +268,9 @@ class StdlibRunPodTransport:
     @staticmethod
     def _http_error_code(status: int, *, mutation: bool, body: str = "") -> RunPodTransportFailure:
         if 300 <= status < 400 or status == 408 or 500 <= status < 600:
-            # runpod answers a plain capacity shortfall with a 500 whose body says so. nothing was
-            # created, so treating it as ambiguous would tell the user resources may be billing and
-            # send them to `serve status` and `serve undeploy` for a pod that never existed. only
-            # this exact wording narrows: any other 5xx may have landed and must stay unknown.
-            if _NO_CAPACITY_RE.search(body) is not None:
-                return RunPodTransportFailure("capacity_unavailable")
+            for pattern, definite in _DEFINITE_5XX:
+                if pattern.search(body) is not None:
+                    return RunPodTransportFailure(definite)
             return RunPodTransportFailure(
                 "resource_ambiguous" if mutation else "transport_failed",
                 outcome_unknown=mutation,

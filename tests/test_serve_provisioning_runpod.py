@@ -3455,8 +3455,35 @@ def test_no_capacity_500_is_a_definite_rejection_not_an_ambiguous_outcome() -> N
     assert exc_info.value.outcome_unknown is False
 
 
+def test_unsupported_datacenter_500_is_a_definite_rejection_not_an_ambiguous_outcome() -> None:
+    """an unsupported datacenter is a config error runpod also reports as a 500.
+
+    measured live against `POST /networkvolumes` with `US-TX-4`, which has L40S capacity but no
+    network-volume support: `{"error":"create network volume: Data center \\"US-TX-4\\" not found
+    or does not support network volumes. Available data centers: ...","status":500}`. the provider
+    refused before creating anything and its body names the datacenters that would work, so
+    reporting `outcome_unknown` both invents a cleanup problem and buries the fix. `capacity` is
+    the wrong code here -- waiting will never help, the request itself has to change.
+    """
+    body = (
+        b'{"error":"create network volume: Data center \\"US-TX-4\\" not found or does not '
+        b'support network volumes. Available data centers: US-TX-3, US-WA-1.","status":500}'
+    )
+
+    def opener(_request, *, timeout: float):
+        raise urllib.error.HTTPError(
+            "https://rest.runpod.io/v1/networkvolumes", 500, "sanitized", None, io.BytesIO(body)
+        )
+
+    transport = StdlibRunPodTransport(PROVIDER_SECRET, opener=opener, clock=lambda: 0.0)
+    with pytest.raises(RunPodTransportFailure) as exc_info:
+        transport.rest("POST", "/networkvolumes", {}, mutation=True, deadline_at=10.0)
+    assert exc_info.value.code == "provider_rejected"
+    assert exc_info.value.outcome_unknown is False
+
+
 def test_unrelated_500_stays_ambiguous_on_a_mutation() -> None:
-    """only the provider's own no-capacity wording is definite; every other 5xx stays unknown.
+    """only the provider's own stated refusals are definite; every other 5xx stays unknown.
 
     a 500 whose cause is not stated may well have landed, so narrowing must not leak into the
     general case that protects a possibly-created resource from being forgotten.
