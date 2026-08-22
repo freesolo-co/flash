@@ -631,6 +631,41 @@ def test_adoption_of_a_cold_bootstrap_app_waits_instead_of_probing_once() -> Non
     assert ("deploy_app", "finalized") in sdk.calls
 
 
+def test_fresh_readiness_timeout_aborts_confirmed_resources() -> None:
+    factory = _Factory()
+
+    result, _probe = _provision(_bundle(), factory, probe=_Probe(False))
+
+    sdk = factory.sdk
+    assert sdk is not None
+    assert result.status == "failed"
+    assert result.error_code == "readiness_failed"
+    assert sdk.apps[0].state == "stopped"
+    assert sdk.volumes == []
+    assert sdk.inference == []
+    assert sdk.artifact == []
+
+
+def test_fresh_readiness_timeout_preserves_confirmed_handle_when_cleanup_is_unknown() -> None:
+    class _RetainedVolumeSdk(_FakeSdk):
+        def delete_volume(self, plan) -> None:
+            self.calls.append(("delete_volume", None))
+
+    factory = _Factory()
+    factory.sdk_class = _RetainedVolumeSdk
+
+    result, _probe = _provision(_bundle(), factory, probe=_Probe(False))
+
+    sdk = factory.sdk
+    assert sdk is not None
+    assert result.status == "outcome_unknown"
+    assert result.handle is not None
+    assert result.handle.app_id == APP_ID
+    assert result.handle.volume_id == VOLUME_ID
+    assert result.handle.inference_secret_id == INFERENCE_SECRET_ID
+    assert sdk.volumes, "the test did not retain the volume it is meant to report"
+
+
 def test_adoption_keeps_the_artifact_when_readiness_is_never_proven() -> None:
     """reclaim follows proof of readiness, never precedes it.
 

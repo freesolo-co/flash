@@ -130,6 +130,32 @@ def delete_confirmed_abort_resources(
         return False
 
 
+def confirmed_abort_handle(
+    plan: ModalCreatePlan,
+    expected: ExpectedResources | None,
+) -> ModalProviderHandle | None:
+    """build the recovery handle only from provider ids confirmed by this invocation."""
+
+    if expected is None or expected.app_id is None:
+        return None
+    return ModalProviderHandle(
+        deployment_id=plan.bundle.spec.deployment_id,
+        generation=plan.bundle.spec.generation,
+        engine_id=plan.bundle.spec.engine.engine_id,
+        workspace_name=plan.placement.workspace_name,
+        app_id=expected.app_id,
+        app_name=plan.names.app_or_pod,
+        volume_id=expected.volume_id,
+        volume_name=plan.names.volume,
+        inference_secret_id=expected.inference_secret_id,
+        inference_secret_name=plan.names.inference_secret,
+        environment=plan.placement.environment,
+        region=plan.placement.region,
+        image_digest=plan.bundle.image.digest,
+        public_url=plan.expected_public_url,
+    )
+
+
 def confirm_teardown_absence(
     plan: ModalCreatePlan,
     sdk: ModalSdk,

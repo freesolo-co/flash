@@ -57,6 +57,7 @@ from ._modal_sdk import (
 )
 from ._modal_teardown import (
     confirm_teardown_absence,
+    confirmed_abort_handle,
     delete_confirmed_abort_resources,
     delete_teardown_resources,
     suppressed,
@@ -580,6 +581,30 @@ def _adopt_existing(
     )
 
 
+def _readiness_timeout_result(
+    create_plan: ModalCreatePlan,
+    finalized_plan: ModalCreatePlan,
+    sdk: ModalSdk,
+    created: _CreatedResources,
+    deadline_at: float,
+    clock: Clock,
+    sleep: Sleeper,
+) -> DeploymentResult:
+    cleaned = _abort_created_resources(
+        create_plan,
+        sdk,
+        created,
+        expected=created.confirmed,
+        deadline_at=deadline_at,
+        clock=clock,
+        sleep=sleep,
+    )
+    handle = confirmed_abort_handle(finalized_plan, created.confirmed)
+    if not cleaned:
+        return unknown_result(finalized_plan, handle=handle)
+    return failure_result(finalized_plan, LifecycleFailure("readiness_failed"))
+
+
 def provision_modal_deployment(
     bundle: DeploymentBundle,
     credentials: ModalCredentials,
@@ -651,7 +676,9 @@ def provision_modal_deployment(
                 return unknown_result(finalized_plan)
             raise
         if phase is None:
-            return unknown_result(finalized_plan)
+            return _readiness_timeout_result(
+                create_plan, finalized_plan, sdk, created, deadline_at, clock, sleep
+            )
         # the app is deployed and has answered the readiness probe. from here the only remaining
         # work is swapping the bootstrap phase out for the finalized one, so an interrupt must
         # leave the deployment standing rather than delete what the user just waited for.
