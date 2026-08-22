@@ -28,6 +28,10 @@ from ._runpod_protocol import (
 MAX_RUNPOD_REQUEST_BYTES = 128 * 1024
 MAX_RUNPOD_ENVIRONMENT_BYTES = 96 * 1024
 
+# runpod's template create schema accepts this key; its update schema rejects unknown keys and
+# does not list it. sending the create body back to PATCH fails with 400 "Extra input keys".
+_TEMPLATE_CREATE_ONLY_KEY = "isServerless"
+
 
 def _canonical_payload(value: dict[str, object], name: str) -> str:
     encoded = json.dumps(
@@ -108,6 +112,18 @@ class RunPodCreatePlan:
             if include_artifact_secret
             else self.template_without_artifact_json
         )
+
+    def template_update_payload(self) -> dict[str, object]:
+        """the create payload minus the keys PATCH /templates rejects.
+
+        `isServerless` is create-only: the update schema refuses unknown keys, so sending the
+        create body back fails every attempt with 400 rather than stripping the artifact
+        reference. the create payload must keep it, so only the update body drops it.
+        """
+
+        payload = self.template_payload(False)
+        del payload[_TEMPLATE_CREATE_ONLY_KEY]
+        return payload
 
     def pod_environment_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {"env": dict(self.environment_without_artifact)}

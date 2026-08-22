@@ -93,6 +93,13 @@ def unknown_result(
     )
 
 
+# a patch carrying one of these is wrong about the request itself, so every retry sends the same
+# body and collects the same answer. `capacity_unavailable` covers rate limiting and stays out.
+_PATCH_REJECTIONS: frozenset[str] = frozenset(
+    {"authentication_failed", "conflict", "not_found", "provider_rejected"}
+)
+
+
 def sleep_until_poll(deadline_at: float, clock: Clock, sleep: Sleeper) -> bool:
     remaining = deadline_at - clock()
     if remaining <= 0:
@@ -403,14 +410,23 @@ def delete_artifact_and_confirm(
         try:
             if needs_template_patch:
                 template_patch_attempted = True
-                patch_template(template.id, plan.template_payload(False))
+                patch_template(template.id, plan.template_update_payload())
             if needs_pod_patch:
                 pod_patch_attempted = True
                 # the payload carries only flash-authored entries. if runpod replaces rather than merges
                 # the map, provider-added values such as PUBLIC_KEY are dropped; the serving workload does
                 # not consume them. if runpod retains them, the subset check below deliberately allows it.
                 patch_pod(pod.id, plan.pod_environment_payload())
-        except RunPodTransportFailure:
+        except RunPodTransportFailure as exc:
+            # a rejection of the request itself answers the same way every attempt, so retrying it
+            # only burns the deadline and then reports `outcome_unknown` for a failure the provider
+            # already stated definitively. rate limiting and unknown outcomes stay retryable.
+            if not exc.outcome_unknown and exc.code in _PATCH_REJECTIONS:
+                return failure_result(
+                    plan,
+                    LifecycleFailure(exc.code, reason="artifact_cleanup_patch_rejected"),
+                    handle=handle,
+                )
             if sleep_until_poll(deadline_at, clock, sleep):
                 continue
             return unknown_result(

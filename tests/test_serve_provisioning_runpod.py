@@ -1361,11 +1361,13 @@ def test_artifact_cleanup_does_not_repatch_an_already_stripped_pod() -> None:
 
 
 def test_artifact_pod_environment_patch_retries_transient_failure() -> None:
+    # `ambiguous_before`, not `definite_before`: a 4xx `provider_rejected` answers identically on
+    # every attempt, so it is terminal rather than transient. only an unknown outcome is re-observed.
     bundle = _bundle()
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle, artifact_secret=True)
     transport.fail_mutation_at = 2
-    transport.failure_mode = "definite_before"
+    transport.failure_mode = "ambiguous_before"
     transport.calls.clear()
 
     result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
@@ -1382,7 +1384,13 @@ def test_artifact_pod_environment_patch_retries_transient_failure() -> None:
     assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
 
 
-def test_artifact_environment_patch_failure_exhausts_the_deadline() -> None:
+def test_artifact_environment_patch_rejection_fails_without_retrying() -> None:
+    """a definite rejection answers identically every attempt, so retrying it only burns the clock.
+
+    a live deploy spent its whole deadline re-sending a payload runpod had already rejected with
+    400, then reported `outcome_unknown` for a failure the provider had stated definitively.
+    """
+
     bundle = _bundle()
 
     class _PersistentPatchFailureTransport(_FakeTransport):
@@ -1397,13 +1405,52 @@ def test_artifact_environment_patch_failure_exhausts_the_deadline() -> None:
     result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
     patch_calls = [call for call in _mutation_calls(transport) if call[1].startswith("PATCH ")]
 
+    assert result.status == "failed"
+    assert result.error_code == "provider_rejected"
+    assert result.error_reason == "artifact_cleanup_patch_rejected"
+    assert result.handle == handle
+    assert len(patch_calls) == 1, "a definite rejection must not be retried"
+    assert transport.clock.now < 100.0, "the deadline must not be spent on a stated failure"
+    assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
+
+
+def test_artifact_environment_patch_still_retries_an_unknown_outcome() -> None:
+    """the fast-fail above must not swallow a genuinely ambiguous mutation, which may have landed."""
+
+    bundle = _bundle()
+
+    class _AmbiguousPatchFailureTransport(_FakeTransport):
+        def _begin_mutation(self) -> None:
+            super()._begin_mutation()
+            raise RunPodTransportFailure("resource_ambiguous", outcome_unknown=True)
+
+    transport = _AmbiguousPatchFailureTransport()
+    handle = _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+    patch_calls = [call for call in _mutation_calls(transport) if call[1].startswith("PATCH ")]
+
     assert result.status == "outcome_unknown"
-    assert result.error_code == "resource_ambiguous"
     assert result.error_reason == "artifact_cleanup_patch_unknown"
     assert result.handle == handle
-    assert transport.clock.now == 100.0
-    assert len(patch_calls) > 1, "the persistent patch failure was not retried"
-    assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
+    assert len(patch_calls) > 1, "an unknown outcome must still be retried"
+
+
+def test_template_update_payload_drops_the_create_only_key() -> None:
+    """`isServerless` is accepted by template create and rejected by template update.
+
+    runpod's update schema refuses unknown keys, so reusing the create body made every artifact
+    cleanup attempt fail with 400 "Extra input keys". the create payload must still carry it.
+    """
+
+    plan = build_runpod_create_plan(_bundle())
+    create = plan.template_payload(False)
+    update = plan.template_update_payload()
+
+    assert "isServerless" in create
+    assert "isServerless" not in update
+    assert update == {key: value for key, value in create.items() if key != "isServerless"}
 
 
 def test_lost_artifact_pod_patch_response_is_confirmed_before_secret_delete() -> None:
