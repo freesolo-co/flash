@@ -499,24 +499,28 @@ def resolve_gpu_mem_util(
     n_gpus: int,
     fp8_kv: bool,
     sleep_unsupported: bool,
+    preserve_legacy_floor: bool = False,
 ) -> float:
     """size vllm's colocated executor budget from this run's geometry.
 
     ``gpu_memory_utilization`` covers the second bf16 weight copy plus kv pool. using
     ``colocate_kv_util`` keeps worker allocation aligned with preflight admission.
 
-    the flat constant is kept where the model does NOT apply, because a wrong number is worse than
+    for multi-gpu runs, vllm shards its bf16 weight copy across tensor-parallel ranks. the kv term
+    remains unsharded here because vllm can replicate kv heads when tensor parallelism is wider than
+    the model's kv-head count. the result is explicitly capped at the old 0.5 constant, so this path
+    can only lower a rank's reservation and cannot create a new over-reservation.
+
+    the flat constant is kept where the model does not apply, because a wrong number is worse than
     a conservative one:
 
-    - UNKNOWN CARD (empty/unmanaged ``gpu.type``): the budget is a fraction of the card, so without
+    - unknown card (empty/unmanaged ``gpu.type``): the budget is a fraction of the card, so without
       its size there is nothing to take a fraction of.
-    - MULTI-GPU (``n_gpus > 1``): the rollout is tensor-parallel, so vLLM's weight copy is sharded
-      ACROSS cards while ``colocate_kv_util`` sizes one whole copy against one card. a single-card
-      number would over-reserve per rank on exactly the shapes already tight.
-    - PINNED REVISION with no resolvable parameter count: the weight term dominates, so a guessed
+    - pinned revision with no resolvable parameter count: the weight term dominates, so a guessed
       size is not worth acting on.
+    - any sizing exception: launch falls back to the previous constant instead of failing.
     """
-    if n_gpus > 1 or not (gpu_type or "").strip():
+    if not (gpu_type or "").strip():
         return _DEFAULT_GPU_MEM_UTIL
     try:
         from flash.core.catalog import MODELS
@@ -545,7 +549,7 @@ def resolve_gpu_mem_util(
         )
         if params_b <= 0:
             return _DEFAULT_GPU_MEM_UTIL
-        return colocate_kv_util(
+        sized = colocate_kv_util(
             params_b,
             int(inp["engine_len"]),
             total_vram_gb,
@@ -558,7 +562,12 @@ def resolve_gpu_mem_util(
             active_params_b=float(getattr(info, "active_params_b", 0.0) or 0.0) or None,
             fp8_kv=fp8_kv,
             model_info=info,
+            preserve_legacy_floor=preserve_legacy_floor,
+            tensor_parallel=n_gpus,
         )
+        # multi-rank sizing is strictly one-directional against the previous worker contract: it may
+        # free memory but can never claim more than the flat reservation a working run already used.
+        return min(_DEFAULT_GPU_MEM_UTIL, sized) if n_gpus > 1 else sized
     except Exception as e:  # sizing must never be what stops a run from launching
         print(
             f"[rl-verl] gpu_memory_utilization sizing failed ({e}); using {_DEFAULT_GPU_MEM_UTIL}"
