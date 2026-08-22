@@ -18,7 +18,10 @@ import sys
 import time
 
 from flash.serve.control import ModalCredentials, RunPodCredentials
-from flash.serve.provisioning import InterruptedProvisioning
+from flash.serve.provisioning import (
+    FreshDeploymentArtifactTokenRequired,
+    InterruptedProvisioning,
+)
 
 MODAL_TOKEN_ID_ENV = "MODAL_TOKEN_ID"
 MODAL_TOKEN_SECRET_ENV = "MODAL_TOKEN_SECRET"
@@ -273,30 +276,16 @@ def cmd_serve_deploy(args) -> int:
 
     try:
         credentials = _credentials(provider)
-        # the artifact token is passed rather than omitted whenever the operator has one. it is
-        # optional because a public artifact repo needs none, and the provisioning layer treats
-        # absence as "hydration cannot run": with a token it uses the two-phase bootstrap that
-        # deploys with the secret, hydrates the volume, then redeploys without it and deletes the
-        # secret, so the token never outlives hydration.
+        # the artifact token is passed rather than omitted whenever the operator has one. absence
+        # remains valid through provider observation because adopting an existing generation does
+        # not hydrate. a fresh create rejects it before mutation; with a token, bootstrap deploys
+        # with the secret, hydrates the volume, then redeploys without it and deletes the secret, so
+        # the token never outlives hydration.
         runtime_secrets = _runtime_secrets()
     except ValueError as exc:
         return _err(
             f"{exc}. provider credentials are read from the environment for this one request "
             f"and are never stored"
-        )
-
-    if _optional_env(ARTIFACT_TOKEN_ENV) is None:
-        # a fresh volume holds neither adapters nor base weights, so the container hydrates both
-        # from the hub on its first start -- and that path is token-only end to end:
-        # `launch._prepare_cache` rejects every cache miss outright when the artifact token is
-        # None, and both hydration functions read the token from a descriptor that
-        # `read_artifact_token_fd` refuses to treat as empty. a public repository does not change
-        # that, so permitting the deploy would create and bill provider resources for a container
-        # that cannot reach readiness. reject it here instead, where nothing has been created.
-        return _err(
-            f"{ARTIFACT_TOKEN_ENV} is not set. a new deployment hydrates its serving cache from "
-            f"the hub before the engine starts, and that hydration requires a token even when "
-            f"the repositories are public"
         )
 
     deadline_at = time.monotonic() + float(args.timeout)
@@ -319,6 +308,8 @@ def cmd_serve_deploy(args) -> int:
                 )
             except RunPodDataCenterUnsupported as exc:
                 return _err(str(exc))
+    except FreshDeploymentArtifactTokenRequired as exc:
+        return _err(f"{ARTIFACT_TOKEN_ENV} is not set. {exc}")
     except InterruptedProvisioning as interrupted:
         # the interrupt still propagates -- the user pressed Ctrl-C and the exit code must say so.
         # but the generic handler prints only "aborted", which reads as "nothing was created",

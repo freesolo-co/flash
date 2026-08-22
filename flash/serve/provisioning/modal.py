@@ -14,6 +14,7 @@ from flash.serve.control.types import validate_modal_handle
 from ._common import (
     Clock,
     DeploymentBundle,
+    FreshDeploymentArtifactTokenRequired,
     InterruptedProvisioning,
     LifecycleFailure,
     ServingRuntimeSecrets,
@@ -157,7 +158,9 @@ def provision_modal_deployment(
                 clock=clock,
                 sleep=sleep,
             )
-        create_plan = bootstrap_plan if artifact_token is not None else finalized_plan
+        if artifact_token is None:
+            raise FreshDeploymentArtifactTokenRequired
+        create_plan = bootstrap_plan
         phase = _start_fresh_deployment(
             create_plan,
             finalized_plan,
@@ -180,12 +183,6 @@ def provision_modal_deployment(
         # work is swapping the bootstrap phase out for the finalized one, so an interrupt must
         # leave the deployment standing rather than delete what the user just waited for.
         reached_ready = True
-        if artifact_token is None:
-            return DeploymentResult.from_spec(
-                bundle.spec,
-                status="ready",
-                handle=phase.handle,
-            )
         return _finalize_bootstrap(
             bootstrap_plan,
             finalized_plan,

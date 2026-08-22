@@ -240,53 +240,59 @@ def test_hub_token_reaches_provisioning_so_the_container_can_hydrate(
     assert seen == [("inference-key", "hf-token")]
 
 
-def test_a_blank_hub_token_is_treated_as_absent_not_as_a_secret(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("provider", "target"),
+    [
+        ("modal", "flash.serve.provisioning.modal.provision_modal_deployment"),
+        ("runpod", "flash.serve.provisioning.runpod.provision_runpod_deployment"),
+    ],
+)
+def test_tokenless_adoption_reaches_the_provider(
+    monkeypatch: pytest.MonkeyPatch, provider: str, target: str
 ) -> None:
-    # a blank string is not a credential: `_optional_env` normalizes it to absence, and
-    # `ServingRuntimeSecrets` rejects an empty artifact token outright. a whitespace-only
-    # variable must therefore take the same rejection path as an unset one rather than being
-    # forwarded as a secret or crashing inside the secret boundary.
-    def _explode(*_args, **_kwargs):
-        raise AssertionError("provisioning ran with a blank artifact token")
+    seen: list[tuple[str, str | None]] = []
+
+    def _adopt(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        seen.append(secrets._reveal_for_launch())
+        return _result(bundle)
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
     monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "   ")
-    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _explode)
+    monkeypatch.setattr(target, _adopt)
 
     assert serve_deploy._optional_env(serve_deploy.ARTIFACT_TOKEN_ENV) is None
-    assert cmd_serve_deploy(_args()) == 1
-    assert serve_deploy.ARTIFACT_TOKEN_ENV in capsys.readouterr().err
+    assert cmd_serve_deploy(_args(provider=provider)) == 0
+    assert seen == [("inference-key", None)]
 
 
-def test_missing_artifact_token_is_rejected_before_any_provider_call(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("provider", "target"),
+    [
+        ("modal", "flash.serve.provisioning.modal.provision_modal_deployment"),
+        ("runpod", "flash.serve.provisioning.runpod.provision_runpod_deployment"),
+    ],
+)
+def test_tokenless_fresh_create_rejection_is_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    provider: str,
+    target: str,
 ) -> None:
-    # a fresh volume must hydrate before the engine starts, and that path is token-only end to
-    # end: `launch._prepare_cache` rejects every cache miss when the artifact token is None, and
-    # `read_artifact_token_fd` refuses an empty descriptor. the command used to pass
-    # artifact_token=None straight through, so the launcher raised "artifact token is required
-    # when serving cache hydration is missing" only after the provider had created and started
-    # billing for the app, volume, and pod. a public repository does not change that, so the
-    # rejection is unconditional rather than conditioned on repository visibility.
-    def _explode(*_args, **_kwargs):
-        raise AssertionError("provisioning ran without a way to hydrate the cache")
+    def _reject(*_args, **_kwargs):
+        raise serve_deploy.FreshDeploymentArtifactTokenRequired
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _explode)
+    monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(target, _reject)
 
-    # unset and blank alike mean "no token": `_optional_env` maps both to absence, and a blank
-    # one would be rejected inside `ServingRuntimeSecrets` anyway.
-    for value in (None, "", "   "):
-        if value is None:
-            monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
-        else:
-            monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, value)
-
-        assert cmd_serve_deploy(_args()) == 1
-        assert serve_deploy.ARTIFACT_TOKEN_ENV in capsys.readouterr().err
+    assert cmd_serve_deploy(_args(provider=provider)) == 1
+    assert capsys.readouterr().err == (
+        f"error: {serve_deploy.ARTIFACT_TOKEN_ENV} is not set. a new deployment hydrates its "
+        "serving cache from the hub before the engine starts, and that hydration requires a token "
+        "even when the repositories are public\n"
+    )
 
 
 def test_the_deploy_proceeds_once_a_token_is_present(

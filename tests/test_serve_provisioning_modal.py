@@ -26,6 +26,7 @@ from flash.serve.control import (
 )
 from flash.serve.provisioning import (
     DeploymentBundle,
+    FreshDeploymentArtifactTokenRequired,
     InterruptedProvisioning,
     ServingImage,
     ServingRuntimeSecrets,
@@ -503,6 +504,51 @@ def test_plan_is_complete_secret_free_and_binds_pinned_image() -> None:
     )
     assert dict(plan.tags)["flash-image"] == expected_image_tag
     assert plan.bundle.spec.engine.image_digest == bundle.image.digest
+
+
+def test_tokenless_fresh_create_is_rejected_before_every_mutation() -> None:
+    factory = _Factory()
+    failure: FreshDeploymentArtifactTokenRequired | None = None
+
+    try:
+        _provision(_bundle(), factory, artifact_token=None)
+    except FreshDeploymentArtifactTokenRequired as exc:
+        failure = exc
+
+    sdk = factory.sdk
+    assert sdk is not None
+    assert sdk.calls == [("observe", None)]
+    assert all(not name.startswith(("create_", "deploy_")) for name, _value in sdk.calls)
+    assert failure is not None
+    assert failure.code == "invalid_request"
+    assert failure.outcome_unknown is False
+    assert str(failure) == (
+        "a new deployment hydrates its serving cache from the hub before the engine starts, and "
+        "that hydration requires a token even when the repositories are public"
+    )
+
+
+def test_tokenless_existing_generation_is_adopted_without_create_mutations() -> None:
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    expected_handle = _seed_exact(sdk)
+    clock = _Clock()
+
+    result = provision_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
+        probe=_Probe(),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "ready"
+    assert result.handle == expected_handle
+    assert all(not name.startswith(("create_", "deploy_")) for name, _value in sdk.calls)
 
 
 def test_happy_create_uses_exact_resources_endpoint_and_cleanup_order() -> None:
@@ -1288,7 +1334,7 @@ def test_ambiguous_high_level_mutation_is_called_once_and_never_retried() -> Non
     result = provision_modal_deployment(
         bundle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
-        ServingRuntimeSecrets(INFERENCE_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET, ARTIFACT_SECRET),
         deadline_at=100.0,
         sdk_factory=failing_factory,
         probe=_Probe(True),
@@ -1802,7 +1848,7 @@ def test_provider_error_reprs_and_results_never_leak_credential_sentinels() -> N
         sdk.fail_operation = "deploy_finalized"
         return sdk
 
-    result, _probe = _provision(bundle, failing_factory, artifact_token=None)
+    result, _probe = _provision(bundle, failing_factory)
     rendered = repr((result.spec, result.status, result.handle, result.error_code))
     assert result.status == "outcome_unknown"
     for secret in (PROVIDER_ID, PROVIDER_SECRET, INFERENCE_SECRET):
@@ -2546,7 +2592,7 @@ def test_a_create_failure_after_acceptance_stays_ambiguous_without_returned_ids(
         assert sdk.volumes
 
 
-def test_volume_create_interrupt_cleans_only_the_previously_confirmed_secret() -> None:
+def test_volume_create_interrupt_cleans_the_previously_confirmed_secrets() -> None:
     class _InterruptBeforeVolumeCreateSdk(_FakeSdk):
         def create_volume(self, plan, *, deadline_at=None) -> ModalNamedResource:
             self.calls.append(("create_volume", None))
@@ -2556,7 +2602,7 @@ def test_volume_create_interrupt_cleans_only_the_previously_confirmed_secret() -
     factory.sdk_class = _InterruptBeforeVolumeCreateSdk
 
     with pytest.raises(KeyboardInterrupt) as raised:
-        _provision(_bundle(), factory, artifact_token=None)
+        _provision(_bundle(), factory)
 
     assert not isinstance(raised.value, InterruptedProvisioning)
     sdk = factory.sdk
@@ -2565,13 +2611,16 @@ def test_volume_create_interrupt_cleans_only_the_previously_confirmed_secret() -
     assert operations == [
         "observe",
         "create_inference",
+        "create_artifact",
         "create_volume",
         "observe",
+        "delete_artifact",
         "delete_inference",
         "observe",
     ]
     assert "delete_volume" not in operations
     assert sdk.inference == []
+    assert sdk.artifact == []
     assert sdk.volumes == []
 
 

@@ -21,6 +21,7 @@ from flash.serve.control import (
 )
 from flash.serve.provisioning import (
     DeploymentBundle,
+    FreshDeploymentArtifactTokenRequired,
     InterruptedProvisioning,
     ServingImage,
     ServingRuntimeSecrets,
@@ -947,6 +948,29 @@ def test_pod_creation_constrains_the_host_cuda_version() -> None:
     assert planned["allowedCudaVersions"] == ["13.0"]
 
 
+def test_tokenless_fresh_create_is_rejected_before_every_mutation() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    failure: FreshDeploymentArtifactTokenRequired | None = None
+
+    try:
+        _provision(bundle, transport, artifact_token=None)
+    except FreshDeploymentArtifactTokenRequired as exc:
+        failure = exc
+
+    assert transport.mutation_count == 0
+    assert _mutation_calls(transport) == []
+    assert transport.calls
+    assert all(mutation is False for _kind, _operation, mutation, _payload in transport.calls)
+    assert failure is not None
+    assert failure.code == "invalid_request"
+    assert failure.outcome_unknown is False
+    assert str(failure) == (
+        "a new deployment hydrates its serving cache from the hub before the engine starts, and "
+        "that hydration requires a token even when the repositories are public"
+    )
+
+
 def test_unsupported_storage_data_center_is_rejected_before_every_mutation() -> None:
     assert "storageSupport" in OBSERVE_ACCOUNT
     assert "gpuAvailability" not in OBSERVE_ACCOUNT
@@ -982,7 +1006,7 @@ def test_supported_storage_data_center_proceeds_to_creation() -> None:
     transport.fail_mutation_at = 1
     transport.failure_mode = "definite_before"
 
-    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+    result, _factory, _probe = _provision(bundle, transport)
 
     assert result.status == "failed"
     assert result.error_code == "provider_rejected"
@@ -1276,7 +1300,7 @@ def test_ambiguous_mutation_is_not_retried_and_returns_outcome_unknown() -> None
     transport = _FakeTransport()
     transport.fail_mutation_at = 1
 
-    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+    result, _factory, _probe = _provision(bundle, transport)
 
     assert result.status == "outcome_unknown"
     assert result.error_code == "resource_ambiguous"
@@ -1417,7 +1441,7 @@ def test_identity_reclaim_deletes_duplicate_exact_name_volumes() -> None:
     ]
 
 
-@pytest.mark.parametrize(("resource_kind", "failure_boundary"), [("template", 4), ("secret", 2)])
+@pytest.mark.parametrize(("resource_kind", "failure_boundary"), [("template", 5), ("secret", 2)])
 def test_abort_uses_observed_absence_after_ambiguous_delete(
     resource_kind: str,
     failure_boundary: int,
@@ -1427,7 +1451,7 @@ def test_abort_uses_observed_absence_after_ambiguous_delete(
     transport.fail_mutation_at = failure_boundary
     transport.failure_mode = "definite_before"
 
-    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+    result, _factory, _probe = _provision(bundle, transport)
 
     assert result.status == "failed"
     assert result.error_code == "provider_rejected"
@@ -1437,7 +1461,7 @@ def test_abort_uses_observed_absence_after_ambiguous_delete(
     assert transport.pods == []
 
 
-@pytest.mark.parametrize(("resource_kind", "failure_boundary"), [("template", 4), ("secret", 2)])
+@pytest.mark.parametrize(("resource_kind", "failure_boundary"), [("template", 5), ("secret", 2)])
 def test_abort_stays_unknown_when_ambiguous_delete_leaves_resource_present(
     resource_kind: str,
     failure_boundary: int,
@@ -1447,7 +1471,7 @@ def test_abort_stays_unknown_when_ambiguous_delete_leaves_resource_present(
     transport.fail_mutation_at = failure_boundary
     transport.failure_mode = "definite_before"
 
-    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+    result, _factory, _probe = _provision(bundle, transport)
 
     assert result.status == "outcome_unknown"
     assert result.error_code == "resource_ambiguous"
@@ -1460,7 +1484,7 @@ def test_malformed_success_id_binds_no_invalid_proxy_url() -> None:
     transport = _FakeTransport()
     transport.malformed_pod_id = True
 
-    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+    result, _factory, _probe = _provision(bundle, transport)
 
     assert result.status == "outcome_unknown"
     assert result.error_code == "resource_ambiguous"
@@ -1468,7 +1492,7 @@ def test_malformed_success_id_binds_no_invalid_proxy_url() -> None:
     assert len([call for call in _mutation_calls(transport) if call[1] == "POST /pods"]) == 1
     # the malformed response cannot confirm the live pod's id. keep its connected resources for
     # proof-based reclaim rather than deleting a pod that this attempt cannot establish it owns.
-    assert len(transport.secrets) == 1
+    assert len(transport.secrets) == 2
     assert len(transport.templates) == 1
     assert len(transport.volumes) == 1
     assert len(transport.pods) == 1
@@ -1510,7 +1534,7 @@ def test_losing_racer_never_deletes_the_winners_resources() -> None:
     transport.fail_mutation_at = 1
     transport.failure_mode = "definite_before"
 
-    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+    result, _factory, _probe = _provision(bundle, transport)
 
     assert result.status == "outcome_unknown"
     assert transport.secrets == winner_secrets
@@ -1534,7 +1558,7 @@ def test_ambiguous_race_loser_leaves_unconfirmed_winner_secret_for_reclaim() -> 
     transport.fail_mutation_at = 1
     transport.failure_mode = "ambiguous_before"
 
-    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+    result, _factory, _probe = _provision(bundle, transport)
 
     # the provider did not return this secret's id to the loser, so matching deterministic identity
     # cannot authorize deletion. declining cleanup must stay unknown so a later reclaim can prove it.

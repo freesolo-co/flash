@@ -382,7 +382,8 @@ class ServingRuntimeSecrets:
     so have no artifact to fetch. A *fresh create* is the opposite: the volume starts empty, the
     container hydrates before the engine starts, and that path is token-only end to end, so
     provisioning without one would create billable resources for a container that cannot reach
-    readiness. `serve_deploy` rejects that combination before contacting the provider.
+    readiness. provisioning rejects that combination after observing the provider and before the
+    first create mutation, so an existing generation can still be adopted without the token.
     """
 
     __slots__ = ("__artifact_token", "__inference_token")
@@ -445,6 +446,20 @@ class InterruptedProvisioning(KeyboardInterrupt):
         super().__init__(
             f"interrupted before the {provider} deployment was ready, and its cleanup could not "
             f"be confirmed"
+        )
+
+
+class FreshDeploymentArtifactTokenRequired(ValueError):
+    """definite pre-mutation rejection for a fresh deployment without hydration access."""
+
+    __slots__ = ("code", "outcome_unknown")
+
+    def __init__(self) -> None:
+        self.code = "invalid_request"
+        self.outcome_unknown = False
+        super().__init__(
+            "a new deployment hydrates its serving cache from the hub before the engine starts, "
+            "and that hydration requires a token even when the repositories are public"
         )
 
 

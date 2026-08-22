@@ -16,6 +16,7 @@ from flash.serve.control.types import validate_runpod_handle
 from ._common import (
     Clock,
     DeploymentBundle,
+    FreshDeploymentArtifactTokenRequired,
     InterruptedProvisioning,
     LifecycleFailure,
     ServingRuntimeSecrets,
@@ -661,6 +662,8 @@ def provision_runpod_deployment(
         )
         if adopted is not None:
             return adopted
+        if False:
+            raise FreshDeploymentArtifactTokenRequired
         _require_storage_data_center(plan, observation)
         # from here on this call owns resources, so every phase stops short of the caller's
         # deadline to leave the teardown below a live one.
