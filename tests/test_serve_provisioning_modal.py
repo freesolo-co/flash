@@ -646,6 +646,58 @@ def test_fresh_readiness_timeout_aborts_confirmed_resources() -> None:
     assert sdk.artifact == []
 
 
+def test_fresh_readiness_timeout_leaves_time_for_asynchronous_stop() -> None:
+    class _DelayedStopSdk(_FakeSdk):
+        def __init__(self, plan) -> None:
+            super().__init__(plan)
+            self.stop_observations = 0
+
+        def observe(self, plan, *, app_id_hint=None) -> ModalObservation:
+            if self.apps and self.apps[0].state == "lifecycle_pending":
+                self.stop_observations += 1
+                if self.stop_observations >= 2:
+                    self.apps = [
+                        replace(
+                            self.apps[0],
+                            state="stopped",
+                            running_containers=0,
+                            tags=(),
+                            function_id=None,
+                            function_name=None,
+                            public_url=None,
+                        )
+                    ]
+            return super().observe(plan, app_id_hint=app_id_hint)
+
+        def stop_app(self, plan) -> None:
+            self.calls.append(("stop_app", None))
+            self._fail("stop_app")
+            self.apps = [
+                replace(
+                    self.apps[0],
+                    state="lifecycle_pending",
+                    running_containers=None,
+                    function_id=None,
+                    function_name=None,
+                    public_url=None,
+                )
+            ]
+
+    factory = _Factory()
+    factory.sdk_class = _DelayedStopSdk
+
+    result, _probe = _provision(_bundle(), factory, probe=_Probe(False))
+
+    sdk = factory.sdk
+    assert sdk is not None
+    assert result.status == "failed"
+    assert result.error_code == "readiness_failed"
+    assert sdk.stop_observations >= 2
+    assert sdk.volumes == []
+    assert sdk.inference == []
+    assert sdk.artifact == []
+
+
 def test_fresh_readiness_timeout_preserves_confirmed_handle_when_cleanup_is_unknown() -> None:
     class _RetainedVolumeSdk(_FakeSdk):
         def delete_volume(self, plan) -> None:

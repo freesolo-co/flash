@@ -65,6 +65,11 @@ from ._modal_teardown import (
 )
 
 _DEFAULT_ENDPOINT_PROBE = ModalEndpointProbe()
+_CLEANUP_RESERVE_SECONDS = 30.0
+
+
+def _work_deadline(deadline_at: float, clock: Clock) -> float:
+    return deadline_at - min(_CLEANUP_RESERVE_SECONDS, (deadline_at - clock()) / 2.0)
 
 
 @dataclass(slots=True)
@@ -657,7 +662,7 @@ def provision_modal_deployment(
                 expected,
                 artifact_present=artifact_token is not None,
                 transient_phases=(),
-                deadline_at=deadline_at,
+                deadline_at=_work_deadline(deadline_at, clock),
                 probe=probe,
                 clock=clock,
                 sleep=sleep,
