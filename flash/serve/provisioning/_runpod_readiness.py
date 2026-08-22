@@ -30,6 +30,7 @@ from ._runpod_protocol import (
 from ._runpod_resources import (
     RunPodResourceConflict,
     build_handle,
+    complete_resource_set,
     ensure_unique_resources,
     exact_core_resources,
     readiness_state,
@@ -143,8 +144,10 @@ def read_only_reconcile(
     sleep: Sleeper,
     allow_transient_artifact: bool = False,
     unproven_is_failure: bool = True,
+    absent_after_deadline: bool = True,
 ) -> DeploymentResult:
     last_handle: RunPodProviderHandle | None = None
+    saw_resource = False
     while True:
         try:
             observation = observe(plan)
@@ -160,16 +163,27 @@ def read_only_reconcile(
                     handle=last_handle,
                 )
             continue
-        if observation.resource_count == 0:
-            return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
+        saw_resource = saw_resource or observation.resource_count > 0
         try:
-            secret, template, volume, pod = exact_core_resources(plan, observation)
-            last_handle = build_handle(plan, secret, template, volume, pod)
+            complete = complete_resource_set(plan, observation)
         except RunPodResourceConflict:
             return failure_result(
                 plan,
                 LifecycleFailure("conflict", reason="readiness_resource_conflict"),
             )
+        if not complete:
+            if sleep_until_poll(deadline_at, clock, sleep):
+                continue
+            if absent_after_deadline and not saw_resource:
+                return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
+            if not unproven_is_failure:
+                return unknown_result(plan, reason="readiness_deadline_unproven")
+            return failure_result(
+                plan,
+                LifecycleFailure("readiness_failed", reason="readiness_deadline_unproven"),
+            )
+        secret, template, volume, pod = exact_core_resources(plan, observation)
+        last_handle = build_handle(plan, secret, template, volume, pod)
         state = readiness_state(pod.desired_status)
         if state == "invalid":
             return failure_result(
@@ -494,6 +508,7 @@ def await_ready_and_reclaim(
     artifact: RunPodSecretObservation | None,
     *,
     unproven_is_failure: bool,
+    absent_after_deadline: bool,
     on_ready: Callable[[], None] = lambda: None,
     deadline_at: float,
     probe: EndpointProbe,
@@ -529,6 +544,7 @@ def await_ready_and_reclaim(
         sleep=sleep,
         allow_transient_artifact=True,
         unproven_is_failure=unproven_is_failure,
+        absent_after_deadline=absent_after_deadline,
     )
     if ready.status != "ready":
         return ready

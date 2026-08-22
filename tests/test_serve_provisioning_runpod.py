@@ -38,7 +38,11 @@ from flash.serve.provisioning._runpod_protocol import (
     parse_templates,
     parse_volumes,
 )
-from flash.serve.provisioning._runpod_resources import pod_identity_matches
+from flash.serve.provisioning._runpod_resources import (
+    RunPodResourceConflict,
+    _one,
+    pod_identity_matches,
+)
 from flash.serve.provisioning._runpod_transport import (
     GRAPHQL_URL,
     REST_BASE_URL,
@@ -478,6 +482,43 @@ class _LateVisibleAmbiguousVolumeTransport(_FakeTransport):
             self.hidden_volume_observations += 1
             return []
         return super()._list(path)
+
+
+class _PartialThenCompleteTransport(_FakeTransport):
+    def __init__(self, *, post_create: bool = False) -> None:
+        super().__init__()
+        self.post_create = post_create
+        self.observation_number = 0
+        self.delete_observations: list[int] = []
+
+    def _hide_first_observation(self) -> bool:
+        hidden_count = 1 if self.post_create else 2
+        return self.observation_number < hidden_count and (
+            not self.post_create or self.mutation_count >= 5
+        )
+
+    def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
+        response = super().graphql(
+            document,
+            variables,
+            mutation=mutation,
+            deadline_at=deadline_at,
+        )
+        if not mutation and self._hide_first_observation():
+            response["data"]["myself"]["secrets"] = []
+        return response
+
+    def _list(self, path: str) -> list[dict[str, object]]:
+        rows = super()._list(path)
+        if self._hide_first_observation():
+            rows = [] if self.post_create or path in {"/networkvolumes", "/pods"} else rows
+        if path == "/pods" and (not self.post_create or self.mutation_count >= 5):
+            self.observation_number += 1
+        return rows
+
+    def _delete(self, path: str) -> None:
+        self.delete_observations.append(self.observation_number)
+        super()._delete(path)
 
 
 class _AmbiguousAbortDeleteTransport(_FakeTransport):
@@ -1045,6 +1086,51 @@ def test_duplicate_or_mismatched_resources_fail_closed_without_mutation(mutate) 
     assert _mutation_calls(transport) == []
 
 
+def test_partial_adoption_waits_for_the_complete_resource_set() -> None:
+    bundle = _bundle()
+    transport = _PartialThenCompleteTransport()
+    handle = _seed_exact(transport, bundle)
+    transport.calls.clear()
+
+    result, _factory, probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "ready"
+    assert result.handle == handle
+    assert transport.observation_number >= 2
+    assert _mutation_calls(transport) == []
+    assert len(probe.calls) == 1
+
+
+def test_fresh_create_waits_through_an_empty_first_readiness_observation() -> None:
+    bundle = _bundle()
+    transport = _PartialThenCompleteTransport(post_create=True)
+
+    result, _factory, probe = _provision(bundle, transport)
+
+    assert result.status == "ready"
+    assert result.handle is not None
+    assert result.handle.pod_id == POD_ID
+    assert transport.observation_number >= 2
+    assert transport.pods, "the live pod was mistaken for an absent deployment"
+    assert transport.volumes, "the live volume was mistaken for an absent deployment"
+    assert len(probe.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ((), "inference secret is missing"),
+        ((object(), object()), "inference secret is duplicated"),
+    ],
+)
+def test_exact_resource_diagnostic_distinguishes_missing_from_duplicated(
+    values: tuple[object, ...],
+    message: str,
+) -> None:
+    with pytest.raises(RunPodResourceConflict, match=message):
+        _one(values, "inference secret")
+
+
 def test_wrong_account_fails_closed_with_sanitized_error() -> None:
     bundle = _bundle()
     transport = _FakeTransport(account_id="account-other")
@@ -1121,7 +1207,7 @@ def test_create_failure_boundaries_reclaim_only_fully_confirmed_resources(
         )
 
 
-def test_identity_reclaim_deletes_a_volume_that_materializes_after_ambiguous_create() -> None:
+def test_identity_reclaim_preserves_an_incomplete_late_visible_volume() -> None:
     bundle = _bundle()
     transport = _LateVisibleAmbiguousVolumeTransport()
     transport.fail_mutation_at = 3
@@ -1147,20 +1233,53 @@ def test_identity_reclaim_deletes_a_volume_that_materializes_after_ambiguous_cre
         sleep=transport.clock.sleep,
     )
 
-    assert reclaimed.status == "absent"
+    assert reclaimed.status == "outcome_unknown"
+    assert reclaimed.error_reason == "teardown_cleanup_unconfirmed"
     assert transport.hidden_volume_observations == 3
-    assert transport.volumes == []
-    assert [call[1] for call in _mutation_calls(transport)] == ["DELETE /networkvolumes/volume01"]
+    assert len(transport.volumes) == 1
+    assert _mutation_calls(transport) == []
+
+
+def test_identity_reclaim_waits_for_complete_visibility_before_any_delete() -> None:
+    bundle = _bundle()
+    transport = _PartialThenCompleteTransport()
+    _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    reclaimed = teardown_runpod_deployment(
+        bundle,
+        None,
+        RunPodCredentials(PROVIDER_SECRET),
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert reclaimed.status == "absent"
+    assert transport.pods == [], "a later-visible pod survived after its template was deleted"
+    assert transport.volumes == [], "a live volume survived the partial reclaim"
+    assert transport.templates == []
+    assert transport.secrets == []
+    assert transport.delete_observations
+    assert min(transport.delete_observations) >= 2, (
+        "reclaim deleted dependencies before the partial listing settled"
+    )
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        f"DELETE /pods/{POD_ID}",
+        "DELETE /templates/template01",
+        "DELETE /networkvolumes/volume01",
+        "secretDelete",
+        "secretDelete",
+    ]
 
 
 def test_identity_reclaim_deletes_duplicate_exact_name_volumes() -> None:
     bundle = _bundle()
     transport = _FakeTransport()
+    _seed_exact(transport, bundle)
     plan = build_runpod_create_plan(bundle)
-    transport.volumes = [
-        {"id": "volume01", **plan.volume_payload()},
-        {"id": "volume02", **plan.volume_payload()},
-    ]
+    transport.volumes.append({"id": "volume02", **plan.volume_payload()})
 
     reclaimed = teardown_runpod_deployment(
         bundle,
@@ -1175,8 +1294,11 @@ def test_identity_reclaim_deletes_duplicate_exact_name_volumes() -> None:
     assert reclaimed.status == "absent"
     assert transport.volumes == []
     assert [call[1] for call in _mutation_calls(transport)] == [
+        f"DELETE /pods/{POD_ID}",
+        "DELETE /templates/template01",
         "DELETE /networkvolumes/volume01",
         "DELETE /networkvolumes/volume02",
+        "secretDelete",
     ]
 
 

@@ -67,9 +67,10 @@ from ._runpod_readiness import (
 from ._runpod_resources import (
     RunPodResourceConflict,
     build_handle,
+    complete_resource_set,
     ensure_unique_resources,
-    exact_core_resources,
     exact_teardown_resources,
+    merge_resource_observations,
     pod_identity_matches,
     template_identity_matches,
     volume_identity_matches,
@@ -606,16 +607,23 @@ def provision_runpod_deployment(
 
     try:
         transport = open_transport(transport_factory, credentials)
+        discovery_deadline_at = min(deadline_at, clock() + _CLEANUP_RESERVE_SECONDS)
         observation = _observe(plan, transport, deadline_at=deadline_at)
+        saw_resource = observation.resource_count > 0
         try:
-            ensure_unique_resources(observation)
+            complete = complete_resource_set(plan, observation)
         except RunPodResourceConflict:
             return failure_result(plan, LifecycleFailure("conflict"))
-        if observation.resource_count:
+        while (
+            saw_resource and not complete and sleep_until_poll(discovery_deadline_at, clock, sleep)
+        ):
+            observation = _observe(plan, transport, deadline_at=deadline_at)
+            saw_resource = saw_resource or observation.resource_count > 0
             try:
-                exact_core_resources(plan, observation)
+                complete = complete_resource_set(plan, observation)
             except RunPodResourceConflict:
                 return failure_result(plan, LifecycleFailure("conflict"))
+        if complete:
             return await_ready_and_reclaim(
                 plan,
                 _bind_observe(transport, deadline_at=deadline_at),
@@ -627,11 +635,14 @@ def provision_runpod_deployment(
                 # adoption owns resources it did not create and has no ledger to undo, so an
                 # unproven pod is reported unknown rather than failed. see `read_only_reconcile`.
                 unproven_is_failure=False,
+                absent_after_deadline=False,
                 deadline_at=deadline_at,
                 probe=probe,
                 clock=clock,
                 sleep=sleep,
             )
+        if saw_resource:
+            return unknown_result(plan, reason="readiness_deadline_unproven")
         # from here on this call owns resources, so every phase stops short of the caller's
         # deadline to leave the teardown below a live one.
         work_deadline_at = _work_deadline(deadline_at, clock)
@@ -653,6 +664,7 @@ def provision_runpod_deployment(
             inference_token,
             artifact,
             unproven_is_failure=True,
+            absent_after_deadline=False,
             on_ready=_mark_ready,
             deadline_at=work_deadline_at,
             probe=probe,
@@ -742,29 +754,6 @@ def _validate_handle(plan: RunPodCreatePlan, handle: RunPodProviderHandle) -> No
         raise ValueError("runpod handle does not match the exact deployment generation")
 
 
-def _require_reclaim_identity(
-    plan: RunPodCreatePlan,
-    observation: RunPodObservation,
-) -> None:
-    if any(not template_identity_matches(plan, item) for item in observation.templates):
-        raise RunPodResourceConflict("template does not match the deployment identity")
-    if any(not volume_identity_matches(plan, item) for item in observation.volumes):
-        raise RunPodResourceConflict("network volume does not match the deployment identity")
-    if not observation.pods:
-        return
-    template_ids = tuple(item.id for item in observation.templates)
-    volume_ids = tuple(item.id for item in observation.volumes)
-    if not template_ids or not volume_ids:
-        raise RunPodResourceConflict("pod dependencies are not observable")
-    for pod in observation.pods:
-        if not any(
-            pod_identity_matches(plan, pod, template_id=template_id, volume_id=volume_id)
-            for template_id in template_ids
-            for volume_id in volume_ids
-        ):
-            raise RunPodResourceConflict("pod does not match the deployment identity")
-
-
 def _reclaim_runpod_deployment(
     plan: RunPodCreatePlan,
     transport: RunPodTransport,
@@ -776,34 +765,51 @@ def _reclaim_runpod_deployment(
     """reclaim resources after an ambiguous create returned no provider handle."""
 
     mutation_attempted = False
-    observed_resource = False
+    known: RunPodObservation | None = None
     attempted_deletes: set[tuple[str, str]] = set()
     discovery_deadline_at = min(deadline_at, clock() + _CLEANUP_RESERVE_SECONDS)
+    discovery_settled = False
     try:
         while True:
             observation = _observe(plan, transport, deadline_at=deadline_at)
-            _require_reclaim_identity(plan, observation)
-            if observation.resource_count == 0:
-                if clock() >= discovery_deadline_at:
-                    if observed_resource:
-                        return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
+            if not discovery_settled:
+                complete = complete_resource_set(plan, observation, allow_duplicates=True)
+                if not complete:
+                    if sleep_until_poll(discovery_deadline_at, clock, sleep):
+                        continue
                     return unknown_result(plan, reason="teardown_cleanup_unconfirmed")
-                # an ambiguous create may still be pending behind the provider's eventually
-                # consistent listing. one empty read cannot prove absence, so wait a bounded interval
-                # for it to materialize and report unknown if it never becomes observable.
-                sleep_until_poll(discovery_deadline_at, clock, sleep)
-                continue
-
-            observed_resource = True
-            if observation.pods:
-                resources = (("pod", item) for item in observation.pods)
+                known = observation
+                discovery_settled = True
             else:
-                resources = (
-                    *(("template", item) for item in observation.templates),
-                    *(("volume", item) for item in observation.volumes),
-                    *(("artifact_secret", item) for item in observation.artifact_secrets),
-                    *(("inference_secret", item) for item in observation.inference_secrets),
+                complete_resource_set(plan, observation, allow_duplicates=True)
+                assert known is not None
+                known = merge_resource_observations(known, observation)
+                complete_resource_set(plan, known, allow_duplicates=True)
+            if observation.resource_count == 0 and all(
+                (kind, item.id) in attempted_deletes
+                for kind, values in (
+                    ("pod", known.pods),
+                    ("template", known.templates),
+                    ("volume", known.volumes),
+                    ("artifact_secret", known.artifact_secrets),
+                    ("inference_secret", known.inference_secrets),
                 )
+                for item in values
+            ):
+                return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
+            pending_pods = tuple(
+                item for item in known.pods if ("pod", item.id) not in attempted_deletes
+            )
+            resources = (
+                (("pod", item) for item in pending_pods)
+                if pending_pods or observation.pods
+                else (
+                    *(("template", item) for item in known.templates),
+                    *(("volume", item) for item in known.volumes),
+                    *(("artifact_secret", item) for item in known.artifact_secrets),
+                    *(("inference_secret", item) for item in known.inference_secrets),
+                )
+            )
             issued_delete = False
             for kind, resource in resources:
                 key = (kind, resource.id)

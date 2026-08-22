@@ -42,8 +42,10 @@ def readiness_state(status: str) -> ReadinessState:
 
 
 def _one(values: tuple[object, ...], name: str):
-    if len(values) != 1:
-        raise RunPodResourceConflict(f"{name} is not unique")
+    if not values:
+        raise RunPodResourceConflict(f"{name} is missing")
+    if len(values) > 1:
+        raise RunPodResourceConflict(f"{name} is duplicated")
     return values[0]
 
 
@@ -57,6 +59,78 @@ def ensure_unique_resources(observation: RunPodObservation) -> None:
     )
     if any(len(group) > 1 for group in groups):
         raise RunPodResourceConflict("deterministic resource name is duplicated")
+
+
+def complete_resource_set(
+    plan: RunPodCreatePlan,
+    observation: RunPodObservation,
+    *,
+    allow_duplicates: bool = False,
+) -> bool:
+    """validate visible identity and report whether the connected core set is observable."""
+
+    if not allow_duplicates:
+        ensure_unique_resources(observation)
+    if any(item.name != plan.names.inference_secret for item in observation.inference_secrets):
+        raise RunPodResourceConflict("inference secret does not match")
+    if any(item.name != plan.names.artifact_secret for item in observation.artifact_secrets):
+        raise RunPodResourceConflict("artifact secret does not match")
+    if any(not template_identity_matches(plan, item) for item in observation.templates):
+        raise RunPodResourceConflict("template does not match")
+    if any(not volume_identity_matches(plan, item) for item in observation.volumes):
+        raise RunPodResourceConflict("network volume does not match")
+    for pod in observation.pods:
+        # dependency listings can lag the pod listing. use its observed attachment ids here to
+        # validate the pod's own immutable fields, then prove the relationships once both lists land.
+        if not pod_identity_matches(
+            plan,
+            pod,
+            template_id=pod.template_id or "",
+            volume_id=pod.network_volume_id or "",
+        ):
+            raise RunPodResourceConflict("pod does not match")
+    core_groups = (
+        observation.inference_secrets,
+        observation.templates,
+        observation.volumes,
+        observation.pods,
+    )
+    if not all(core_groups):
+        return False
+    template_ids = tuple(item.id for item in observation.templates)
+    volume_ids = tuple(item.id for item in observation.volumes)
+    if any(
+        not any(
+            pod_identity_matches(plan, pod, template_id=template_id, volume_id=volume_id)
+            for template_id in template_ids
+            for volume_id in volume_ids
+        )
+        for pod in observation.pods
+    ):
+        raise RunPodResourceConflict("pod does not match")
+    return True
+
+
+def merge_resource_observations(
+    previous: RunPodObservation,
+    current: RunPodObservation,
+) -> RunPodObservation:
+    """retain validated ids after one complete observation has settled discovery."""
+
+    if previous.account_id != current.account_id:
+        raise RunPodResourceConflict("observation account changed")
+
+    def merged(previous_values, current_values):
+        return tuple({item.id: item for item in (*previous_values, *current_values)}.values())
+
+    return RunPodObservation(
+        account_id=current.account_id,
+        inference_secrets=merged(previous.inference_secrets, current.inference_secrets),
+        artifact_secrets=merged(previous.artifact_secrets, current.artifact_secrets),
+        templates=merged(previous.templates, current.templates),
+        volumes=merged(previous.volumes, current.volumes),
+        pods=merged(previous.pods, current.pods),
+    )
 
 
 def template_identity_matches(
