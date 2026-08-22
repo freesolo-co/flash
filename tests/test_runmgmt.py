@@ -1492,6 +1492,69 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     assert raw["remote"] == confirmed
 
 
+def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
+    monkeypatch, tmp_path
+):
+    """A deployed-format record still names a billable endpoint, so teardown must reach it.
+
+    `key_fingerprint` is validated at exactly 68 chars, but the deployed release writes the 16-char
+    form, so such a record fails the strict `from_dict` behind `_canonical_cleanup_remote` and
+    `_remote_resource_identity`. The teardown loop builds a base `JobHandle` (which validates only
+    `provider`) and `_delete_runpod_endpoint` resolves that exact fingerprint through
+    `resolve_legacy_key_fingerprint`. Filtering the record out before teardown would leave a live
+    RunPod endpoint billing forever with nothing left to delete it.
+    """
+    import json as _json
+
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+    from flash.providers.runpod import api as runpod_api
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cleanup-legacy", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner._save_status(
+        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
+    )
+    legacy_fingerprint = "rpk-" + "0" * 12
+    resolved_fingerprint = "rpk-" + "a" * 64
+    legacy = _runpod_remote("endpoint-legacy", None, attempt=1, key_fingerprint=legacy_fingerprint)
+    # the strict writer rejects the legacy record, so seed the status file directly.
+    path = runner.runs_file_path(spec.run_id, ".json")
+    with open(path) as f:
+        raw = _json.load(f)
+    raw[runner._CLEANUP_REMOTES_KEY] = [legacy]
+    with open(path, "w") as f:
+        _json.dump(raw, f)
+
+    def _key_for_fingerprint(fingerprint):
+        raise runpod_api.RunpodApiError("no configured key matches the stored fingerprint")
+
+    resolved = []
+    deleted = []
+
+    def resolve_legacy(endpoint_id, fingerprint):
+        resolved.append((endpoint_id, fingerprint))
+        return resolved_fingerprint
+
+    def delete_endpoint(endpoint_id, fingerprint):
+        deleted.append((endpoint_id, fingerprint))
+        return True
+
+    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", _key_for_fingerprint)
+    monkeypatch.setattr(runpod_api, "resolve_legacy_key_fingerprint", resolve_legacy)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
+
+    attempted = runner._drain_cleanup_remotes(spec.run_id)
+
+    assert resolved == [("endpoint-legacy", legacy_fingerprint)], (
+        "the legacy fingerprint resolver was never reached"
+    )
+    assert deleted == [("endpoint-legacy", resolved_fingerprint)], (
+        "the billable endpoint was never deleted"
+    )
+    assert any("endpoint-legacy" in repr(item) for item in attempted)
+
+
 def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypatch, tmp_path):
     import flash.runner as runner
     from flash.core.spec import JobSpec
