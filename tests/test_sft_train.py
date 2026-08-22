@@ -5243,7 +5243,7 @@ def test_resume_upload_unavailable_reports_the_oversized_member(tmp_path, capsys
     resume_upload_unavailable(1, str(ckpt), job_label="sft")
 
     out = capsys.readouterr().out
-    assert "step 1 resume checkpoint was not uploaded" in out
+    assert "step 1 resume checkpoint was not confirmed uploaded" in out
     assert "largest member" in out, "the size that caused the failure must be reported"
     # the deepest file must be walked, not just the top level, or a sharded layout reports 0.
     assert "0.0 GB" in out

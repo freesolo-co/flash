@@ -391,6 +391,40 @@ def test_fused_export_accepts_the_visual_pair_a_multimodal_run_trained(monkeypat
     assert saved["base_model_name_or_path"] == _MODEL_ID
 
 
+def test_fused_export_rejects_a_tensor_no_lora_pair_claims(monkeypatch, tmp_path):
+    """an unpaired tensor is published without ever being value-checked.
+
+    `fused_expert_lora_tensor_pairs` filters to canonical `.lora_A/.lora_B.` keys, so a
+    `modules_to_save` entry or a bare bias key rides along unvalidated. peft loads the saved state
+    dict with `strict=False`, so such a key whose name matches the base model is restored OVER the
+    base weights at warm start and serve.
+    """
+    import flash.engine.worker.verl.checkpoints as checkpoints
+
+    tensors = _complete_expert_tensors()
+    tensors["base_model.model.layers.0.mlp.gate_proj.weight"] = (2048, 2048)
+    monkeypatch.setattr(checkpoints, "_read_adapter_tensor_metadata", lambda _path: tensors)
+    monkeypatch.setattr(
+        checkpoints, "_validate_adapter_tensor_values", lambda *args, **kwargs: None
+    )
+    config = {
+        "peft_type": "LORA",
+        "r": 32,
+        "target_modules": ["q_proj", "experts", "base_layer"],
+        "target_parameters": None,
+    }
+    _write_expert_adapter(tmp_path, config=config)
+    config_path = tmp_path / "adapter_config.json"
+    before = config_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="unpaired tensor"):
+        checkpoints.stamp_adapter_dir_provenance(
+            str(tmp_path), _MODEL_ID, "d" * 40, exclude_modules=_TEXT_ONLY_EXCLUDE
+        )
+
+    assert config_path.read_bytes() == before
+
+
 def test_export_refuses_incomplete_expert_weights_before_changing_config(tmp_path):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 

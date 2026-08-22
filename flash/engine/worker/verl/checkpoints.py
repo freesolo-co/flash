@@ -421,11 +421,15 @@ def resume_upload_unavailable(step: int, checkpoint_dir: str, *, job_label: str)
     """
     largest = _largest_file_bytes(checkpoint_dir)
     detail = f" largest member {largest / 1e9:.1f} GB." if largest else ""
+    # "not confirmed", not "not uploaded": the False this reports on is also returned when the
+    # folder commit landed and only the closing heartbeat exhausted its retries, so the restart
+    # state may well be present. the run is continued either way, and the next attempt re-checks
+    # what is actually in the repo rather than trusting this line.
     print(
-        f"[{job_label}] step {step} resume checkpoint was not uploaded; continuing without "
-        f"restart state for it.{detail} the deployable adapter is unaffected and is enforced "
-        "separately -- only a crash or preemption after this point would have to replay from an "
-        "earlier step.",
+        f"[{job_label}] step {step} resume checkpoint was not confirmed uploaded; continuing "
+        f"without relying on restart state for it.{detail} the deployable adapter is unaffected "
+        "and is enforced separately -- only a crash or preemption after this point would have to "
+        "replay from an earlier step.",
         flush=True,
     )
 
@@ -763,6 +767,18 @@ def stamp_adapter_dir_provenance(
             raise RuntimeError(
                 f"exported adapter for {model_id} does not contain complete fused expert LoRA "
                 "weights; refusing to stamp it as warm-start compatible"
+            )
+        # a key the pair builder did not claim is neither paired nor value-checked below -- it is
+        # simply published. peft loads the saved state dict with `strict=False`, so a declared
+        # `modules_to_save` entry or a bare bias key whose name matches the base model is restored
+        # OVER the base weights at warm start and serve. the non-moe path rejects every key it does
+        # not recognize; require the same here rather than letting the fused topology be the one
+        # that carries unvalidated tensors.
+        claimed = {key for pair in pairs.values() for key in pair}
+        unclaimed = sorted(set(tensors) - claimed)
+        if unclaimed:
+            raise RuntimeError(
+                f"exported fused-expert adapter contains an unpaired tensor {unclaimed[0]!r}"
             )
         # same language-subset requirement as the non-moe path: this model is image-capable, so a
         # multimodal export must not discharge "something trained" with a vision pair alone.
