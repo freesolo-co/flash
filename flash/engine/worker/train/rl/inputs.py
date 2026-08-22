@@ -16,6 +16,7 @@ import random
 from functools import reduce
 from math import gcd
 
+from flash.adapters.targets import LoraTargeting, resolve_lora_targeting
 from flash.content.structured_outputs import (
     describe_structured_outputs,
     parse_structured_outputs,
@@ -132,7 +133,8 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
         if train_spec and train_spec.prompts_per_step is not None
         else rl.prompts_per_step
     )
-    group_size = int(gcfg.get("group_size") or rl.group_size)
+    configured_group_size = gcfg.get("group_size")
+    group_size = int(rl.group_size if configured_group_size is None else configured_group_size)
     gcfg_temp = gcfg.get("temperature")
     temperature = float(gcfg_temp if gcfg_temp is not None else rl.sampling_temperature)
     think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
@@ -169,10 +171,17 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
     }
 
 
-def _resolve_warmstart_config(train_spec, model_id, adapter_path, lora_rank, lora_alpha):
+def _resolve_warmstart_config(
+    train_spec,
+    model_id,
+    adapter_path,
+    lora_rank,
+    lora_alpha,
+    targeting: LoraTargeting,
+):
     with open(os.path.join(adapter_path, "adapter_config.json")) as f:
         source_config = json.load(f)
-    _w.validate_warmstart_adapter(source_config, model_id, adapter_path)
+    _w.validate_warmstart_adapter(source_config, model_id, adapter_path, targeting)
     # a patterned adapter trains some modules at higher rank than the base `r`; verl allocates
     # one uniform rank, so it must cover the MAXIMUM prepared rank or the load truncates.
     ranks = [int(source_config.get("r", lora_rank))]
@@ -493,16 +502,19 @@ def _resolve_grpo_inputs():
             raise RuntimeError(
                 "warm-start source adapter could not be downloaded; refusing to start from the base."
             )
+
+    train, message_prompts = _load_training_records(env, _t)
+    multimodal = _grpo_is_multimodal(env, train, message_prompts)
+    targeting = resolve_lora_targeting(model_id, algorithm="grpo", multimodal=multimodal)
+    if warmstart_adapter:
         options["lora_rank"], options["lora_alpha"] = _resolve_warmstart_config(
             _t,
             model_id,
             warmstart_adapter,
             options["lora_rank"],
             options["lora_alpha"],
+            targeting,
         )
-
-    train, message_prompts = _load_training_records(env, _t)
-    multimodal = _grpo_is_multimodal(env, train, message_prompts)
     package_root = getattr(env, "package_root", None)
     processor = None
     image_pad_token_id = None

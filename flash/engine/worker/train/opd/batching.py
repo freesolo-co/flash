@@ -60,7 +60,11 @@ class _TeacherBridgeHTTPServer(BoundedThreadingHTTPServer):
 
 def _teacher_batch_error(error: Exception) -> Exception:
     if isinstance(error, TeacherError):
-        return TeacherError(str(error), permanent=error.permanent)
+        return TeacherError(
+            str(error),
+            permanent=error.permanent,
+            provider_status=error.provider_status,
+        )
     return RuntimeError(str(error))
 
 

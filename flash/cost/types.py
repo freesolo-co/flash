@@ -197,8 +197,12 @@ class RunConfig:
                 if self.seq_len is not None
                 else max(1024, rc.max_prompt_len + int(comp))
             )
-            batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
-            group = self.group_size if self.group_size is not None else rc.group_size
+            if self.is_grpo:
+                batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
+                group = self.group_size if self.group_size is not None else rc.group_size
+            else:
+                batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
+                group = self.group_size if self.group_size is not None else rc.group_size
         else:
             seq = self.seq_len
             if seq is None:

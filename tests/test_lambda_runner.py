@@ -391,6 +391,7 @@ class _FakePipProc:
 
 
 def _pip_payload(**extra) -> dict:
+    created_at = time.time()
     return {
         "env": {
             "GITHUB_TOKEN": "ghp-secret",
@@ -398,6 +399,9 @@ def _pip_payload(**extra) -> dict:
             "PYTHONPATH": "",
         },
         "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
+        "deadline_at": created_at + 3600.0,
+        "run_created_at": created_at,
+        "run_max_wall_seconds": 3600.0,
         **extra,
     }
 

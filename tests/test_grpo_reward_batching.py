@@ -55,7 +55,18 @@ def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order(monk
             results = list(
                 pool.map(
                     lambda i: namespace["compute_score"](
-                        "env", f"a{i}", "unused", extra_info={"index": i}
+                        "env",
+                        f"a{i}",
+                        "unused",
+                        extra_info={
+                            "index": i,
+                            "flash_rollout_identity": {
+                                "optimizer_step": 1,
+                                "sample_index": i,
+                                "rollout_ordinal": 0,
+                                "validate": False,
+                            },
+                        },
                     ),
                     range(8),
                 )

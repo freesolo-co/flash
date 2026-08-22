@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import threading
+
 from flash.engine.huggingface import model_revision_kwargs
+
+_TRANSFORMERS_IMPORT_LOCK = threading.Lock()
 
 
 def load_tokenizer(model_id: str, revision: str = "", *, trust_remote_code: bool = True):
     """load a tokenizer without importing worker runtime state."""
-    from transformers import AutoTokenizer
+    # transformers resolves lazy exports outside python's module import lock. fastapi can prepare
+    # multiple runs in worker threads, so serialize only the first symbol lookup rather than
+    # serializing tokenizer downloads or retrying arbitrary import failures.
+    with _TRANSFORMERS_IMPORT_LOCK:
+        from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
         model_id,

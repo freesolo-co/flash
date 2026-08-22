@@ -62,6 +62,7 @@ class _VerlResumeUploader:
         python_bin: str = "",
         model_id: str = "",
         model_revision: str = "",
+        exclude_modules: str | None = None,
         preprocessor=None,
         had_gradient: Callable[[], bool] | None = None,
     ) -> None:
@@ -81,6 +82,7 @@ class _VerlResumeUploader:
         self.python_bin = python_bin
         self.model_id = model_id
         self.model_revision = model_revision
+        self.exclude_modules = exclude_modules
         # the processor on a multimodal job, else the tokenizer: an image model cannot be served
         # from an adapter dir that carries only tokenizer files, since the runtime needs the
         # preprocessor config to turn pixels back into tokens.
@@ -165,7 +167,12 @@ class _VerlResumeUploader:
         # the served adapter needs its preprocessor alongside it, exactly as the final publish does:
         # the processor on a multimodal job (tokenizer + image preprocessor), else the tokenizer.
         self.preprocessor.save_pretrained(adapter_dir)
-        _rl_train().stamp_adapter_dir_provenance(adapter_dir, self.model_id, self.model_revision)
+        _rl_train().stamp_adapter_dir_provenance(
+            adapter_dir,
+            self.model_id,
+            self.model_revision,
+            exclude_modules=self.exclude_modules,
+        )
         _w.write_base_model_provenance(adapter_dir, self.model_id, self.model_revision)
         return adapter_dir
 

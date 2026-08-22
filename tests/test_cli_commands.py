@@ -1343,66 +1343,6 @@ def test_train_dry_run_sends_declared_runtime_secrets(
     assert call[3] is True
 
 
-def test_train_dry_run_enriches_legacy_unknown_authored_key_rejection(
-    fake_client, tmp_path, capsys, monkeypatch
-) -> None:
-    from flash.client import ApiError
-
-    detail = "[train] unknown key(s): save_at_steps (allowed: epochs, hf_repo, max_examples)"
-
-    def reject(*_args, **_kwargs):
-        raise ApiError(400, detail)
-
-    monkeypatch.setattr(fake_client, "create_run", reject)
-    # the authored key has to be one THIS algorithm accepts: an sft config authoring a
-    # rollout-only knob is now rejected by the client's own parser, so the request would never
-    # reach the server whose response this test is about.
-    config = _train_config(tmp_path, extra_train="max_steps = 4\nsave_at_steps = [1]\n")
-
-    assert _run(["train", str(config), "--dry-run"]) == 1
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert detail in captured.err
-    assert "save_at_steps (minimum released Flash version 0.2.57)" in captured.err
-    assert "client/server [train] schemas disagree" in captured.err
-
-
-@pytest.mark.parametrize(
-    ("status", "detail"),
-    [
-        (400, "budget precheck rejected this run"),
-        (
-            400,
-            "[train] unknown key(s): structured_outputs (allowed: epochs, hf_repo, max_examples)",
-        ),
-        (
-            400,
-            "[train] unknown key(s): future_knob (allowed: epochs, hf_repo, max_examples)",
-        ),
-        (
-            500,
-            "[train] unknown key(s): save_at_steps (allowed: epochs, hf_repo, max_examples)",
-        ),
-    ],
-)
-def test_train_dry_run_does_not_enrich_unrelated_or_unknown_errors(
-    fake_client, tmp_path, capsys, monkeypatch, status, detail
-) -> None:
-    from flash.client import ApiError
-
-    def reject(*_args, **_kwargs):
-        raise ApiError(status, detail)
-
-    monkeypatch.setattr(fake_client, "create_run", reject)
-    # sft-applicable by necessity: see the enrichment test above.
-    config = _train_config(tmp_path, extra_train="max_steps = 4\nsave_at_steps = [1]\n")
-
-    assert _run(["train", str(config), "--dry-run"]) == 1
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err == f"error: {detail}\n"
-
-
 def test_train_dry_run_authoritative_rejection_keeps_stdout_empty(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:

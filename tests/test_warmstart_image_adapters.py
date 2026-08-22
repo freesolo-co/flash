@@ -51,6 +51,7 @@ def _adapter_config(model: str = _IMAGE_MODEL) -> dict:
         "lora_alpha": 32,
         "task_type": "CAUSAL_LM",
         "base_model_name_or_path": model,
+        "exclude_modules": None,
     }
 
 
@@ -163,8 +164,6 @@ def test_image_sft_warm_start_inherits_the_source_pin_like_any_other_algorithm()
     inherited = _adopted_warmstart_revision(spec, source)
 
     assert inherited.model_revision == source_revision
-    # inherited, not authored: serving refuses an AUTHORED pin, so a warm-started image SFT child
-    # stays deployable only while this flag survives the inheritance.
     assert inherited.model_revision_auto is True
 
 

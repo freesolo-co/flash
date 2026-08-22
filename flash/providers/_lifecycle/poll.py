@@ -259,7 +259,7 @@ def _format_heartbeat(hb: dict) -> str:
         for name, value in reward_metrics.items():
             if isinstance(value, (int, float)):
                 msg += f" {name}={value:.3f}"
-    msg += format_gpu_status(hb.get("gpu") or hb.get("diag"))
+    msg += format_gpu_status(hb.get("gpu"))
     sample_lines: list[str] = []
     rendered_samples = 0
     samples = hb.get("sampled_completions")

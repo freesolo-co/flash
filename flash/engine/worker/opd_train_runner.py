@@ -13,8 +13,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from flash.adapters.targets import resolve_lora_targeting
+from flash.core.catalog import get_model
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
+from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.train.opd.reporting import (
     _build_train_note_sections as _build_train_note_sections,
 )
@@ -208,6 +211,7 @@ def _prepare_prompts(
     package_root_value = getattr(request.env, "package_root", None)
     package_root = str(Path(package_root_value).resolve()) if package_root_value else None
     prepped = [0]
+    thinking_semantics_set = False
     with _opd_train.liveness_heartbeat("opd_image_prep", progress=lambda: prepped[0]):
         for example, messages in prompt_rows:
             prepped[0] += 1
@@ -222,7 +226,7 @@ def _prepare_prompts(
                 teacher_messages = image_teacher_prompt_messages(
                     student_messages, len(image_descriptors)
                 )
-                prompt_ids = _opd_train._processor_expanded_prompt_ids(
+                prompt_ids, rendered_prompt = _opd_train._processor_expanded_prompt(
                     processor,
                     student_messages,
                     image_descriptors,
@@ -232,10 +236,10 @@ def _prepare_prompts(
             else:
                 teacher_messages = student_messages
                 if processor is not None:
-                    # mixed job: the verl child tokenizes EVERY row through the multimodal dataset
+                    # mixed job: the verl child tokenizes every row through the multimodal dataset
                     # path (the processor), so text-only rows must freeze via the same path or the
                     # bridge's exact prompt-id check trips on tokenizer-vs-processor differences.
-                    prompt_ids = _opd_train._processor_expanded_prompt_ids(
+                    prompt_ids, rendered_prompt = _opd_train._processor_expanded_prompt(
                         processor,
                         student_messages,
                         (),
@@ -243,6 +247,12 @@ def _prepare_prompts(
                         enable_thinking=bool(_opd_train._w.THINKING),
                     )
                 else:
+                    rendered_prompt = tokenizer.apply_chat_template(
+                        student_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=_opd_train._w.THINKING,
+                    )
                     prompt_ids = _opd_train._normalize_prompt_ids(
                         tokenizer.apply_chat_template(
                             student_messages,
@@ -254,6 +264,19 @@ def _prepare_prompts(
             if len(prompt_ids) > prompt_budget:
                 dropped_long += 1
                 continue
+            # derive the run-level flag from the first RETAINED prompt, as grpo does. a row dropped
+            # for length never reaches the student, so latching on it can describe the run by a
+            # prompt no rollout ever sees: a retained prompt that does open thinking would then be
+            # graded as if it did not, and `strip_think` would return the reasoning as the answer.
+            if not thinking_semantics_set:
+                thinking = bool(_opd_train._w.THINKING)
+                if hasattr(request.env, "thinking"):
+                    request.env.thinking = thinking
+                if hasattr(request.env, "prompt_opens_thinking"):
+                    request.env.prompt_opens_thinking = (
+                        thinking and _opd_train._w.prompt_opens_thinking(rendered_prompt)
+                    )
+                thinking_semantics_set = True
             prompts.append(
                 _opd_train._BridgePrompt(
                     student_messages=student_messages,
@@ -357,7 +380,8 @@ def _prepare_workload(
     _opd_train._write_opd_parquet(rows, train_file)
     _opd_train._write_opd_parquet([rows[0]], val_file)
     lora_config = _opd_train._w.make_lora(request.model_id)
-    target_modules = lora_config.target_modules
+    targeting = resolve_lora_targeting(request.model_id, algorithm="opd", multimodal=multimodal)
+    target_modules = targeting.target_modules
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
     lora_rank = int(lora_config.r)
@@ -380,8 +404,13 @@ def _prepare_workload(
         lora_rank,
         int(lora_config.lora_alpha),
         target_modules,
+        targeting.exclude_modules,
         _opd_train._warmstart_adapter_path(
-            request.model_id, request.model_revision, lora_rank, int(lora_config.lora_alpha)
+            request.model_id,
+            request.model_revision,
+            lora_rank,
+            int(lora_config.lora_alpha),
+            targeting,
         ),
     )
 
@@ -558,6 +587,7 @@ def _build_base_config(
         "lora_rank": workload.lora_rank,
         "lora_alpha": workload.lora_alpha,
         "target_modules": workload.target_modules,
+        "exclude_modules": None,
         "target_parameters": _opd_train._w.lora_target_parameters(request.model_id),
         "lora_adapter_path": workload.warmstart_adapter,
         "learning_rate": knobs.learning_rate,
@@ -715,6 +745,7 @@ def _run_child(
     # filtering is the entire meaning of that marker.
     expected_shims = (
         (("opd-core",) if request.knobs.save_at_steps else ())
+        + ((TEXT_LORA_TARGET_SHIM,) if getattr(workload, "exclude_modules", None) else ())
         + (LORA_ROLLOUT_GUARD_SHIM,)
         + (("gdn-varlen",) if runtime.gdn_reset_arch else ())
     )
@@ -811,6 +842,7 @@ def _build_checkpoint_watcher(
         model_id=request.model_id,
         model_revision=request.model_revision,
         required_steps=request.knobs.save_at_steps,
+        exclude_modules=workload.exclude_modules,
         preprocessor=runtime.bridge.processor,
         seed=int(_opd_train._w.SEED),
         prompt_pool_fingerprint=workload.prompt_pool_fingerprint,
@@ -854,6 +886,9 @@ def _build_child_env(
             shim_dir=workload.shim_dir,
             save_at_steps=request.knobs.save_at_steps,
             total_steps=workload.update_horizon,
+            lora_language_prefix=(
+                get_model(request.model_id).lora_language_prefix if workload.exclude_modules else ""
+            ),
             gdn_model_type=runtime.gdn_reset_arch,
             loggers=runtime.loggers,
         ),
@@ -944,6 +979,7 @@ def _export_and_upload_adapter(
         adapter_dir,
         model_id=request.model_id,
         model_revision=request.model_revision,
+        exclude_modules=workload.exclude_modules,
         python_bin=runtime.python_bin,
         preprocessor=runtime.bridge.processor,
     )

@@ -14,6 +14,7 @@ from flash.adapters.fused_experts import (
     validate_fused_expert_adapter_config,
 )
 from flash.adapters.lora_rank import resolve_adapter_ref
+from flash.adapters.targets import LoraTargeting, require_modality_marker, resolve_lora_targeting
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.worker.io.hf import (
     RetriableInfraError,
@@ -32,23 +33,44 @@ _ADAPTER_DOWNLOAD_RETRIES = 4
 _ADAPTER_DOWNLOAD_BACKOFF_S = 5.0
 
 
-def validate_warmstart_adapter(config: Mapping[str, Any], model_id: str, adapter_dir: str) -> None:
+def validate_warmstart_adapter(
+    config: Mapping[str, Any],
+    model_id: str,
+    adapter_dir: str,
+    targeting: LoraTargeting | None = None,
+) -> None:
     """Validate a downloaded warm-start adapter without changing its config or files."""
+    # the same rejection the control plane already made at submit time, repeated on the bytes this
+    # worker actually downloaded. not redundant: the two never share a call stack, so only this
+    # call sees the config the trainer will load.
+    require_modality_marker(config, source="warm-start adapter")
+    tensors: Mapping[str, tuple[int, ...]] | None = None
+    source_is_multimodal = config.get("exclude_modules") is None
+    if targeting is not None:
+        run_is_multimodal = targeting.exclude_modules is None
+        if source_is_multimodal != run_is_multimodal:
+            source_modality = "multimodal (image-trained)" if source_is_multimodal else "text-only"
+            run_modality = "multimodal" if run_is_multimodal else "text-only"
+            raise ValueError(
+                f"warm-start modality mismatch: a {run_modality} run cannot continue a "
+                f"{source_modality} adapter; start a fresh run or use a matching-modality source adapter"
+            )
     validate_fused_expert_adapter_config(config, model_id)
     if not lora_target_parameters(model_id):
         return
-    tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
+    if tensors is None:
+        tensors = _read_adapter_tensor_metadata(adapter_dir) or {}
     if not has_complete_fused_expert_tensors(tensors, config, model_id):
         raise ValueError(
             f"warm-start adapter for {model_id} does not contain complete fused expert LoRA weights"
         )
 
 
-def make_lora(model_id: str | None = None):
-    """build the model's complete serve-compatible lora target set."""
+def make_lora(model_id: str, *, algorithm: str = "sft", multimodal: bool = False):
+    """build the model's modality-correct serve-compatible lora target set."""
     from peft import LoraConfig
 
-    targets = "all-linear"
+    targeting = resolve_lora_targeting(model_id, algorithm=algorithm, multimodal=multimodal)
     rank = _w.JOB_SPEC.train.lora_rank if _w.JOB_SPEC else RECIPE.lora.rank
     alpha = _w.JOB_SPEC.train.lora_alpha if _w.JOB_SPEC else RECIPE.lora.alpha
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
@@ -56,12 +78,13 @@ def make_lora(model_id: str | None = None):
         "r": rank,
         "lora_alpha": alpha,
         "lora_dropout": RECIPE.lora.dropout,
-        "target_modules": targets,
+        "target_modules": targeting.target_modules,
+        "exclude_modules": targeting.exclude_modules,
         "task_type": "CAUSAL_LM",
         "revision": model_revision or None,
     }
-    if target_parameters := lora_target_parameters(model_id):
-        kwargs["target_parameters"] = target_parameters
+    if targeting.target_parameters:
+        kwargs["target_parameters"] = targeting.target_parameters
     # pissa removed: it mutates the base, so its adapter corrupts serve + warm-start on the unmodified base.
     kwargs["init_lora_weights"] = True
     print(

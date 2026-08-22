@@ -20,8 +20,12 @@ from flash.schema import format_adapter_revision, parse_adapter_revision
 if TYPE_CHECKING:
     from flash.runner import RunStatus
 
+# reads the TOP-LEVEL `status.state`, where `deployed` is a live value this build writes.
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
-_RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
+# reads the NESTED `status.deployment["state"]`, a different vocabulary: no build has ever written
+# `deployed` there. the cli keeps both spellings on purpose, because it reads this field back from
+# a remote control plane whose version it does not control.
+_RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready"})
 _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 _REVOCATION_RETRY_STATE = "revocation_failed"
 _INACTIVE_DEPLOYMENT_STATES = frozenset({"undeployed", "dry_run"})
@@ -685,6 +689,18 @@ def _cancellation_billing(
     }
 
 
+def _prepare_cancellation(run_id: str) -> list[Exception]:
+    """Fence teacher authority before teardown begins."""
+    from flash.server.platform import db as server_db
+
+    deferred_fencing_errors: list[Exception] = []
+    try:
+        server_db.revoke_teacher_capabilities_for_run(run_id)
+    except Exception as exc:
+        deferred_fencing_errors.append(exc)
+    return deferred_fencing_errors
+
+
 def cancel_run(run_id: str) -> RunStatus:
     """Cancel training while preserving verified serving and durable cleanup targets."""
     from flash.runner import (
@@ -697,12 +713,7 @@ def cancel_run(run_id: str) -> RunStatus:
     from flash.server.platform import db as server_db
     from flash.server.platform.locks import _deploy_lock
 
-    # fence teacher authority before waiting on deployment locks or slow provider teardown.
-    deferred_fencing_errors: list[Exception] = []
-    try:
-        server_db.revoke_teacher_capabilities_for_run(run_id)
-    except Exception as exc:
-        deferred_fencing_errors.append(exc)
+    deferred_fencing_errors = _prepare_cancellation(run_id)
 
     def _clear_exact_remote(expected_remote: dict) -> bool:
         return _clear_remote_if_unchanged(run_id, expected_remote)

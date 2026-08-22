@@ -520,7 +520,7 @@ def test_grpo_rejects_single_generation_group_before_paid_worker() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
 
-    with pytest.raises(ConfigError, match=r"group_size.*>= 2.*GRPO"):
+    with pytest.raises(ConfigError, match=r"group_size.*one of \{2, 4, 8\}.*GRPO"):
         spec_from_dict(
             {**base, "train": {"epochs": 1, "max_examples": 8, "group_size": 1}}, run_id="bad"
         )

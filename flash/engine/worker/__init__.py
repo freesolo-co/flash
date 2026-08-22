@@ -430,7 +430,12 @@ def main():
                 error=detail,
                 **hb_flags,
                 **_err_metrics,
-                diag=gpu_diagnostics(),
+                # `gpu=`, like every other producer here: this was the one path spelling it `diag`,
+                # and the consumer reads `gpu` alone. the mismatch is worse than a missing field --
+                # `record_heartbeat` assigns `gpu_status` unconditionally, so an error heartbeat
+                # whose diagnostics land under an unread key CLEARS the snapshot a healthy
+                # heartbeat already stored, losing the evidence exactly when an oom needs it.
+                gpu=gpu_diagnostics(),
             )
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics)

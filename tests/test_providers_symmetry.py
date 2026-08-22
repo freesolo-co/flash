@@ -17,7 +17,7 @@ import importlib
 
 import pytest
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 
 # The universal per-provider surface: concerns every substrate must implement itself (no shared
 # default fits). ``gpus``/``train`` are intentionally NOT here — they're per-provider by necessity.
@@ -334,7 +334,40 @@ def test_provider_cancel_destroy_dispatch(monkeypatch):
     assert deleted == ["ep"]
 
 
-def test_runpod_destroy_rejects_unconfirmed_delete(monkeypatch):
+def test_runpod_destroy_accepts_exact_owner_404_confirmation(monkeypatch):
+    from flash.providers import get_provider
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as rp_api
+
+    lookups = []
+    monkeypatch.setattr(
+        rp_api,
+        "delete_endpoint_for_fingerprint",
+        lambda endpoint_id, _fingerprint: False,
+    )
+    monkeypatch.setattr(
+        rp_api,
+        "endpoint_absent_for_fingerprint",
+        lambda endpoint_id, fingerprint: lookups.append((endpoint_id, fingerprint)) or True,
+    )
+    handle = JobHandle(
+        "runpod",
+        {
+            "endpoint_id": "ep-unconfirmed",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "j",
+            "attempt": 0,
+            "started_ts": 1.0,
+        },
+    )
+
+    get_provider("runpod").destroy(handle)
+
+    assert lookups == [("ep-unconfirmed", _RUNPOD_FINGERPRINT)]
+
+
+def test_runpod_destroy_rejects_non_authoritative_absence_result(monkeypatch):
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
     from flash.providers.runpod import api as rp_api
@@ -343,6 +376,11 @@ def test_runpod_destroy_rejects_unconfirmed_delete(monkeypatch):
         rp_api,
         "delete_endpoint_for_fingerprint",
         lambda endpoint_id, _fingerprint: False,
+    )
+    monkeypatch.setattr(
+        rp_api,
+        "endpoint_absent_for_fingerprint",
+        lambda endpoint_id, fingerprint: False,
     )
     handle = JobHandle(
         "runpod",

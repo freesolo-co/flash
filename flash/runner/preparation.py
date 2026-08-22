@@ -15,10 +15,11 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import replace
 
 from flash.core.spec import JobSpec
-from flash.core.spec_persistence import VersionedPersistedSpecEnvelope
+from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 
 
 def _runner():
@@ -35,20 +36,15 @@ def _runner():
 
 
 def _adopted_warmstart_revision(spec: JobSpec, src_spec: JobSpec) -> JobSpec:
-    """Take the warm-start source's pin and preserve who chose it.
-
-    The child must train against the exact immutable base its source adapter used. For an SFT source,
-    the runner chose the pin, so inheriting ``model_revision_auto=True`` keeps the child deployable.
-    A pre-removal source may instead carry an author-supplied pin; the removed public key means the
-    child cannot repeat it, so it inherits that pin with ``model_revision_auto=False`` and remains
-    rejected at deploy for the same reason as its parent.
-    """
+    """Take the warm-start source's runner-managed immutable base-model pin."""
     if spec.model_revision or not src_spec.model_revision:
         return spec
+    if not src_spec.model_revision_auto:
+        raise ValueError("warm-start source has an unsupported unmanaged model revision")
     return replace(
         spec,
         model_revision=src_spec.model_revision,
-        model_revision_auto=src_spec.model_revision_auto,
+        model_revision_auto=True,
     )
 
 
@@ -97,11 +93,9 @@ def _inherit_warmstart_revision(
     Applies to an SFT target too, and that case is the one with no second chance. SFT is the only
     algorithm ``prepare_job`` force-pins (``_resolve_model_revision(required=True)``), and that call
     runs immediately after this one. Skipping the inheritance here would let the child resolve its
-    own pin to whatever the base model's hub tip is NOW, so a source trained before the tip moved
-    fails the equality check in ``_prepare_init_from_adapter_inner`` -- warm start would work only
-    while the base happened to be unchanged. Inheriting first also carries the source's
-    ``model_revision_auto``, which is what keeps a warm-started SFT child deployable: serving
-    refuses an AUTHORED pin, and a self-resolved one would be indistinguishable from the author's.
+    own pin to whatever the base model's hub tip is now, so a source trained before the tip moved
+    fails the equality check in ``_prepare_init_from_adapter_inner``. inheriting first also preserves
+    the source pin's runner-managed provenance.
 
     Two ordering rules this function must not relax, because it now runs BEFORE the code that used
     to enforce them:
@@ -179,6 +173,7 @@ def _prepare_init_from_adapter_inner(
         preflight_init_adapter_lora_rank,
         resolve_hf_dataset_revision,
     )
+    from flash.adapters.targets import require_modality_marker
     from flash.runner.results.checkpoints import CheckpointListingError, adapter_artifact_exists
     from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
 
@@ -255,6 +250,10 @@ def _prepare_init_from_adapter_inner(
         ),
     )
     config = load_hf_adapter_config(storage, token, revision)
+    # here rather than only in the worker: this is the same config the worker will re-download and
+    # re-check, and an unmarked adapter is unusable by every algorithm, so deciding it now turns a
+    # post-allocation worker failure into a submit-time error and spends no GPU on a doomed run.
+    require_modality_marker(config, source=f"train.init_from_adapter source {ref!r}")
     validate_fused_expert_adapter_config(config, spec.model)
     metadata = preflight_init_adapter_lora_rank(
         worker_spec, token=token, config_loader=lambda _ref, _token, _revision: config
@@ -302,20 +301,42 @@ def _preparation_digest(
     worker_spec: JobSpec,
     adapter_identity: dict | None,
     *,
-    persisted: VersionedPersistedSpecEnvelope | None = None,
+    stored_public: object = None,
 ) -> str:
-    persisted = persisted or VersionedPersistedSpecEnvelope()
-    worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
-    # ``[environment] pip`` became user-authorable, so to_dict() now emits it where it used to be
-    # stripped, and a pre-upgrade snapshot hashed an environment with no pip key at all. dropping it
-    # when empty reproduces those bytes without needing to know when the run was prepared: absent
-    # and empty are the same install, so they must hash alike. an authored pip is non-empty and
-    # stays bound, so tampering with the persisted value is still caught. unlike the rewinds below
-    # this needs no stored reading, which is why it is not part of one.
+    # `lora_alpha` became user-authorable in 1.1.35, so `to_dict()` now MATERIALIZES it (defaulting
+    # to 2 * lora_rank) where a spec prepared before that stored no key at all. rehashing such a
+    # run with today's serialization hashes bytes it never had, so its digest can only be
+    # reproduced by replaying the omission. `workload_profile` predates the change (1.1.32), so the
+    # digest branch is genuinely reachable for runs in that window.
+    #
+    # this cannot forge a value: the omission is read from the STORED public spec, and the digest
+    # it is compared against was computed over the original. a warm start is excluded because
+    # `to_dict()` strips rank and alpha for those in EVERY version, so absence there dates nothing
+    # and dropping the binding would lose real cover -- `_validate_effective_spec` excludes alpha
+    # from its structural comparison, leaving the digest as the only thing tying the two halves.
+    if isinstance(stored_public, Mapping):
+        stored_train = stored_public.get("train")
+        if (
+            isinstance(stored_train, Mapping)
+            and "lora_alpha" not in stored_train
+            and not stored_train.get("init_from_adapter")
+        ):
+            public_payload["train"].pop("lora_alpha", None)
+    worker_payload = worker_spec.to_internal_dict()
+    # NORMALIZATION, not legacy replay: this is the canonical shape `dev` hashes TODAY (1.2.88), and
+    # it is unconditional -- it reads nothing off the stored record and applies to every run this
+    # build prepares. Deleting it as "historical" made the digest depend on which build wrote it, so
+    # a record the DEPLOYED release is writing right now stops verifying here. Measured: a spec
+    # hashed dev's way then recovered on this branch fails `reallocation_spec_from_status`, which
+    # `server/platform/runtime.py:697-710` turns into `unrecoverable` -- retiring in-flight runs on
+    # upgrade. The genuinely historical half (`VersionedPersistedSpecEnvelope.rewind`) stays deleted.
+    #
+    # absent and empty are the same value for all of these, so hashing them alike costs no binding:
+    # a set field is non-empty and stays covered, and every key is derived from the spec rather than
+    # read from the snapshot, so nothing here can be forged by tampering with the stored record.
     if not public_payload["environment"].get("pip"):
         public_payload["environment"].pop("pip", None)
-    # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
         "model_revision_auto",
         "model_revision_force_pin",
@@ -326,9 +347,8 @@ def _preparation_digest(
     ):
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
-    persisted.rewind(public_payload, worker_payload)
     payload = {
-        "version": persisted.version,
+        "version": PREPARATION_ENVELOPE_VERSION,
         "public_spec": public_payload,
         "worker_spec": worker_payload,
         "adapter_identity": adapter_identity,
@@ -350,6 +370,7 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         # re-parseable by the submission schema), so the reconstructed public spec always reads
         # False while the worker half carries the real value. Comparing them would reject every
         # auto-pinned run here -- the same runs the deploy guard was just relaxed to admit.
+        "model_revision",
         "model_revision_auto",
         "gpu_count_auto",
         "workload_profile_input_digest",
@@ -357,11 +378,6 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         "workload_profile",
     ):
         effective[managed_top] = public.get(managed_top)
-    # new public specs omit the pin, so their worker half legitimately carries the only copy. a
-    # historical public spec can still carry an authored pin; keep comparing that value because a
-    # plain source run reaches neither digest branch and this structural check is its only cover.
-    if not public.get("model_revision"):
-        effective["model_revision"] = public.get("model_revision")
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
     public_ref = public_train.get("init_from_adapter") or ""
@@ -478,29 +494,13 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
 
 
 def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec:
-    # a forced pin is runner-managed even though it is present. otherwise a pin already marked
-    # runner-assigned (inherited from a warm-start source) is not authored either: reading presence
-    # alone would relabel it as the author's and hand deploy a pin it refuses.
-    authored = (
-        spec.model_revision
-        if spec.model_revision_force_pin
-        else ""
-        if spec.model_revision_auto
-        else spec.model_revision
-    )
-    if not authored and not required:
+    if spec.model_revision and not spec.model_revision_auto:
+        raise ValueError("unmanaged model_revision is unsupported")
+    if not spec.model_revision and not required:
         return spec
     # an inherited warm-start pin is already an immutable sha chosen by a previous run, so there is
-    # nothing left to resolve. re-resolving would look up the CURRENT hub tip (``authored`` is empty
-    # for a runner-assigned pin, so the lookup passes ``revision=None``) and overwrite the source's
-    # sha with it. the warm start would then be rejected for a revision mismatch the moment the base
-    # model moved -- and ``_adopted_warmstart_revision`` cannot undo it, because it refuses to
-    # replace a pin that is already set.
-    # a FORCED pin is excluded, and the exclusion is load-bearing rather than defensive: the
-    # ``model_revision_force_pin`` contract requires auto=True and a 40-hex sha, so a forced pin
-    # matches this condition every single time. without the exclusion this return would swallow
-    # every forced pin, skipping both the hub verification the marker exists to demand and the
-    # clearing below that keeps the one-shot request out of any persisted spec.
+    # nothing left to resolve. a forced pin is excluded because it is a one-shot request to verify
+    # that exact immutable commit before clearing the request marker.
     if (
         spec.model_revision_auto
         and not spec.model_revision_force_pin
@@ -512,7 +512,7 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
 
         info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(
             spec.model,
-            revision=authored or None,
+            revision=spec.model_revision if spec.model_revision_force_pin else None,
         )
         reported = str(getattr(info, "sha", "") or "").strip()
         resolved = reported.lower()
@@ -525,14 +525,10 @@ def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec
             f"could not resolve model_revision for model {spec.model!r}; "
             "verify that the revision exists and the operator token can access it"
         ) from exc
-    # record who chose the pin, not just its value. a forced pin is supplied by the internal runner,
-    # so it retains auto provenance while the one-shot verification request is cleared before any
-    # prepared public or worker spec is persisted. an authored pin remains authored.
-    auto_assigned = True if spec.model_revision_force_pin else not authored
     return replace(
         spec,
         model_revision=resolved,
-        model_revision_auto=auto_assigned,
+        model_revision_auto=True,
         model_revision_force_pin=False,
     )
 

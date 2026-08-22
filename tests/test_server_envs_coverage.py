@@ -610,10 +610,8 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
     # deployment record. every serving route parses the persisted spec before inference, so
     # chat raises there instead of answering -- while `/v1/deployments` still lists the record
     # as active, and only BUSY states were recovered at startup. the record therefore survived
-    # every restart as a deployment that looks live and can never respond. both readiness
-    # spellings are covered: this pass reads records persisted by OTHER builds, so the one
-    # spelling the current build happens to write is not the set it can encounter.
-    rows = [{"run_id": "r-retired"}, {"run_id": "r-legacy-spelling"}, {"run_id": "r-servable"}]
+    # every restart as a deployment that looks live and can never respond.
+    rows = [{"run_id": "r-retired"}, {"run_id": "r-servable"}]
     monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
 
     project = "11111111-1111-4111-8111-111111111111"
@@ -624,18 +622,6 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
             deployment={"state": "ready"},
             spec={
                 "run_id": "r-retired",
-                "model": "Qwen/Qwen3.5-4B",
-                "algorithm": "opsd",
-                "project": project,
-            },
-        ),
-        # the same unservable record under the other readiness spelling this module recognizes.
-        "r-legacy-spelling": types.SimpleNamespace(
-            run_id="r-legacy-spelling",
-            state="done",
-            deployment={"state": "deployed"},
-            spec={
-                "run_id": "r-legacy-spelling",
                 "model": "Qwen/Qwen3.5-4B",
                 "algorithm": "opsd",
                 "project": project,
@@ -669,8 +655,8 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
     monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
     monkeypatch.setattr(runner, "_report_status", lambda status: None)
 
-    assert serving.recover_deployments() == 2
-    assert [run_id for run_id, _failed in marked] == ["r-retired", "r-legacy-spelling"]
+    assert serving.recover_deployments() == 1
+    assert [run_id for run_id, _failed in marked] == ["r-retired"]
     for _run_id, failed in marked:
         assert failed["state"] == "failed"
         # the reason names the actual cause, not the restart the busy branch reports.

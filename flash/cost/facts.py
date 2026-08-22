@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from flash.core.catalog import MODELS, ModelInfo
-from flash.providers.base import GPU_INFO, GpuClass, providers_for
+from flash.providers.base import GPU_INFO
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
     # A10: 125 TFLOPS dense bf16 tensor (NVIDIA spec); Lambda-only 24 GB class, else defaults to 100.
@@ -109,99 +109,11 @@ def effective_train_tflops(name: str) -> float:
     return min(peak, cap) if cap is not None else peak
 
 
-def gpu_hourly_usd(
-    name: str,
-    provider: str | None = None,
-    max_wall_seconds: float = 0.0,
-    min_vram_gb: int = 0,
-    gpu_type: str = "",
-) -> float:
-    """Representative $/hr for a class, on ``provider`` when given.
-
-    Lambda and Vast use provider pricing with static fallback; others use RunPod rates. Vast gets
-    the run-duration and VRAM floors so quote and allocator search the same market.
-    """
-    info = GPU_INFO.get(name)
-    if info is None:
-        raise KeyError(f"unknown GPU class {name!r}")
-    p = (provider or "").strip().lower()
-    if p == "lambda" and info.lambda_name:
-        from flash.providers import get_provider
-
-        return get_provider("lambda").hourly_rate(name)
-    if p == "vast" and info.vast_name:
-        # Vast is a live market whose rates differ materially from RunPod's static ones, so price a
-        # provider="vast" quote through the Vast pricing module (live + static fallback).
-        from flash.providers.vast.pricing import hourly_rate
-
-        return hourly_rate(
-            name,
-            max_wall_seconds=max_wall_seconds,
-            min_vram_gb=min_vram_gb,
-            gpu_type=gpu_type,
-        )
-    return info.hourly_usd
-
-
 def gpu_vram_gb(name: str) -> int:
     info = GPU_INFO.get(name)
     if info is None:
         raise KeyError(f"unknown GPU class {name!r}")
     return info.vram_gb
-
-
-def pick_gpu(
-    required_vram_gb: int,
-    *,
-    provider: str | None = None,
-    max_wall_seconds: float = 0.0,
-    cost_key=None,
-) -> str:
-    """Cheapest GPU class that fits ``required_vram_gb``.
-
-    This is intentionally gate-free; provider and wall-time filters constrain candidates.
-    `cost_key` ranks whole-job cost and is injected to keep the dependency on `analytical` one-way.
-    """
-
-    def _selectable(g: GpuClass) -> bool:
-        return provider in (None, "auto") or provider in providers_for(g.name)
-
-    candidates = [g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _selectable(g)]
-    if not candidates:
-        raise ValueError(f"no GPU class fits >= {required_vram_gb} GB")
-    # Rank by the rate on the REQUESTED provider, not the RunPod nominal. For Vast, fetch the live offer
-    # map ONCE (a duration-bound query bypasses the per-call cache, so pricing per candidate would fire N
-    # identical market fetches) and, when reachable, restrict to classes that actually have a rentable
-    # offer under the wall cap and rank by LIVE price — else a cheaper class with no surviving offer gets
-    # selected/quoted on a static rate the launch path would never rent. Static fallback when offline.
-    if (provider or "").strip().lower() == "vast":
-        from flash.providers.vast.pricing import live_offer_rates
-
-        live = live_offer_rates(max_wall_seconds=max_wall_seconds, min_vram_gb=required_vram_gb)
-        rentable = [g for g in candidates if g.name in live] if live else []
-        if rentable:
-            candidates = rentable
-
-            def _rate(g: GpuClass) -> float:
-                return live[g.name]
-        else:
-
-            def _rate(g: GpuClass) -> float:
-                return g.hourly_usd
-    else:
-
-        def _rate(g: GpuClass) -> float:
-            return gpu_hourly_usd(g.name, provider=provider, max_wall_seconds=max_wall_seconds)
-
-    if cost_key is not None:
-        # rank on job cost, tie-breaking on rate then the same vram/name order as the $/hr path so
-        # the two bases stay comparable when a run is unpriceable in only one of them.
-        best = min(
-            candidates, key=lambda g: (cost_key(g.name, _rate(g)), _rate(g), g.vram_gb, g.name)
-        )
-    else:
-        best = min(candidates, key=lambda g: (_rate(g), g.vram_gb, g.name))
-    return best.name
 
 
 def _catalog_model_info(model_id: str) -> ModelInfo:

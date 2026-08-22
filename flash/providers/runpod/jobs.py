@@ -184,12 +184,7 @@ class JobHandle:
         if not isinstance(endpoint_name, str) or not endpoint_name:
             raise ValueError("persisted RunPod endpoint name is invalid")
         fingerprint = d.get("key_fingerprint")
-        if (
-            not isinstance(fingerprint, str)
-            or len(fingerprint) != 16
-            or not fingerprint.startswith("rpk-")
-            or any(char not in "0123456789abcdef" for char in fingerprint[4:])
-        ):
+        if not runpod_api._is_valid_key_fingerprint(fingerprint):
             raise ValueError("persisted RunPod key fingerprint is invalid")
         job_id = d.get("job_id")
         if job_id is not None and (not isinstance(job_id, str) or not job_id):

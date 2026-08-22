@@ -499,8 +499,6 @@ class _AttachContext:
     recovered_attempt: int
     next_attempt: int
     source_snapshot: dict | None
-    allocated_gpu: object | None
-    allocated_gpu_count: object | None
 
 
 def _build_attach_context(
@@ -521,8 +519,11 @@ def _build_attach_context(
     recovered_attempt = _attempt_int(remote.get("attempt"))
     if recovered_attempt is None:
         raise ValueError("persisted attempt identity is missing or invalid")
-    allocated_gpu = remote.pop("allocated_gpu", None)
-    allocated_gpu_count = remote.pop("allocated_gpu_count", None)
+    # strip the allocation stamp off the HANDLE copy only: `JobHandle.from_dict` round-trips
+    # unknown keys, and the stamp belongs to `persisted_remote`, which `_carry_allocation_stamp`
+    # reads whole when adopting metrics.
+    remote.pop("allocated_gpu", None)
+    remote.pop("allocated_gpu_count", None)
     return _AttachContext(
         worker_spec=worker_spec,
         persisted_remote=persisted_remote,
@@ -531,8 +532,6 @@ def _build_attach_context(
         recovered_attempt=recovered_attempt,
         next_attempt=recovered_attempt + 1,
         source_snapshot=source_snapshot,
-        allocated_gpu=allocated_gpu,
-        allocated_gpu_count=allocated_gpu_count,
     )
 
 
@@ -750,12 +749,15 @@ def _adopt_attached_poll_result(
     log,
 ) -> None:
     """Restore allocation metadata and adopt one successful provider result."""
+    from flash.runner.supervise.deploy import _carry_allocation_stamp
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
-    if context.allocated_gpu and isinstance(result.metrics, dict):
-        result.metrics.setdefault("allocated_gpu", context.allocated_gpu)
-    if context.allocated_gpu_count and isinstance(result.metrics, dict):
-        result.metrics.setdefault("allocated_gpu_count", int(context.allocated_gpu_count))
+    # the shared carrier, not a local copy of two of its three fields: `_build_attach_context` pops
+    # gpu and count off its handle copy but leaves `persisted_remote` whole, so the provider is
+    # available here too. dropping it left `_gpu_rate` to fall back to whichever configured provider
+    # offers the class -- normally RunPod -- so an attached vast or lambda run was priced at the
+    # wrong substrate's rate and its notes named a provider that never ran it.
+    _carry_allocation_stamp(result.metrics, context.persisted_remote)
     if not _adopt_completed_attempt(
         run_id,
         context.worker_spec,

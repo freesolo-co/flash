@@ -804,19 +804,6 @@ def message_content_text(content: object) -> str:
     return ""
 
 
-def assistant_completion_text(completion: object) -> str:
-    if not isinstance(completion, list):
-        return str(completion or "")
-    for message in reversed(completion):
-        if isinstance(message, dict) and message.get("role") == "assistant":
-            content = message.get("content", "")
-            # a content shape with no text at all (null tool-call content) keeps scanning earlier
-            # assistant turns rather than resolving to "" here.
-            if isinstance(content, (str, list)):
-                return message_content_text(content)
-    return ""
-
-
 def _record_messages(record: dict) -> list[dict]:
     value = record.get("input")
     if isinstance(value, list) and all(isinstance(message, dict) for message in value):

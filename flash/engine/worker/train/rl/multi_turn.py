@@ -195,6 +195,7 @@ class MultiTurnBridge:
         per_turn_credit: bool = False,
         on_episode_scored: Callable[[object, object, float], None] | None = None,
         parent_work: ParentWorkGauge | None = None,
+        identity_ledger=None,
         score_batch_size: int = _MULTI_TURN_SCORE_BATCH_SIZE,
         score_flush_wait_s: float = _MULTI_TURN_SCORE_FLUSH_WAIT_S,
         session_lease_s: float = _MULTI_TURN_SESSION_LEASE_S,
@@ -230,10 +231,21 @@ class MultiTurnBridge:
         self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
         self._parent_work = parent_work or ParentWorkGauge()
+        self._identity_ledger = identity_ledger
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
         self._warned_missing_turn_rewards = False
+        # per-run turn totals, published through `turn_accounting`. guarded by the same lock as
+        # every other mutable bridge state.
+        self._scored_episodes = 0
+        # counted from the parent's own `next_turn`, NOT from the child's `turn_count`. these
+        # counters exist to prove the child's turn loop really iterated, so deriving them from a
+        # number the child reports about itself would make a child that collapsed to one turn
+        # report whatever it liked -- the one failure they are here to catch. `step` validates
+        # every ordinal against `next_turn` before incrementing it, so the parent's count is exact.
+        self._scored_turns = 0
+        self._max_observed_turns = 0
         self._sessions: dict[str, dict] = {}
         self._session_lease_s = float(session_lease_s)
         # score many episodes under one lock-held env call so judge work can use the env's own
@@ -272,6 +284,25 @@ class MultiTurnBridge:
             "/multiturn/step": step,
             "/multiturn/score": self.score,
             "/multiturn/close": self.close,
+        }
+
+    def turn_accounting(self) -> dict[str, int | float | None]:
+        """Bounded per-run turn totals, for proving the multi-turn loop actually iterated.
+
+        A regression that ended every episode after one turn still produces finite gradients, a
+        nonzero adapter delta, and complete artifacts -- every existing gate stays green while the
+        environment's multi-turn contract is silently dead. These counters make that visible.
+        OPD already publishes the same pair as `episodes_seen` / `mt_turn_records`.
+        """
+        with self._lock:
+            episodes = self._scored_episodes
+            turns = self._scored_turns
+            maximum = self._max_observed_turns
+        return {
+            "episodes_scored": episodes,
+            "turn_records": turns,
+            "max_turns_observed": maximum,
+            "mean_turns_per_episode": (turns / episodes if episodes else None),
         }
 
     def shutdown(self) -> None:
@@ -327,6 +358,11 @@ class MultiTurnBridge:
             )
         session_id = request_session_id(payload)
         example = self._examples[index]
+        identity = (
+            self._identity_ledger.require_registered(payload.get("identity"), index)
+            if self._identity_ledger is not None
+            else None
+        )
         expected_prompt = self._env_prompts[index]
         expected_digests = self._prompt_digests[index]
         if "raw_prompt" in payload:
@@ -358,6 +394,7 @@ class MultiTurnBridge:
             self._sessions[session_id] = {
                 "example": example,
                 "state": state,
+                "identity": identity,
                 "messages": copy.deepcopy(expected_prompt),
                 "descriptors": list(self._prompt_descriptors[index]),
                 "image_digests": list(expected_digests),
@@ -518,6 +555,15 @@ class MultiTurnBridge:
         with self._lock:
             session = self._session(payload)
             state = session["state"]
+            expected_identity = session.get("identity")
+        if self._identity_ledger is not None:
+            identity = self._identity_ledger.validate_for_index(
+                payload.get("identity"),
+                expected_identity.sample_index,
+            )
+            if identity != expected_identity:
+                raise ValueError("multi-turn GRPO score identity does not match its session")
+            self._identity_ledger.record(payload.get("identity"), expected_identity.sample_index)
         # queued OUTSIDE the lock so concurrent episodes can coalesce into one env call; the
         # batcher thread reacquires it to do the scoring. safe to read this session's state
         # unlocked because the episode is terminal -- the child sends /score only after its turn
@@ -530,6 +576,28 @@ class MultiTurnBridge:
             )
         )
         with self._lock:
+            # counted here, AFTER identity validation and a scorer reply, so the accounting only
+            # ever describes episodes that were really scored. counting on entry let a request the
+            # checks below reject -- a mismatched or duplicate identity -- or a scorer failure
+            # still inflate the totals, and `turn_accounting()` is published from the runner's
+            # `finally` path, so those inflated numbers reach the durable notes of a run that
+            # failed. that is the opposite of what the counters exist to prove.
+            #
+            # one /score call per terminal episode, so this counts episodes exactly once. recorded
+            # in `score` rather than in `step` because a truncated turn returns terminal without
+            # ever reaching the env, and it is still a turn the model generated and trained on.
+            #
+            # `next_turn`, not the payload's `turn_count`: they are different quantities on purpose.
+            # `turn_count` is the SCOREABLE turn total the child derives from `turn_spans`, which
+            # deliberately omits an unusable turn because the env never saw it and returns no reward
+            # for it -- that is the scoring contract and it stays as it is. the counters here want
+            # the GENERATED total, which is what the sentence above says they mean, and taking it
+            # from the parent's own validated ordinal also stops the child from self-reporting the
+            # very number that would expose it collapsing to one turn per episode.
+            generated_turns = int(session["next_turn"])
+            self._scored_episodes += 1
+            self._scored_turns += generated_turns
+            self._max_observed_turns = max(self._max_observed_turns, generated_turns)
             # snapshot under the same lock that guards the session: `step` mutates this list in
             # place, and a concurrent episode's turn would otherwise be read mid-append.
             prompt = list(state.get("prompt") or ())
@@ -640,6 +708,7 @@ def start_reward_server(
     multi_turn_bridge=None,
     rollout_batch: int = 0,
     score_batch=None,
+    identity_ledger=None,
 ):
     """start the localhost reward server and return ``(server, base_url)``.
 
@@ -662,17 +731,28 @@ def start_reward_server(
         else None
     )
 
+    def _register_identities(payload: dict) -> dict:
+        if identity_ledger is None:
+            raise RuntimeError("GRPO identity registration is not configured")
+        identities = _request_field(payload, "identities")
+        if not isinstance(identities, list):
+            raise _BadRequest("field 'identities' must be a list")
+        step = identity_ledger.register(identities)
+        return {"optimizer_step": step, "registered": len(identities)}
+
     def _score_route(payload: dict) -> dict:
         index = request_int(payload, "index")
         if index < 0 or index >= example_count:
             raise _BadIndex(f"reward example index {index} is outside [0, {example_count})")
         solution_str = payload.get("solution_str", "")
+        if identity_ledger is not None:
+            identity_ledger.record(payload.get("identity"), index)
         if score_batcher is not None:
             return {"score": float(score_batcher.submit((index, solution_str)))}
         with score_lock:
             return {"score": float(score_by_index(index, solution_str))}
 
-    routes = {"/score": _score_route}
+    routes = {"/identity/register": _register_identities, "/score": _score_route}
     if multi_turn_bridge is not None:
         routes.update(multi_turn_bridge.routes())
 

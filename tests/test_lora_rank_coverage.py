@@ -163,3 +163,46 @@ def test_preflight_without_warm_start_returns_none() -> None:
     )
 
     assert lora_rank.preflight_init_adapter_lora_rank(spec) is None
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.0, "1"])
+def test_strict_declared_ranks_reject_invalid_scalar_r(value) -> None:
+    with pytest.raises(ValueError, match="r must be a positive integer"):
+        lora_rank.strict_declared_lora_ranks({"r": value})
+
+
+@pytest.mark.parametrize("value", [None, [], "q_proj"])
+def test_strict_declared_ranks_reject_invalid_pattern_container(value) -> None:
+    with pytest.raises(ValueError, match="rank_pattern must be an object"):
+        lora_rank.strict_declared_lora_ranks({"r": 1, "rank_pattern": value})
+
+
+@pytest.mark.parametrize("key", ["", " ", 1])
+def test_strict_declared_ranks_reject_invalid_pattern_key(key) -> None:
+    with pytest.raises(ValueError, match="keys must be non-empty strings"):
+        lora_rank.strict_declared_lora_ranks({"r": 1, "rank_pattern": {key: 2}})
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 2.0, "2"])
+def test_strict_declared_ranks_reject_invalid_pattern_value(value) -> None:
+    with pytest.raises(ValueError, match="values must be positive integers"):
+        lora_rank.strict_declared_lora_ranks({"r": 1, "rank_pattern": {"q_proj": value}})
+
+
+def test_strict_declared_ranks_reject_malformed_pattern_regex() -> None:
+    with pytest.raises(ValueError, match="invalid regex"):
+        lora_rank.strict_declared_lora_ranks({"r": 1, "rank_pattern": {"(": 2}})
+
+
+def test_strict_declared_ranks_preserve_ordered_first_match_resolution() -> None:
+    declared = lora_rank.strict_declared_lora_ranks(
+        {"r": 1, "rank_pattern": {"q_proj": 2, ".*q_proj": 4}}
+    )
+
+    assert lora_rank._rank_for_module("model.layers.0.self_attn.q_proj", declared) == 2
+
+
+def test_strict_declared_ranks_use_scalar_for_unmatched_valid_override() -> None:
+    declared = lora_rank.strict_declared_lora_ranks({"r": 3, "rank_pattern": {"v_proj": 5}})
+
+    assert lora_rank._rank_for_module("model.layers.0.self_attn.q_proj", declared) == 3

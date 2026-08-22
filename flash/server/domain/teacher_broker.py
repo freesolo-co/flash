@@ -19,6 +19,7 @@ from flash.engine.plan.recipe import RECIPE, resolve_teacher
 from flash.server.domain.teacher_errors import TeacherBrokerError, ValidatedCompletionRequest
 from flash.server.domain.teacher_requests import (
     CAPABILITY_PATTERN,
+    MAX_REQUEST_BODY_BYTES,
     REQUEST_ID_PATTERN,
     _canonical_json,
     _reject_nonfinite,
@@ -36,6 +37,7 @@ from flash.server.domain.teacher_requests import (
 # names below are unused in this file by design, which is what __all__ tells ruff.
 __all__ = [
     "CAPABILITY_PATTERN",
+    "MAX_REQUEST_BODY_BYTES",
     "REQUEST_ID_PATTERN",
     "TeacherBrokerError",
     "ValidatedCompletionRequest",
@@ -69,7 +71,6 @@ PARASAIL_CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 PARASAIL_SCORING_MODE = "supplied_token_completion_v1"
 PARASAIL_API_KEY_ENV = "PARASAIL_API_KEY"
 
-MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024
 MAX_RESPONSE_BODY_BYTES = 32 * 1024 * 1024
 MAX_PROVIDER_ERROR_BODY_BYTES = 64 * 1024
 # per-logical-request upstream attempt budget, enforced by mark_teacher_request_started.
@@ -388,6 +389,7 @@ def _map_ledger_error(error: db.TeacherLedgerError, request_id: str) -> TeacherB
         status_code=status,
         retryable=error.retryable,
         request_id=request_id,
+        provider_status=error.provider_status,
     )
 
 
@@ -698,9 +700,9 @@ def _dispatch_to_teacher_provider(
             request_id=request_id,
         ) from exc
     except (OSError, http.client.HTTPException) as exc:
-        # the connection failed mid-call, so the upstream outcome is unknown. the row stays
-        # readmissible for a re-dispatch of the same request_id; billed usage lands only on
-        # the terminal 'succeeded' completion, so re-dispatching cannot double-bill.
+        # the provider may have accepted work before the connection failed. without an upstream
+        # idempotency key, redispatch could execute and bill the same logical request twice, so the
+        # ambiguous outcome is terminal even though flash cannot settle provider usage internally.
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,
@@ -711,29 +713,29 @@ def _dispatch_to_teacher_provider(
         raise TeacherBrokerError(
             "outcome_unknown",
             status_code=502,
-            retryable=True,
             request_id=request_id,
         ) from exc
     if status < 200 or status >= 300:
-        # 408, 429 and 5xx are provider-side conditions a retry can outlive (a 408 is the
-        # provider timing out the request, not rejecting it), so those rows are recorded
-        # readmissible; other 4xx (400/401/403/404/422 ...) reject the request or credential
-        # itself, so a retry cannot change the outcome. the recorded error_class is the value
-        # readmission keys on.
-        transient = status in (408, 429) or 500 <= status <= 599
+        # only a conventional 429 proves the provider rejected the request before execution. a 408 or
+        # 5xx can arrive after work started, so those outcomes are terminal until the provider offers
+        # an idempotency contract that makes redispatch safe.
+        rate_limited = status == 429
+        ambiguous = status == 408 or 500 <= status <= 599
+        state = "outcome_unknown" if ambiguous else "provider_rejected"
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,
                 request_id,
-                state="provider_rejected",
+                state=state,
                 provider_status=status,
-                error_class="transient" if transient else "permanent",
+                error_class="transient" if rate_limited else "permanent",
             )
         raise TeacherBrokerError(
-            "provider_rejected",
+            state,
             status_code=502,
-            retryable=transient,
+            retryable=rate_limited,
             request_id=request_id,
+            provider_status=status,
         )
     return status, response_body
 
@@ -785,6 +787,9 @@ def _settle_teacher_response(
             response_body=_canonical_json(response.body),
         )
     except Exception as exc:
+        # a validated provider response is already in hand. if ledger settlement did not commit, the
+        # result cannot be replayed, but redispatch would be pure duplicate provider work. if it did
+        # commit before raising, the normal succeeded replay path remains available.
         with contextlib.suppress(Exception):
             db.complete_teacher_request(
                 capability_id,

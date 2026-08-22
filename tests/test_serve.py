@@ -438,15 +438,13 @@ def test_deploy_adapter_rejects_zero_byte_sharded_tensor(monkeypatch, tmp_path):
         )
 
 
-def test_deploy_accepts_legacy_bin_adapter_tensor(monkeypatch, tmp_path):
-    from flash.serve.deploy import adapter_artifact_lora_rank
+def test_deploy_rejects_bin_adapter_tensor(monkeypatch, tmp_path):
+    from flash.serve.deploy import AdapterTensorMissing, adapter_artifact_lora_rank
 
     seen = _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"adapter_model.bin": None})
 
-    assert (
+    with pytest.raises(AdapterTensorMissing, match="has no adapter_model tensor file"):
         adapter_artifact_lora_rank("org/repo", "sft/r-bin/seed0/adapter", hf_revision="a" * 40)
-        == 32
-    )
     assert seen["list_repo_tree"]["path_in_repo"] == "sft/r-bin/seed0/adapter"
 
 

@@ -25,7 +25,10 @@ from flash.server import app as _app
 # defined here rather than in the route module because that one imports this one: the routes read
 # them back through their own namespace, so there is still exactly one definition.
 _DEPLOYMENT_BUSY_STATES = {"queued", "smoke_testing", "reconciling"}
-_DEPLOYMENT_READY_STATES = {"ready", "deployed"}
+# the nested `deployment["state"]` vocabulary, not the top-level `status.state` one: `deployed` is
+# live in the latter and has never been written in the former. the cli copy of this set keeps both
+# spellings, because it reads the field from a remote plane whose version it does not control.
+_DEPLOYMENT_READY_STATES = {"ready"}
 
 
 def _previous_ready_deployment(deployment: dict) -> dict | None:

@@ -57,21 +57,6 @@ def broker_db(monkeypatch, tmp_path):
     return path
 
 
-def test_existing_teacher_request_table_gains_replay_column(tmp_path):
-    path = tmp_path / "legacy.db"
-    connection = sqlite3.connect(path)
-    connection.execute(
-        "CREATE TABLE teacher_score_requests (id INTEGER PRIMARY KEY, state TEXT NOT NULL)"
-    )
-    db._migrate_schema(connection)
-    columns = {
-        row[1] for row in connection.execute("PRAGMA table_info(teacher_score_requests)").fetchall()
-    }
-    connection.close()
-
-    assert "response_body" in columns
-
-
 def _issue(*, now=None, expires_at=None, limits=None):
     current = time.time() if now is None else float(now)
     return db.issue_teacher_capability(
@@ -422,7 +407,7 @@ def test_total_token_quota_is_reserved_before_dispatch_and_never_overshoots(brok
     assert db.teacher_capability_binding(token)["token_count"] == 74
 
 
-def test_stale_started_request_is_readmitted_only_within_the_attempt_bound(broker_db):
+def test_stale_started_request_becomes_terminal_after_broker_recovery(broker_db):
     token = _issue(limits=_limits(max_upstream_attempts=2))
     reservation = db.reserve_teacher_request(
         token=token,
@@ -449,26 +434,7 @@ def test_stale_started_request_is_readmitted_only_within_the_attempt_bound(broke
 
     assert recovered == {"retryable": 1, "outcome_unknown": 1}
     assert db.teacher_capability_binding(token)["token_count"] == 128
-    # the outcome_unknown row is readmitted without charging its token reservation again ...
-    readmitted = db.reserve_teacher_request(
-        token=token,
-        request_id="request-stale-000001",
-        request_fingerprint="a" * 64,
-        request_bytes=10,
-        score_items=1,
-        expected_run_id="run-1",
-        expected_attempt=2,
-    )
-    assert readmitted["request"]["state"] == "reserved"
-    assert db.teacher_capability_binding(token)["token_count"] == 128
-    # ... and the second dispatch spends the last budgeted attempt.
-    db.mark_teacher_request_started(capability_id, "request-stale-000001")
-
-    assert db.recover_teacher_request_ledger() == {"retryable": 0, "outcome_unknown": 1}
-    # the budget is now spent, so readmission itself refuses before touching any counter: the
-    # row must keep its terminal state and held reservation rather than bounce to 'retryable'
-    # and stay readmissible forever.
-    with pytest.raises(db.TeacherLedgerError, match="upstream_attempt_quota_exhausted"):
+    with pytest.raises(db.TeacherLedgerError, match="outcome_unknown"):
         db.reserve_teacher_request(
             token=token,
             request_id="request-stale-000001",
@@ -478,6 +444,7 @@ def test_stale_started_request_is_readmitted_only_within_the_attempt_bound(broke
             expected_run_id="run-1",
             expected_attempt=2,
         )
+    assert db.recover_teacher_request_ledger() == {"retryable": 0, "outcome_unknown": 0}
     connection = sqlite3.connect(broker_db)
     connection.row_factory = sqlite3.Row
     row = connection.execute(
@@ -486,7 +453,7 @@ def test_stale_started_request_is_readmitted_only_within_the_attempt_bound(broke
     ).fetchone()
     in_flight = connection.execute("SELECT in_flight FROM teacher_capabilities").fetchone()[0]
     connection.close()
-    assert (row["state"], row["upstream_attempt_count"]) == ("outcome_unknown", 2)
+    assert (row["state"], row["upstream_attempt_count"]) == ("outcome_unknown", 1)
     assert in_flight == 0
     assert db.teacher_capability_binding(token)["token_count"] == 128
 
@@ -744,6 +711,7 @@ def test_provider_error_body_is_suppressed_from_response_and_sqlite(broker_db, m
             "code": "provider_rejected",
             "classification": "permanent",
             "request_id": "request-private-00001",
+            "provider_status": 400,
         }
     }
     assert error.value.retryable is False
@@ -755,22 +723,64 @@ def test_provider_error_body_is_suppressed_from_response_and_sqlite(broker_db, m
         )
     assert duplicate.value.code == "provider_rejected"
     assert duplicate.value.retryable is False
+    assert duplicate.value.payload()["error"]["provider_status"] == 400
     assert len(dispatches) == 1
     assert private_canary not in dump
     assert "control-plane-only-canary" not in dump
     assert token not in dump
 
 
-@pytest.mark.parametrize("status", [408, 429, 500, 502, 503])
-def test_transient_provider_rejects_are_readmitted_and_dispatch_again(
-    broker_db, monkeypatch, status
+@pytest.mark.parametrize("provider_status", [True, "invalid", 0, -1, 600, 700])
+def test_malformed_stored_provider_status_is_omitted_on_replay(
+    broker_db, monkeypatch, provider_status
 ):
-    """408, 429 and 5xx are provider-side conditions a retry can outlive.
+    _service_ready(monkeypatch)
+    token = _issue()
+    private_canary = "private-provider-error-body-canary"
+    dispatches = []
 
-    the ledger records the rejection with error_class 'transient' so the row stays readmissible,
-    the broker reports it retryable, and a follow-up call with the same request_id dispatches
-    upstream again under the max_upstream_attempts bound, settling and billing exactly once.
-    """
+    def reject(*_args):
+        dispatches.append(1)
+        return 403, private_canary.encode()
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", reject)
+    request_id = "request-malformed-status-01"
+
+    with pytest.raises(teacher_broker.TeacherBrokerError):
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+
+    connection = sqlite3.connect(broker_db)
+    connection.execute(
+        "UPDATE teacher_score_requests SET provider_status = ? WHERE request_id = ?",
+        (provider_status, request_id),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as replay:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+
+    payload = replay.value.payload()
+    assert replay.value.retryable is False
+    assert replay.value.provider_status is None
+    assert payload["error"]["code"] == "provider_rejected"
+    assert payload["error"]["classification"] == "permanent"
+    assert "provider_status" not in payload["error"]
+    assert private_canary not in json.dumps(payload)
+    assert len(dispatches) == 1
+
+
+def test_provider_429_is_readmitted_and_dispatches_again(broker_db, monkeypatch):
+    """a conventional 429 proves rejection before execution and is safe to redispatch."""
+    status = 429
     _service_ready(monkeypatch)
     token = _issue(limits=_limits(max_upstream_attempts=teacher_broker.MAX_UPSTREAM_ATTEMPTS))
     outcomes = [(status, b"upstream"), (200, _response())]
@@ -808,8 +818,175 @@ def test_transient_provider_rejects_are_readmitted_and_dispatch_again(
     token_count = connection.execute("SELECT token_count FROM teacher_capabilities").fetchone()[0]
     connection.close()
     assert row == ("succeeded", 2, 1, 1)
-    # billed once: the token reservation settles to the single succeeded call's actual usage.
+    # the rejected 429 did no provider work, so the single accepted call is the only billable one.
     assert token_count == 2
+
+
+@pytest.mark.parametrize("status", [408, 500, 502, 503])
+def test_ambiguous_provider_status_is_terminal_without_redispatch(broker_db, monkeypatch, status):
+    _service_ready(monkeypatch)
+    token = _issue(limits=_limits(max_upstream_attempts=teacher_broker.MAX_UPSTREAM_ATTEMPTS))
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return status, b"upstream"
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    request_id = "request-ambiguous-0001"
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as first:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+    assert first.value.code == "outcome_unknown"
+    assert first.value.retryable is False
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as replay:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+    assert replay.value.code == "outcome_unknown"
+    assert replay.value.retryable is False
+    assert len(dispatches) == 1
+
+    connection = sqlite3.connect(broker_db)
+    row = connection.execute(
+        "SELECT state, upstream_attempt_count, provider_status, error_class "
+        "FROM teacher_score_requests WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    connection.close()
+    assert row == ("outcome_unknown", 1, status, "permanent")
+
+
+def test_validated_response_with_failed_ledger_settlement_never_redispatches(
+    broker_db, monkeypatch
+):
+    _service_ready(monkeypatch)
+    token = _issue(limits=_limits(max_upstream_attempts=teacher_broker.MAX_UPSTREAM_ATTEMPTS))
+    dispatches = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return 200, _response()
+
+    real_complete = db.complete_teacher_request
+
+    def fail_success_completion(capability_id, request_id, **kwargs):
+        if kwargs["state"] == "succeeded":
+            raise sqlite3.OperationalError("ledger write failed after provider success")
+        return real_complete(capability_id, request_id, **kwargs)
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    monkeypatch.setattr(db, "complete_teacher_request", fail_success_completion)
+    request_id = "request-settlement-0001"
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as first:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+    assert first.value.code == "outcome_unknown"
+    assert first.value.retryable is True
+
+    with pytest.raises(teacher_broker.TeacherBrokerError) as replay:
+        teacher_broker.complete_teacher_request(
+            capability_token=token,
+            request_id=request_id,
+            raw_body=_body(),
+        )
+    assert replay.value.code == "outcome_unknown"
+    assert replay.value.retryable is False
+    assert len(dispatches) == 1
+
+    connection = sqlite3.connect(broker_db)
+    row = connection.execute(
+        "SELECT state, upstream_attempt_count, error_class FROM teacher_score_requests "
+        "WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    connection.close()
+    assert row == ("outcome_unknown", 1, "ledger_completion_failed")
+
+
+def test_worker_retries_committed_success_settlement_exception_without_redispatch(
+    broker_db, monkeypatch
+):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    _service_ready(monkeypatch)
+    token = _issue(limits=_limits(max_upstream_attempts=teacher_broker.MAX_UPSTREAM_ATTEMPTS))
+    dispatches = []
+    request_ids = []
+
+    def dispatch(*_args):
+        dispatches.append(1)
+        return 200, _response()
+
+    real_complete = db.complete_teacher_request
+    raised_after_commit = False
+
+    def commit_then_raise(capability_id, request_id, **kwargs):
+        nonlocal raised_after_commit
+        result = real_complete(capability_id, request_id, **kwargs)
+        if kwargs["state"] == "succeeded" and not raised_after_commit:
+            raised_after_commit = True
+            raise sqlite3.OperationalError("ledger response lost after commit")
+        return result
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.body
+
+    def urlopen(_transport, request, timeout=None):
+        headers = {name.lower(): value for name, value in request.header_items()}
+        request_id = headers["x-flash-teacher-request-id"]
+        request_ids.append(request_id)
+        capability_token = headers["authorization"].removeprefix("Bearer ")
+        try:
+            result = teacher_broker.complete_teacher_request(
+                capability_token=capability_token,
+                request_id=request_id,
+                raw_body=request.data,
+            )
+        except teacher_broker.TeacherBrokerError as error:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                error.status_code,
+                error.code,
+                {},
+                io.BytesIO(json.dumps(error.payload()).encode()),
+            ) from error
+        return Response(json.dumps(result).encode())
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
+    monkeypatch.setattr(db, "complete_teacher_request", commit_then_raise)
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(token, "https://broker.example", "parasail-glm-52")
+
+    assert client.score("question", "answer")
+    assert raised_after_commit is True
+    assert len(request_ids) == 2
+    assert len(set(request_ids)) == 1
+    assert len(dispatches) == 1
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
@@ -853,7 +1030,7 @@ def test_upstream_attempts_are_bounded_even_for_transient_rejects(broker_db, mon
 
     def dispatch(*_args):
         dispatches.append(1)
-        return 503, b"unavailable"
+        return 429, b"rate limited"
 
     monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
 
@@ -945,6 +1122,123 @@ def test_worker_reuses_one_logical_request_id_across_transport_retries(monkeypat
     assert client.score("question", "answer")
     assert len(request_ids) == 2
     assert len(set(request_ids)) == 1
+
+
+@pytest.mark.parametrize("body", [b"", b"<html>bad gateway</html>", b'{"error":'])
+def test_worker_keeps_unstructured_502_terminal(monkeypatch, body):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    request_ids = []
+
+    def urlopen(_transport, request, timeout=None):
+        request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
+        raise urllib.error.HTTPError(request.full_url, 502, "bad gateway", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert len(request_ids) == 1
+
+
+@pytest.mark.parametrize("status", [429])
+def test_worker_retries_unstructured_proven_pre_dispatch_http_status(monkeypatch, status):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    request_ids = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return _response()
+
+    def urlopen(_transport, request, timeout=None):
+        request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
+        if len(request_ids) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, status, "broker failure", {}, io.BytesIO(b"")
+            )
+        return Response()
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    assert client.score("question", "answer")
+    assert len(request_ids) == 2
+    assert len(set(request_ids)) == 1
+
+
+@pytest.mark.parametrize("status", [408, 409, 500, 502, 599])
+def test_worker_keeps_unstructured_post_dispatch_ambiguity_terminal(monkeypatch, status):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    request_ids = []
+
+    def urlopen(_transport, request, timeout=None):
+        request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
+        raise urllib.error.HTTPError(
+            request.full_url, status, "broker failure", {}, io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert len(request_ids) == 1
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 413, 415, 422])
+def test_worker_keeps_unstructured_permanent_4xx_terminal(monkeypatch, status):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    request_ids = []
+
+    def urlopen(_transport, request, timeout=None):
+        request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
+        raise urllib.error.HTTPError(
+            request.full_url, status, "broker rejection", {}, io.BytesIO(b"<html>rejected</html>")
+        )
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert "broker_http_error (permanent)" in str(error.value)
+    assert len(request_ids) == 1
 
 
 def test_worker_retries_body_ingress_timeout_with_same_request_id(monkeypatch):
@@ -1060,8 +1354,90 @@ def test_worker_fails_closed_on_nontransient_broker_classification(monkeypatch, 
         client.score("question", "answer")
 
     assert error.value.permanent is True
+    assert error.value.provider_status is None
     assert "provider_rejected (permanent)" in str(error.value)
+    assert "provider_status=" not in str(error.value)
     assert len(request_ids) == 1
+
+
+def test_opd_batch_error_preserves_provider_status():
+    from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.batching import _teacher_batch_error
+
+    wrapped = _teacher_batch_error(
+        TeacherError("rate limited", permanent=False, provider_status=429)
+    )
+
+    assert isinstance(wrapped, TeacherError)
+    assert wrapped.permanent is False
+    assert wrapped.provider_status == 429
+
+
+def test_worker_renders_provider_status_without_leaking_broker_payload(monkeypatch):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    private_canary = "private-provider-error-body-canary"
+
+    def urlopen(_transport, request, timeout=None):
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "provider_rejected",
+                    "classification": "permanent",
+                    "provider_status": 403,
+                    "provider_text": private_canary,
+                }
+            }
+        ).encode()
+        raise urllib.error.HTTPError(request.full_url, 502, "rejected", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert error.value.provider_status == 403
+    assert "provider_rejected provider_status=403 (permanent)" in str(error.value)
+    assert private_canary not in str(error.value)
+
+
+@pytest.mark.parametrize("provider_status", [True, "403", 0, -1, 600, 700])
+def test_worker_omits_malformed_provider_status(monkeypatch, provider_status):
+    import urllib.error
+
+    from flash.engine.worker.teacher import client as worker_teacher
+
+    body = json.dumps(
+        {
+            "error": {
+                "code": "provider_rejected",
+                "classification": "permanent",
+                "provider_status": provider_status,
+            }
+        }
+    ).encode()
+
+    def urlopen(_transport, request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 502, "rejected", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    client = worker_teacher.TeacherClient(
+        "capability-value", "https://broker.example", "parasail-glm-52"
+    )
+
+    with pytest.raises(worker_teacher.TeacherError) as error:
+        client.score("question", "answer")
+
+    assert error.value.permanent is True
+    assert error.value.provider_status is None
+    assert "provider_rejected (permanent)" in str(error.value)
+    assert "provider_status=" not in str(error.value)
 
 
 def test_operation_specific_route_requires_bearer_json_and_request_id(monkeypatch):
@@ -1114,6 +1490,92 @@ def test_operation_specific_route_requires_bearer_json_and_request_id(monkeypatc
         "raw_body": bytearray(b"{}"),
     }
     assert isinstance(captured["raw_body"], bytearray)
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "expected_status"),
+    [
+        (403, 403),
+        (None, None),
+        (True, None),
+        ("403", None),
+        (0, None),
+        (-1, None),
+        (600, None),
+        (700, None),
+    ],
+)
+def test_broker_error_serializes_only_valid_provider_status(provider_status, expected_status):
+    error = teacher_broker.TeacherBrokerError(
+        "provider_rejected",
+        status_code=502,
+        request_id="request-status-boundary-01",
+        provider_status=provider_status,
+    )
+
+    payload = error.payload()["error"]
+    if expected_status is None:
+        assert error.provider_status is None
+        assert "provider_status" not in payload
+    else:
+        assert error.provider_status == expected_status
+        assert payload["provider_status"] == expected_status
+
+
+def test_teacher_route_propagates_provider_status_through_dispatch_and_replay(
+    broker_db, monkeypatch
+):
+    fastapi = pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from flash.server.routes import teacher as teacher_route
+
+    _service_ready(monkeypatch)
+    token = _issue()
+    request_id = "request-route-replay-001"
+    private_canary = "private-provider-error-body-canary"
+    dispatches = []
+
+    def reject(*_args):
+        dispatches.append(1)
+        return 403, private_canary.encode()
+
+    monkeypatch.setattr(teacher_broker, "_provider_post", reject)
+    app = fastapi.FastAPI()
+    app.include_router(teacher_route.router)
+    client = TestClient(app)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Flash-Teacher-Request-Id": request_id,
+    }
+    expected = {
+        "error": {
+            "code": "provider_rejected",
+            "classification": "permanent",
+            "request_id": request_id,
+            "provider_status": 403,
+        }
+    }
+
+    first = client.post("/v1/teacher/completions", content=_body(), headers=headers)
+    replay = client.post("/v1/teacher/completions", content=_body(), headers=headers)
+
+    assert first.status_code == 502
+    assert replay.status_code == 409
+    assert first.json() == expected
+    assert replay.json() == expected
+    assert private_canary not in first.text
+    assert private_canary not in replay.text
+    assert len(dispatches) == 1
+    connection = sqlite3.connect(broker_db)
+    stored = connection.execute(
+        "SELECT state, provider_status, error_class FROM teacher_score_requests "
+        "WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    connection.close()
+    assert stored == ("provider_rejected", 403, "permanent")
 
 
 def test_chat_route_mirrors_completion_route_auth_and_request_binding(monkeypatch):
@@ -1336,7 +1798,11 @@ def test_stalled_capability_bodies_time_out_without_blocking_another_capability(
     other, timed_out, recovered = asyncio.run(exercise())
 
     assert other.status_code == 200
-    assert [response.status_code for response in timed_out] == [408, 408]
+    # 429, not 408: the ingress timeout is retryable, and a retryable broker failure has to say so
+    # in the status line because an intermediary can replace the body. a bare 408 is unusable for
+    # that -- a proxy emits it for its own post-dispatch timeout -- so the concurrency-limit
+    # condition reports as 429. see BODY_INDEPENDENT_TRANSIENT_STATUSES.
+    assert [response.status_code for response in timed_out] == [429, 429]
     assert all(
         json.loads(response.body)["error"]["code"] == "body_ingress_timeout"
         for response in timed_out

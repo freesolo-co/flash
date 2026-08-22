@@ -100,18 +100,6 @@ def test_label_bounded_and_sweep_matches_for_long_run_id():
     assert run_label_prefix("flash-1700-abcd") == "flash-1700-abcd"
 
 
-def test_provider_cost_uses_provider_rate():
-    """A provider-specific quote prices through the provider's pricing, not the RunPod nominal."""
-    from flash.cost.facts import gpu_hourly_usd
-
-    runpod = gpu_hourly_usd("B200")  # nominal RunPod snapshot
-    lam = gpu_hourly_usd("B200", provider="lambda")  # Lambda static fallback (no key in tests)
-    assert runpod == 5.89
-    assert lam == 6.99  # Lambda B200
-    # unknown-on-provider class falls back to nominal (e.g. a RunPod-only consumer card on lambda)
-    assert gpu_hourly_usd("RTX 4090", provider="lambda") == gpu_hourly_usd("RTX 4090")
-
-
 def test_user_data_fails_fast_and_throttles_bootlog():
     """The cloud-init writes a retriable failure marker on docker failure and throttles the host
     boot-log (no 30s-forever loop that would blow HF's commit budget)."""

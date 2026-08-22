@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from contextlib import contextmanager
 from dataclasses import fields, replace
 
 import pytest
@@ -54,7 +53,12 @@ def _raw(**overrides) -> dict:
 
 
 def _job_from_dict(data: dict) -> JobSpec:
-    return JobSpec.from_dict({"project": "11111111-1111-4111-8111-111111111111", **data})
+    payload = {"project": "11111111-1111-4111-8111-111111111111", **data}
+    if "train" not in payload:
+        payload["train"] = {"credit_assignment": "per_episode"}
+    elif isinstance(payload["train"], dict) and "credit_assignment" not in payload["train"]:
+        payload["train"] = {**payload["train"], "credit_assignment": "per_episode"}
+    return JobSpec.from_dict(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +210,8 @@ def test_project_id_is_required_canonicalized_and_roundtrips() -> None:
         spec_from_dict(_raw(project="   "), project_required=True)
     with pytest.raises(ConfigError, match="project must be a valid UUID"):
         spec_from_dict(_raw(project="not-a-uuid"))
-    assert JobSpec.from_dict({"model": "Qwen/Qwen3.5-0.8B"}).project == ""
+    persisted = JobSpec(model="Qwen/Qwen3.5-0.8B").to_internal_dict()
+    assert JobSpec.from_dict(persisted).project == ""
 
     synthetic = JobSpec(model="Qwen/Qwen3.5-0.8B")
     assert synthetic.project == ""
@@ -234,17 +239,26 @@ def test_credit_assignment_rejects_invalid_values(invalid: object) -> None:
 
 
 def test_job_spec_from_dict_credit_assignment_validates_worker_boundary() -> None:
-    # the worker-side deserialization boundary must round-trip valid modes, default a missing value,
-    # and reject a malformed persisted/tampered value rather than silently downgrading to per-episode.
     payload = spec_from_dict(_raw(**{"train.credit_assignment": "per_turn"})).to_dict()
     assert _job_from_dict(payload).train.credit_assignment == "per_turn"
 
     payload["train"].pop("credit_assignment", None)
-    assert _job_from_dict(payload).train.credit_assignment == "per_episode"
+    assert JobSpec.from_dict(payload).train.credit_assignment == "per_episode"
 
-    payload["train"]["credit_assignment"] = "per_step"
-    with pytest.raises(ValueError, match="credit_assignment must be one of"):
-        _job_from_dict(payload)
+    for invalid in (None, "", "  ", "per_step"):
+        payload["train"]["credit_assignment"] = invalid
+        with pytest.raises(ValueError, match="credit_assignment must be one of"):
+            JobSpec.from_dict(payload)
+
+
+def test_job_spec_from_dict_rejects_nonpositive_save_every() -> None:
+    payload = spec_from_dict(_raw(**{"train.save_every": 20})).to_dict()
+    assert _job_from_dict(payload).train.save_every == 20
+
+    for invalid in (0, -1, -20):
+        payload["train"]["save_every"] = invalid
+        with pytest.raises(ValueError, match=r"train\.save_every must be positive"):
+            _job_from_dict(payload)
 
 
 def test_train_key_validator_rejects_unknown_names_only() -> None:
@@ -411,10 +425,24 @@ def test_internal_from_dict_round_trips_stored_lora_alpha() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16, "lora_alpha": 48},
+        "train": {
+            "epochs": 1,
+            "max_examples": 8,
+            "lora_rank": 16,
+            "lora_alpha": 48,
+            "credit_assignment": "per_episode",
+        },
     }
     assert JobSpec.from_dict(base).train.lora_alpha == 48  # present -> round-trip
-    absent = {**base, "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16}}
+    absent = {
+        **base,
+        "train": {
+            "epochs": 1,
+            "max_examples": 8,
+            "lora_rank": 16,
+            "credit_assignment": "per_episode",
+        },
+    }
     assert JobSpec.from_dict(absent).train.lora_alpha == 32  # absent -> derive 2 x rank
 
 
@@ -998,15 +1026,36 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
     assert spec.environment.secrets == ()
 
 
-def test_jobspec_from_dict_rejects_path() -> None:
-    # Defense-in-depth: a stale worker payload carrying a local path must be rejected.
+@pytest.mark.parametrize("unknown_key", ["path", "pth", "totally_made_up"])
+def test_jobspec_from_dict_rejects_unknown_environment_keys(unknown_key) -> None:
     data = {
         "project": "11111111-1111-4111-8111-111111111111",
         "model": "Qwen/Qwen3-0.6B",
-        "environment": {"id": "gsm8k", "path": "./environment.py"},
+        "environment": {"id": "gsm8k", unknown_key: "./environment.py"},
     }
-    with pytest.raises(ValueError, match="local environment paths are no longer supported"):
+    with pytest.raises(ValueError, match=rf"environment has unknown key\(s\): {unknown_key}"):
         _job_from_dict(data)
+
+
+def test_jobspec_from_dict_keeps_valid_environment_package() -> None:
+    data = {
+        "project": "11111111-1111-4111-8111-111111111111",
+        "model": "Qwen/Qwen3-0.6B",
+        "environment": {
+            "id": "owner/project/gsm8k",
+            "resolved_sha": "d" * 40,
+            "package": {
+                "artifact_revision": "a" * 40,
+                "archive_sha256": "b" * 64,
+                "manifest_sha256": "c" * 64,
+            },
+        },
+    }
+
+    spec = _job_from_dict(data)
+
+    assert spec.environment.package is not None
+    assert spec.environment.package.artifact_revision == "a" * 40
 
 
 # ---------------------------------------------------------------------------
@@ -1468,14 +1517,19 @@ def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
         _job_from_dict({"gpu": {"type": "RTX A6000"}})
 
 
-def test_model_revision_stays_available_to_internal_round_trips() -> None:
-    persisted = {**JobSpec().to_internal_dict(), "model_revision": "  refs/pr/123  "}
+def test_runner_model_revision_stays_available_to_internal_round_trips() -> None:
+    revision = "a" * 40
+    persisted = {
+        **JobSpec().to_internal_dict(),
+        "model_revision": revision,
+        "model_revision_auto": True,
+    }
 
     spec = JobSpec.from_dict(persisted)
 
-    assert spec.model_revision == "refs/pr/123"
-    assert JobSpec.from_json(spec.to_json()).model_revision == "refs/pr/123"
-    assert spec.to_internal_dict()["model_revision"] == "refs/pr/123"
+    assert spec.model_revision == revision
+    assert JobSpec.from_json(spec.to_json()).model_revision == revision
+    assert spec.to_internal_dict()["model_revision"] == revision
     assert "model_revision" not in spec.to_dict()
 
     for value in (None, 123, False, ["main"], {"revision": "main"}):
@@ -1547,7 +1601,7 @@ def test_model_revision_markers_require_bool_for_direct_construction_and_replace
 
 @pytest.mark.parametrize(
     ("model_revision_auto", "model_revision_force_pin"),
-    [(False, False), (True, False), (True, True)],
+    [(True, False), (True, True)],
 )
 def test_model_revision_markers_accept_valid_bool_states(
     model_revision_auto, model_revision_force_pin
@@ -1568,7 +1622,6 @@ def test_model_revision_markers_accept_valid_bool_states(
     [
         ("true", "false", (True, False)),
         (1, 0, (True, False)),
-        (0, 0, (False, False)),
         ("true", "true", (True, True)),
     ],
 )
@@ -1584,22 +1637,10 @@ def test_model_revision_marker_from_dict_coercion_and_roundtrip_are_unchanged(
     assert JobSpec.from_dict(restored.to_internal_dict()) == restored
 
 
-def test_historical_internal_model_revision_marker_roundtrip_without_force_pin() -> None:
-    payload = JobSpec(model_revision="a" * 40, model_revision_auto=True).to_internal_dict()
-    payload.pop("model_revision_force_pin")
-
-    restored = JobSpec.from_dict(payload)
-
-    assert restored.model_revision_auto is True
-    assert restored.model_revision_force_pin is False
-    assert JobSpec.from_dict(restored.to_internal_dict()) == restored
-
-
 @pytest.mark.parametrize(
     "overrides",
     [
         {"model_revision_force_pin": True},
-        {"model_revision": "a" * 40, "model_revision_force_pin": True},
         {
             "model_revision": "main",
             "model_revision_auto": True,
@@ -1615,58 +1656,6 @@ def test_historical_internal_model_revision_marker_roundtrip_without_force_pin()
 def test_model_revision_force_pin_rejects_invalid_internal_states(overrides) -> None:
     with pytest.raises(ValueError, match="model_revision_force_pin requires"):
         _job_from_dict(overrides)
-
-
-def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() -> None:
-    """A snapshot prepared before this field existed must still rehash to its stored digest.
-
-    `_preparation_digest` has to reproduce the bytes that were hashed, not today's serialization,
-    or a still-valid warm-start or profile-bearing training run fails integrity validation on recovery.
-    """
-    from flash.runner.preparation import _preparation_digest
-
-    unmarked = JobSpec(model="Qwen/Qwen3.5-9B", algorithm="sft", model_revision="c" * 40)
-
-    # rebuild the pre-upgrade bytes: the same payload this build produces, minus the key that did
-    # not exist then. mirrors _preparation_digest's own omission list rather than re-deriving it,
-    # so the control cannot drift from the code under test.
-    worker_payload = unmarked.to_internal_dict()
-    for key in (
-        "workload_profile_input_digest",
-        "workload_profile_producer_version",
-        "workload_profile",
-    ):
-        if not worker_payload.get(key):
-            worker_payload.pop(key, None)
-    worker_payload.pop("model_revision_auto", None)
-    worker_payload.pop("model_revision_force_pin", None)
-    worker_payload.pop("gpu_count_auto", None)
-    worker_payload["gpu"].pop("type_fallbacks", None)
-    public_payload = unmarked.to_dict()  # to_dict() already strips the markers
-    # the old plane popped `[environment] pip` from every public payload, so its bytes carried no
-    # such key. mirrors _preparation_digest's drop-when-empty for the same reason as the list above.
-    if not public_payload["environment"].get("pip"):
-        public_payload["environment"].pop("pip", None)
-
-    payload = json.dumps(
-        {
-            "version": 1,
-            "public_spec": public_payload,
-            "worker_spec": worker_payload,
-            "adapter_identity": None,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    import hashlib
-
-    legacy = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    assert _preparation_digest(unmarked, unmarked, None) == legacy
-
-    # a marked run still binds the marker into its digest, so tampering remains detectable
-    marked = replace(unmarked, model_revision_auto=True)
-    assert _preparation_digest(marked, marked, None) != legacy
 
 
 def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
@@ -1806,35 +1795,15 @@ def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algo
     assert resolved.model_revision_force_pin is False
 
 
-def test_authored_and_ordinary_auto_model_revision_resolution_is_unchanged(monkeypatch) -> None:
+def test_unmanaged_model_revision_is_rejected_and_runner_pin_is_unchanged() -> None:
     from flash.runner.preparation import _resolve_model_revision
 
-    resolved_sha = "e" * 40
-    calls = []
+    with pytest.raises(ValueError, match="model_revision requires model_revision_auto=True"):
+        _job_from_dict({"model_revision": "release-tag"})
+    runner_pin = _job_from_dict({"model_revision": "d" * 40, "model_revision_auto": True})
 
-    class _Api:
-        def __init__(self, *a, **k) -> None: ...
-
-        def model_info(self, model, revision=None):
-            calls.append(revision)
-            return type("_Info", (), {"sha": resolved_sha})
-
-    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
-    authored = _job_from_dict({"model_revision": "release-tag"})
-    ordinary_auto = _job_from_dict({"model_revision": "d" * 40, "model_revision_auto": True})
-
-    authored_resolved = _resolve_model_revision(authored, required=False)
-    rollout_unchanged = _resolve_model_revision(ordinary_auto, required=False)
-    sft_unchanged = _resolve_model_revision(ordinary_auto, required=True)
-
-    # only the authored pin reaches the hub. an already-resolved auto sha is returned untouched in
-    # BOTH directions: re-resolving it would look up the current tip and overwrite a pin a previous
-    # run chose, which is what breaks a warm start the moment the base model moves.
-    assert calls == ["release-tag"]
-    assert authored_resolved.model_revision == resolved_sha
-    assert authored_resolved.model_revision_auto is False
-    assert rollout_unchanged == ordinary_auto
-    assert sft_unchanged == ordinary_auto
+    assert _resolve_model_revision(runner_pin, required=False) == runner_pin
+    assert _resolve_model_revision(runner_pin, required=True) == runner_pin
 
 
 def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() -> None:
@@ -1848,30 +1817,6 @@ def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() ->
     assert _preparation_digest(public, worker, None) == _preparation_digest(
         JobSpec.from_dict(stored), worker, None
     )
-
-
-@contextmanager
-def _serializing_without_prompts_per_step():
-    """Serialize `JobSpec` the way 1.1.40 did: with no ``prompts_per_step`` key at all.
-
-    That build predates the field, so its payload carried no such key -- which hashes differently
-    from the explicit null today's dataclass always emits. A digest meant to stand in for a real
-    persisted snapshot has to be taken over those historical bytes, or the test asserts against a
-    shape production never wrote.
-    """
-    original_internal, original_public = JobSpec.to_internal_dict, JobSpec.to_dict
-
-    def _drop(emit):
-        return lambda self: {
-            **emit(self),
-            "train": {k: v for k, v in emit(self)["train"].items() if k != "prompts_per_step"},
-        }
-
-    JobSpec.to_internal_dict, JobSpec.to_dict = _drop(original_internal), _drop(original_public)
-    try:
-        yield
-    finally:
-        JobSpec.to_internal_dict, JobSpec.to_dict = original_internal, original_public
 
 
 def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> None:
@@ -2256,6 +2201,20 @@ def test_gpu_count_of_reads_spec_and_defaults() -> None:
 # ---------------------------------------------------------------------------
 # the optimizer batch is a different quantity per algorithm, so it has a different name
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_persisted_rl_batch_size_is_rejected_and_names_the_right_key(algorithm) -> None:
+    record = JobSpec(algorithm=algorithm).to_internal_dict()
+    record["train"]["batch_size"] = 16
+    record["train"].pop("prompts_per_step", None)
+
+    with pytest.raises(ValueError, match=r"batch_size.*prompts_per_step") as excinfo:
+        JobSpec.from_dict(record)
+
+    message = str(excinfo.value)
+    assert f"batch_size does not apply to {algorithm}" in message
+    assert "prompts_per_step" in message
 
 
 def test_sft_batch_size_is_rejected_on_rl_and_names_the_right_key() -> None:

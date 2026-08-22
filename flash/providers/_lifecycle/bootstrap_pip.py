@@ -126,7 +126,7 @@ def install(payload: dict, *, require_deadline_at, retriable_error) -> None:
     args = [sys.executable, "-m", "pip", "install", *extra_pip]
     try:
         for attempt in range(len(_PIP_RETRY_DELAYS_S) + 1):
-            deadline_at = require_deadline_at(payload) if "deadline_at" in payload else None
+            deadline_at = require_deadline_at(payload)
             tail = collections.deque(maxlen=_PIP_OUTPUT_TAIL_LINES)
             # errors="replace": a build or VCS child can emit bytes invalid under the worker's
             # locale, and strict decoding raises mid-stream, failing a paid run whose install
@@ -151,11 +151,10 @@ def install(payload: dict, *, require_deadline_at, retriable_error) -> None:
                     f"attempts (pip exited {rc})"
                 )
             delay = _PIP_RETRY_DELAYS_S[attempt]
-            if deadline_at is not None:
-                # clamping to the remaining wall alone sleeps the whole window, so the retry just
-                # announced never issues: the next pass only fails the deadline precheck.
-                remaining = deadline_at - time.time() - _PIP_RETRY_RESERVE_S
-                delay = max(0.0, min(delay, remaining))
+            # clamping to the remaining wall alone sleeps the whole window, so the retry just
+            # announced never issues: the next pass only fails the deadline precheck.
+            remaining = deadline_at - time.time() - _PIP_RETRY_RESERVE_S
+            delay = max(0.0, min(delay, remaining))
             # best-effort for the same reason the tee is: a console that closed between attempts
             # would otherwise raise HERE and end the install with a terminal, non-retriable console
             # error, losing the retry this line only announces.

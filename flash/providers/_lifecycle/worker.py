@@ -10,6 +10,7 @@ from pathlib import Path
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash._internal.logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+from flash.core.grpo import GRPO_CONTROL_PLANE_OWNED_ENV_KEYS, GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import (
     CONTROL_PLANE_OWNED_ENV_KEYS,
     MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
@@ -154,11 +155,13 @@ def build_worker_env(
     # populated. removed keys are filtered here too. the two sets are disjoint and answer
     # different questions: control-plane ownership prevents overrides such as SEED, while removed
     # optimization keys configure nothing and must not silently reach the worker.
+    owned_env_keys = CONTROL_PLANE_OWNED_ENV_KEYS
+    if str(getattr(spec, "algorithm", "")).lower() == "grpo":
+        owned_env_keys |= GRPO_CONTROL_PLANE_OWNED_ENV_KEYS
     allowed_runtime_secrets = {
         k
         for k in (set(DEFAULT_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
-        if k.upper() not in CONTROL_PLANE_OWNED_ENV_KEYS
-        and k.upper() not in _REMOVED_OPTIMIZATION_ENV
+        if k.upper() not in owned_env_keys and k.upper() not in _REMOVED_OPTIMIZATION_ENV
     }
     for k, v in (runtime_secrets or {}).items():
         if k in allowed_runtime_secrets and v:
@@ -184,6 +187,8 @@ def build_worker_env(
             raise RuntimeError("managed opd control-panel teacher transport is missing")
         env[PUBLIC_URL_ENV] = public_url
         env[TEACHER_CAPABILITY_ENV] = capability
+    if str(getattr(spec, "algorithm", "")).lower() == "grpo":
+        env.update(GRPO_NATIVE_THREAD_ENV)
     # declared runtime secrets can carry any name, so their names are listed explicitly for the
     # redactors (flash._internal.diagnostics and the provider bootstraps): the name-shape
     # heuristic alone would let AWS_SECRET_ACCESS_KEY-style values through. set last so no

@@ -235,7 +235,7 @@ def test_deployed_prefixes_from_serving_registry(monkeypatch):
     _serving(
         monkeypatch,
         [
-            {"repoId": _managed("e1"), "subfolder": "rl/flash-1-a"},
+            {"repo_id": _managed("e1"), "subfolder": "rl/flash-1-a"},
             {"repo_id": _managed("e2"), "subfolder": "sft/flash-2-b/checkpoints/step-4"},
         ],
     )
@@ -253,7 +253,7 @@ def test_deployed_prefixes_incomplete_when_record_has_no_repo(monkeypatch):
 
 
 def test_deployed_prefixes_protects_whole_repo_when_subfolder_unmappable(monkeypatch):
-    _serving(monkeypatch, [{"repoId": _managed("e1"), "subfolder": "toplevel-only"}])
+    _serving(monkeypatch, [{"repo_id": _managed("e1"), "subfolder": "toplevel-only"}])
     prefixes, whole, complete = _REAL_DEPLOYED()
     assert whole == {_managed("e1")}
     assert prefixes == set()
