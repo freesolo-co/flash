@@ -92,6 +92,34 @@ def _readiness_timeout_result(
     return failure_result(finalized_plan, LifecycleFailure("readiness_failed"))
 
 
+def _resource_conflict_result(
+    create_plan: ModalCreatePlan | None,
+    finalized_plan: ModalCreatePlan,
+    sdk: ModalSdk | None,
+    created: _CreatedResources,
+    reached_ready: bool,
+    *,
+    deadline_at: float,
+    clock: Clock,
+    sleep: Sleeper,
+) -> DeploymentResult:
+    if create_plan is None or sdk is None or not created.any_created or reached_ready:
+        return failure_result(finalized_plan, LifecycleFailure("conflict"))
+    cleaned = _abort_created_resources(
+        create_plan,
+        sdk,
+        created,
+        expected=created.confirmed,
+        deadline_at=deadline_at,
+        clock=clock,
+        sleep=sleep,
+    )
+    if cleaned:
+        return failure_result(finalized_plan, LifecycleFailure("conflict"))
+    handle = confirmed_abort_handle(finalized_plan, created.confirmed)
+    return unknown_result(finalized_plan, handle=handle)
+
+
 def provision_modal_deployment(
     bundle: DeploymentBundle,
     credentials: ModalCredentials,
@@ -109,6 +137,7 @@ def provision_modal_deployment(
     bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
     finalized_plan = build_modal_create_plan(bundle, phase="finalized")
     sdk: ModalSdk | None = None
+    create_plan: ModalCreatePlan | None = None
     created = _CreatedResources()
     reached_ready = False
     try:
@@ -169,9 +198,18 @@ def provision_modal_deployment(
             sleep=sleep,
         )
     except ModalResourceConflict:
-        # identity conflict means the deterministic names may belong to another caller, so aborting
-        # by those names would be destructive without proof that this call created the resources.
-        return failure_result(finalized_plan, LifecycleFailure("conflict"))
+        # pre-create conflicts remain non-destructive. after this invocation has confirmed provider
+        # ids, cleanup can target only that generation and must not strand a live billing app.
+        return _resource_conflict_result(
+            create_plan,
+            finalized_plan,
+            sdk,
+            created,
+            reached_ready,
+            deadline_at=deadline_at,
+            clock=clock,
+            sleep=sleep,
+        )
     except ModalSdkFailure as exc:
         # an ambiguous mutation may have landed under the deterministic name after our initial empty
         # observation, so deleting it could destroy a concurrent deployment. a definite failure makes
@@ -333,7 +371,7 @@ def _abort_created_resources(
             return False
         # stop acknowledgement is not terminal proof. modal may retain the mount until lifecycle
         # observation reaches a zero-container terminal state, so use the same wait as teardown.
-        suppressed(lambda: mutation(lambda: sdk.stop_app(plan)))
+        suppressed(lambda: mutation(lambda: sdk.stop_app(plan, proof.handle.app_id)))
         try:
             terminal = wait_for_terminal_app(
                 plan,
@@ -371,7 +409,7 @@ def _abort_created_resources(
             return False
 
     # plan identity is byte-identical across same-generation racers. only provider ids returned to
-    # this invocation can authorize a name-addressed delete of an observed secret or volume.
+    # this invocation can authorize deletion of an observed secret or volume.
     return delete_confirmed_abort_resources(
         plan,
         sdk,
@@ -428,7 +466,7 @@ def teardown_modal_deployment(
         if app.state == "deployed":
             mutation_attempted = True
             try:
-                mutation(lambda: sdk.stop_app(plan))
+                mutation(lambda: sdk.stop_app(plan, handle.app_id))
             except ModalSdkFailure as exc:
                 if not exc.outcome_unknown:
                     return failure_result(plan, from_sdk_failure(exc), handle=handle)

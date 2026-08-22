@@ -254,10 +254,11 @@ class _FakeSdk:
         ]
         return APP_ID
 
-    def stop_app(self, plan) -> None:
+    def stop_app(self, plan, app_id: str) -> None:
         self.calls.append(("stop_app", None))
         self._fail("stop_app")
         app = self.apps[0]
+        assert app.app_id == app_id
         self.apps = [
             replace(
                 app,
@@ -270,8 +271,9 @@ class _FakeSdk:
             )
         ]
 
-    def delete_secret(self, plan, name: str) -> None:
-        role = "artifact" if name == plan.names.artifact_secret else "inference"
+    def delete_secret(self, plan, secret_id: str) -> None:
+        role = "artifact" if secret_id == ARTIFACT_SECRET_ID else "inference"
+        assert secret_id in {ARTIFACT_SECRET_ID, INFERENCE_SECRET_ID}
         self.calls.append((f"delete_{role}", None))
         self._fail(f"delete_{role}")
         if role == "artifact":
@@ -279,8 +281,9 @@ class _FakeSdk:
         else:
             self.inference.clear()
 
-    def delete_volume(self, plan) -> None:
+    def delete_volume(self, plan, volume_id: str) -> None:
         self.calls.append(("delete_volume", None))
+        assert volume_id == VOLUME_ID
         self._fail("delete_volume")
         self.volumes.clear()
 
@@ -676,6 +679,63 @@ def test_fresh_readiness_timeout_aborts_confirmed_resources() -> None:
     assert sdk.artifact == []
 
 
+def test_fresh_phase_conflict_aborts_resources_confirmed_by_this_invocation() -> None:
+    class _TransientArtifactOmissionSdk(_FakeSdk):
+        omitted = False
+
+        def observe(self, plan, *, app_id_hint=None) -> ModalObservation:
+            observation = super().observe(plan, app_id_hint=app_id_hint)
+            if self.apps and self.artifact and not self.omitted:
+                self.omitted = True
+                return replace(observation, artifact_secrets=())
+            return observation
+
+    factory = _Factory()
+    factory.sdk_class = _TransientArtifactOmissionSdk
+
+    result, _probe = _provision(_bundle(), factory)
+
+    sdk = factory.sdk
+    assert sdk is not None
+    assert sdk.omitted is True, "the post-deploy conflict was not injected"
+    assert result.status == "failed"
+    assert result.error_code == "conflict"
+    assert sdk.apps[0].state == "stopped"
+    assert sdk.volumes == []
+    assert sdk.inference == []
+    assert sdk.artifact == []
+
+
+def test_fresh_phase_conflict_preserves_confirmed_handle_when_cleanup_is_unknown() -> None:
+    class _RetainedVolumeAfterConflictSdk(_FakeSdk):
+        omitted = False
+
+        def observe(self, plan, *, app_id_hint=None) -> ModalObservation:
+            observation = super().observe(plan, app_id_hint=app_id_hint)
+            if self.apps and self.artifact and not self.omitted:
+                self.omitted = True
+                return replace(observation, artifact_secrets=())
+            return observation
+
+        def delete_volume(self, plan, volume_id: str) -> None:
+            self.calls.append(("delete_volume", None))
+            assert volume_id == VOLUME_ID
+
+    factory = _Factory()
+    factory.sdk_class = _RetainedVolumeAfterConflictSdk
+
+    result, _probe = _provision(_bundle(), factory)
+
+    sdk = factory.sdk
+    assert sdk is not None
+    assert result.status == "outcome_unknown"
+    assert result.handle is not None
+    assert result.handle.app_id == APP_ID
+    assert result.handle.volume_id == VOLUME_ID
+    assert result.handle.inference_secret_id == INFERENCE_SECRET_ID
+    assert sdk.volumes, "the test did not retain the volume it is meant to report"
+
+
 def test_fresh_readiness_timeout_leaves_time_for_asynchronous_stop() -> None:
     class _DelayedStopSdk(_FakeSdk):
         def __init__(self, plan) -> None:
@@ -699,7 +759,7 @@ def test_fresh_readiness_timeout_leaves_time_for_asynchronous_stop() -> None:
                     ]
             return super().observe(plan, app_id_hint=app_id_hint)
 
-        def stop_app(self, plan) -> None:
+        def stop_app(self, plan, app_id: str) -> None:
             self.calls.append(("stop_app", None))
             self._fail("stop_app")
             self.apps = [
@@ -730,7 +790,7 @@ def test_fresh_readiness_timeout_leaves_time_for_asynchronous_stop() -> None:
 
 def test_fresh_readiness_timeout_preserves_confirmed_handle_when_cleanup_is_unknown() -> None:
     class _RetainedVolumeSdk(_FakeSdk):
-        def delete_volume(self, plan) -> None:
+        def delete_volume(self, plan, volume_id: str) -> None:
             self.calls.append(("delete_volume", None))
 
     factory = _Factory()
@@ -1283,9 +1343,9 @@ def test_post_cleanup_core_resource_drift_is_outcome_unknown() -> None:
     plan = build_modal_create_plan(bundle)
 
     class DriftingCleanupSdk(_FakeSdk):
-        def delete_secret(self, received_plan, name: str) -> None:
-            super().delete_secret(received_plan, name)
-            if name == received_plan.names.artifact_secret:
+        def delete_secret(self, received_plan, secret_id: str) -> None:
+            super().delete_secret(received_plan, secret_id)
+            if secret_id == ARTIFACT_SECRET_ID:
                 self.volumes = [ModalNamedResource("vo-" + "D" * 22, received_plan.names.volume)]
 
     sdk = DriftingCleanupSdk(plan)
@@ -1431,7 +1491,7 @@ def test_teardown_deletes_resources_after_lifecycle_only_stopped_app_observation
             assert client is self._client
             return SimpleNamespace(stopped_at=object())
 
-        def stop_app(self, received_plan) -> None:
+        def stop_app(self, received_plan, app_id: str) -> None:
             self.calls.append(("stop_app", None))
             self._fail("stop_app")
             self.apps.clear()
@@ -1503,7 +1563,7 @@ def test_teardown_never_deletes_resources_without_explicit_terminal_app_proof() 
     plan = build_modal_create_plan(bundle)
 
     class PendingLifecycleSdk(_FakeSdk):
-        def stop_app(self, received_plan) -> None:
+        def stop_app(self, received_plan, app_id: str) -> None:
             self.calls.append(("stop_app", None))
             app = self.apps[0]
             self.apps = [
@@ -1555,7 +1615,7 @@ def test_teardown_accepts_terminal_app_with_retained_finalized_tags() -> None:
     plan = build_modal_create_plan(bundle)
 
     class RetainedTagsSdk(_FakeSdk):
-        def stop_app(self, received_plan) -> None:
+        def stop_app(self, received_plan, app_id: str) -> None:
             self.calls.append(("stop_app", None))
             app = self.apps[0]
             self.apps = [
@@ -1817,7 +1877,7 @@ class _DelayedAbortSdk(_FakeSdk):
         super().__init__(plan)
         self.terminal_polls = 0
 
-    def stop_app(self, plan) -> None:
+    def stop_app(self, plan, app_id: str) -> None:
         self.calls.append(("stop_app", None))
         app = self.apps[0]
         self.apps = [
@@ -1842,7 +1902,7 @@ class _DelayedAbortSdk(_FakeSdk):
             return replace(observation, apps=())
         return observation
 
-    def delete_volume(self, plan) -> None:
+    def delete_volume(self, plan, volume_id: str) -> None:
         self.calls.append(("delete_volume", None))
         if self.apps and self.apps[0].state != "stopped":
             return
@@ -2059,7 +2119,7 @@ def test_interrupt_before_create_returns_declines_race_winner_teardown() -> None
 
 def test_abort_does_not_report_confirmed_cleanup_while_the_volume_remains() -> None:
     class _RetainedVolumeSdk(_FakeSdk):
-        def delete_volume(self, plan) -> None:
+        def delete_volume(self, plan, volume_id: str) -> None:
             self.calls.append(("delete_volume", None))
 
     factory = _Factory()

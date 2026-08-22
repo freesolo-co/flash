@@ -21,6 +21,7 @@ from tests.test_serve_provisioning_modal import (
     FUNCTION_ID,
     INFERENCE_SECRET,
     INFERENCE_SECRET_ID,
+    OTHER_APP_ID,
     PROVIDER_ID,
     PROVIDER_SECRET,
     VOLUME_ID,
@@ -326,11 +327,39 @@ class _VolumeApi:
         return self.module.resources[("volume", name)]
 
 
+class _IdMutationStub:
+    def __init__(self, module) -> None:
+        self.module = module
+
+    async def AppStop(self, request) -> None:
+        self.module.mutations.append(("stop_app_by_id", request.app_id, request.source, {}))
+        self.module.deployed_apps = [
+            app for app in self.module.deployed_apps if app.app_id != request.app_id
+        ]
+
+    async def SecretDelete(self, request) -> None:
+        self.module.mutations.append(("delete_secret_by_id", request.secret_id, None, {}))
+        self.module.resources = {
+            key: resource
+            for key, resource in self.module.resources.items()
+            if resource.object_id != request.secret_id
+        }
+
+    async def VolumeDelete(self, request) -> None:
+        self.module.mutations.append(("delete_volume_by_id", request.volume_id, None, {}))
+        self.module.resources = {
+            key: resource
+            for key, resource in self.module.resources.items()
+            if resource.object_id != request.volume_id
+        }
+
+
 class _Client:
     def __init__(self, module) -> None:
         self.module = module
         self.close_count = 0
         self.close_error = False
+        self.stub = _IdMutationStub(module)
 
     def _close(self) -> None:
         self.close_count += 1
@@ -728,6 +757,66 @@ def test_pinned_sdk_deploys_exact_image_without_local_source_overlays() -> None:
     assert len(modal.calls["function"]["secrets"]) == 1
 
 
+def test_destructive_mutations_bind_confirmed_provider_ids() -> None:
+    plan = build_modal_create_plan(_bundle())
+    modal = _ModalModule(plan)
+    sdk = _sdk(plan, modal)
+    sdk.create_inference_secret(plan, INFERENCE_SECRET)
+    sdk.create_artifact_secret(plan, ARTIFACT_SECRET)
+    sdk.create_volume(plan)
+    sdk.deploy_app(plan)
+    modal.mutations.clear()
+    modal.deployed_apps = [
+        SimpleNamespace(app_id=OTHER_APP_ID, name=plan.names.app_or_pod, containers=0)
+    ]
+    newer_artifact_id = "st-" + "R" * 22
+    newer_inference_id = "st-" + "N" * 22
+    newer_volume_id = "vo-" + "R" * 22
+    modal.resources[("secret", plan.names.artifact_secret)] = _NamedHandle(
+        name=plan.names.artifact_secret, object_id=newer_artifact_id
+    )
+    modal.resources[("secret", plan.names.inference_secret)] = _NamedHandle(
+        name=plan.names.inference_secret, object_id=newer_inference_id
+    )
+    modal.resources[("volume", plan.names.volume)] = _NamedHandle(
+        name=plan.names.volume, object_id=newer_volume_id
+    )
+
+    sdk.stop_app(plan, APP_ID)
+    sdk.delete_secret(plan, ARTIFACT_SECRET_ID)
+    sdk.delete_secret(plan, INFERENCE_SECRET_ID)
+    sdk.delete_volume(plan, VOLUME_ID)
+
+    assert modal.deployed_apps[0].app_id == OTHER_APP_ID
+    assert {resource.object_id for resource in modal.resources.values()} == {
+        newer_artifact_id,
+        newer_inference_id,
+        newer_volume_id,
+    }
+    assert modal.mutations == [
+        ("stop_app_by_id", APP_ID, 2, {}),
+        ("delete_secret_by_id", ARTIFACT_SECRET_ID, None, {}),
+        ("delete_secret_by_id", INFERENCE_SECRET_ID, None, {}),
+        ("delete_volume_by_id", VOLUME_ID, None, {}),
+    ]
+
+
+def test_id_mutation_declines_when_the_generated_request_is_unavailable(monkeypatch) -> None:
+    from flash.serve.provisioning import _modal_sdk
+
+    plan = build_modal_create_plan(_bundle())
+    modal = _ModalModule(plan)
+    sdk = _sdk(plan, modal)
+    monkeypatch.setattr(_modal_sdk.importlib, "import_module", lambda _name: SimpleNamespace())
+
+    with pytest.raises(ModalSdkFailure) as exc_info:
+        sdk.stop_app(plan, APP_ID)
+
+    assert exc_info.value.code == "resource_ambiguous"
+    assert exc_info.value.outcome_unknown is True
+    assert modal.mutations == []
+
+
 def test_observe_lifecycle_stop_and_deletes_use_exact_pinned_signatures() -> None:
     plan = build_modal_create_plan(_bundle())
     modal = _ModalModule(plan)
@@ -770,53 +859,21 @@ def test_observe_lifecycle_stop_and_deletes_use_exact_pinned_signatures() -> Non
     assert pending.apps[0].tags == ()
     assert modal.calls["get_app_lifecycle"] == (APP_ID, modal.client)
 
-    sdk.stop_app(plan)
+    sdk.stop_app(plan, APP_ID)
     modal.lifecycle_stopped_at = object()
     stopped = sdk.observe(plan, app_id_hint=APP_ID)
     assert stopped.apps[0].state == "stopped"
     assert stopped.apps[0].running_containers == 0
     assert stopped.apps[0].tags == ()
     assert modal.deployed_tags == dict(plan.tags)
-    sdk.delete_secret(plan, plan.names.artifact_secret)
-    sdk.delete_secret(plan, plan.names.inference_secret)
-    sdk.delete_volume(plan)
+    sdk.delete_secret(plan, ARTIFACT_SECRET_ID)
+    sdk.delete_secret(plan, INFERENCE_SECRET_ID)
+    sdk.delete_volume(plan, VOLUME_ID)
     assert modal.mutations == [
-        (
-            "stop_app",
-            plan.names.app_or_pod,
-            None,
-            {"environment_name": plan.placement.environment, "client": modal.client},
-        ),
-        (
-            "delete_secret",
-            plan.names.artifact_secret,
-            None,
-            {
-                "allow_missing": True,
-                "environment_name": plan.placement.environment,
-                "client": modal.client,
-            },
-        ),
-        (
-            "delete_secret",
-            plan.names.inference_secret,
-            None,
-            {
-                "allow_missing": True,
-                "environment_name": plan.placement.environment,
-                "client": modal.client,
-            },
-        ),
-        (
-            "delete_volume",
-            plan.names.volume,
-            None,
-            {
-                "allow_missing": True,
-                "environment_name": plan.placement.environment,
-                "client": modal.client,
-            },
-        ),
+        ("stop_app_by_id", APP_ID, 2, {}),
+        ("delete_secret_by_id", ARTIFACT_SECRET_ID, None, {}),
+        ("delete_secret_by_id", INFERENCE_SECRET_ID, None, {}),
+        ("delete_volume_by_id", VOLUME_ID, None, {}),
     ]
 
 

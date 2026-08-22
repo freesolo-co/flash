@@ -110,11 +110,11 @@ class ModalSdk(Protocol):
 
     def deploy_app(self, plan: ModalCreatePlan) -> str: ...
 
-    def stop_app(self, plan: ModalCreatePlan) -> None: ...
+    def stop_app(self, plan: ModalCreatePlan, app_id: str) -> None: ...
 
-    def delete_secret(self, plan: ModalCreatePlan, name: str) -> None: ...
+    def delete_secret(self, plan: ModalCreatePlan, secret_id: str) -> None: ...
 
-    def delete_volume(self, plan: ModalCreatePlan) -> None: ...
+    def delete_volume(self, plan: ModalCreatePlan, volume_id: str) -> None: ...
 
     def close(self) -> None: ...
 
@@ -476,33 +476,43 @@ class PinnedModalSdk:
         )
         return _post_mutation_read(lambda: _provider_id(getattr(deployed, "app_id", None), "app"))
 
-    def stop_app(self, plan: ModalCreatePlan) -> None:
-        _call_mutation(
-            lambda: self._modal.experimental.stop_app(
-                plan.names.app_or_pod,
-                environment_name=plan.placement.environment,
-                client=self._client,
-            )
+    def _id_mutation(
+        self,
+        request_name: str,
+        rpc_name: str,
+        **fields: object,
+    ) -> None:
+        try:
+            api_pb2 = importlib.import_module("modal_proto.api_pb2")
+            request_type = getattr(api_pb2, request_name)
+            rpc = getattr(self._client.stub, rpc_name)
+            if request_name == "AppStopRequest":
+                fields["source"] = api_pb2.APP_STOP_SOURCE_PYTHON_CLIENT
+            request = request_type(**fields)
+        except Exception:
+            # name mutations can target a newer same-generation deployment after ownership proof.
+            # if the pinned generated id rpc is unavailable, decline cleanup as ambiguous instead.
+            raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True) from None
+        _call_mutation(lambda: rpc(request))
+
+    def stop_app(self, plan: ModalCreatePlan, app_id: str) -> None:
+        validate_modal_plan(plan)
+        self._id_mutation("AppStopRequest", "AppStop", app_id=_provider_id(app_id, "app"))
+
+    def delete_secret(self, plan: ModalCreatePlan, secret_id: str) -> None:
+        validate_modal_plan(plan)
+        self._id_mutation(
+            "SecretDeleteRequest",
+            "SecretDelete",
+            secret_id=_provider_id(secret_id, "secret"),
         )
 
-    def delete_secret(self, plan: ModalCreatePlan, name: str) -> None:
-        _call_mutation(
-            lambda: self._modal.Secret.objects.delete(
-                name,
-                allow_missing=True,
-                environment_name=plan.placement.environment,
-                client=self._client,
-            )
-        )
-
-    def delete_volume(self, plan: ModalCreatePlan) -> None:
-        _call_mutation(
-            lambda: self._modal.Volume.objects.delete(
-                plan.names.volume,
-                allow_missing=True,
-                environment_name=plan.placement.environment,
-                client=self._client,
-            )
+    def delete_volume(self, plan: ModalCreatePlan, volume_id: str) -> None:
+        validate_modal_plan(plan)
+        self._id_mutation(
+            "VolumeDeleteRequest",
+            "VolumeDelete",
+            volume_id=_provider_id(volume_id, "volume"),
         )
 
     def close(self) -> None:

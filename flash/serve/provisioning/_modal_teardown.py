@@ -66,11 +66,11 @@ def delete_teardown_resources(
             step()
 
     if artifact is not None:
-        run(lambda: mutation(lambda: sdk.delete_secret(plan, artifact.name)))
+        run(lambda: mutation(lambda: sdk.delete_secret(plan, artifact.id)))
     if inference is not None:
-        run(lambda: mutation(lambda: sdk.delete_secret(plan, inference.name)))
+        run(lambda: mutation(lambda: sdk.delete_secret(plan, inference.id)))
     if volume is not None:
-        run(lambda: mutation(lambda: sdk.delete_volume(plan)))
+        run(lambda: mutation(lambda: sdk.delete_volume(plan, volume.id)))
 
 
 def delete_confirmed_abort_resources(

@@ -45,10 +45,10 @@ class _CreatedResources:
     billing. Recording after the call meant cleanup walked past exactly that resource and still
     reported success, so the CLI printed a plain abort over a volume the customer keeps paying for.
     marking first keeps an unresolved create visible even when no provider id returns. cleanup then
-    declines name-addressed deletion and reports ambiguity instead of falsely claiming clean absence.
+    declines destructive cleanup and reports ambiguity instead of falsely claiming clean absence.
 
     The flags remain separate from `confirmed`: an attempt keeps ambiguous cleanup from reporting
-    success, while only provider ids returned to this invocation authorize name-addressed deletes.
+    success, while only provider ids returned to this invocation authorize destructive cleanup.
     provider ids enter `confirmed` only after the mutation return reaches this invocation.
 
     `app_deployed` is the expensive one. The secrets and the volume are cheap storage; the app is
@@ -214,8 +214,6 @@ def _start_fresh_deployment(
             sleep=sleep,
             created=created,
         )
-    except ModalResourceConflict:
-        return unknown_result(finalized_plan)
     except ModalSdkFailure as exc:
         # a definite failure here is terminal, and the secrets, volume and possibly the app are
         # already created and billing. returning from this catch would report the failure with
@@ -253,7 +251,7 @@ def _delete_artifact_and_confirm(
         artifact_secret_id=artifact.id,
     )
     try:
-        mutation(lambda: sdk.delete_secret(finalized_plan, artifact.name))
+        mutation(lambda: sdk.delete_secret(finalized_plan, artifact.id))
     except ModalSdkFailure as exc:
         if not exc.outcome_unknown:
             return failure_result(finalized_plan, from_sdk_failure(exc), handle=proof.handle)
@@ -383,8 +381,8 @@ def _adopt_uncleaned(
             expected,
         ):
             raise
-        # hand it to the reclaim: the delete is name-addressed and `allow_missing`, so it is a
-        # no-op against a secret already gone, and its own wait -- which targets the cleaned phase
+        # hand it to the reclaim: the id-bound delete may find the secret already gone, and its own
+        # wait -- which targets the cleaned phase
         # this observation just showed -- is what decides ready versus unknown.
         return _delete_artifact_and_confirm(
             finalized_plan,
