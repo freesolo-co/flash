@@ -11,11 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from flash.serve.control import ModalCredentials
-from flash.serve.provisioning._modal_plan import (
-    MODAL_VOLUME_MOUNT,
-    MODAL_WRAPPER_REMOTE_PATH,
-    build_modal_create_plan,
-)
+from flash.serve.provisioning._modal_plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
 from flash.serve.provisioning._modal_sdk import ModalSdkFailure, PinnedModalSdk
 from flash.serve.provisioning._modal_wrapper import launch_modal_server
 from tests.test_serve_provisioning_modal import (
@@ -67,12 +63,8 @@ class _FunctionHandle:
 
 
 class _Image:
-    def __init__(self, calls: dict[str, object]) -> None:
-        self.calls = calls
-
-    def add_local_file(self, local_path: str, remote_path: str, *, copy: bool):
-        self.calls["add_local_file"] = (local_path, remote_path, copy)
-        return self
+    def add_local_file(self, *_args: object, **_kwargs: object) -> object:
+        raise AssertionError("digest-pinned image must not be mutated with local wrapper code")
 
 
 class _LookupApp:
@@ -440,7 +432,9 @@ class _ModalModule:
 
     def _image(self, reference: str):
         self.calls["image_reference"] = reference
-        return _Image(self.calls)
+        image = _Image()
+        self.calls["image"] = image
+        return image
 
     def web_server(self, port: int, *, startup_timeout: int, label: str):
         self.calls["web_server"] = (port, startup_timeout, label)
@@ -678,7 +672,7 @@ def test_client_closes_once_when_workspace_or_environment_binding_fails(failure:
     assert PROVIDER_SECRET not in str(exc_info.value) + repr(exc_info.value)
 
 
-def test_pinned_sdk_deploys_exact_bootstrap_and_finalized_phases() -> None:
+def test_pinned_sdk_deploys_exact_image_without_local_source_overlays() -> None:
     bootstrap = build_modal_create_plan(_bundle(), phase="bootstrap")
     modal = _ModalModule(bootstrap)
     sdk = _sdk(bootstrap, modal)
@@ -690,10 +684,7 @@ def test_pinned_sdk_deploys_exact_bootstrap_and_finalized_phases() -> None:
 
     assert app_id == APP_ID
     assert modal.calls["image_reference"] == bootstrap.bundle.image.reference
-    local_path, remote_path, copy = modal.calls["add_local_file"]
-    assert local_path == bootstrap.wrapper_local_path
-    assert remote_path == MODAL_WRAPPER_REMOTE_PATH
-    assert copy is True
+    assert modal.calls["function"]["image"] is modal.calls["image"]
     assert modal.calls["app"] == {
         "name": bootstrap.names.app_or_pod,
         "tags": dict(bootstrap.tags),
@@ -715,6 +706,8 @@ def test_pinned_sdk_deploys_exact_bootstrap_and_finalized_phases() -> None:
     assert function["name"] == bootstrap.function_name
     assert function["region"] == "us-east-1"
     assert function["include_source"] is False
+    assert modal.calls["function_target"] is launch_modal_server
+    assert launch_modal_server.__module__ == "flash.serve.provisioning._modal_wrapper"
     assert modal.calls["web_server"] == (
         8000,
         bootstrap.startup_timeout_seconds,

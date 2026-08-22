@@ -14,7 +14,6 @@ import pytest
 
 from flash.serve.app.manifest import build_serving_manifest, load_serving_manifest
 from flash.serve.provisioning import (
-    LAUNCHER_ABI_ID,
     MAX_CANONICAL_MANIFEST_BYTES,
     MAX_ENCODED_MANIFEST_BYTES,
     DeploymentBundle,
@@ -312,13 +311,11 @@ def test_provider_failures_use_only_fixed_allowlisted_data() -> None:
     assert SECRET not in str(exc_info.value)
 
 
-def test_base64url_identity_and_launcher_abi_fit_provider_tags() -> None:
+def test_base64url_identity_fits_provider_tags() -> None:
     encoded = base64url_identity(bytes(range(32)))
     assert len(encoded) == 43
     assert "=" not in encoded
     assert base64.urlsafe_b64decode(encoded + "=") == bytes(range(32))
-    assert len(LAUNCHER_ABI_ID) <= 63
-    assert LAUNCHER_ABI_ID.startswith("fsla1-")
     with pytest.raises(ValueError, match="32 bytes"):
         base64url_identity(b"short")
 
@@ -385,36 +382,6 @@ def test_manifest_codec_rejects_trailing_malformed_noncanonical_and_wrong_identi
     ).decode("ascii")
     with pytest.raises(ValueError, match="not canonical"):
         decode_manifest_environment(noncanonical)
-
-
-def test_the_launcher_abi_tracks_the_wrapper_source_that_actually_runs(tmp_path) -> None:
-    """A changed wrapper must change the deployment identity.
-
-    `deploy_app` copies the CLI's local `_modal_wrapper.py` over the copy inside the pinned image,
-    so the executed code is NOT covered by `bundle.image.digest`. While the ABI was a hash of a
-    fixed literal, a CLI and an image from different releases produced byte-identical provenance:
-    the manifest, engine id, provider handle, and readiness proof all reported only the registry
-    digest, so substituted wrapper code ran under an immutability claim it did not satisfy.
-
-    Recomputed from bytes rather than asserting a pinned constant, so this keeps testing the
-    binding itself instead of freezing today's digest.
-    """
-    import base64
-    import hashlib
-    from pathlib import Path
-
-    from flash.serve.provisioning import _common
-
-    wrapper = Path(_common.__file__).with_name("_modal_wrapper.py")
-    expected = "fsla1-" + base64.urlsafe_b64encode(
-        hashlib.sha256(b"flash.serve.app.launch:v1\0" + wrapper.read_bytes()).digest()
-    ).decode("ascii").rstrip("=")
-    assert expected == _common.LAUNCHER_ABI_ID
-
-    # and a different wrapper yields a different id -- the property that makes it provenance.
-    altered = hashlib.sha256(b"flash.serve.app.launch:v1\0" + wrapper.read_bytes() + b"# x\n")
-    altered_id = "fsla1-" + base64.urlsafe_b64encode(altered.digest()).decode("ascii").rstrip("=")
-    assert altered_id != _common.LAUNCHER_ABI_ID
 
 
 def test_inference_tokens_must_be_usable_as_bearer_credentials() -> None:

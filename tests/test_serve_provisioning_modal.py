@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import email.message
 import io
 import json
@@ -409,10 +410,8 @@ def test_app_tag_set_fits_modals_tag_budget_in_every_phase() -> None:
         assert len(tags) <= MODAL_APP_TAG_LIMIT, f"{phase} carries {len(tags)} tags"
         assert len({key for key, _ in tags}) == len(tags), "tag keys must be unique"
 
-    assert "flash-launcher" not in dict(build_modal_create_plan(_bundle()).tags)
 
-
-def test_plan_is_complete_secret_free_and_binds_launcher_abi(monkeypatch) -> None:
+def test_plan_is_complete_secret_free_and_binds_pinned_image() -> None:
     bundle = _bundle()
     plan = build_modal_create_plan(bundle)
     bootstrap = build_modal_create_plan(bundle, phase="bootstrap")
@@ -436,19 +435,11 @@ def test_plan_is_complete_secret_free_and_binds_launcher_abi(monkeypatch) -> Non
         secret not in rendered
         for secret in (PROVIDER_ID, PROVIDER_SECRET, INFERENCE_SECRET, ARTIFACT_SECRET)
     )
-
-    from flash.serve.provisioning import _modal_plan
-
-    original = plan.names
-    original_topology = dict(plan.tags)["flash-topology"]
-    monkeypatch.setattr(_modal_plan, "LAUNCHER_ABI_ID", "fsla1-" + "a" * 43)
-    changed = build_modal_create_plan(bundle)
-    assert changed.names != original
-    # the abi no longer travels as its own tag, so `flash-topology` is what carries it into the
-    # tag set. without this, dropping `flash-launcher` would let two different launcher abis
-    # produce byte-identical tags, and `deployed_app_matches` compares tags to decide whether an
-    # existing app may be adopted rather than replaced.
-    assert dict(changed.tags)["flash-topology"] != original_topology
+    expected_image_tag = base64.urlsafe_b64encode(
+        bytes.fromhex(bundle.image.digest.removeprefix("sha256:"))
+    ).decode("ascii").rstrip("=")
+    assert dict(plan.tags)["flash-image"] == expected_image_tag
+    assert plan.bundle.spec.engine.image_digest == bundle.image.digest
 
 
 def test_happy_create_uses_exact_resources_endpoint_and_cleanup_order() -> None:

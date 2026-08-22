@@ -13,7 +13,6 @@ import pytest
 
 from flash.serve.app.__main__ import _bound_manifest
 from flash.serve.app.manifest import build_serving_manifest
-from flash.serve.provisioning import LAUNCHER_ABI_ID
 from tests.test_serve_app_manifest import _spec_and_inputs
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -217,7 +216,6 @@ def test_dockerfile_serve_uses_existing_cuda_family_and_frozen_lock() -> None:
     assert 'CMD ["python", "/app/serve_launch.py"]' in source
     assert "python -m flash" not in source
     assert "EXPOSE 8000" in source
-    assert len(LAUNCHER_ABI_ID) <= 63
     for forbidden in (
         "arg hf_token",
         "env hf_token",
@@ -228,3 +226,21 @@ def test_dockerfile_serve_uses_existing_cuda_family_and_frozen_lock() -> None:
         "freesolo_internal_key",
     ):
         assert forbidden not in source.lower()
+
+
+def test_modal_wrapper_is_packaged_under_the_image_import_root() -> None:
+    source = (ROOT / "Dockerfile.serve").read_text()
+    lines = source.splitlines()
+    assert "COPY flash ./flash" in lines, "digest-pinned image must package the modal wrapper"
+    copy_index = lines.index("COPY flash ./flash")
+    assert lines.index("WORKDIR /app") < copy_index
+    assert copy_index < lines.index("RUN uv sync --frozen --no-dev --extra serve-runtime")
+    assert "UV_PROJECT_ENVIRONMENT=/opt/flash-venv" in source
+    assert "PATH=/opt/flash-venv/bin:${PATH}" in source
+    assert "--no-editable" not in source
+    assert (ROOT / "flash/serve/provisioning/_modal_wrapper.py").is_file()
+
+    lock = (ROOT / "uv.lock").read_text()
+    project_start = lock.index('name = "freesolo-flash"')
+    project_end = lock.index("[[package]]", project_start)
+    assert 'source = { editable = "." }' in lock[project_start:project_end]

@@ -14,12 +14,7 @@ from flash.serve.control import DeploymentErrorCode, ModalCredentials
 from flash.serve.control._urls import validate_modal_public_url
 from flash.serve.control.types import validate_modal_provider_id
 
-from ._modal_plan import (
-    MODAL_VOLUME_MOUNT,
-    MODAL_WRAPPER_REMOTE_PATH,
-    ModalCreatePlan,
-    validate_modal_plan,
-)
+from ._modal_plan import MODAL_VOLUME_MOUNT, ModalCreatePlan, validate_modal_plan
 
 ModalAppState = Literal["deployed", "lifecycle_pending", "stopped", "failed"]
 
@@ -418,11 +413,7 @@ class PinnedModalSdk:
 
     def deploy_app(self, plan: ModalCreatePlan) -> str:
         validate_modal_plan(plan)
-        image = self._modal.Image.from_registry(plan.bundle.image.reference).add_local_file(
-            plan.wrapper_local_path,
-            MODAL_WRAPPER_REMOTE_PATH,
-            copy=True,
-        )
+        image = self._modal.Image.from_registry(plan.bundle.image.reference)
         volume = self._modal.Volume.from_name(
             plan.names.volume,
             environment_name=plan.placement.environment,

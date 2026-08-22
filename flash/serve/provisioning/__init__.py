@@ -1,7 +1,6 @@
 """provider-neutral serving provisioning foundation."""
 
 from ._common import (
-    LAUNCHER_ABI_ID,
     MAX_CANONICAL_MANIFEST_BYTES,
     MAX_ENCODED_MANIFEST_BYTES,
     DeploymentBundle,
@@ -18,7 +17,6 @@ from ._common import (
 )
 
 __all__ = [
-    "LAUNCHER_ABI_ID",
     "MAX_CANONICAL_MANIFEST_BYTES",
     "MAX_ENCODED_MANIFEST_BYTES",
     "DeploymentBundle",

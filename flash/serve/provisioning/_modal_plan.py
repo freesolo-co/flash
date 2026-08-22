@@ -7,13 +7,11 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 from flash.serve.control import ModalPlacement
 
 from ._common import (
-    LAUNCHER_ABI_ID,
     DeploymentBundle,
     ServingResourceNames,
     _resource_name,
@@ -30,7 +28,6 @@ MODAL_SCALEDOWN_WINDOW_SECONDS = 60
 MODAL_MAX_CONTAINERS = 1
 MODAL_MIN_CONTAINERS = 0
 MODAL_BUFFER_CONTAINERS = 0
-MODAL_WRAPPER_REMOTE_PATH = "/app/flash/serve/provisioning/_modal_wrapper.py"
 
 ModalDeploymentPhase = Literal["bootstrap", "finalized"]
 _MODAL_PHASES = frozenset({"bootstrap", "finalized"})
@@ -115,7 +112,6 @@ def _modal_resource_names(bundle: DeploymentBundle) -> ServingResourceNames:
             bundle.spec.deployment_id.encode("utf-8"),
             str(bundle.spec.generation).encode("ascii"),
             bundle.spec.engine.engine_id.encode("ascii"),
-            LAUNCHER_ABI_ID.encode("ascii"),
         )
     )
     return ServingResourceNames(
@@ -152,7 +148,6 @@ def _endpoint_label(bundle: DeploymentBundle, placement: ModalPlacement) -> str:
             bundle.spec.deployment_id.encode("utf-8"),
             str(bundle.spec.generation).encode("ascii"),
             bundle.spec.engine.engine_id.encode("ascii"),
-            LAUNCHER_ABI_ID.encode("ascii"),
         )
     )
     suffix = base64.b32encode(hashlib.sha256(payload).digest()).decode("ascii").lower().rstrip("=")
@@ -175,7 +170,6 @@ def _topology_identity(
             "gpu_count": placement.gpu_count,
             "image": bundle.image.reference,
             "include_source": False,
-            "launcher_abi": LAUNCHER_ABI_ID,
             "max_containers": MODAL_MAX_CONTAINERS,
             "min_containers": MODAL_MIN_CONTAINERS,
             "region": placement.region,
@@ -195,12 +189,9 @@ def _tags(
     phase: ModalDeploymentPhase,
 ) -> tuple[tuple[str, str], ...]:
     # modal caps an app at MODAL_APP_TAG_LIMIT tags server-side, and this dict is the whole app
-    # tag set. the launcher abi is deliberately absent: it is a compile-time constant, so as a tag
-    # it distinguishes nothing between deployments, and it is already bound into `flash-topology`
-    # (as `launcher_abi`), every resource name, and the endpoint label. dropping it costs no
-    # provenance. adding a tenth key here would exceed the cap, and because the failure lands at
+    # tag set. adding a ninth key here would exceed the cap, and because the failure lands at
     # app.deploy() -- after the secret and volume exist -- it surfaces as outcome_unknown with
-    # orphaned billable resources rather than a clean rejection. _assert_tag_budget enforces that.
+    # orphaned billable resources rather than a clean rejection.
     values = {
         "flash-deployment": _hashed_identity(bundle.spec.deployment_id),
         "flash-engine": _identity(bundle.spec.engine.engine_id),
@@ -249,7 +240,6 @@ class ModalCreatePlan:
     function_name: str
     endpoint_label: str
     expected_public_url: str
-    wrapper_local_path: str
     include_source: bool = False
     web_port: int = MODAL_WEB_PORT
     startup_timeout_seconds: int = MODAL_STARTUP_TIMEOUT_SECONDS
@@ -282,8 +272,6 @@ def validate_modal_plan(plan: ModalCreatePlan) -> None:
         or plan.expected_public_url != f"https://{combined_label}.modal.run"
     ):
         raise ValueError("modal endpoint does not match the deterministic label")
-    if plan.wrapper_local_path != str(Path(__file__).with_name("_modal_wrapper.py")):
-        raise ValueError("modal wrapper path does not match the fixed launcher abi")
 
 
 def build_modal_create_plan(
@@ -321,7 +309,6 @@ def build_modal_create_plan(
         function_name=names.template,
         endpoint_label=endpoint_label,
         expected_public_url=f"https://{_url_source(placement)}--{endpoint_label}.modal.run",
-        wrapper_local_path=str(Path(__file__).with_name("_modal_wrapper.py")),
     )
     validate_modal_plan(plan)
     return plan
