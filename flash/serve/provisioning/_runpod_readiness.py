@@ -20,7 +20,12 @@ from flash.serve.control import DeploymentResult, RunPodProviderHandle
 
 from ._common import Clock, DeploymentBundle, LifecycleFailure, Sleeper, failed_deployment_result
 from ._runpod_plan import RunPodCreatePlan
-from ._runpod_protocol import RunPodObservation, RunPodSecretObservation
+from ._runpod_protocol import (
+    RunPodObservation,
+    RunPodPodObservation,
+    RunPodSecretObservation,
+    RunPodTemplateObservation,
+)
 from ._runpod_resources import (
     RunPodResourceConflict,
     build_handle,
@@ -35,6 +40,7 @@ MAX_PROBE_TIMEOUT_SECONDS = 30.0
 
 Observe = Callable[[RunPodCreatePlan], RunPodObservation]
 PatchTemplate = Callable[[str, dict[str, object]], None]
+PatchPod = Callable[[str, dict[str, object]], None]
 DeleteSecret = Callable[[str], None]
 
 
@@ -216,10 +222,47 @@ def confirm_artifact_absence(
             return False
 
 
+def _pod_environment_is_stripped(plan: RunPodCreatePlan, pod: RunPodPodObservation) -> bool:
+    environment = dict(pod.environment)
+    return "FLASH_ARTIFACT_TOKEN" not in environment and all(
+        environment.get(key) == value for key, value in plan.environment_without_artifact
+    )
+
+
+def _await_stripped_resources(
+    plan: RunPodCreatePlan,
+    observe: Observe,
+    template_id: str,
+    pod_id: str,
+    is_stripped: Callable[[RunPodTemplateObservation, RunPodPodObservation], bool],
+    *,
+    deadline_at: float,
+    clock: Clock,
+    sleep: Sleeper,
+) -> tuple[RunPodTemplateObservation, RunPodPodObservation] | None:
+    """wait until one cleanup transition is observed on the same template and pod."""
+
+    while True:
+        try:
+            _secret, template, _volume, pod = exact_core_resources(plan, observe(plan))
+        except (RunPodResourceConflict, RunPodTransportFailure):
+            return None
+        # a successful patch response is not proof that the next read still names the resources we
+        # patched. deterministic names can be reused after replacement, so ids bind cleanup to the
+        # exact template and pod whose artifact reference was present before the transition.
+        if template.id != template_id or pod.id != pod_id:
+            return None
+        if is_stripped(template, pod):
+            return template, pod
+        if not sleep_until_poll(deadline_at, clock, sleep):
+            return None
+
+
 def delete_artifact_and_confirm(
     plan: RunPodCreatePlan,
     observe: Observe,
     patch_template: PatchTemplate,
+    patch_pod: PatchPod,
     delete_secret: DeleteSecret,
     artifact: RunPodSecretObservation,
     handle: RunPodProviderHandle,
@@ -228,10 +271,11 @@ def delete_artifact_and_confirm(
     clock: Clock,
     sleep: Sleeper,
 ) -> DeploymentResult:
-    # the template must stop referring to the one-shot secret before the secret is deleted. patch
-    # only the exact template observed now, then re-observe the stripped environment before delete.
+    # the template and live pod must stop referring to the one-shot secret before it is deleted.
+    # the stored value is only a named secret reference, not the credential itself, but observing
+    # both stripped environments proves no dangling artifact entry remains on a later restart.
     try:
-        _secret, template, _volume, _pod = exact_core_resources(plan, observe(plan))
+        _secret, template, _volume, pod = exact_core_resources(plan, observe(plan))
     except (RunPodResourceConflict, RunPodTransportFailure):
         return unknown_result(plan, handle=handle)
     if template.environment != plan.environment_without_artifact:
@@ -239,18 +283,44 @@ def delete_artifact_and_confirm(
             patch_template(template.id, plan.template_payload(False))
         except RunPodTransportFailure:
             return unknown_result(plan, handle=handle)
-        while True:
-            try:
-                stripped = observe(plan)
-                _secret, stripped_template, _volume, _pod = exact_core_resources(plan, stripped)
-            except (RunPodResourceConflict, RunPodTransportFailure):
-                return unknown_result(plan, handle=handle)
-            if stripped_template.id != template.id:
-                return unknown_result(plan, handle=handle)
-            if stripped_template.environment == plan.environment_without_artifact:
-                break
-            if not sleep_until_poll(deadline_at, clock, sleep):
-                return unknown_result(plan, handle=handle)
+        stripped = _await_stripped_resources(
+            plan,
+            observe,
+            template.id,
+            pod.id,
+            lambda current_template, _pod: (
+                current_template.environment == plan.environment_without_artifact
+            ),
+            deadline_at=deadline_at,
+            clock=clock,
+            sleep=sleep,
+        )
+        if stripped is None:
+            return unknown_result(plan, handle=handle)
+        template, pod = stripped
+    if not _pod_environment_is_stripped(plan, pod):
+        try:
+            # the payload carries only flash-authored entries. if runpod replaces rather than merges
+            # the map, provider-added values such as PUBLIC_KEY are dropped; the serving workload does
+            # not consume them. if runpod retains them, the subset check below deliberately allows it.
+            patch_pod(pod.id, plan.pod_environment_payload())
+        except RunPodTransportFailure:
+            return unknown_result(plan, handle=handle)
+        stripped = _await_stripped_resources(
+            plan,
+            observe,
+            template.id,
+            pod.id,
+            lambda _template, current_pod: (
+                _pod_environment_is_stripped(plan, current_pod)
+                and readiness_state(current_pod.desired_status) == "running"
+            ),
+            deadline_at=deadline_at,
+            clock=clock,
+            sleep=sleep,
+        )
+        if stripped is None:
+            return unknown_result(plan, handle=handle)
     try:
         delete_secret(artifact.id)
     except RunPodTransportFailure:
@@ -274,6 +344,7 @@ def await_ready_and_reclaim(
     plan: RunPodCreatePlan,
     observe: Observe,
     patch_template: PatchTemplate,
+    patch_pod: PatchPod,
     delete_secret: DeleteSecret,
     inference_token: str,
     artifact: RunPodSecretObservation | None,
@@ -324,6 +395,7 @@ def await_ready_and_reclaim(
         plan,
         observe,
         patch_template,
+        patch_pod,
         delete_secret,
         artifact,
         ready.handle,

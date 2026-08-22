@@ -95,6 +95,8 @@ def pod_identity_matches(
     template_id: str,
     volume_id: str,
 ) -> bool:
+    # environment is observed so artifact cleanup can verify the live pod was stripped, but it is
+    # not identity: the same pod legitimately transitions from the bootstrap env to the stripped env.
     # placement is assigned by runpod, not by us, and is absent until it happens: a `CREATED` or
     # `PENDING` pod (including the one the create call just returned) reports no machine even with
     # `includeMachine=true`. comparing `None` for equality read that as "a different gpu than we

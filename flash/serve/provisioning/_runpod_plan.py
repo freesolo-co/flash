@@ -109,6 +109,11 @@ class RunPodCreatePlan:
             else self.template_without_artifact_json
         )
 
+    def pod_environment_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {"env": dict(self.environment_without_artifact)}
+        _canonical_payload(payload, "runpod pod environment payload")
+        return payload
+
     def pod_payload(self, *, template_id: str, volume_id: str) -> dict[str, object]:
         payload = _payload(self.pod_static_json)
         payload["networkVolumeId"] = volume_id

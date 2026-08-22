@@ -119,6 +119,7 @@ class RunPodPodObservation:
     # the key, and the same foreign-pod reasoning as network_volume_id applies.
     template_id: str | None
     ports: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,6 +422,9 @@ def parse_pods(value: object) -> tuple[RunPodPodObservation, ...]:
                     else None
                 ),
                 ports=_ports(row.get("ports"), "pod ports"),
+                # every account pod is parsed, including foreign pods that legitimately omit env.
+                # an absent environment therefore means no overrides rather than a failed pass.
+                environment=_environment(row.get("env", {})),
             )
         )
     return tuple(parsed)
