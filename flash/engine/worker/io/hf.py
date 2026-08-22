@@ -553,7 +553,14 @@ def upload_resume_checkpoint(
                         )
                         if emit_heartbeat:
                             with contextlib.suppress(Exception):
-                                _w.heartbeat("checkpoint_upload_failed", step=step)
+                                # worker stdout is not part of control-plane run logs, so the stage
+                                # name alone would otherwise be the entire failure report.
+                                _w.heartbeat(
+                                    "checkpoint_upload_failed",
+                                    step=step,
+                                    error=sanitize_diagnostic(e, limit=300),
+                                    failure_stage=failure_stage,
+                                )
                         if failure_stage in {"before", "after"}:
                             raise
     return False

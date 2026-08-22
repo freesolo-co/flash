@@ -212,6 +212,79 @@ def test_resume_first_companion_retries_without_reuploading_full_state(monkeypat
     assert calls == {"resume": 1, "deployable": 2}
 
 
+def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatch, tmp_path):
+    import flash.engine.worker as worker
+    from flash.engine.worker.io import hf as worker_hf
+
+    secret = "hf_checkpoint_upload_secret"
+    calls = 0
+    heartbeats: list[tuple[str, dict]] = []
+
+    class Api:
+        def upload_folder(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise PermissionError(f"hf quota refused credential {secret} " + "x" * 400)
+
+    monkeypatch.setenv("HF_TOKEN", secret)
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(
+        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+    )
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
+
+    assert not worker_hf.upload_resume_checkpoint(50, str(tmp_path))
+
+    failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
+    assert calls == worker_hf._CKPT_UPLOAD_RETRIES
+    assert len(failed) == 1
+    assert failed[0]["step"] == 50
+    assert failed[0]["failure_stage"] == "resume"
+    assert failed[0]["error"].startswith("PermissionError: hf quota refused")
+    assert "<redacted>" in failed[0]["error"]
+    assert secret not in failed[0]["error"]
+    assert len(failed[0]["error"]) <= 300
+
+
+@pytest.mark.parametrize("failure_stage", ["before", "after"])
+def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path, failure_stage):
+    import flash.engine.worker as worker
+    from flash.engine.worker.io import hf as worker_hf
+
+    calls = {"resume": 0, "companion": 0}
+    heartbeats: list[tuple[str, dict]] = []
+
+    class Api:
+        def upload_folder(self, **_kwargs):
+            calls["resume"] += 1
+
+        def list_repo_files(self, **_kwargs):
+            return []
+
+    def fail_companion():
+        calls["companion"] += 1
+        raise RuntimeError(f"{failure_stage} companion failed")
+
+    callbacks = {f"{failure_stage}_upload": fail_companion}
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(
+        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+    )
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
+
+    with pytest.raises(RuntimeError, match=f"{failure_stage} companion failed"):
+        worker_hf.upload_resume_checkpoint(50, str(tmp_path), **callbacks)
+
+    failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
+    assert calls["companion"] == worker_hf._CKPT_UPLOAD_RETRIES
+    assert calls["resume"] == (0 if failure_stage == "before" else 1)
+    assert len(failed) == 1
+    assert failed[0]["failure_stage"] == failure_stage
+    assert f"{failure_stage} companion failed" in failed[0]["error"]
+
+
 def test_seed_training_rngs_initializes_all_supported_generators(monkeypatch):
     from flash.engine.worker.runtime import rng
 
