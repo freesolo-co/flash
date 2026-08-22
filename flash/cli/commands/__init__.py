@@ -723,15 +723,20 @@ def cmd_log(args) -> int:
     text = str(client.get_logs(args.run_id, offset=0).get("logs") or "")
     if text:
         print(text, end="" if text.endswith("\n") else "\n")
-    try:
-        # only the heading depends on this. a failed lookup must not cost the user the artifacts,
-        # which carry the traceback that explains the failure they ran this command to read.
-        current_attempt = render.live_attempt(client.get_run(args.run_id) or {})
-    except ClientError:
-        current_attempt = None
-    _print_worker_output(
-        client, args.run_id, printed_any=bool(text), current_attempt=current_attempt
-    )
+
+    def live_attempt() -> int | None:
+        """Resolve the live attempt for the headings, or give up on it.
+
+        Only the heading depends on this, so a failed lookup must not cost the user the artifacts,
+        which carry the traceback that explains the failure they ran this command to read. The
+        printer calls this after fetching them, so a run with no artifacts never pays for it.
+        """
+        try:
+            return render.live_attempt(client.get_run(args.run_id) or {})
+        except ClientError:
+            return None
+
+    _print_worker_output(client, args.run_id, printed_any=bool(text), current_attempt=live_attempt)
     return 0
 
 

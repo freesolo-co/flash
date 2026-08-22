@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 from flash.cli.ui import render
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from flash.client import ApiClient
 
 
@@ -43,18 +45,31 @@ def _worker_section_name(name: str, current_attempt: int | None) -> str:
 
 
 def _print_worker_output(
-    client: ApiClient, run_id: str, *, printed_any: bool = False, current_attempt: int | None = None
+    client: ApiClient,
+    run_id: str,
+    *,
+    printed_any: bool = False,
+    current_attempt: Callable[[], int | None] | int | None = None,
 ) -> bool:
     """Print each worker artifact under a heading naming the attempt that produced it.
 
-    `current_attempt` is supplied by the caller rather than fetched here: the follow loop already
-    reads a status every tick, so fetching another inside the printer would both duplicate a request
-    and consume a status that loop is pacing itself against. None means the caller could not
-    establish it, and each section is then labelled with its own attempt alone.
+    `current_attempt` comes from the caller, as a value or as a callable resolved lazily, because
+    the two callers know it at different times. The follow loop already reads a status every tick
+    and passes what it saw; fetching another here would duplicate that request and consume a status
+    the loop is pacing itself against. A snapshot read has none, so it passes a callable.
+
+    The callable is invoked only after the artifacts are in hand, and only when there is a heading
+    to label. That ordering is load-bearing twice over: a run with no artifacts costs no status
+    request at all, and a retry starting mid-command is reflected rather than mislabelled, since
+    the endpoint returns the highest UPLOADED attempt and resolving the live attempt first would
+    pin a number the artifacts then contradict. None means it could not be established, and each
+    section is labelled with its own attempt alone.
     """
     worker_output = client.get_worker_output(run_id) or {}
     if not worker_output:
         return printed_any
+    if callable(current_attempt):
+        current_attempt = current_attempt()
     for name, text in worker_output.items():
         if not text:
             continue
