@@ -6,6 +6,7 @@ scripts, and the trainer agent depend on.
 
 from __future__ import annotations
 
+import argparse
 import json
 
 import pytest
@@ -636,6 +637,54 @@ def test_flag_typo_after_option_terminator_has_no_unusable_suggestion(monkeypatc
     assert "unrecognized arguments: --folow" in err
     assert "--follow" not in err
     assert "did you mean" not in err
+
+
+def test_a_lone_dash_reaches_argparses_own_message(monkeypatch, capsys) -> None:
+    """A bare `-` names no option, so the typo machinery must not answer it with a flag.
+
+    `_get_option_tuples` indexes the token's second character, so asking argparse about a lone dash
+    raised IndexError from inside the handler whose whole job is to improve an error message.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["runs", "log", "flash-1", "-"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: -" in err
+    assert "did you mean" not in err
+    assert "-v" not in err
+
+
+@pytest.mark.parametrize("arity", [3, 4])
+def test_a_repeated_short_root_flag_is_recognized_under_both_parse_optional_shapes(
+    monkeypatch, arity
+) -> None:
+    """`_parse_optional` returns 3 items before 3.11.9/3.12.3, and `requires-python` admits those.
+
+    Reading the separator positionally raised ValueError there, so the themed path crashed on
+    exactly the interpreters it was not developed on. The predicate is exercised directly rather
+    than through `cli.main`: argparse's own parse loop unpacks this tuple too, so narrowing it
+    parser-wide fails inside argparse and would prove nothing about our handling.
+    """
+    from flash.cli.errors import _is_repeated_root_short_option
+
+    root = argparse.ArgumentParser()
+    root.add_argument("-v", action="count")
+    original = root._parse_optional
+
+    def narrow(arg_string):
+        parsed = original(arg_string)
+        # drop the separator argparse inserted at index 2 in the newer releases.
+        return (parsed[0], parsed[1], parsed[3]) if parsed and len(parsed) == 4 else parsed
+
+    if arity == 3:
+        monkeypatch.setattr(root, "_parse_optional", narrow)
+    assert len(root._parse_optional("-vv")) == arity
+    assert _is_repeated_root_short_option(root, "-vv", frozenset({"-v"})) is True
+    # a short flag that is not a repeat of itself must not be repositioned as one.
+    assert _is_repeated_root_short_option(root, "-vx", frozenset({"-v"})) is False
 
 
 def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:

@@ -69,11 +69,14 @@ def _friendly_message(message: str, context: _SuggestionContext) -> str:
     prefix = "unrecognized arguments: "
     if not message.startswith(prefix):
         return message
+    # a bare `-` starts with a dash but names no option, so it is an ordinary positional argparse
+    # could not place. requiring a character after the dash keeps it out of the typo machinery,
+    # which would otherwise answer it with the nearest short flag.
     bad = next(
         (
             token.split("=", 1)[0]
             for token in message[len(prefix) :].split()
-            if token.startswith("-")
+            if token.startswith("-") and len(token.split("=", 1)[0]) > 1
         ),
         None,
     )
@@ -160,7 +163,7 @@ def _option_location(
             fallback = location
             # repeated spellings can include one accepted root occurrence and one rejected
             # subcommand occurrence. choose the occurrence argparse could not consume here.
-            if after_terminator or len(current._get_option_tuples(token)) != 1:
+            if after_terminator or len(_option_tuples(current, token)) != 1:
                 return location
         if after_terminator or token.startswith("-") or not path_open:
             continue
@@ -179,6 +182,18 @@ def _option_location(
     return fallback
 
 
+def _option_tuples(parser: argparse.ArgumentParser, token: str) -> list:
+    """The prefix matches for a token, for tokens argparse's own helper cannot be asked about.
+
+    `_get_option_tuples` indexes the token's second character, so a bare ``-`` raises IndexError
+    there. A lone dash is an ordinary unrecognized positional and must reach argparse's own message
+    rather than crash the code that was trying to improve it.
+    """
+    if len(token) < 2:
+        return []
+    return parser._get_option_tuples(token)
+
+
 def _is_repeated_root_short_option(
     root: argparse.ArgumentParser, token: str, root_only: frozenset[str]
 ) -> bool:
@@ -188,12 +203,20 @@ def _is_repeated_root_short_option(
     parsed = root._parse_optional(token)
     if parsed is None:
         return False
-    action, option, separator, explicit = parsed
+    # argparse widened this tuple from 3 to 4 in 3.11.9/3.12.3 by inserting a separator, and
+    # `requires-python` still admits the narrower interpreters. only the action, the option and the
+    # explicit remainder are common to both, and the separator adds nothing the exact-spelling
+    # check below does not already settle -- so read the three shared fields positionally and let
+    # the reconstruction decide. an unfamiliar arity is not worth raising from inside an error path.
+    if len(parsed) not in (3, 4):
+        return False
+    action, option, explicit = parsed[0], parsed[1], parsed[-1]
     return (
         isinstance(action, argparse._CountAction)
         and option in root_only
-        and separator == ""
-        and explicit is not None
+        and isinstance(explicit, str)
+        and bool(explicit)
+        # the whole token must be that one short flag repeated, so `-vx` and `-v=2` are not repeats.
         and token == option + option[-1] * len(explicit)
     )
 
