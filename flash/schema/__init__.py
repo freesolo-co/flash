@@ -50,6 +50,13 @@ from flash.schema.fields import (
     _wandb_spec,
 )
 
+# the smallest rank the parser accepts, and so the smallest a source adapter can turn out to have.
+# an unresolved warm start is sized and priced here rather than at the serialization default: the
+# client cannot read the source adapter, and this is the one value that is a true lower bound rather
+# than a guess. it must stay the floor `lora_rank` is parsed against, or a check derived from it
+# would admit shapes the parser rejects.
+MIN_LORA_RANK = 1
+
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 # canonical short checkpoint references name a run alias or a saved checkpoint. immutable adapter
@@ -493,7 +500,9 @@ def _validate_gpu_section(
     # serialization placeholder here. keep geometry checks and reject shapes that cannot fit even at
     # the minimum valid rank; the server replaces this value from adapter_config.json before its
     # authoritative allocation-time vram check.
-    preflight_train = {**train_raw, "lora_rank": 1} if unresolved_warmstart_rank else train_raw
+    preflight_train = (
+        {**train_raw, "lora_rank": MIN_LORA_RANK} if unresolved_warmstart_rank else train_raw
+    )
     preflight_gpu_count = provisional_gpu_count(
         model,
         algorithm,
@@ -575,7 +584,7 @@ def _validate_algorithm_model_consistency(
             "train.lora_alpha cannot be set with train.init_from_adapter because source adapter "
             "alpha metadata is authoritative"
         )
-    lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
+    lora_rank = _train_int(train_raw, "lora_rank", minimum=MIN_LORA_RANK) or 32
     # unset -> the tuned 2 x rank default. authored -> the user's value, which need not be 2 x rank.
     lora_alpha = _train_int(train_raw, "lora_alpha", minimum=1) or 2 * lora_rank
     max_lora_rank = serving_lora_rank_cap(info)

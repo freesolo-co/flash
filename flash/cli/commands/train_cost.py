@@ -64,30 +64,32 @@ def _cmd_train_cost_offline(spec, authored_train_keys: frozenset[str] = frozense
     from dataclasses import replace
 
     from flash.cost import estimate_cost
+    from flash.schema import MIN_LORA_RANK
 
     config = runconfig_from_spec(spec)
     if spec.train.init_from_adapter:
         # --cost is offline/catalog-only and cannot read the source adapter's rank. stderr keeps
         # stdout clean for machine-readable callers.
-        unresolved_rank = "lora_rank" not in authored_train_keys
-        if unresolved_rank:
+        if "lora_rank" in authored_train_keys:
+            warning = (
+                "warning: warm-start (train.init_from_adapter) cost uses the authored LoRA rank; "
+                "the source adapter's authoritative rank is resolved server-side, so this offline "
+                "estimate may be higher or lower than the resolved run cost."
+            )
+        else:
             # quote at rank 1 rather than at the serialization placeholder. the placeholder is not a
             # measurement of anything, and `estimate_cost` reads the rank for BOTH the price and the
             # exact-card fit -- so pricing at 32 refused the very configuration the parser now
             # accepts, with advice (`--gpus 2`) for a shortfall the real source rank may not have.
             # rank 1 is the true lower bound, which makes the quote a floor the run cannot come in
             # under, and withholds it only when no source rank could fit at all.
-            config = replace(config, lora_rank=1)
-        print(
-            "warning: warm-start (train.init_from_adapter) cost is estimated at the minimum LoRA "
-            "rank because the source adapter's rank is resolved server-side, so treat it as a lower "
-            "bound: a higher source rank costs more."
-            if unresolved_rank
-            else "warning: warm-start (train.init_from_adapter) cost uses the authored LoRA rank; "
-            "the source adapter's authoritative rank is resolved server-side, so this offline "
-            "estimate may be higher or lower than the resolved run cost.",
-            file=sys.stderr,
-        )
+            config = replace(config, lora_rank=MIN_LORA_RANK)
+            warning = (
+                "warning: warm-start (train.init_from_adapter) cost is estimated at the minimum "
+                "LoRA rank because the source adapter's rank is resolved server-side, so treat it "
+                "as a lower bound: a higher source rank costs more."
+            )
+        print(warning, file=sys.stderr)
     estimate = estimate_cost(config)
     if render.styled():
         print(render.cost_panel(estimate))
