@@ -29,6 +29,7 @@ from flash.engine.worker.model.lora import _read_safetensors_tensor_metadata
 from flash.serve.contract import reject_non_finite_json_constant
 
 from .manifest import ArtifactFile, ManifestAdapter, ServingManifest
+from .progress import emit_boot_progress
 
 _ARTIFACT_TOKEN_FD_ENV = "FLASH_ARTIFACT_TOKEN_FD"
 _CONFIG_NAME = "adapter_config.json"
@@ -202,6 +203,7 @@ def hydrate_base_weights(
         cache_dir = root / BASE_WEIGHTS_CACHE_DIRNAME
         cache_dir.mkdir(mode=0o755, exist_ok=True)
         for repo_id, revision in _base_weight_sources(manifest):
+            emit_boot_progress("artifact-download-starting", repo=repo_id, revision=revision)
             try:
                 snapshot_path = snapshot_download_fn(
                     repo_id=repo_id,
@@ -323,6 +325,11 @@ def _materialize_adapter(
         try:
             hf_cache = root / ".hf-cache"
             patterns = [f"{adapter.source_subfolder}/{entry.path}" for entry in adapter.files]
+            emit_boot_progress(
+                "artifact-download-starting",
+                repo=adapter.repo_id,
+                revision=adapter.source_revision,
+            )
             try:
                 snapshot = snapshot_download_fn(
                     repo_id=adapter.repo_id,
@@ -465,7 +472,9 @@ def _digest_lock(path: Path):
             "adapter digest lock",
             enforce_mode=_directory_enforces_permission_bits(path.parent),
         )
+        emit_boot_progress("digest-lock-acquiring", path=path)
         fcntl.flock(fd, fcntl.LOCK_EX)
+        emit_boot_progress("digest-lock-acquired", path=path)
         if os.fstat(fd) != details:
             raise MaterializationError("adapter digest lock changed while it was opened")
         yield

@@ -201,7 +201,7 @@ def test_unset_engine_knobs_are_omitted_rather_than_passed_as_none() -> None:
 
 
 def test_bootstrap_registers_every_revision_before_atomic_publish(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, capsys
 ) -> None:
     manifest = _manifest()
     paths = {
@@ -217,6 +217,17 @@ def test_bootstrap_registers_every_revision_before_atomic_publish(
     owner = asyncio.run(
         bootstrap_serving(manifest, tmp_path, runtime_factory=lambda _config: runtime)
     )
+    output = capsys.readouterr().out
+    phases = [
+        "engine-construction-starting",
+        "engine-constructed",
+        "adapters-registered",
+    ]
+    positions = [output.index(f"phase={phase}") for phase in phases]
+    assert positions == sorted(positions)
+    assert f'model="{manifest.engine.served_model}"' in output
+    assert f'revision="{manifest.engine.model_revision}"' in output
+    assert AUTH_TOKEN not in output
 
     assert owner.ready is True
     assert [spec.adapter_id for spec in runtime.registered] == [
@@ -995,7 +1006,7 @@ def test_serve_construction_failures_close_bootstrapped_runtime(
     assert [callable(handler) for handler in bootstrap_kwargs] == [True]
 
 
-def test_engine_death_asks_the_running_server_to_exit(monkeypatch) -> None:
+def test_engine_death_asks_the_running_server_to_exit(monkeypatch, capsys) -> None:
     # wiring the handler is not enough: invoking it has to actually stop the http server, which
     # is what ends the container and lets the provider start a healthy replacement.
     import uvicorn
@@ -1031,7 +1042,10 @@ def test_engine_death_asks_the_running_server_to_exit(monkeypatch) -> None:
     args = SimpleNamespace(cache_root="/cache", host="127.0.0.1", port=8000)
 
     asyncio.run(app_main._serve(args, _manifest()))
+    output = capsys.readouterr().out
 
+    assert 'phase=port-bind-starting host="127.0.0.1" port="8000"' in output
+    assert AUTH_TOKEN not in output
     assert built[0].should_exit is True
     assert owner.close_calls == 1
 

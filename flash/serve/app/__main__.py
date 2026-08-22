@@ -13,6 +13,7 @@ from .bootstrap import bootstrap_serving
 from .http import create_app
 from .manifest import ServingManifest
 from .materialize import read_artifact_token_fd
+from .progress import emit_boot_progress
 
 _INFERENCE_TOKEN_FD_ENV = "FLASH_INFERENCE_TOKEN_FD"
 
@@ -95,6 +96,7 @@ async def _serve(
                     signal.raise_signal(captured_signal)
 
             server.capture_signals = capture_with_handoff
+        emit_boot_progress("port-bind-starting", host=args.host, port=args.port)
         await server.serve()
     finally:
         await owner.close()

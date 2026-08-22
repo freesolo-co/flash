@@ -15,6 +15,8 @@ from pathlib import Path
 from types import FrameType, SimpleNamespace
 from typing import Any, Protocol, Self
 
+from .progress import emit_boot_progress
+
 _MANIFEST_ENV = "FLASH_SERVING_MANIFEST"
 _MANIFEST_ID_ENV = "FLASH_SERVING_MANIFEST_ID"
 _IMAGE_DIGEST_ENV = "FLASH_SERVING_IMAGE_DIGEST"
@@ -284,7 +286,11 @@ def _verify_external_bindings(manifest: Any, environment: MutableMapping[str, st
 
 
 def _atomic_write_manifest(manifest: Any, cache_root: str) -> Path:
+    # the walk below opens, creates and mode-probes every component of the cache root on the
+    # provider's network volume, so it is the first place startup can block on remote storage.
+    emit_boot_progress("cache-root-preparing", path=cache_root)
     root = _prepare_cache_root(cache_root)
+    emit_boot_progress("cache-root-prepared", path=root)
     target = root / "serving-manifest.json"
     temporary_name = f".serving-manifest-{uuid.uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
@@ -310,6 +316,7 @@ def _atomic_write_manifest(manifest: Any, cache_root: str) -> Path:
         if temporary_fd is not None:
             os.close(temporary_fd)
         os.close(directory_fd)
+    emit_boot_progress("manifest-written", path=target, manifest_id=manifest.manifest_id)
     return target
 
 
@@ -372,16 +379,27 @@ def _prepare_cache(manifest: Any, cache_root: str, artifact_token: str | None) -
     resolves them offline from that volume.
     """
 
+    emit_boot_progress("cache-validation-starting", path=cache_root)
     adapters_missing = True
     try:
         validate_manifest_cache(manifest, cache_root)
         adapters_missing = False
+        emit_boot_progress("adapters-validated", count=len(manifest.adapters))
     except MaterializationError as exc:
         if not _cache_has_missing_adapter(manifest, cache_root):
             raise LaunchError("serving cache validation failed") from exc
     weights_missing = not base_weights_are_cached(manifest, cache_root)
     if not adapters_missing and not weights_missing:
+        emit_boot_progress("cache-validated", result="hit")
         return
+    emit_boot_progress(
+        "hydration-starting",
+        path=cache_root,
+        repo=manifest.engine.served_model,
+        revision=manifest.engine.model_revision,
+        weights=weights_missing,
+        adapters=adapters_missing,
+    )
     if artifact_token is None:
         raise LaunchError("artifact token is required when serving cache hydration is missing")
     try:
@@ -391,8 +409,10 @@ def _prepare_cache(manifest: Any, cache_root: str, artifact_token: str | None) -
         if adapters_missing:
             with _secret_descriptor(artifact_token) as token_fd:
                 hydrate_manifest(manifest, cache_root, token_fd=token_fd)
+            emit_boot_progress("adapters-validated", count=len(manifest.adapters))
     except MaterializationError as exc:
         raise LaunchError("serving cache hydration failed") from exc
+    emit_boot_progress("hydration-complete", path=cache_root)
 
 
 def _bind_hub_cache(environment: MutableMapping[str, str], cache_root: str) -> None:
@@ -483,6 +503,10 @@ def _run_with_secrets(
 ) -> tuple[str, SimpleNamespace, Any]:
     """hydrate while the artifact credential exists, then return only serving inputs."""
 
+    # first marker of the process. everything below it -- the cache-root walk in particular --
+    # touches the provider's network volume, so without a marker here a hang there is
+    # indistinguishable from a container that never ran python at all.
+    emit_boot_progress("launcher-entered")
     _load_project_boundaries()
     try:
         secrets = ServingRuntimeSecrets(raw_inference, raw_artifact)
@@ -526,6 +550,7 @@ def _run_prepared(
     prepared: tuple[str, SimpleNamespace, Any], startup_signals: _StartupSignalGuard
 ) -> None:
     inference_token, args, manifest = prepared
+    emit_boot_progress("entering-serve", host=args.host, port=args.port)
     with _secret_descriptor(inference_token) as inference_fd:
         asyncio.run(
             _serve(

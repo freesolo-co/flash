@@ -12,6 +12,7 @@ from flash.serve.runtime import AdapterSpec, EngineConfig, VllmLoraRuntime
 
 from .manifest import ManifestAdapter, ServingManifest
 from .materialize import locked_manifest_cache
+from .progress import emit_boot_progress
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +134,17 @@ async def bootstrap_serving(
     owner = ServingBootstrap(manifest, runtime)
     try:
         with locked_manifest_cache(manifest, cache_root) as paths:
+            emit_boot_progress(
+                "engine-construction-starting",
+                model=manifest.engine.served_model,
+                revision=manifest.engine.model_revision,
+            )
             await runtime.start()
+            emit_boot_progress(
+                "engine-constructed",
+                model=manifest.engine.served_model,
+                revision=manifest.engine.model_revision,
+            )
             revisions: dict[str, PublishedAdapter] = {}
             for adapter in manifest.adapters:
                 path = paths[adapter.adapter_revision]
@@ -154,6 +165,7 @@ async def bootstrap_serving(
                     adapter=adapter,
                     local_path=path,
                 )
+            emit_boot_progress("adapters-registered", count=len(revisions))
         published = dict(revisions)
         for alias, revision in manifest.aliases.items():
             target = revisions[revision]

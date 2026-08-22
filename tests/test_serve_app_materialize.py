@@ -104,7 +104,7 @@ def _token_fd() -> int:
     return read_fd
 
 
-def test_hydrate_forwards_exact_source_patterns_and_closes_token_fd(tmp_path: Path) -> None:
+def test_hydrate_forwards_exact_source_patterns_and_closes_token_fd(tmp_path: Path, capsys) -> None:
     config_bytes, weights_bytes = _artifact_bytes(tmp_path)
     manifest = _manifest(config_bytes, weights_bytes)
     calls: list[dict] = []
@@ -116,6 +116,15 @@ def test_hydrate_forwards_exact_source_patterns_and_closes_token_fd(tmp_path: Pa
         token_fd=read_fd,
         snapshot_download_fn=_download_stub(config_bytes, weights_bytes, calls),
     )
+    output = capsys.readouterr().out
+    acquiring = output.index("phase=digest-lock-acquiring")
+    acquired = output.index("phase=digest-lock-acquired")
+    assert acquiring < acquired
+    assert str(tmp_path / "cache" / ".locks") in output
+    assert "phase=artifact-download-starting" in output
+    assert 'repo="flash-owned/run-artifacts"' in output
+    assert f'revision="{manifest.adapters[0].source_revision}"' in output
+    assert TOKEN not in output
 
     with pytest.raises(OSError, match="Bad file descriptor"):
         os.fstat(read_fd)

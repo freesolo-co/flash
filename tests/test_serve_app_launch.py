@@ -81,7 +81,7 @@ def _successful_serve(captured: dict[str, object]):
 
 
 def test_launcher_uses_cache_first_without_reading_artifact_token(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, capsys
 ) -> None:
     environment = _environment(tmp_path, artifact=False)
     calls: list[str] = []
@@ -107,6 +107,12 @@ def test_launcher_uses_cache_first_without_reading_artifact_token(
     assert (tmp_path / "cache" / "serving-manifest.json").read_text() == (
         _manifest().canonical_json()
     )
+    output = capsys.readouterr().out
+    assert output.index("phase=adapters-validated") < output.index(
+        'phase=cache-validated result="hit"'
+    )
+    assert INFERENCE_TOKEN not in output
+    assert ARTIFACT_TOKEN not in output
 
 
 def test_bootstrap_handoff_installs_inner_guard_before_restoring_outer(
@@ -187,6 +193,7 @@ def test_launcher_cache_miss_requires_artifact_token_before_serving(
 def test_launcher_hydrates_missing_cache_through_closed_descriptor(
     monkeypatch,
     tmp_path: Path,
+    capsys,
 ) -> None:
     environment = _environment(tmp_path)
     captured: dict[str, object] = {}
@@ -210,6 +217,24 @@ def test_launcher_hydrates_missing_cache_through_closed_descriptor(
     for key in ("artifact_fd", "inference_fd"):
         with pytest.raises(OSError, match="Bad file descriptor"):
             os.fstat(captured[key])
+    output = capsys.readouterr().out
+    phases = [
+        "cache-root-prepared",
+        "manifest-written",
+        "cache-validation-starting",
+        "hydration-starting",
+        "adapters-validated",
+        "hydration-complete",
+        "entering-serve",
+    ]
+    positions = [output.index(f"phase={phase}") for phase in phases]
+    assert positions == sorted(positions)
+    assert f'repo="{_manifest().engine.served_model}"' in output
+    assert f'revision="{_manifest().engine.model_revision}"' in output
+    assert f'path="{tmp_path / "cache"}"' in output
+    assert all(line.startswith("flash-serving boot elapsed=") for line in output.splitlines())
+    assert INFERENCE_TOKEN not in output
+    assert ARTIFACT_TOKEN not in output
 
 
 def _value_contains_secret(value: object, fingerprint: bytes, seen: set[int]) -> bool:
