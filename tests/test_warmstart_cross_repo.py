@@ -1326,12 +1326,29 @@ def test_recovery_reproduces_a_digest_taken_before_lora_alpha_was_public(monkeyp
     worker = JobSpec.from_dict(worker_dict)
     # the digest the ORIGINAL build computed, hashed HERE rather than through the function under
     # test: deriving it from `_preparation_digest` would move with the code and pass either way.
+    # that build normalized too -- falsy managed keys and an empty `environment.pip` were omitted --
+    # so the fixture has to reproduce THAT shape, not this build's raw serialization. `pip` is
+    # already absent from `stored_public` because `to_dict()` emits an empty tuple here.
+    original_worker = worker.to_internal_dict()
+    for key in (
+        "model_revision_auto",
+        "model_revision_force_pin",
+        "gpu_count_auto",
+        "workload_profile_input_digest",
+        "workload_profile_producer_version",
+        "workload_profile",
+    ):
+        if not original_worker.get(key):
+            original_worker.pop(key, None)
+    original_public = {**stored_public, "environment": dict(stored_public["environment"])}
+    if not original_public["environment"].get("pip"):
+        original_public["environment"].pop("pip", None)
     original_digest = hashlib.sha256(
         json.dumps(
             {
                 "version": PREPARATION_ENVELOPE_VERSION,
-                "public_spec": stored_public,
-                "worker_spec": worker.to_internal_dict(),
+                "public_spec": original_public,
+                "worker_spec": original_worker,
                 "adapter_identity": None,
             },
             sort_keys=True,
@@ -1419,6 +1436,94 @@ def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(mon
     # public spec, which the rewrite left untouched.
     recovered = R.reallocation_spec_from_status(R.get_status(public.run_id))
     assert recovered.train.lora_rank == 32
+
+
+def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_path):
+    """The digest must hash the canonical shape `dev` writes TODAY, not this build's raw dict.
+
+    `_preparation_digest` omits falsy managed keys and an empty `environment.pip`. That is
+    NORMALIZATION, not a legacy replay: it is unconditional, reads nothing off the stored record,
+    and defines the digest the currently deployed release (1.2.88) computes for every run it
+    prepares. Dropping it would make the digest depend on which build wrote the record, so a
+    snapshot written by production stops verifying here -- and `reallocation_spec_from_status` is
+    the retry path, which `server/platform/runtime.py` turns into `unrecoverable`.
+
+    The expected digest is hashed HERE over dev's canonical bytes rather than taken from the
+    function under test, so it cannot move with the code.
+    """
+    import hashlib
+    from dataclasses import replace
+
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+    from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
+
+    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = replace(
+        JobSpec.from_dict(
+            {
+                "run_id": "canonical-digest-run",
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": "sft",
+                "gpu": {"type": "RTX 4090"},
+                "train": {"lora_rank": 32},
+            }
+        ),
+        model_revision="a" * 40,
+        model_revision_auto=True,
+    )
+
+    public_payload = spec.to_dict()
+    worker_payload = spec.to_internal_dict()
+    if not public_payload["environment"].get("pip"):
+        public_payload["environment"].pop("pip", None)
+    stripped = []
+    for key in (
+        "model_revision_auto",
+        "model_revision_force_pin",
+        "gpu_count_auto",
+        "workload_profile_input_digest",
+        "workload_profile_producer_version",
+        "workload_profile",
+    ):
+        if not worker_payload.get(key):
+            worker_payload.pop(key, None)
+            stripped.append(key)
+    # the fixture is only meaningful if this spec actually carries keys the normalization drops.
+    assert stripped, "spec must exercise at least one omitted managed key"
+
+    canonical_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "version": PREPARATION_ENVELOPE_VERSION,
+                "public_spec": public_payload,
+                "worker_spec": worker_payload,
+                "adapter_identity": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert R._preparation_digest(spec, spec, None, stored_public=spec.to_dict()) == canonical_digest
+
+    # and a record carrying that digest -- the shape production writes -- recovers on the retry path.
+    R._save_status(
+        R.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            effective_preparation={
+                "worker_spec": spec.to_internal_dict(),
+                "adapter_identity": None,
+                "version": PREPARATION_ENVELOPE_VERSION,
+                "workload_profile": None,
+                "preparation_digest": canonical_digest,
+            },
+        )
+    )
+    assert R.reallocation_spec_from_status(R.get_status(spec.run_id)).train.lora_rank == 32
 
 
 def test_a_snapshot_written_before_the_version_key_still_recovers(monkeypatch, tmp_path):

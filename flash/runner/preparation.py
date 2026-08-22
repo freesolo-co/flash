@@ -318,10 +318,34 @@ def _preparation_digest(
             and not stored_train.get("init_from_adapter")
         ):
             public_payload["train"].pop("lora_alpha", None)
+    worker_payload = worker_spec.to_internal_dict()
+    # NORMALIZATION, not legacy replay: this is the canonical shape `dev` hashes TODAY (1.2.88), and
+    # it is unconditional -- it reads nothing off the stored record and applies to every run this
+    # build prepares. Deleting it as "historical" made the digest depend on which build wrote it, so
+    # a record the DEPLOYED release is writing right now stops verifying here. Measured: a spec
+    # hashed dev's way then recovered on this branch fails `reallocation_spec_from_status`, which
+    # `server/platform/runtime.py:697-710` turns into `unrecoverable` -- retiring in-flight runs on
+    # upgrade. The genuinely historical half (`VersionedPersistedSpecEnvelope.rewind`) stays deleted.
+    #
+    # absent and empty are the same value for all of these, so hashing them alike costs no binding:
+    # a set field is non-empty and stays covered, and every key is derived from the spec rather than
+    # read from the snapshot, so nothing here can be forged by tampering with the stored record.
+    if not public_payload["environment"].get("pip"):
+        public_payload["environment"].pop("pip", None)
+    for key in (
+        "model_revision_auto",
+        "model_revision_force_pin",
+        "gpu_count_auto",
+        "workload_profile_input_digest",
+        "workload_profile_producer_version",
+        "workload_profile",
+    ):
+        if not worker_payload.get(key):
+            worker_payload.pop(key, None)
     payload = {
         "version": PREPARATION_ENVELOPE_VERSION,
         "public_spec": public_payload,
-        "worker_spec": worker_spec.to_internal_dict(),
+        "worker_spec": worker_payload,
         "adapter_identity": adapter_identity,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
