@@ -683,3 +683,75 @@ def test_multimodal_export_still_requires_a_trained_language_tensor(tmp_path):
 
     with pytest.raises(RuntimeError, match="no language-stack LoRA pair"):
         stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", exclude_modules=None)
+
+
+def test_multimodal_export_requires_the_language_stack_to_have_actually_trained(tmp_path):
+    """Presence of a language pair is not evidence the language stack moved.
+
+    The pair-presence check above proves the tensors exist; the value check proves *something*
+    composed to a nonzero delta. Neither alone proves the *language* stack trained: a vision pair
+    with a nonzero delta satisfied "something moved" while every language tensor was still zero,
+    so a paid run with dead text gradients published and served as a text model that learned
+    nothing. The nonzero requirement is discharged by the language subset specifically.
+    """
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    adapter = tmp_path / "zero-language"
+    adapter.mkdir()
+    language = "base_model.model.model.language_model.layers.0.self_attn.q_proj"
+    vision = "base_model.model.model.visual.blocks.0.attn.proj"
+    (adapter / "adapter_model.safetensors").write_bytes(
+        save(
+            {
+                # complete and correctly shaped, but composes to an all-zero delta
+                f"{language}.lora_A.weight": np.zeros((1, 2), dtype=np.float16),
+                f"{language}.lora_B.weight": np.zeros((2, 1), dtype=np.float16),
+                f"{vision}.lora_A.weight": np.array([[1.0, 0.0]], dtype=np.float16),
+                f"{vision}.lora_B.weight": np.array([[1.0], [0.0]], dtype=np.float16),
+            }
+        )
+    )
+    (adapter / "adapter_config.json").write_text(
+        json.dumps(
+            {"peft_type": "LORA", "r": 1, "lora_alpha": 2, "target_modules": ["q_proj", "proj"]}
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="no nonzero composed LoRA delta in its language stack"):
+        stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", exclude_modules=None)
+
+
+def test_multimodal_export_publishes_when_only_the_language_stack_trained(tmp_path):
+    """The narrowed requirement must not reject a healthy export.
+
+    A vision pair that happens to compose to zero is not a failure of the stated invariant, which
+    is about the language stack. Without this the fix above would be indistinguishable from simply
+    requiring every pair to be nonzero.
+    """
+    from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
+
+    adapter = tmp_path / "language-trained"
+    adapter.mkdir()
+    language = "base_model.model.model.language_model.layers.0.self_attn.q_proj"
+    vision = "base_model.model.model.visual.blocks.0.attn.proj"
+    (adapter / "adapter_model.safetensors").write_bytes(
+        save(
+            {
+                f"{language}.lora_A.weight": np.array([[1.0, 0.0]], dtype=np.float16),
+                f"{language}.lora_B.weight": np.array([[1.0], [0.0]], dtype=np.float16),
+                f"{vision}.lora_A.weight": np.zeros((1, 2), dtype=np.float16),
+                f"{vision}.lora_B.weight": np.zeros((2, 1), dtype=np.float16),
+            }
+        )
+    )
+    (adapter / "adapter_config.json").write_text(
+        json.dumps(
+            {"peft_type": "LORA", "r": 1, "lora_alpha": 2, "target_modules": ["q_proj", "proj"]}
+        ),
+        encoding="utf-8",
+    )
+
+    stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", exclude_modules=None)
+    saved = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
+    assert saved["exclude_modules"] is None

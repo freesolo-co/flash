@@ -8881,6 +8881,76 @@ def test_single_turn_episode_is_reported_as_one_turn():
     assert accounting["mean_turns_per_episode"] == 1.0
 
 
+def test_a_failed_score_does_not_inflate_the_turn_accounting():
+    """Accounting must describe episodes that were really scored, not requests that arrived.
+
+    The counters were incremented on entry to `/multiturn/score`, before the scorer confirmed
+    anything. `turn_accounting()` is published from the runner's `finally` path, so a run whose
+    episodes failed to score still wrote turn totals into its durable notes -- inflated evidence
+    for exactly the collapsed-multi-turn regression the counters exist to detect.
+    """
+
+    class _Unscorable(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            raise RuntimeError("env scoring failed")
+
+    bridge = rl_train.MultiTurnBridge(
+        _Unscorable(done_after=1),
+        examples=[{"q": "a"}],
+        env_prompts=[[{"role": "user", "content": "a"}]],
+        max_turns=5,
+        prompt_ids=[[1]],
+        tokenizer=_BridgeGlueTokenizer(),
+    )
+    server, url = rl_train.start_reward_server(
+        lambda i, s: 1.0, example_count=1, multi_turn_bridge=bridge
+    )
+
+    def _post(path, payload):
+        request = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=10)
+
+    try:
+        _post(
+            "/multiturn/start",
+            {
+                "index": 0,
+                "session_id": "s",
+                "raw_prompt": [{"role": "user", "content": "a"}],
+                "prompt_ids": [1],
+                "image_count": 0,
+                "image_digests": [],
+            },
+        ).close()
+        _post(
+            "/multiturn/step",
+            {
+                "session_id": "s",
+                "turn_ordinal": 0,
+                "accepted_prefix": [1],
+                "response_ids": [ord("x")],
+                "completion_text": "x",
+                "image_count": 0,
+                "image_digests": [],
+            },
+        ).close()
+        with pytest.raises(urllib.error.HTTPError):
+            _post("/multiturn/score", {"session_id": "s", "turn_count": 4}).close()
+    finally:
+        bridge.shutdown()
+        server.shutdown()
+
+    accounting = bridge.turn_accounting()
+    assert accounting["episodes_scored"] == 0
+    assert accounting["turn_records"] == 0
+    assert accounting["max_turns_observed"] == 0
+    assert accounting["mean_turns_per_episode"] is None
+
+
 def test_turn_accounting_reaches_the_durable_notes_not_only_the_heartbeat():
     """The counters have to land in `metrics.json` notes, which is what a terminal proof reads.
 

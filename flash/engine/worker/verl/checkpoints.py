@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Mapping
+from typing import Any
 
 from flash.adapters.fused_experts import (
     fused_expert_lora_tensor_pairs,
@@ -542,11 +543,19 @@ def _pair_has_nonzero_delta(factor_a, factor_b, *, require_finite_scan: bool) ->
 def _validate_adapter_tensor_values(
     adapter_dir: str,
     metadata: dict[str, tuple[int, ...]],
-    pairs: Mapping[object, tuple[str, str]],
+    pairs: Mapping[Any, tuple[str, str]],
     *,
     label: str,
+    must_train: Mapping[Any, tuple[str, str]] | None = None,
+    must_train_subject: str = "",
 ) -> None:
-    """validate finite payload values and require one nonzero composed LoRA delta."""
+    """validate finite payload values and require one nonzero composed LoRA delta.
+
+    every pair is shape- and finite-checked. `must_train` narrows which pairs may SATISFY the
+    nonzero requirement: a multimodal export passes its language subset, because "some pair moved"
+    is satisfied by a vision pair alone and would publish a run whose whole text stack is zero.
+    omitting it keeps the whole set eligible, which is what a text-only export wants.
+    """
     import numpy as np
 
     from flash.adapters.artifacts import loadable_adapter_weight_files
@@ -570,6 +579,7 @@ def _validate_adapter_tensor_values(
             if not np.isfinite(tensor(key)).all():
                 raise RuntimeError(f"{label} tensor {key!r} contains non-finite values")
 
+        eligible = {tuple(pair) for pair in (pairs if must_train is None else must_train).values()}
         any_nonzero_delta = False
         ordered_pairs = sorted(pairs.values(), key=lambda pair: metadata[pair[0]][0])
         for a_key, b_key in ordered_pairs:
@@ -591,9 +601,13 @@ def _validate_adapter_tensor_values(
                 raise RuntimeError(
                     f"{label} LoRA pair {a_key!r}, {b_key!r} has a non-finite composed delta"
                 ) from exc
-            any_nonzero_delta = any_nonzero_delta or pair_nonzero
+            # an ineligible pair is still composed above, because that is where a non-finite delta
+            # surfaces; it just cannot be the pair that discharges the requirement.
+            if pair_nonzero and (a_key, b_key) in eligible:
+                any_nonzero_delta = True
         if not any_nonzero_delta:
-            raise RuntimeError(f"{label} has no nonzero composed LoRA delta")
+            subject = f" in its {must_train_subject}" if must_train_subject else ""
+            raise RuntimeError(f"{label} has no nonzero composed LoRA delta{subject}")
 
 
 def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal: bool) -> None:
@@ -674,7 +688,20 @@ def _validate_lora_adapter_tensors(adapter_dir: str, config: dict, *, multimodal
         raise RuntimeError(f"{label} contains no language-stack LoRA pair")
 
     pair_keys = {module: (factors["A"], factors["B"]) for module, factors in pairs.items()}
-    _validate_adapter_tensor_values(adapter_dir, metadata, pair_keys, label=label)
+    language_keys = {
+        module: (factors["A"], factors["B"]) for module, factors in language_pairs.items()
+    }
+    # the nonzero-delta requirement is discharged by the LANGUAGE subset. presence alone (checked
+    # above) does not mean the text stack trained: a vision-only delta would otherwise satisfy it
+    # and publish a paid run that serves as a text model with no learned text delta.
+    _validate_adapter_tensor_values(
+        adapter_dir,
+        metadata,
+        pair_keys,
+        label=label,
+        must_train=language_keys,
+        must_train_subject="language stack",
+    )
     missing_targets = sorted(set(targets) - target_evidence)
     if missing_targets:
         raise RuntimeError(
@@ -742,8 +769,20 @@ def stamp_adapter_dir_provenance(
                 f"exported adapter for {model_id} does not contain complete fused expert LoRA "
                 "weights; refusing to stamp it as warm-start compatible"
             )
+        # same language-subset requirement as the non-moe path: this model is image-capable, so a
+        # multimodal export must not discharge "something trained" with a vision pair alone.
+        language_pairs = {
+            module: pair for module, pair in pairs.items() if not is_non_language_lora_key(module)
+        }
+        if not language_pairs:
+            raise RuntimeError("exported fused-expert adapter contains no language-stack LoRA pair")
         _validate_adapter_tensor_values(
-            adapter_dir, tensors, pairs, label="exported fused-expert adapter"
+            adapter_dir,
+            tensors,
+            pairs,
+            label="exported fused-expert adapter",
+            must_train=language_pairs,
+            must_train_subject="language stack",
         )
     else:
         _validate_lora_adapter_tensors(adapter_dir, cfg, multimodal=multimodal)

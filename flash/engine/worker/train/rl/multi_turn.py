@@ -551,12 +551,6 @@ class MultiTurnBridge:
             session = self._session(payload)
             state = session["state"]
             expected_identity = session.get("identity")
-            # one /score call per terminal episode, so this counts episodes exactly once. recorded
-            # here rather than in `step` because a truncated turn returns terminal without ever
-            # reaching the env, and it is still a turn the model generated and trained on.
-            self._scored_episodes += 1
-            self._scored_turns += turn_count
-            self._max_observed_turns = max(self._max_observed_turns, turn_count)
         if self._identity_ledger is not None:
             identity = self._identity_ledger.validate_for_index(
                 payload.get("identity"),
@@ -577,6 +571,19 @@ class MultiTurnBridge:
             )
         )
         with self._lock:
+            # counted here, AFTER identity validation and a scorer reply, so the accounting only
+            # ever describes episodes that were really scored. counting on entry let a request the
+            # checks below reject -- a mismatched or duplicate identity -- or a scorer failure
+            # still inflate the totals, and `turn_accounting()` is published from the runner's
+            # `finally` path, so those inflated numbers reach the durable notes of a run that
+            # failed. that is the opposite of what the counters exist to prove.
+            #
+            # one /score call per terminal episode, so this counts episodes exactly once. recorded
+            # in `score` rather than in `step` because a truncated turn returns terminal without
+            # ever reaching the env, and it is still a turn the model generated and trained on.
+            self._scored_episodes += 1
+            self._scored_turns += turn_count
+            self._max_observed_turns = max(self._max_observed_turns, turn_count)
             # snapshot under the same lock that guards the session: `step` mutates this list in
             # place, and a concurrent episode's turn would otherwise be read mid-append.
             prompt = list(state.get("prompt") or ())
