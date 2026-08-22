@@ -43,6 +43,33 @@ _WARMUP_HEARTBEAT_FRESH_FOR_S = 1200.0
 _WARMUP_STAGES = frozenset({"rl_train_start", "rl_initializing"})
 
 
+def live_attempt(obj: dict) -> int | None:
+    """The attempt a status payload says is live, or None when it cannot be established.
+
+    `remote.attempt` is the plane's live attempt. It is preferred over `last_heartbeat.attempt`,
+    which is whichever worker produced the ping and may already be superseded. The heartbeat is a
+    fallback only when `remote` is ABSENT: an explicitly null `remote` is the teardown window, where
+    the attached ping belongs to a worker that is already gone, so falling back there would report a
+    dead attempt as the live one.
+
+    Shared so the status line, the log-follow spinner, and worker-artifact labelling cannot disagree
+    about which attempt is current -- three surfaces that a user reads within one screen of each
+    other, where a disagreement reads as a run that is on two attempts at once.
+    """
+    from flash.providers._lifecycle.poll import _attempt_int
+
+    remote = obj.get("remote")
+    if isinstance(remote, dict):
+        attempt = _attempt_int(remote.get("attempt"))
+        if attempt is not None:
+            return attempt
+    elif "remote" in obj:
+        # explicitly null: the teardown window. the ping is the dead worker's, so there is no answer.
+        return None
+    heartbeat = obj.get("last_heartbeat")
+    return _attempt_int(heartbeat.get("attempt")) if isinstance(heartbeat, dict) else None
+
+
 def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
     """False only when the heartbeat provably belongs to a superseded retry attempt.
 

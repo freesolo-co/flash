@@ -224,6 +224,9 @@ def _format_child_tail(tail: object, silent_ticks: object = None) -> str:
 
 def _format_heartbeat(hb: dict) -> str:
     msg = f"worker: stage={hb.get('stage')}"
+    attempt = _attempt_int(hb.get("attempt"))
+    if attempt is not None:
+        msg += f" attempt={attempt}"
     if hb.get("liveness"):
         msg += " liveness=true"
     for key, digits in (

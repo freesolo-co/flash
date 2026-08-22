@@ -808,6 +808,7 @@ from flash.cli.ui.heartbeat import (  # noqa: E402,F401
     _superseded_hint,
     heartbeat_is_current_attempt,
     heartbeat_is_superseded,
+    live_attempt,
     warmup_message,
 )
 from flash.cli.ui.tables import (  # noqa: E402,F401

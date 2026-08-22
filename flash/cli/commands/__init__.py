@@ -470,16 +470,10 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     parts = [state]
     heartbeat = status.get("last_heartbeat") if isinstance(status, dict) else None
     # retries rewind steps while state remains running, so surface the 0-based attempt identity.
-    # prefer live `remote.attempt`; the heartbeat may belong to the superseded worker. fall back only
-    # when `remote` is absent, not explicitly null: null marks the allocation window after teardown,
-    # when the new attempt is unknown and the attached heartbeat is stale.
-    from flash.providers._lifecycle.poll import _attempt_int
-
-    remote = status.get("remote")
-    remote_cleared = "remote" in status and remote is None
-    attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
-    if attempt is None and not remote_cleared and isinstance(heartbeat, dict):
-        attempt = _attempt_int(heartbeat.get("attempt"))
+    # `live_attempt` owns the provenance order (live `remote.attempt` first, heartbeat only when
+    # `remote` is absent rather than cleared at teardown) and is shared with the worker-artifact
+    # labelling below, so the spinner and the appended sections name the same current attempt.
+    attempt = render.live_attempt(status)
     if isinstance(heartbeat, dict):
         heartbeat_age_seconds = render._heartbeat_age_seconds(heartbeat.get("ts"))
         # stage and step come from the heartbeat, attempt from `remote` below. during the relaunch
@@ -710,20 +704,6 @@ def _follow_status(
     except KeyboardInterrupt:
         _print_detached_note(run_id)
         return 130
-
-
-def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:
-    for name, text in (client.get_worker_output(run_id) or {}).items():
-        if not text:
-            continue
-        sep = "\n" if printed_any else ""
-        if render.styled():
-            print(f"{sep}{render.log_section(name)}")
-        else:
-            print(f"{sep}----- {name} -----")
-        print(text, end="" if text.endswith("\n") else "\n")
-        printed_any = True
-    return printed_any
 
 
 def cmd_log(args) -> int:
@@ -979,4 +959,11 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _print_unpacked_batch_warning,
     _sft_cost_rows,
     _warn_if_wandb_requested_without_key,
+)
+
+# re-exported so `commands._print_worker_output(...)` keeps resolving for `cmd_log` and the CLI tests.
+from flash.cli.commands.worker_output import (  # noqa: E402,F401
+    _artifact_attempt,
+    _print_worker_output,
+    _worker_section_name,
 )

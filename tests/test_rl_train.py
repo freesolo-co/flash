@@ -1730,7 +1730,19 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
     got = rl_train.resolve_gpu_mem_util(
         _mem_util_inp(), gpu_type="H100", n_gpus=1, fp8_kv=False, sleep_unsupported=False
     )
-    assert got == want
+    explicit_tp_one = colocate_kv_util(
+        float(info.params_b),
+        2048,
+        float(get_gpu_info("H100").vram_gb),
+        sleep_mode=True,
+        num_generations=8,
+        active_params_b=None,
+        fp8_kv=False,
+        model_info=info,
+        tensor_parallel=1,
+    )
+    assert got == want == explicit_tp_one
+    assert got.hex() == "0x1.11eb851eb851ep-2"
     # and it is genuinely NOT the old constant, so the test cannot pass on an unwired build.
     assert got != rl_train._DEFAULT_GPU_MEM_UTIL
     assert got < rl_train._DEFAULT_GPU_MEM_UTIL
@@ -1791,22 +1803,49 @@ def test_gpu_mem_util_sizing_reaches_the_launch_config():
     )
 
 
-def test_gpu_mem_util_keeps_the_constant_where_the_model_does_not_apply():
-    """The three shapes ``colocate_kv_util`` cannot size are left on the conservative constant.
-
-    Multi-gpu is the load-bearing one: the rollout is tensor-parallel, so vLLM's weight copy is
-    sharded ACROSS cards while the model sizes one whole copy against ONE card. Sizing it here would
-    over-reserve per rank on exactly the shapes that are already tight.
-    """
+def test_multigpu_gpu_mem_util_shards_only_weights_and_frees_the_observed_shortfall():
     default = rl_train._DEFAULT_GPU_MEM_UTIL
-    # multi-gpu: sharded rollout, unmodelled.
-    assert (
-        rl_train.resolve_gpu_mem_util(
-            _mem_util_inp(), gpu_type="H100", n_gpus=2, fp8_kv=False, sleep_unsupported=False
+    inp = _mem_util_inp(model_id="Qwen/Qwen3.6-35B-A3B", group_size=4)
+    for gpu_type, vram_gb in (("H200", 141.0), ("B200", 180.0)):
+        got = rl_train.resolve_gpu_mem_util(
+            inp, gpu_type=gpu_type, n_gpus=2, fp8_kv=False, sleep_unsupported=True
         )
-        == default
-    )
-    # unknown card: the budget is a FRACTION of the card, so there is nothing to take a fraction of.
+        assert got < default
+        assert (default - got) * vram_gb > 1.57
+
+
+def test_multigpu_gpu_mem_util_never_exceeds_the_previous_constant():
+    default = rl_train._DEFAULT_GPU_MEM_UTIL
+    model_ids = ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-35B-A3B")
+    for model_id in model_ids:
+        for gpu_type in ("H100", "H200", "B200"):
+            for tensor_parallel in (2, 4, 8):
+                for engine_len in (1024, 2048, 8192, 32768):
+                    for group_size in (2, 4, 8):
+                        got = rl_train.resolve_gpu_mem_util(
+                            _mem_util_inp(
+                                model_id=model_id,
+                                engine_len=engine_len,
+                                group_size=group_size,
+                            ),
+                            gpu_type=gpu_type,
+                            n_gpus=tensor_parallel,
+                            fp8_kv=False,
+                            sleep_unsupported=True,
+                        )
+                        assert 0.10 <= got <= default, (
+                            model_id,
+                            gpu_type,
+                            tensor_parallel,
+                            engine_len,
+                            group_size,
+                            got,
+                        )
+
+
+def test_gpu_mem_util_keeps_the_constant_where_the_model_does_not_apply(monkeypatch):
+    default = rl_train._DEFAULT_GPU_MEM_UTIL
+    # unknown card: the budget is a fraction of the card, so there is nothing to take a fraction of.
     for unknown in ("", "   ", "Nonexistent9000"):
         assert (
             rl_train.resolve_gpu_mem_util(
@@ -1815,13 +1854,25 @@ def test_gpu_mem_util_keeps_the_constant_where_the_model_does_not_apply():
             == default
         )
     # unresolvable model size: the weight copy is the dominant term.
+    monkeypatch.setattr("flash.engine.plan.vram.resolve_params_b", lambda *_args, **_kwargs: None)
     assert (
         rl_train.resolve_gpu_mem_util(
-            _mem_util_inp(model_id="not-a-real-org/not-a-real-model-xyz"),
+            _mem_util_inp(
+                model_id="Qwen/Qwen3.5-4B",
+                model_revision="a" * 40,
+            ),
             gpu_type="H100",
             n_gpus=1,
             fp8_kv=False,
             sleep_unsupported=False,
+        )
+        == default
+    )
+    # any sizing exception keeps launch on the prior constant rather than making sizing fatal.
+    monkeypatch.setattr("flash.providers.base.get_gpu_info", lambda _gpu_type: 1 / 0)
+    assert (
+        rl_train.resolve_gpu_mem_util(
+            _mem_util_inp(), gpu_type="H100", n_gpus=2, fp8_kv=False, sleep_unsupported=False
         )
         == default
     )

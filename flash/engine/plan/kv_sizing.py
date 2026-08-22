@@ -19,6 +19,10 @@ _KV_BLOCK_TOKENS = 16
 # floor remains authoritative at short context; longer contexts retain 1.5 gb plus 25% fragmentation.
 _KV_PROFILE_OVERHEAD_GB = 1.5
 _KV_FRAGMENTATION_MARGIN = 1.25
+# the smallest share of a card vllm is given. below this the engine has no room for its own runtime
+# once the kv pool is carved out, so a budget that prices under it is not a smaller engine but a
+# broken one. the legacy equation and the multi-rank shard path both bottom out here.
+_MIN_ENGINE_UTIL = 0.10
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -138,15 +142,18 @@ def colocate_kv_util(
     fp8_kv: bool = False,
     model_info=None,
     preserve_legacy_floor: bool = False,
+    tensor_parallel: int = 1,
 ) -> float:
-    """vllm_gpu_memory_utilization for the colocated GRPO rollout engine.
+    """vllm_gpu_memory_utilization for one colocated rollout tensor-parallel rank.
 
-    Budget vLLM's weight copy plus KV cache. Catalog models use geometry with measured overhead
-    and an 8 GB floor; uncataloged models retain the conservative legacy equation.
+    Budget the rank's weight shard plus a conservative full KV cache. Catalog models use geometry
+    with measured overhead and an 8 GB floor; uncataloged models retain the legacy KV equation.
     """
-    weights_gb = (
-        max(0.5, float(params_b or 1.0)) * 2.0
-    )  # vLLM's bf16 weight copy lives in the budget
+    total_weights_gb = max(0.5, float(params_b or 1.0)) * 2.0
+    tp_size = max(1, int(tensor_parallel))
+    # tensor parallelism shards vllm's bf16 weights, but kv heads can replicate when tp is wider than
+    # the model's kv-head count. shard only the weight term and keep the full kv budget on every rank.
+    weights_gb = total_weights_gb if tp_size == 1 else total_weights_gb / tp_size
     # catalog geometry is authoritative. active params remain only for the uncataloged fallback, while
     # the weight copy always uses total parameters.
     kv_params_b = float(active_params_b) if active_params_b else params_b
@@ -169,7 +176,7 @@ def colocate_kv_util(
                 preserve_legacy_floor=preserve_legacy_floor,
             ),
         )
-        return max(0.10, min(_util_cap, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
+        return max(_MIN_ENGINE_UTIL, min(_util_cap, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
     # bigger rollout-phase KV does not compete with the training peak.
     kv_pool_gb = max(
@@ -184,4 +191,9 @@ def colocate_kv_util(
             preserve_legacy_floor=preserve_legacy_floor,
         ),
     )
-    return min(_util_cap, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
+    sized = min(_util_cap, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
+    # sharding the weight term can drive a small model's rank budget low enough that vllm has no
+    # room left for its own runtime once the kv pool is carved out -- a 4B model on 2 cards prices
+    # under this floor. single-rank sizing carries the whole weight copy and never gets that small,
+    # so the floor exists only where sharding created the problem.
+    return max(_MIN_ENGINE_UTIL, sized) if tp_size > 1 else sized

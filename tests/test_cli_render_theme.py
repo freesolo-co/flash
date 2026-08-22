@@ -671,6 +671,30 @@ def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
     assert is_current({"remote": {"attempt": 2}}, {"attempt": 1}) is False
 
 
+def test_live_attempt_is_one_rule_for_every_surface_that_names_an_attempt() -> None:
+    """The spinner, the status line, and the worker-artifact labels must not disagree.
+
+    They are read within one screen of each other, so two provenance rules read as a run that is on
+    two attempts at once -- and the artifact labels would call the live attempt's console "previous".
+    """
+    live = render.live_attempt
+
+    # the plane's live attempt wins over the ping, which may be the superseded worker's.
+    assert live({"remote": {"attempt": 2}, "last_heartbeat": {"attempt": 1}}) == 2
+    # `remote` absent entirely (a managed payload that omits it): the ping is all there is.
+    assert live({"last_heartbeat": {"attempt": 3}}) == 3
+    # a `remote` that carries no usable attempt is not an answer either, so the ping still applies.
+    assert live({"remote": {}, "last_heartbeat": {"attempt": 1}}) == 1
+    for bad in ["1", True, 2.7, float("inf"), -1]:
+        assert live({"remote": {"attempt": bad}, "last_heartbeat": {"attempt": 4}}) == 4
+    # explicitly null `remote` is the teardown window: the attached ping belongs to a dead worker,
+    # so there is no live attempt to report rather than that worker's.
+    assert live({"remote": None, "last_heartbeat": {"attempt": 1}}) is None
+    # nothing usable anywhere reads as unknown, never as attempt 0.
+    assert live({}) is None
+    assert live({"last_heartbeat": {"attempt": "1"}}) is None
+
+
 def test_progress_age_always_adds_to_heartbeat_age(monkeypatch):
     from flash.cli.ui import heartbeat as heartbeat_ui
     from flash.cli.ui import render

@@ -2707,6 +2707,55 @@ def test_worker_artifacts_prefers_latest_attempt_console(monkeypatch, tmp_path):
     assert "console_rl_attempt0.txt" not in out
 
 
+def test_worker_artifacts_keep_previous_attempt_evidence_until_the_retry_uploads(
+    monkeypatch, tmp_path
+):
+    """A live retry may not have uploaded any attempt-1 artifact yet.
+
+    The highest uploaded attempt is then attempt 0. Keep its console, traceback, and matching ray logs
+    so the CLI can label the historical evidence instead of hiding the OOM that caused the retry.
+    """
+    import types
+
+    import huggingface_hub
+
+    from flash.server.platform.runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl",
+        run_id="r1",
+        train=types.SimpleNamespace(hf_repo="org/repo"),
+    )
+    content = {
+        "rl/r1/console_rl_attempt0.txt": "HEARTBEAT attempt=0 device=NVIDIA H200\n",
+        "rl/r1/error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n",
+        "rl/r1/raylogs_rl_attempt0.txt": "raylet exited after OOM\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        path = tmp_path / filename.replace("/", "_")
+        path.write_text(content[filename])
+        return str(path)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    assert _worker_artifacts(spec) == {
+        "console_rl_attempt0.txt": "HEARTBEAT attempt=0 device=NVIDIA H200\n",
+        "error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n",
+        "raylogs_rl_attempt0.txt": "raylet exited after OOM\n",
+    }
+
+
 def test_local_env_path_rejected(api):
     # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
     key = _login()

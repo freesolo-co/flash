@@ -1429,6 +1429,60 @@ def test_status_runs_and_log_command(fake_client, capsys, monkeypatch) -> None:
     assert "cost_usd" not in out
 
 
+def test_log_labels_previous_attempt_artifacts_after_the_live_attempt_log(
+    fake_client, capsys, monkeypatch
+) -> None:
+    live_heartbeat = {
+        "stage": "rl_step",
+        "step": 4,
+        "ts": 456.0,
+        "attempt": 1,
+        "gpu": {"device_name": "NVIDIA B200"},
+    }
+    fake_client.log_text = _format_heartbeat(live_heartbeat) + "\n"
+    monkeypatch.setattr(
+        fake_client,
+        "get_run",
+        lambda _run_id: {
+            "run_id": "flash-1",
+            "state": "running",
+            "remote": {"attempt": 1},
+            "last_heartbeat": live_heartbeat,
+        },
+    )
+    monkeypatch.setattr(
+        fake_client,
+        "get_worker_output",
+        lambda _run_id: {
+            "console_rl_attempt0.txt": (
+                'HEARTBEAT {"stage":"rl_step","step":0,"attempt":0,'
+                '"gpu":{"device_name":"NVIDIA H200"}}\n'
+            ),
+            "error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n",
+            "raylogs_rl_attempt0.txt": "raylet exited\n",
+        },
+    )
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    out = capsys.readouterr().out
+
+    live_line = "worker: stage=rl_step attempt=1 step=4"
+    previous_header = (
+        "----- console_rl_attempt0.txt (attempt=0, previous attempt; current attempt=1) -----"
+    )
+    assert live_line in out
+    assert previous_header in out
+    assert (
+        "----- error_rl_attempt0.txt (attempt=0, previous attempt; current attempt=1) -----" in out
+    )
+    assert (
+        "----- raylogs_rl_attempt0.txt (attempt=0, previous attempt; current attempt=1) -----"
+        in out
+    )
+    assert out.index(live_line) < out.index(previous_header)
+    assert 'HEARTBEAT {"stage":"rl_step","step":0,"attempt":0' in out
+
+
 def test_log_prints_partial_log_line_with_newline(fake_client, capsys) -> None:
     fake_client.log_text = "partial log line"
     fake_client.get_worker_output = lambda run_id: {}
