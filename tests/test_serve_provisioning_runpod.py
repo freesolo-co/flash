@@ -1360,7 +1360,7 @@ def test_artifact_cleanup_does_not_repatch_an_already_stripped_pod() -> None:
     ]
 
 
-def test_artifact_pod_environment_patch_failure_is_outcome_unknown() -> None:
+def test_artifact_pod_environment_patch_retries_transient_failure() -> None:
     bundle = _bundle()
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle, artifact_secret=True)
@@ -1370,16 +1370,62 @@ def test_artifact_pod_environment_patch_failure_is_outcome_unknown() -> None:
 
     result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
 
-    assert result.status == "outcome_unknown"
+    assert result.status == "ready"
     assert result.handle == handle
+    assert transport.clock.now == 2.0
     assert [call[1] for call in _mutation_calls(transport)] == [
         "PATCH /templates/template01",
         f"PATCH /pods/{POD_ID}",
+        f"PATCH /pods/{POD_ID}",
+        "secretDelete",
     ]
-    assert [item["name"] for item in transport.secrets] == [
-        _names(bundle).inference_secret,
-        _names(bundle).artifact_secret,
+    assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
+
+
+def test_artifact_environment_patch_failure_exhausts_the_deadline() -> None:
+    bundle = _bundle()
+
+    class _PersistentPatchFailureTransport(_FakeTransport):
+        def _begin_mutation(self) -> None:
+            super()._begin_mutation()
+            raise RunPodTransportFailure("provider_rejected")
+
+    transport = _PersistentPatchFailureTransport()
+    handle = _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+    patch_calls = [call for call in _mutation_calls(transport) if call[1].startswith("PATCH ")]
+
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "resource_ambiguous"
+    assert result.error_reason == "artifact_cleanup_patch_unknown"
+    assert result.handle == handle
+    assert transport.clock.now == 100.0
+    assert len(patch_calls) > 1, "the persistent patch failure was not retried"
+    assert any(item["name"] == _names(bundle).artifact_secret for item in transport.secrets)
+
+
+def test_lost_artifact_patch_response_is_reobserved_before_retry() -> None:
+    bundle = _bundle()
+    plan = build_runpod_create_plan(bundle)
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, artifact_secret=True)
+    transport.templates[0]["env"] = dict(plan.environment_without_artifact)
+    transport.fail_mutation_at = 1
+    transport.failure_mode = "ambiguous_after"
+    transport.calls.clear()
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "ready"
+    assert result.handle == handle
+    assert transport.clock.now == 2.0
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        f"PATCH /pods/{POD_ID}",
+        "secretDelete",
     ]
+    assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
 
 
 def test_artifact_secret_survives_until_a_patched_pod_is_running_again() -> None:
@@ -2062,7 +2108,7 @@ def test_artifact_secret_duplicates_are_conflict_without_cleanup() -> None:
     assert _mutation_calls(transport) == []
 
 
-def test_ambiguous_adoption_artifact_cleanup_is_outcome_unknown() -> None:
+def test_landed_adoption_artifact_patch_is_confirmed_after_lost_response() -> None:
     bundle = _bundle()
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle, artifact_secret=True)
@@ -2071,14 +2117,16 @@ def test_ambiguous_adoption_artifact_cleanup_is_outcome_unknown() -> None:
     transport.calls.clear()
 
     result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
-    assert result.status == "outcome_unknown"
+
+    assert result.status == "ready"
     assert result.handle == handle
-    mutations = [call[1] for call in _mutation_calls(transport)]
-    assert mutations == ["PATCH /templates/template01"]
-    assert [item["name"] for item in transport.secrets] == [
-        _names(bundle).inference_secret,
-        _names(bundle).artifact_secret,
+    assert transport.clock.now == 2.0
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "PATCH /templates/template01",
+        f"PATCH /pods/{POD_ID}",
+        "secretDelete",
     ]
+    assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
 
 
 def test_teardown_deletes_pod_before_attached_volume_and_confirms_absence() -> None:
@@ -2282,24 +2330,21 @@ def test_teardown_refuses_mismatched_exact_resource_before_deletion() -> None:
     assert _mutation_calls(transport) == []
 
 
-def test_artifact_template_patch_ambiguity_keeps_handle_and_secret() -> None:
+def test_artifact_template_patch_ambiguity_retries_within_deadline() -> None:
     bundle = _bundle()
     transport = _FakeTransport()
     transport.fail_mutation_at = 6
 
     result, _factory, _probe = _provision(bundle, transport)
 
-    assert result.status == "outcome_unknown"
-    assert result.error_code == "resource_ambiguous"
+    assert result.status == "ready"
     assert result.handle is not None
-    assert transport.mutation_count == 6
+    assert transport.clock.now == 2.0
+    assert transport.mutation_count == 9
     mutations = [call[1] for call in _mutation_calls(transport)]
-    assert mutations.count("PATCH /templates/template01") == 1
-    assert "secretDelete" not in mutations
-    assert [item["name"] for item in transport.secrets] == [
-        _names(bundle).inference_secret,
-        _names(bundle).artifact_secret,
-    ]
+    assert mutations.count("PATCH /templates/template01") == 2
+    assert mutations[-1] == "secretDelete"
+    assert all(item["name"] != _names(bundle).artifact_secret for item in transport.secrets)
 
 
 def test_stdlib_transport_attempts_mutation_once_and_sanitizes_malformed_success() -> None:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from enum import Enum, auto
+from typing import Protocol, cast
 
 from flash.serve.control import DeploymentErrorReason, DeploymentResult, RunPodProviderHandle
 
@@ -52,7 +53,7 @@ class _Confirmation(Enum):
     IDENTITY_DRIFT = auto()
 
 
-class EndpointProbe:
+class EndpointProbe(Protocol):
     """structural type for the readiness probe (see `RunPodEndpointProbe`)."""
 
     def __call__(
@@ -348,7 +349,7 @@ def _unconfirmed_cleanup_result(
             ),
             handle=handle,
         )
-    reason_by_confirmation = {
+    reason_by_confirmation: dict[_Confirmation, DeploymentErrorReason] = {
         _Confirmation.OBSERVATION_FAILED: "artifact_cleanup_observation_failed",
         _Confirmation.CONFLICT: "artifact_cleanup_conflict",
         _Confirmation.IDENTITY_DRIFT: "artifact_cleanup_identity_drift",
@@ -395,10 +396,8 @@ def delete_artifact_and_confirm(
                 reason="artifact_cleanup_conflict",
                 handle=handle,
             )
-        break
-    needs_template_patch = template.environment != plan.environment_without_artifact
-    needs_pod_patch = not _pod_environment_is_stripped(plan, pod)
-    if needs_template_patch or needs_pod_patch:
+        needs_template_patch = template.environment != plan.environment_without_artifact
+        needs_pod_patch = not _pod_environment_is_stripped(plan, pod)
         try:
             if needs_template_patch:
                 patch_template(template.id, plan.template_payload(False))
@@ -408,11 +407,15 @@ def delete_artifact_and_confirm(
                 # not consume them. if runpod retains them, the subset check below deliberately allows it.
                 patch_pod(pod.id, plan.pod_environment_payload())
         except RunPodTransportFailure:
+            if sleep_until_poll(deadline_at, clock, sleep):
+                continue
             return unknown_result(
                 plan,
                 reason="artifact_cleanup_patch_unknown",
                 handle=handle,
             )
+        break
+    if needs_template_patch or needs_pod_patch:
         # the endpoint probe authenticates with the inference token, not the artifact token. prove
         # the restarted workload before deleting the artifact secret so an unproven transition
         # remains recoverable, while the stripped references prevent the restarted pod using it.
@@ -519,7 +522,7 @@ def await_ready_and_reclaim(
         patch_pod,
         delete_secret,
         artifact,
-        ready.handle,
+        cast("RunPodProviderHandle", ready.handle),
         inference_token,
         deadline_at=deadline_at,
         probe=probe,
