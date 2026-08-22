@@ -227,6 +227,14 @@ def _docker_start_cmd(value: object) -> str:
     return " ".join(_string(part, "template dockerStartCmd entry") for part in value)
 
 
+def _environment_value(value: object) -> str:
+    """read an opaque env value without changing whitespace or rejecting empty."""
+
+    if type(value) is not str:
+        raise ValueError("env value must be a string")
+    return value
+
+
 def _environment(value: object) -> tuple[tuple[str, str], ...]:
     # runpod sends json null rather than an empty object for a resource with no overrides, exactly
     # as it does for `ports` and `dockerStartCmd` above. every account resource is parsed before the
@@ -244,9 +252,7 @@ def _environment(value: object) -> tuple[tuple[str, str], ...]:
             items.append((row.get("key"), row.get("value")))
     else:
         raise ValueError("template env must be an object or list")
-    parsed = tuple(
-        sorted((_string(key, "env key"), _string(val, "env value")) for key, val in items)
-    )
+    parsed = tuple(sorted((_string(key, "env key"), _environment_value(val)) for key, val in items))
     if len(parsed) != len({key for key, _value in parsed}):
         raise ValueError("template env contains duplicate keys")
     return parsed

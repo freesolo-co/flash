@@ -2777,6 +2777,67 @@ def test_observation_survives_a_resource_that_exposes_no_ports() -> None:
             )
 
 
+def test_pod_observation_accepts_an_empty_environment_value() -> None:
+    pod = parse_pods(
+        [
+            {
+                "id": "abc123def45689",
+                "name": "chalk-hive-sm80",
+                "desiredStatus": "RUNNING",
+                "imageName": "pytorch/pytorch:2.6.0",
+                "gpuCount": 1,
+                "containerDiskInGb": 60,
+                "ports": "8000/http",
+                "env": {"PUBLIC_KEY": "", "NORMAL_VAR": "populated"},
+                "machine": {"gpuTypeId": "NVIDIA H100", "dataCenterId": "US-KS-2"},
+            }
+        ]
+    )
+
+    assert pod[0].environment == (("NORMAL_VAR", "populated"), ("PUBLIC_KEY", ""))
+
+
+def test_template_observation_preserves_opaque_environment_values() -> None:
+    template = parse_templates(
+        [
+            {
+                "id": "tpl0000011",
+                "name": "opaque-env-template",
+                "imageName": "pytorch/pytorch:2.6.0",
+                "dockerStartCmd": ["sleep", "infinity"],
+                "containerDiskInGb": 60,
+                "volumeMountPath": "/workspace",
+                "ports": "8000/http",
+                "env": [
+                    {"key": "EMPTY", "value": ""},
+                    {"key": "PADDED", "value": "  keep exactly  "},
+                ],
+            }
+        ]
+    )
+
+    assert template[0].environment == (("EMPTY", ""), ("PADDED", "  keep exactly  "))
+
+
+def test_environment_still_rejects_an_empty_key() -> None:
+    with pytest.raises(ValueError, match="env key must be a nonempty unpadded string"):
+        parse_pods(
+            [
+                {
+                    "id": "abc123def45688",
+                    "name": "empty-env-key",
+                    "desiredStatus": "RUNNING",
+                    "imageName": "pytorch/pytorch:2.6.0",
+                    "gpuCount": 1,
+                    "containerDiskInGb": 60,
+                    "ports": "8000/http",
+                    "env": {"": "value"},
+                    "machine": {"gpuTypeId": "NVIDIA L4", "dataCenterId": "US-KS-2"},
+                }
+            ]
+        )
+
+
 def test_observation_survives_a_resource_that_sets_no_environment() -> None:
     # runpod sends `env: null` for a resource with no overrides rather than an empty object, the
     # same shape `ports` and `dockerStartCmd` already had to accept. every account resource is
