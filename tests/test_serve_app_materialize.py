@@ -16,6 +16,7 @@ from safetensors.numpy import save_file
 from flash.serve.app.manifest import ArtifactFile, build_serving_manifest
 from flash.serve.app.materialize import (
     MaterializationError,
+    _load_strict_config,
     _validate_cache_ancestor_stat,
     adapter_cache_path,
     base_weights_are_cached,
@@ -155,6 +156,23 @@ def test_serve_revalidation_rejects_corruption_without_downloading(tmp_path: Pat
 
     with pytest.raises(MaterializationError, match=r"size|digest"):
         validate_manifest_cache(manifest, tmp_path / "cache")
+
+
+@pytest.mark.parametrize(
+    "constant",
+    [
+        pytest.param("NaN", id="nan"),
+        pytest.param("Infinity", id="positive-infinity"),
+        pytest.param("-Infinity", id="negative-infinity"),
+    ],
+)
+def test_non_finite_adapter_config_constants_are_not_strict_json(constant: str) -> None:
+    raw = f'{{"peft_type":"LORA","r":16,"lora_alpha":{constant}}}'.encode()
+
+    with pytest.raises(
+        MaterializationError, match="adapter_config.json is not strict utf-8 json"
+    ):
+        _load_strict_config(raw)
 
 
 def test_invalid_current_adapter_metadata_never_publishes_cache(tmp_path: Path) -> None:

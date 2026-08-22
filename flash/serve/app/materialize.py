@@ -26,6 +26,7 @@ from flash.adapters.lora_rank import (
     rank_from_adapter_config,
 )
 from flash.engine.worker.model.lora import _read_safetensors_tensor_metadata
+from flash.serve.runtime.structured_outputs import _reject_non_finite
 
 from .manifest import ArtifactFile, ManifestAdapter, ServingManifest
 
@@ -829,8 +830,12 @@ def _stable_file_identity(details: os.stat_result) -> tuple[int, ...]:
 
 def _load_strict_config(raw: bytes) -> dict[str, Any]:
     try:
-        config = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        config = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_non_finite,
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
         raise MaterializationError("adapter_config.json is not strict utf-8 json") from exc
     if type(config) is not dict:
         raise MaterializationError("adapter_config.json must contain a json object")

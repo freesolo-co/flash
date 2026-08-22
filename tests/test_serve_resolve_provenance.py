@@ -352,6 +352,28 @@ def test_an_unreadable_config_is_a_resolve_error(monkeypatch, tmp_path) -> None:
         _resolve()
 
 
+@pytest.mark.parametrize(
+    "constant",
+    [
+        pytest.param("NaN", id="nan"),
+        pytest.param("Infinity", id="positive-infinity"),
+        pytest.param("-Infinity", id="negative-infinity"),
+    ],
+)
+def test_non_finite_adapter_config_constants_are_not_readable_json(
+    tmp_path: Path, constant: str
+) -> None:
+    config_path = tmp_path / ADAPTER_CONFIG
+    config_path.write_text(
+        f'{{"peft_type":"LORA","r":32,"lora_alpha":{constant},'
+        f'"base_model_name_or_path":"{BASE}"}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ResolveError, match="adapter_config.json is not readable json"):
+        resolve_module._declared_provenance(str(config_path))
+
+
 def test_a_duplicate_key_is_rejected_before_provider_resources_exist(monkeypatch, tmp_path) -> None:
     """the control plane must read this file exactly as the gpu container will.
 

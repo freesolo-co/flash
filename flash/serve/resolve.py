@@ -24,6 +24,7 @@ from flash.serve.app.materialize import MaterializationError, validate_adapter_w
 from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
 from flash.serve.profiles import ServingProfile
 from flash.serve.provisioning import ServingImage
+from flash.serve.runtime.structured_outputs import _reject_non_finite
 
 # a peft lora adapter is exactly these files. requiring the pair (rather than accepting whatever
 # the prefix happens to contain) keeps an incomplete upload from deploying as if it were whole:
@@ -180,7 +181,11 @@ def _declared_provenance(
         # the duplicate-key rule is shared for the same reason: plain `json.load` takes the last
         # value, so a config declaring `r` twice would resolve against one rank and then be
         # rejected inside the container this function exists to avoid paying for.
-        config = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+        config = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_non_finite,
+        )
     except _DuplicateConfigKey as exc:
         raise ResolveError(str(exc)) from exc
     except (OSError, UnicodeDecodeError, ValueError) as exc:
