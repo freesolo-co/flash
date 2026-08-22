@@ -105,7 +105,10 @@ def test_revive_stamps_timestamp_so_post_deploy_resists_stale_forward() -> None:
 
 
 def test_lora_int_id_is_stable_positive() -> None:
-    assert lora_int_id("adapter") == lora_int_id("adapter")
+    # a literal, not a second call: comparing the function to itself passes for ANY implementation,
+    # so it could not catch a changed hash that silently repoints every served adapter. this value
+    # is sha1("adapter")[:4] masked to 31 bits, derived independently of the code under test.
+    assert lora_int_id("adapter") == 2145909947
     assert lora_int_id("adapter") > 0
 
 

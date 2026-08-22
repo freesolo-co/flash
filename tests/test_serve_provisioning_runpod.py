@@ -683,9 +683,12 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
     assert transport.templates[0]["dockerStartCmd"] == ["python", "/app/serve_launch.py"]
     template_env = dict(transport.templates[0]["env"])
     names = _names(bundle)
-    assert template_env["FLASH_INFERENCE_TOKEN"] == (
-        f"{{{{ RUNPOD_SECRET_{names.inference_secret} }}}}"
-    )
+    # the literal `{{ RUNPOD_SECRET_<name> }}` shape, not an f-string rebuilt from the same
+    # `names.inference_secret` the plan used: rebuilding it asserts the sentinel equals itself and
+    # passes for any format. runpod only substitutes this exact spelling, and an unsubstituted
+    # placeholder reaches the container as literal text, so the launcher dies on a bogus token.
+    expected_token_reference = "{{ RUNPOD_SECRET_" + names.inference_secret + " }}"
+    assert template_env["FLASH_INFERENCE_TOKEN"] == expected_token_reference
     assert "FLASH_ARTIFACT_TOKEN" not in template_env
     assert "FLASH_ARTIFACT_TOKEN" not in transport.pods[0]["env"]
     assert transport.volumes[0]["dataCenterId"] == bundle.spec.placement.data_center_id
