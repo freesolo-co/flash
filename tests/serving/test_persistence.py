@@ -28,7 +28,7 @@ REVISION_ID = f"{RUN_ID}@step-20.{SHA}"
 def _settings() -> Settings:
     return Settings(
         SUPABASE_URL="https://supabase.test",
-        SUPABASE_SERVICE_ROLE_KEY="service-role",
+        SUPABASE_SERVICE_ROLE_KEY="sb_secret_service_role",
     )
 
 

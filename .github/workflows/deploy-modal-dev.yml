@@ -169,17 +169,9 @@ jobs:
               and isinstance(item.get("api_key"), str)
               and item["api_key"].startswith("sb_secret_")
           ]
-          legacy_keys = [
-              item.get("api_key")
-              for item in keys
-              if isinstance(item, dict)
-              and item.get("name") == "service_role"
-              and isinstance(item.get("api_key"), str)
-              and item["api_key"]
-          ]
-          selected = secret_keys[0] if secret_keys else legacy_keys[0] if legacy_keys else None
+          selected = secret_keys[0] if secret_keys else None
           if selected is None:
-              raise SystemExit("No supported development Supabase server key was returned")
+              raise SystemExit("No sb_secret_* development Supabase server key was returned")
           print(selected)
           PY
           )"
@@ -212,9 +204,6 @@ jobs:
             --header "apikey: $SUPABASE_SERVICE_ROLE_KEY"
             --header "Accept-Profile: flash"
           )
-          if [[ "$SUPABASE_SERVICE_ROLE_KEY" != sb_secret_* ]]; then
-            headers+=(--header "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY")
-          fi
           status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
             --connect-timeout 5 \
             --max-time 15 \

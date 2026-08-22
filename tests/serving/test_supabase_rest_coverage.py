@@ -20,21 +20,13 @@ def test_supabase_headers_requires_service_role_key(monkeypatch: pytest.MonkeyPa
         supabase_headers(settings, "flash")
 
 
-def test_supabase_headers_include_bearer_for_jwt_service_role_key(
+def test_supabase_headers_rejects_legacy_service_role_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service_role_key = "eyJhbGciOiJIUzI1NiJ9.test.signature"
-    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", service_role_key)
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "eyJhbGciOiJIUzI1NiJ9.test.signature")
 
-    headers = supabase_headers(Settings(_env_file=None), "flash")
-
-    assert headers == {
-        "apikey": service_role_key,
-        "Authorization": f"Bearer {service_role_key}",
-        "Content-Type": "application/json",
-        "Accept-Profile": "flash",
-        "Content-Profile": "flash",
-    }
+    with pytest.raises(RuntimeError, match="must use the sb_secret_ format"):
+        supabase_headers(Settings(_env_file=None), "flash")
 
 
 def test_supabase_headers_omit_bearer_for_opaque_secret_key(

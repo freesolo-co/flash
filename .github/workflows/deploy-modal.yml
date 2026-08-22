@@ -174,6 +174,10 @@ jobs:
         run: |
           supabase_url="$SUPABASE_URL"
           service_role_key="$SUPABASE_SERVICE_ROLE_KEY"
+          if [[ "$service_role_key" != sb_secret_* ]]; then
+            echo "::error::SUPABASE_SERVICE_ROLE_KEY must use the sb_secret_ format."
+            exit 1
+          fi
           # probe the columns the runtime actually reads, not `id` -- which is not even among them.
           # selecting only `id` proved the TABLE exists while a schema still missing, say,
           # `deployment_generation` passed this gate and then failed on every read after deploy.
@@ -206,9 +210,6 @@ jobs:
               --header "apikey: $service_role_key"
               --header "Accept-Profile: flash"
             )
-            if [[ "$service_role_key" != sb_secret_* ]]; then
-              headers+=(--header "Authorization: Bearer $service_role_key")
-            fi
 
             if response_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
               --connect-timeout 5 \

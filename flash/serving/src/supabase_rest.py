@@ -12,18 +12,17 @@ def supabase_table_url(settings: Settings, table: str) -> str:
 def supabase_headers(settings: Settings, schema: str) -> dict[str, str]:
     if not settings.supabase_service_role_key:
         raise RuntimeError("Missing SUPABASE_SERVICE_ROLE_KEY")
+    if not settings.supabase_service_role_key.startswith("sb_secret_"):
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY must use the sb_secret_ format")
     # postgrest routes by profile header: Accept-Profile for reads,
     # Content-Profile for writes. sending both keeps every verb on the
     # requested schema.
-    headers = {
+    return {
         "apikey": settings.supabase_service_role_key,
         "Content-Type": "application/json",
         "Accept-Profile": schema,
         "Content-Profile": schema,
     }
-    if not settings.supabase_service_role_key.startswith("sb_secret_"):
-        headers["Authorization"] = f"Bearer {settings.supabase_service_role_key}"
-    return headers
 
 
 def postgrest_error(response: httpx.Response) -> tuple[str, str]:
