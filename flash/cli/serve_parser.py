@@ -120,8 +120,8 @@ def _add_deployment_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument(
         "--timeout",
         type=_positive_finite_seconds,
-        default=1800.0,
-        help="seconds to wait for the provider operation (default: 1800)",
+        default=3600.0,
+        help="seconds to wait for the provider operation (default: 3600)",
     )
 
 

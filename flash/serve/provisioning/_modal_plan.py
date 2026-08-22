@@ -24,7 +24,8 @@ MODAL_VOLUME_MOUNT = "/modal-volume"
 MODAL_CACHE_ROOT = "/modal-volume/flash-serving"
 MODAL_WEB_PORT = 8000
 # a live cold boot projected about 21 minutes before readiness. 1200s is still below that, while
-# 1800s adds roughly eight minutes of margin and remains inside the 3600s command deadline.
+# 1800s adds roughly eight minutes of margin. this is modal's own container-boot limit, so it must
+# stay strictly under the cli deadline that also has to cover finalize and cleanup after readiness.
 MODAL_STARTUP_TIMEOUT_SECONDS = 1800
 MODAL_SCALEDOWN_WINDOW_SECONDS = 60
 MODAL_MAX_CONTAINERS = 1

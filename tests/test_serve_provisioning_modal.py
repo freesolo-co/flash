@@ -446,6 +446,22 @@ def test_app_tag_set_fits_modals_tag_budget_in_every_phase() -> None:
         assert len({key for key, _ in tags}) == len(tags), "tag keys must be unique"
 
 
+def _default_serve_timeout_seconds() -> float:
+    """The real `--timeout` default the deploy command ships with.
+
+    Read from the parser rather than restated, so the budget assertion below cannot drift away
+    from the value users actually get.
+    """
+    import argparse
+
+    from flash.cli.serve_parser import _add_deployment_arguments
+
+    command = argparse.ArgumentParser()
+    _add_deployment_arguments(command)
+    timeout = next(a for a in command._actions if a.dest == "timeout")
+    return float(timeout.default)
+
+
 def test_plan_is_complete_secret_free_and_binds_pinned_image() -> None:
     bundle = _bundle()
     plan = build_modal_create_plan(bundle)
@@ -469,6 +485,9 @@ def test_plan_is_complete_secret_free_and_binds_pinned_image() -> None:
     assert plan.max_containers == 1
     assert plan.buffer_containers == 0
     assert plan.startup_timeout_seconds == MODAL_STARTUP_TIMEOUT_SECONDS == 1800
+    # modal's container-boot limit must leave room under the cli deadline for finalize and
+    # cleanup, otherwise a slow boot strands a billable half-finalized app.
+    assert _default_serve_timeout_seconds() > MODAL_STARTUP_TIMEOUT_SECONDS
     assert plan.scaledown_window_seconds > 0
     assert plan.environment
     assert "FLASH_SERVING_MANIFEST" in dict(plan.environment)
