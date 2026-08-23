@@ -295,3 +295,128 @@ def test_durable_experience_never_feeds_capacity_exhaustion(monkeypatch, tmp_pat
     assert not _capacity_exhausted(ctx, outcome, first_cache_drop=False)
     ctx.capacity_refusals[shape] = 1
     assert _capacity_exhausted(ctx, outcome, first_cache_drop=False)
+
+
+def test_stale_refusal_after_success_keeps_the_entry_consistent(monkeypatch, tmp_path):
+    """A refusal older than the last success must not persist an entry the reader then rejects.
+
+    `_entry_from_json` requires `refusal_count > 0` to agree with "the latest observation is a
+    refusal". A sample taken before the exclusive lock can be merged with a success another writer
+    committed in between, producing `refusal_count = 1` with `last_refusal_at <= last_success_at`.
+    That entry is unreadable, and before the fix one unreadable entry discarded the WHOLE ledger,
+    so an unrelated shape's experience was destroyed by a race on a different shape.
+    """
+    import flash.runner as runner
+    from flash.providers import capacity_experience
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    shape = ("runpod", "H100", 1)
+    other = ("vast", "B200", 8)
+
+    capacity_experience.record_capacity_refusal(shape, now=100.0)
+    capacity_experience.record_capacity_success(shape, now=200.0)
+    capacity_experience.record_capacity_refusal(other, now=150.0)
+    # the stale pre-lock sample: predates the success it is merged with.
+    capacity_experience.record_capacity_refusal(shape, now=120.0)
+
+    experience = capacity_experience.read_capacity_experience()
+    # the unrelated shape survives, which is what the whole-ledger discard used to destroy.
+    assert other in experience
+    entry = experience[shape]
+    active = entry.last_refusal_at is not None and (
+        entry.last_success_at is None or entry.last_refusal_at > entry.last_success_at
+    )
+    assert active == (entry.refusal_count > 0)
+    # a market that has since admitted this shape is not demoted by an older refusal.
+    assert shape not in capacity_experience.recent_capacity_refusals(experience, now=210.0)
+
+
+def test_one_unreadable_entry_does_not_discard_the_others(monkeypatch, tmp_path):
+    """A single corrupt ENTRY costs that shape's hint, never every other shape's."""
+    import flash.runner as runner
+    from flash.providers import capacity_experience
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    good = ("runpod", "H100", 1)
+    capacity_experience.record_capacity_refusal(good, now=1000.0)
+
+    path = Path(capacity_experience._paths()[1])
+    raw = json.loads(path.read_text())
+    # a refusal time with a zero count: the exact disagreement _entry_from_json rejects.
+    raw["shapes"]["vast\x1fB200\x1f8"] = {
+        "last_refusal_at": 10.0,
+        "refusal_count": 0,
+        "last_success_at": None,
+    }
+    path.write_text(json.dumps(raw))
+
+    experience = capacity_experience.read_capacity_experience()
+    assert good in experience
+    assert ("vast", "B200", 8) not in experience
+
+
+def _forgiven_shapes_after_failure(monkeypatch, tmp_path, failure):
+    """Drive the real _handle_failure and return the shapes it forgave on the durable ledger."""
+    import flash.runner as runner
+    from flash.providers.base import Candidate, PollResult
+    from flash.runner.supervise import lifecycle as _lifecycle
+    from flash.runner.supervise import seed_submission
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    forgiven: list[tuple] = []
+    monkeypatch.setattr(
+        seed_submission._capacity_experience, "record_capacity_success", forgiven.append
+    )
+    monkeypatch.setattr(
+        seed_submission._capacity_experience, "record_capacity_refusal", lambda _shape: None
+    )
+    # the failure branch is the subject; keep every collaborator around it inert.
+    monkeypatch.setattr(_lifecycle, "_await_runpod_completed_metrics", lambda *a, **k: None)
+    # _handle_failure imports this from flash.runner inside the body, so patch it at the source.
+    monkeypatch.setattr(runner, "_load_run_deadline_at", lambda _run_id: None)
+
+    candidate = Candidate("runpod", "H100", hourly_usd=1.0, vram_gb=80, gpu_count=1)
+    outcome = SimpleNamespace(
+        result=PollResult(False, failure=failure, detail="d"),
+        chosen=candidate,
+        candidates=(candidate,),
+        run_spec=SimpleNamespace(gpu=SimpleNamespace(network_volume=None)),
+        quote_refresh_failed=False,
+    )
+    ctx = SimpleNamespace(
+        seed=0,
+        spec=SimpleNamespace(
+            run_id="cap-exp",
+            gpu=SimpleNamespace(type="H100", provider="runpod", count=1),
+        ),
+        capacity_refusals={_lifecycle._shape_key(candidate): 1},
+        failed_providers=set(),
+        tried_classes=set(),
+        oom_vram_floor=0.0,
+        drop_weight_cache=False,
+        retry_budget=SimpleNamespace(
+            can_retry=lambda *a, **k: False, record_retry=lambda *a, **k: None
+        ),
+        last_handle=None,
+        last_detail="",
+        log=None,
+        raise_if_cancelled=lambda: None,
+        return_completed_runpod_metrics=lambda metrics: metrics,
+    )
+    seed_submission._handle_failure(ctx, SimpleNamespace(attempt=0), outcome)
+    return forgiven, ctx.capacity_refusals
+
+
+@pytest.mark.parametrize("failure", ["job_failed", "stalled", "job_preempted", "oom"])
+def test_admitted_failure_forgives_a_prior_refusal(monkeypatch, tmp_path, failure):
+    """A worker that reached the box and died there proves the shape had capacity."""
+    forgiven, in_run = _forgiven_shapes_after_failure(monkeypatch, tmp_path, failure)
+    assert forgiven == [("runpod", "H100", 1)], f"{failure} must forgive the admitted shape"
+    assert in_run == {}, f"{failure} must also clear the in-run tally"
+
+
+@pytest.mark.parametrize("failure", ["no_capacity", "poll_error"])
+def test_unadmitted_failure_does_not_forgive(monkeypatch, tmp_path, failure):
+    """no_capacity and poll_error can both precede admission, so neither clears a refusal."""
+    forgiven, _in_run = _forgiven_shapes_after_failure(monkeypatch, tmp_path, failure)
+    assert forgiven == [], f"{failure} is ambiguous and must not forgive"

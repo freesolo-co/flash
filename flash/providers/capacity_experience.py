@@ -158,7 +158,17 @@ def _read_unlocked(path: str) -> dict[CapacityShape, CapacityExperience]:
     shapes = raw["shapes"]
     if not isinstance(shapes, dict) or len(shapes) > _MAX_TRACKED_SHAPES:
         raise ValueError(f"invalid capacity experience shape map: {path}")
-    return {_shape_from_key(key): _entry_from_json(value) for key, value in shapes.items()}
+    # one unreadable ENTRY drops that entry, not the file. the whole-ledger raise is reserved for a
+    # structurally invalid container above, because the two failures have very different blast
+    # radii: a single shape whose observations disagree costs one shape's hint, while discarding
+    # the map costs every OTHER shape's hint too and the next write then persists that loss.
+    entries: dict[CapacityShape, CapacityExperience] = {}
+    for key, value in shapes.items():
+        try:
+            entries[_shape_from_key(key)] = _entry_from_json(value)
+        except ValueError:
+            logger.debug("dropping unreadable capacity experience entry %r", key)
+    return entries
 
 
 def _fsync_directory(path: str) -> None:
@@ -258,11 +268,15 @@ def recent_capacity_refusals(
 
 def _record(shape: CapacityShape, *, success: bool, now: float | None) -> None:
     shape = _validated_shape(shape)
-    observed_at = time.time() if now is None else float(now)
-    if observed_at < 0 or not math.isfinite(observed_at):
-        raise ValueError(f"invalid capacity experience observation time: {observed_at!r}")
+    if now is not None and (float(now) < 0 or not math.isfinite(float(now))):
+        raise ValueError(f"invalid capacity experience observation time: {now!r}")
     try:
         with _locked_ledger(exclusive=True) as (runs_dir, path):
+            # sampled UNDER the lock, never before it. a timestamp taken outside the lock can be
+            # merged with state a concurrent writer committed in between, which persists a refusal
+            # older than the success it is merged with -- an entry whose count disagrees with its
+            # latest observation, exactly what `_entry_from_json` rejects on the next read.
+            observed_at = float(now) if now is not None else time.time()
             try:
                 entries = _read_unlocked(path)
             except ValueError:
@@ -271,21 +285,36 @@ def _record(shape: CapacityShape, *, success: bool, now: float | None) -> None:
                 entries = {}
             previous = entries.get(shape, CapacityExperience(None, 0, None))
             if success:
+                # monotonic: an explicitly supplied older sample must not walk the success time
+                # backwards past a refusal already recorded after it, which would leave the entry
+                # claiming an active refusal with a zero count.
+                last_success = max(observed_at, previous.last_success_at or observed_at)
                 entries[shape] = CapacityExperience(
                     previous.last_refusal_at,
                     0,
-                    observed_at,
+                    last_success,
                 )
             else:
+                # a refusal older than the last success describes a market that has since admitted
+                # this shape, so it says nothing new. keeping the newer success (rather than
+                # stamping the stale time) is what keeps `refusal_count` and the latest observation
+                # agreeing, which is the invariant `_entry_from_json` enforces on the next read.
+                last_refusal = max(observed_at, previous.last_refusal_at or observed_at)
                 after_success = previous.last_success_at is not None and (
                     previous.last_refusal_at is None
                     or previous.last_success_at >= previous.last_refusal_at
                 )
-                entries[shape] = CapacityExperience(
-                    observed_at,
-                    1 if after_success else previous.refusal_count + 1,
-                    previous.last_success_at,
-                )
+                if (
+                    previous.last_success_at is not None
+                    and last_refusal <= previous.last_success_at
+                ):
+                    entries[shape] = previous
+                else:
+                    entries[shape] = CapacityExperience(
+                        last_refusal,
+                        1 if after_success else previous.refusal_count + 1,
+                        previous.last_success_at,
+                    )
             _write_unlocked(runs_dir, path, _bounded(entries))
     except Exception as exc:
         # a lost hint is cheaper than turning an otherwise runnable job into a control-plane failure.

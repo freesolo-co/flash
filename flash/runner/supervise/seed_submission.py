@@ -846,10 +846,20 @@ def _handle_failure(
         return _FailureDecision(ctx.return_completed_runpod_metrics(completed_metrics), False)
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
-    if outcome.chosen is not None and result.failure in ("stalled", "job_preempted", "oom"):
+    if outcome.chosen is not None and result.failure in (
+        "stalled",
+        "job_preempted",
+        "oom",
+        "job_failed",
+    ):
         # these outcomes happen after the class admitted the run, so an older no-capacity refusal no
         # longer describes the current market. poll_error stays ambiguous because submit and lookup
         # failures can happen before any capacity was granted.
+        #
+        # job_failed belongs here for the same reason the other three do: the worker reached the box
+        # and died there, which is proof the shape had capacity. leaving the refusal standing kept a
+        # shape demoted plane-wide for the full ttl while it was demonstrably taking work, and it is
+        # the one admitted-and-failed outcome the durable ledger was missing.
         admitted_shape = _lifecycle._shape_key(outcome.chosen)
         ctx.capacity_refusals.pop(admitted_shape, None)
         _record_capacity_observation(
