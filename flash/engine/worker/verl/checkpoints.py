@@ -4,7 +4,7 @@ verl writes a full training checkpoint per save step, in a layout that differs b
 ppo trainers. These helpers find the right directory inside it, work out which steps are already
 complete, and export the one flash actually deploys.
 
-Split out of `flash.engine.worker.backend_common` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.backend_common` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

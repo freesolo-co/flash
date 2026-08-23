@@ -4,7 +4,7 @@
 the child is launched with; the rest prepare what that child needs on disk and in its environment
 (the resolved env vars and rollout parquet).
 
-Split out of `flash.engine.worker.opd_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.opd_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

@@ -147,8 +147,15 @@ def test_undeploy_uses_supplied_identity_when_hub_resolution_fails(
         calls.append(getattr(handle, handle_field))
         return _result(bundle, "absent")
 
+    # modal's entry sits under execution/, runpod's directly under the package.
+    entry = (
+        "flash.serve.provisioning.modal.execution.lifecycle_entry"
+        if provider == "modal"
+        else "flash.serve.provisioning.runpod.lifecycle_entry"
+    )
     monkeypatch.setattr(
-        f"flash.serve.provisioning.{provider}.teardown_{provider}_deployment", _teardown
+        f"{entry}.teardown_{provider}_deployment",
+        _teardown,
     )
 
     assert cmd_serve_undeploy(args) == 0

@@ -5,7 +5,7 @@ call: they strip the thinking prefix the student may have emitted, coerce whatev
 returned into a finite float, and batch concurrent requests so one slow reward function does not
 serialize the step.
 
-Split out of `flash.engine.worker.rl_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.rl_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

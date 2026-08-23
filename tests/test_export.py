@@ -75,7 +75,7 @@ def test_export_import_does_not_initialize_worker_package(tmp_path):
             sys.executable,
             "-c",
             (
-                "import sys; import flash.serve.export; "
+                "import sys; import flash.serve.deployment.export; "
                 "assert 'flash.engine.worker' not in sys.modules"
             ),
         ],

@@ -7,7 +7,7 @@ verl child (a separate interpreter) can reach it, and the alignment bookkeeping 
 coverage, forced-mask validation, seam dedup, no-signal accounting -- makes it by far the largest
 piece of the OPD orchestrator.
 
-Split out of `flash.engine.worker.opd_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.opd_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

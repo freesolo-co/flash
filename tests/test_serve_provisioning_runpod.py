@@ -25,8 +25,8 @@ from flash.serve.provisioning import (
     InterruptedProvisioning,
     ServingImage,
     ServingRuntimeSecrets,
-    _common,
 )
+from flash.serve.provisioning.common import records as _common
 from flash.serve.provisioning.common.records import serving_resource_names
 from flash.serve.provisioning.runpod.plan import build_runpod_create_plan
 from flash.serve.provisioning.runpod.probe import RunPodEndpointProbe, _provenance_matches

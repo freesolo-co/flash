@@ -5,7 +5,7 @@ the `_render_*`/`render_*` helpers emit the child-side python that goes with it:
 that reads flash's parquet, and the sitecustomize that patches verl in-process (tf32, gdn varlen,
 exact dataloader order, LoRA+). It is all string and dict construction -- no torch, no subprocess.
 
-Split out of `flash.engine.worker.sft_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.sft_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@ ones and streams them to the Hub on a background thread so a retry can resume an
 are durable. `_check_grpo_had_a_gradient` is the publish-time guard that refuses an adapter
 identical to its initialization.
 
-Split out of `flash.engine.worker.rl_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.rl_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

@@ -1290,8 +1290,8 @@ def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatc
 @pytest.mark.parametrize(
     ("modname", "outer", "stage"),
     [
-        ("flash.engine.worker.rl_train", "run_rl_train", "rl_step"),
-        ("flash.engine.worker.sft_train", "run_sft_train", "sft_step"),
+        ("flash.engine.worker.train.entry.rl_train", "run_rl_train", "rl_step"),
+        ("flash.engine.worker.train.entry.sft_train", "run_sft_train", "sft_step"),
     ],
 )
 def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
@@ -1327,12 +1327,12 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
     ("modname", "outer", "stages"),
     [
         (
-            "flash.engine.worker.sft_train",
+            "flash.engine.worker.train.entry.sft_train",
             "run_sft_train",
             ("sft_data_loading", "sft_finalizing"),
         ),
         (
-            "flash.engine.worker.rl_train",
+            "flash.engine.worker.train.entry.rl_train",
             "run_rl_train",
             ("rl_data_loading", "rl_configuring", "rl_finalizing"),
         ),
@@ -1354,9 +1354,9 @@ def test_quiet_phases_are_wrapped_in_liveness_heartbeat(modname, outer, stages):
 @pytest.mark.parametrize(
     ("modname", "outer", "stage"),
     [
-        ("flash.engine.worker.sft_train", "run_sft_train", "sft_configuring"),
-        ("flash.engine.worker.rl_train", "run_rl_train", "rl_configuring"),
-        ("flash.engine.worker.opd_train", "run_opd_train", "opd_configuring"),
+        ("flash.engine.worker.train.entry.sft_train", "run_sft_train", "sft_configuring"),
+        ("flash.engine.worker.train.entry.rl_train", "run_rl_train", "rl_configuring"),
+        ("flash.engine.worker.train.entry.opd_train", "run_opd_train", "opd_configuring"),
     ],
 )
 def test_venv_provisioning_and_the_capability_probe_run_under_one_wrap(modname, outer, stage):

@@ -5,7 +5,7 @@ The teacher is a remote model, so OPD scores rollouts in batches rather than one
 response whose token ids or logprobs do not line up with what was sent -- a mismatch would
 silently train the student against the wrong distribution.
 
-Split out of `flash.engine.worker.opd_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.opd_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

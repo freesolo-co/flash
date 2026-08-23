@@ -29,7 +29,7 @@ SERVER_ONLY_PREFIXES = (
     "flash.engine.worker",
     "flash.serve.app",
     "flash.serve.deploy",
-    "flash.serve.export",
+    "flash.serve.deployment.export",
     "flash.serve.preflight",
     # The serving app runs only inside the GPU container built from Dockerfile.serve, which
     # installs the `serving` extra (modal, orjson, pydantic-settings) plus vLLM. Nothing a client

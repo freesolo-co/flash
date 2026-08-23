@@ -4,7 +4,7 @@ Everything that turns a resolved flash job into the exact verl 0.8.0 surface: th
 child reads, the hydra override list, the GPU memory-utilization split between the training and
 rollout engines, and the human-readable notes attached to the run.
 
-Split out of `flash.engine.worker.rl_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.rl_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

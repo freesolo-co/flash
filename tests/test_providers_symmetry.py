@@ -192,13 +192,14 @@ def test_run_instances_remaining_is_optional_not_required_by_protocol():
 
 
 def test_static_pricing():
-    pricing = importlib.import_module("flash.providers.runpod.pricing")
+    pricing = importlib.import_module("flash.providers.runpod.client.pricing")
     assert pricing.hourly_rate("RTX 5090") == pytest.approx(0.99)
 
 
 def _stub_candidates(monkeypatch, *, runpod=(), lambda_=(), vast=()):
     """Pin allocate()'s three provider candidate lists so ranking can be tested in isolation."""
-    from flash.providers.core import allocator, get_provider
+    from flash.providers.core import allocator
+    from flash.providers import get_provider
     from flash.providers.core.base import Candidate
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))

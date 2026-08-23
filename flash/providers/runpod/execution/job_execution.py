@@ -1,6 +1,6 @@
 """RunPod endpoint deployment and job polling.
 
-Split out of ``flash.providers.runpod.jobs`` to keep that module under the file-size limit.
+Split out of ``flash.providers.runpod.execution.jobs`` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

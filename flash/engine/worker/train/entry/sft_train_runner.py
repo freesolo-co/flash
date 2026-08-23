@@ -1,6 +1,6 @@
 """SFT training orchestration phases and the paid child-run boundary.
 
-Split out of ``flash.engine.worker.sft_train`` to keep that module under the file-size limit.
+Split out of ``flash.engine.worker.train.entry.sft_train`` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -558,7 +558,9 @@ def _write_sft_child_shims(
     multimodal: bool = False,
 ) -> tuple[str, tuple[str, ...], str]:
     """write the SFT plugin bundle, startup bootstrap, and non-secret plugin config."""
-    parent_dir = os.path.dirname(_sft_train.__file__)
+    # the bundle paths below are relative to flash/engine/worker/; this module now lives in
+    # worker/train/entry/, so climb back out of train/entry rather than anchoring here.
+    parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(_sft_train.__file__)))
     copies = (
         ("train/core/child/runtime.py", "flash_verl_runtime.py"),
         ("train/sft/child/plugin.py", "flash_sft_plugin.py"),

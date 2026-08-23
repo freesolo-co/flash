@@ -5,7 +5,7 @@ grows the network volume the workers read base weights from, per datacenter. The
 endpoint quota by retiring flash endpoints idle past their grace, tracking when each was first seen
 idle so a brief lull does not delete a live one.
 
-Split out of `flash.providers.runpod.jobs` to keep that module under the file-size limit.
+Split out of `flash.providers.runpod.execution.jobs` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

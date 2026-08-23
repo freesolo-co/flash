@@ -6,7 +6,7 @@ batch, a mutation-callback error). These helpers read those records back, reconc
 what the parent observed, and turn the pair into one accurate raise. The resume-staging helpers sit
 alongside them because a retry's contract is written from the same accounting.
 
-Split out of `flash.engine.worker.opd_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.opd_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

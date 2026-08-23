@@ -1,6 +1,6 @@
 """Execution phases for the verl-backed grpo worker.
 
-Split out of ``flash.engine.worker.rl_train`` to keep that module under the file-size limit.
+Split out of ``flash.engine.worker.train.entry.rl_train`` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

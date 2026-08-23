@@ -2853,7 +2853,7 @@ def test_run_instances_remaining_uses_exact_labels_and_exact_lookup(monkeypatch)
         LambdaProvider,
         jobs,
     )
-    from flash.providers.lambda_ import (
+    from flash.providers.lambda_.client import (
         api as lambda_api,
     )
 
@@ -2881,7 +2881,7 @@ def test_run_instances_remaining_fails_closed_on_enumeration_lookup_or_identity(
         LambdaProvider,
         jobs,
     )
-    from flash.providers.lambda_ import (
+    from flash.providers.lambda_.client import (
         api as lambda_api,
     )
 

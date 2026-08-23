@@ -5,7 +5,7 @@ rejects the shapes verl cannot run, and returns the fully-resolved dict the data
 hydra override builder, and the child launcher all read from. It is pure config work -- no verl,
 no gpu, no subprocess -- which is why so many tests call it directly.
 
-Split out of `flash.engine.worker.rl_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.rl_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

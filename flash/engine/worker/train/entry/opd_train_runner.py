@@ -1,6 +1,6 @@
 """OPD training preparation, child execution, and finalization helpers.
 
-Split out of ``flash.engine.worker.opd_train`` to keep that module under the file-size limit.
+Split out of ``flash.engine.worker.train.entry.opd_train`` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -496,7 +496,9 @@ def _write_child_shims(
     loggers: list[str],
 ) -> tuple[str, str]:
     shim_dir = workload.shim_dir
-    parent_dir = os.path.dirname(_opd_train.__file__)
+    # the bundle paths below are relative to flash/engine/worker/; this module now lives in
+    # worker/train/entry/, so climb back out of train/entry rather than anchoring here.
+    parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(_opd_train.__file__)))
     copies = (
         ("train/core/child/runtime.py", "flash_verl_runtime.py"),
         ("train/core/child/glue.py", "flash_multiturn_glue.py"),

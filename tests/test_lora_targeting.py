@@ -448,7 +448,7 @@ def test_runtime_installer_rejects_stale_or_non_dataclass_configs_and_incomplete
 
 
 def test_sft_grpo_and_opd_plugins_install_text_targeting_only_for_text_jobs(tmp_path):
-    importlib.import_module("flash.engine.worker.sft_train")
+    importlib.import_module("flash.engine.worker.train.entry.sft_train")
     from flash.engine.worker.train.entry import sft_train_runner
     from flash.engine.worker.train.opd.orchestration.overrides import _build_opd_plugin_config
     from flash.engine.worker.train.rl.child.plugin import required_patch_names

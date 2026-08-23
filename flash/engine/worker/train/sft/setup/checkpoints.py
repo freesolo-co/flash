@@ -4,7 +4,7 @@ verl writes a full fsdp checkpoint per save step; flash needs a peft adapter dir
 conversion inline would stall the trainer, so `_VerlCheckpointWatcher` runs it on a background
 thread, one checkpoint at a time, and the parent joins it at the end of the run.
 
-Split out of `flash.engine.worker.sft_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.sft_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@ checked: the tensor file has to exist, and the rank recorded in `adapter_config.
 to be one the serving engine was built for. That validation is independent of the
 deployment state machine, so it lives here.
 
-Split out of `flash.serve.deploy` to keep that module under the file-size limit.
+Split out of `flash.serve.deployment.deploy` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from flash.adapters.targets import config_targets_images
 from flash.serve.contract.errors import AdapterConfigMissing, AdapterTensorMissing, ServingError
 
 # The accepted weight-file shapes live beside the filenames themselves so serving validation and
-# `flash.serve.export` cannot drift apart. The alias name is load-bearing: `flash.serve.deploy`
+# `flash.serve.deployment.export` cannot drift apart. The alias name is load-bearing: `flash.serve.deployment.deploy`
 # re-exports it and the serving tests resolve it there.
 _is_adapter_tensor_filename = is_adapter_weight_filename
 

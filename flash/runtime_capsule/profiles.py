@@ -31,10 +31,10 @@ class Profile:
 # bare top-level modules when it runs outside a package (its `if __package__:` branch), which is
 # exactly how it is imported from inside the capsule.
 _INSTANCE_BOOTSTRAP_SOURCES = (
-    (f"{_LIFECYCLE}/bootstrap.py", "bootstrap.py"),
-    (f"{_LIFECYCLE}/bootstrap_secrets.py", "bootstrap_secrets.py"),
-    (f"{_LIFECYCLE}/bootstrap_console.py", "bootstrap_console.py"),
-    (f"{_LIFECYCLE}/bootstrap_pip.py", "bootstrap_pip.py"),
+    (f"{_LIFECYCLE}/bootstrapping/bootstrap.py", "bootstrap.py"),
+    (f"{_LIFECYCLE}/bootstrapping/secrets.py", "bootstrap_secrets.py"),
+    (f"{_LIFECYCLE}/bootstrapping/console.py", "bootstrap_console.py"),
+    (f"{_LIFECYCLE}/bootstrapping/pip.py", "bootstrap_pip.py"),
     ("flash/source_snapshot.py", "source_snapshot.py"),
 )
 

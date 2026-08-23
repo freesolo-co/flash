@@ -5,7 +5,7 @@ here, in the parent, and the child reaches it over a local reward server. `Multi
 that per-session env state, `start_reward_server` serves both the single- and multi-turn scoring
 endpoints, and the copy/env helpers stage the child-side modules the verl interpreter imports.
 
-Split out of `flash.engine.worker.rl_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.rl_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -168,7 +168,9 @@ _REWARD_BRIDGE_MIN_REQUEST_BACKLOG = 128
 # the directory the child-side modules are copied FROM. anchored to `flash/engine/worker` rather
 # than to this file: the paths in MULTI_TURN_CHILD_MODULES are relative to the worker package, and
 # resolving them against this module's own directory would silently look under train/rl/.
-_WORKER_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_WORKER_DIR = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 
 class MultiTurnBridge:

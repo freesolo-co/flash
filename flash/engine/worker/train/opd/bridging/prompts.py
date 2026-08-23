@@ -5,7 +5,7 @@ normalizing prompt ids across text and multimodal processors, shifting group met
 student's token grid, and validating or trimming the forced-token mask that marks which tokens the
 teacher supplied rather than the student.
 
-Split out of `flash.engine.worker.opd_train` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.opd_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
