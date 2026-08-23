@@ -16,29 +16,35 @@ DEFAULT_CACHE_DIR = "/opt/flash/kernelcache"
 MEGA_CACHE_FILENAME = "mega_cache.bin"
 MEGA_CACHE_META_FILENAME = "mega_cache.json"
 
+# every env var that addresses the baked kernel cache, mapped to its subdirectory of the cache root.
+# Dockerfile.worker sets these image-wide to the same layout; this module re-forces them so a stale
+# image or a prior run cannot defeat the redirect. it is also the allowlist the verl child inherits
+# (see sft_train._CHILD_ENV_EXACT) -- the child is the interpreter that actually trains, so a cache
+# only the parent can see is no cache at all. one definition, so a var added here cannot be added
+# without the child getting it too.
+KERNEL_CACHE_ENV_SUBDIRS = {
+    "TRITON_CACHE_DIR": "triton",
+    "TORCHINDUCTOR_CACHE_DIR": "inductor",
+    # flashinfer downloads b200 attention cubins and builds a host wrapper on first use. redirect
+    # both to distinct persistent-cache subdirs so cold workers do not depend on nvidia artifactory
+    # or pay the first-step build repeatedly. it reads FLASHINFER_CUBIN_DIR for cubins and
+    # FLASHINFER_WORKSPACE_BASE for the 0.6.x jit wrapper; FLASHINFER_CACHE_DIR is
+    # forward-compatible only, and is set anyway so a future version cannot silently miss the cache.
+    "FLASHINFER_CUBIN_DIR": "flashinfer_cubin",
+    "FLASHINFER_CACHE_DIR": "flashinfer",
+    "FLASHINFER_WORKSPACE_BASE": "flashinfer",
+}
+
 
 def _log(msg: str) -> None:
     print(f"[kernel-warmup] {msg}", flush=True)
 
 
 def _point_backends_at(cache_dir: str) -> None:
-    os.makedirs(os.path.join(cache_dir, "triton"), exist_ok=True)
-    os.makedirs(os.path.join(cache_dir, "inductor"), exist_ok=True)
-    os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_dir, "triton")
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(cache_dir, "inductor")
-    # flashinfer downloads b200 attention cubins and builds a host wrapper on first use. redirect both
-    # to distinct persistent-cache subdirs so cold workers do not depend on nvidia artifactory or pay
-    # the first-step build repeatedly.
-    fi_cubin = os.path.join(cache_dir, "flashinfer_cubin")
-    fi_cache = os.path.join(cache_dir, "flashinfer")
-    os.makedirs(fi_cubin, exist_ok=True)
-    os.makedirs(fi_cache, exist_ok=True)
-    # flashinfer reads FLASHINFER_CUBIN_DIR for cubins and FLASHINFER_WORKSPACE_BASE for the 0.6.x
-    # jit wrapper; FLASHINFER_CACHE_DIR is forward-compatible only. force all three so stale image or
-    # prior-run env values cannot defeat this workspace redirect.
-    os.environ["FLASHINFER_CUBIN_DIR"] = fi_cubin
-    os.environ["FLASHINFER_CACHE_DIR"] = fi_cache
-    os.environ["FLASHINFER_WORKSPACE_BASE"] = fi_cache
+    for var, subdir in KERNEL_CACHE_ENV_SUBDIRS.items():
+        path = os.path.join(cache_dir, subdir)
+        os.makedirs(path, exist_ok=True)
+        os.environ[var] = path
 
 
 def _torch_sm(torch) -> str:
