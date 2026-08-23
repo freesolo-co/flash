@@ -321,19 +321,19 @@ def _smoke_answer(
     return content, finish, answer
 
 
-def _lora_attestation_advertised() -> bool:
-    """Whether the serving backend says it emits ``X-Freesolo-LoRA-Request-Adapter``.
+def _lora_attestation_advertised(advertised: frozenset[str] | None) -> bool:
+    """Whether the serving backend said it emits ``X-Freesolo-LoRA-Request-Adapter``.
 
-    Read through the same ``/healthz`` contract ``deploy`` already uses. A backend that cannot be
-    asked is treated as NOT advertising: the attestation then degrades rather than turning an
-    unrelated health-check problem into a deployment failure.
+    ``advertised`` is the capability set THIS deployment already gated on, captured once by
+    ``deploy_adapter`` before registration and handed down. Asking ``/healthz`` a second time here
+    would re-open a question the deployment has settled: a rolling serving deploy can answer from
+    an older replica that does not advertise the capability, and a transient failure answers not
+    at all -- either way the smoke would fail open on a deployment that WAS promised the header.
+
+    ``None`` means no set was captured (a caller outside the deploy path), which is treated as not
+    advertising so the attestation degrades rather than turning discovery into a deploy failure.
     """
-    from flash.serve.deploy import _require_serving_capabilities
-
-    try:
-        return LORA_REQUEST_ATTESTATION_CAPABILITY in _require_serving_capabilities()
-    except Exception:  # never let capability discovery be what fails a deploy
-        return False
+    return advertised is not None and LORA_REQUEST_ATTESTATION_CAPABILITY in advertised
 
 
 def _smoke_lora_request_adapter(
@@ -526,6 +526,9 @@ def _run_deployment_smoke(
     *,
     serving_model: str,
     expected_checkpoint: str,
+    # the capability set deploy_adapter already gated this deployment on. see
+    # `_lora_attestation_advertised` for why this is handed down instead of re-fetched.
+    advertised_capabilities: frozenset[str] | None = None,
     budget_s: float = _SMOKE_BUDGET_SECONDS,
 ) -> dict:
     started = time.monotonic()
@@ -534,7 +537,7 @@ def _run_deployment_smoke(
     from flash.core.catalog import supports_image_training
 
     image_capable = supports_image_training(spec.model)
-    attestation_advertised = _lora_attestation_advertised()
+    attestation_advertised = _lora_attestation_advertised(advertised_capabilities)
     expected_colour, image_messages = _smoke_image_challenge(run_id)
     result = _bounded_smoke_chat(
         serving_model=serving_model,

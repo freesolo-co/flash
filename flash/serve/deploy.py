@@ -331,6 +331,30 @@ def deployment_record(
     )
 
 
+def _call_before_activate(
+    callback: Callable[..., None], revision: str, checkpoint: str, advertised: frozenset[str]
+) -> None:
+    """Invoke the pre-activation callback, passing the advertised capability set when it takes one.
+
+    The capability set is a KEYWORD so a callback that does not care keeps its two-argument
+    signature. Introspected rather than try/except-TypeError, because swallowing a TypeError would
+    also swallow one raised from INSIDE the callback and silently skip the smoke.
+    """
+    import inspect
+
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):  # builtins and C callables are not introspectable
+        parameters = {}
+    accepts = "advertised_capabilities" in parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
+    if accepts:
+        callback(revision, checkpoint, advertised_capabilities=advertised)
+    else:
+        callback(revision, checkpoint)
+
+
 def deploy_adapter(
     run_id: str,
     model: str,
@@ -344,7 +368,12 @@ def deploy_adapter(
     org_id: str | None = None,
     checkpoint_step: int | None = None,
     expected_adapter_revision: str | None = None,
-    before_activate: Callable[[str, str], None] | None = None,
+    # called as (adapter_revision, checkpoint, advertised_capabilities=...). the capability set is
+    # the one THIS deployment already gated on above, handed down rather than re-fetched: a second
+    # /healthz call can hit a different replica mid-rollout, or fail transiently, and answer a
+    # question this deployment has already settled. passed as a KEYWORD so a callback that does
+    # not need it keeps its two-argument signature.
+    before_activate: Callable[..., None] | None = None,
 ) -> Deployment:
     """Register, verify, and atomically activate one immutable adapter revision.
 
@@ -432,7 +461,7 @@ def deploy_adapter(
         budget_s=revision_ready_budget_seconds(model),
     )
     if before_activate is not None:
-        before_activate(revision, checkpoint)
+        _call_before_activate(before_activate, revision, checkpoint, frozenset(advertised))
     activation = _activate_revision(
         run_id,
         revision,

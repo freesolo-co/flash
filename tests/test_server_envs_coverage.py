@@ -768,14 +768,18 @@ def _smoke_expected_colour(run_id: str = "run-1") -> str:
     return expected
 
 
-def _run_smoke(spec, *, budget_s: float = 600.0):
+def _run_smoke(spec, *, budget_s: float = 600.0, advertised=None):
     return serving._run_deployment_smoke(
         "run-1",
         spec,
         serving_model=_SMOKE_REVISION,
         expected_checkpoint="run-1",
+        advertised_capabilities=advertised,
         budget_s=budget_s,
     )
+
+
+_ATTESTING = frozenset({serving_smoke.LORA_REQUEST_ATTESTATION_CAPABILITY})
 
 
 def _schema_validation_child_pids() -> set[int | None]:
@@ -851,14 +855,48 @@ def test_image_deployment_smoke_uses_valid_trusted_image_without_persisting_it(m
         assert data_uri not in json.dumps(out)
 
 
+def test_smoke_uses_the_capability_set_deploy_gated_on_not_a_second_healthz(monkeypatch):
+    """The advertised set is handed down, so a rolling serving deploy cannot fail this open.
+
+    ``deploy_adapter`` captures capabilities once before registration. Re-reading /healthz inside
+    the smoke would let a mid-rollout replica that does not advertise the attestation -- or one
+    transient failure -- accept a response that omits a header this deployment WAS promised.
+    """
+    from flash.serve import deploy as deploy_mod
+
+    healthz_calls = 0
+
+    def exploding_capabilities(**_kwargs):
+        nonlocal healthz_calls
+        healthz_calls += 1
+        raise RuntimeError("a second /healthz must never be issued from the smoke")
+
+    monkeypatch.setattr(deploy_mod, "_require_serving_capabilities", exploding_capabilities)
+    response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+
+    # the handed-down set still enforces the contract strictly...
+    with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"), advertised=_ATTESTING)
+    # ...and a backend that never claimed the header still degrades rather than failing.
+    out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"), advertised=frozenset())
+    assert out["verify_kind"] == "fixed_image"
+    assert healthz_calls == 0, "the smoke re-fetched capabilities instead of using deploy's set"
+
+
+def test_lora_attestation_predicate_reads_only_the_handed_down_set():
+    """No captured set means not advertised; it must never fall back to a live lookup."""
+    assert serving_smoke._lora_attestation_advertised(_ATTESTING) is True
+    assert serving_smoke._lora_attestation_advertised(frozenset()) is False
+    assert serving_smoke._lora_attestation_advertised(None) is False
+
+
 def test_image_deployment_smoke_rejects_missing_lora_request_attestation(monkeypatch):
     """A backend that ADVERTISES the attestation must actually send it."""
     response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
-    monkeypatch.setattr(serving_smoke, "_lora_attestation_advertised", lambda: True)
-
     with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
-        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"), advertised=_ATTESTING)
 
 
 def test_image_deployment_smoke_allows_missing_attestation_when_not_advertised(monkeypatch):
@@ -870,9 +908,7 @@ def test_image_deployment_smoke_allows_missing_attestation_when_not_advertised(m
     """
     response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
-    monkeypatch.setattr(serving_smoke, "_lora_attestation_advertised", lambda: False)
-
-    out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+    out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"), advertised=frozenset())
     assert out["verify_kind"] == "fixed_image"
 
 
@@ -884,10 +920,8 @@ def test_image_deployment_smoke_rejects_wrong_adapter_even_when_not_advertised(m
     """
     response = _smoke_response(_smoke_expected_colour(), request_adapter="run-1@final." + "b" * 40)
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
-    monkeypatch.setattr(serving_smoke, "_lora_attestation_advertised", lambda: False)
-
     with pytest.raises(ServingError, match="wrong LoRA request adapter"):
-        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"), advertised=frozenset())
 
 
 def test_image_deployment_smoke_rejects_mismatched_lora_request_adapter(monkeypatch):
@@ -1029,7 +1063,6 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
 def test_image_structured_smoke_requires_attestation_on_second_request(
     monkeypatch, request_adapter, error, advertised
 ):
-    monkeypatch.setattr(serving_smoke, "_lora_attestation_advertised", lambda: advertised)
     calls = 0
 
     def fake_serve_chat(**_kwargs):
@@ -1047,7 +1080,8 @@ def test_image_structured_smoke_requires_attestation_on_second_request(
                 thinking=False,
                 model="Qwen/Qwen3.5-4B",
                 constraint={"json_object": True},
-            )
+            ),
+            advertised=_ATTESTING if advertised else frozenset(),
         )
 
     assert calls == 2
